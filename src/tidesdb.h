@@ -275,7 +275,7 @@ typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 
 /* lock-free immutable memtable snapshot slot
  * part of a double-buffered RCU scheme: writers build in inactive slot,
- * swap the active index, then wait for old-slot readers to drain 
+ * swap the active index, then wait for old-slot readers to drain
  * @param items array of immutable memtables
  * @param count number of items in the array
  * @param readers number of active readers on this slot
@@ -284,7 +284,7 @@ typedef struct
 {
     tidesdb_memtable_t *items[TDB_IMM_SNAP_MAX_ITEMS];
     _Atomic(size_t) count;
-    _Atomic(int32_t) readers; 
+    _Atomic(int32_t) readers;
 } tidesdb_imm_snap_t;
 
 typedef struct tidesdb_txn_t tidesdb_txn_t;

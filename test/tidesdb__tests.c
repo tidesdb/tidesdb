@@ -1695,7 +1695,7 @@ static void test_cache_stats_disabled(void)
 
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
-    config.block_cache_size = 0; 
+    config.block_cache_size = 0;
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -1940,7 +1940,7 @@ static void test_compaction_basic(void)
     tidesdb_flush_memtable(cf);
 
     /* wait for all flushes to complete */
-    int max_wait = 200; 
+    int max_wait = 200;
     for (int i = 0; i < max_wait; i++)
     {
         usleep(50000);
@@ -3961,7 +3961,7 @@ static void test_sync_interval_mode(void)
         tidesdb_txn_free(txn);
 
         /* we wait for at least one sync interval to ensure WAL is synced */
-        usleep(600000); 
+        usleep(600000);
 
         tidesdb_close(db);
     }
@@ -21172,7 +21172,6 @@ static void test_memory_pressure_auto_limit(void)
     cleanup_test_dir();
 }
 
-
 typedef struct
 {
     tidesdb_t *db;
@@ -21187,7 +21186,9 @@ typedef struct
 static void *iter_seek_last_thread(void *arg)
 {
     iter_direction_thread_data_t *d = (iter_direction_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -21238,7 +21239,9 @@ static void *iter_seek_last_thread(void *arg)
 static void *iter_seek_forward_thread(void *arg)
 {
     iter_direction_thread_data_t *d = (iter_direction_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -21290,7 +21293,9 @@ static void *iter_seek_forward_thread(void *arg)
 static void *iter_direction_writer_thread(void *arg)
 {
     iter_direction_thread_data_t *d = (iter_direction_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -21302,8 +21307,8 @@ static void *iter_direction_writer_thread(void *arg)
         memset(value, 'W' + (d->thread_id % 10), sizeof(value));
         snprintf(value, sizeof(value), "t%d_i%d", d->thread_id, i);
 
-        tidesdb_txn_put(txn, d->cf, (uint8_t *)key, strlen(key) + 1,
-                        (uint8_t *)value, strlen(value) + 1, 0);
+        tidesdb_txn_put(txn, d->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                        strlen(value) + 1, 0);
 
         if (i % 7 == 0)
         {
@@ -21312,8 +21317,7 @@ static void *iter_direction_writer_thread(void *arg)
             tidesdb_txn_delete(txn, d->cf, (uint8_t *)del_key, strlen(del_key) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) != 0)
-            atomic_fetch_add(d->errors, 1);
+        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -21341,8 +21345,9 @@ static void test_concurrent_iter_seek_directions(void)
         char key[64], value[128];
         snprintf(key, sizeof(key), "mdir_key_%06d", i);
         snprintf(value, sizeof(value), "mdir_value_%06d", i);
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                                  (uint8_t *)value, strlen(value) + 1, 0), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
     }
@@ -21410,7 +21415,9 @@ typedef struct
 static void *multi_cf_writer_thread(void *arg)
 {
     multi_cf_thread_data_t *d = (multi_cf_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -21424,29 +21431,27 @@ static void *multi_cf_writer_thread(void *arg)
         char pk[64], row_val[128], idx_key[128];
         snprintf(pk, sizeof(pk), "\x01pk_%04d_%04d", d->thread_id, i % 100);
         snprintf(row_val, sizeof(row_val), "row_t%d_i%d", d->thread_id, i);
-        snprintf(idx_key, sizeof(idx_key), "\x01idx_v%04d_pk_%04d_%04d",
-                 i % 50, d->thread_id, i % 100);
+        snprintf(idx_key, sizeof(idx_key), "\x01idx_v%04d_pk_%04d_%04d", i % 50, d->thread_id,
+                 i % 100);
 
         /* we write data CF + index CF atomically in same txn */
-        tidesdb_txn_put(txn, d->data_cf, (uint8_t *)pk, strlen(pk) + 1,
-                        (uint8_t *)row_val, strlen(row_val) + 1, 0);
-        tidesdb_txn_put(txn, d->idx_cf, (uint8_t *)idx_key, strlen(idx_key) + 1,
-                        (uint8_t *)"\x00", 1, 0);
+        tidesdb_txn_put(txn, d->data_cf, (uint8_t *)pk, strlen(pk) + 1, (uint8_t *)row_val,
+                        strlen(row_val) + 1, 0);
+        tidesdb_txn_put(txn, d->idx_cf, (uint8_t *)idx_key, strlen(idx_key) + 1, (uint8_t *)"\x00",
+                        1, 0);
 
         /* interleave deletes */
         if (i % 11 == 0 && i > 0)
         {
             char old_pk[64], old_idx[128];
-            snprintf(old_pk, sizeof(old_pk), "\x01pk_%04d_%04d",
+            snprintf(old_pk, sizeof(old_pk), "\x01pk_%04d_%04d", d->thread_id, (i - 5) % 100);
+            snprintf(old_idx, sizeof(old_idx), "\x01idx_v%04d_pk_%04d_%04d", (i - 5) % 50,
                      d->thread_id, (i - 5) % 100);
-            snprintf(old_idx, sizeof(old_idx), "\x01idx_v%04d_pk_%04d_%04d",
-                     (i - 5) % 50, d->thread_id, (i - 5) % 100);
             tidesdb_txn_delete(txn, d->data_cf, (uint8_t *)old_pk, strlen(old_pk) + 1);
             tidesdb_txn_delete(txn, d->idx_cf, (uint8_t *)old_idx, strlen(old_idx) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) != 0)
-            atomic_fetch_add(d->errors, 1);
+        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -21455,7 +21460,9 @@ static void *multi_cf_writer_thread(void *arg)
 static void *multi_cf_reader_thread(void *arg)
 {
     multi_cf_thread_data_t *d = (multi_cf_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -21538,8 +21545,8 @@ static void test_concurrent_multi_cf_put_delete_iterate(void)
     }
     for (int i = 0; i < NUM_READERS; i++)
     {
-        r_data[i] = (multi_cf_thread_data_t){db, data_cf, idx_cf, 10 + i, OPS * 2,
-                                              &errors, &go, &stop};
+        r_data[i] =
+            (multi_cf_thread_data_t){db, data_cf, idx_cf, 10 + i, OPS * 2, &errors, &go, &stop};
         pthread_create(&readers[i], NULL, multi_cf_reader_thread, &r_data[i]);
     }
 
@@ -21579,8 +21586,9 @@ static void test_iterator_reuse_seek_patterns(void)
         char key[64], value[128];
         snprintf(key, sizeof(key), "reuse_key_%06d", i);
         snprintf(value, sizeof(value), "reuse_value_%06d", i);
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                                  (uint8_t *)value, strlen(value) + 1, 0), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
     }
@@ -21682,8 +21690,9 @@ static void test_concurrent_savepoint_rollback_under_load(void)
         char key[64], value[64];
         snprintf(key, sizeof(key), "sp_key_%04d", i);
         snprintf(value, sizeof(value), "sp_val_%04d", i);
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                                  (uint8_t *)value, strlen(value) + 1, 0), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
     }
@@ -21703,8 +21712,9 @@ static void test_concurrent_savepoint_rollback_under_load(void)
         char key[64], value[64];
         snprintf(key, sizeof(key), "sp_round_%04d_s1", round);
         snprintf(value, sizeof(value), "val_%04d_s1", round);
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                                  (uint8_t *)value, strlen(value) + 1, 0), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
 
         tidesdb_txn_release_savepoint(txn, "stmt");
 
@@ -21714,8 +21724,8 @@ static void test_concurrent_savepoint_rollback_under_load(void)
 
         snprintf(key, sizeof(key), "sp_round_%04d_SHOULD_NOT_EXIST", round);
         snprintf(value, sizeof(value), "rollback_me");
-        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                        (uint8_t *)value, strlen(value) + 1, 0);
+        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                        strlen(value) + 1, 0);
 
         /* simulate statement failure -- rollback to savepoint */
         int rb_rc = tidesdb_txn_rollback_to_savepoint(txn, "stmt");
@@ -21726,8 +21736,8 @@ static void test_concurrent_savepoint_rollback_under_load(void)
 
         snprintf(key, sizeof(key), "sp_round_%04d_s3", round);
         snprintf(value, sizeof(value), "val_%04d_s3", round);
-        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                        (uint8_t *)value, strlen(value) + 1, 0);
+        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                        strlen(value) + 1, 0);
 
         tidesdb_txn_release_savepoint(txn, "stmt");
 
@@ -21736,8 +21746,8 @@ static void test_concurrent_savepoint_rollback_under_load(void)
         tidesdb_txn_free(txn);
     }
 
-    printf("  savepoint/rollback: %d savepoints, %d rollbacks, %d commits\n",
-           savepoint_ok, rollback_ok, commit_ok);
+    printf("  savepoint/rollback: %d savepoints, %d rollbacks, %d commits\n", savepoint_ok,
+           rollback_ok, commit_ok);
     ASSERT_EQ(commit_ok, 200);
 
     /* s1 and s3 keys should exist, SHOULD_NOT_EXIST keys should not */
@@ -21776,8 +21786,8 @@ static void test_concurrent_savepoint_rollback_under_load(void)
     }
     tidesdb_txn_free(vtxn);
 
-    printf("  verification: s1=%d/200, s3=%d/200, bad=%d (should be 0)\n",
-           found_s1, found_s3, found_bad);
+    printf("  verification: s1=%d/200, s3=%d/200, bad=%d (should be 0)\n", found_s1, found_s3,
+           found_bad);
     ASSERT_EQ(found_s1, 200);
     ASSERT_EQ(found_s3, 200);
     ASSERT_EQ(found_bad, 0);
@@ -21817,9 +21827,10 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
             memset(value, 'A' + (batch % 26), sizeof(value));
             snprintf(value, sizeof(value), "ddir_batch%d_idx%d_padding_to_fill_block_", batch, i);
             size_t vlen = strlen(value) + 1;
-            if (vlen < 128) vlen = 128; 
-            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                                      (uint8_t *)value, vlen, 0), 0);
+            if (vlen < 128) vlen = 128;
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      vlen, 0),
+                      0);
             ASSERT_EQ(tidesdb_txn_commit(txn), 0);
             tidesdb_txn_free(txn);
         }
@@ -21831,7 +21842,6 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
             usleep(20000);
         }
 
-  
         tidesdb_compact(cf);
         for (int w = 0; w < 200; w++)
         {
@@ -21853,8 +21863,8 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
             total_ssts += n;
         }
     }
-    printf("  deep SST seed: %d levels, %d total SSTables, %d levels with data\n",
-           num_levels, total_ssts, levels_with_ssts);
+    printf("  deep SST seed: %d levels, %d total SSTables, %d levels with data\n", num_levels,
+           total_ssts, levels_with_ssts);
     ASSERT_TRUE(total_ssts >= 2);
 
     /* we run a concurrent seek stress with data on disk across levels */
@@ -21921,7 +21931,9 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
 static void *deep_sst_compactor_thread(void *arg)
 {
     multi_cf_thread_data_t *d = (multi_cf_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -21967,20 +21979,20 @@ static void test_concurrent_multi_cf_deep_sst_mixed_ops(void)
             snprintf(idx_key, sizeof(idx_key), "\x01didx_v%04d_pk_%06d", i % 50, key_idx);
 
             ASSERT_EQ(tidesdb_txn_put(txn, data_cf, (uint8_t *)pk, strlen(pk) + 1,
-                                      (uint8_t *)row_val, strlen(row_val) + 1, 0), 0);
+                                      (uint8_t *)row_val, strlen(row_val) + 1, 0),
+                      0);
             ASSERT_EQ(tidesdb_txn_put(txn, idx_cf, (uint8_t *)idx_key, strlen(idx_key) + 1,
-                                      (uint8_t *)"\x00", 1, 0), 0);
+                                      (uint8_t *)"\x00", 1, 0),
+                      0);
             ASSERT_EQ(tidesdb_txn_commit(txn), 0);
             tidesdb_txn_free(txn);
         }
 
-       
         tidesdb_flush_memtable(data_cf);
         tidesdb_flush_memtable(idx_cf);
         for (int w = 0; w < 200; w++)
         {
-            int done = !atomic_load(&data_cf->is_flushing) &&
-                       !atomic_load(&idx_cf->is_flushing) &&
+            int done = !atomic_load(&data_cf->is_flushing) && !atomic_load(&idx_cf->is_flushing) &&
                        queue_size(db->flush_queue) == 0;
             if (done) break;
             usleep(20000);
@@ -21991,8 +22003,7 @@ static void test_concurrent_multi_cf_deep_sst_mixed_ops(void)
         tidesdb_compact(idx_cf);
         for (int w = 0; w < 200; w++)
         {
-            if (!atomic_load(&data_cf->is_compacting) &&
-                !atomic_load(&idx_cf->is_compacting))
+            if (!atomic_load(&data_cf->is_compacting) && !atomic_load(&idx_cf->is_compacting))
                 break;
             usleep(20000);
         }
@@ -22031,20 +22042,19 @@ static void test_concurrent_multi_cf_deep_sst_mixed_ops(void)
 
     for (int i = 0; i < NUM_WRITERS; i++)
     {
-        w_data[i] = (multi_cf_thread_data_t){db, data_cf, idx_cf, i, W_OPS,
-                                              &errors, &go, &stop};
+        w_data[i] = (multi_cf_thread_data_t){db, data_cf, idx_cf, i, W_OPS, &errors, &go, &stop};
         pthread_create(&writers[i], NULL, multi_cf_writer_thread, &w_data[i]);
     }
     for (int i = 0; i < NUM_READERS; i++)
     {
-        r_data[i] = (multi_cf_thread_data_t){db, data_cf, idx_cf, 10 + i, R_OPS,
-                                              &errors, &go, &stop};
+        r_data[i] =
+            (multi_cf_thread_data_t){db, data_cf, idx_cf, 10 + i, R_OPS, &errors, &go, &stop};
         pthread_create(&readers[i], NULL, multi_cf_reader_thread, &r_data[i]);
     }
     for (int i = 0; i < NUM_COMPACTORS; i++)
     {
-        c_data[i] = (multi_cf_thread_data_t){db, data_cf, idx_cf, 30 + i, C_OPS,
-                                              &errors, &go, &stop};
+        c_data[i] =
+            (multi_cf_thread_data_t){db, data_cf, idx_cf, 30 + i, C_OPS, &errors, &go, &stop};
         pthread_create(&compactors[i], NULL, deep_sst_compactor_thread, &c_data[i]);
     }
 
@@ -22097,7 +22107,9 @@ typedef struct
 static void *mcf_sat_writer_thread(void *arg)
 {
     mcf_sat_thread_data_t *d = (mcf_sat_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22108,11 +22120,10 @@ static void *mcf_sat_writer_thread(void *arg)
         snprintf(key, sizeof(key), "sat_t%d_%06d", d->thread_id, i);
         snprintf(val, sizeof(val), "val_t%d_%06d_pad%0*d", d->thread_id, i, 60, 0);
 
-        tidesdb_txn_put(txn, d->cf, (uint8_t *)key, strlen(key) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) != 0)
-            atomic_fetch_add(d->errors, 1);
+        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -22151,8 +22162,7 @@ static void test_multi_cf_flush_queue_saturation(void)
         for (int w = 0; w < WRITERS_PER_CF; w++)
         {
             int idx = c * WRITERS_PER_CF + w;
-            tdata[idx] = (mcf_sat_thread_data_t){db, cfs[c], c * 10 + w, OPS,
-                                                  &errors, &go, &stop};
+            tdata[idx] = (mcf_sat_thread_data_t){db, cfs[c], c * 10 + w, OPS, &errors, &go, &stop};
             pthread_create(&threads[idx], NULL, mcf_sat_writer_thread, &tdata[idx]);
         }
     }
@@ -22179,8 +22189,7 @@ static void test_multi_cf_flush_queue_saturation(void)
                 snprintf(key, sizeof(key), "sat_t%d_%06d", tid, i);
                 uint8_t *val = NULL;
                 size_t vs = 0;
-                if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1,
-                                    &val, &vs) == 0)
+                if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
                 {
                     found++;
                     free(val);
@@ -22213,7 +22222,9 @@ typedef struct
 static void *mcf_atom_writer_thread(void *arg)
 {
     mcf_atom_thread_data_t *d = (mcf_atom_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22229,10 +22240,10 @@ static void *mcf_atom_writer_thread(void *arg)
         snprintf(key_b, sizeof(key_b), "atom_b_t%d_%06d", d->thread_id, i);
         snprintf(val, sizeof(val), "xval_t%d_%06d_pad%0*d", d->thread_id, i, 50, 0);
 
-        tidesdb_txn_put(txn, d->cf_a, (uint8_t *)key_a, strlen(key_a) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
-        tidesdb_txn_put(txn, d->cf_b, (uint8_t *)key_b, strlen(key_b) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->cf_a, (uint8_t *)key_a, strlen(key_a) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->cf_b, (uint8_t *)key_b, strlen(key_b) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
 
         if (tidesdb_txn_commit(txn) == 0)
             atomic_fetch_add(d->committed, 1);
@@ -22246,7 +22257,9 @@ static void *mcf_atom_writer_thread(void *arg)
 static void *mcf_atom_compactor_thread(void *arg)
 {
     mcf_atom_thread_data_t *d = (mcf_atom_thread_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22286,14 +22299,14 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
 
     for (int i = 0; i < NUM_WRITERS; i++)
     {
-        w_data[i] = (mcf_atom_thread_data_t){db, cf_a, cf_b, i, W_OPS,
-                                               &committed, &errors, &go, &stop};
+        w_data[i] =
+            (mcf_atom_thread_data_t){db, cf_a, cf_b, i, W_OPS, &committed, &errors, &go, &stop};
         pthread_create(&writers[i], NULL, mcf_atom_writer_thread, &w_data[i]);
     }
     for (int i = 0; i < NUM_COMPACTORS; i++)
     {
-        c_data[i] = (mcf_atom_thread_data_t){db, cf_a, cf_b, 50 + i, C_OPS,
-                                               &committed, &errors, &go, &stop};
+        c_data[i] = (mcf_atom_thread_data_t){db,         cf_a,    cf_b, 50 + i, C_OPS,
+                                             &committed, &errors, &go,  &stop};
         pthread_create(&compactors[i], NULL, mcf_atom_compactor_thread, &c_data[i]);
     }
 
@@ -22321,21 +22334,23 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
 
             uint8_t *va = NULL, *vb = NULL;
             size_t sa = 0, sb = 0;
-            int got_a = tidesdb_txn_get(vtxn, cf_a, (uint8_t *)key_a, strlen(key_a) + 1,
-                                        &va, &sa) == 0;
-            int got_b = tidesdb_txn_get(vtxn, cf_b, (uint8_t *)key_b, strlen(key_b) + 1,
-                                        &vb, &sb) == 0;
+            int got_a =
+                tidesdb_txn_get(vtxn, cf_a, (uint8_t *)key_a, strlen(key_a) + 1, &va, &sa) == 0;
+            int got_b =
+                tidesdb_txn_get(vtxn, cf_b, (uint8_t *)key_b, strlen(key_b) + 1, &vb, &sb) == 0;
             if (va) free(va);
             if (vb) free(vb);
 
-            if (got_a && got_b) both_present++;
-            else if (got_a && !got_b) only_a++;
-            else if (!got_a && got_b) only_b++;
+            if (got_a && got_b)
+                both_present++;
+            else if (got_a && !got_b)
+                only_a++;
+            else if (!got_a && got_b)
+                only_b++;
         }
     }
     tidesdb_txn_free(vtxn);
-    printf("  atomicity check: both=%d only_a=%d only_b=%d\n",
-           both_present, only_a, only_b);
+    printf("  atomicity check: both=%d only_a=%d only_b=%d\n", both_present, only_a, only_b);
     ASSERT_EQ(only_a, 0);
     ASSERT_EQ(only_b, 0);
     ASSERT_EQ(both_present, final_committed);
@@ -22359,7 +22374,9 @@ typedef struct
 static void *mcf_iter_mut_iterator_thread(void *arg)
 {
     mcf_iter_mut_data_t *d = (mcf_iter_mut_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22410,7 +22427,9 @@ static void *mcf_iter_mut_iterator_thread(void *arg)
 static void *mcf_iter_mut_writer_thread(void *arg)
 {
     mcf_iter_mut_data_t *d = (mcf_iter_mut_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22424,11 +22443,10 @@ static void *mcf_iter_mut_writer_thread(void *arg)
         snprintf(key, sizeof(key), "lm_key_%06d", (d->thread_id * 1000 + i) % 200);
         snprintf(val, sizeof(val), "lm_val_%06d_pad%0*d", i, 60, 0);
 
-        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val, strlen(val) + 1,
+                        0);
 
-        if (tidesdb_txn_commit(txn) != 0)
-            atomic_fetch_add(d->errors, 1);
+        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -22437,7 +22455,9 @@ static void *mcf_iter_mut_writer_thread(void *arg)
 static void *mcf_iter_mut_flusher_thread(void *arg)
 {
     mcf_iter_mut_data_t *d = (mcf_iter_mut_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22451,7 +22471,9 @@ static void *mcf_iter_mut_flusher_thread(void *arg)
 static void *mcf_iter_mut_compactor_thread(void *arg)
 {
     mcf_iter_mut_data_t *d = (mcf_iter_mut_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22494,8 +22516,8 @@ static void test_multi_cf_iterator_during_level_mutation(void)
             char key[64], val[128];
             snprintf(key, sizeof(key), "lm_key_%06d", i);
             snprintf(val, sizeof(val), "seed_cf%d_%06d_pad%0*d", c, i, 60, 0);
-            tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1,
-                            (uint8_t *)val, strlen(val) + 1, 0);
+            tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                            strlen(val) + 1, 0);
             ASSERT_EQ(tidesdb_txn_commit(txn), 0);
             tidesdb_txn_free(txn);
         }
@@ -22507,8 +22529,7 @@ static void test_multi_cf_iterator_during_level_mutation(void)
         int busy = 0;
         for (int c = 0; c < NUM_CFS; c++)
         {
-            if (atomic_load(&cfs[c]->is_flushing) || queue_size(db->flush_queue) > 0)
-                busy = 1;
+            if (atomic_load(&cfs[c]->is_flushing) || queue_size(db->flush_queue) > 0) busy = 1;
         }
         if (!busy) break;
         usleep(20000);
@@ -22526,26 +22547,22 @@ static void test_multi_cf_iterator_during_level_mutation(void)
 
     for (int i = 0; i < NUM_ITERATORS; i++)
     {
-        i_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, i, 600,
-                                            &errors, &go, &stop};
+        i_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, i, 600, &errors, &go, &stop};
         pthread_create(&iter_threads[i], NULL, mcf_iter_mut_iterator_thread, &i_data[i]);
     }
     for (int i = 0; i < NUM_WRITERS; i++)
     {
-        w_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, 10 + i, 800,
-                                            &errors, &go, &stop};
+        w_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, 10 + i, 800, &errors, &go, &stop};
         pthread_create(&writer_threads[i], NULL, mcf_iter_mut_writer_thread, &w_data[i]);
     }
     for (int i = 0; i < NUM_FLUSHERS; i++)
     {
-        f_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, 20 + i, 40,
-                                            &errors, &go, &stop};
+        f_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, 20 + i, 40, &errors, &go, &stop};
         pthread_create(&flusher_threads[i], NULL, mcf_iter_mut_flusher_thread, &f_data[i]);
     }
     for (int i = 0; i < NUM_COMPACTORS; i++)
     {
-        c_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, 30 + i, 30,
-                                            &errors, &go, &stop};
+        c_data[i] = (mcf_iter_mut_data_t){db, cfs, NUM_CFS, 30 + i, 30, &errors, &go, &stop};
         pthread_create(&compactor_threads[i], NULL, mcf_iter_mut_compactor_thread, &c_data[i]);
     }
 
@@ -22619,8 +22636,7 @@ static void test_multi_cf_cascading_memory_pressure(void)
             snprintf(key, sizeof(key), "sat_t%d_%06d", c, i);
             uint8_t *val = NULL;
             size_t vs = 0;
-            if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1,
-                                &val, &vs) == 0)
+            if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
             {
                 found++;
                 free(val);
@@ -22650,7 +22666,9 @@ typedef struct
 static void *mcf_churn_writer_thread(void *arg)
 {
     mcf_churn_data_t *d = (mcf_churn_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22662,13 +22680,12 @@ static void *mcf_churn_writer_thread(void *arg)
         snprintf(key_b, sizeof(key_b), "churn_b_t%d_%06d", d->thread_id, i);
         snprintf(val, sizeof(val), "churn_val_%d_%d_pad%0*d", d->thread_id, i, 40, 0);
 
-        tidesdb_txn_put(txn, d->stable_a, (uint8_t *)key_a, strlen(key_a) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
-        tidesdb_txn_put(txn, d->stable_b, (uint8_t *)key_b, strlen(key_b) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->stable_a, (uint8_t *)key_a, strlen(key_a) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->stable_b, (uint8_t *)key_b, strlen(key_b) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) != 0)
-            atomic_fetch_add(d->errors, 1);
+        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -22677,7 +22694,9 @@ static void *mcf_churn_writer_thread(void *arg)
 static void *mcf_churn_lifecycle_thread(void *arg)
 {
     mcf_churn_data_t *d = (mcf_churn_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
     cfg.write_buffer_size = 1024;
@@ -22698,8 +22717,8 @@ static void *mcf_churn_lifecycle_thread(void *arg)
                 {
                     char key[64];
                     snprintf(key, sizeof(key), "eph_key_%d", i);
-                    tidesdb_txn_put(txn, ecf, (uint8_t *)key, strlen(key) + 1,
-                                    (uint8_t *)"eph", 4, 0);
+                    tidesdb_txn_put(txn, ecf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)"eph", 4,
+                                    0);
                     tidesdb_txn_commit(txn);
                     tidesdb_txn_free(txn);
                 }
@@ -22740,14 +22759,12 @@ static void test_multi_cf_create_drop_churn_under_load(void)
 
     for (int i = 0; i < NUM_WRITERS; i++)
     {
-        w_data[i] = (mcf_churn_data_t){db, stable_a, stable_b, i, W_OPS,
-                                         &errors, &go, &stop};
+        w_data[i] = (mcf_churn_data_t){db, stable_a, stable_b, i, W_OPS, &errors, &go, &stop};
         pthread_create(&writers[i], NULL, mcf_churn_writer_thread, &w_data[i]);
     }
     for (int i = 0; i < NUM_CHURNERS; i++)
     {
-        c_data[i] = (mcf_churn_data_t){db, stable_a, stable_b, 10 + i, C_OPS,
-                                         &errors, &go, &stop};
+        c_data[i] = (mcf_churn_data_t){db, stable_a, stable_b, 10 + i, C_OPS, &errors, &go, &stop};
         pthread_create(&churners[i], NULL, mcf_churn_lifecycle_thread, &c_data[i]);
     }
 
@@ -22773,14 +22790,12 @@ static void test_multi_cf_create_drop_churn_under_load(void)
             snprintf(kb, sizeof(kb), "churn_b_t%d_%06d", t, i);
             uint8_t *va = NULL, *vb = NULL;
             size_t sa = 0, sb = 0;
-            if (tidesdb_txn_get(vtxn, stable_a, (uint8_t *)ka, strlen(ka) + 1,
-                                &va, &sa) == 0)
+            if (tidesdb_txn_get(vtxn, stable_a, (uint8_t *)ka, strlen(ka) + 1, &va, &sa) == 0)
             {
                 found_a++;
                 free(va);
             }
-            if (tidesdb_txn_get(vtxn, stable_b, (uint8_t *)kb, strlen(kb) + 1,
-                                &vb, &sb) == 0)
+            if (tidesdb_txn_get(vtxn, stable_b, (uint8_t *)kb, strlen(kb) + 1, &vb, &sb) == 0)
             {
                 found_b++;
                 free(vb);
@@ -22813,7 +22828,9 @@ typedef struct
 static void *mcf_iso_writer_thread(void *arg)
 {
     mcf_iso_data_t *d = (mcf_iso_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22825,13 +22842,12 @@ static void *mcf_iso_writer_thread(void *arg)
         snprintf(key_y, sizeof(key_y), "iso_y_t%d_%06d", d->thread_id, i);
         snprintf(val, sizeof(val), "iso_val_%d_%d_pad%0*d", d->thread_id, i, 40, 0);
 
-        tidesdb_txn_put(txn, d->cf_x, (uint8_t *)key_x, strlen(key_x) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
-        tidesdb_txn_put(txn, d->cf_y, (uint8_t *)key_y, strlen(key_y) + 1,
-                        (uint8_t *)val, strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->cf_x, (uint8_t *)key_x, strlen(key_x) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
+        tidesdb_txn_put(txn, d->cf_y, (uint8_t *)key_y, strlen(key_y) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) != 0)
-            atomic_fetch_add(d->errors, 1);
+        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -22840,7 +22856,9 @@ static void *mcf_iso_writer_thread(void *arg)
 static void *mcf_iso_reader_thread(void *arg)
 {
     mcf_iso_data_t *d = (mcf_iso_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22855,8 +22873,8 @@ static void *mcf_iso_reader_thread(void *arg)
         {
             char key[64];
             int t = (i + k) % 4;
-            snprintf(key, sizeof(key), "iso_%c_t%d_%06d",
-                     (cf == d->cf_x) ? 'x' : 'y', t, (i * 3 + k) % 300);
+            snprintf(key, sizeof(key), "iso_%c_t%d_%06d", (cf == d->cf_x) ? 'x' : 'y', t,
+                     (i * 3 + k) % 300);
             uint8_t *val = NULL;
             size_t vs = 0;
             if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
@@ -22895,7 +22913,9 @@ static void *mcf_iso_reader_thread(void *arg)
 static void *mcf_iso_flusher_thread(void *arg)
 {
     mcf_iso_data_t *d = (mcf_iso_data_t *)arg;
-    while (!atomic_load(d->go)) { /* spin */ }
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
 
     for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
     {
@@ -22928,8 +22948,8 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
     /* writer group -- SERIALIZABLE cross-CF txns */
     const int NUM_SER_WRITERS = 2;
     /* reader groups -- different isolation per CF */
-    const int NUM_RC_READERS = 2;   /* READ_COMMITTED on cf_x */
-    const int NUM_RR_READERS = 2;   /* REPEATABLE_READ on cf_y */
+    const int NUM_RC_READERS = 2; /* READ_COMMITTED on cf_x */
+    const int NUM_RR_READERS = 2; /* REPEATABLE_READ on cf_y */
     const int NUM_FLUSHERS = 2;
     const int W_OPS = 500;
     const int R_OPS = 600;
@@ -22940,30 +22960,26 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
 
     for (int i = 0; i < NUM_SER_WRITERS; i++)
     {
-        sw_data[i] = (mcf_iso_data_t){db, cf_x, cf_y, i, W_OPS,
-                                        TDB_ISOLATION_SERIALIZABLE,
-                                        &errors, &go, &stop};
+        sw_data[i] = (mcf_iso_data_t){db,      cf_x, cf_y, i, W_OPS, TDB_ISOLATION_SERIALIZABLE,
+                                      &errors, &go,  &stop};
         pthread_create(&ser_writers[i], NULL, mcf_iso_writer_thread, &sw_data[i]);
     }
     for (int i = 0; i < NUM_RC_READERS; i++)
     {
-        rc_data[i] = (mcf_iso_data_t){db, cf_x, cf_y, 10 + i * 2, R_OPS,
-                                        TDB_ISOLATION_READ_COMMITTED,
-                                        &errors, &go, &stop};
+        rc_data[i] = (mcf_iso_data_t){
+            db, cf_x, cf_y, 10 + i * 2, R_OPS, TDB_ISOLATION_READ_COMMITTED, &errors, &go, &stop};
         pthread_create(&rc_readers[i], NULL, mcf_iso_reader_thread, &rc_data[i]);
     }
     for (int i = 0; i < NUM_RR_READERS; i++)
     {
-        rr_data[i] = (mcf_iso_data_t){db, cf_x, cf_y, 11 + i * 2, R_OPS,
-                                        TDB_ISOLATION_REPEATABLE_READ,
-                                        &errors, &go, &stop};
+        rr_data[i] = (mcf_iso_data_t){
+            db, cf_x, cf_y, 11 + i * 2, R_OPS, TDB_ISOLATION_REPEATABLE_READ, &errors, &go, &stop};
         pthread_create(&rr_readers[i], NULL, mcf_iso_reader_thread, &rr_data[i]);
     }
     for (int i = 0; i < NUM_FLUSHERS; i++)
     {
-        f_data[i] = (mcf_iso_data_t){db, cf_x, cf_y, 30 + i, F_OPS,
-                                       TDB_ISOLATION_READ_UNCOMMITTED,
-                                       &errors, &go, &stop};
+        f_data[i] = (mcf_iso_data_t){
+            db, cf_x, cf_y, 30 + i, F_OPS, TDB_ISOLATION_READ_UNCOMMITTED, &errors, &go, &stop};
         pthread_create(&flushers[i], NULL, mcf_iso_flusher_thread, &f_data[i]);
     }
 
@@ -22992,10 +23008,8 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
             snprintf(ky, sizeof(ky), "iso_y_t%d_%06d", t, i);
             uint8_t *vx = NULL, *vy = NULL;
             size_t sx = 0, sy = 0;
-            int gx = tidesdb_txn_get(vtxn, cf_x, (uint8_t *)kx, strlen(kx) + 1,
-                                     &vx, &sx) == 0;
-            int gy = tidesdb_txn_get(vtxn, cf_y, (uint8_t *)ky, strlen(ky) + 1,
-                                     &vy, &sy) == 0;
+            int gx = tidesdb_txn_get(vtxn, cf_x, (uint8_t *)kx, strlen(kx) + 1, &vx, &sx) == 0;
+            int gy = tidesdb_txn_get(vtxn, cf_y, (uint8_t *)ky, strlen(ky) + 1, &vy, &sy) == 0;
             if (vx) free(vx);
             if (vy) free(vy);
             if (gx) found_x++;
@@ -23004,8 +23018,7 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
         }
     }
     tidesdb_txn_free(vtxn);
-    printf("  iso verification: cf_x=%d cf_y=%d mismatches=%d\n",
-           found_x, found_y, mismatch);
+    printf("  iso verification: cf_x=%d cf_y=%d mismatches=%d\n", found_x, found_y, mismatch);
     ASSERT_EQ(mismatch, 0);
     ASSERT_EQ(found_x, found_y);
 

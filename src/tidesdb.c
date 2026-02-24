@@ -3434,6 +3434,29 @@ static void tidesdb_immutable_memtable_ref(tidesdb_immutable_memtable_t *imm)
 }
 
 /**
+ * tidesdb_immutable_memtable_try_ref
+ * try to increment reference count using CAS -- fails if refcount is 0
+ * this prevents resurrecting an immutable whose cleanup has already been claimed
+ * @param imm immutable memtable to reference
+ * @return 1 if reference was acquired, 0 if refcount was 0 (claimed for cleanup)
+ */
+static int tidesdb_immutable_memtable_try_ref(tidesdb_immutable_memtable_t *imm)
+{
+    if (!imm) return 0;
+
+    int old = atomic_load_explicit(&imm->refcount, memory_order_acquire);
+    for (;;)
+    {
+        if (old <= 0) return 0;
+        if (atomic_compare_exchange_weak_explicit(&imm->refcount, &old, old + 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+        {
+            return 1;
+        }
+    }
+}
+
+/**
  * tidesdb_immutable_memtable_unref
  * decrement reference count of an immutable memtable
  * @param imm immutable memtable to unreference
@@ -3644,15 +3667,25 @@ static tidesdb_immutable_memtable_t **tidesdb_snapshot_immutable_memtables(
         return NULL;
     }
 
+    size_t valid = 0;
     for (size_t i = 0; i < count; i++)
     {
-        result[i] = (tidesdb_immutable_memtable_t *)snap->items[i];
-        tidesdb_immutable_memtable_ref(result[i]);
+        tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)snap->items[i];
+        if (tidesdb_immutable_memtable_try_ref(imm))
+        {
+            result[valid++] = imm;
+        }
     }
 
     tidesdb_imm_snap_release(snap);
 
-    if (out_count) *out_count = count;
+    if (valid == 0)
+    {
+        free(result);
+        return NULL;
+    }
+
+    if (out_count) *out_count = valid;
     return result;
 }
 
@@ -13713,8 +13746,7 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
         wait_count++;
         if (wait_count % 100 == 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "CF '%s' drop waiting for flush to complete (waited %d ms)",
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' drop waiting for flush to complete (waited %d ms)",
                           cf_to_drop->name, wait_count * (TDB_CLOSE_FLUSH_WAIT_SLEEP_US / 1000));
         }
     }
@@ -13728,10 +13760,9 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
         wait_count++;
         if (wait_count % 100 == 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "CF '%s' drop waiting for compaction to complete (waited %d ms)",
-                          cf_to_drop->name,
-                          wait_count * (TDB_COMPACTION_FLUSH_WAIT_SLEEP_US / 1000));
+            TDB_DEBUG_LOG(
+                TDB_LOG_INFO, "CF '%s' drop waiting for compaction to complete (waited %d ms)",
+                cf_to_drop->name, wait_count * (TDB_COMPACTION_FLUSH_WAIT_SLEEP_US / 1000));
         }
     }
 
@@ -15536,8 +15567,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         best_value = malloc(candidate_kv->entry.value_size);
                         if (best_value)
                         {
-                            memcpy(best_value, candidate_kv->value,
-                                   candidate_kv->entry.value_size);
+                            memcpy(best_value, candidate_kv->value, candidate_kv->entry.value_size);
                             best_value_size = candidate_kv->entry.value_size;
                         }
                     }
@@ -20784,8 +20814,8 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
             result = tidesdb_flush_memtable_internal(cf, 0, 1);
             if (result != TDB_SUCCESS && result != TDB_ERR_MEMORY)
             {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "Checkpoint: flush failed for CF '%s' (err=%d)", cf->name, result);
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: flush failed for CF '%s' (err=%d)",
+                              cf->name, result);
                 return result;
             }
 

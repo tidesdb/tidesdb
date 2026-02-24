@@ -392,7 +392,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_DB_COMPACTION_POOL_THREADS 2)
     endif()
     if(NOT DEFINED BENCH_DB_MAX_MEMORY)
-        math(EXPR BENCH_DB_MAX_MEMORY 0) # 0 defaults to 80% of system memory
+        math(EXPR BENCH_DB_MAX_MEMORY 0) # 0 defaults to 50% of system memory
     endif()
 
     # column family configuration variables for benchmark

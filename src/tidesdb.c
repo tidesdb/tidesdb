@@ -16140,28 +16140,18 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
         return TDB_SUCCESS;
     }
 
+    /* we hold rdlock for the entire iteration to prevent other threads from
+     * removing and freeing their transactions while we dereference them.
+     * removal from active list requires wrlock, so all pointers in the
+     * array remain valid while we hold rdlock. */
     pthread_rwlock_rdlock(&txn->db->active_txns_lock);
-    int snapshot_count = txn->db->num_active_txns;
-    tidesdb_txn_t **snapshot = NULL;
-
-    if (snapshot_count > 0)
-    {
-        snapshot = malloc(snapshot_count * sizeof(tidesdb_txn_t *));
-        if (snapshot)
-        {
-            memcpy(snapshot, txn->db->active_txns, snapshot_count * sizeof(tidesdb_txn_t *));
-        }
-        else
-        {
-            snapshot_count = 0;
-        }
-    }
-    pthread_rwlock_unlock(&txn->db->active_txns_lock);
+    const int count = txn->db->num_active_txns;
+    tidesdb_txn_t **active = txn->db->active_txns;
 
     /* we detect rw-conflicts */
-    for (int i = 0; i < snapshot_count; i++)
+    for (int i = 0; i < count; i++)
     {
-        tidesdb_txn_t *other = snapshot[i];
+        tidesdb_txn_t *other = active[i];
         if (other == txn || other->is_committed || other->is_aborted) continue;
 
         if (txn->read_set_hash && txn->read_set_count >= TDB_TXN_READ_HASH_THRESHOLD)
@@ -16199,25 +16189,20 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
     }
 
     /* we check for dangerous structures */
-    if (txn->has_rw_conflict_in && txn->has_rw_conflict_out)
-    {
-        free(snapshot);
-        tidesdb_txn_remove_from_active_list(txn);
-        return TDB_ERR_CONFLICT;
-    }
+    int conflict = (txn->has_rw_conflict_in && txn->has_rw_conflict_out);
 
-    if (txn->num_ops > 0)
+    if (!conflict && txn->num_ops > 0)
     {
-        for (int i = 0; i < snapshot_count; i++)
+        for (int i = 0; i < count && !conflict; i++)
         {
-            const tidesdb_txn_t *other = snapshot[i];
+            const tidesdb_txn_t *other = active[i];
             if (other == txn || other->is_committed || other->is_aborted ||
                 !other->has_rw_conflict_in || !other->has_rw_conflict_out)
             {
                 continue;
             }
 
-            for (int w = 0; w < txn->num_ops; w++)
+            for (int w = 0; w < txn->num_ops && !conflict; w++)
             {
                 const tidesdb_txn_op_t *op = &txn->ops[w];
                 for (int r = 0; r < other->read_set_count; r++)
@@ -16225,16 +16210,23 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
                     if (op->key_size == other->read_key_sizes[r] && op->cf == other->read_cfs[r] &&
                         memcmp(op->key, other->read_keys[r], op->key_size) == 0)
                     {
-                        free(snapshot);
-                        tidesdb_txn_remove_from_active_list(txn);
-                        return TDB_ERR_CONFLICT;
+                        conflict = 1;
+                        break;
                     }
                 }
             }
         }
     }
 
-    free(snapshot);
+    /* release rdlock before taking wrlock in remove_from_active_list */
+    pthread_rwlock_unlock(&txn->db->active_txns_lock);
+
+    if (conflict)
+    {
+        tidesdb_txn_remove_from_active_list(txn);
+        return TDB_ERR_CONFLICT;
+    }
+
     return TDB_SUCCESS;
 }
 

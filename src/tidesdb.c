@@ -14396,14 +14396,6 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         return TDB_SUCCESS;
     }
 
-    /* we swap active_memtable pointer -- new writers will use the new memtable
-     * no need to wait for old memtable refcount to drain here becase:
-     * -- old memtable becomes immutable and is enqueued for background flush
-     * -- refcount naturally drains as in-flight writers finish
-     * -- tidesdb_immutable_memtable_unref() handles cleanup when refcount hits 0 */
-    atomic_store_explicit(&cf->active_memtable, new_mt, memory_order_release);
-    atomic_thread_fence(memory_order_seq_cst);
-
     /* we reuse old_mt directly as the immutable memtable instead of allocating a new structure
      * this avoids a race condition where another thread still holds a pointer to old_mt
      * and tries to decrement its refcount after we free it
@@ -14412,9 +14404,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     if (!immutable)
     {
         /* no old memtable to flush -- this shouldnt happen but handle gracefully
-         * note -- new_mt is already stored as active_memtable, so we cannot free it here
-         * the new memtable will be cleaned up when the CF is freed */
+         * store new_mt as active before returning so the CF has a usable memtable */
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' no old memtable to flush", cf->name);
+        atomic_store_explicit(&cf->active_memtable, new_mt, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -14423,7 +14415,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
      * just reset flushed flag */
     atomic_store_explicit(&immutable->flushed, 0, memory_order_release);
 
-    /* enqueue immutable -- this should never fail but check anyway to prevent data loss */
+    /* we enqueue immutable and publish snapshot before swapping the active pointer.
+     * this eliminates a visibility gap where the old memtable is neither active nor in
+     * the immutable snapshot. readers seeing old_mt in both active and immutable is
+     * harmless because active is always checked first. old_mt has flushed=0, so the
+     * cleanup code will not free it while it is still the active memtable.
+     * is_flushing CAS ensures only one flush runs per CF at a time. */
     if (queue_enqueue(cf->immutable_memtables, immutable) != 0)
     {
         TDB_DEBUG_LOG(
@@ -14440,6 +14437,16 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     }
 
     (void)tidesdb_imm_snap_publish(cf);
+
+    /* we swap active_memtable pointer AFTER publishing the immutable snapshot.
+     * new writers will use the new memtable. the old memtable is already visible
+     * in the immutable snapshot, so readers will always find committed data.
+     * no need to wait for old memtable refcount to drain here because:
+     * -- old memtable is now immutable and enqueued for background flush
+     * -- refcount naturally drains as in-flight writers finish
+     * -- tidesdb_immutable_memtable_unref() handles cleanup when refcount hits 0 */
+    atomic_store_explicit(&cf->active_memtable, new_mt, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO,
                   "CF '%s' memtable swapped, allocating flush work for SSTable %" PRIu64, cf->name,

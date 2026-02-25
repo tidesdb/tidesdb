@@ -48,6 +48,15 @@ extern FILE *_tidesdb_log_file;      /* log file pointer (NULL = stderr, non-NUL
 extern size_t _tidesdb_log_truncate; /* truncate log file at this size (0 = no truncation) */
 extern char _tidesdb_log_path[MAX_FILE_PATH_LENGTH]; /* path to log file for truncation */
 
+/**
+ * tidesdb_log_write
+ * writes a log message to the configured log output (stderr or log file)
+ * @param level log level (TDB_LOG_DEBUG, TDB_LOG_INFO, TDB_LOG_WARN, TDB_LOG_ERROR, TDB_LOG_FATAL)
+ * @param file source file name (typically __FILE__)
+ * @param line source line number (typically __LINE__)
+ * @param fmt printf-style format string
+ * @param ... format arguments
+ */
 void tidesdb_log_write(int level, const char *file, int line, const char *fmt, ...);
 
 #define TDB_DEBUG_LOG(level, fmt, ...)                                           \
@@ -126,6 +135,22 @@ typedef enum
 #define TDB_ERR_LOCKED       -12
 
 #ifdef TDB_ENABLE_READ_PROFILING
+/**
+ * tidesdb_read_stats_t
+ * read profiling statistics (only available when TDB_ENABLE_READ_PROFILING is defined)
+ * @param total_reads total number of read operations
+ * @param memtable_hits reads satisfied from active memtable
+ * @param immutable_hits reads satisfied from immutable memtables
+ * @param sstable_hits reads satisfied from sstables on disk
+ * @param levels_searched total levels searched across all reads
+ * @param sstables_checked total sstables checked across all reads
+ * @param bloom_checks total bloom filter checks performed
+ * @param bloom_hits bloom filter checks that returned positive
+ * @param blocks_read total klog blocks read from disk or cache
+ * @param cache_block_hits block reads satisfied from block cache
+ * @param cache_block_misses block reads that missed the cache
+ * @param disk_reads total raw disk reads performed
+ */
 typedef struct
 {
     _Atomic(uint64_t) total_reads;
@@ -190,6 +215,12 @@ typedef enum
 /**
  * tidesdb_comparator_fn
  * comparator function type for custom key ordering
+ * @param key1 first key to compare
+ * @param key1_size size of first key in bytes
+ * @param key2 second key to compare
+ * @param key2_size size of second key in bytes
+ * @param ctx user-provided context pointer
+ * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                      size_t key2_size, void *ctx);
@@ -197,6 +228,12 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 /**
  * tidesdb_commit_op_t
  * represents a single operation in a committed transaction batch
+ * @param key pointer to the key data
+ * @param key_size size of the key in bytes
+ * @param value pointer to the value data (NULL for deletes)
+ * @param value_size size of the value in bytes (0 for deletes)
+ * @param ttl time-to-live in seconds (0 = no expiration)
+ * @param is_delete 1 if this is a delete operation, 0 for put
  */
 typedef struct tidesdb_commit_op_t
 {
@@ -211,6 +248,10 @@ typedef struct tidesdb_commit_op_t
 /**
  * tidesdb_commit_hook_fn
  * callback invoked synchronously after a transaction commits to a column family
+ * @param ops array of commit operations
+ * @param num_ops number of operations in the array
+ * @param commit_seq commit sequence number
+ * @param ctx user-provided context
  */
 typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_ops,
                                       uint64_t commit_seq, void *ctx);
@@ -234,13 +275,18 @@ typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 
 /* lock-free immutable memtable snapshot slot
  * part of a double-buffered RCU scheme: writers build in inactive slot,
- * swap the active index, then wait for old-slot readers to drain */
+ * swap the active index, then wait for old-slot readers to drain
+ * @param items array of immutable memtables
+ * @param count number of items in the array
+ * @param readers number of active readers on this slot
+ */
 typedef struct
 {
     tidesdb_memtable_t *items[TDB_IMM_SNAP_MAX_ITEMS];
     _Atomic(size_t) count;
-    _Atomic(int32_t) readers; /* active reader count on this slot */
+    _Atomic(int32_t) readers;
 } tidesdb_imm_snap_t;
+
 typedef struct tidesdb_txn_t tidesdb_txn_t;
 typedef struct tidesdb_iter_t tidesdb_iter_t;
 typedef struct tidesdb_stats_t tidesdb_stats_t;
@@ -390,6 +436,8 @@ struct tidesdb_memtable_t
  * @param marked_for_deletion flag indicating column family is marked for deletion
  * @param manifest manifest for column family
  * @param db parent database reference
+ * @param imm_snaps double-buffered lock-free immutable memtable snapshot slots
+ * @param imm_snap_active index (0 or 1) of the currently active snapshot slot
  */
 struct tidesdb_column_family_t
 {
@@ -567,6 +615,7 @@ struct tidesdb_level_t
  * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param cf_list_lock rwlock for cf list modifications
+ * @param deferred_free_list lock-free singly-linked list of deferred free nodes for retired arrays
  * @param lock_fd file descriptor for lock file
  * @param log_file file descriptor for log file
  * @param read_stats read profiling statistics (only when TDB_ENABLE_READ_PROFILING is defined)

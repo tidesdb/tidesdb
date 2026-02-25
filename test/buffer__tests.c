@@ -1076,7 +1076,6 @@ void test_buffer_null_safety_extended(void)
     ASSERT_EQ(buffer_new(&buffer, 5), 0);
 
     uint32_t id;
-    void *data;
     uint64_t gen;
 
     /* buffer_try_acquire with NULL buffer */

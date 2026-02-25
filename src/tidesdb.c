@@ -1290,14 +1290,18 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
     tidesdb_ref_counted_block_t *rc_block;
     memcpy(&rc_block, payload, sizeof(rc_block));
 
-    clock_cache_release(cache_entry);
-
     if (!rc_block || !rc_block->block)
     {
+        clock_cache_release(cache_entry);
         return NULL;
     }
 
+    /* we acquire block ref BEFORE releasing cache entry reader ref.
+     * this prevents another thread from evicting and freeing rc_block
+     * between our release and acquire (use-after-free race). */
     tidesdb_block_acquire(rc_block);
+
+    clock_cache_release(cache_entry);
 
     *rc_block_out = rc_block;
 

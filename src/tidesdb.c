@@ -203,8 +203,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
 /* thread name prefix for all tidesdb background threads (15 char limit on posix) */
-#define TDB_THREAD_PREFIX         "tdb."
-#define TDB_THREAD_NAME_LEN_LIMIT 16
+#define TDB_THREAD_PREFIX   "tdb."
+#define TDB_THREAD_NAME_LEN 16
 
 /* sstable reaper thread configuration */
 #define TDB_SSTABLE_REAPER_SLEEP_US    100000

@@ -202,12 +202,15 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS             10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
-/* thread name prefix for all tidesdb background threads (15 char limit on Linux) */
-#define TDB_THREAD_PREFIX "tdb."
+/* thread name prefix for all tidesdb background threads (15 char limit on posix) */
+#define TDB_THREAD_PREFIX         "tdb."
+#define TDB_THREAD_NAME_LEN_LIMIT 16
 
 /* sstable reaper thread configuration */
 #define TDB_SSTABLE_REAPER_SLEEP_US    100000
 #define TDB_SSTABLE_REAPER_EVICT_RATIO 0.25
+
+#define TDB_WAL_STACK_BUFFER_SIZE 512
 
 /* deferred free configuration for retired sstable arrays
  * when a level's sstable array is swapped (flush/compaction), the old array cannot be freed
@@ -10936,7 +10939,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
 {
     tidesdb_worker_thread_arg_t *targ = (tidesdb_worker_thread_arg_t *)arg;
     tidesdb_t *db = targ->db;
-    char tname[16]; /* linux limit is 15 chars + null */
+    char tname[TDB_THREAD_NAME_LEN];
     snprintf(tname, sizeof(tname), TDB_THREAD_PREFIX "flush.%d", targ->index);
     tdb_set_thread_name(tname);
     free(targ);
@@ -11413,7 +11416,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 {
     tidesdb_worker_thread_arg_t *targ = (tidesdb_worker_thread_arg_t *)arg;
     tidesdb_t *db = targ->db;
-    char tname[16];
+    char tname[TDB_THREAD_NAME_LEN];
     snprintf(tname, sizeof(tname), TDB_THREAD_PREFIX "compact.%d", targ->index);
     tdb_set_thread_name(tname);
     free(targ);
@@ -16684,7 +16687,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         cf_skiplists[cf_idx] = mt ? mt->skip_list : NULL;
 
         /* stack buffer for small WAL payloads -- avoids malloc/free per txn */
-        uint8_t wal_stack_buf[512];
+        uint8_t wal_stack_buf[TDB_WAL_STACK_BUFFER_SIZE];
         size_t wal_size = 0;
         uint8_t *wal_batch =
             tidesdb_txn_serialize_wal(txn, cf, &wal_size, wal_stack_buf, sizeof(wal_stack_buf));

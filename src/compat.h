@@ -1841,7 +1841,8 @@ static inline size_t get_available_memory(void)
     if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
         host_statistics(mach_port, HOST_VM_INFO, (host_info_t)&vm_stats, &count) == KERN_SUCCESS)
     {
-        return (size_t)(vm_stats.free_count * page_size);
+        return (size_t)((vm_stats.free_count + vm_stats.inactive_count + vm_stats.purgeable_count) *
+                        page_size);
     }
 #else
     /* try 64-bit first (macOS 10.6+ on x86/x86_64/ARM), fall back to 32-bit */
@@ -1851,7 +1852,9 @@ static inline size_t get_available_memory(void)
         host_statistics64(mach_port, HOST_VM_INFO, (host_info64_t)&vm_stats64, &count) ==
             KERN_SUCCESS)
     {
-        return (size_t)(vm_stats64.free_count * page_size);
+        return (size_t)((vm_stats64.free_count + vm_stats64.inactive_count +
+                         vm_stats64.purgeable_count) *
+                        page_size);
     }
     else
     {
@@ -1862,17 +1865,43 @@ static inline size_t get_available_memory(void)
             host_statistics(mach_port, HOST_VM_INFO, (host_info_t)&vm_stats, &count) ==
                 KERN_SUCCESS)
         {
-            return (size_t)(vm_stats.free_count * page_size);
+            return (
+                size_t)((vm_stats.free_count + vm_stats.inactive_count + vm_stats.purgeable_count) *
+                        page_size);
         }
     }
 #endif
     return 0;
 #elif defined(__linux__)
-    /* linux-specific sysinfo */
-    struct sysinfo si;
-    if (sysinfo(&si) == 0)
+    /* prefer /proc/meminfo MemAvailable -- the kernel's own estimate of memory
+     * available for new allocations without swapping (includes free + reclaimable
+     * buffers/cache + reclaimable slab). sysinfo.freeram only reports truly free
+     * pages which is typically very low on a busy system and triggers false
+     * critical memory pressure */
     {
-        return (size_t)si.freeram * (size_t)si.mem_unit;
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (f)
+        {
+            char line[256];
+            while (fgets(line, sizeof(line), f))
+            {
+                unsigned long long val;
+                if (sscanf(line, "MemAvailable: %llu kB", &val) == 1)
+                {
+                    fclose(f);
+                    return (size_t)(val * 1024ULL);
+                }
+            }
+            fclose(f);
+        }
+    }
+    /* fallback to sysinfo.freeram if /proc/meminfo is unavailable */
+    {
+        struct sysinfo si;
+        if (sysinfo(&si) == 0)
+        {
+            return (size_t)si.freeram * (size_t)si.mem_unit;
+        }
     }
     return 0;
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)

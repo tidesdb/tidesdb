@@ -1878,8 +1878,9 @@ void benchmark_cache_rw_contention(void)
     run_cache_rw_contention_ratio(0, total_threads, ops_per_thread, num_unique_keys);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     srand((unsigned int)time(NULL));
     RUN_TEST(test_cache_create_destroy, tests_passed);
     RUN_TEST(test_cache_put_get, tests_passed);

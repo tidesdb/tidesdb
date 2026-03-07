@@ -939,8 +939,9 @@ void test_manifest_large_uint64_roundtrip(void)
     remove(test_path);
 }
 
-int main()
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_manifest_create, tests_passed);
     RUN_TEST(test_manifest_add_sstable, tests_passed);
     RUN_TEST(test_manifest_update_existing_sstable, tests_passed);

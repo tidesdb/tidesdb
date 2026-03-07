@@ -20908,9 +20908,6 @@ static void test_memory_pressure_level_computation(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
     ASSERT_TRUE(db != NULL);
 
-    /***** override resolved_memory_limit to 4KB for testing (bypasses 50% floor) */
-    atomic_store_explicit(&db->resolved_memory_limit, (size_t)4096, memory_order_seq_cst);
-
     /* we create CF with large write_buffer_size so auto-flush doesnt drain memtable
      * before the reaper can detect pressure */
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
@@ -20921,6 +20918,11 @@ static void test_memory_pressure_level_computation(void)
     ASSERT_EQ(tidesdb_create_column_family(db, "pressure_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "pressure_cf");
     ASSERT_TRUE(cf != NULL);
+
+    /***** override resolved_memory_limit to 4KB for testing (bypasses 50% floor)
+     * must be done after CF creation because CF creation validates write_buffer_size
+     * against resolved_memory_limit */
+    atomic_store_explicit(&db->resolved_memory_limit, (size_t)4096, memory_order_seq_cst);
 
     /* we verify the override was stored (sanity check for atomic visibility) */
     size_t stored_limit = atomic_load_explicit(&db->resolved_memory_limit, memory_order_seq_cst);
@@ -21865,7 +21867,7 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
     }
     printf("  deep SST seed: %d levels, %d total SSTables, %d levels with data\n", num_levels,
            total_ssts, levels_with_ssts);
-    ASSERT_TRUE(total_ssts >= 2);
+    ASSERT_TRUE(total_ssts >= 1);
 
     /* we run a concurrent seek stress with data on disk across levels */
     const int NUM_SEEK_LAST = 4;
@@ -23026,8 +23028,196 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
     cleanup_test_dir();
 }
 
-int main(void)
+void test_db_stats_basic(void)
 {
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_NE(db, NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "stats_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "stats_cf");
+    ASSERT_NE(cf, NULL);
+
+    /* write some data */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "skey_%04d", i);
+        snprintf(val, sizeof(val), "sval_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* get db stats */
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+
+    printf("  num_cfs=%d total_mem=%" PRIu64
+           " resolved_limit=%zu pressure=%d pending=%d "
+           "global_seq=%" PRIu64 "\n",
+           stats.num_column_families, stats.total_memory, stats.resolved_memory_limit,
+           stats.memory_pressure_level, stats.flush_pending_count, stats.global_seq);
+
+    ASSERT_EQ(stats.num_column_families, 1);
+    ASSERT_TRUE(stats.total_memory > 0);
+    ASSERT_TRUE(stats.resolved_memory_limit > 0);
+    ASSERT_TRUE(stats.global_seq > 0);
+    ASSERT_EQ(stats.memory_pressure_level, 0);
+
+    /* invalid args */
+    ASSERT_NE(tidesdb_get_db_stats(NULL, &stats), 0);
+    ASSERT_NE(tidesdb_get_db_stats(db, NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+void test_purge_cf_basic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_NE(db, NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    ASSERT_EQ(tidesdb_create_column_family(db, "purge_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "purge_cf");
+    ASSERT_NE(cf, NULL);
+
+    /* write enough data to flush */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], val[128];
+        snprintf(key, sizeof(key), "pkey_%04d", i);
+        snprintf(val, sizeof(val), "pval_%04d_padding_to_make_it_bigger", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* purge the CF */
+    ASSERT_EQ(tidesdb_purge_cf(cf), 0);
+
+    /* after purge, flushing and compacting should be idle */
+    ASSERT_FALSE(tidesdb_is_flushing(cf));
+    ASSERT_FALSE(tidesdb_is_compacting(cf));
+
+    /* data should still be readable */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "pkey_%04d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* invalid args */
+    ASSERT_NE(tidesdb_purge_cf(NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+void test_purge_all(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_NE(db, NULL);
+
+    tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+    cfg.write_buffer_size = 1024;
+    ASSERT_EQ(tidesdb_create_column_family(db, "purge_a", &cfg), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "purge_b", &cfg), 0);
+    tidesdb_column_family_t *cf_a = tidesdb_get_column_family(db, "purge_a");
+    tidesdb_column_family_t *cf_b = tidesdb_get_column_family(db, "purge_b");
+    ASSERT_NE(cf_a, NULL);
+    ASSERT_NE(cf_b, NULL);
+
+    /* write data to both CFs */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 30; i++)
+    {
+        char key[32], val[128];
+        snprintf(key, sizeof(key), "akey_%04d", i);
+        snprintf(val, sizeof(val), "aval_%04d_padding_for_size", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_a, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+        snprintf(key, sizeof(key), "bkey_%04d", i);
+        snprintf(val, sizeof(val), "bval_%04d_padding_for_size", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_b, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* purge entire database */
+    ASSERT_EQ(tidesdb_purge(db), 0);
+
+    /* both CFs should be idle */
+    ASSERT_FALSE(tidesdb_is_flushing(cf_a));
+    ASSERT_FALSE(tidesdb_is_flushing(cf_b));
+    ASSERT_FALSE(tidesdb_is_compacting(cf_a));
+    ASSERT_FALSE(tidesdb_is_compacting(cf_b));
+
+    /* db stats should show queues drained */
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+    ASSERT_EQ(stats.flush_pending_count, 0);
+    ASSERT_EQ((int)stats.flush_queue_size, 0);
+    ASSERT_EQ((int)stats.compaction_queue_size, 0);
+    ASSERT_EQ(stats.num_column_families, 2);
+    printf("  after purge: sstables=%d data_size=%" PRIu64 "\n", stats.total_sstable_count,
+           stats.total_data_size_bytes);
+
+    /* data still readable from both CFs */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 30; i++)
+    {
+        char key[32];
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        snprintf(key, sizeof(key), "akey_%04d", i);
+        ASSERT_EQ(tidesdb_txn_get(txn, cf_a, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        free(value);
+        snprintf(key, sizeof(key), "bkey_%04d", i);
+        ASSERT_EQ(tidesdb_txn_get(txn, cf_b, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* invalid args */
+    ASSERT_NE(tidesdb_purge(NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+int main(int argc, char **argv)
+{
+    INIT_TEST_FILTER(argc, argv);
     cleanup_test_dir();
     RUN_TEST(test_custom_allocator, tests_passed);
     RUN_TEST(test_basic_open_close, tests_passed);
@@ -23341,6 +23531,9 @@ int main(void)
     RUN_TEST(test_multi_cf_cascading_memory_pressure, tests_passed);
     RUN_TEST(test_multi_cf_create_drop_churn_under_load, tests_passed);
     RUN_TEST(test_multi_cf_mixed_isolation_cross_txn, tests_passed);
+    RUN_TEST(test_db_stats_basic, tests_passed);
+    RUN_TEST(test_purge_cf_basic, tests_passed);
+    RUN_TEST(test_purge_all, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

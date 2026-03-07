@@ -112,6 +112,7 @@ typedef struct
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
  * @param block_index current index in shared position cache (-1 if before first block)
+ * @param block_size_valid 1 if current_block_size is cached and valid, 0 otherwise
  */
 typedef struct
 {
@@ -119,7 +120,7 @@ typedef struct
     uint64_t current_pos;
     uint64_t current_block_size;
     int block_index;
-    int block_size_valid; /* 1 if current_block_size is cached and valid, 0 otherwise */
+    int block_size_valid;
 } block_manager_cursor_t;
 
 /**

@@ -299,6 +299,45 @@ typedef struct tidesdb_cache_stats_t
     size_t num_partitions;
 } tidesdb_cache_stats_t;
 
+/**
+ * tidesdb_db_stats_t
+ * database-level statistics
+ * @param num_column_families number of column families
+ * @param total_memory system total memory
+ * @param available_memory system available memory at open
+ * @param resolved_memory_limit resolved memory limit
+ * @param memory_pressure_level current memory pressure level (0=normal, 1=elevated, 2=high,
+ * 3=critical)
+ * @param flush_pending_count number of pending flush operations (queued + in-flight)
+ * @param total_memtable_bytes total bytes in active memtables across all CFs
+ * @param total_immutable_count total immutable memtables across all CFs
+ * @param total_sstable_count total sstables across all CFs and levels
+ * @param total_data_size_bytes total data size across all CFs
+ * @param num_open_sstables number of currently open sstable file handles
+ * @param global_seq current global sequence number
+ * @param txn_memory_bytes bytes held by in-flight transactions
+ * @param compaction_queue_size number of pending compaction tasks
+ * @param flush_queue_size number of pending flush tasks in queue
+ */
+typedef struct tidesdb_db_stats_t
+{
+    int num_column_families;
+    uint64_t total_memory;
+    uint64_t available_memory;
+    size_t resolved_memory_limit;
+    int memory_pressure_level;
+    int flush_pending_count;
+    int64_t total_memtable_bytes;
+    int total_immutable_count;
+    int total_sstable_count;
+    uint64_t total_data_size_bytes;
+    int num_open_sstables;
+    uint64_t global_seq;
+    int64_t txn_memory_bytes;
+    size_t compaction_queue_size;
+    size_t flush_queue_size;
+} tidesdb_db_stats_t;
+
 /**** system default configuration functions */
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 tidesdb_config_t tidesdb_default_config(void);
@@ -488,6 +527,24 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir);
  */
 int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char *dst_name);
 
+/**
+ * tidesdb_purge_cf
+ * forces a full flush of the active memtable and triggers aggressive compaction for a column
+ * family. waits for all flush and compaction I/O to complete before returning.
+ * @param cf column family handle
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_purge_cf(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_purge
+ * forces a full flush and aggressive compaction for all column families.
+ * waits for all flush and compaction queues to fully drain before returning.
+ * @param db database handle
+ * @return 0 on success, first non-zero error code on failure
+ */
+int tidesdb_purge(tidesdb_t *db);
+
 /**** configuration operations */
 int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_name,
                                     tidesdb_column_family_config_t *config);
@@ -500,6 +557,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
 /**** statistics operations */
 int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
 void tidesdb_free_stats(tidesdb_stats_t *stats);
+int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats);
 int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 
 int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t key_a_size,

@@ -742,8 +742,9 @@ void test_bloom_filter_deserialize_corrupted_assertions(void)
     ASSERT_TRUE(bloom_filter_deserialize(crafted_h0) == NULL);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_bloom_filter_new, tests_passed);
     RUN_TEST(test_bloom_filter_add_and_contains, tests_passed);
     RUN_TEST(test_bloom_filter_serialize_deserialize, tests_passed);

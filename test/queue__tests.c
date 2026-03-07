@@ -1406,8 +1406,9 @@ void benchmark_queue_peek()
     queue_free(queue);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_queue_new, tests_passed);
     RUN_TEST(test_queue_enqueue_dequeue, tests_passed);
     RUN_TEST(test_queue_peek, tests_passed);

@@ -20,9 +20,21 @@
 #define __TEST_UTILS_H__
 
 #include <assert.h>
+#include <string.h>
 
 #include "../src/compat.h"
 #include "test_macros.h"
+
+/* global test filter -- set via argv[1] for running specific tests */
+static const char *test_filter = NULL;
+static int tests_skipped = 0;
+
+/* call at the top of main(argc, argv) to enable --filter or positional arg */
+#define INIT_TEST_FILTER(argc, argv)             \
+    do                                           \
+    {                                            \
+        if ((argc) > 1) test_filter = (argv)[1]; \
+    } while (0)
 
 /* disable format-truncation warnings for test utilities. all path buffers use 1024 bytes */
 #ifndef _MSC_VER
@@ -41,26 +53,33 @@
 #define ASSERT_TRUE(a)  assert(a)
 #define ASSERT_FALSE(a) assert(!(a))
 
-#define RUN_TEST(test_func, test_passed)                    \
-    do                                                      \
-    {                                                       \
-        printf(YELLOW "Running: %s... " RESET, #test_func); \
-        fflush(stdout);                                     \
-        test_func();                                        \
-        printf(GREEN "PASSED\n" RESET);                     \
-        tests_passed++;                                     \
+#define RUN_TEST(test_func, test_passed)                     \
+    do                                                       \
+    {                                                        \
+        if (test_filter && !strstr(#test_func, test_filter)) \
+        {                                                    \
+            tests_skipped++;                                 \
+            break;                                           \
+        }                                                    \
+        printf(YELLOW "Running: %s... " RESET, #test_func);  \
+        fflush(stdout);                                      \
+        test_func();                                         \
+        printf(GREEN "PASSED\n" RESET);                      \
+        tests_passed++;                                      \
     } while (0)
 
 /* print test results summary */
-#define PRINT_TEST_RESULTS(test_passed, test_failed)                  \
-    do                                                                \
-    {                                                                 \
-        printf("\n");                                                 \
-        printf("*=======================================*\n");        \
-        printf("Test Results:\n");                                    \
-        printf("  " BOLDGREEN "PASSED: %d" RESET "\n", tests_passed); \
-        printf("  " BOLDRED "FAILED: %d" RESET "\n", tests_failed);   \
-        printf("*=======================================*\n");        \
+#define PRINT_TEST_RESULTS(test_passed, test_failed)                                        \
+    do                                                                                      \
+    {                                                                                       \
+        printf("\n");                                                                       \
+        printf("*=======================================*\n");                              \
+        printf("Test Results:\n");                                                          \
+        printf("  " BOLDGREEN "PASSED: %d" RESET "\n", tests_passed);                       \
+        printf("  " BOLDRED "FAILED: %d" RESET "\n", tests_failed);                         \
+        if (tests_skipped > 0) printf("  " YELLOW "SKIPPED: %d" RESET "\n", tests_skipped); \
+        if (test_filter) printf("  Filter: \"%s\"\n", test_filter);                         \
+        printf("*=======================================*\n");                              \
     } while (0)
 
 #define REMOVE_DIR_RETRY_COUNT 5

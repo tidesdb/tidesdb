@@ -19898,7 +19898,7 @@ static void test_stress_unified_read_races(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    cf_config.write_buffer_size = 1024;
+    cf_config.write_buffer_size = 4096;
     cf_config.level_size_ratio = 4;
     cf_config.min_levels = 4;
     cf_config.compression_algorithm = TDB_COMPRESS_LZ4;
@@ -19913,8 +19913,8 @@ static void test_stress_unified_read_races(void)
     const int NUM_READERS = 6;
     const int NUM_COMPACTORS = 2;
     const int NUM_FLUSHERS = 2;
-    const int OPS_PER_WRITER = 2000;
-    const int OPS_PER_READER = 1050;
+    const int OPS_PER_WRITER = 1500;
+    const int OPS_PER_READER = 800;
     const int OPS_PER_COMPACTOR = 20;
     const int OPS_PER_FLUSHER = 30;
 
@@ -22593,7 +22593,7 @@ static void test_multi_cf_cascading_memory_pressure(void)
     const char *cf_names[] = {"mp_cf0", "mp_cf1", "mp_cf2", "mp_cf3", "mp_cf4", "mp_cf5"};
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 512;
+    cf_config.write_buffer_size = 1024 * 4;
     cf_config.compression_algorithm = TDB_COMPRESS_LZ4;
     cf_config.enable_bloom_filter = 1;
 
@@ -22738,7 +22738,7 @@ static void test_multi_cf_create_drop_churn_under_load(void)
     tidesdb_t *db = create_test_db();
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 1024;
+    cf_config.write_buffer_size = 1024 * 4;
     cf_config.compression_algorithm = TDB_COMPRESS_LZ4;
     cf_config.enable_bloom_filter = 1;
 

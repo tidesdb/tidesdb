@@ -7543,6 +7543,23 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                 kb->entries[idx].flags & TDB_KV_FLAG_TOMBSTONE);
 
             free(vlog_value);
+
+            /* prefetch next block when we reach the last entry in this block.
+             * this issues a non-blocking POSIX_FADV_WILLNEED so the OS begins
+             * reading the next block into the page cache before we need it,
+             * hiding I/O latency for sequential iteration across block boundaries. */
+            if ((uint32_t)(idx + 1) >= kb->num_entries)
+            {
+                const tidesdb_sstable_t *sst = source->source.sstable.sst;
+                block_manager_cursor_t *kc = source->source.sstable.klog_cursor;
+                if (sst->klog_bm && kc &&
+                    (sst->klog_data_end_offset == 0 || kc->current_pos < sst->klog_data_end_offset))
+                {
+                    prefetch_file_region(sst->klog_bm->fd, (off_t)kc->current_pos,
+                                         (off_t)TDB_KLOG_BLOCK_SIZE);
+                }
+            }
+
             return TDB_SUCCESS;
         }
 
@@ -12177,18 +12194,30 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             time_t last_access;
         } sstable_candidate_t;
 
-        sstable_candidate_t *candidates = malloc(current_open * sizeof(sstable_candidate_t));
-        if (!candidates)
+        /* stack buffer for common case (≤256 open SSTs), heap fallback for large configs */
+#define TDB_REAPER_STACK_CANDIDATES 256
+        sstable_candidate_t stack_candidates[TDB_REAPER_STACK_CANDIDATES];
+        sstable_candidate_t *candidates;
+        const int use_stack = (current_open <= TDB_REAPER_STACK_CANDIDATES);
+        if (use_stack)
         {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Reaper: failed to allocate candidates array");
-            continue;
+            candidates = stack_candidates;
+        }
+        else
+        {
+            candidates = malloc(current_open * sizeof(sstable_candidate_t));
+            if (!candidates)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Reaper: failed to allocate candidates array");
+                continue;
+            }
         }
 
         int candidate_count = 0;
 
         if (!atomic_load(&db->sstable_reaper_active))
         {
-            free(candidates);
+            if (!use_stack) free(candidates);
             break;
         }
 
@@ -12282,20 +12311,20 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             {
                 tidesdb_sstable_unref(db, candidates[i].sst);
             }
-            free(candidates);
+            if (!use_stack) free(candidates);
             break;
         }
 
         if (!atomic_load(&db->sstable_reaper_active))
         {
-            free(candidates);
+            if (!use_stack) free(candidates);
             break;
         }
 
         if (candidate_count == 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "Reaper: no closeable SSTables found");
-            free(candidates);
+            if (!use_stack) free(candidates);
             continue;
         }
 
@@ -12338,7 +12367,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             tidesdb_sstable_unref(db, candidates[i].sst);
         }
 
-        free(candidates);
+        if (!use_stack) free(candidates);
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Reaper thread stopped");
@@ -14983,7 +15012,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         {
             const size_t mem_limit =
                 atomic_load_explicit(&cf->db->resolved_memory_limit, memory_order_relaxed);
-            const size_t arena_size = cf->config.write_buffer_size * 2;
+            const size_t arena_size = cf->config.write_buffer_size;
             if (mem_limit > 0 && arena_size > 0)
             {
                 size_t per_cf_budget = mem_limit / ((size_t)num_cfs * arena_size);
@@ -14997,6 +15026,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 
     /* l0 queue exceeds threshold -- force blocking flush of all immutables
      * this prevents unbounded memory growth when flush worker falls behind */
+    int l0_delayed = 0; /* track if L0/L1 already applied a delay */
     if (l0_queue_depth >= effective_stall)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN,
@@ -15026,6 +15056,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' L0 queue stall resolved after %d iterations (%dms)",
                       cf->name, wait_iterations,
                       wait_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+        l0_delayed = 1;
     }
     /* coordinated L0/L1 backpressure
      * we apply graduated delays based on queue depth and L1 file count */
@@ -15038,6 +15069,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' high backpressure: L0=%zu L1=%d - %dus delay",
                       cf->name, l0_queue_depth, l1_file_count, TDB_BACKPRESSURE_HIGH_DELAY_US);
+        l0_delayed = 1;
     }
     else if (l0_queue_depth >=
                  (size_t)(effective_stall * TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO) ||
@@ -15049,9 +15081,13 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         usleep(TDB_BACKPRESSURE_MODERATE_DELAY_US);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' moderate backpressure: L0=%zu L1=%d - %dus delay",
                       cf->name, l0_queue_depth, l1_file_count, TDB_BACKPRESSURE_MODERATE_DELAY_US);
+        l0_delayed = 1;
     }
 
-    /* global memory pressure (computed by reaper every 100ms, single atomic_load) */
+    /* global memory pressure (computed by reaper every 100ms, single atomic_load)
+     * critical blocking and self-help flushes always fire regardless of L0 delay.
+     * high/elevated delays are skipped if L0/L1 already applied a delay to avoid
+     * double-sleeping on the same commit (the L0 delay already throttled ingestion). */
     if (cf->db)
     {
         int pressure = atomic_load_explicit(&cf->db->memory_pressure_level, memory_order_relaxed);
@@ -15088,17 +15124,16 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         }
         else if (pressure >= TDB_MEMORY_PRESSURE_HIGH)
         {
-            /* high -- we force flush this CF + delay */
+            /* high -- we force flush this CF; skip delay if L0 already throttled */
             tidesdb_flush_memtable_internal(cf, 0, 1);
-            usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
+            if (!l0_delayed) usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
         }
         else if (pressure >= TDB_MEMORY_PRESSURE_ELEVATED)
         {
-            /* elevated -- tiny yield to slow ingestion and let flushes keep up
-             * if nothing is flushing on this CF we proactively trigger one */
+            /* elevated -- proactive flush + tiny yield (skip yield if L0 already throttled) */
             if (!atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
                 tidesdb_flush_memtable_internal(cf, 0, 0);
-            usleep(TDB_BACKPRESSURE_ELEVATED_DELAY_US);
+            if (!l0_delayed) usleep(TDB_BACKPRESSURE_ELEVATED_DELAY_US);
         }
     }
 
@@ -15555,11 +15590,6 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     /* we wait for database to finish opening, or fail if shutting down */
     if (!txn->db) return TDB_ERR_INVALID_ARGS;
-
-    /* we apply coordinated L0/L1 backpressure before accepting write
-     * this prevents memory exhaustion and coordinates flush/compaction */
-    const int backpressure_result = tidesdb_apply_backpressure(cf);
-    if (backpressure_result != TDB_SUCCESS) return backpressure_result;
 
     /* we validate key-value size against memory limits */
     const int size_check = tidesdb_validate_kv_size(txn->db, key_size, value_size);
@@ -16115,9 +16145,6 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
 
     /* we wait for database to finish opening, or fail if shutting down */
     if (!txn->db) return TDB_ERR_INVALID_ARGS;
-
-    const int backpressure_result = tidesdb_apply_backpressure(cf);
-    if (backpressure_result != TDB_SUCCESS) return backpressure_result;
 
     if (txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
 
@@ -17244,6 +17271,15 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
         skip_list_t *memtable = cf_skiplists[cf_idx];
+
+        /* we apply coordinated L0/L1 backpressure once per CF per commit
+         * this replaces the per-put/delete checks, reducing overhead from
+         * O(num_ops) to O(num_cfs) atomic loads per transaction */
+        result = tidesdb_apply_backpressure(cf);
+        if (result != TDB_SUCCESS)
+        {
+            goto cleanup_error_result;
+        }
 
         result = tidesdb_txn_apply_ops_to_memtable(txn, cf, memtable);
         if (result != TDB_SUCCESS)
@@ -18552,10 +18588,17 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
     tidesdb_sstable_t *sst = source->source.sstable.sst;
     block_manager_cursor_t *cursor = source->source.sstable.klog_cursor;
 
-    skip_list_comparator_fn comparator_fn = NULL;
-    void *comparator_ctx = NULL;
-    tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    /* we use cached comparator from sst (resolved at load/create time) to avoid
+     * per-seek registry lookup via tidesdb_resolve_comparator */
+    skip_list_comparator_fn comparator_fn = sst->cached_comparator_fn;
+    void *comparator_ctx = sst->cached_comparator_ctx;
+    if (TDB_UNLIKELY(!comparator_fn))
+    {
+        tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    }
 
+    /* fast path -- if current block is already loaded and target key is within its range,
+     * skip the expensive release + read + deserialize cycle */
     const tidesdb_klog_block_t *cb = source->source.sstable.current_block;
     if (cb && cb->num_entries > 0)
     {
@@ -18612,6 +18655,20 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
             source->current_kv = tidesdb_iter_create_kv_from_block(iter, sst, cb, 0);
             return;
         }
+        else if (cmp_last < 0)
+        {
+            /* sequential advance hint -- target is past current block.
+             * try advancing cursor to next block directly instead of going through
+             * block index lookup. this saves a binary search for monotonically advancing seeks. */
+            tidesdb_iter_release_sst_source_block(source);
+            if (sst->klog_data_end_offset > 0 && cursor->current_pos < sst->klog_data_end_offset &&
+                block_manager_cursor_next(cursor) == 0 &&
+                cursor->current_pos < sst->klog_data_end_offset)
+            {
+                goto scan_blocks;
+            }
+            return;
+        }
     }
 
     tidesdb_iter_release_sst_source_block(source);
@@ -18631,6 +18688,8 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
     {
         block_manager_cursor_goto_first(cursor);
     }
+
+scan_blocks:;
 
     const char *cf_name = sst->cf_name;
     const int has_cf_name = (cf_name[0] != '\0');
@@ -18812,9 +18871,14 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
     tidesdb_sstable_t *sst = source->source.sstable.sst;
     block_manager_cursor_t *cursor = source->source.sstable.klog_cursor;
 
-    skip_list_comparator_fn comparator_fn = NULL;
-    void *comparator_ctx = NULL;
-    tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    /* we use cached comparator from sst (resolved at load/create time) to avoid
+     * per-seek registry lookup via tidesdb_resolve_comparator */
+    skip_list_comparator_fn comparator_fn = sst->cached_comparator_fn;
+    void *comparator_ctx = sst->cached_comparator_ctx;
+    if (TDB_UNLIKELY(!comparator_fn))
+    {
+        tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    }
 
     /* fast path -- reuse current block if target key is within its range */
     tidesdb_klog_block_t *cb = source->source.sstable.current_block;
@@ -19003,17 +19067,32 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
  */
 static int tidesdb_iter_find_visible_entry(tidesdb_iter_t *iter, const int direction)
 {
-    /* we rebuild heap */
-    if (direction > 0)
+    /* we rebuild heap -- optimized for small source counts (common after compaction).
+     * with 1-2 sources a simple comparison is O(1) vs O(N) full heapify. */
+    const int ns = iter->heap->num_sources;
+    if (ns <= 1)
     {
-        for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
+        /* 0 or 1 sources -- already a valid heap */
+    }
+    else if (ns == 2)
+    {
+        const int cmp =
+            (direction > 0) ? heap_compare(iter->heap, 0, 1) : heap_compare_max(iter->heap, 0, 1);
+        if ((direction > 0 && cmp > 0) || (direction < 0 && cmp < 0))
+        {
+            heap_swap(&iter->heap->sources[0], &iter->heap->sources[1]);
+        }
+    }
+    else if (direction > 0)
+    {
+        for (int i = (ns / 2) - 1; i >= 0; i--)
         {
             heap_sift_down(iter->heap, i);
         }
     }
     else
     {
-        for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
+        for (int i = (ns / 2) - 1; i >= 0; i--)
         {
             heap_sift_down_max(iter->heap, i);
         }

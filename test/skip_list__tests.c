@@ -2900,8 +2900,9 @@ void benchmark_skip_list_rw_contention()
     run_rw_contention_suite(total_threads, ops_per_thread, num_unique_keys, 1);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_skip_list_create_node, tests_passed);
     RUN_TEST(test_skip_list_put_get, tests_passed);
     RUN_TEST(test_skip_list_destroy, tests_passed);

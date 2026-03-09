@@ -182,6 +182,7 @@ struct skip_list_node_t
  * @param tail sentinel tail node (compares greater than all keys)
  * @param total_size total size of all entries
  * @param entry_count track entry count atomically to avoid O(n) traversals
+ * @param cmp_type comparator type enum (memcmp, string, numeric, custom)
  * @param comparator key comparison function
  * @param comparator_ctx context for comparator
  * @param cached_time pointer to external cached time (NULL = use time(NULL))

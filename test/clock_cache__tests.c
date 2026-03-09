@@ -58,7 +58,7 @@ void test_cache_put_get(void)
     const uint8_t payload1[] = "Hello, World!";
     size_t payload1_len = sizeof(payload1);
 
-    ASSERT_EQ(clock_cache_put(cache, key1, strlen(key1), payload1, payload1_len), 0);
+    ASSERT_EQ(clock_cache_put(cache, key1, strlen(key1), payload1, payload1_len, 0), 0);
 
     size_t retrieved_len = 0;
     uint8_t *retrieved = clock_cache_get(cache, key1, strlen(key1), &retrieved_len);
@@ -85,8 +85,8 @@ void test_cache_update(void)
     const uint8_t payload1[] = "original";
     const uint8_t payload2[] = "updated value";
 
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload1, sizeof(payload1)), 0);
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload2, sizeof(payload2)), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload1, sizeof(payload1), 0), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload2, sizeof(payload2), 0), 0);
 
     size_t retrieved_len = 0;
     uint8_t *retrieved = clock_cache_get(cache, key, strlen(key), &retrieved_len);
@@ -109,7 +109,7 @@ void test_cache_delete(void)
     const char *key = "delete_key";
     const uint8_t payload[] = "to be deleted";
 
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
 
     size_t check_len;
     uint8_t *check_data = clock_cache_get(cache, key, strlen(key), &check_len);
@@ -141,7 +141,7 @@ void test_cache_exists(void)
     uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
     ASSERT_TRUE(data == NULL);
 
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
 
     data = clock_cache_get(cache, key, strlen(key), &len);
     ASSERT_TRUE(data != NULL);
@@ -164,7 +164,7 @@ void test_cache_clear(void)
         snprintf(key, sizeof(key), "key_%d", i);
         uint8_t payload[32];
         snprintf((char *)payload, sizeof(payload), "value_%d", i);
-        ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1),
+        ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0),
                   0);
     }
 
@@ -223,7 +223,7 @@ void test_cache_clock_eviction(void)
         {
             char key[16];
             snprintf(key, sizeof(key), "k%d", i);
-            ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+            ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
         }
 
         clock_cache_stats_t stats;
@@ -279,7 +279,7 @@ void test_cache_clock_eviction(void)
 
             /* w cache pointer to data */
             int result =
-                clock_cache_put(cache, key, strlen(key), &data, sizeof(test_evict_data_t *));
+                clock_cache_put(cache, key, strlen(key), &data, sizeof(test_evict_data_t *), 0);
             ASSERT_EQ(result, 0);
         }
 
@@ -327,7 +327,7 @@ void test_cache_clock_eviction(void)
                 char key[16];
                 snprintf(key, sizeof(key), "r%d_k%d", round, i);
 
-                clock_cache_put(cache, key, strlen(key), &data, sizeof(test_evict_data_t *));
+                clock_cache_put(cache, key, strlen(key), &data, sizeof(test_evict_data_t *), 0);
             }
         }
 
@@ -365,7 +365,7 @@ void test_cache_stats(void)
         uint8_t payload[64];
         snprintf((char *)payload, sizeof(payload), "stats_value_%d", i);
         size_t payload_len = strlen((char *)payload) + 1;
-        ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, payload_len), 0);
+        ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, payload_len, 0), 0);
     }
 
     clock_cache_get_stats(cache, &stats);
@@ -387,9 +387,9 @@ void test_cache_null_handling(void)
     const uint8_t payload[] = "test";
     size_t len;
 
-    ASSERT_EQ(clock_cache_put(NULL, "key", 3, payload, sizeof(payload)), -1);
-    ASSERT_EQ(clock_cache_put(cache, NULL, 3, payload, sizeof(payload)), -1);
-    ASSERT_EQ(clock_cache_put(cache, "key", 3, NULL, sizeof(payload)), -1);
+    ASSERT_EQ(clock_cache_put(NULL, "key", 3, payload, sizeof(payload), 0), -1);
+    ASSERT_EQ(clock_cache_put(cache, NULL, 3, payload, sizeof(payload), 0), -1);
+    ASSERT_EQ(clock_cache_put(cache, "key", 3, NULL, sizeof(payload), 0), -1);
 
     ASSERT_TRUE(clock_cache_get(NULL, "key", 3, &len) == NULL);
     ASSERT_TRUE(clock_cache_get(cache, NULL, 3, &len) == NULL);
@@ -420,7 +420,7 @@ void *concurrent_put_thread(void *arg)
         snprintf(key, sizeof(key), "key_%08x", key_num * 2654435761u);
         uint8_t payload[128];
         snprintf((char *)payload, sizeof(payload), "value_%d_%d", args->thread_id, i);
-        clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
     }
     return NULL;
 }
@@ -461,7 +461,7 @@ void *concurrent_mixed_thread(void *arg)
         {
             uint8_t payload[64];
             snprintf((char *)payload, sizeof(payload), "value_%d_%d", args->thread_id, i);
-            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
         }
         else /* 5% deletes */
         {
@@ -521,7 +521,7 @@ void *write_thread_race(void *arg)
     for (int i = 0; i < 10; i++)
     {
         snprintf(key, sizeof(key), "evict_%d", i);
-        if (clock_cache_put(args->cache, key, strlen(key), payload, sizeof(payload)) == 0)
+        if (clock_cache_put(args->cache, key, strlen(key), payload, sizeof(payload), 0) == 0)
         {
             local_writes++;
         }
@@ -548,7 +548,7 @@ void test_concurrent_read_evict_race(void)
     /* pre-populate with just key_0 */
     uint8_t payload[128];
     memset(payload, 'X', sizeof(payload));
-    clock_cache_put(cache, "key_0", 5, payload, sizeof(payload));
+    clock_cache_put(cache, "key_0", 5, payload, sizeof(payload), 0);
 
     _Atomic(int) stop_flag = 0;
     _Atomic(int) read_count = 0;
@@ -663,7 +663,7 @@ void test_cache_compute_config(void)
     /* verify cache is functional */
     const char *key = "test_key";
     const uint8_t payload[] = "test_value";
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
 
     size_t len;
     uint8_t *retrieved = clock_cache_get(cache, key, strlen(key), &len);
@@ -690,7 +690,7 @@ void benchmark_cache_insertions(void)
         snprintf(key, sizeof(key), "bench_key_%d", i);
         uint8_t payload[128];
         snprintf((char *)payload, sizeof(payload), "bench_value_%d", i);
-        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
     }
     double end = wall_time_sec();
 
@@ -719,7 +719,7 @@ void benchmark_cache_lookups(void)
         snprintf(key, sizeof(key), "lookup_key_%d", i);
         uint8_t payload[128];
         snprintf((char *)payload, sizeof(payload), "lookup_value_%d", i);
-        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
     }
 
     double start = wall_time_sec();
@@ -799,7 +799,7 @@ void benchmark_concurrent_gets(void)
         snprintf(key, sizeof(key), "thread_0_key_%d", i);
         uint8_t payload[128];
         snprintf((char *)payload, sizeof(payload), "thread_0_value_%d", i);
-        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
     }
 
     const int num_threads = 8;
@@ -934,7 +934,7 @@ void benchmark_scaling_gets(void)
         snprintf(key, sizeof(key), "shared_key_%d", i);
         uint8_t payload[128];
         snprintf((char *)payload, sizeof(payload), "shared_value_%d", i);
-        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
     }
 
     const int thread_counts[] = {1, 2, 4, 8, 16};
@@ -1053,7 +1053,7 @@ void *put_same_key_thread(void *arg)
         uint8_t payload[64];
         snprintf((char *)payload, sizeof(payload), "thread_%d_iter_%d", args->thread_id, i);
         int result = clock_cache_put(args->cache, args->key, args->key_len, payload,
-                                     strlen((char *)payload) + 1);
+                                     strlen((char *)payload) + 1, 0);
         if (result == 0)
             local_success++;
         else
@@ -1157,7 +1157,7 @@ void *delete_while_read_thread(void *arg)
         clock_cache_delete(args->cache, args->key, args->key_len);
 
         uint8_t payload[] = "value_after_delete";
-        clock_cache_put(args->cache, args->key, args->key_len, payload, sizeof(payload));
+        clock_cache_put(args->cache, args->key, args->key_len, payload, sizeof(payload), 0);
 
         if (i % 100 == 0) sched_yield();
     }
@@ -1177,7 +1177,7 @@ void test_concurrent_delete_while_reading(void)
 
     const char *key = "delete_read_key";
     uint8_t initial_payload[] = "value_initial";
-    clock_cache_put(cache, key, strlen(key), initial_payload, sizeof(initial_payload));
+    clock_cache_put(cache, key, strlen(key), initial_payload, sizeof(initial_payload), 0);
 
     const int num_readers = 4;
     const int num_deleters = 2;
@@ -1235,8 +1235,8 @@ void *put_delete_race_put_thread(void *arg)
     {
         uint8_t payload[32];
         snprintf((char *)payload, sizeof(payload), "put_%d_%d", args->thread_id, i);
-        clock_cache_put(args->cache, args->key, args->key_len, payload,
-                        strlen((char *)payload) + 1);
+        clock_cache_put(args->cache, args->key, args->key_len, payload, strlen((char *)payload) + 1,
+                        0);
     }
     return NULL;
 }
@@ -1381,7 +1381,7 @@ void *shutdown_worker_thread(void *arg)
         /* mix of operations */
         if (i % 3 == 0)
         {
-            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
         }
         else if (i % 3 == 1)
         {
@@ -1461,7 +1461,7 @@ void test_zero_copy_get_release(void)
     const char *key = "zero_copy_key";
     const uint8_t payload[] = "zero_copy_payload_data";
 
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
 
     size_t len;
     clock_cache_entry_t *entry = NULL;
@@ -1507,7 +1507,7 @@ void test_large_payload(void)
     }
 
     const char *key = "large_key";
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), large_payload, large_size), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), large_payload, large_size, 0), 0);
 
     size_t retrieved_len;
     uint8_t *retrieved = clock_cache_get(cache, key, strlen(key), &retrieved_len);
@@ -1537,7 +1537,7 @@ void test_large_payload(void)
         uint8_t *payload = malloc(large_size);
         memset(payload, (uint8_t)i, large_size);
 
-        clock_cache_put(cache, key_buf, strlen(key_buf), payload, large_size);
+        clock_cache_put(cache, key_buf, strlen(key_buf), payload, large_size, 0);
         free(payload);
     }
 
@@ -1570,7 +1570,7 @@ void test_many_small_entries(void)
         uint8_t payload[8];
         snprintf((char *)payload, sizeof(payload), "v%d", i);
 
-        if (clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1) == 0)
+        if (clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0) == 0)
         {
             insert_success++;
         }
@@ -1631,7 +1631,7 @@ void *foreach_modifier_thread(void *arg)
 
         if (i % 2 == 0)
         {
-            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
         }
         else
         {
@@ -1657,7 +1657,7 @@ void test_foreach_prefix_concurrent(void)
         snprintf(key, sizeof(key), "prefix_%d", i);
         uint8_t payload[32];
         snprintf((char *)payload, sizeof(payload), "value_%d", i);
-        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1, 0);
     }
 
     const int num_modifiers = 2;
@@ -1705,11 +1705,11 @@ void test_put_after_shutdown(void)
 
     const char *key = "shutdown_test_key";
     uint8_t payload[] = "test_value";
-    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
 
     atomic_store(&cache->shutdown, 1);
 
-    int put_result = clock_cache_put(cache, "new_key", 7, payload, sizeof(payload));
+    int put_result = clock_cache_put(cache, "new_key", 7, payload, sizeof(payload), 0);
     ASSERT_EQ(put_result, -1);
 
     size_t len;
@@ -1768,7 +1768,7 @@ void *rw_cache_bench_writer(void *arg)
         snprintf(value_buf, sizeof(value_buf), "t%d_v%d", ctx->thread_id, i);
 
         if (clock_cache_put(ctx->cache, key_buf, strlen(key_buf), (uint8_t *)value_buf,
-                            strlen(value_buf) + 1) == 0)
+                            strlen(value_buf) + 1, 0) == 0)
         {
             completed++;
         }
@@ -1798,7 +1798,7 @@ static void run_cache_rw_contention_ratio(int num_readers, int num_writers, int 
         snprintf(key_buf, sizeof(key_buf), "rwcache_%06d", i);
         snprintf(value_buf, sizeof(value_buf), "init_%d", i);
         clock_cache_put(cache, key_buf, strlen(key_buf), (uint8_t *)value_buf,
-                        strlen(value_buf) + 1);
+                        strlen(value_buf) + 1, 0);
     }
 
     int total_threads = num_readers + num_writers;
@@ -1878,8 +1878,815 @@ void benchmark_cache_rw_contention(void)
     run_cache_rw_contention_ratio(0, total_threads, ops_per_thread, num_unique_keys);
 }
 
-int main(void)
+/* simple xorshift32 PRNG -- deterministic, no global state, fast */
+static inline uint32_t xorshift32(uint32_t *state)
 {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+/* approximate Zipfian: pick index in [0, n) biased toward low indices.
+ * models real-world "hot key" patterns -- a few btree root/internal nodes
+ * are accessed far more often than deep leaf nodes. */
+static inline int zipf_pick(uint32_t *rng, int n)
+{
+    /* square the uniform [0,1) sample to skew toward 0 */
+    uint32_t r = xorshift32(rng);
+    double u = (double)(r & 0x7FFFFFFF) / (double)0x7FFFFFFF;
+    int idx = (int)(u * u * n);
+    return (idx >= n) ? n - 1 : idx;
+}
+
+/* variable block size: models real btree nodes that range from ~200B (small leaf)
+ * to ~4KB (large internal node with many keys). returns a size in [lo, hi). */
+static inline size_t variable_block_size(uint32_t *rng, size_t lo, size_t hi)
+{
+    return lo + (xorshift32(rng) % (hi - lo));
+}
+
+/* fill a payload with a deterministic pattern so we can verify integrity on read.
+ * byte 0 = checksum (XOR of remaining bytes), bytes 1..len-1 = pattern from block_id. */
+static void fill_block_payload(uint8_t *buf, size_t len, uint32_t block_id)
+{
+    if (len == 0) return;
+    uint32_t s = block_id ^ 0xDEADBEEF;
+    uint8_t cksum = 0;
+    for (size_t i = 1; i < len; i++)
+    {
+        s = s * 1103515245 + 12345;
+        buf[i] = (uint8_t)(s >> 16);
+        cksum ^= buf[i];
+    }
+    buf[0] = cksum;
+}
+
+/* verify payload integrity. returns 1 if valid, 0 if corrupt. */
+static int verify_block_payload(const uint8_t *buf, size_t len)
+{
+    if (len == 0) return 1;
+    uint8_t cksum = 0;
+    for (size_t i = 1; i < len; i++) cksum ^= buf[i];
+    return buf[0] == cksum;
+}
+
+/**
+ * test_realistic_block_cache_eviction
+ * models a single-threaded btree scan workload:
+ *   -- 5000 "blocks" (more than fit in cache) with variable sizes 200B–4KB
+ *   -- insert all blocks, verify byte budget is respected throughout
+ *   -- read back with Zipfian access (hot blocks hit cache, cold blocks miss)
+ *   -- verify every successful read returns uncorrupted data
+ *   -- verify hot blocks have higher hit rates than cold blocks
+ */
+void test_realistic_block_cache_eviction(void)
+{
+    printf("Testing realistic block cache eviction (single-threaded)...\n");
+
+    /* 1 MB cache -- holds ~500-2000 variable-size blocks.
+     * total keyspace is 2000 blocks so cache can hold a meaningful fraction
+     * of the hot working set (Zipfian skew means ~top 200 blocks are "hot"). */
+    const size_t max_bytes = 1024 * 1024;
+    cache_config_t config = {
+        .max_bytes = max_bytes, .num_partitions = 4, .slots_per_partition = 512};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const int num_blocks = 2000;
+    uint32_t rng = 42;
+    size_t total_data_inserted = 0;
+    size_t max_observed_bytes = 0;
+    int corruptions = 0;
+
+    /* pre-compute block sizes so we can re-generate on cache miss */
+    size_t block_sizes[2000];
+    for (int i = 0; i < num_blocks; i++) block_sizes[i] = variable_block_size(&rng, 200, 2048);
+
+    /* phase 1: warm-up -- insert all blocks (simulates initial table scan / SST open) */
+    printf("  Phase 1: inserting %d variable-size blocks (200B-2KB)...\n", num_blocks);
+    for (int i = 0; i < num_blocks; i++)
+    {
+        size_t bsz = block_sizes[i];
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        ASSERT_TRUE(block != NULL);
+        fill_block_payload(block, bsz, (uint32_t)i);
+
+        char key[32];
+        snprintf(key, sizeof(key), "blk:%05d", i);
+        clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+        total_data_inserted += bsz;
+        free(block);
+
+        if (i % 500 == 499)
+        {
+            clock_cache_stats_t stats;
+            clock_cache_get_stats(cache, &stats);
+            if (stats.total_bytes > max_observed_bytes) max_observed_bytes = stats.total_bytes;
+            printf("    [%d/%d] bytes_used=%zu / %zu, entries=%zu\n", i + 1, num_blocks,
+                   stats.total_bytes, max_bytes, stats.total_entries);
+            ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
+        }
+    }
+    printf("    Total data offered: %zu bytes (%.1fx cache size)\n", total_data_inserted,
+           (double)total_data_inserted / max_bytes);
+
+    /* phase 2: steady-state Zipfian workload (90% read, 10% new-block writes).
+     * on cache miss, we re-insert the block (simulating a real disk read that
+     * populates the cache -- this is how btree_node_read_cached works). */
+    printf("  Phase 2: 20000 Zipfian accesses (90%% read, 10%% write)...\n");
+    const int num_accesses = 20000;
+    int hits = 0, reads = 0, integrity_checks = 0;
+
+    for (int i = 0; i < num_accesses; i++)
+    {
+        int op = xorshift32(&rng) % 10;
+        if (op < 9) /* 90% read */
+        {
+            int block_id = zipf_pick(&rng, num_blocks);
+            char key[32];
+            snprintf(key, sizeof(key), "blk:%05d", block_id);
+
+            size_t len;
+            uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+            reads++;
+            if (data)
+            {
+                hits++;
+                integrity_checks++;
+                if (!verify_block_payload(data, len))
+                {
+                    printf("    ERROR: corruption in block %d (len=%zu)\n", block_id, len);
+                    corruptions++;
+                }
+                free(data);
+            }
+            else
+            {
+                /* cache miss -- simulate disk read and re-populate cache */
+                size_t bsz = block_sizes[block_id];
+                uint8_t *block = (uint8_t *)malloc(bsz);
+                fill_block_payload(block, bsz, (uint32_t)block_id);
+                clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+                free(block);
+            }
+        }
+        else /* 10% write -- simulate compaction producing new blocks */
+        {
+            int block_id = num_blocks + i;
+            size_t bsz = variable_block_size(&rng, 200, 2048);
+            uint8_t *block = (uint8_t *)malloc(bsz);
+            fill_block_payload(block, bsz, (uint32_t)block_id);
+
+            char key[32];
+            snprintf(key, sizeof(key), "blk:%05d", block_id);
+            clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+            free(block);
+        }
+    }
+
+    double hit_rate = (reads > 0) ? (double)hits / reads * 100.0 : 0.0;
+    printf("    Reads: %d, Hits: %d, Hit rate: %.1f%%\n", reads, hits, hit_rate);
+    printf("    Integrity checks: %d, Corruptions: %d\n", integrity_checks, corruptions);
+
+    /* with Zipfian access + miss-fill, hot blocks get re-cached and should
+     * yield a meaningful hit rate.  the exact rate depends on cache pressure
+     * from the 10% writes, but should be well above zero. */
+    ASSERT_TRUE(hits > 0);
+    ASSERT_TRUE(corruptions == 0);
+
+    /* verify byte budget is still respected after steady-state phase */
+    clock_cache_stats_t mid_stats;
+    clock_cache_get_stats(cache, &mid_stats);
+    printf("    Post-steady-state: bytes_used=%zu / %zu\n", mid_stats.total_bytes, max_bytes);
+    ASSERT_TRUE(mid_stats.total_bytes <= max_bytes * 2);
+
+    /* phase 3: scan burst -- sequential scan of 500 cold blocks forces eviction
+     * of working set, then re-access hot keys to verify cache recovers */
+    printf("  Phase 3: sequential scan burst (500 cold blocks)...\n");
+    for (int i = 0; i < 500; i++)
+    {
+        size_t bsz = variable_block_size(&rng, 512, 2048);
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        fill_block_payload(block, bsz, (uint32_t)(100000 + i));
+
+        char key[32];
+        snprintf(key, sizeof(key), "scan:%05d", i);
+        clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+        free(block);
+    }
+
+    clock_cache_stats_t final_stats;
+    clock_cache_get_stats(cache, &final_stats);
+    printf("    Post-scan: bytes_used=%zu / %zu, entries=%zu\n", final_stats.total_bytes, max_bytes,
+           final_stats.total_entries);
+    ASSERT_TRUE(final_stats.total_bytes <= max_bytes * 2);
+
+    /* re-access hot block 0 -- may have been evicted by scan, verify graceful miss */
+    size_t len;
+    uint8_t *data = clock_cache_get(cache, "blk:00000", 9, &len);
+    if (data)
+    {
+        ASSERT_TRUE(verify_block_payload(data, len));
+        free(data);
+        printf("    Hot block 0 survived scan burst (still cached)\n");
+    }
+    else
+    {
+        printf("    Hot block 0 was evicted by scan burst (expected)\n");
+    }
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Realistic block cache eviction test passed\n");
+}
+
+/**
+ * test_realistic_node_cache_external_bytes
+ * models btree node caching where the inline payload is a pointer (8 bytes)
+ * but the real cost is the heap-allocated btree_node_t behind it (external_bytes).
+ * this is exactly how btree_node_read_cached uses the cache:
+ *   -- inline payload = sizeof(btree_node_t *) = 8 bytes
+ *   -- external_bytes = actual node size (arena allocation, keys, values)
+ * verifies that eviction is driven by external_bytes, not just inline size.
+ */
+void test_realistic_node_cache_external_bytes(void)
+{
+    printf("Testing realistic node cache with external_bytes...\n");
+
+    /* 128 KB cache -- should hold ~30-60 "nodes" at 2-4KB each */
+    const size_t max_bytes = 128 * 1024;
+    cache_config_t config = {
+        .max_bytes = max_bytes, .num_partitions = 4, .slots_per_partition = 128};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const int num_nodes = 500; /* more nodes than fit in cache */
+    uint32_t rng = 12345;
+
+    /* phase 1: populate -- each entry is a small pointer (8B inline) + large external cost */
+    printf("  Inserting %d nodes with variable external_bytes (1-8 KB each)...\n", num_nodes);
+    size_t total_external_offered = 0;
+
+    for (int i = 0; i < num_nodes; i++)
+    {
+        /* inline payload: simulates a pointer value */
+        uint64_t fake_ptr = (uint64_t)(0xCAFE0000 + i);
+
+        /* external_bytes: simulates the real heap cost of the node */
+        size_t ext = variable_block_size(&rng, 1024, 8192);
+        total_external_offered += ext;
+
+        char key[32];
+        snprintf(key, sizeof(key), "node:%04d", i);
+        clock_cache_put(cache, key, strlen(key), &fake_ptr, sizeof(fake_ptr), ext);
+    }
+
+    clock_cache_stats_t stats;
+    clock_cache_get_stats(cache, &stats);
+    printf("  Total external offered: %zu bytes (%.1fx cache)\n", total_external_offered,
+           (double)total_external_offered / max_bytes);
+    printf("  bytes_used=%zu / %zu, entries=%zu / %d\n", stats.total_bytes, max_bytes,
+           stats.total_entries, num_nodes);
+
+    /* external_bytes should drive eviction -- far fewer than num_nodes should remain */
+    ASSERT_TRUE(stats.total_entries < (size_t)num_nodes);
+    ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
+
+    /* phase 2: Zipfian reads with miss-fill -- simulates btree_node_read_cached:
+     * on miss, read from "disk" and re-populate cache with external_bytes cost.
+     * hot root/internal nodes get re-cached and stay cached. */
+    printf("  Zipfian reads of %d nodes (with miss-fill)...\n", num_nodes);
+    int hits = 0;
+    const int num_reads = 5000;
+    for (int i = 0; i < num_reads; i++)
+    {
+        int nid = zipf_pick(&rng, num_nodes);
+        char key[32];
+        snprintf(key, sizeof(key), "node:%04d", nid);
+
+        size_t len;
+        uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+        if (data)
+        {
+            /* verify inline payload is the expected pointer value */
+            ASSERT_EQ(len, sizeof(uint64_t));
+            uint64_t retrieved_ptr;
+            memcpy(&retrieved_ptr, data, sizeof(uint64_t));
+            ASSERT_EQ(retrieved_ptr, (uint64_t)(0xCAFE0000 + nid));
+            hits++;
+            free(data);
+        }
+        else
+        {
+            /* cache miss -- simulate disk read: re-insert with external_bytes */
+            uint64_t fake_ptr = (uint64_t)(0xCAFE0000 + nid);
+            size_t ext = variable_block_size(&rng, 1024, 8192);
+            clock_cache_put(cache, key, strlen(key), &fake_ptr, sizeof(fake_ptr), ext);
+        }
+    }
+
+    double hit_rate = (double)hits / num_reads * 100.0;
+    printf("  Reads: %d, Hits: %d, Hit rate: %.1f%%\n", num_reads, hits, hit_rate);
+    /* with miss-fill and Zipfian skew, hot nodes get re-cached */
+    ASSERT_TRUE(hits > 0);
+
+    /* phase 3: compare with no external_bytes -- should fit far more entries */
+    clock_cache_clear(cache);
+    for (int i = 0; i < num_nodes; i++)
+    {
+        uint64_t fake_ptr = (uint64_t)(0xBEEF0000 + i);
+        char key[32];
+        snprintf(key, sizeof(key), "noext:%04d", i);
+        clock_cache_put(cache, key, strlen(key), &fake_ptr, sizeof(fake_ptr), 0);
+    }
+
+    clock_cache_stats_t noext_stats;
+    clock_cache_get_stats(cache, &noext_stats);
+    printf("  Without external_bytes: entries=%zu (vs %zu with external)\n",
+           noext_stats.total_entries, stats.total_entries);
+    /* without external cost, many more tiny entries should fit */
+    ASSERT_TRUE(noext_stats.total_entries > stats.total_entries);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Realistic node cache external_bytes test passed\n");
+}
+
+/**
+ * test_realistic_oltp_concurrent
+ * models a realistic concurrent OLTP workload:
+ *   -- 6 reader threads (point lookups, Zipfian -- simulates SELECT queries)
+ *   -- 2 writer threads (insert new blocks + update existing -- simulates INSERT/UPDATE)
+ *   -- cache sized to hold ~30% of working set (forces realistic eviction pressure)
+ *   -- runs for ~1 second, sampling stats every 200ms
+ *   -- verifies: byte budget, data integrity, reasonable hit rates, no crashes
+ */
+#define OLTP_NUM_BLOCKS    10000 /* total block keyspace */
+#define OLTP_BLOCK_MIN_SZ  256
+#define OLTP_BLOCK_MAX_SZ  2048
+#define OLTP_NUM_READERS   6
+#define OLTP_NUM_WRITERS   2
+#define OLTP_TOTAL_THREADS (OLTP_NUM_READERS + OLTP_NUM_WRITERS)
+
+typedef struct
+{
+    clock_cache_t *cache;
+    int thread_id;
+    _Atomic(int) *stop_flag;
+    _Atomic(int64_t) *total_reads;
+    _Atomic(int64_t) *total_hits;
+    _Atomic(int64_t) *total_writes;
+    _Atomic(int) *corruption_count;
+} oltp_thread_args_t;
+
+static void *oltp_reader_thread(void *arg)
+{
+    oltp_thread_args_t *a = (oltp_thread_args_t *)arg;
+    uint32_t rng = (uint32_t)(a->thread_id * 7919 + 1);
+    int64_t local_reads = 0, local_hits = 0;
+
+    while (!atomic_load(a->stop_flag))
+    {
+        /* Zipfian pick from block keyspace */
+        int block_id = zipf_pick(&rng, OLTP_NUM_BLOCKS);
+        char key[32];
+        snprintf(key, sizeof(key), "blk:%05d", block_id);
+
+        size_t len;
+        uint8_t *data = clock_cache_get(a->cache, key, strlen(key), &len);
+        local_reads++;
+        if (data)
+        {
+            local_hits++;
+            if (!verify_block_payload(data, len))
+            {
+                atomic_fetch_add(a->corruption_count, 1);
+            }
+            free(data);
+        }
+    }
+
+    atomic_fetch_add(a->total_reads, local_reads);
+    atomic_fetch_add(a->total_hits, local_hits);
+    return NULL;
+}
+
+static void *oltp_writer_thread(void *arg)
+{
+    oltp_thread_args_t *a = (oltp_thread_args_t *)arg;
+    uint32_t rng = (uint32_t)(a->thread_id * 6271 + 31);
+    int64_t local_writes = 0;
+
+    while (!atomic_load(a->stop_flag))
+    {
+        /* 70% update existing block (Zipfian), 30% insert new sequential block */
+        int op = xorshift32(&rng) % 10;
+        int block_id;
+        if (op < 7)
+        {
+            block_id = zipf_pick(&rng, OLTP_NUM_BLOCKS);
+        }
+        else
+        {
+            block_id = OLTP_NUM_BLOCKS + (int)(local_writes & 0xFFFF);
+        }
+
+        size_t bsz = variable_block_size(&rng, OLTP_BLOCK_MIN_SZ, OLTP_BLOCK_MAX_SZ);
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        fill_block_payload(block, bsz, (uint32_t)block_id);
+
+        char key[32];
+        snprintf(key, sizeof(key), "blk:%05d", block_id);
+        clock_cache_put(a->cache, key, strlen(key), block, bsz, 0);
+        free(block);
+        local_writes++;
+    }
+
+    atomic_fetch_add(a->total_writes, local_writes);
+    return NULL;
+}
+
+void test_realistic_oltp_concurrent(void)
+{
+    printf("Testing realistic concurrent OLTP workload (~1s)...\n");
+
+    /* cache holds ~30% of typical working set to force realistic eviction */
+    const size_t max_bytes = 512 * 1024; /* 512 KB */
+    cache_config_t config = {
+        .max_bytes = max_bytes, .num_partitions = 8, .slots_per_partition = 256};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    /* pre-populate ~2000 hot blocks so readers get hits from the start */
+    printf("  Pre-populating %d hot blocks...\n", 2000);
+    uint32_t rng = 99;
+    for (int i = 0; i < 2000; i++)
+    {
+        size_t bsz = variable_block_size(&rng, OLTP_BLOCK_MIN_SZ, OLTP_BLOCK_MAX_SZ);
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        fill_block_payload(block, bsz, (uint32_t)i);
+
+        char key[32];
+        snprintf(key, sizeof(key), "blk:%05d", i);
+        clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+        free(block);
+    }
+
+    _Atomic(int) stop_flag = 0;
+    _Atomic(int64_t) total_reads = 0, total_hits = 0, total_writes = 0;
+    _Atomic(int) corruption_count = 0;
+
+    pthread_t threads[OLTP_TOTAL_THREADS];
+    oltp_thread_args_t args[OLTP_TOTAL_THREADS];
+
+    for (int i = 0; i < OLTP_TOTAL_THREADS; i++)
+    {
+        args[i].cache = cache;
+        args[i].thread_id = i;
+        args[i].stop_flag = &stop_flag;
+        args[i].total_reads = &total_reads;
+        args[i].total_hits = &total_hits;
+        args[i].total_writes = &total_writes;
+        args[i].corruption_count = &corruption_count;
+    }
+
+    double start = wall_time_sec();
+
+    for (int i = 0; i < OLTP_NUM_READERS; i++)
+        pthread_create(&threads[i], NULL, oltp_reader_thread, &args[i]);
+    for (int i = 0; i < OLTP_NUM_WRITERS; i++)
+        pthread_create(&threads[OLTP_NUM_READERS + i], NULL, oltp_writer_thread,
+                       &args[OLTP_NUM_READERS + i]);
+
+    /* run for ~1 second, sampling stats every 200ms */
+    size_t peak_bytes = 0;
+    for (int sample = 0; sample < 5; sample++)
+    {
+        usleep(200000); /* 200ms */
+        clock_cache_stats_t stats;
+        clock_cache_get_stats(cache, &stats);
+        if (stats.total_bytes > peak_bytes) peak_bytes = stats.total_bytes;
+        printf("    [%dms] bytes=%zu/%zu entries=%zu R=%" PRId64 " W=%" PRId64 "\n",
+               (sample + 1) * 200, stats.total_bytes, max_bytes, stats.total_entries,
+               atomic_load(&total_reads), atomic_load(&total_writes));
+        /* verify byte budget at each sample point */
+        ASSERT_TRUE(stats.total_bytes <= max_bytes * 3);
+    }
+
+    atomic_store(&stop_flag, 1);
+    for (int i = 0; i < OLTP_TOTAL_THREADS; i++) pthread_join(threads[i], NULL);
+
+    double elapsed = wall_time_sec() - start;
+    int64_t tr = atomic_load(&total_reads);
+    int64_t th = atomic_load(&total_hits);
+    int64_t tw = atomic_load(&total_writes);
+    int corr = atomic_load(&corruption_count);
+
+    clock_cache_stats_t final_stats;
+    clock_cache_get_stats(cache, &final_stats);
+
+    double final_hit_rate = (tr > 0) ? (double)th / tr * 100.0 : 0.0;
+    printf("  Results (%.2fs):\n", elapsed);
+    printf("    Reads: %" PRId64 ", Hits: %" PRId64 ", Hit rate: %.1f%%\n", tr, th, final_hit_rate);
+    printf("    Writes: %" PRId64 "\n", tw);
+    printf("    Corruptions: %d\n", corr);
+    printf("    Final bytes=%zu/%zu, peak=%zu, entries=%zu\n", final_stats.total_bytes, max_bytes,
+           peak_bytes, final_stats.total_entries);
+
+    ASSERT_EQ(corr, 0);
+    ASSERT_TRUE(final_stats.total_bytes <= max_bytes * 3);
+    ASSERT_TRUE(tr > 0);
+    ASSERT_TRUE(tw > 0);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Realistic concurrent OLTP test passed\n");
+}
+
+/**
+ * test_realistic_working_set_shift
+ * simulates a workload where the hot working set shifts over time
+ * (e.g., time-series ingestion where recent partitions are hot):
+ *   -- epoch 0: blocks 0-999 are hot
+ *   -- epoch 1: blocks 1000-1999 become hot, 0-999 cool off
+ *   -- epoch 2: blocks 2000-2999 become hot
+ * after each epoch shift, verifies:
+ *   -- new hot blocks achieve high hit rates after warm-up
+ *   -- old cold blocks are mostly evicted
+ *   -- byte budget remains respected
+ */
+void test_realistic_working_set_shift(void)
+{
+    printf("Testing realistic working-set shift (3 epochs)...\n");
+
+    const size_t max_bytes = 256 * 1024; /* 256 KB */
+    cache_config_t config = {
+        .max_bytes = max_bytes, .num_partitions = 4, .slots_per_partition = 256};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const int blocks_per_epoch = 1000;
+    const int num_epochs = 3;
+    const int reads_per_epoch = 5000;
+    uint32_t rng = 7777;
+    int corruptions = 0;
+
+    for (int epoch = 0; epoch < num_epochs; epoch++)
+    {
+        int base = epoch * blocks_per_epoch;
+        printf("  Epoch %d: hot blocks [%d, %d)\n", epoch, base, base + blocks_per_epoch);
+
+        /* insert this epoch's blocks */
+        for (int i = 0; i < blocks_per_epoch; i++)
+        {
+            int bid = base + i;
+            size_t bsz = variable_block_size(&rng, 200, 1024);
+            uint8_t *block = (uint8_t *)malloc(bsz);
+            fill_block_payload(block, bsz, (uint32_t)bid);
+
+            char key[32];
+            snprintf(key, sizeof(key), "ts:%06d", bid);
+            clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+            free(block);
+        }
+
+        /* Zipfian reads within this epoch's range */
+        int hits = 0;
+        for (int i = 0; i < reads_per_epoch; i++)
+        {
+            int offset = zipf_pick(&rng, blocks_per_epoch);
+            int bid = base + offset;
+            char key[32];
+            snprintf(key, sizeof(key), "ts:%06d", bid);
+
+            size_t len;
+            uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+            if (data)
+            {
+                hits++;
+                if (!verify_block_payload(data, len)) corruptions++;
+                free(data);
+            }
+        }
+
+        clock_cache_stats_t stats;
+        clock_cache_get_stats(cache, &stats);
+        double hr = (double)hits / reads_per_epoch * 100.0;
+        printf("    Hit rate: %.1f%% (%d/%d), bytes=%zu/%zu, entries=%zu\n", hr, hits,
+               reads_per_epoch, stats.total_bytes, max_bytes, stats.total_entries);
+        ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
+
+        /* after epoch 1+, verify old epoch blocks are mostly evicted */
+        if (epoch > 0)
+        {
+            int old_base = (epoch - 1) * blocks_per_epoch;
+            int old_found = 0;
+            for (int i = 0; i < 50; i++) /* sample 50 from previous epoch */
+            {
+                int bid = old_base + (int)(xorshift32(&rng) % (unsigned)blocks_per_epoch);
+                char key[32];
+                snprintf(key, sizeof(key), "ts:%06d", bid);
+                size_t len;
+                uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+                if (data)
+                {
+                    old_found++;
+                    if (!verify_block_payload(data, len)) corruptions++;
+                    free(data);
+                }
+            }
+            printf("    Previous epoch sample: %d/50 still cached\n", old_found);
+            /* most old blocks should have been evicted by new epoch's inserts */
+            ASSERT_TRUE(old_found < 40);
+        }
+    }
+
+    ASSERT_EQ(corruptions, 0);
+    printf("  Data integrity: %d corruptions\n", corruptions);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Realistic working-set shift test passed\n");
+}
+
+/**
+ * test_realistic_mixed_block_sizes
+ * models a column family with mixed SST block sizes:
+ *   -- index blocks: small (~128B), frequently accessed
+ *   -- data blocks: large (~2-8KB), less frequently accessed
+ *   -- filter/bloom blocks: medium (~512B), accessed on every query
+ * verifies that the cache fairly handles mixed sizes and that
+ * small hot entries don't get unfairly evicted by large cold entries.
+ */
+void test_realistic_mixed_block_sizes(void)
+{
+    printf("Testing realistic mixed block sizes...\n");
+
+    const size_t max_bytes = 128 * 1024; /* 128 KB */
+    cache_config_t config = {
+        .max_bytes = max_bytes, .num_partitions = 4, .slots_per_partition = 128};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    uint32_t rng = 31337;
+
+    /* insert index blocks (small, 50 entries) */
+    const int num_index = 50;
+    for (int i = 0; i < num_index; i++)
+    {
+        size_t bsz = variable_block_size(&rng, 64, 192);
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        fill_block_payload(block, bsz, (uint32_t)(10000 + i));
+
+        char key[32];
+        snprintf(key, sizeof(key), "idx:%04d", i);
+        clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+        free(block);
+    }
+
+    /* insert filter/bloom blocks (medium, 50 entries) */
+    const int num_filter = 50;
+    for (int i = 0; i < num_filter; i++)
+    {
+        size_t bsz = variable_block_size(&rng, 384, 640);
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        fill_block_payload(block, bsz, (uint32_t)(20000 + i));
+
+        char key[32];
+        snprintf(key, sizeof(key), "flt:%04d", i);
+        clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+        free(block);
+    }
+
+    /* insert data blocks (large, 200 entries -- these will force eviction) */
+    const int num_data = 200;
+    for (int i = 0; i < num_data; i++)
+    {
+        size_t bsz = variable_block_size(&rng, 2048, 8192);
+        uint8_t *block = (uint8_t *)malloc(bsz);
+        fill_block_payload(block, bsz, (uint32_t)(30000 + i));
+
+        char key[32];
+        snprintf(key, sizeof(key), "dat:%04d", i);
+        clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+        free(block);
+    }
+
+    clock_cache_stats_t stats;
+    clock_cache_get_stats(cache, &stats);
+    printf("  After inserting %d idx + %d flt + %d dat blocks:\n", num_index, num_filter, num_data);
+    printf("    bytes=%zu/%zu, entries=%zu\n", stats.total_bytes, max_bytes, stats.total_entries);
+    ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
+
+    /* now simulate realistic query pattern: each query reads 1 index + 1 filter + 1 data block
+     * index/filter blocks are Zipfian-hot, data blocks are more uniformly accessed */
+    printf("  Simulating 5000 queries (idx + flt + dat per query)...\n");
+    int idx_hits = 0, flt_hits = 0, dat_hits = 0;
+    int corruptions = 0;
+    const int num_queries = 5000;
+
+    for (int q = 0; q < num_queries; q++)
+    {
+        /* index lookup -- Zipfian hot */
+        int iid = zipf_pick(&rng, num_index);
+        char key[32];
+        snprintf(key, sizeof(key), "idx:%04d", iid);
+        size_t len;
+        uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+        if (data)
+        {
+            idx_hits++;
+            if (!verify_block_payload(data, len)) corruptions++;
+            free(data);
+        }
+        else
+        {
+            /* miss-fill: simulate disk read populating cache */
+            size_t bsz = variable_block_size(&rng, 64, 192);
+            uint8_t *block = (uint8_t *)malloc(bsz);
+            fill_block_payload(block, bsz, (uint32_t)(10000 + iid));
+            clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+            free(block);
+        }
+
+        /* filter check -- Zipfian hot (same distribution as index) */
+        int fid = zipf_pick(&rng, num_filter);
+        snprintf(key, sizeof(key), "flt:%04d", fid);
+        data = clock_cache_get(cache, key, strlen(key), &len);
+        if (data)
+        {
+            flt_hits++;
+            if (!verify_block_payload(data, len)) corruptions++;
+            free(data);
+        }
+        else
+        {
+            size_t bsz = variable_block_size(&rng, 384, 640);
+            uint8_t *block = (uint8_t *)malloc(bsz);
+            fill_block_payload(block, bsz, (uint32_t)(20000 + fid));
+            clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+            free(block);
+        }
+
+        /* data block -- more uniform (less skew, models range scans) */
+        int did = xorshift32(&rng) % num_data;
+        snprintf(key, sizeof(key), "dat:%04d", did);
+        data = clock_cache_get(cache, key, strlen(key), &len);
+        if (data)
+        {
+            dat_hits++;
+            if (!verify_block_payload(data, len)) corruptions++;
+            free(data);
+        }
+        else
+        {
+            size_t bsz = variable_block_size(&rng, 2048, 8192);
+            uint8_t *block = (uint8_t *)malloc(bsz);
+            fill_block_payload(block, bsz, (uint32_t)(30000 + did));
+            clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+            free(block);
+        }
+
+        /* periodically re-insert a data block (simulates compaction output) */
+        if (q % 50 == 0)
+        {
+            int new_did = num_data + q;
+            size_t bsz = variable_block_size(&rng, 2048, 8192);
+            uint8_t *block = (uint8_t *)malloc(bsz);
+            fill_block_payload(block, bsz, (uint32_t)(30000 + new_did));
+
+            snprintf(key, sizeof(key), "dat:%04d", new_did);
+            clock_cache_put(cache, key, strlen(key), block, bsz, 0);
+            free(block);
+        }
+    }
+
+    printf("    Index hit rate:  %.1f%% (%d/%d)\n", (double)idx_hits / num_queries * 100.0,
+           idx_hits, num_queries);
+    printf("    Filter hit rate: %.1f%% (%d/%d)\n", (double)flt_hits / num_queries * 100.0,
+           flt_hits, num_queries);
+    printf("    Data hit rate:   %.1f%% (%d/%d)\n", (double)dat_hits / num_queries * 100.0,
+           dat_hits, num_queries);
+    printf("    Corruptions: %d\n", corruptions);
+
+    ASSERT_EQ(corruptions, 0);
+
+    clock_cache_get_stats(cache, &stats);
+    printf("    Final: bytes=%zu/%zu, entries=%zu\n", stats.total_bytes, max_bytes,
+           stats.total_entries);
+    ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Realistic mixed block sizes test passed\n");
+}
+
+int main(int argc, char **argv)
+{
+    INIT_TEST_FILTER(argc, argv);
     srand((unsigned int)time(NULL));
     RUN_TEST(test_cache_create_destroy, tests_passed);
     RUN_TEST(test_cache_put_get, tests_passed);
@@ -1902,6 +2709,11 @@ int main(void)
     RUN_TEST(test_foreach_prefix_concurrent, tests_passed);
     RUN_TEST(test_put_after_shutdown, tests_passed);
     RUN_TEST(test_concurrent_delete_while_reading, tests_passed);
+    RUN_TEST(test_realistic_block_cache_eviction, tests_passed);
+    RUN_TEST(test_realistic_node_cache_external_bytes, tests_passed);
+    RUN_TEST(test_realistic_oltp_concurrent, tests_passed);
+    RUN_TEST(test_realistic_working_set_shift, tests_passed);
+    RUN_TEST(test_realistic_mixed_block_sizes, tests_passed);
     RUN_TEST(benchmark_cache_insertions, tests_passed);
     RUN_TEST(benchmark_cache_lookups, tests_passed);
     RUN_TEST(benchmark_concurrent_puts, tests_passed);

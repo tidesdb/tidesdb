@@ -200,6 +200,9 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
     const size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
                                  ? partition->hash_index_size
                                  : CLOCK_CACHE_MAX_HASH_PROBE;
+    size_t removed_pos = SIZE_MAX;
+
+    /* find the entry to remove */
     for (size_t probe = 0; probe < max_probe; probe++)
     {
         const size_t pos = (idx + probe) & partition->hash_mask;
@@ -207,15 +210,58 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
 
         if (current == (int32_t)slot_idx)
         {
-            atomic_store_explicit(&partition->hash_index[pos], -1, memory_order_release);
-            return;
+            removed_pos = pos;
+            break;
         }
 
         if (current == -1)
         {
-            return;
+            return; /* entry not in index */
         }
     }
+
+    if (removed_pos == SIZE_MAX) return;
+
+    /* backward-shift deletion: shift subsequent entries back to fill the gap
+     * this preserves the linear probing chain so lookups don't break */
+    size_t empty = removed_pos;
+    for (size_t step = 1; step < max_probe; step++)
+    {
+        const size_t candidate = (removed_pos + step) & partition->hash_mask;
+        int32_t cand_slot =
+            atomic_load_explicit(&partition->hash_index[candidate], memory_order_acquire);
+
+        if (cand_slot == -1)
+        {
+            break; /* end of cluster */
+        }
+
+        /* check if this entry's ideal position is at or before the empty slot
+         * if so, shift it back to fill the gap */
+        uint64_t cand_hash =
+            atomic_load_explicit(&partition->slots[cand_slot].cached_hash, memory_order_relaxed);
+        const size_t cand_ideal = cand_hash & partition->hash_mask;
+
+        /* entry belongs at or before the empty slot if moving it would bring it
+         * closer to (or keep it at) its ideal position.
+         * with wrapping: entry is displaced if its ideal position is in the range
+         * (empty, candidate] on the circular index, i.e., it does NOT need to pass
+         * through the empty slot to reach candidate from ideal position */
+        int displaced;
+        if (empty <= candidate)
+            displaced = (cand_ideal <= empty || cand_ideal > candidate);
+        else
+            displaced = (cand_ideal <= empty && cand_ideal > candidate);
+
+        if (displaced)
+        {
+            atomic_store_explicit(&partition->hash_index[empty], cand_slot, memory_order_release);
+            empty = candidate;
+        }
+    }
+
+    /* clear the final empty position */
+    atomic_store_explicit(&partition->hash_index[empty], -1, memory_order_release);
 }
 
 /**
@@ -329,6 +375,7 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
     void *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     const size_t plen = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
+    const size_t klen = atomic_load_explicit(&entry->key_len, memory_order_acquire);
 
     if (!key || !payload)
     {
@@ -381,15 +428,74 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     atomic_store_explicit(&entry->payload_len, 0, memory_order_release);
     atomic_store_explicit(&entry->ref_bit, 0, memory_order_release);
 
+    const size_t ext_bytes = atomic_load_explicit(&entry->external_bytes, memory_order_relaxed);
+
     atomic_fetch_sub_explicit(&partition->occupied_count, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&partition->bytes_used, entry_size(klen, plen) + ext_bytes,
+                              memory_order_relaxed);
 
     /* we transition to empty state */
     atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
 }
 
 /**
+ * evict_for_space
+ * CLOCK eviction that targets VALID entries to free memory.
+ * skips EMPTY slots (unlike clock_evict which returns them).
+ * uses two passes: first pass clears ref_bits, second pass evicts.
+ * @param cache the cache
+ * @param partition the partition
+ * @return 1 if an entry was evicted, 0 if no evictable entry found
+ */
+static int evict_for_space(const clock_cache_t *cache, clock_cache_partition_t *partition)
+{
+    const size_t slots_mask = partition->slots_mask;
+    const size_t start =
+        atomic_fetch_add_explicit(&partition->clock_hand, 1, memory_order_relaxed) & slots_mask;
+
+    /* we limit scan distance based on occupied count rather than total slots.
+     * when the partition is sparsely populated (e.g., 128 entries in 8192 slots),
+     * scanning all slots wastes 98%+ of iterations on EMPTY slots.
+     * we scan at most occupied_count * 3 slots (gives high probability of finding
+     * a victim even with clustering) with a minimum of 64. */
+    const size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
+    size_t scan_limit = occupied * 3;
+    if (scan_limit < 64) scan_limit = 64;
+    if (scan_limit > partition->num_slots) scan_limit = partition->num_slots;
+
+    /* two passes: pass 0 clears ref_bits, pass 1 evicts entries with ref_bit=0 */
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (size_t i = 0; i < scan_limit; i++)
+        {
+            const size_t hand = (start + i) & slots_mask;
+            clock_cache_entry_t *entry = &partition->slots[hand];
+
+            const uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+            if (state != ENTRY_VALID) continue;
+
+            const uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+            if (CLOCK_CACHE_HAS_READERS(ref)) continue;
+
+            if ((ref & CLOCK_CACHE_REF_BIT) == 0)
+            {
+                /* no ref_bit, no readers -- evict */
+                free_entry(cache, partition, entry);
+                atomic_store_explicit(&partition->clock_hand, hand + 1, memory_order_relaxed);
+                return 1;
+            }
+
+            /* ref_bit set -- clear it (second chance), will evict on next pass */
+            atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK, memory_order_relaxed);
+        }
+    }
+
+    return 0;
+}
+
+/**
  * clock_evict
- * CLOCK second-chance eviction -- finds or frees a slot
+ * CLOCK second-chance eviction -- finds or frees a slot for new entry insertion
  * @param cache the cache
  * @param partition the partition
  * @return slot index of an available (empty or just-evicted) entry
@@ -433,8 +539,6 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
 
         if (state != ENTRY_VALID)
         {
-            /* fast-skip transient states (WRITING/DELETING) without counting
-             * toward max_iterations -- these are momentary and will resolve */
             iterations++;
             continue;
         }
@@ -493,12 +597,33 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
 static int ensure_space(const clock_cache_t *cache, clock_cache_partition_t *partition,
                         const size_t required_bytes)
 {
-    (void)required_bytes;
+    const size_t max_partition_bytes = cache->max_bytes / cache->num_partitions;
+    const size_t current_bytes = atomic_load_explicit(&partition->bytes_used, memory_order_relaxed);
+    const size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
 
-    /* we use cached occupied count instead of scanning all slots */
-    size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
+    /* fast path -- if we have room in both byte budget and slot count, skip entirely.
+     * this is the common case when the cache is not yet full or has been recently evicted. */
+    if (current_bytes + required_bytes <= max_partition_bytes &&
+        occupied < partition->evict_threshold)
+    {
+        return 0;
+    }
 
-    /* if partition is getting full (>85%), evict one entry */
+    /* byte-based eviction -- enforce per-partition byte budget */
+    if (max_partition_bytes > 0 && current_bytes + required_bytes > max_partition_bytes)
+    {
+        size_t cur = current_bytes;
+        size_t evict_rounds = 0;
+        const size_t max_evictions = occupied;
+        while (cur + required_bytes > max_partition_bytes && evict_rounds < max_evictions)
+        {
+            if (!evict_for_space(cache, partition)) break;
+            cur = atomic_load_explicit(&partition->bytes_used, memory_order_relaxed);
+            evict_rounds++;
+        }
+    }
+
+    /* slot-count-based eviction -- prevent hash table overload */
     if (occupied >= partition->evict_threshold)
     {
         clock_evict(cache, partition);
@@ -723,7 +848,7 @@ void clock_cache_destroy(clock_cache_t *cache)
 }
 
 int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
-                    size_t payload_len)
+                    size_t payload_len, size_t external_bytes)
 {
     if (!cache || !key || key_len == 0 || !payload) return -1;
 
@@ -732,7 +857,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     const uint64_t hash = compute_hash(key, key_len);
     const size_t partition_idx = get_local_partition(cache, hash);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
-    const size_t entry_bytes = entry_size(key_len, payload_len);
+    const size_t entry_bytes = entry_size(key_len, payload_len) + external_bytes;
 
     /* we try to find and invalidate existing entry (best-effort update) */
     clock_cache_entry_t *old_entry = find_entry_with_hash(partition, key, key_len, hash);
@@ -796,11 +921,84 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     atomic_store_explicit(&entry->key_len, key_len, memory_order_release);
     atomic_store_explicit(&entry->payload_len, payload_len, memory_order_release);
     atomic_store_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_release);
+    atomic_store_explicit(&entry->external_bytes, external_bytes, memory_order_release);
 
     /* we transition to valid, entry is now visible */
     atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
 
     atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
+
+    hash_table_insert(partition, hash, slot_idx);
+
+    return 0;
+}
+
+int clock_cache_put_new(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
+                        size_t payload_len, size_t external_bytes)
+{
+    if (!cache || !key || key_len == 0 || !payload) return -1;
+
+    if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
+
+    const uint64_t hash = compute_hash(key, key_len);
+    const size_t partition_idx = get_local_partition(cache, hash);
+    clock_cache_partition_t *partition = &cache->partitions[partition_idx];
+    const size_t entry_bytes = entry_size(key_len, payload_len) + external_bytes;
+
+    /* skip find_entry_with_hash -- caller guarantees key is not in cache
+     * this saves a full hash table probe on the cache-miss-then-populate path */
+
+    ensure_space(cache, partition, entry_bytes);
+
+    clock_cache_entry_t *entry = NULL;
+    size_t slot_idx = 0;
+    const int max_retries = CLOCK_CACHE_MAX_PUT_RETRIES;
+
+    for (int retry = 0; retry < max_retries; retry++)
+    {
+        slot_idx = clock_evict(cache, partition);
+        entry = &partition->slots[slot_idx];
+        PREFETCH_WRITE(entry);
+
+        uint8_t expected = ENTRY_EMPTY;
+        if (atomic_compare_exchange_strong(&entry->state, &expected, ENTRY_WRITING))
+        {
+            break;
+        }
+
+        entry = NULL;
+    }
+
+    if (!entry)
+    {
+        return -1;
+    }
+
+    const size_t aligned_key_len = CLOCK_CACHE_ALIGN_UP(key_len, CLOCK_CACHE_PAYLOAD_ALIGN);
+    char *new_buf = (char *)malloc(aligned_key_len + payload_len);
+    if (!new_buf)
+    {
+        atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
+        return -1;
+    }
+
+    char *new_key = new_buf;
+    void *new_payload = new_buf + aligned_key_len;
+    memcpy(new_key, key, key_len);
+    memcpy(new_payload, payload, payload_len);
+
+    atomic_store_explicit(&entry->key, new_key, memory_order_release);
+    atomic_store_explicit(&entry->payload, new_payload, memory_order_release);
+    atomic_store_explicit(&entry->key_len, key_len, memory_order_release);
+    atomic_store_explicit(&entry->payload_len, payload_len, memory_order_release);
+    atomic_store_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_release);
+    atomic_store_explicit(&entry->external_bytes, external_bytes, memory_order_release);
+
+    atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
+
+    atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
 
     hash_table_insert(partition, hash, slot_idx);
 
@@ -955,6 +1153,11 @@ void clock_cache_clear(clock_cache_t *cache)
         }
     }
 
+    /* reset per-partition byte counters (may have residual from reader-held entries) */
+    for (size_t i = 0; i < cache->num_partitions; i++)
+    {
+        atomic_store_explicit(&cache->partitions[i].bytes_used, 0, memory_order_relaxed);
+    }
     atomic_store_explicit(&cache->total_bytes, 0, memory_order_relaxed);
 }
 
@@ -962,37 +1165,23 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
 {
     if (!cache || !stats) return;
 
+    /* we use tracked per-partition counters instead of scanning all slots
+     * this is O(num_partitions) instead of O(total_slots) */
     size_t total_bytes = 0;
     size_t total_entries = 0;
-    for (size_t i = 0; i < cache->num_partitions; i++)
-    {
-        clock_cache_partition_t *partition = &cache->partitions[i];
-        for (size_t j = 0; j < partition->num_slots; j++)
-        {
-            uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_relaxed);
-            if (state == ENTRY_VALID)
-            {
-                const size_t klen =
-                    atomic_load_explicit(&partition->slots[j].key_len, memory_order_relaxed);
-                const size_t plen =
-                    atomic_load_explicit(&partition->slots[j].payload_len, memory_order_relaxed);
-                total_bytes += entry_size(klen, plen);
-                total_entries++;
-            }
-        }
-    }
-
-    stats->total_bytes = total_bytes;
-    stats->total_entries = total_entries;
-
-    /* we sum per-partition counters to avoid false sharing on hot path */
     uint64_t total_hits = 0;
     uint64_t total_misses = 0;
     for (size_t i = 0; i < cache->num_partitions; i++)
     {
+        total_bytes += atomic_load_explicit(&cache->partitions[i].bytes_used, memory_order_relaxed);
+        total_entries +=
+            atomic_load_explicit(&cache->partitions[i].occupied_count, memory_order_relaxed);
         total_hits += atomic_load_explicit(&cache->partitions[i].hits, memory_order_relaxed);
         total_misses += atomic_load_explicit(&cache->partitions[i].misses, memory_order_relaxed);
     }
+
+    stats->total_bytes = total_bytes;
+    stats->total_entries = total_entries;
     stats->hits = total_hits;
     stats->misses = total_misses;
     stats->num_partitions = cache->num_partitions;

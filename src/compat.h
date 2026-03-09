@@ -1794,6 +1794,41 @@ static inline void tdb_set_thread_name(const char *name)
 #endif
 #endif
 
+/* cross-platform pwritev for scatter-gather I/O
+ * POSIX systems (Linux, macOS, BSDs) have native pwritev in <sys/uio.h>
+ * Windows falls back to sequential pwrite calls */
+#ifdef _WIN32
+struct iovec
+{
+    void *iov_base;
+    size_t iov_len;
+};
+
+/*
+ * pwritev
+ * scatter-gather write at offset (Windows fallback using sequential pwrite)
+ * @param fd the file descriptor
+ * @param iov array of iovec buffers
+ * @param iovcnt number of iovec entries
+ * @param offset the file offset to write at
+ * @return total bytes written, or -1 on error
+ */
+static inline ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++)
+    {
+        ssize_t n = pwrite(fd, iov[i].iov_base, iov[i].iov_len, offset);
+        if (n != (ssize_t)iov[i].iov_len) return (total > 0) ? total : -1;
+        total += n;
+        offset += n;
+    }
+    return total;
+}
+#else
+#include <sys/uio.h>
+#endif
+
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */
 #if !defined(_MSC_VER) || _MSC_VER >= 1930
 /*

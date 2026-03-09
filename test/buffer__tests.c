@@ -1172,8 +1172,9 @@ void test_buffer_validate_edge_cases(void)
     buffer_free(buffer);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_buffer_create, tests_passed);
     RUN_TEST(test_buffer_acquire_release, tests_passed);
     RUN_TEST(test_buffer_get, tests_passed);

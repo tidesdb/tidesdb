@@ -2215,8 +2215,9 @@ void test_block_manager_convert_sync_mode(void)
     ASSERT_EQ(convert_sync_mode(-1), BLOCK_MANAGER_SYNC_NONE);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_block_manager_open, tests_passed);
     RUN_TEST(test_block_manager_block_create, tests_passed);
     RUN_TEST(test_block_manager_block_write, tests_passed);

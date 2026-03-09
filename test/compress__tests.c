@@ -678,8 +678,9 @@ void benchmark_compress_small_payloads(void)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
 #ifndef __sun
     RUN_TEST(test_compress_decompress_snappy, tests_passed);
 #endif

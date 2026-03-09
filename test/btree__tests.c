@@ -1774,8 +1774,9 @@ void bench_btree_node_sizes()
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_btree_builder_new, tests_passed);
     RUN_TEST(test_btree_builder_add_single, tests_passed);
     RUN_TEST(test_btree_builder_add_multiple, tests_passed);

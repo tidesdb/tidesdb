@@ -360,7 +360,6 @@ block_manager_block_t *block_manager_block_create(const uint64_t size, const voi
     if (!block->data)
     {
         free(block);
-        block = NULL;
         return NULL;
     }
 
@@ -412,8 +411,8 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
 
     /* block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
-     * we write header, data, and footer with separate pwrite calls
-     * to avoid copying block data into an intermediate buffer */
+     * we use pwritev scatter-gather I/O to write header, data, and footer
+     * in a single syscall while avoiding copying block data into an intermediate buffer */
     unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
     encode_uint32_le_compat(header, (uint32_t)block->size);
     encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
@@ -422,22 +421,16 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     encode_uint32_le_compat(footer, (uint32_t)block->size);
     encode_uint32_le_compat(footer + 4, BLOCK_MANAGER_FOOTER_MAGIC);
 
-    /* we write header */
-    off_t write_pos = (off_t)offset;
-    if (BM_UNLIKELY(pwrite(bm->fd, header, BLOCK_MANAGER_BLOCK_HEADER_SIZE, write_pos) !=
-                    (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE))
-        return -1;
-    write_pos += BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    /* we write header + data + footer in a single pwritev call -- zero copy from block->data */
+    struct iovec iov[3];
+    iov[0].iov_base = header;
+    iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    iov[1].iov_base = block->data;
+    iov[1].iov_len = block->size;
+    iov[2].iov_base = footer;
+    iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    /* we write data directly from block->data -- zero copy */
-    if (BM_UNLIKELY(pwrite(bm->fd, block->data, block->size, write_pos) != (ssize_t)block->size))
-        return -1;
-    write_pos += (off_t)block->size;
-
-    /* write footer */
-    if (BM_UNLIKELY(pwrite(bm->fd, footer, BLOCK_MANAGER_FOOTER_SIZE, write_pos) !=
-                    (ssize_t)BLOCK_MANAGER_FOOTER_SIZE))
-        return -1;
+    if (BM_UNLIKELY(pwritev(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size)) return -1;
 
     /* if O_DSYNC is available and was used at open time, pwrite already synced
      * otherwise fall back to explicit fdatasync for durability */
@@ -895,9 +888,10 @@ block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_curso
     if (!block) return NULL;
 
     /* we advance cursor using the block size we just read, avoiding redundant pread */
-    cursor->current_block_size = block->size;
     cursor->current_pos +=
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
+    cursor->current_block_size = 0;
+    cursor->block_size_valid = 0; /* invalidate cache -- we moved to a new position */
     cursor->block_index++;
 
     return block;
@@ -908,7 +902,6 @@ void block_manager_cursor_free(block_manager_cursor_t *cursor)
     if (cursor)
     {
         free(cursor);
-        cursor = NULL;
     }
 }
 
@@ -1029,34 +1022,11 @@ int block_manager_truncate(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    if (ftruncate(bm->fd, 0) != 0)
-    {
-        return -1;
-    }
+    /* truncate to header-only (preserves valid header, single sync) */
+    if (truncate_to_header(bm) != 0) return -1;
 
-    /* ftruncate is not covered by O_DSYNC, always sync truncation */
-    if (is_sync_full(bm))
-    {
-        fdatasync(bm->fd);
-    }
-
+    /* reopen fd to clear kernel page cache state after truncation */
     if (reopen_fd(bm) != 0) return -1;
-
-    if (write_header(bm->fd) != 0)
-    {
-        return -1;
-    }
-
-    if (is_sync_full(bm) && !odsync_available())
-    {
-        if (fdatasync(bm->fd) != 0)
-        {
-            return -1;
-        }
-    }
-
-    /* we reset cached file size to header size */
-    atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
 
     return 0;
 }
@@ -1297,9 +1267,9 @@ int block_manager_validate_last_block(block_manager_t *bm,
     }
 
     /* footer magic is valid, verify size matches header */
-    const uint64_t block_start =
-        file_size - BLOCK_MANAGER_FOOTER_SIZE - footer_size - BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (block_start < BLOCK_MANAGER_HEADER_SIZE)
+    const uint64_t min_required =
+        (uint64_t)BLOCK_MANAGER_FOOTER_SIZE + footer_size + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    if (file_size < min_required + BLOCK_MANAGER_HEADER_SIZE)
     {
         if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
@@ -1309,6 +1279,8 @@ int block_manager_validate_last_block(block_manager_t *bm,
         /*** permissive mode -- truncate to header */
         return truncate_to_header(bm);
     }
+
+    const uint64_t block_start = file_size - min_required;
 
     unsigned char header_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     if (pread(bm->fd, header_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)block_start) !=

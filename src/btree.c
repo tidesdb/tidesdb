@@ -1188,8 +1188,8 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     /* rc_count = 2, 1 for cache ownership + 1 for caller */
     atomic_store_explicit(&new_node->rc_count, 2, memory_order_relaxed);
 
-    clock_cache_put(tree->node_cache, cache_key, (size_t)key_len, &new_node,
-                    sizeof(btree_node_t *));
+    clock_cache_put(tree->node_cache, cache_key, (size_t)key_len, &new_node, sizeof(btree_node_t *),
+                    0);
 
     *node = new_node;
     return 0;

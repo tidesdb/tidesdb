@@ -77,6 +77,7 @@ typedef enum
  * @param fd the file descriptor the block manager is managing
  * @param file_path the path of the file
  * @param sync_mode sync mode for this block manager
+ * @param sync_full_cached cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL)
  * @param current_file_size track file size in memory to avoid syscalls
  */
 typedef struct
@@ -112,6 +113,7 @@ typedef struct
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
  * @param block_index current index in shared position cache (-1 if before first block)
+ * @param block_size_valid 1 if current_block_size is cached and valid, 0 otherwise
  */
 typedef struct
 {
@@ -119,7 +121,7 @@ typedef struct
     uint64_t current_pos;
     uint64_t current_block_size;
     int block_index;
-    int block_size_valid; /* 1 if current_block_size is cached and valid, 0 otherwise */
+    int block_size_valid;
 } block_manager_cursor_t;
 
 /**

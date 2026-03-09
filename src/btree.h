@@ -238,6 +238,7 @@ typedef struct
  * @param max_seq maximum sequence number
  * @param node_cache node cache for fast lookups (optional, can be NULL)
  * @param node_arena arena for cached node allocations (owned by btree, created with cache)
+ * @param cache_key_prefix precomputed cache key prefix for this btree's node cache entries
  */
 struct btree_t
 {
@@ -285,6 +286,7 @@ typedef struct
  * @param current_leaf_offset offset of current leaf node
  * @param at_end flag indicating cursor is past end
  * @param at_begin flag indicating cursor is before begin
+ * @param using_cache flag indicating current node was loaded from cache
  */
 struct btree_cursor_t
 {

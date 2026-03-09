@@ -328,7 +328,7 @@ static inline int skip_list_compare_keys_32_inline(const uint8_t *key1, const ui
 /**
  * skip_list_get_latest_valid_version
  * fast path for accessing the latest valid version
- * @param node node to get version from
+ * @param version version to check
  * @param current_time current time for TTL validation
  * @return latest valid version, or NULL if none
  */
@@ -609,6 +609,7 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
 /**
  * skip_list_create_version
  * creates a new version for a key
+ * @param list skip list (for arena allocation)
  * @param value value data
  * @param value_size size of value
  * @param ttl time-to-live
@@ -649,6 +650,7 @@ static skip_list_version_t *skip_list_create_version(const skip_list_t *list, co
 /**
  * skip_list_free_version
  * frees a single version
+ * @param list skip list (for arena deallocation)
  * @param version version to free
  */
 static void skip_list_free_version(const skip_list_t *list, skip_list_version_t *version)
@@ -661,6 +663,7 @@ static void skip_list_free_version(const skip_list_t *list, skip_list_version_t 
 /**
  * skip_list_free_version_list
  * frees a linked list of versions
+ * @param list skip list (for arena deallocation)
  * @param head head of version list
  */
 static void skip_list_free_version_list(const skip_list_t *list, skip_list_version_t *head)

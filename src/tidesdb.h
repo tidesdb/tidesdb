@@ -472,6 +472,7 @@ struct tidesdb_column_family_t
  * consists of two files: .klog (keys + metadata) and .vlog (large values)
  * @param id unique identifier
  * @param klog_path path to .klog file
+ * @param klog_filename cached pointer into klog_path past the last path separator
  * @param vlog_path path to .vlog file
  * @param cf_name cached column family name for block cache lookups
  * @param min_key minimum key in this sstable
@@ -615,6 +616,9 @@ struct tidesdb_level_t
  * @param resolved_memory_limit resolved global memory limit in bytes
  * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
+ * @param txn_memory_bytes bytes held by in-flight transactions
+ * @param flush_pending_count number of pending flush operations (queued + in-flight)
+ * @param os_check_counter counter for periodic os-level memory checks
  * @param cf_list_lock rwlock for cf list modifications
  * @param deferred_free_list lock-free singly-linked list of deferred free nodes for retired arrays
  * @param lock_fd file descriptor for lock file
@@ -777,6 +781,10 @@ struct tidesdb_txn_t
  * @param num_cached_sources number of cached sources
  * @param cached_sources_capacity capacity of cached sources array
  * @param cached_layout_version sstable layout version when sources were cached
+ * @param cached_mt_sources cached memtable sources for reuse across seeks
+ * @param num_cached_mt_sources number of cached memtable sources
+ * @param temp_sources pre-allocated temporary source array for seek operations
+ * @param temp_sources_capacity capacity of temp_sources array
  */
 struct tidesdb_iter_t
 {

@@ -59,7 +59,7 @@ typedef struct
  * @param ref_bit atomic ref bit (LSB) plus reader count in upper bits
  * @param state atomic state -- 0=empty, 1=writing, 2=valid, 3=deleting
  * @param cached_hash cached hash value for this entry
- * @param _pad padding to align struct to cache line size
+ * @param external_bytes caller-declared memory cost of pointed-to data
  */
 typedef struct
 {
@@ -70,7 +70,7 @@ typedef struct
     _Atomic(uint8_t) ref_bit;
     _Atomic(uint8_t) state;
     atomic_uint64_t cached_hash;
-    atomic_size_t external_bytes; /* caller-declared memory cost of pointed-to data */
+    atomic_size_t external_bytes;
 } clock_cache_entry_t;
 
 /** entry states */

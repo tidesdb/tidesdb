@@ -77,6 +77,7 @@ typedef enum
  * @param fd the file descriptor the block manager is managing
  * @param file_path the path of the file
  * @param sync_mode sync mode for this block manager
+ * @param sync_full_cached cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL)
  * @param current_file_size track file size in memory to avoid syscalls
  */
 typedef struct

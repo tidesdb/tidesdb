@@ -274,9 +274,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_MEMORY_PRESSURE_CRITICAL_RATIO 0.90 /* ratio threshold for critical */
 #define TDB_MEMORY_AUTO_LIMIT_RATIO        0.50 /* auto limit = 50% of total memory */
 #define TDB_MEMORY_MIN_LIMIT_RATIO         0.05 /* minimum limit = 5% of total memory */
-#define TDB_MEMORY_OS_CHECK_INTERVAL \
-    50 /* OS memory check every 50 reaper cycles (~5s at 100ms sleep) */
-#define TDB_MEMORY_OS_CRITICAL_RATIO 0.05 /* OS critically low if < 5% free */
+#define TDB_MEMORY_OS_CHECK_INTERVAL       50
+#define TDB_MEMORY_OS_CRITICAL_RATIO       0.05 /* OS critically low if < 5% free */
 
 /* lock-free immutable snapshot configuration */
 #define TDB_IMM_SNAP_ACQUIRE_SPIN_LIMIT 4 /* spins before yielding in snapshot acquire */
@@ -1102,7 +1101,7 @@ static void tidesdb_cache_evict_block(void *payload, const size_t payload_len)
  * tidesdb_block_cache_key
  * generate a cache key for a block
  * @param cf_name column family name
- * @param klog_path path to klog file
+ * @param klog_filename filename portion of klog path (past last separator)
  * @param block_position position of block in klog
  * @param key_buffer buffer to store the cache key
  * @param buffer_size size of key_buffer
@@ -1158,7 +1157,7 @@ static size_t tidesdb_block_cache_key(const char *cf_name, const char *klog_file
  * uses clock_cache_put_new since we just confirmed the key was absent (cache miss).
  * @param db the database
  * @param cf_name column family name
- * @param klog_path path to klog file
+ * @param klog_filename filename portion of klog path (past last separator)
  * @param block_position position of block in file
  * @param block_data raw block bytes (from pread, before or after decompression)
  * @param block_size size of block data
@@ -1186,7 +1185,7 @@ static int tidesdb_cache_raw_block_put(tidesdb_t *db, const char *cf_name,
  * retrieves cached raw block bytes (allocates a copy -- caller must free).
  * @param db the database
  * @param cf_name column family name
- * @param klog_path path to klog file
+ * @param klog_filename filename portion of klog path (past last separator)
  * @param block_position position of block in file
  * @param out_size output parameter for the size of the returned data
  * @return allocated copy of raw block bytes (caller must free), or NULL on miss
@@ -2324,16 +2323,13 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
  * tidesdb_build_indexed_block_data
  * builds a key offset index with pre-computed absolute sequence numbers
  * and prepends it to decompressed block data.
- * the indexed format allows search_raw to skip BOTH the O(N) linear scan (Phase 1)
- * AND the O(found) delta-seq reconstruction loop on cache hits.
+ * the indexed format allows search_raw to skip both the O(N) linear scan
+ * and the O(found) delta-seq reconstruction loop on cache hits.
  *
- * v2 indexed format:
  *   [magic_v2:u32][header_size:u32][num_entries:u32]
  *   [entry × (entry_off:u32, key_off:u32, key_size:u32, abs_seq_lo:u32, abs_seq_hi:u32)]
  *   [original decompressed block data]
  *
- * entry size is 20 bytes. pre-computed abs_seq eliminates
- * the O(found) delta-seq reconstruction that was consuming ~48% of total CPU.
  *
  * @param data decompressed block data
  * @param data_size size of data
@@ -2479,13 +2475,6 @@ static int tidesdb_build_indexed_block_data(const uint8_t *data, const size_t da
 
 /**
  * tidesdb_klog_block_search_raw
- * searches serialized klog block bytes directly for a key WITHOUT full deserialization.
- * instead of deserializing all ~1084 entries (125KB arena + 108KB value copies),
- * we build a compact index of key offsets (8 bytes/entry) and binary search in-place.
- * on match, we extract only the single matching entry's data.
- *
- * perf analysis showed full deserialization (tidesdb_klog_block_deserialize + memmove)
- * consumed 87% of CPU for point lookups. this function eliminates that bottleneck.
  *
  * @param data serialized (decompressed) klog block bytes
  * @param data_size size of data
@@ -2506,9 +2495,6 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
 {
     if (!data || data_size < sizeof(uint32_t) * 2 || !search_key || !out_entry) return -2;
 
-    /* pre-computed abs_seq + key offsets from cache.
-     * eliminates both O(N) linear scan and O(found) delta-seq reconstruction.
-     * this is the hot path for ~87%+ of reads (cache hits). */
     const uint32_t maybe_magic = decode_uint32_le_compat(data);
     if (maybe_magic == TDB_BLOCK_INDEX_MAGIC)
     {
@@ -2606,7 +2592,7 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
     }
 
     /** raw block data from disk (cache miss).
-     * build offset index via phase 1 linear scan, then binary search. */
+     * build offset index via linear scan, then binary search. */
     const uint8_t *ptr = data;
     const uint32_t num_entries = decode_uint32_le_compat(ptr);
     ptr += sizeof(uint32_t);
@@ -2766,10 +2752,6 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
     eptr += br;
     erem -= br;
 
-    /* for delta seq, reconstruct absolute seq by summing deltas from entry 0 to found.
-     * uses entry_offsets to jump directly to each entry's header (no key/value parsing).
-     * this is still much cheaper than full deserialization-- ~11 bytes parsed per entry
-     * vs ~180 bytes copied per entry. */
     if (flags & TDB_KV_FLAG_DELTA_SEQ)
     {
         uint64_t abs_seq = 0;
@@ -5324,6 +5306,7 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
  * @param key the key
  * @param key_size the size of the key
  * @param kv the key-value pair
+ * @param skip_bloom if nonzero, skip bloom filter check
  */
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                const size_t key_size, tidesdb_kv_pair_t **kv, const int skip_bloom)
@@ -18295,7 +18278,6 @@ static void tidesdb_iter_release_sst_source_block(tidesdb_merge_source_t *source
  * @param cf_name the column family name for cache
  * @param has_cf_name whether cf_name is valid
  * @param kb_out output klog block
- * @param rc_block_out output ref-counted block (if from cache)
  * @param bmblock_out output raw block (if from disk)
  * @param decompressed_out output decompressed data (if decompression was needed)
  * @return TDB_SUCCESS on success, error code on failure
@@ -18574,9 +18556,7 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
 
-    /* fast path -- if current block is already loaded and target key is within its range,
-     * skip the expensive release + read + deserialize cycle (eliminates ~88% of seek CPU) */
-    tidesdb_klog_block_t *cb = source->source.sstable.current_block;
+    const tidesdb_klog_block_t *cb = source->source.sstable.current_block;
     if (cb && cb->num_entries > 0)
     {
         const int cmp_first =

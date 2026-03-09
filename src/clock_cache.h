@@ -70,7 +70,7 @@ typedef struct
     _Atomic(uint8_t) ref_bit;
     _Atomic(uint8_t) state;
     atomic_uint64_t cached_hash;
-    char _pad[16];
+    atomic_size_t external_bytes; /* caller-declared memory cost of pointed-to data */
 } clock_cache_entry_t;
 
 /** entry states */
@@ -230,10 +230,29 @@ void clock_cache_destroy(clock_cache_t *cache);
  * @param key_len the key length
  * @param payload the payload (can be any pointer type)
  * @param payload_len the payload length
+ * @param external_bytes caller-declared memory cost of data pointed to by payload
+ *                       (e.g., heap-allocated block data). included in bytes_used accounting
+ *                       and eviction decisions. pass 0 if payload is self-contained.
  * @return 0 on success, -1 on failure
  */
 int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
-                    size_t payload_len);
+                    size_t payload_len, size_t external_bytes);
+
+/**
+ * clock_cache_put_new
+ * insert a key-value pair that is known to NOT already exist in the cache
+ * skips the existing-entry lookup (find_entry_with_hash) for better performance
+ * on the cache-miss-then-populate path where we just confirmed the key is absent
+ * @param cache the cache
+ * @param key the key
+ * @param key_len the key length
+ * @param payload the payload
+ * @param payload_len the payload length
+ * @param external_bytes caller-declared memory cost of pointed-to data
+ * @return 0 on success, -1 on failure
+ */
+int clock_cache_put_new(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
+                        size_t payload_len, size_t external_bytes);
 
 /**
  * clock_cache_get

@@ -508,6 +508,7 @@ struct tidesdb_sstable_t
 {
     uint64_t id;
     char *klog_path;
+    const char *klog_filename; /* cached pointer into klog_path past last separator */
     char *vlog_path;
     char cf_name[TDB_MAX_CF_NAME_LEN];
     uint8_t *min_key;
@@ -791,6 +792,10 @@ struct tidesdb_iter_t
     int num_cached_sources;
     int cached_sources_capacity;
     uint64_t cached_layout_version;
+    void **cached_mt_sources;
+    int num_cached_mt_sources;
+    void **temp_sources;
+    int temp_sources_capacity;
 };
 
 /**

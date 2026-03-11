@@ -15060,7 +15060,8 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
     }
     /* coordinated L0/L1 backpressure
      * we apply graduated delays based on queue depth and L1 file count */
-    else if (l0_queue_depth >= (size_t)(effective_stall * TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO) ||
+    else if (l0_queue_depth >=
+                 (size_t)((double)effective_stall * TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO) ||
              l1_file_count >=
                  (cf->config.l1_file_count_trigger * TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER))
     {
@@ -15072,7 +15073,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         l0_delayed = 1;
     }
     else if (l0_queue_depth >=
-                 (size_t)(effective_stall * TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO) ||
+                 (size_t)((double)effective_stall * TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO) ||
              l1_file_count >=
                  (cf->config.l1_file_count_trigger * TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER))
     {
@@ -22992,6 +22993,35 @@ void tidesdb_reset_read_stats(tidesdb_t *db)
     atomic_store(&db->read_stats.disk_reads, 0);
 }
 #endif
+
+int tidesdb_sync_wal(tidesdb_column_family_t *cf)
+{
+    if (!cf || !cf->db) return TDB_ERR_INVALID_ARGS;
+
+    /* we load active memtable with refcount protection to safely access its WAL */
+    tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    if (!tidesdb_memtable_try_ref(mt))
+    {
+        /* memtable was rotated, reload */
+        mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+        if (!tidesdb_memtable_try_ref(mt))
+        {
+            return TDB_ERR_IO;
+        }
+    }
+
+    int result = TDB_SUCCESS;
+    if (mt->wal)
+    {
+        if (block_manager_escalate_fsync(mt->wal) != 0)
+        {
+            result = TDB_ERR_IO;
+        }
+    }
+
+    tidesdb_immutable_memtable_unref(mt);
+    return result;
+}
 
 void tidesdb_free(void *ptr)
 {

@@ -1549,6 +1549,15 @@ int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t
                        const uint8_t *key_b, size_t key_b_size, double *cost);
 
 /**
+ * tidesdb_sync_wal
+ * forces an fsync of the active WAL for a column family.
+ * useful for explicit durability control when using TDB_SYNC_NONE or TDB_SYNC_INTERVAL modes.
+ * @param cf column family handle
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_sync_wal(tidesdb_column_family_t *cf);
+
+/**
  * tidesdb_free
  * frees a pointer allocated by TidesDB
  * @param ptr pointer to free

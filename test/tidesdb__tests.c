@@ -23378,6 +23378,62 @@ void test_purge_all(void)
     cleanup_test_dir();
 }
 
+void test_sync_wal(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_NE(db, NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.sync_mode = TDB_SYNC_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "sync_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sync_cf");
+    ASSERT_NE(cf, NULL);
+
+    /* test 1 -- sync on empty memtable succeeds */
+    ASSERT_EQ(tidesdb_sync_wal(cf), 0);
+
+    /* test 2 -- write data then sync */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "sync_key_%04d", i);
+        snprintf(val, sizeof(val), "sync_val_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* sync WAL after writes -- should flush data to stable storage */
+    ASSERT_EQ(tidesdb_sync_wal(cf), 0);
+
+    /* test 3 -- verify data is still readable after sync */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "sync_key_%04d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_NE(value, NULL);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* test 4 -- invalid args */
+    ASSERT_NE(tidesdb_sync_wal(NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -23700,6 +23756,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_db_stats_basic, tests_passed);
     RUN_TEST(test_purge_cf_basic, tests_passed);
     RUN_TEST(test_purge_all, tests_passed);
+    RUN_TEST(test_sync_wal, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

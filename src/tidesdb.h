@@ -97,9 +97,9 @@ void tidesdb_log_write(int level, const char *file, int line, const char *fmt, .
  *   -- consistent snapshot with first-committer-wins semantics
  *   -- prevents dirty reads and non-repeatable reads
  *   -- prevents lost updates via write-write conflict detection
- *   -- still allows some phantom reads
- *   -- uses read-write and write-write conflict detection
- *   -- aborts on any read or write conflict
+ *   -- allows write skew anomaly (two txns read overlapping data and write disjoint sets)
+ *   -- no read set tracking, only write-write conflict detection
+ *   -- aborts only on write-write conflict
  *   -- good for financial transactions, inventory management
  *
  * tdb_isolation_serializable (4)
@@ -1547,6 +1547,15 @@ int tidesdb_purge(tidesdb_t *db);
  */
 int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t key_a_size,
                        const uint8_t *key_b, size_t key_b_size, double *cost);
+
+/**
+ * tidesdb_sync_wal
+ * forces an fsync of the active WAL for a column family.
+ * useful for explicit durability control when using TDB_SYNC_NONE or TDB_SYNC_INTERVAL modes.
+ * @param cf column family handle
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_sync_wal(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_free

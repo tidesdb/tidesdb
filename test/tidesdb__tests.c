@@ -6924,9 +6924,10 @@ static void test_read_write_conflict(void)
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
     ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
 
-    /* start SNAPSHOT transaction and read */
+    /* start REPEATABLE_READ transaction and read
+     * read-write conflict detection applies to REPEATABLE_READ and SERIALIZABLE only */
     tidesdb_txn_t *txn2 = NULL;
-    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn2), 0);
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &txn2), 0);
     uint8_t *read_val = NULL;
     size_t read_size = 0;
     ASSERT_EQ(tidesdb_txn_get(txn2, cf, key, sizeof(key), &read_val, &read_size), 0);
@@ -6945,6 +6946,168 @@ static void test_read_write_conflict(void)
     tidesdb_txn_free(txn1);
     tidesdb_txn_free(txn2);
     tidesdb_txn_free(txn3);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_snapshot_no_read_conflict(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "snap_norc_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "snap_norc_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t key1[] = "key_read";
+    uint8_t key2[] = "key_write";
+    uint8_t value1[] = "initial";
+    uint8_t value2[] = "updated";
+    uint8_t value3[] = "snap_val";
+
+    /* commit initial values */
+    tidesdb_txn_t *txn0 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn0, cf, key1, sizeof(key1), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn0, cf, key2, sizeof(key2), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn0), 0);
+    tidesdb_txn_free(txn0);
+
+    /* start SNAPSHOT transaction and read key1 */
+    tidesdb_txn_t *txn_snap = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn_snap), 0);
+    uint8_t *read_val = NULL;
+    size_t read_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn_snap, cf, key1, sizeof(key1), &read_val, &read_size), 0);
+    ASSERT_TRUE(memcmp(read_val, value1, sizeof(value1)) == 0);
+    free(read_val);
+
+    /* another transaction updates key1 (the key we read) */
+    tidesdb_txn_t *txn_other = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn_other), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn_other, cf, key1, sizeof(key1), value2, sizeof(value2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn_other), 0);
+    tidesdb_txn_free(txn_other);
+
+    /* SNAPSHOT transaction writes to a DIFFERENT key (key2)
+     * under standard snapshot isolation this must succeed because
+     * snapshot only checks write-write conflicts, not read-write */
+    ASSERT_EQ(tidesdb_txn_put(txn_snap, cf, key2, sizeof(key2), value3, sizeof(value3), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn_snap), 0);
+
+    tidesdb_txn_free(txn_snap);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_snapshot_allows_write_skew(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ws_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ws_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* classic write skew scenario
+     * two accounts V1 and V2 both start at 100
+     * T1 reads both, writes V1
+     * T2 reads both, writes V2
+     * under snapshot isolation both should commit (write skew allowed)
+     * under serializable one would be aborted */
+    uint8_t v1_key[] = "account_v1";
+    uint8_t v2_key[] = "account_v2";
+    uint8_t balance_100[] = "100";
+    uint8_t balance_neg[] = "-100";
+
+    /* commit initial balances */
+    tidesdb_txn_t *txn0 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn0), 0);
+    ASSERT_EQ(
+        tidesdb_txn_put(txn0, cf, v1_key, sizeof(v1_key), balance_100, sizeof(balance_100), 0), 0);
+    ASSERT_EQ(
+        tidesdb_txn_put(txn0, cf, v2_key, sizeof(v2_key), balance_100, sizeof(balance_100), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn0), 0);
+    tidesdb_txn_free(txn0);
+
+    /* T1 reads both accounts, decides to withdraw from V1 */
+    tidesdb_txn_t *t1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t1), 0);
+    uint8_t *val = NULL;
+    size_t val_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(t1, cf, v1_key, sizeof(v1_key), &val, &val_size), 0);
+    free(val);
+    val = NULL;
+    ASSERT_EQ(tidesdb_txn_get(t1, cf, v2_key, sizeof(v2_key), &val, &val_size), 0);
+    free(val);
+    val = NULL;
+
+    /* T2 reads both accounts, decides to withdraw from V2 */
+    tidesdb_txn_t *t2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t2), 0);
+    ASSERT_EQ(tidesdb_txn_get(t2, cf, v1_key, sizeof(v1_key), &val, &val_size), 0);
+    free(val);
+    val = NULL;
+    ASSERT_EQ(tidesdb_txn_get(t2, cf, v2_key, sizeof(v2_key), &val, &val_size), 0);
+    free(val);
+    val = NULL;
+
+    /* T1 writes V1 (disjoint from T2 write set) */
+    ASSERT_EQ(tidesdb_txn_put(t1, cf, v1_key, sizeof(v1_key), balance_neg, sizeof(balance_neg), 0),
+              0);
+
+    /* T2 writes V2 (disjoint from T1 write set) */
+    ASSERT_EQ(tidesdb_txn_put(t2, cf, v2_key, sizeof(v2_key), balance_neg, sizeof(balance_neg), 0),
+              0);
+
+    /* both should commit under snapshot isolation (write skew allowed) */
+    ASSERT_EQ(tidesdb_txn_commit(t1), 0);
+    ASSERT_EQ(tidesdb_txn_commit(t2), 0);
+
+    tidesdb_txn_free(t1);
+    tidesdb_txn_free(t2);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_snapshot_write_write_conflict_still_works(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "snap_ww_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "snap_ww_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t key[] = "shared_key";
+    uint8_t value0[] = "original";
+    uint8_t value1[] = "from_t1";
+    uint8_t value2[] = "from_t2";
+
+    /* commit initial value */
+    tidesdb_txn_t *txn0 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn0, cf, key, sizeof(key), value0, sizeof(value0), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn0), 0);
+    tidesdb_txn_free(txn0);
+
+    /* two SNAPSHOT transactions both write the same key */
+    tidesdb_txn_t *t1 = NULL, *t2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t1), 0);
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t2), 0);
+
+    ASSERT_EQ(tidesdb_txn_put(t1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(t2, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
+
+    /* first commit succeeds, second fails with write-write conflict */
+    ASSERT_EQ(tidesdb_txn_commit(t1), 0);
+    ASSERT_EQ(tidesdb_txn_commit(t2), TDB_ERR_CONFLICT);
+
+    tidesdb_txn_free(t1);
+    tidesdb_txn_free(t2);
     tidesdb_close(db);
     cleanup_test_dir();
 }
@@ -23215,6 +23378,62 @@ void test_purge_all(void)
     cleanup_test_dir();
 }
 
+void test_sync_wal(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_NE(db, NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.sync_mode = TDB_SYNC_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "sync_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sync_cf");
+    ASSERT_NE(cf, NULL);
+
+    /* test 1 -- sync on empty memtable succeeds */
+    ASSERT_EQ(tidesdb_sync_wal(cf), 0);
+
+    /* test 2 -- write data then sync */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "sync_key_%04d", i);
+        snprintf(val, sizeof(val), "sync_val_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* sync WAL after writes -- should flush data to stable storage */
+    ASSERT_EQ(tidesdb_sync_wal(cf), 0);
+
+    /* test 3 -- verify data is still readable after sync */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "sync_key_%04d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_NE(value, NULL);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* test 4 -- invalid args */
+    ASSERT_NE(tidesdb_sync_wal(NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -23267,6 +23486,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_snapshot_isolation_consistency, tests_passed);
     RUN_TEST(test_write_write_conflict, tests_passed);
     RUN_TEST(test_read_write_conflict, tests_passed);
+    RUN_TEST(test_snapshot_no_read_conflict, tests_passed);
+    RUN_TEST(test_snapshot_allows_write_skew, tests_passed);
+    RUN_TEST(test_snapshot_write_write_conflict_still_works, tests_passed);
     RUN_TEST(test_serializable_phantom_prevention, tests_passed);
     RUN_TEST(test_transaction_abort_retry, tests_passed);
     RUN_TEST(test_long_running_transaction, tests_passed);
@@ -23534,6 +23756,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_db_stats_basic, tests_passed);
     RUN_TEST(test_purge_cf_basic, tests_passed);
     RUN_TEST(test_purge_all, tests_passed);
+    RUN_TEST(test_sync_wal, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

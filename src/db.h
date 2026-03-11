@@ -565,4 +565,6 @@ int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t
 
 void tidesdb_free(void *ptr);
 
+int tidesdb_sync_wal(tidesdb_column_family_t *cf);
+
 #endif /* __TIDESDB_DB_H__ */

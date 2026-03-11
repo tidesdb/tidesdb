@@ -16,6 +16,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "../external/uthash.h"
 #include "../src/tidesdb.h"
 #include "../test/test_utils.h"
 
@@ -35,18 +41,30 @@
  */
 typedef struct
 {
-    tidesdb_t *tdb;
-    tidesdb_column_family_t *cf;
-    uint8_t **keys;
-    uint8_t **values;
-    size_t *key_sizes;
-    size_t *value_sizes;
+    tidesdb_t* tdb;
+    tidesdb_column_family_t* cf;
+    uint8_t** keys;
+    uint8_t** values;
+    size_t* key_sizes;
+    size_t* value_sizes;
     int start;
     int end;
     int thread_id;
     int count;
-    _Atomic(int) *errors;
+    _Atomic(int)* errors;
 } thread_data_t;
+
+/**
+ * ht_key_t
+ * data structure for hash table items. Utilizes uthash library for the hash table
+ * @param key acts as the identifier for the hash table
+ * @hh required by uthash to make the structure hashable
+ */
+typedef struct
+{
+    uint8_t* key;
+    UT_hash_handle hh;
+} ht_key_t;
 
 /**
  * generate_sequential_key
@@ -56,10 +74,10 @@ typedef struct
  * @param size size of buffer
  * @param index index of key
  */
-void generate_sequential_key(uint8_t *buffer, const size_t size, const int index)
+void generate_sequential_key(uint8_t* buffer, const size_t size, const int index)
 {
     /* use a format that fits in the buffer size */
-    snprintf((char *)buffer, size, "k%06d", index);
+    snprintf((char*)buffer, size, "k%06d", index);
 }
 
 /**
@@ -68,7 +86,7 @@ void generate_sequential_key(uint8_t *buffer, const size_t size, const int index
  * @param buffer buffer to store key
  * @param size size of buffer
  */
-void generate_random_key(uint8_t *buffer, const size_t size)
+void generate_random_key(uint8_t* buffer, const size_t size)
 {
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for (size_t i = 0; i < size - 1; i++)
@@ -79,24 +97,104 @@ void generate_random_key(uint8_t *buffer, const size_t size)
 }
 
 /**
- * zipfian_next
- * generates a zipfian-distributed number (80/20 rule)
- * 80% of accesses go to 20% of keys
- * @param max_value maximum value
- * @return zipfian-distributed number
+ *  calculates H(x) the continuous approximation of the discrete pmf.
+ *  @param x candidate
+ *
+ *  @return calculated h(x)
  */
-int zipfian_next(const int max_value)
+double calc_continuous_approximation(double offset, double zipf_exponent, double x)
 {
-    const double random = (double)rand() / RAND_MAX;
+    double h_x = pow(offset + x, 1 - zipf_exponent) / (1 - zipf_exponent);
+    return h_x;
+}
 
-    /* simple zipfian approximation */
-    if (random < 0.8)
+/**
+ *  maps the point  u ∈ [0,1] into the total integrated mass.
+ *  @param hlow
+ *  @u - randomly generated value u ∈ [0,1)
+ *  @returns calculated area
+ */
+double cumulative_area(double hlow, double tot_area, double u)
+{
+    assert(u >= 0);
+
+    return hlow + (u * tot_area);
+}
+
+/**
+ * hinv - finds x by finding h inverse
+ * @param zipf_eponent zipf exponent(s)
+ * @param c_area cumulative area
+ *
+ * @return value of x retrieved from inversing H(x)
+ */
+double hinv(double zipf_exponent, double c_area)
+{
+    return floor(exp((log((1 - zipf_exponent) * c_area)) / (1 - zipf_exponent)));
+}
+
+/**
+ *  passes k through an acceptance test and returns 1 if value is
+ * accepted else 0.
+ *  @param hlow value of the cumulative intergal function at the lower bound.
+ *  @param off offset
+ *  @param c_area amount of probability mass the sample picks a random point from.
+ *  @param k candidate
+ *
+ *  @return 1 if accepted, 0 if rejected.
+ */
+int is_accepted(double hlow, double off, double zipf_exp, double c_area, double k)
+{
+    double l = hlow - pow(off + k, (-zipf_exp));
+
+    if (c_area >= l)
     {
-        /* 80% of accesses go to first 20% of keys */
-        return rand() % (max_value / 5);
+        return 1;
     }
-    /* 20% of accesses go to remaining 80% of keys */
-    return (max_value / 5) + (rand() % (max_value - max_value / 5));
+    else
+    {
+        return 0;
+    }
+}
+
+/**
+ * applies Hörmann-Derflinger rejection-inversion sampling to generate a value that
+ * follows zipfian distribution
+ *  @param zipf_exponent Constant used to alter howmuch skew to apply. FOr zipfian distributions
+ * ~1.13. Should be > 1
+ *  @param off Offset(v) is a non-negative constant that shifts keyspace while preserving zipfian
+ * shape.
+ *  @param imax upper bound of the distribution. Values generated will be 1...imax. Should be > 0.
+ *
+ * @return generated 64 bit unsigned integer
+ */
+static uint8_t zipf_next(double zipf_exponent, double off, double imax)
+{
+    assert(zipf_exponent > 1);
+    assert(imax >= 1);
+    assert(off >= 0);
+
+    double xmin = 0.5;
+    double xmax = imax + 0.5;
+
+    // calculate hlow, hupp and tot_area
+    double hlow = calc_continuous_approximation(off, zipf_exponent, xmin);
+    double hupp = calc_continuous_approximation(off, zipf_exponent, xmax);
+    double tot_area = hupp - hlow;
+
+    // Find next uint64 zipf value
+    uint accepted = 0;
+    double u, k, c_area;
+
+    while (!accepted)
+    {
+        u = (double)rand() / (double)RAND_MAX;
+        c_area = cumulative_area(hlow, tot_area, u);
+        k = hinv(zipf_exponent, c_area);
+        accepted = is_accepted(hlow, off, zipf_exponent, c_area, k);
+    }
+
+    return (uint8_t)k;
 }
 
 /**
@@ -109,13 +207,18 @@ int zipfian_next(const int max_value)
  * pattern where early indices (hot keys) are accessed more frequently.
  * @param buffer buffer to store key
  * @param size size of buffer
- * @param operation_index the operation index (used to generate deterministic key)
+ * @param max_operations total number of benchmark operations (used to set an upper limit for the
+ * generated key)
  */
-void generate_zipfian_key(uint8_t *buffer, const size_t size, const int operation_index)
+void generate_zipfian_key(uint8_t* buffer, const size_t size, const double max_operations)
 {
-    /** we use operation index directly to ensure deterministic key generation
-     * format: k%010d fits in 16 bytes (k + 10 digits + null = 12 bytes) */
-    snprintf((char *)buffer, size, "k%010d", operation_index);
+    uint8_t key_num = 0;
+
+    /** we use rejection inversion for zipfian key generation key generation*/
+    key_num = zipf_next(1.3, 0.99, max_operations);
+
+    /** format: k%010d fits in 16 bytes (k + 10 digits + null = 12 bytes) */
+    snprintf((char*)buffer, size, "k%010d", key_num);
 }
 
 /**
@@ -124,7 +227,7 @@ void generate_zipfian_key(uint8_t *buffer, const size_t size, const int operatio
  * @param buffer buffer to store string
  * @param size size of buffer
  */
-void generate_random_string(uint8_t *buffer, const size_t size)
+void generate_random_string(uint8_t* buffer, const size_t size)
 {
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for (size_t i = 0; i < size - 1; i++)
@@ -136,16 +239,105 @@ void generate_random_string(uint8_t *buffer, const size_t size)
 }
 
 /**
- * generate_deterministic_value
  * generates a deterministic value based on index for verification
  * @param buffer buffer to store value
  * @param size size of buffer
  * @param index index to generate value for
  */
-void generate_deterministic_value(uint8_t *buffer, const size_t size, const int index)
+void generate_deterministic_value(uint8_t* buffer, const size_t size, const int index)
 {
     /* create a deterministic pattern: "val_XXXX" where XXXX is the index */
-    snprintf((char *)buffer, size, "val_%04d", index);
+    snprintf((char*)buffer, size, "val_%010d", index);
+}
+
+/**
+ * generates a value for zipfian distributions based on the key. This value is deterministic
+ * for every key.
+ * @param buffer buffer to store value
+ * @param size size of buffer
+ * @param key pointer to key
+ *
+ */
+void generate_zipfian_value(uint8_t* buffer, const size_t size, uint8_t* key)
+{
+    /* generate value in the form: val_xxxxxxxxxx for the key k_xxxxxxxxxx */
+    snprintf((char*)buffer, size, "val_%s", (char*)(key + 1));
+}
+
+/**
+ * adds a key to the hash table provided by `head`
+ * @param head head of the hash table. This is a double pointer to a NULL initialized ht_key_t
+ * struct
+ * @key_t ky key to add
+ * @counter pointer to int counter to be incremented when a new item is added
+ *
+ */
+void add_to_ht(ht_key_t** head, uint8_t* ky, int* counter)
+{
+    assert(head != NULL);
+    ht_key_t* k = NULL;
+
+    /* Check if key already exists and add if it doesn't */
+    HASH_FIND(hh, *head, ky, strlen((char*)ky), k);
+    if (k == NULL)
+    {
+        k = malloc(sizeof *k);
+        if (k == NULL)
+        {
+            printf(BOLDRED "Unable to allocate memory on hashtable key" RESET);
+            return;
+        }
+
+        k->key = ky;
+        /* add to hash table */
+        HASH_ADD_KEYPTR(hh, *head, k->key, strlen((char*)k->key), k);
+
+        /* new item added. increment counter. */
+        *counter += 1;
+    }
+}
+
+/**
+ * clears hash table entries and frees allocated memory
+ * head double pointer to the hash table
+ */
+void clear_ht(ht_key_t** head)
+{
+    ht_key_t *curr, *tmp;
+
+    HASH_ITER(hh, *head, curr, tmp)
+    {
+        HASH_DEL(*head, curr);
+        free(curr);
+    }
+}
+
+/**
+ * counts the number of distinct keys in keys array.
+ * useful when you have duplicate keys in zipfian distributions.
+ * @param keys pointer to keys array
+ *
+ * @return number of distinct keys
+ */
+int count_distinct_keys(uint8_t** key_arr, int num_operations)
+{
+    assert(key_arr != NULL);
+
+    ht_key_t *curr, *tmp;
+    ht_key_t* ht_head = NULL;
+    int count = 0;
+
+    /* go through the key array, adding items to the hash table */
+    for (int i = 0; i < num_operations; i++)
+    {
+        add_to_ht(&ht_head, key_arr[i], &count);
+    }
+
+    /* clear and free */
+    clear_ht(&ht_head);
+
+    printf(BOLDMAGENTA "%d distinct keys found\n" RESET, count);
+    return count;
 }
 
 /**
@@ -166,14 +358,14 @@ double get_time_ms()
  * @param arg thread data
  * @return NULL
  */
-void *thread_put(void *arg)
+void* thread_put(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
+    thread_data_t* data = (thread_data_t*)arg;
     const int BATCH_SIZE = 1000;
 
     for (int i = data->start; i < data->end;)
     {
-        tidesdb_txn_t *txn = NULL;
+        tidesdb_txn_t* txn = NULL;
         if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
             continue;
@@ -212,14 +404,14 @@ void *thread_put(void *arg)
  * @param arg thread data
  * @return NULL
  */
-void *thread_get(void *arg)
+void* thread_get(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
+    thread_data_t* data = (thread_data_t*)arg;
     const int BATCH_SIZE = 1000;
 
     for (int i = data->start; i < data->end;)
     {
-        tidesdb_txn_t *txn = NULL;
+        tidesdb_txn_t* txn = NULL;
         if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin read transaction\n" RESET);
@@ -232,7 +424,7 @@ void *thread_get(void *arg)
 
         for (int j = i; j < batch_end; j++)
         {
-            uint8_t *value_out = NULL;
+            uint8_t* value_out = NULL;
             size_t value_len = 0;
 
             if (tidesdb_txn_get(txn, data->cf, data->keys[j], data->key_sizes[j], &value_out,
@@ -251,7 +443,7 @@ void *thread_get(void *arg)
                     printf("  Expected %zu bytes: ", data->value_sizes[j]);
                     for (size_t k = 0; k < data->value_sizes[j] && k < 20; k++)
                         printf("%02x ", data->values[j][k]);
-                    printf("\n  Got %zu bytes:      ", value_len);
+                    printf("\nGot %zu bytes:      ", value_len);
                     for (size_t k = 0; k < value_len && k < 20; k++) printf("%02x ", value_out[k]);
                     printf("\n");
                 }
@@ -282,14 +474,14 @@ void *thread_get(void *arg)
  * @param arg thread data
  * @return NULL
  */
-void *thread_delete(void *arg)
+void* thread_delete(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
+    thread_data_t* data = (thread_data_t*)arg;
     const int BATCH_SIZE = 1000;
 
     for (int i = data->start; i < data->end;)
     {
-        tidesdb_txn_t *txn = NULL;
+        tidesdb_txn_t* txn = NULL;
         if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin transaction\n" RESET);
@@ -327,17 +519,17 @@ void *thread_delete(void *arg)
  * @param arg thread data
  * @return NULL
  */
-void *thread_iter_forward(void *arg)
+void* thread_iter_forward(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
-    tidesdb_txn_t *txn = NULL;
+    thread_data_t* data = (thread_data_t*)arg;
+    tidesdb_txn_t* txn = NULL;
     if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "Failed to begin read transaction\n" RESET);
         return NULL;
     }
 
-    tidesdb_iter_t *iter = NULL;
+    tidesdb_iter_t* iter = NULL;
     if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
@@ -346,7 +538,7 @@ void *thread_iter_forward(void *arg)
     }
 
     int count = 0;
-    uint8_t *prev_key = NULL;
+    uint8_t* prev_key = NULL;
     size_t prev_key_size = 0;
 
     if (tidesdb_iter_seek_to_first(iter) == 0)
@@ -405,18 +597,18 @@ void *thread_iter_forward(void *arg)
  * @param arg thread data
  * @return NULL
  */
-void *thread_iter_backward(void *arg)
+void* thread_iter_backward(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
+    thread_data_t* data = (thread_data_t*)arg;
 
-    tidesdb_txn_t *txn = NULL;
+    tidesdb_txn_t* txn = NULL;
     if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "Failed to begin read transaction\n" RESET);
         return NULL;
     }
 
-    tidesdb_iter_t *iter = NULL;
+    tidesdb_iter_t* iter = NULL;
     if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
@@ -425,7 +617,7 @@ void *thread_iter_backward(void *arg)
     }
 
     int count = 0;
-    uint8_t *prev_key = NULL;
+    uint8_t* prev_key = NULL;
     size_t prev_key_size = 0;
 
     if (tidesdb_iter_seek_to_last(iter) == 0)
@@ -485,11 +677,11 @@ void *thread_iter_backward(void *arg)
  * @param arg thread data
  * @return NULL
  */
-void *thread_iter_seek(void *arg)
+void* thread_iter_seek(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
+    thread_data_t* data = (thread_data_t*)arg;
 
-    tidesdb_txn_t *txn = NULL;
+    tidesdb_txn_t* txn = NULL;
 
     if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
@@ -501,7 +693,7 @@ void *thread_iter_seek(void *arg)
     srand(time(NULL) + data->thread_id);
 
     /* create iterator once and reuse for all seeks */
-    tidesdb_iter_t *iter = NULL;
+    tidesdb_iter_t* iter = NULL;
     if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
@@ -533,11 +725,11 @@ void *thread_iter_seek(void *arg)
  * @param arg thread data
  * @return NULL
  */
-void *thread_iter_seek_for_prev(void *arg)
+void* thread_iter_seek_for_prev(void* arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
+    thread_data_t* data = (thread_data_t*)arg;
 
-    tidesdb_txn_t *txn = NULL;
+    tidesdb_txn_t* txn = NULL;
 
     if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
@@ -549,7 +741,7 @@ void *thread_iter_seek_for_prev(void *arg)
     srand(time(NULL) + data->thread_id + 1000); /* different seed than regular seek */
 
     /* create iterator once and reuse for all seeks */
-    tidesdb_iter_t *iter = NULL;
+    tidesdb_iter_t* iter = NULL;
     if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
@@ -581,7 +773,7 @@ void *thread_iter_seek_for_prev(void *arg)
  * @param isolation_level isolation level
  * @return name of isolation level
  */
-char *get_isolation_level_name(int isolation_level)
+char* get_isolation_level_name(int isolation_level)
 {
     switch (isolation_level)
     {
@@ -606,7 +798,7 @@ char *get_isolation_level_name(int isolation_level)
  * @param log_level log level
  * @return name of log level
  */
-char *get_log_level_name(int log_level)
+char* get_log_level_name(int log_level)
 {
     switch (log_level)
     {
@@ -626,7 +818,7 @@ char *get_log_level_name(int log_level)
 int main()
 {
     remove_directory(BENCH_DB_PATH);
-    tidesdb_t *tdb = NULL;
+    tidesdb_t* tdb = NULL;
     double start_time, end_time;
 
     srand((unsigned int)time(NULL));
@@ -671,14 +863,14 @@ int main()
     printf("  Use B+tree: %s\n", BENCH_USE_BTREE ? "enabled" : "disabled");
     printf("*======================================*\n\n" RESET);
 
-    uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
+    uint8_t** keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t*));
     if (keys == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for keys array\n" RESET);
         return 1;
     }
 
-    uint8_t **values = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
+    uint8_t** values = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t*));
     if (values == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for values array\n" RESET);
@@ -686,7 +878,7 @@ int main()
         return 1;
     }
 
-    size_t *key_sizes = malloc(BENCH_NUM_OPERATIONS * sizeof(size_t));
+    size_t* key_sizes = malloc(BENCH_NUM_OPERATIONS * sizeof(size_t));
     if (key_sizes == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for key sizes array\n" RESET);
@@ -695,7 +887,7 @@ int main()
         return 1;
     }
 
-    size_t *value_sizes = malloc(BENCH_NUM_OPERATIONS * sizeof(size_t));
+    size_t* value_sizes = malloc(BENCH_NUM_OPERATIONS * sizeof(size_t));
     if (value_sizes == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for value sizes array\n" RESET);
@@ -734,14 +926,14 @@ int main()
         else if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
         {
             /* use operation index to generate deterministic keys */
-            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, i);
+            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, BENCH_NUM_OPERATIONS);
         }
         else /* default to random */
         {
             generate_random_key(keys[i], BENCH_KEY_SIZE);
         }
 
-        key_sizes[i] = strlen((char *)keys[i]);
+        key_sizes[i] = strlen((char*)keys[i]);
 
         values[i] = malloc(BENCH_VALUE_SIZE);
         if (values[i] == NULL)
@@ -759,8 +951,19 @@ int main()
             free(value_sizes);
             return 1;
         }
-        generate_deterministic_value(values[i], BENCH_VALUE_SIZE, i);
-        value_sizes[i] = strlen((char *)values[i]);
+
+        if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
+        {
+            /* given zipfian distribution produces duplicate keys, generate the same value for all
+             * identical keys */
+            generate_zipfian_value(values[i], BENCH_VALUE_SIZE, keys[i]);
+        }
+        else
+        {
+            generate_deterministic_value(values[i], BENCH_VALUE_SIZE, i);
+        }
+
+        value_sizes[i] = strlen((char*)values[i]);
     }
 
     tidesdb_config_t config = {.db_path = BENCH_DB_PATH,
@@ -830,7 +1033,7 @@ int main()
         return 1;
     }
 
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(tdb, BENCH_CF_NAME);
+    tidesdb_column_family_t* cf = tidesdb_get_column_family(tdb, BENCH_CF_NAME);
     if (cf == NULL)
     {
         printf(BOLDRED "Failed to get column family\n" RESET);
@@ -1048,13 +1251,25 @@ int main()
     end_time = get_time_ms();
 
     /* each thread iterates ALL keys independently, so check one thread's count */
-    int keys_per_thread = thread_data[0].count;
+    int expected_keys_per_thread;
 
+    /* for zipfian distribution, there will be less number of distinct keys due to duplicates.
+     * distinct_keys < BENCH_NUM_OPERATIONS */
+    if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
+    {
+        expected_keys_per_thread = count_distinct_keys(thread_data[0].keys, BENCH_NUM_OPERATIONS);
+    }
+    else
+    {
+        expected_keys_per_thread = BENCH_NUM_OPERATIONS;
+    }
+
+    int keys_per_thread = thread_data[0].count;
     printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
            (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    if (keys_per_thread == BENCH_NUM_OPERATIONS)
+    if (keys_per_thread == expected_keys_per_thread)
     {
         printf(BOLDGREEN "  ✓ Each thread iterated all %d keys successfully\n" RESET,
                keys_per_thread);
@@ -1062,7 +1277,7 @@ int main()
     else
     {
         printf(BOLDRED "  ✗ Iterator count mismatch: expected %d, got %d keys per thread\n" RESET,
-               BENCH_NUM_OPERATIONS, keys_per_thread);
+               expected_keys_per_thread, keys_per_thread);
     }
 
     if (verification_errors > 0)
@@ -1093,6 +1308,19 @@ int main()
 
     end_time = get_time_ms();
 
+    int expected_backward_keys_per_thread;
+
+    /* check distribution */
+    if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
+    {
+        /* reuse already calculated expected_keys_per_thread */
+        expected_backward_keys_per_thread = expected_keys_per_thread;
+    }
+    else
+    {
+        expected_backward_keys_per_thread = BENCH_NUM_OPERATIONS;
+    }
+
     /* get the count from backward iterator */
     int backward_keys_per_thread = thread_data[0].count;
 
@@ -1100,7 +1328,7 @@ int main()
            BENCH_NUM_THREADS, end_time - start_time,
            (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    if (backward_keys_per_thread == BENCH_NUM_OPERATIONS)
+    if (backward_keys_per_thread == expected_backward_keys_per_thread)
     {
         printf(BOLDGREEN "  ✓ Each thread iterated all %d keys successfully\n" RESET,
                backward_keys_per_thread);
@@ -1108,7 +1336,7 @@ int main()
     else
     {
         printf(BOLDRED "  ✗ Iterator count mismatch: expected %d, got %d keys per thread\n" RESET,
-               BENCH_NUM_OPERATIONS, backward_keys_per_thread);
+               expected_backward_keys_per_thread, backward_keys_per_thread);
     }
 
     if (verification_errors > 0)

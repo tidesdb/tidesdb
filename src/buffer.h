@@ -35,7 +35,7 @@ typedef struct buffer_slot_t buffer_slot_t;
 #define BUFFER_ACQUIRE_BACKOFF_EXPO_INCREASE 10000
 
 /* special ID value indicating invalid/no slot */
-#define BUFFER_INVALID_ID ((uint32_t)-1)
+#define BUFFER_INVALID_ID ((uint32_t) - 1)
 
 /* default retry parameters */
 #define BUFFER_DEFAULT_MAX_RETRIES 1000

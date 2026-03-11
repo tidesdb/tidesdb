@@ -15189,10 +15189,13 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
                                        const uint8_t *key, const size_t key_size,
                                        const uint64_t seq)
 {
-    /* we skip read tracking for isolation levels that dont need conflict detection */
-    if (txn->isolation_level < TDB_ISOLATION_REPEATABLE_READ)
+    /* we skip read tracking for isolation levels that dont need conflict detection
+     * SNAPSHOT only needs write-write conflict detection (no read set tracking)
+     * only REPEATABLE_READ and SERIALIZABLE need read tracking */
+    if (txn->isolation_level != TDB_ISOLATION_REPEATABLE_READ &&
+        txn->isolation_level != TDB_ISOLATION_SERIALIZABLE)
     {
-        return 0; /* READ_UNCOMMITTED and READ_COMMITTED dont need read tracking */
+        return 0;
     }
 
     /** we check last few entries first (hot cache, likely duplicates)
@@ -15359,7 +15362,7 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
  * -- READ_UNCOMMITTED     -- sees all versions including uncommitted (dirty reads allowed)
  * -- READ_COMMITTED       -- refreshes snapshot on each read (prevents dirty reads)
  * -- REPEATABLE_READ      -- consistent snapshot, read-write conflict detection
- * -- SNAPSHOT             -- consistent snapshot, read-write + write-write conflict detection
+ * -- SNAPSHOT             -- consistent snapshot, write-write conflict detection only
  * -- SERIALIZABLE         -- SSI with dangerous structure detection (prevents all anomalies)
  *
  * @param db database handle
@@ -15420,9 +15423,10 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, const tidesdb_isolation_leve
         return TDB_ERR_MEMORY;
     }
 
-    /* we defer read set allocation for isolation levels that dont need conflict detection
-     * READ_UNCOMMITTED and READ_COMMITTED skip read tracking entirely */
-    if (isolation >= TDB_ISOLATION_REPEATABLE_READ)
+    /* we defer read set allocation for isolation levels that dont need read conflict detection
+     * only REPEATABLE_READ and SERIALIZABLE need read tracking
+     * SNAPSHOT uses write-write conflict detection only (no read set needed) */
+    if (isolation == TDB_ISOLATION_REPEATABLE_READ || isolation == TDB_ISOLATION_SERIALIZABLE)
     {
         (*txn)->read_set_capacity = TDB_INITIAL_TXN_READ_SET_CAPACITY;
         (*txn)->read_keys = calloc((*txn)->read_set_capacity, sizeof(uint8_t *));
@@ -16328,8 +16332,9 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
     txn->read_key_arena_count = 0;
     txn->read_key_arena_used = 0;
 
-    /* we allocate read set arrays if switching to higher isolation that needs them */
-    if (isolation >= TDB_ISOLATION_REPEATABLE_READ && !txn->read_keys)
+    /* we allocate read set arrays if switching to isolation that needs read tracking */
+    if ((isolation == TDB_ISOLATION_REPEATABLE_READ || isolation == TDB_ISOLATION_SERIALIZABLE) &&
+        !txn->read_keys)
     {
         txn->read_set_capacity = TDB_INITIAL_TXN_READ_SET_CAPACITY;
         txn->read_keys = calloc(txn->read_set_capacity, sizeof(uint8_t *));
@@ -16618,7 +16623,9 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
  */
 static int tidesdb_txn_check_read_conflicts(const tidesdb_txn_t *txn)
 {
-    if (txn->isolation_level < TDB_ISOLATION_REPEATABLE_READ || txn->read_set_count == 0)
+    if ((txn->isolation_level != TDB_ISOLATION_REPEATABLE_READ &&
+         txn->isolation_level != TDB_ISOLATION_SERIALIZABLE) ||
+        txn->read_set_count == 0)
     {
         return TDB_SUCCESS;
     }

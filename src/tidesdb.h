@@ -97,9 +97,9 @@ void tidesdb_log_write(int level, const char *file, int line, const char *fmt, .
  *   -- consistent snapshot with first-committer-wins semantics
  *   -- prevents dirty reads and non-repeatable reads
  *   -- prevents lost updates via write-write conflict detection
- *   -- still allows some phantom reads
- *   -- uses read-write and write-write conflict detection
- *   -- aborts on any read or write conflict
+ *   -- allows write skew anomaly (two txns read overlapping data and write disjoint sets)
+ *   -- no read set tracking, only write-write conflict detection
+ *   -- aborts only on write-write conflict
  *   -- good for financial transactions, inventory management
  *
  * tdb_isolation_serializable (4)

@@ -183,7 +183,7 @@ static uint8_t zipf_next(double zipf_exponent, double off, double imax)
     double tot_area = hupp - hlow;
 
     // Find next uint64 zipf value
-    uint accepted = 0;
+    int accepted = 0;
     double u, k, c_area;
 
     while (!accepted)
@@ -323,7 +323,6 @@ int count_distinct_keys(uint8_t** key_arr, int num_operations)
 {
     assert(key_arr != NULL);
 
-    ht_key_t *curr, *tmp;
     ht_key_t* ht_head = NULL;
     int count = 0;
 

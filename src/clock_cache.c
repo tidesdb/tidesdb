@@ -26,9 +26,9 @@
 #define CLOCK_CACHE_REF_BIT                  1u
 #define CLOCK_CACHE_READER_INC               2u
 #define CLOCK_CACHE_REF_MASK                 ((uint8_t)(~1u & 0xFFu))
-#define CLOCK_CACHE_HAS_READERS(ref)         (((ref) & CLOCK_CACHE_REF_MASK) != 0)
+#define CLOCK_CACHE_HAS_READERS(ref)         (((ref)&CLOCK_CACHE_REF_MASK) != 0)
 #define CLOCK_CACHE_PAYLOAD_ALIGN            8 /* align payload for safe typed access */
-#define CLOCK_CACHE_ALIGN_UP(x, a)           (((x) + ((a) - 1)) & ~((size_t)(a) - 1))
+#define CLOCK_CACHE_ALIGN_UP(x, a)           (((x) + ((a)-1)) & ~((size_t)(a)-1))
 #define CLOCK_CACHE_MAX_CPUS                 1024
 
 /**

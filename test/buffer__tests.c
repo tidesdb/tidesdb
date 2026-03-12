@@ -382,7 +382,8 @@ void *concurrent_acquire_release(void *arg)
             atomic_fetch_add(args->success_count, 1);
 
             /* small delay to increase contention */
-            for (volatile int j = 0; j < 10; j++);
+            for (volatile int j = 0; j < 10; j++)
+                ;
 
             /* verify we can get the value back */
             void *data;

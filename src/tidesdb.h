@@ -44,7 +44,7 @@ typedef enum
 } tidesdb_log_level_t;
 
 extern int _tidesdb_log_level;       /* minimum level to log (default is TDB_LOG_DEBUG) */
-extern FILE* _tidesdb_log_file;      /* log file pointer (NULL = stderr, non-NULL = file) */
+extern FILE *_tidesdb_log_file;      /* log file pointer (NULL = stderr, non-NULL = file) */
 extern size_t _tidesdb_log_truncate; /* truncate log file at this size (0 = no truncation) */
 extern char _tidesdb_log_path[MAX_FILE_PATH_LENGTH]; /* path to log file for truncation */
 
@@ -57,7 +57,7 @@ extern char _tidesdb_log_path[MAX_FILE_PATH_LENGTH]; /* path to log file for tru
  * @param fmt printf-style format string
  * @param ... format arguments
  */
-void tidesdb_log_write(int level, const char* file, int line, const char* fmt, ...);
+void tidesdb_log_write(int level, const char *file, int line, const char *fmt, ...);
 
 #define TDB_DEBUG_LOG(level, fmt, ...)                                           \
     do                                                                           \
@@ -222,8 +222,8 @@ typedef enum
  * @param ctx user-provided context pointer
  * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
-typedef int (*tidesdb_comparator_fn)(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                                     size_t key2_size, void* ctx);
+typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                     size_t key2_size, void *ctx);
 
 /**
  * tidesdb_commit_op_t
@@ -237,9 +237,9 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t* key1, size_t key1_size, cons
  */
 typedef struct tidesdb_commit_op_t
 {
-    const uint8_t* key;
+    const uint8_t *key;
     size_t key_size;
-    const uint8_t* value;
+    const uint8_t *value;
     size_t value_size;
     time_t ttl;
     int is_delete;
@@ -253,8 +253,8 @@ typedef struct tidesdb_commit_op_t
  * @param commit_seq commit sequence number
  * @param ctx user-provided context
  */
-typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t* ops, int num_ops,
-                                      uint64_t commit_seq, void* ctx);
+typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_ops,
+                                      uint64_t commit_seq, void *ctx);
 
 /* forward declarations for internal types */
 #define TDB_MAX_LEVELS         32
@@ -282,7 +282,7 @@ typedef struct tidesdb_column_family_t tidesdb_column_family_t;
  */
 typedef struct
 {
-    tidesdb_memtable_t* items[TDB_IMM_SNAP_MAX_ITEMS];
+    tidesdb_memtable_t *items[TDB_IMM_SNAP_MAX_ITEMS];
     _Atomic(size_t) count;
     _Atomic(int32_t) readers;
 } tidesdb_imm_snap_t;
@@ -341,7 +341,7 @@ typedef struct tidesdb_column_family_config_t
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
     char comparator_ctx_str[TDB_MAX_COMPARATOR_CTX];
     skip_list_comparator_fn comparator_fn_cached;
-    void* comparator_ctx_cached;
+    void *comparator_ctx_cached;
     int skip_list_max_level;
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
@@ -350,7 +350,7 @@ typedef struct tidesdb_column_family_config_t
     int l0_queue_stall_threshold;
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
-    void* commit_hook_ctx;
+    void *commit_hook_ctx;
 } tidesdb_column_family_config_t;
 
 /**
@@ -366,7 +366,7 @@ typedef struct tidesdb_comparator_entry_t
     char name[TDB_MAX_COMPARATOR_NAME];
     tidesdb_comparator_fn fn;
     char ctx_str[TDB_MAX_COMPARATOR_CTX];
-    void* ctx;
+    void *ctx;
 } tidesdb_comparator_entry_t;
 
 /**
@@ -385,7 +385,7 @@ typedef struct tidesdb_comparator_entry_t
  */
 typedef struct tidesdb_config_t
 {
-    char* db_path;
+    char *db_path;
     int num_flush_threads;
     int num_compaction_threads;
     tidesdb_log_level_t log_level;
@@ -408,8 +408,8 @@ typedef struct tidesdb_config_t
  */
 struct tidesdb_memtable_t
 {
-    skip_list_t* skip_list;
-    block_manager_t* wal;
+    skip_list_t *skip_list;
+    block_manager_t *wal;
     uint64_t id;
     uint64_t generation;
     _Atomic(int) refcount;
@@ -441,14 +441,14 @@ struct tidesdb_memtable_t
  */
 struct tidesdb_column_family_t
 {
-    char* name;
-    char* directory;
+    char *name;
+    char *directory;
     tidesdb_column_family_config_t config;
-    _Atomic(tidesdb_memtable_t*) active_memtable;
-    queue_t* immutable_memtables;
+    _Atomic(tidesdb_memtable_t *) active_memtable;
+    queue_t *immutable_memtables;
     _Atomic(uint64_t) pending_commits;
-    buffer_t* active_txn_buffer;
-    tidesdb_level_t* levels[TDB_MAX_LEVELS];
+    buffer_t *active_txn_buffer;
+    tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) sstable_layout_version;
@@ -456,8 +456,8 @@ struct tidesdb_column_family_t
     _Atomic(int) is_flushing;
     _Atomic(int) immutable_cleanup_counter;
     _Atomic(int) marked_for_deletion;
-    tidesdb_manifest_t* manifest;
-    tidesdb_t* db;
+    tidesdb_manifest_t *manifest;
+    tidesdb_t *db;
 
     /* lock-free immutable memtable snapshot (double-buffered RCU)
      * readers acquire active slot, use items, release when done
@@ -508,13 +508,13 @@ struct tidesdb_column_family_t
 struct tidesdb_sstable_t
 {
     uint64_t id;
-    char* klog_path;
-    const char* klog_filename; /* cached pointer into klog_path past last separator */
-    char* vlog_path;
+    char *klog_path;
+    const char *klog_filename; /* cached pointer into klog_path past last separator */
+    char *vlog_path;
     char cf_name[TDB_MAX_CF_NAME_LEN];
-    uint8_t* min_key;
+    uint8_t *min_key;
     size_t min_key_size;
-    uint8_t* max_key;
+    uint8_t *max_key;
     size_t max_key_size;
     uint64_t num_entries;
     uint64_t num_klog_blocks;
@@ -523,15 +523,15 @@ struct tidesdb_sstable_t
     uint64_t klog_size;
     uint64_t vlog_size;
     uint64_t max_seq;
-    bloom_filter_t* bloom_filter;
-    tidesdb_block_index_t* block_indexes;
+    bloom_filter_t *bloom_filter;
+    tidesdb_block_index_t *block_indexes;
     _Atomic(int) refcount;
-    block_manager_t* klog_bm;
-    block_manager_t* vlog_bm;
-    tidesdb_column_family_config_t* config;
+    block_manager_t *klog_bm;
+    block_manager_t *vlog_bm;
+    tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
     _Atomic(time_t) last_access_time;
-    tidesdb_t* db;
+    tidesdb_t *db;
     int use_btree;
     int64_t btree_root_offset;
     int64_t btree_first_leaf;
@@ -539,7 +539,7 @@ struct tidesdb_sstable_t
     uint64_t btree_node_count;
     uint32_t btree_height;
     skip_list_comparator_fn cached_comparator_fn;
-    void* cached_comparator_ctx;
+    void *cached_comparator_ctx;
     int is_reverse;
 };
 
@@ -563,13 +563,13 @@ struct tidesdb_level_t
     int level_num;
     _Atomic(size_t) capacity;
     _Atomic(size_t) current_size;
-    _Atomic(tidesdb_sstable_t**) sstables;
+    _Atomic(tidesdb_sstable_t **) sstables;
     _Atomic(int) num_sstables;
     _Atomic(int) sstables_capacity;
-    _Atomic(uint8_t**) file_boundaries;
-    _Atomic(size_t*) boundary_sizes;
+    _Atomic(uint8_t **) file_boundaries;
+    _Atomic(size_t *) boundary_sizes;
     _Atomic(int) num_boundaries;
-    _Atomic(tidesdb_sstable_t**) retired_sstables_arr;
+    _Atomic(tidesdb_sstable_t **) retired_sstables_arr;
     _Atomic(int) array_readers;
 };
 
@@ -627,20 +627,20 @@ struct tidesdb_level_t
  */
 struct tidesdb_t
 {
-    char* db_path;
+    char *db_path;
     tidesdb_config_t config;
-    tidesdb_column_family_t** column_families;
+    tidesdb_column_family_t **column_families;
     int num_column_families;
     int cf_capacity;
     _Atomic(int) is_open;
     _Atomic(int) is_recovering;
-    _Atomic(tidesdb_comparator_entry_t*) comparators;
+    _Atomic(tidesdb_comparator_entry_t *) comparators;
     _Atomic(int) num_comparators;
     _Atomic(int) comparators_capacity;
-    pthread_t* flush_threads;
-    queue_t* flush_queue;
-    pthread_t* compaction_threads;
-    queue_t* compaction_queue;
+    pthread_t *flush_threads;
+    queue_t *flush_queue;
+    pthread_t *compaction_threads;
+    queue_t *compaction_queue;
     pthread_t sync_thread;
     _Atomic(int) sync_thread_active;
     pthread_mutex_t sync_thread_mutex;
@@ -649,14 +649,14 @@ struct tidesdb_t
     _Atomic(int) sstable_reaper_active;
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
-    clock_cache_t* clock_cache;
-    clock_cache_t* btree_node_cache;
+    clock_cache_t *clock_cache;
+    clock_cache_t *btree_node_cache;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
-    tidesdb_commit_status_t* commit_status;
+    tidesdb_commit_status_t *commit_status;
     pthread_rwlock_t active_txns_lock;
-    tidesdb_txn_t** active_txns;
+    tidesdb_txn_t **active_txns;
     int num_active_txns;
     int active_txns_capacity;
     _Atomic(uint64_t) cached_available_disk_space;
@@ -671,9 +671,9 @@ struct tidesdb_t
     _Atomic(int) flush_pending_count;
     int os_check_counter;
     pthread_rwlock_t cf_list_lock;
-    _Atomic(tidesdb_deferred_free_node_t*) deferred_free_list;
+    _Atomic(tidesdb_deferred_free_node_t *) deferred_free_list;
     int lock_fd;
-    FILE* log_file;
+    FILE *log_file;
 #ifdef TDB_ENABLE_READ_PROFILING
     tidesdb_read_stats_t read_stats;
 #endif
@@ -732,31 +732,31 @@ struct tidesdb_t
  */
 struct tidesdb_txn_t
 {
-    tidesdb_t* db;
+    tidesdb_t *db;
     uint64_t txn_id;
     uint64_t snapshot_seq;
     uint64_t commit_seq;
-    tidesdb_txn_op_t* ops;
+    tidesdb_txn_op_t *ops;
     int num_ops;
     int ops_capacity;
-    uint8_t** read_keys;
-    size_t* read_key_sizes;
-    uint64_t* read_seqs;
-    tidesdb_column_family_t** read_cfs;
+    uint8_t **read_keys;
+    size_t *read_key_sizes;
+    uint64_t *read_seqs;
+    tidesdb_column_family_t **read_cfs;
     int read_set_count;
     int read_set_capacity;
-    uint8_t** read_key_arenas;
+    uint8_t **read_key_arenas;
     int read_key_arena_count;
     size_t read_key_arena_used;
-    void* write_set_hash;
-    void* read_set_hash;
-    tidesdb_column_family_t** cfs;
+    void *write_set_hash;
+    void *read_set_hash;
+    tidesdb_column_family_t **cfs;
     int num_cfs;
     int cf_capacity;
-    tidesdb_column_family_t* last_cf;
+    tidesdb_column_family_t *last_cf;
     int last_cf_index;
-    tidesdb_txn_t** savepoints;
-    char** savepoint_names;
+    tidesdb_txn_t **savepoints;
+    char **savepoint_names;
     int num_savepoints;
     int savepoints_capacity;
     int is_committed;
@@ -788,21 +788,21 @@ struct tidesdb_txn_t
  */
 struct tidesdb_iter_t
 {
-    tidesdb_column_family_t* cf;
-    tidesdb_txn_t* txn;
-    tidesdb_merge_heap_t* heap;
-    tidesdb_kv_pair_t* current;
+    tidesdb_column_family_t *cf;
+    tidesdb_txn_t *txn;
+    tidesdb_merge_heap_t *heap;
+    tidesdb_kv_pair_t *current;
     int valid;
     int direction;
     time_t snapshot_time;
     uint64_t cf_snapshot;
-    void** cached_sources;
+    void **cached_sources;
     int num_cached_sources;
     int cached_sources_capacity;
     uint64_t cached_layout_version;
-    void** cached_mt_sources;
+    void **cached_mt_sources;
     int num_cached_mt_sources;
-    void** temp_sources;
+    void **temp_sources;
     int temp_sources_capacity;
 };
 
@@ -830,14 +830,14 @@ struct tidesdb_stats_t
 {
     int num_levels;
     size_t memtable_size;
-    size_t* level_sizes;
-    int* level_num_sstables;
-    tidesdb_column_family_config_t* config;
+    size_t *level_sizes;
+    int *level_num_sstables;
+    tidesdb_column_family_config_t *config;
     uint64_t total_keys;
     uint64_t total_data_size;
     double avg_key_size;
     double avg_value_size;
-    uint64_t* level_key_counts;
+    uint64_t *level_key_counts;
     double read_amp;
     double hit_rate;
     /* btree stats (only populated if use_btree=1) */
@@ -927,7 +927,7 @@ tidesdb_config_t tidesdb_default_config(void);
  * @param db output parameter for database handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_open(const tidesdb_config_t* config, tidesdb_t** db);
+int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
 
 /**
  * tidesdb_register_comparator
@@ -939,8 +939,8 @@ int tidesdb_open(const tidesdb_config_t* config, tidesdb_t** db);
  * @param ctx optional runtime context pointer (can be NULL)
  * @return 0 on success, -n on failure (duplicate name, invalid args, etc.)
  */
-int tidesdb_register_comparator(tidesdb_t* db, const char* name, skip_list_comparator_fn fn,
-                                const char* ctx_str, void* ctx);
+int tidesdb_register_comparator(tidesdb_t *db, const char *name, skip_list_comparator_fn fn,
+                                const char *ctx_str, void *ctx);
 
 /**
  * tidesdb_get_comparator
@@ -951,8 +951,8 @@ int tidesdb_register_comparator(tidesdb_t* db, const char* name, skip_list_compa
  * @param ctx output parameter for runtime context pointer (can be NULL)
  * @return 0 on success, -n if not found
  */
-int tidesdb_get_comparator(tidesdb_t* db, const char* name, skip_list_comparator_fn* fn,
-                           void** ctx);
+int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator_fn *fn,
+                           void **ctx);
 
 /**
  * tidesdb_close
@@ -960,7 +960,7 @@ int tidesdb_get_comparator(tidesdb_t* db, const char* name, skip_list_comparator
  * @param db database handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_close(tidesdb_t* db);
+int tidesdb_close(tidesdb_t *db);
 
 #ifdef TDB_ENABLE_READ_PROFILING
 /**
@@ -970,21 +970,21 @@ int tidesdb_close(tidesdb_t* db);
  * @param stats output statistics structure
  * @return TDB_SUCCESS on success, error code on failure
  */
-int tidesdb_get_read_stats(tidesdb_t* db, tidesdb_read_stats_t* stats);
+int tidesdb_get_read_stats(tidesdb_t *db, tidesdb_read_stats_t *stats);
 
 /**
  * tidesdb_print_read_stats
  * prints read profiling statistics to stdout
  * @param db the database
  */
-void tidesdb_print_read_stats(tidesdb_t* db);
+void tidesdb_print_read_stats(tidesdb_t *db);
 
 /**
  * tidesdb_reset_read_stats
  * resets read profiling statistics
  * @param db the database
  */
-void tidesdb_reset_read_stats(tidesdb_t* db);
+void tidesdb_reset_read_stats(tidesdb_t *db);
 #endif
 
 /**
@@ -995,8 +995,8 @@ void tidesdb_reset_read_stats(tidesdb_t* db);
  * @param config configuration for column family
  * @return 0 on success, -n on failure
  */
-int tidesdb_create_column_family(tidesdb_t* db, const char* name,
-                                 const tidesdb_column_family_config_t* config);
+int tidesdb_create_column_family(tidesdb_t *db, const char *name,
+                                 const tidesdb_column_family_config_t *config);
 
 /**
  * tidesdb_drop_column_family
@@ -1005,7 +1005,7 @@ int tidesdb_create_column_family(tidesdb_t* db, const char* name,
  * @param name name of column family
  * @return 0 on success, -n on failure
  */
-int tidesdb_drop_column_family(tidesdb_t* db, const char* name);
+int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 
 /**
  * tidesdb_delete_column_family
@@ -1014,7 +1014,7 @@ int tidesdb_drop_column_family(tidesdb_t* db, const char* name);
  * @param cf column family to drop
  * @return 0 on success, -n on failure
  */
-int tidesdb_delete_column_family(tidesdb_t* db, tidesdb_column_family_t* cf);
+int tidesdb_delete_column_family(tidesdb_t *db, tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_rename_column_family
@@ -1024,7 +1024,7 @@ int tidesdb_delete_column_family(tidesdb_t* db, tidesdb_column_family_t* cf);
  * @param new_name new name for column family
  * @return 0 on success, -n on failure
  */
-int tidesdb_rename_column_family(tidesdb_t* db, const char* old_name, const char* new_name);
+int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char *new_name);
 
 /**
  * tidesdb_get_column_family
@@ -1033,7 +1033,7 @@ int tidesdb_rename_column_family(tidesdb_t* db, const char* old_name, const char
  * @param name name of column family
  * @return pointer to column family, NULL on failure
  */
-tidesdb_column_family_t* tidesdb_get_column_family(tidesdb_t* db, const char* name);
+tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name);
 
 /**
  * tidesdb_list_column_families
@@ -1043,7 +1043,7 @@ tidesdb_column_family_t* tidesdb_get_column_family(tidesdb_t* db, const char* na
  * @param count pointer to store the number of column families
  * @return 0 on success, -n on failure
  */
-int tidesdb_list_column_families(tidesdb_t* db, char*** names, int* count);
+int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
 
 /**
  * tidesdb_txn_begin
@@ -1052,7 +1052,7 @@ int tidesdb_list_column_families(tidesdb_t* db, char*** names, int* count);
  * @param txn pointer to transaction handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_begin(tidesdb_t* db, tidesdb_txn_t** txn);
+int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn);
 
 /**
  * tidesdb_txn_begin_with_isolation
@@ -1062,8 +1062,8 @@ int tidesdb_txn_begin(tidesdb_t* db, tidesdb_txn_t** txn);
  * @param txn pointer to transaction handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_begin_with_isolation(tidesdb_t* db, tidesdb_isolation_level_t isolation,
-                                     tidesdb_txn_t** txn);
+int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t isolation,
+                                     tidesdb_txn_t **txn);
 
 /**
  * tidesdb_txn_put
@@ -1077,8 +1077,8 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t* db, tidesdb_isolation_level_t is
  * @param ttl time-to-live for key-value pair
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_put(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
-                    size_t key_size, const uint8_t* value, size_t value_size, time_t ttl);
+int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                    size_t key_size, const uint8_t *value, size_t value_size, time_t ttl);
 
 /**
  * tidesdb_txn_get
@@ -1091,8 +1091,8 @@ int tidesdb_txn_put(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8
  * @param value_size pointer to size of value
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_get(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
-                    size_t key_size, uint8_t** value, size_t* value_size);
+int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                    size_t key_size, uint8_t **value, size_t *value_size);
 
 /**
  * tidesdb_txn_delete
@@ -1103,7 +1103,7 @@ int tidesdb_txn_get(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8
  * @param key_size size of key
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_delete(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
+int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                        size_t key_size);
 
 /**
@@ -1112,7 +1112,7 @@ int tidesdb_txn_delete(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const ui
  * @param txn transaction handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_rollback(tidesdb_txn_t* txn);
+int tidesdb_txn_rollback(tidesdb_txn_t *txn);
 
 /**
  * tidesdb_txn_commit
@@ -1120,14 +1120,14 @@ int tidesdb_txn_rollback(tidesdb_txn_t* txn);
  * @param txn transaction handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_commit(tidesdb_txn_t* txn);
+int tidesdb_txn_commit(tidesdb_txn_t *txn);
 
 /**
  * tidesdb_txn_free
  * frees the transaction
  * @param txn transaction handle
  */
-void tidesdb_txn_free(tidesdb_txn_t* txn);
+void tidesdb_txn_free(tidesdb_txn_t *txn);
 
 /**
  * tidesdb_txn_reset
@@ -1139,7 +1139,7 @@ void tidesdb_txn_free(tidesdb_txn_t* txn);
  * @param isolation new isolation level for the reset transaction
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_reset(tidesdb_txn_t* txn, tidesdb_isolation_level_t isolation);
+int tidesdb_txn_reset(tidesdb_txn_t *txn, tidesdb_isolation_level_t isolation);
 
 /**
  * tidesdb_txn_savepoint
@@ -1148,7 +1148,7 @@ int tidesdb_txn_reset(tidesdb_txn_t* txn, tidesdb_isolation_level_t isolation);
  * @param name name of savepoint
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_savepoint(tidesdb_txn_t* txn, const char* name);
+int tidesdb_txn_savepoint(tidesdb_txn_t *txn, const char *name);
 
 /**
  * tidesdb_txn_rollback_to_savepoint
@@ -1157,7 +1157,7 @@ int tidesdb_txn_savepoint(tidesdb_txn_t* txn, const char* name);
  * @param name name of savepoint
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t* txn, const char* name);
+int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name);
 
 /**
  * tidesdb_txn_release_savepoint
@@ -1166,7 +1166,7 @@ int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t* txn, const char* name);
  * @param name name of savepoint
  * @return 0 on success, -n on failure
  */
-int tidesdb_txn_release_savepoint(tidesdb_txn_t* txn, const char* name);
+int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name);
 
 /**
  * tidesdb_iter_new
@@ -1176,7 +1176,7 @@ int tidesdb_txn_release_savepoint(tidesdb_txn_t* txn, const char* name);
  * @param iter pointer to iterator handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_new(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, tidesdb_iter_t** iter);
+int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_iter_t **iter);
 
 /**
  * tidesdb_iter_seek
@@ -1186,7 +1186,7 @@ int tidesdb_iter_new(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, tidesdb_it
  * @param key_size size of key
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_seek(tidesdb_iter_t* iter, const uint8_t* key, size_t key_size);
+int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size);
 
 /**
  * tidesdb_iter_seek_for_prev
@@ -1196,7 +1196,7 @@ int tidesdb_iter_seek(tidesdb_iter_t* iter, const uint8_t* key, size_t key_size)
  * @param key_size size of key
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_seek_for_prev(tidesdb_iter_t* iter, const uint8_t* key, size_t key_size);
+int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size);
 
 /**
  * tidesdb_iter_seek_to_first
@@ -1204,7 +1204,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t* iter, const uint8_t* key, size_t 
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_seek_to_first(tidesdb_iter_t* iter);
+int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_seek_to_last
@@ -1212,7 +1212,7 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t* iter);
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_seek_to_last(tidesdb_iter_t* iter);
+int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_next
@@ -1220,7 +1220,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t* iter);
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_next(tidesdb_iter_t* iter);
+int tidesdb_iter_next(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_prev
@@ -1228,7 +1228,7 @@ int tidesdb_iter_next(tidesdb_iter_t* iter);
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_prev(tidesdb_iter_t* iter);
+int tidesdb_iter_prev(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_valid
@@ -1236,7 +1236,7 @@ int tidesdb_iter_prev(tidesdb_iter_t* iter);
  * @param iter iterator handle
  * @return non-zero if valid, 0 if invalid
  */
-int tidesdb_iter_valid(tidesdb_iter_t* iter);
+int tidesdb_iter_valid(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_key
@@ -1246,7 +1246,7 @@ int tidesdb_iter_valid(tidesdb_iter_t* iter);
  * @param key_size pointer to size of key
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_key(tidesdb_iter_t* iter, uint8_t** key, size_t* key_size);
+int tidesdb_iter_key(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size);
 
 /**
  * tidesdb_iter_value
@@ -1256,14 +1256,14 @@ int tidesdb_iter_key(tidesdb_iter_t* iter, uint8_t** key, size_t* key_size);
  * @param value_size pointer to size of value
  * @return 0 on success, -n on failure
  */
-int tidesdb_iter_value(tidesdb_iter_t* iter, uint8_t** value, size_t* value_size);
+int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size);
 
 /**
  * tidesdb_iter_free
  * frees an iterator
  * @param iter iterator handle
  */
-void tidesdb_iter_free(tidesdb_iter_t* iter);
+void tidesdb_iter_free(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_comparator_memcmp
@@ -1276,8 +1276,8 @@ void tidesdb_iter_free(tidesdb_iter_t* iter);
  * @param ctx unused context
  * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
-int tidesdb_comparator_memcmp(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                              size_t key2_size, void* ctx);
+int tidesdb_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                              size_t key2_size, void *ctx);
 
 /**
  * tidesdb_comparator_lexicographic
@@ -1290,8 +1290,8 @@ int tidesdb_comparator_memcmp(const uint8_t* key1, size_t key1_size, const uint8
  * @param ctx unused context
  * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
-int tidesdb_comparator_lexicographic(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                                     size_t key2_size, void* ctx);
+int tidesdb_comparator_lexicographic(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                     size_t key2_size, void *ctx);
 
 /**
  * tidesdb_comparator_uint64
@@ -1304,8 +1304,8 @@ int tidesdb_comparator_lexicographic(const uint8_t* key1, size_t key1_size, cons
  * @param ctx unused context
  * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
-int tidesdb_comparator_uint64(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                              size_t key2_size, void* ctx);
+int tidesdb_comparator_uint64(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                              size_t key2_size, void *ctx);
 
 /**
  * tidesdb_comparator_int64
@@ -1318,8 +1318,8 @@ int tidesdb_comparator_uint64(const uint8_t* key1, size_t key1_size, const uint8
  * @param ctx unused context
  * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
-int tidesdb_comparator_int64(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                             size_t key2_size, void* ctx);
+int tidesdb_comparator_int64(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                             size_t key2_size, void *ctx);
 
 /**
  * tidesdb_comparator_reverse_memcmp
@@ -1332,8 +1332,8 @@ int tidesdb_comparator_int64(const uint8_t* key1, size_t key1_size, const uint8_
  * @param ctx unused context
  * @return >0 if key1 < key2, 0 if equal, <0 if key1 > key2
  */
-int tidesdb_comparator_reverse_memcmp(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                                      size_t key2_size, void* ctx);
+int tidesdb_comparator_reverse_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                      size_t key2_size, void *ctx);
 
 /**
  * tidesdb_comparator_case_insensitive
@@ -1346,8 +1346,8 @@ int tidesdb_comparator_reverse_memcmp(const uint8_t* key1, size_t key1_size, con
  * @param ctx unused context
  * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
-int tidesdb_comparator_case_insensitive(const uint8_t* key1, size_t key1_size, const uint8_t* key2,
-                                        size_t key2_size, void* ctx);
+int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                        size_t key2_size, void *ctx);
 
 /**
  * tidesdb_cf_set_commit_hook
@@ -1358,7 +1358,7 @@ int tidesdb_comparator_case_insensitive(const uint8_t* key1, size_t key1_size, c
  * @param ctx user-provided context passed to the callback
  * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS if cf is NULL
  */
-int tidesdb_cf_set_commit_hook(tidesdb_column_family_t* cf, tidesdb_commit_hook_fn fn, void* ctx);
+int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_fn fn, void *ctx);
 
 /**
  * tidesdb_compact
@@ -1366,7 +1366,7 @@ int tidesdb_cf_set_commit_hook(tidesdb_column_family_t* cf, tidesdb_commit_hook_
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_compact(tidesdb_column_family_t* cf);
+int tidesdb_compact(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_flush_memtable
@@ -1374,7 +1374,7 @@ int tidesdb_compact(tidesdb_column_family_t* cf);
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_flush_memtable(tidesdb_column_family_t* cf);
+int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_is_flushing
@@ -1382,7 +1382,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t* cf);
  * @param cf column family handle
  * @return 1 if flushing, 0 if not flushing
  */
-int tidesdb_is_flushing(tidesdb_column_family_t* cf);
+int tidesdb_is_flushing(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_is_compacting
@@ -1390,7 +1390,7 @@ int tidesdb_is_flushing(tidesdb_column_family_t* cf);
  * @param cf column family handle
  * @return 1 if compacting, 0 if not compacting
  */
-int tidesdb_is_compacting(tidesdb_column_family_t* cf);
+int tidesdb_is_compacting(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_cf_config_load_from_ini
@@ -1400,8 +1400,8 @@ int tidesdb_is_compacting(tidesdb_column_family_t* cf);
  * @param config pointer to column family configuration
  * @return 0 on success, -n on failure
  */
-int tidesdb_cf_config_load_from_ini(const char* ini_file, const char* section_name,
-                                    tidesdb_column_family_config_t* config);
+int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_name,
+                                    tidesdb_column_family_config_t *config);
 
 /**
  * tidesdb_cf_config_save_to_ini
@@ -1411,8 +1411,8 @@ int tidesdb_cf_config_load_from_ini(const char* ini_file, const char* section_na
  * @param config pointer to column family configuration
  * @return 0 on success, -n on failure
  */
-int tidesdb_cf_config_save_to_ini(const char* ini_file, const char* section_name,
-                                  const tidesdb_column_family_config_t* config);
+int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name,
+                                  const tidesdb_column_family_config_t *config);
 
 /**
  * tidesdb_cf_update_runtime_config
@@ -1422,8 +1422,8 @@ int tidesdb_cf_config_save_to_ini(const char* ini_file, const char* section_name
  * @param persist_to_disk whether to persist the configuration to disk
  * @return 0 on success, -n on failure
  */
-int tidesdb_cf_update_runtime_config(tidesdb_column_family_t* cf,
-                                     const tidesdb_column_family_config_t* new_config,
+int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
+                                     const tidesdb_column_family_config_t *new_config,
                                      int persist_to_disk);
 
 /**
@@ -1433,14 +1433,14 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t* cf,
  * @param stats pointer to statistics
  * @return 0 on success, -n on failure
  */
-int tidesdb_get_stats(tidesdb_column_family_t* cf, tidesdb_stats_t** stats);
+int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
 
 /**
  * tidesdb_free_stats
  * frees the statistics of the column family
  * @param stats statistics
  */
-void tidesdb_free_stats(tidesdb_stats_t* stats);
+void tidesdb_free_stats(tidesdb_stats_t *stats);
 
 /**
  * tidesdb_get_db_stats
@@ -1449,7 +1449,7 @@ void tidesdb_free_stats(tidesdb_stats_t* stats);
  * @param stats output parameter for database statistics (caller provides pointer to struct)
  * @return 0 on success, -n on failure
  */
-int tidesdb_get_db_stats(tidesdb_t* db, tidesdb_db_stats_t* stats);
+int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats);
 
 /**
  * tidesdb_get_cache_stats
@@ -1459,7 +1459,7 @@ int tidesdb_get_db_stats(tidesdb_t* db, tidesdb_db_stats_t* stats);
  * @return 0 on success, -n on failure
  * @note if block cache is disabled, stats->enabled will be 0 and other fields will be zero
  */
-int tidesdb_get_cache_stats(tidesdb_t* db, tidesdb_cache_stats_t* stats);
+int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 
 /**
  * tidesdb_backup
@@ -1470,7 +1470,7 @@ int tidesdb_get_cache_stats(tidesdb_t* db, tidesdb_cache_stats_t* stats);
  * @param dir destination directory for the backup
  * @return 0 on success, -n on failure
  */
-int tidesdb_backup(tidesdb_t* db, char* dir);
+int tidesdb_backup(tidesdb_t *db, char *dir);
 
 /**
  * tidesdb_checkpoint
@@ -1492,7 +1492,7 @@ int tidesdb_backup(tidesdb_t* db, char* dir);
  * @param checkpoint_dir destination directory for the checkpoint (must not exist or be empty)
  * @return 0 on success, -n on failure
  */
-int tidesdb_checkpoint(tidesdb_t* db, const char* checkpoint_dir);
+int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir);
 
 /**
  * tidesdb_clone_column_family
@@ -1505,7 +1505,7 @@ int tidesdb_checkpoint(tidesdb_t* db, const char* checkpoint_dir);
  * @return TDB_SUCCESS on success, TDB_ERR_NOT_FOUND if source doesn't exist,
  *         TDB_ERR_EXISTS if destination already exists, or other error codes on failure
  */
-int tidesdb_clone_column_family(tidesdb_t* db, const char* src_name, const char* dst_name);
+int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char *dst_name);
 
 /**
  * tidesdb_purge_cf
@@ -1515,7 +1515,7 @@ int tidesdb_clone_column_family(tidesdb_t* db, const char* src_name, const char*
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_purge_cf(tidesdb_column_family_t* cf);
+int tidesdb_purge_cf(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_purge
@@ -1524,7 +1524,7 @@ int tidesdb_purge_cf(tidesdb_column_family_t* cf);
  * @param db database handle
  * @return 0 on success, first non-zero error code on failure (continues processing remaining CFs)
  */
-int tidesdb_purge(tidesdb_t* db);
+int tidesdb_purge(tidesdb_t *db);
 
 /**
  * tidesdb_range_cost
@@ -1545,8 +1545,8 @@ int tidesdb_purge(tidesdb_t* db);
  * @param cost output -- estimated traversal cost (higher = more expensive)
  * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS on bad input
  */
-int tidesdb_range_cost(tidesdb_column_family_t* cf, const uint8_t* key_a, size_t key_a_size,
-                       const uint8_t* key_b, size_t key_b_size, double* cost);
+int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t key_a_size,
+                       const uint8_t *key_b, size_t key_b_size, double *cost);
 
 /**
  * tidesdb_sync_wal
@@ -1555,13 +1555,13 @@ int tidesdb_range_cost(tidesdb_column_family_t* cf, const uint8_t* key_a, size_t
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */
-int tidesdb_sync_wal(tidesdb_column_family_t* cf);
+int tidesdb_sync_wal(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_free
  * frees a pointer allocated by TidesDB
  * @param ptr pointer to free
  */
-void tidesdb_free(void* ptr);
+void tidesdb_free(void *ptr);
 
 #endif /* __TIDESDB_H__ */

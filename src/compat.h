@@ -28,7 +28,7 @@
 
 /* fallback for SIZE_MAX, just in case */
 #ifndef SIZE_MAX
-#define SIZE_MAX ((size_t) - 1)
+#define SIZE_MAX ((size_t)-1)
 #endif
 
 #include <stdlib.h>
@@ -1109,9 +1109,9 @@ static inline int sem_post(sem_t *sem)
 
 /* file operations macros for cross-platform compatibility */
 #ifndef S_ISDIR
-#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#define S_ISDIR(m) (((m)&S_IFMT) == S_IFDIR)
 #endif
-#define sleep(seconds)       Sleep((seconds) * 1000)
+#define sleep(seconds)       Sleep((seconds)*1000)
 #define usleep(microseconds) Sleep((microseconds) / 1000) /* usleep for Windows */
 #define access               _access
 #define ftell                _ftelli64

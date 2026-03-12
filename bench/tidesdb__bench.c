@@ -177,12 +177,12 @@ static uint8_t zipf_next(double zipf_exponent, double off, double imax)
     double xmin = 0.5;
     double xmax = imax + 0.5;
 
-    // calculate hlow, hupp and tot_area
+    /* calculate hlow, hupp and tot_area */
     double hlow = calc_continuous_approximation(off, zipf_exponent, xmin);
     double hupp = calc_continuous_approximation(off, zipf_exponent, xmax);
     double tot_area = hupp - hlow;
 
-    // Find next uint64 zipf value
+    /* Find next uint64 zipf value */
     int accepted = 0;
     double u, k, c_area;
 

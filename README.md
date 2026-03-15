@@ -35,6 +35,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Ability to clone column families
 - Easy pluggable custom allocator support
 - Column family commit hooks 
+- Optionally can unify configure to have unified memtable and WAL for all column families
 
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/)

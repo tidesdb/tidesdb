@@ -23378,6 +23378,191 @@ void test_purge_all(void)
     cleanup_test_dir();
 }
 
+static void test_perf_multi_cf_commit_throughput(void)
+{
+    const int cf_counts[] = {1, 4, 8, 12};
+    const int num_configs = (int)(sizeof(cf_counts) / sizeof(cf_counts[0]));
+    const int ops_per_txn = 10;
+    const int num_txns = 500;
+
+    for (int c = 0; c < num_configs; c++)
+    {
+        cleanup_test_dir();
+        tidesdb_t *db = create_test_db();
+        ASSERT_TRUE(db != NULL);
+
+        const int num_cfs = cf_counts[c];
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 64 * 1024 * 1024;
+        cf_config.sync_mode = TDB_SYNC_NONE;
+
+        tidesdb_column_family_t *cfs[12];
+        for (int i = 0; i < num_cfs; i++)
+        {
+            char name[32];
+            snprintf(name, sizeof(name), "perf_cf_%d", i);
+            ASSERT_EQ(tidesdb_create_column_family(db, name, &cf_config), 0);
+            cfs[i] = tidesdb_get_column_family(db, name);
+            ASSERT_TRUE(cfs[i] != NULL);
+        }
+
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        for (int t = 0; t < num_txns; t++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            for (int op = 0; op < ops_per_txn; op++)
+            {
+                tidesdb_column_family_t *cf = cfs[op % num_cfs];
+                char key[32], val[64];
+                snprintf(key, sizeof(key), "k_%d_%d", t, op);
+                snprintf(val, sizeof(val), "v_%d_%d", t, op);
+                ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                          strlen(val) + 1, -1),
+                          0);
+            }
+
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        const double elapsed_ms =
+            (t_end.tv_sec - t_start.tv_sec) * 1000.0 + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+        const double txns_per_sec = num_txns / (elapsed_ms / 1000.0);
+
+        printf("\n  [PERF] %2d CFs: %d txns in %.1f ms (%.0f txn/s, %.1f us/txn)\n", num_cfs,
+               num_txns, elapsed_ms, txns_per_sec, (elapsed_ms * 1000.0) / num_txns);
+
+        tidesdb_close(db);
+        cleanup_test_dir();
+    }
+}
+
+static void test_perf_savepoint_throughput(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 64 * 1024 * 1024;
+    ASSERT_EQ(tidesdb_create_column_family(db, "sp_perf_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sp_perf_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_ops_before_sp = 500;
+    const int num_ops_after_sp = 500;
+    const int num_iterations = 200;
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < num_ops_before_sp; i++)
+    {
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "base_key_%04d", i);
+        snprintf(val, sizeof(val), "base_val_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, -1),
+                  0);
+    }
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int iter = 0; iter < num_iterations; iter++)
+    {
+        ASSERT_EQ(tidesdb_txn_savepoint(txn, "bench_sp"), 0);
+
+        for (int i = 0; i < num_ops_after_sp; i++)
+        {
+            char key[32], val[64];
+            snprintf(key, sizeof(key), "sp_key_%04d_%04d", iter, i);
+            snprintf(val, sizeof(val), "sp_val_%04d_%04d", iter, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, -1),
+                      0);
+        }
+
+        ASSERT_EQ(tidesdb_txn_rollback_to_savepoint(txn, "bench_sp"), 0);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    const double elapsed_ms =
+        (t_end.tv_sec - t_start.tv_sec) * 1000.0 + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+    const double iters_per_sec = num_iterations / (elapsed_ms / 1000.0);
+
+    printf(
+        "\n  [PERF] savepoint: %d create+%d puts+rollback x %d = %.1f ms "
+        "(%.0f iter/s, %.1f us/iter)\n",
+        num_ops_before_sp, num_ops_after_sp, num_iterations, elapsed_ms, iters_per_sec,
+        (elapsed_ms * 1000.0) / num_iterations);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_perf_txn_put_throughput(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 128 * 1024 * 1024;
+    cf_config.sync_mode = TDB_SYNC_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "put_perf_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "put_perf_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_ops = 100000;
+    const int value_size = 100;
+    uint8_t value[100];
+    memset(value, 'V', value_size);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "put_key_%08d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, value, value_size, -1),
+                  0);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    const double elapsed_ms =
+        (t_end.tv_sec - t_start.tv_sec) * 1000.0 + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+    const double ops_per_sec = num_ops / (elapsed_ms / 1000.0);
+
+    printf(
+        "\n  [PERF] txn_put: %d ops x %d-byte values in %.1f ms "
+        "(%.0f ops/s, %.2f us/op)\n",
+        num_ops, value_size, elapsed_ms, ops_per_sec, (elapsed_ms * 1000.0) / num_ops);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* we drain flush queue before close */
+    for (int w = 0; w < 200; w++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 void test_sync_wal(void)
 {
     cleanup_test_dir();
@@ -23429,6 +23614,738 @@ void test_sync_wal(void)
 
     /* test 4 -- invalid args */
     ASSERT_NE(tidesdb_sync_wal(NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static tidesdb_t *create_unified_test_db(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer = 1024 * 1024; /* 1 MB */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    return db;
+}
+
+static void test_unified_basic_put_get(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf1", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ucf1");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key[] = "unified_key";
+    uint8_t value[] = "unified_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t *rv = NULL;
+    size_t rs = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &rv, &rs), 0);
+    ASSERT_TRUE(rv != NULL);
+    ASSERT_EQ(rs, sizeof(value));
+    ASSERT_TRUE(memcmp(rv, value, sizeof(value)) == 0);
+    free(rv);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_multi_cf_isolation(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_b", &cf_config), 0);
+    tidesdb_column_family_t *cf_a = tidesdb_get_column_family(db, "ucf_a");
+    tidesdb_column_family_t *cf_b = tidesdb_get_column_family(db, "ucf_b");
+    ASSERT_TRUE(cf_a != NULL);
+    ASSERT_TRUE(cf_b != NULL);
+
+    uint8_t key[] = "shared_key";
+    uint8_t val_a[] = "value_a";
+    uint8_t val_b[] = "value_b";
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf_a, key, sizeof(key), val_a, sizeof(val_a), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf_b, key, sizeof(key), val_b, sizeof(val_b), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t *rv = NULL;
+    size_t rs = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf_a, key, sizeof(key), &rv, &rs), 0);
+    ASSERT_EQ(rs, sizeof(val_a));
+    ASSERT_TRUE(memcmp(rv, val_a, sizeof(val_a)) == 0);
+    free(rv);
+
+    rv = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf_b, key, sizeof(key), &rv, &rs), 0);
+    ASSERT_EQ(rs, sizeof(val_b));
+    ASSERT_TRUE(memcmp(rv, val_b, sizeof(val_b)) == 0);
+    free(rv);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_delete(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_del", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ucf_del");
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t key[] = "del_key";
+    uint8_t value[] = "del_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, key, sizeof(key)), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t *rv = NULL;
+    size_t rs = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &rv, &rs), TDB_ERR_NOT_FOUND);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_flush_to_sstable(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer = 4096; /* tiny buffer to trigger flush */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_flush", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ucf_flush");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 200; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "flush_key_%04d", i);
+        snprintf(value, sizeof(value), "flush_value_%04d_padding_for_size", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* wait for background flushes to complete */
+    usleep(500000);
+
+    /* verify all keys still readable (from memtable or SSTable) */
+    for (int i = 0; i < 200; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char expected[128];
+        snprintf(key, sizeof(key), "flush_key_%04d", i);
+        snprintf(expected, sizeof(expected), "flush_value_%04d_padding_for_size", i);
+
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+        ASSERT_EQ(rc, 0);
+        ASSERT_TRUE(rv != NULL);
+        ASSERT_EQ(rs, strlen(expected) + 1);
+        ASSERT_TRUE(memcmp(rv, expected, rs) == 0);
+        free(rv);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_recovery_after_reopen(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_recov", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ucf_recov");
+
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[64];
+        snprintf(key, sizeof(key), "recov_key_%04d", i);
+        snprintf(value, sizeof(value), "recov_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+
+    /* reopen with unified memtable */
+    tidesdb_config_t config2 = tidesdb_default_config();
+    config2.db_path = TEST_DB_PATH;
+    config2.unified_memtable = 1;
+    config2.unified_memtable_write_buffer = 1024 * 1024;
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config2, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "ucf_recov");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char expected[64];
+        snprintf(key, sizeof(key), "recov_key_%04d", i);
+        snprintf(expected, sizeof(expected), "recov_value_%04d", i);
+
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+        ASSERT_EQ(rc, 0);
+        ASSERT_TRUE(rv != NULL);
+        ASSERT_EQ(rs, strlen(expected) + 1);
+        ASSERT_TRUE(memcmp(rv, expected, rs) == 0);
+        free(rv);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_multi_cf_many_keys(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_mk1", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_mk2", &cf_config), 0);
+    tidesdb_column_family_t *cf1 = tidesdb_get_column_family(db, "ucf_mk1");
+    tidesdb_column_family_t *cf2 = tidesdb_get_column_family(db, "ucf_mk2");
+    ASSERT_TRUE(cf1 != NULL && cf2 != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64], val1[64], val2[64];
+        snprintf(key, sizeof(key), "mk_key_%04d", i);
+        snprintf(val1, sizeof(val1), "cf1_val_%04d", i);
+        snprintf(val2, sizeof(val2), "cf2_val_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf1, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val1,
+                                  strlen(val1) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf2, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val2,
+                                  strlen(val2) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* verify isolation: same key has different values in each CF */
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64], exp1[64], exp2[64];
+        snprintf(key, sizeof(key), "mk_key_%04d", i);
+        snprintf(exp1, sizeof(exp1), "cf1_val_%04d", i);
+        snprintf(exp2, sizeof(exp2), "cf2_val_%04d", i);
+
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cf1, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(exp1) + 1);
+        ASSERT_TRUE(memcmp(rv, exp1, rs) == 0);
+        free(rv);
+
+        rv = NULL;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf2, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(exp2) + 1);
+        ASSERT_TRUE(memcmp(rv, exp2, rs) == 0);
+        free(rv);
+
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_multi_cf_flush_and_recovery(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer = 4096; /* tiny to trigger many flushes */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_fr_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_fr_b", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_fr_c", &cf_config), 0);
+    tidesdb_column_family_t *cfa = tidesdb_get_column_family(db, "ucf_fr_a");
+    tidesdb_column_family_t *cfb = tidesdb_get_column_family(db, "ucf_fr_b");
+    tidesdb_column_family_t *cfc = tidesdb_get_column_family(db, "ucf_fr_c");
+    ASSERT_TRUE(cfa != NULL && cfb != NULL && cfc != NULL);
+
+    const int N = 150;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64], va[96], vb[96], vc[96];
+        snprintf(key, sizeof(key), "fr_key_%04d", i);
+        snprintf(va, sizeof(va), "val_a_%04d_padding_data", i);
+        snprintf(vb, sizeof(vb), "val_b_%04d_padding_data", i);
+        snprintf(vc, sizeof(vc), "val_c_%04d_padding_data", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cfa, (uint8_t *)key, strlen(key) + 1, (uint8_t *)va,
+                                  strlen(va) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cfb, (uint8_t *)key, strlen(key) + 1, (uint8_t *)vb,
+                                  strlen(vb) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cfc, (uint8_t *)key, strlen(key) + 1, (uint8_t *)vc,
+                                  strlen(vc) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* let background flushes drain */
+    usleep(500000);
+
+    /* verify before close */
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64], ea[96], eb[96], ec[96];
+        snprintf(key, sizeof(key), "fr_key_%04d", i);
+        snprintf(ea, sizeof(ea), "val_a_%04d_padding_data", i);
+        snprintf(eb, sizeof(eb), "val_b_%04d_padding_data", i);
+        snprintf(ec, sizeof(ec), "val_c_%04d_padding_data", i);
+
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cfa, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(ea) + 1);
+        ASSERT_TRUE(memcmp(rv, ea, rs) == 0);
+        free(rv);
+        rv = NULL;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cfb, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(eb) + 1);
+        ASSERT_TRUE(memcmp(rv, eb, rs) == 0);
+        free(rv);
+        rv = NULL;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cfc, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(ec) + 1);
+        ASSERT_TRUE(memcmp(rv, ec, rs) == 0);
+        free(rv);
+
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+
+    tidesdb_config_t config2 = tidesdb_default_config();
+    config2.db_path = TEST_DB_PATH;
+    config2.unified_memtable = 1;
+    config2.unified_memtable_write_buffer = 1024 * 1024;
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config2, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    cfa = tidesdb_get_column_family(db, "ucf_fr_a");
+    cfb = tidesdb_get_column_family(db, "ucf_fr_b");
+    cfc = tidesdb_get_column_family(db, "ucf_fr_c");
+    ASSERT_TRUE(cfa != NULL && cfb != NULL && cfc != NULL);
+
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64], ea[96], eb[96], ec[96];
+        snprintf(key, sizeof(key), "fr_key_%04d", i);
+        snprintf(ea, sizeof(ea), "val_a_%04d_padding_data", i);
+        snprintf(eb, sizeof(eb), "val_b_%04d_padding_data", i);
+        snprintf(ec, sizeof(ec), "val_c_%04d_padding_data", i);
+
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cfa, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(ea) + 1);
+        ASSERT_TRUE(memcmp(rv, ea, rs) == 0);
+        free(rv);
+        rv = NULL;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cfb, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(eb) + 1);
+        ASSERT_TRUE(memcmp(rv, eb, rs) == 0);
+        free(rv);
+        rv = NULL;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, cfc, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(rs, strlen(ec) + 1);
+        ASSERT_TRUE(memcmp(rv, ec, rs) == 0);
+        free(rv);
+
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t **cfs;
+    int num_cfs;
+    int thread_id;
+    int num_ops;
+    _Atomic(int) *commits_ok;
+    _Atomic(int) *commits_fail;
+    _Atomic(int) *go;
+    _Atomic(int) *stop;
+} unified_concurrent_data_t;
+
+static void *unified_concurrent_writer(void *arg)
+{
+    unified_concurrent_data_t *d = (unified_concurrent_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(d->db, &txn) != 0)
+        {
+            atomic_fetch_add(d->commits_fail, 1);
+            continue;
+        }
+
+        /* write to a random CF -- exercises unified memtable prefix isolation */
+        int cf_idx = (d->thread_id + i) % d->num_cfs;
+        tidesdb_column_family_t *cf = d->cfs[cf_idx];
+
+        char key[64], value[128];
+        /* shared keys across threads to stress concurrent overwrites */
+        if (i % 4 == 0)
+        {
+            snprintf(key, sizeof(key), "ushared_%06d", i % 50);
+        }
+        else
+        {
+            snprintf(key, sizeof(key), "uuniq_t%d_%06d", d->thread_id, i);
+        }
+
+        size_t val_size = (i % 3 == 0) ? 96 : 48;
+        snprintf(value, sizeof(value), "uval_t%d_i%d_cf%d", d->thread_id, i, cf_idx);
+
+        tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value, val_size, 0);
+
+        /* interleave cross-CF writes in same txn (every 5th op) */
+        if (i % 5 == 0)
+        {
+            int cf2_idx = (cf_idx + 1) % d->num_cfs;
+            char key2[64];
+            snprintf(key2, sizeof(key2), "ucross_t%d_%06d", d->thread_id, i);
+            tidesdb_txn_put(txn, d->cfs[cf2_idx], (uint8_t *)key2, strlen(key2) + 1,
+                            (uint8_t *)value, val_size, 0);
+        }
+
+        /* interleave deletes */
+        if (i % 11 == 0 && i > 0)
+        {
+            char del_key[64];
+            snprintf(del_key, sizeof(del_key), "ushared_%06d", (i + 17) % 50);
+            tidesdb_txn_delete(txn, cf, (uint8_t *)del_key, strlen(del_key) + 1);
+        }
+
+        if (tidesdb_txn_commit(txn) == 0)
+            atomic_fetch_add(d->commits_ok, 1);
+        else
+            atomic_fetch_add(d->commits_fail, 1);
+
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+static void *unified_concurrent_reader(void *arg)
+{
+    unified_concurrent_data_t *d = (unified_concurrent_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        int cf_idx = (d->thread_id + i) % d->num_cfs;
+        tidesdb_column_family_t *cf = d->cfs[cf_idx];
+
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(d->db, &txn) != 0) continue;
+
+        /* point reads */
+        for (int k = 0; k < 5; k++)
+        {
+            char key[64];
+            if (k < 2)
+                snprintf(key, sizeof(key), "ushared_%06d", (i * 3 + k) % 50);
+            else
+                snprintf(key, sizeof(key), "uuniq_t%d_%06d", (i + k) % 6, (i * 5 + k) % 300);
+
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+                free(val);
+        }
+
+        /* short iterator scan */
+        tidesdb_iter_t *iter = NULL;
+        if (tidesdb_iter_new(txn, cf, &iter) == 0)
+        {
+            if (i % 2 == 0)
+                tidesdb_iter_seek_to_first(iter);
+            else
+                tidesdb_iter_seek_to_last(iter);
+
+            int walked = 0;
+            while (tidesdb_iter_valid(iter) && walked < 10)
+            {
+                uint8_t *key = NULL;
+                size_t ks = 0;
+                tidesdb_iter_key(iter, &key, &ks);
+                if (i % 2 == 0)
+                    tidesdb_iter_next(iter);
+                else
+                    tidesdb_iter_prev(iter);
+                walked++;
+            }
+            tidesdb_iter_free(iter);
+        }
+
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+static void test_unified_concurrent_multi_cf_read_write(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer = 8192; /* small to trigger frequent rotation */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    const int NUM_CFS = 3;
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+
+    tidesdb_column_family_t *cfs[3];
+    const char *cf_names[] = {"uconcur_cf0", "uconcur_cf1", "uconcur_cf2"};
+
+    for (int i = 0; i < NUM_CFS; i++)
+    {
+        ASSERT_EQ(tidesdb_create_column_family(db, cf_names[i], &cf_config), 0);
+        cfs[i] = tidesdb_get_column_family(db, cf_names[i]);
+        ASSERT_TRUE(cfs[i] != NULL);
+    }
+
+    /* seed some initial data so readers have something to find */
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        for (int i = 0; i < 50; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[64], value[64];
+            snprintf(key, sizeof(key), "ushared_%06d", i);
+            snprintf(value, sizeof(value), "seed_cf%d_%06d", c, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1,
+                                      (uint8_t *)value, strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+    }
+
+    const int NUM_WRITERS = 4;
+    const int NUM_READERS = 4;
+    const int W_OPS = 500;
+    const int R_OPS = 600;
+
+    _Atomic(int) commits_ok = 0, commits_fail = 0, go = 0, stop = 0;
+
+    pthread_t writers[4], readers[4];
+    unified_concurrent_data_t w_data[4], r_data[4];
+
+    for (int i = 0; i < NUM_WRITERS; i++)
+    {
+        w_data[i] = (unified_concurrent_data_t){db,          cfs,           NUM_CFS, i,    W_OPS,
+                                                &commits_ok, &commits_fail, &go,     &stop};
+        pthread_create(&writers[i], NULL, unified_concurrent_writer, &w_data[i]);
+    }
+    for (int i = 0; i < NUM_READERS; i++)
+    {
+        r_data[i] = (unified_concurrent_data_t){db,          cfs,           NUM_CFS, 10 + i, R_OPS,
+                                                &commits_ok, &commits_fail, &go,     &stop};
+        pthread_create(&readers[i], NULL, unified_concurrent_reader, &r_data[i]);
+    }
+
+    atomic_store(&go, 1);
+
+    for (int i = 0; i < NUM_WRITERS; i++) pthread_join(writers[i], NULL);
+    atomic_store(&stop, 1);
+    for (int i = 0; i < NUM_READERS; i++) pthread_join(readers[i], NULL);
+
+    int final_ok = atomic_load(&commits_ok);
+    int final_fail = atomic_load(&commits_fail);
+    printf("  unified concurrent: commits=%d errors=%d\n", final_ok, final_fail);
+    ASSERT_EQ(final_fail, 0);
+    ASSERT_EQ(final_ok, NUM_WRITERS * W_OPS);
+
+    /* wait for background flushes to settle */
+    usleep(500000);
+
+    /* verify CF isolation -- each CF should have its own data */
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        tidesdb_txn_t *vtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
+
+        int found = 0;
+        for (int i = 0; i < 50; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "ushared_%06d", i);
+            uint8_t *val = NULL;
+            size_t vs = 0;
+            /* shared keys may have been deleted by interleaved deletes, so some misses are OK */
+            if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+            {
+                found++;
+                free(val);
+            }
+        }
+        printf("  %s: %d/50 shared keys found\n", cf_names[c], found);
+        /* at least some shared keys should survive (deletes only hit ~1/11 of ops) */
+        ASSERT_TRUE(found > 20);
+
+        tidesdb_txn_free(vtxn);
+    }
+
+    /* verify unique keys from each writer are present */
+    tidesdb_txn_t *vtxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
+    int unique_found = 0;
+    for (int t = 0; t < NUM_WRITERS; t++)
+    {
+        for (int i = 1; i < W_OPS; i += 20)
+        {
+            if (i % 4 == 0) continue; /* shared key pattern, skip */
+            int cf_idx = (t + i) % NUM_CFS;
+            char key[64];
+            snprintf(key, sizeof(key), "uuniq_t%d_%06d", t, i);
+            uint8_t *val = NULL;
+            size_t vs = 0;
+            if (tidesdb_txn_get(vtxn, cfs[cf_idx], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+            {
+                unique_found++;
+                free(val);
+            }
+        }
+    }
+    tidesdb_txn_free(vtxn);
+    printf("  unique keys found: %d\n", unique_found);
+    ASSERT_TRUE(unique_found > 0);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -23757,6 +24674,17 @@ int main(int argc, char **argv)
     RUN_TEST(test_purge_cf_basic, tests_passed);
     RUN_TEST(test_purge_all, tests_passed);
     RUN_TEST(test_sync_wal, tests_passed);
+    RUN_TEST(test_perf_multi_cf_commit_throughput, tests_passed);
+    RUN_TEST(test_perf_savepoint_throughput, tests_passed);
+    RUN_TEST(test_perf_txn_put_throughput, tests_passed);
+    RUN_TEST(test_unified_basic_put_get, tests_passed);
+    RUN_TEST(test_unified_multi_cf_isolation, tests_passed);
+    RUN_TEST(test_unified_delete, tests_passed);
+    RUN_TEST(test_unified_flush_to_sstable, tests_passed);
+    RUN_TEST(test_unified_recovery_after_reopen, tests_passed);
+    RUN_TEST(test_unified_multi_cf_many_keys, tests_passed);
+    RUN_TEST(test_unified_multi_cf_flush_and_recovery, tests_passed);
+    RUN_TEST(test_unified_concurrent_multi_cf_read_write, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

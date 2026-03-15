@@ -26,8 +26,8 @@
 #include "test_macros.h"
 
 /* global test filter -- set via argv[1] for running specific tests */
-static const char *test_filter = NULL;
-static int tests_skipped = 0;
+static UNUSED const char *test_filter = NULL;
+static UNUSED int tests_skipped = 0;
 
 /* call at the top of main(argc, argv) to enable --filter or positional arg */
 #define INIT_TEST_FILTER(argc, argv)             \

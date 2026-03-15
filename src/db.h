@@ -220,9 +220,16 @@ typedef struct tidesdb_column_family_config_t
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
- * @param log_to_file flag to determine if debug logging should be written to a file\
- * @param log_truncation_at log file truncation threshold (0 = no truncation)
- * @param max_memory_usage global memory limit in bytes (0 = auto, 80%% of total system memory)
+ * @param log_to_file flag to determine if debug logging should be written to a file
+ * @param log_truncation_at size in bytes at which to truncate the log file, 0 = no truncation
+ * @param max_memory_usage maximum memory usage for the database
+ * @param unified_memtable flag to determine if unified memtable should be used
+ * @param unified_memtable_write_buffer write buffer size for unified memtable (0 = auto)
+ * @param unified_memtable_skip_list_max_level skip list max level for unified memtable (0 = default
+ * 12)
+ * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
+ * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
+ * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
  */
 typedef struct tidesdb_config_t
 {
@@ -235,6 +242,12 @@ typedef struct tidesdb_config_t
     int log_to_file;
     size_t log_truncation_at;
     size_t max_memory_usage;
+    int unified_memtable;
+    size_t unified_memtable_write_buffer;
+    int unified_memtable_skip_list_max_level;
+    float unified_memtable_skip_list_probability;
+    int unified_memtable_sync_mode;
+    uint64_t unified_memtable_sync_interval_us;
 } tidesdb_config_t;
 
 /**
@@ -318,6 +331,12 @@ typedef struct tidesdb_cache_stats_t
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param compaction_queue_size number of pending compaction tasks
  * @param flush_queue_size number of pending flush tasks in queue
+ * @param unified_memtable_enabled whether unified memtable mode is active
+ * @param unified_memtable_bytes bytes in unified active memtable
+ * @param unified_immutable_count number of unified immutable memtables
+ * @param unified_is_flushing whether unified memtable is currently flushing/rotating
+ * @param unified_next_cf_index next CF index to be assigned in unified mode
+ * @param unified_wal_generation current unified WAL generation counter
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -336,6 +355,12 @@ typedef struct tidesdb_db_stats_t
     int64_t txn_memory_bytes;
     size_t compaction_queue_size;
     size_t flush_queue_size;
+    int unified_memtable_enabled;
+    int64_t unified_memtable_bytes;
+    int unified_immutable_count;
+    int unified_is_flushing;
+    uint32_t unified_next_cf_index;
+    uint64_t unified_wal_generation;
 } tidesdb_db_stats_t;
 
 /**** system default configuration functions */

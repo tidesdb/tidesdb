@@ -13491,7 +13491,7 @@ int tidesdb_close(tidesdb_t *db)
 
         /* we check all conditions -- no CF admission flag, queue empty, no pending flush I/O */
         int pending = atomic_load_explicit(&db->flush_pending_count, memory_order_acquire);
-        if (!any_flushing && queue_size_val == 0 && pending == 0)
+        if (!any_flushing && queue_size_val == 0 && pending <= 0)
         {
             break;
         }
@@ -13500,8 +13500,9 @@ int tidesdb_close(tidesdb_t *db)
         {
             TDB_DEBUG_LOG(
                 TDB_LOG_INFO,
-                "Still waiting for background flushes (waited %d seconds, queue_size=%zu)",
-                flush_wait_count / 1000, queue_size_val);
+                "Still waiting for background flushes (waited %d seconds, queue_size=%zu, "
+                "any_flushing=%d, pending=%d)",
+                flush_wait_count / 1000, queue_size_val, any_flushing, pending);
         }
 
         pthread_rwlock_unlock(&db->cf_list_lock);
@@ -21024,8 +21025,11 @@ static void tidesdb_recover_single_wal(tidesdb_column_family_t *cf, char *wal_pa
                       work->sst_id);
         tidesdb_immutable_memtable_ref(imm);
 
+        atomic_fetch_add_explicit(&cf->db->flush_pending_count, 1, memory_order_release);
+
         if (queue_enqueue(cf->db->flush_queue, work) != 0)
         {
+            atomic_fetch_sub_explicit(&cf->db->flush_pending_count, 1, memory_order_release);
             tidesdb_immutable_memtable_unref(imm);
             free(work);
         }

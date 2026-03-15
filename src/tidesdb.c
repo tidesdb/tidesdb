@@ -129,6 +129,19 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_UNIFIED_WAL_PREFIX     "uwal_"
 #define TDB_UNIFIED_WAL_MAGIC      0x55AAU
 #define TDB_UNIFIED_CF_PREFIX_SIZE 4
+#define TDB_PREFIXED_KEY_STACK_MAX 256
+
+/* stack-with-heap-fallback for prefixed keys */
+#define TDB_PREFIXED_KEY_ALLOC(name, total_size, stack_buf) \
+    uint8_t stack_buf[TDB_PREFIXED_KEY_STACK_MAX];          \
+    uint8_t *name =                                         \
+        ((total_size) <= TDB_PREFIXED_KEY_STACK_MAX) ? stack_buf : (uint8_t *)malloc(total_size)
+
+#define TDB_PREFIXED_KEY_FREE(name, stack_buf) \
+    do                                         \
+    {                                          \
+        if ((name) != (stack_buf)) free(name); \
+    } while (0)
 
 static inline void tdb_encode_be32(uint32_t val, uint8_t *out)
 {
@@ -16132,9 +16145,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     /* unified memtable read path -- search shared skip list with prefixed key */
     if (txn->db->unified_mt.enabled)
     {
-        uint8_t prefixed_key[TDB_UNIFIED_CF_PREFIX_SIZE + key_size];
+        const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
+        TDB_PREFIXED_KEY_ALLOC(prefixed_key, pk_total, _pk_stack1);
+        if (!prefixed_key) return TDB_ERR_MEMORY;
         size_t pk_size = tdb_build_prefixed_key(cf->unified_cf_index, key, key_size, prefixed_key);
 
+        int unified_rc = TDB_ERR_NOT_FOUND;
         const int64_t now_u = (int64_t)atomic_load(&txn->db->cached_current_time);
         const uint8_t *temp_val;
         size_t temp_val_size;
@@ -16157,7 +16173,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 if (deleted_u)
                 {
                     tidesdb_immutable_memtable_unref(umt);
-                    return TDB_ERR_NOT_FOUND;
+                    unified_rc = TDB_ERR_NOT_FOUND;
+                    goto unified_memtable_done;
                 }
                 if (ttl_u <= 0 || ttl_u > now_u)
                 {
@@ -16165,17 +16182,20 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     if (!*value)
                     {
                         tidesdb_immutable_memtable_unref(umt);
-                        return TDB_ERR_MEMORY;
+                        unified_rc = TDB_ERR_MEMORY;
+                        goto unified_memtable_done;
                     }
                     memcpy(*value, temp_val, temp_val_size);
                     *value_size = temp_val_size;
                     tidesdb_immutable_memtable_unref(umt);
                     PROFILE_INC(txn->db, memtable_hits);
                     tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
-                    return TDB_SUCCESS;
+                    unified_rc = TDB_SUCCESS;
+                    goto unified_memtable_done;
                 }
                 tidesdb_immutable_memtable_unref(umt);
-                return TDB_ERR_NOT_FOUND;
+                unified_rc = TDB_ERR_NOT_FOUND;
+                goto unified_memtable_done;
             }
             tidesdb_immutable_memtable_unref(umt);
         }
@@ -16197,24 +16217,39 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     visibility_check ? txn->db->commit_status : NULL);
                 if (mr == 0)
                 {
-                    if (deleted_u) return TDB_ERR_NOT_FOUND;
+                    if (deleted_u)
+                    {
+                        unified_rc = TDB_ERR_NOT_FOUND;
+                        goto unified_memtable_done;
+                    }
                     if (ttl_u <= 0 || ttl_u > now_u)
                     {
                         *value = malloc(temp_val_size);
-                        if (!*value) return TDB_ERR_MEMORY;
+                        if (!*value)
+                        {
+                            unified_rc = TDB_ERR_MEMORY;
+                            goto unified_memtable_done;
+                        }
                         memcpy(*value, temp_val, temp_val_size);
                         *value_size = temp_val_size;
                         PROFILE_INC(txn->db, immutable_hits);
                         tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
-                        return TDB_SUCCESS;
+                        unified_rc = TDB_SUCCESS;
+                        goto unified_memtable_done;
                     }
-                    return TDB_ERR_NOT_FOUND;
+                    unified_rc = TDB_ERR_NOT_FOUND;
+                    goto unified_memtable_done;
                 }
             }
         }
 
         /* not in unified memtables -- fall through to per-CF sstable search */
+        TDB_PREFIXED_KEY_FREE(prefixed_key, _pk_stack1);
         goto unified_sst_search;
+
+    unified_memtable_done:
+        TDB_PREFIXED_KEY_FREE(prefixed_key, _pk_stack1);
+        return unified_rc;
     }
 
     /* we now load active memtable with refcount protection
@@ -17653,24 +17688,32 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
     if (txn->num_ops == 1)
     {
         const tidesdb_txn_op_t *op = &txn->ops[0];
-        uint8_t prefixed[TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size];
+        const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+        TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack2);
+        if (!prefixed) return TDB_ERR_MEMORY;
         size_t pk_size =
             tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, prefixed);
-        return skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
-                                      op->ttl, txn->commit_seq, op->is_delete) == 0
-                   ? TDB_SUCCESS
-                   : TDB_ERR_MEMORY;
+        int rc = skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
+                                        op->ttl, txn->commit_seq, op->is_delete) == 0
+                     ? TDB_SUCCESS
+                     : TDB_ERR_MEMORY;
+        TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack2);
+        return rc;
     }
 
     /* for multi-op transactions, apply each op with prefixed key */
     for (int i = 0; i < txn->num_ops; i++)
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
-        uint8_t prefixed[TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size];
+        const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+        TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack3);
+        if (!prefixed) return TDB_ERR_MEMORY;
         size_t pk_size =
             tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, prefixed);
-        if (skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size, op->ttl,
-                                   txn->commit_seq, op->is_delete) != 0)
+        int rc = skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
+                                        op->ttl, txn->commit_seq, op->is_delete);
+        TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack3);
+        if (rc != 0)
         {
             return TDB_ERR_MEMORY;
         }
@@ -18343,9 +18386,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
-        /* we apply coordinated L0/L1 backpressure once per CF per commit
-         * this replaces the per-put/delete checks, reducing overhead from
-         * O(num_ops) to O(num_cfs) atomic loads per transaction */
         result = tidesdb_apply_backpressure(cf);
         if (result != TDB_SUCCESS)
         {
@@ -21534,7 +21574,9 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
                     }
 
                     /* build prefixed key and insert into unified memtable */
-                    uint8_t prefixed[TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64];
+                    const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
+                    TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack4);
+                    if (!prefixed) break;
                     tdb_encode_be32(cf_index, prefixed);
                     memcpy(prefixed + TDB_UNIFIED_CF_PREFIX_SIZE, key, key_size_u64);
                     size_t pk_size = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
@@ -21543,6 +21585,7 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
                     skip_list_put_with_seq(
                         umt->skip_list, prefixed, pk_size, is_delete ? NULL : (uint8_t *)value,
                         is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, is_delete);
+                    TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack4);
 
                     if (seq_value > max_seq) max_seq = seq_value;
                     total_entries++;
@@ -21562,7 +21605,7 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
 
     queue_free(wal_files);
 
-    /* update global_seq if recovered entries have higher sequence numbers */
+    /* we update global_seq if recovered entries have higher sequence numbers */
     if (max_seq > 0)
     {
         uint64_t current_seq = atomic_load_explicit(&db->global_seq, memory_order_acquire);

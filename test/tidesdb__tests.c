@@ -23380,7 +23380,16 @@ void test_purge_all(void)
 
 static void test_perf_multi_cf_commit_throughput(void)
 {
+#if INTPTR_MAX == INT32_MAX
+    /* 32-bit builds have limited address space; reduce CF counts and buffer
+     * size to avoid OOM under AddressSanitizer (which amplifies each
+     * allocation ~2-3x with shadow memory). */
+    const int cf_counts[] = {1, 4};
+    const size_t write_buf = 8 * 1024 * 1024;
+#else
     const int cf_counts[] = {1, 4, 8, 12};
+    const size_t write_buf = 64 * 1024 * 1024;
+#endif
     const int num_configs = (int)(sizeof(cf_counts) / sizeof(cf_counts[0]));
     const int ops_per_txn = 10;
     const int num_txns = 500;
@@ -23393,7 +23402,7 @@ static void test_perf_multi_cf_commit_throughput(void)
 
         const int num_cfs = cf_counts[c];
         tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-        cf_config.write_buffer_size = 64 * 1024 * 1024;
+        cf_config.write_buffer_size = write_buf;
         cf_config.sync_mode = TDB_SYNC_NONE;
 
         tidesdb_column_family_t *cfs[12];

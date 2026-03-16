@@ -293,6 +293,7 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=powerpc \
             -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
+            -DCMAKE_C_FLAGS="-mlongcall" \
             -DCMAKE_FIND_ROOT_PATH=/usr/powerpc-linux-gnu \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -333,6 +334,7 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=powerpc \
             -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
+            -DCMAKE_C_FLAGS="-mlongcall" \
             -DCMAKE_FIND_ROOT_PATH=/usr/powerpc-linux-gnu \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \

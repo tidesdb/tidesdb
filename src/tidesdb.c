@@ -18350,6 +18350,12 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
     }
 
+    /* we use a single loop for WAL write + memtable apply to close the race window
+     * where another thread could flush the memtable between WAL write and op apply.
+     * previously two separate loops meant ops for CF[1] could be applied to an
+     * immutable memtable whose flush worker already finished reading the skip list,
+     * causing committed data loss. ref release and flush trigger are deferred to a
+     * second pass to avoid triggering flushes while holding refs to other CFs. */
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
@@ -18404,8 +18410,31 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 
         if (wal_is_heap) free(wal_batch);
+
+        /* we apply ops to memtable immediately after WAL write to ensure entries
+         * are visible in the skip list before any concurrent flush can read it.
+         * this closes the race where another thread flushes this CF's memtable
+         * between our WAL write and op apply, causing the flush worker to
+         * serialize the skip list without our entries. */
+        if (mt)
+        {
+            result = tidesdb_apply_backpressure(cf);
+            if (result != TDB_SUCCESS)
+            {
+                goto cleanup_error_result;
+            }
+
+            result = tidesdb_txn_apply_ops_to_memtable(txn, cf, cf_skiplists[cf_idx]);
+            if (result != TDB_SUCCESS)
+            {
+                goto cleanup_error_result;
+            }
+        }
     }
 
+    /* second pass -- we release refs and trigger flushes. deferred from the first loop
+     * because flush can block on backpressure and we don't want to hold refs
+     * to other CFs' memtables while waiting. */
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
         tidesdb_memtable_t *mt = cf_memtables[cf_idx];
@@ -18413,18 +18442,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
         skip_list_t *memtable = cf_skiplists[cf_idx];
-
-        result = tidesdb_apply_backpressure(cf);
-        if (result != TDB_SUCCESS)
-        {
-            goto cleanup_error_result;
-        }
-
-        result = tidesdb_txn_apply_ops_to_memtable(txn, cf, memtable);
-        if (result != TDB_SUCCESS)
-        {
-            goto cleanup_error_result;
-        }
 
         const size_t memtable_size = (size_t)skip_list_get_size(memtable);
 

@@ -1960,7 +1960,7 @@ tidesdb_config_t tidesdb_default_config(void)
                               .log_truncation_at = TDB_DEFAULT_LOG_FILE_TRUNCATION,
                               .max_memory_usage = 0,
                               .unified_memtable = 0,
-                              .unified_memtable_write_buffer = 0,
+                              .unified_memtable_write_buffer_size = 0,
                               .unified_memtable_skip_list_max_level = 0,
                               .unified_memtable_skip_list_probability = 0,
                               .unified_memtable_sync_mode = 0,
@@ -12964,8 +12964,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable mode enabled");
 
-        (*db)->unified_mt.write_buffer_size = config->unified_memtable_write_buffer > 0
-                                                  ? config->unified_memtable_write_buffer
+        (*db)->unified_mt.write_buffer_size = config->unified_memtable_write_buffer_size > 0
+                                                  ? config->unified_memtable_write_buffer_size
                                                   : TDB_DEFAULT_WRITE_BUFFER_SIZE;
 
         (*db)->unified_mt.immutables = queue_new();

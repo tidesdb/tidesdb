@@ -23635,7 +23635,7 @@ static tidesdb_t *create_unified_test_db(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.unified_memtable = 1;
-    config.unified_memtable_write_buffer = 1024 * 1024; /* 1 MB */
+    config.unified_memtable_write_buffer_size = 1024 * 1024; /* 1 MB */
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -23761,7 +23761,7 @@ static void test_unified_flush_to_sstable(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.unified_memtable = 1;
-    config.unified_memtable_write_buffer = 4096; /* tiny buffer to trigger flush */
+    config.unified_memtable_write_buffer_size = 4096; /* tiny buffer to trigger flush */
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -23849,7 +23849,7 @@ static void test_unified_recovery_after_reopen(void)
     tidesdb_config_t config2 = tidesdb_default_config();
     config2.db_path = TEST_DB_PATH;
     config2.unified_memtable = 1;
-    config2.unified_memtable_write_buffer = 1024 * 1024;
+    config2.unified_memtable_write_buffer_size = 1024 * 1024;
 
     db = NULL;
     ASSERT_EQ(tidesdb_open(&config2, &db), 0);
@@ -23953,7 +23953,7 @@ static void test_unified_multi_cf_flush_and_recovery(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.unified_memtable = 1;
-    config.unified_memtable_write_buffer = 4096; /* tiny to trigger many flushes */
+    config.unified_memtable_write_buffer_size = 4096; /* tiny to trigger many flushes */
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -24036,7 +24036,7 @@ static void test_unified_multi_cf_flush_and_recovery(void)
     tidesdb_config_t config2 = tidesdb_default_config();
     config2.db_path = TEST_DB_PATH;
     config2.unified_memtable = 1;
-    config2.unified_memtable_write_buffer = 1024 * 1024;
+    config2.unified_memtable_write_buffer_size = 1024 * 1024;
 
     db = NULL;
     ASSERT_EQ(tidesdb_open(&config2, &db), 0);
@@ -24228,7 +24228,7 @@ static void test_unified_concurrent_multi_cf_read_write(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.unified_memtable = 1;
-    config.unified_memtable_write_buffer = 8192; /* small to trigger frequent rotation */
+    config.unified_memtable_write_buffer_size = 8192; /* small to trigger frequent rotation */
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);

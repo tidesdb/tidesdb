@@ -386,7 +386,7 @@ typedef struct tidesdb_comparator_entry_t
  * @param log_truncation_at size in bytes at which to truncate the log file, 0 = no truncation
  * @param max_memory_usage maximum memory usage for the database
  * @param unified_memtable flag to determine if unified memtable should be used
- * @param unified_memtable_write_buffer write buffer size for unified memtable (0 = auto)
+ * @param unified_memtable_write_buffer_size write buffer size for unified memtable (0 = auto)
  * @param unified_memtable_skip_list_max_level skip list max level for unified memtable (0 = default
  * 12)
  * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
@@ -405,7 +405,7 @@ typedef struct tidesdb_config_t
     size_t log_truncation_at;
     size_t max_memory_usage;
     int unified_memtable;
-    size_t unified_memtable_write_buffer;
+    size_t unified_memtable_write_buffer_size;
     int unified_memtable_skip_list_max_level;
     float unified_memtable_skip_list_probability;
     int unified_memtable_sync_mode;

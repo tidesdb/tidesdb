@@ -454,11 +454,13 @@ typedef struct
  * @param block_size total size of this block
  * @param capacity allocated capacity for arrays
  * @param is_arena_allocated 1 if arena-allocated (deserialized), 0 if separate mallocs (created)
+ * @param is_zero_copy 1 if keys/values point into external buffer (no copy during deserialize)
  * @param entries array of entries
  * @param keys array of key data
  * @param inline_values array of inline values (null if in vlog)
  * @param max_key maximum key in this block
  * @param max_key_size size of maximum key
+ * @param data_ref owned reference to external data buffer (freed on block_free if non-NULL)
  */
 typedef struct
 {
@@ -466,11 +468,13 @@ typedef struct
     uint32_t block_size;
     uint32_t capacity;
     uint8_t is_arena_allocated;
+    uint8_t is_zero_copy;
     tidesdb_klog_entry_t *entries;
     uint8_t **keys;
     uint8_t **inline_values;
     uint8_t *max_key;
     size_t max_key_size;
+    uint8_t *data_ref;
 } tidesdb_klog_block_t;
 
 /**
@@ -968,7 +972,7 @@ static int tidesdb_klog_block_is_full(const tidesdb_klog_block_t *block, size_t 
 static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **out,
                                         size_t *out_size);
 static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
-                                          tidesdb_klog_block_t **block);
+                                          tidesdb_klog_block_t **block, int zero_copy);
 
 /**
  * tidesdb_block_managers_t
@@ -2099,8 +2103,13 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
     if (block->is_arena_allocated)
     {
         /* with arena allocation everything is in one contiguous block
-         * except max_key which is allocated separately during deserialization */
+         * except max_key which is allocated separately during deserialization.
+         * for zero-copy blocks, also free the owned data buffer if present. */
         free(block->max_key);
+        if (block->is_zero_copy && block->data_ref)
+        {
+            free(block->data_ref);
+        }
         free(block);
     }
     else
@@ -2876,7 +2885,7 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
  * @return 0 on success, -1 on error
  */
 static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
-                                          tidesdb_klog_block_t **block)
+                                          tidesdb_klog_block_t **block, int zero_copy)
 {
     if (!data || !data_size || !block) return TDB_ERR_INVALID_ARGS;
 
@@ -2884,6 +2893,9 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
     /* we use arena allocation -- single malloc for entire block structure
      * layout -- block_struct | entries[] | keys[] | inline_values[] | key_data | value_data
+     * when zero_copy=1, keys/values point directly into the source data buffer
+     * instead of being copied, eliminating the memcpy overhead (~23% of CPU in seeks).
+     * the caller must keep the source data buffer alive for the block's lifetime.
      * this reduces malloc calls from O(N) to O(1) per block */
     const uint8_t *ptr = data;
 
@@ -2896,18 +2908,15 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
      * each entry needs at least 4 bytes (flags + 3 varints min) */
     if (num_entries > data_size / 4) return TDB_ERR_CORRUPTION;
 
-    /* we use data_size as upper bound for key+value data instead of scanning
-     * the entire serialized stream first. this eliminates the pre-scan pass
-     * which was the #1 source of branch mispredictions (34% of all branch misses).
-     * the second (actual deserialization) pass validates everything anyway. */
-    const size_t data_payload_bound = data_size;
+    /* arena layout:
+     * block_struct | entries[] | keys_ptrs[] | values_ptrs[]
+     * when !zero_copy, also: | key_data | value_data */
+    const size_t hdr_size = sizeof(tidesdb_klog_block_t) +
+                            (num_entries * sizeof(tidesdb_klog_entry_t)) +
+                            (num_entries * sizeof(uint8_t *)) + /* keys array */
+                            (num_entries * sizeof(uint8_t *));  /* inline_values array */
 
-    /* block + entries + key_ptrs + value_ptrs + key_data + value_data */
-    const size_t arena_size = sizeof(tidesdb_klog_block_t) +
-                              (num_entries * sizeof(tidesdb_klog_entry_t)) +
-                              (num_entries * sizeof(uint8_t *)) + /* keys array */
-                              (num_entries * sizeof(uint8_t *)) + /* inline_values array */
-                              data_payload_bound;
+    const size_t arena_size = zero_copy ? hdr_size : (hdr_size + data_size);
 
     uint8_t *arena = malloc(arena_size);
     if (!arena) return TDB_ERR_MEMORY;
@@ -2918,6 +2927,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
     /* we mark as arena-allocated for proper cleanup */
     (*block)->is_arena_allocated = 1;
+    (*block)->is_zero_copy = (uint8_t)zero_copy;
 
     uint8_t *arena_ptr = arena + sizeof(tidesdb_klog_block_t);
     (*block)->entries = (tidesdb_klog_entry_t *)arena_ptr;
@@ -2929,7 +2939,8 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     (*block)->inline_values = (uint8_t **)arena_ptr;
     arena_ptr += num_entries * sizeof(uint8_t *);
 
-    uint8_t *data_arena = arena_ptr;
+    /* data_arena only used for non-zero-copy mode */
+    uint8_t *data_arena = zero_copy ? NULL : arena_ptr;
 
     (*block)->num_entries = 0;
     (*block)->block_size = block_size;
@@ -3047,10 +3058,18 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
             return TDB_ERR_CORRUPTION;
         }
 
-        /* we point into arena instead of malloc */
-        (*block)->keys[i] = data_arena + data_offset;
-        memcpy((*block)->keys[i], ptr, (*block)->entries[i].key_size);
-        data_offset += (*block)->entries[i].key_size;
+        if (zero_copy)
+        {
+            /* zero-copy: point directly into the source data buffer */
+            (*block)->keys[i] = (uint8_t *)ptr;
+        }
+        else
+        {
+            /* copy into arena */
+            (*block)->keys[i] = data_arena + data_offset;
+            memcpy((*block)->keys[i], ptr, (*block)->entries[i].key_size);
+            data_offset += (*block)->entries[i].key_size;
+        }
         ptr += (*block)->entries[i].key_size;
         remaining -= (*block)->entries[i].key_size;
 
@@ -3064,9 +3083,17 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
                 return TDB_ERR_CORRUPTION;
             }
 
-            (*block)->inline_values[i] = data_arena + data_offset;
-            memcpy((*block)->inline_values[i], ptr, (*block)->entries[i].value_size);
-            data_offset += (*block)->entries[i].value_size;
+            if (zero_copy)
+            {
+                /* zero-copy: point directly into the source data buffer */
+                (*block)->inline_values[i] = (uint8_t *)ptr;
+            }
+            else
+            {
+                (*block)->inline_values[i] = data_arena + data_offset;
+                memcpy((*block)->inline_values[i], ptr, (*block)->entries[i].value_size);
+                data_offset += (*block)->entries[i].value_size;
+            }
             ptr += (*block)->entries[i].value_size;
             remaining -= (*block)->entries[i].value_size;
         }
@@ -7174,7 +7201,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
         const size_t data_size = block->size;
 
         tidesdb_klog_block_t *klog_block = NULL;
-        if (tidesdb_klog_block_deserialize(data, data_size, &klog_block) != 0)
+        if (tidesdb_klog_block_deserialize(data, data_size, &klog_block, 0) != 0)
         {
             block_manager_block_release(block);
             tidesdb_sstable_unref(db, sst);
@@ -7673,7 +7700,7 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             source->source.sstable.current_block = NULL;
 
             const int deserialize_result = tidesdb_klog_block_deserialize(
-                data, data_size, &source->source.sstable.current_block);
+                data, data_size, &source->source.sstable.current_block, 1);
 
             if (deserialize_result != 0)
             {
@@ -7923,7 +7950,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             source->source.sstable.current_block = NULL;
 
             const int deserialize_result = tidesdb_klog_block_deserialize(
-                data, data_size, &source->source.sstable.current_block);
+                data, data_size, &source->source.sstable.current_block, 1);
 
             if (deserialize_result != 0)
             {
@@ -19350,13 +19377,15 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
             }
 
             tidesdb_klog_block_t *kb = NULL;
-            if (tidesdb_klog_block_deserialize(deser_ptr, deser_size, &kb) != 0 || !kb)
+            if (tidesdb_klog_block_deserialize(deser_ptr, deser_size, &kb, 1) != 0 || !kb)
             {
                 free(cached_data);
                 return TDB_ERR_CORRUPTION;
             }
 
-            free(cached_data);
+            /* zero-copy: block keys/values point into cached_data, so keep it alive.
+             * data_ref is freed when the block is freed. */
+            kb->data_ref = cached_data;
             *kb_out = kb;
             return TDB_SUCCESS;
         }
@@ -19387,7 +19416,9 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
     }
 
     tidesdb_klog_block_t *kb = NULL;
-    if (tidesdb_klog_block_deserialize(data, data_size, &kb) != 0 || !kb)
+    /* zero-copy: keys/values point into data buffer (decompressed or bmblock->data).
+     * the caller keeps these alive via decompressed_out and bmblock_out. */
+    if (tidesdb_klog_block_deserialize(data, data_size, &kb, 1) != 0 || !kb)
     {
         if (*decompressed_out) free(*decompressed_out);
         *decompressed_out = NULL;
@@ -20146,20 +20177,36 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
+    /* we detect forward-monotonic seeks (new target >= last result) BEFORE freeing
+     * iter->current. when the seek target advances forward, each source's current_kv
+     * that is already >= target is still the correct "first entry >= target" answer
+     * because no entries exist between the old target and current_kv (by definition of
+     * the previous seek). this lets us skip ~(N-1) redundant source re-seeks per call
+     * on sequential/near-sequential access patterns. */
+    int forward_monotonic = 0;
+    const skip_list_comparator_fn cmp_fn = iter->heap->comparator;
+    void *cmp_ctx = iter->heap->comparator_ctx;
+
+    if (iter->valid && iter->direction == 1 && iter->current && cmp_fn)
+    {
+        const int cmp =
+            cmp_fn(key, key_size, iter->current->key, iter->current->entry.key_size, cmp_ctx);
+        if (cmp >= 0) forward_monotonic = 1;
+    }
+
     tidesdb_kv_pair_free(iter->current);
     iter->current = NULL;
     iter->valid = 0;
     iter->direction = 1;
 
-    tidesdb_column_family_t *cf = iter->cf;
-
-    /* we check if sst layout has changed or if cached sources need initial build.
-     * fresh iterators (from tidesdb_iter_new) have num_cached_sources == 0 because
-     * SST sources are added directly to the heap, not to cached_sources. we must
-     * rebuild here so the seek can reposition those sources. */
-    const uint64_t current_version =
-        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
-    if (current_version != iter->cached_layout_version || iter->num_cached_sources == 0)
+    /* we only rebuild SST cache on initial build (num_cached_sources == 0).
+     * the iterator holds refs to all sstables it needs and has snapshot semantics
+     * via its transaction -- new sstables from later flushes contain data already
+     * visible through memtable sources, and compaction cannot delete ref'd sstables.
+     * rebuilding on every sstable_layout_version change destroyed cached block
+     * positions and caused massive latency spikes from 8 threads simultaneously
+     * re-reading + decompressing all sstable blocks. */
+    if (iter->num_cached_sources == 0)
     {
         const int result = tidesdb_iter_rebuild_sst_cache(iter);
         if (result != TDB_SUCCESS) return result;
@@ -20208,10 +20255,24 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
         temp_sources[temp_count++] = (tidesdb_merge_source_t *)iter->cached_sources[i];
     }
 
-    /* we reposition all sources to target key */
+    /* we reposition sources to target key */
     for (int i = 0; i < temp_count; i++)
     {
         tidesdb_merge_source_t *source = temp_sources[i];
+
+        /* fast path: on forward-monotonic seeks, if source already has a key >= target,
+         * it is still the correct first entry >= target. skip the expensive re-seek. */
+        if (forward_monotonic && source->current_kv != NULL)
+        {
+            const int cmp = cmp_fn(source->current_kv->key, source->current_kv->entry.key_size, key,
+                                   key_size, cmp_ctx);
+            if (cmp >= 0)
+            {
+                tidesdb_merge_heap_add_source(iter->heap, source);
+                continue;
+            }
+        }
+
         tidesdb_kv_pair_free(source->current_kv);
         source->current_kv = NULL;
 
@@ -20231,12 +20292,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
         {
             tidesdb_iter_seek_sstable_source_forward(iter, source, key, key_size);
         }
-    }
 
-    /* we add all repositioned sources to heap */
-    for (int i = 0; i < temp_count; i++)
-    {
-        tidesdb_merge_source_t *source = temp_sources[i];
         if (source->current_kv != NULL)
         {
             tidesdb_merge_heap_add_source(iter->heap, source);
@@ -20250,16 +20306,26 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
+    /* backward-monotonic detection: new target <= last result means sources
+     * with current_kv->key <= target are still correctly positioned */
+    int backward_monotonic = 0;
+    const skip_list_comparator_fn cmp_fn = iter->heap->comparator;
+    void *cmp_ctx = iter->heap->comparator_ctx;
+
+    if (iter->valid && iter->direction == -1 && iter->current && cmp_fn)
+    {
+        const int cmp =
+            cmp_fn(key, key_size, iter->current->key, iter->current->entry.key_size, cmp_ctx);
+        if (cmp <= 0) backward_monotonic = 1;
+    }
+
     tidesdb_kv_pair_free(iter->current);
     iter->current = NULL;
     iter->valid = 0;
     iter->direction = -1;
 
-    tidesdb_column_family_t *cf = iter->cf;
-
-    const uint64_t current_version =
-        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
-    if (current_version != iter->cached_layout_version || iter->num_cached_sources == 0)
+    /* we only rebuild SST cache on initial build -- see tidesdb_iter_seek comment */
+    if (iter->num_cached_sources == 0)
     {
         const int result = tidesdb_iter_rebuild_sst_cache(iter);
         if (result != TDB_SUCCESS) return result;
@@ -20306,10 +20372,24 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
         temp_sources[temp_count++] = (tidesdb_merge_source_t *)iter->cached_sources[i];
     }
 
-    /* we reposition all sources to target key (backward) */
+    /* we reposition sources to target key (backward) */
     for (int i = 0; i < temp_count; i++)
     {
         tidesdb_merge_source_t *source = temp_sources[i];
+
+        /* fast path: on backward-monotonic seeks, if source already has key <= target,
+         * it is still the correct last entry <= target. skip the expensive re-seek. */
+        if (backward_monotonic && source->current_kv != NULL)
+        {
+            const int cmp = cmp_fn(source->current_kv->key, source->current_kv->entry.key_size, key,
+                                   key_size, cmp_ctx);
+            if (cmp <= 0)
+            {
+                tidesdb_merge_heap_add_source(iter->heap, source);
+                continue;
+            }
+        }
+
         tidesdb_kv_pair_free(source->current_kv);
         source->current_kv = NULL;
 
@@ -20329,12 +20409,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
         {
             tidesdb_iter_seek_sstable_source_backward(iter, source, key, key_size);
         }
-    }
 
-    /* we add all repositioned sources to heap */
-    for (int i = 0; i < temp_count; i++)
-    {
-        tidesdb_merge_source_t *source = temp_sources[i];
         if (source->current_kv != NULL)
         {
             tidesdb_merge_heap_add_source(iter->heap, source);
@@ -20532,8 +20607,8 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                         }
                     }
 
-                    if (tidesdb_klog_block_deserialize(data, data_size,
-                                                       &source->source.sstable.current_block) == 0)
+                    if (tidesdb_klog_block_deserialize(
+                            data, data_size, &source->source.sstable.current_block, 1) == 0)
                     {
                         if (source->source.sstable.current_block->num_entries > 0)
                         {

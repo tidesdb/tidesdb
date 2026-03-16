@@ -467,9 +467,9 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define TDB_U64_CAST(x)  ((unsigned long long)(x))
 #else
 #define TDB_SIZE_FMT     "%zu"
-#define TDB_U64_FMT      "%llu"
+#define TDB_U64_FMT      "%" PRIu64
 #define TDB_SIZE_CAST(x) ((size_t)(x))
-#define TDB_U64_CAST(x)  ((unsigned long long)(x))
+#define TDB_U64_CAST(x)  ((uint64_t)(x))
 #endif
 
 /* cross-platform atomic alignment */

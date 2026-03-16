@@ -205,6 +205,9 @@ typedef enum
 #define TDB_DEFAULT_SYNC_INTERVAL_US       128000
 #define TDB_DEFAULT_LOG_FILE_TRUNCATION    24 * (1024 * 1024)
 
+#define TDB_SKIP_LIST_MAX_LEVEL   12
+#define TDB_SKIP_LIST_PROBABILITY 0.25f
+
 /* configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATOR_CTX  256
@@ -274,7 +277,7 @@ typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 
 /* lock-free immutable memtable snapshot slot
- * part of a double-buffered RCU scheme: writers build in inactive slot,
+ * part of a double-buffered RCU scheme; writers build in inactive slot,
  * swap the active index, then wait for old-slot readers to drain
  * @param items array of immutable memtables
  * @param count number of items in the array
@@ -382,6 +385,13 @@ typedef struct tidesdb_comparator_entry_t
  * @param log_to_file flag to determine if debug logging should be written to a file
  * @param log_truncation_at size in bytes at which to truncate the log file, 0 = no truncation
  * @param max_memory_usage maximum memory usage for the database
+ * @param unified_memtable flag to determine if unified memtable should be used
+ * @param unified_memtable_write_buffer_size write buffer size for unified memtable (0 = auto)
+ * @param unified_memtable_skip_list_max_level skip list max level for unified memtable (0 = default
+ * 12)
+ * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
+ * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
+ * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
  */
 typedef struct tidesdb_config_t
 {
@@ -394,6 +404,12 @@ typedef struct tidesdb_config_t
     int log_to_file;
     size_t log_truncation_at;
     size_t max_memory_usage;
+    int unified_memtable;
+    size_t unified_memtable_write_buffer_size;
+    int unified_memtable_skip_list_max_level;
+    float unified_memtable_skip_list_probability;
+    int unified_memtable_sync_mode;
+    uint64_t unified_memtable_sync_interval_us;
 } tidesdb_config_t;
 
 /**
@@ -438,6 +454,7 @@ struct tidesdb_memtable_t
  * @param db parent database reference
  * @param imm_snaps double-buffered lock-free immutable memtable snapshot slots
  * @param imm_snap_active index (0 or 1) of the currently active snapshot slot
+ * @param unified_cf_index unified memtable column family index (4-byte big-endian prefix)
  */
 struct tidesdb_column_family_t
 {
@@ -464,12 +481,15 @@ struct tidesdb_column_family_t
      * writers rebuild in inactive slot, swap active, wait for old readers */
     tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
     _Atomic(int) imm_snap_active; /* 0 or 1, index of current snapshot */
+
+    /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
+    uint32_t unified_cf_index;
 };
 
 /**
  * tidesdb_sstable_t
  * an immutable sorted string table on disk
- * consists of two files: .klog (keys + metadata) and .vlog (large values)
+ * consists of two files a .klog (keys + metadata) and .vlog (large values)
  * @param id unique identifier
  * @param klog_path path to .klog file
  * @param klog_filename cached pointer into klog_path past the last path separator
@@ -509,7 +529,7 @@ struct tidesdb_sstable_t
 {
     uint64_t id;
     char *klog_path;
-    const char *klog_filename; /* cached pointer into klog_path past last separator */
+    const char *klog_filename;
     char *vlog_path;
     char cf_name[TDB_MAX_CF_NAME_LEN];
     uint8_t *min_key;
@@ -677,6 +697,21 @@ struct tidesdb_t
 #ifdef TDB_ENABLE_READ_PROFILING
     tidesdb_read_stats_t read_stats;
 #endif
+
+    /* unified memtable mode -- single skip_list + single WAL for all CFs */
+    struct
+    {
+        int enabled;
+        _Atomic(tidesdb_memtable_t *) active;
+        queue_t *immutables;
+        tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
+        _Atomic(int) imm_snap_active;
+        _Atomic(int) is_flushing;
+        _Atomic(int) immutable_cleanup_counter;
+        size_t write_buffer_size;
+        _Atomic(uint32_t) next_cf_index;
+        _Atomic(uint64_t) wal_generation;
+    } unified_mt;
 };
 
 /**
@@ -684,11 +719,11 @@ struct tidesdb_t
  * transaction handle for batched operations with acid guarantees
  *
  * supports multiple isolation levels:
- * -- read_uncommitted -- sees all versions including uncommitted (dirty reads allowed)
- * -- read_committed   -- refreshes snapshot on each read (prevents dirty reads)
- * -- repeatable_read  -- consistent snapshot, read-write conflict detection
- * -- snapshot         -- consistent snapshot, read-write + write-write conflict detection
- * -- serializable     -- full ssi with dangerous structure detection (prevents all anomalies)
+ * -- read_uncommitted  sees all versions including uncommitted (dirty reads allowed)
+ * -- read_committed    refreshes snapshot on each read (prevents dirty reads)
+ * -- repeatable_read   consistent snapshot, read-write conflict detection
+ * -- snapshot          consistent snapshot, write-write conflict detection only
+ * -- serializable      full ssi with dangerous structure detection (prevents all anomalies)
  *
  * snapshot isolation semantics:
  * -- snapshot captured at begin (all committed txns with seq <= snapshot_seq are visible)
@@ -755,7 +790,8 @@ struct tidesdb_txn_t
     int cf_capacity;
     tidesdb_column_family_t *last_cf;
     int last_cf_index;
-    tidesdb_txn_t **savepoints;
+    int *savepoint_op_counts;
+    int *savepoint_cf_counts;
     char **savepoint_names;
     int num_savepoints;
     int savepoints_capacity;
@@ -888,6 +924,12 @@ typedef struct tidesdb_cache_stats_t
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param compaction_queue_size number of pending compaction tasks
  * @param flush_queue_size number of pending flush tasks in queue
+ * @param unified_memtable_enabled whether unified memtable mode is active
+ * @param unified_memtable_bytes bytes in unified active memtable
+ * @param unified_immutable_count number of unified immutable memtables
+ * @param unified_is_flushing whether unified memtable is currently flushing/rotating
+ * @param unified_next_cf_index next CF index to be assigned in unified mode
+ * @param unified_wal_generation current unified WAL generation counter
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -906,6 +948,12 @@ typedef struct tidesdb_db_stats_t
     int64_t txn_memory_bytes;
     size_t compaction_queue_size;
     size_t flush_queue_size;
+    int unified_memtable_enabled;
+    int64_t unified_memtable_bytes;
+    int unified_immutable_count;
+    int unified_is_flushing;
+    uint32_t unified_next_cf_index;
+    uint64_t unified_wal_generation;
 } tidesdb_db_stats_t;
 
 /**
@@ -1481,7 +1529,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir);
  * the checkpoint is a fully openable tidesdb database directory.
  *
  * algorithm:
- *   1. for each column family: flush memtable, halt compactions
+ *   1. for each column family -- we flush memtable, halt compactions
  *   2. hard link all live SSTable files into the checkpoint directory
  *   3. copy manifest and config files
  *   4. resume compactions

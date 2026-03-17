@@ -23792,7 +23792,7 @@ static void test_unified_flush_to_sstable(void)
     /* wait for background flushes to complete */
     usleep(500000);
 
-    /* verify all keys still readable (from memtable or SSTable) */
+    /* we verify all keys still readable (from memtable or SSTable) */
     for (int i = 0; i < 200; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -23845,7 +23845,7 @@ static void test_unified_recovery_after_reopen(void)
 
     tidesdb_close(db);
 
-    /* reopen with unified memtable */
+    /* we reopen with unified memtable */
     tidesdb_config_t config2 = tidesdb_default_config();
     config2.db_path = TEST_DB_PATH;
     config2.unified_memtable = 1;
@@ -23996,7 +23996,7 @@ static void test_unified_multi_cf_flush_and_recovery(void)
     /* let background flushes drain */
     usleep(500000);
 
-    /* verify before close */
+    /* we verify before close */
     for (int i = 0; i < N; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -24360,6 +24360,410 @@ static void test_unified_concurrent_multi_cf_read_write(void)
     cleanup_test_dir();
 }
 
+static void test_unified_four_cf_single_txn(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    /* create 4 column families (matches sysbench pattern with t1..t4) */
+    const char *cf_names[] = {"t1", "t2", "t3", "t4"};
+    const int NUM_CFS = 4;
+    tidesdb_column_family_t *cfs[4];
+
+    for (int i = 0; i < NUM_CFS; i++)
+    {
+        ASSERT_EQ(tidesdb_create_column_family(db, cf_names[i], &cf_config), 0);
+        cfs[i] = tidesdb_get_column_family(db, cf_names[i]);
+        ASSERT_TRUE(cfs[i] != NULL);
+    }
+
+    /* seed 1000 rows per CF (mimics sysbench prepare phase) */
+    for (int i = 0; i < 1000; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int c = 0; c < NUM_CFS; c++)
+        {
+            char key[64], val[128];
+            snprintf(key, sizeof(key), "row_%04d", i);
+            snprintf(val, sizeof(val), "seed_val_%s_%04d_padding_data", cf_names[c], i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+        }
+        int rc = tidesdb_txn_commit(txn);
+        ASSERT_EQ(rc, 0);
+        tidesdb_txn_free(txn);
+    }
+    printf("  seeded 1000 rows x 4 CFs\n");
+
+    /* sysbench-like pattern: UPDATE t1 + UPDATE t2 + DELETE t3 + INSERT t4
+     * this is the pattern that triggers the 4-CF unified commit bug */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    /* UPDATE t1 */
+    ASSERT_EQ(tidesdb_txn_put(txn, cfs[0], (uint8_t *)"row_0500", 9, (uint8_t *)"updated_t1_value",
+                              17, 0),
+              0);
+    /* UPDATE t2 */
+    ASSERT_EQ(tidesdb_txn_put(txn, cfs[1], (uint8_t *)"row_0500", 9, (uint8_t *)"updated_t2_value",
+                              17, 0),
+              0);
+    /* DELETE t3 */
+    ASSERT_EQ(tidesdb_txn_delete(txn, cfs[2], (uint8_t *)"row_0500", 9), 0);
+
+    /* INSERT t4 */
+    ASSERT_EQ(
+        tidesdb_txn_put(txn, cfs[3], (uint8_t *)"row_1000", 9, (uint8_t *)"inserted_t4_new", 16, 0),
+        0);
+
+    int commit_rc = tidesdb_txn_commit(txn);
+    printf("  4-CF sysbench commit returned: %d\n", commit_rc);
+    ASSERT_EQ(commit_rc, 0);
+    tidesdb_txn_free(txn);
+
+    /* verify the writes took effect */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t *rv = NULL;
+    size_t rs = 0;
+
+    /* t1 row_0500 should have updated value */
+    ASSERT_EQ(tidesdb_txn_get(txn, cfs[0], (uint8_t *)"row_0500", 9, &rv, &rs), 0);
+    ASSERT_TRUE(rv != NULL);
+    ASSERT_TRUE(memcmp(rv, "updated_t1_value", 17) == 0);
+    free(rv);
+
+    /* t2 row_0500 should have updated value */
+    rv = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cfs[1], (uint8_t *)"row_0500", 9, &rv, &rs), 0);
+    ASSERT_TRUE(rv != NULL);
+    ASSERT_TRUE(memcmp(rv, "updated_t2_value", 17) == 0);
+    free(rv);
+
+    /* t3 row_0500 should be deleted */
+    rv = NULL;
+    int del_rc = tidesdb_txn_get(txn, cfs[2], (uint8_t *)"row_0500", 9, &rv, &rs);
+    ASSERT_TRUE(del_rc != 0); /* must not find deleted key */
+    free(rv);
+
+    /* t4 row_1000 should exist (inserted) */
+    rv = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cfs[3], (uint8_t *)"row_1000", 9, &rv, &rs), 0);
+    ASSERT_TRUE(rv != NULL);
+    ASSERT_TRUE(memcmp(rv, "inserted_t4_new", 16) == 0);
+    free(rv);
+
+    tidesdb_txn_free(txn);
+
+    /* also test 5 CFs to exercise the txn cf_capacity realloc boundary
+     * (TDB_INITIAL_TXN_CF_CAPACITY=4, so 5th CF triggers realloc) */
+    ASSERT_EQ(tidesdb_create_column_family(db, "t5", &cf_config), 0);
+    tidesdb_column_family_t *cf5 = tidesdb_get_column_family(db, "t5");
+    ASSERT_TRUE(cf5 != NULL);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < NUM_CFS; i++)
+    {
+        char key[64], val[64];
+        snprintf(key, sizeof(key), "five_cf_k%d", i);
+        snprintf(val, sizeof(val), "five_cf_v%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cfs[i], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+    }
+    /* 5th CF crosses the realloc boundary */
+    ASSERT_EQ(
+        tidesdb_txn_put(txn, cf5, (uint8_t *)"five_cf_k4", 11, (uint8_t *)"five_cf_v4", 11, 0), 0);
+    commit_rc = tidesdb_txn_commit(txn);
+    printf("  5-CF realloc boundary commit returned: %d\n", commit_rc);
+    ASSERT_EQ(commit_rc, 0);
+    tidesdb_txn_free(txn);
+
+    /* verify 5th CF key */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    rv = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf5, (uint8_t *)"five_cf_k4", 11, &rv, &rs), 0);
+    ASSERT_TRUE(rv != NULL);
+    free(rv);
+    tidesdb_txn_free(txn);
+
+    /* stress: 100 rounds of 4-CF sysbench txns */
+    for (int r = 0; r < 100; r++)
+    {
+        txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int c = 0; c < NUM_CFS; c++)
+        {
+            char key[64], val[128];
+            snprintf(key, sizeof(key), "stress_%04d", r);
+            snprintf(val, sizeof(val), "stress_val_%s_%04d", cf_names[c], r);
+            ASSERT_EQ(tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+        }
+        commit_rc = tidesdb_txn_commit(txn);
+        if (commit_rc != 0)
+        {
+            printf("  stress round %d: commit returned %d\n", r, commit_rc);
+        }
+        ASSERT_EQ(commit_rc, 0);
+        tidesdb_txn_free(txn);
+    }
+    printf("  100 rounds of 4-CF stress commits passed\n");
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_iter_unflushed(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "uiter_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "uiter_b", &cf_config), 0);
+    tidesdb_column_family_t *cf_a = tidesdb_get_column_family(db, "uiter_a");
+    tidesdb_column_family_t *cf_b = tidesdb_get_column_family(db, "uiter_b");
+    ASSERT_TRUE(cf_a != NULL);
+    ASSERT_TRUE(cf_b != NULL);
+
+    /* write 100 keys to each CF (stays in unified memtable, not flushed) */
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char ka[32], kb[32], val[64];
+        snprintf(ka, sizeof(ka), "akey_%04d", i);
+        snprintf(kb, sizeof(kb), "bkey_%04d", i);
+        snprintf(val, sizeof(val), "value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_a, (uint8_t *)ka, strlen(ka) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_b, (uint8_t *)kb, strlen(kb) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* iterate cf_a with seek_to_first -- should see all 100 keys */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf_a, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int count_a = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+
+        /* key must start with "akey_" not "bkey_" (CF isolation) */
+        ASSERT_TRUE(key_size > 5);
+        ASSERT_TRUE(memcmp(key, "akey_", 5) == 0);
+        count_a++;
+
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    printf("  unified iter cf_a: %d/100 keys\n", count_a);
+    ASSERT_EQ(count_a, 100);
+
+    /* iterate cf_b */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf_b, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int count_b = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+        ASSERT_TRUE(memcmp(key, "bkey_", 5) == 0);
+        count_b++;
+
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    printf("  unified iter cf_b: %d/100 keys\n", count_b);
+    ASSERT_EQ(count_b, 100);
+
+    /* test seek to specific key in unified memtable */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf_a, &iter), 0);
+
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)"akey_0050", 10), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    uint8_t *found_key = NULL;
+    size_t found_key_size = 0;
+    ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+    ASSERT_TRUE(strcmp((char *)found_key, "akey_0050") == 0);
+
+    /* seek_for_prev */
+    ASSERT_EQ(tidesdb_iter_seek_for_prev(iter, (uint8_t *)"akey_0050", 10), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+    ASSERT_TRUE(strcmp((char *)found_key, "akey_0050") == 0);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    printf("  unified iter seek: OK\n");
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unified_snapshot_commit(void)
+{
+    tidesdb_t *db = create_unified_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "snap_cf1", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "snap_cf2", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "snap_cf3", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "snap_cf4", &cf_config), 0);
+
+    tidesdb_column_family_t *cf1 = tidesdb_get_column_family(db, "snap_cf1");
+    tidesdb_column_family_t *cf2 = tidesdb_get_column_family(db, "snap_cf2");
+    tidesdb_column_family_t *cf3 = tidesdb_get_column_family(db, "snap_cf3");
+    tidesdb_column_family_t *cf4 = tidesdb_get_column_family(db, "snap_cf4");
+
+    /* seed data with READ_COMMITTED first */
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "skey_%04d", i);
+        snprintf(val, sizeof(val), "sval_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf1, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf2, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+    printf("  seeded 100 rows x 2 CFs (READ_COMMITTED)\n");
+
+    /* now commit with SNAPSHOT isolation touching 4 CFs */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn), 0);
+
+    ASSERT_EQ(
+        tidesdb_txn_put(txn, cf1, (uint8_t *)"skey_0050", 10, (uint8_t *)"updated_snap", 13, 0), 0);
+    ASSERT_EQ(
+        tidesdb_txn_put(txn, cf2, (uint8_t *)"skey_0050", 10, (uint8_t *)"updated_snap", 13, 0), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf3, (uint8_t *)"skey_0050", 10), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf4, (uint8_t *)"skey_new", 9, (uint8_t *)"new_snap_val", 13, 0),
+              0);
+
+    int rc = tidesdb_txn_commit(txn);
+    printf("  SNAPSHOT 4-CF commit returned: %d\n", rc);
+    ASSERT_EQ(rc, 0);
+    tidesdb_txn_free(txn);
+
+    /* also test multiple SNAPSHOT commits in sequence */
+    for (int i = 0; i < 50; i++)
+    {
+        txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn), 0);
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "snap_k_%04d", i);
+        snprintf(val, sizeof(val), "snap_v_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf1, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf2, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        rc = tidesdb_txn_commit(txn);
+        if (rc != 0) printf("  SNAPSHOT commit %d returned: %d\n", i, rc);
+        ASSERT_EQ(rc, 0);
+        tidesdb_txn_free(txn);
+    }
+    printf("  50 SNAPSHOT commits passed\n");
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    /* reproducer for the 12-CF SNAPSHOT commit bug.
+     * 120 READ_COMMITTED txns across many CFs, then a SNAPSHOT txn that
+     * writes the same key twice (INSERT then UPDATE) in one commit.
+     * the unified memtable path must deduplicate same-key writes to avoid
+     * skip_list_validate_sequence rejecting the duplicate commit_seq. */
+    cleanup_test_dir();
+    tidesdb_config_t cfg2 = tidesdb_default_config();
+    cfg2.db_path = TEST_DB_PATH;
+    cfg2.unified_memtable = 1;
+    cfg2.unified_memtable_write_buffer_size = 4 * 1024 * 1024; /* keep small for 32-bit ASAN CI */
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg2, &db), 0);
+
+    const char *many_cf_names[] = {"mcf_0", "mcf_1", "mcf_2", "mcf_3", "mcf_4",  "mcf_5",
+                                   "mcf_6", "mcf_7", "mcf_8", "mcf_9", "mcf_10", "mcf_11"};
+    tidesdb_column_family_config_t mcf_config = tidesdb_default_column_family_config();
+    mcf_config.write_buffer_size = 256 * 1024; /* small per-CF buffer for 32-bit ASAN CI */
+    tidesdb_column_family_t *mcfs[12];
+    for (int i = 0; i < 12; i++)
+    {
+        ASSERT_EQ(tidesdb_create_column_family(db, many_cf_names[i], &mcf_config), 0);
+        mcfs[i] = tidesdb_get_column_family(db, many_cf_names[i]);
+        ASSERT_TRUE(mcfs[i] != NULL);
+    }
+
+    for (int i = 0; i < 120; i++)
+    {
+        txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn), 0);
+        int ci = (i * 3) % 12;
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "\x01key_%06d", i);
+        snprintf(val, sizeof(val), "val_%06d_pad", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, mcfs[ci], (uint8_t *)key, strlen(key), (uint8_t *)val,
+                                  strlen(val), -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, mcfs[(ci + 1) % 12], (uint8_t *)key, strlen(key),
+                                  (uint8_t *)val, strlen(val), -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn), 0);
+    /* INSERT then UPDATE same key = same key written twice in one txn */
+    ASSERT_EQ(tidesdb_txn_put(txn, mcfs[1], (uint8_t *)"snap_k", 7, (uint8_t *)"v1", 3, -1), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, mcfs[2], (uint8_t *)"snap_idx", 9, (uint8_t *)"", 1, -1), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, mcfs[1], (uint8_t *)"snap_k", 7, (uint8_t *)"v2", 3, -1), 0);
+    rc = tidesdb_txn_commit(txn);
+    printf("  12-CF SNAPSHOT same-key commit returned: %d\n", rc);
+    ASSERT_EQ(rc, 0);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -24694,6 +25098,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_multi_cf_many_keys, tests_passed);
     RUN_TEST(test_unified_multi_cf_flush_and_recovery, tests_passed);
     RUN_TEST(test_unified_concurrent_multi_cf_read_write, tests_passed);
+    RUN_TEST(test_unified_four_cf_single_txn, tests_passed);
+    RUN_TEST(test_unified_iter_unflushed, tests_passed);
+    RUN_TEST(test_unified_snapshot_commit, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

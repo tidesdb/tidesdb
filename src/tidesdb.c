@@ -619,7 +619,8 @@ typedef struct
         MERGE_SOURCE_MEMTABLE,
         MERGE_SOURCE_SSTABLE,
         MERGE_SOURCE_BTREE,
-        MERGE_SOURCE_TXN_OPS
+        MERGE_SOURCE_TXN_OPS,
+        MERGE_SOURCE_UNIFIED_MEMTABLE
     } type;
 
     union
@@ -662,6 +663,18 @@ typedef struct
             int count;
             int pos;
         } txn_ops;
+
+        /* unified memtable source with CF-prefix filtering.
+         * the unified skip list has keys prefixed with 4-byte BE CF index.
+         * this source filters to only the target CF and strips the prefix
+         * when returning keys to the iterator. */
+        struct
+        {
+            skip_list_cursor_t *cursor;
+            tidesdb_immutable_memtable_t *imm;
+            uint32_t cf_index;
+            uint8_t prefix[4]; /* TDB_UNIFIED_CF_PREFIX_SIZE */
+        } unified;
     } source;
 
     tidesdb_kv_pair_t *current_kv;
@@ -3060,7 +3073,6 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
         if (zero_copy)
         {
-            /* zero-copy: point directly into the source data buffer */
             (*block)->keys[i] = (uint8_t *)ptr;
         }
         else
@@ -3085,7 +3097,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
             if (zero_copy)
             {
-                /* zero-copy: point directly into the source data buffer */
+                /* we point directly into the source data buffer */
                 (*block)->inline_values[i] = (uint8_t *)ptr;
             }
             else
@@ -6956,6 +6968,107 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
 }
 
 /**
+ * tidesdb_unified_source_advance_to_cf
+ * advance a unified memtable cursor to the next entry matching the CF prefix.
+ * skips entries belonging to other CFs. returns 1 if a matching entry was found.
+ */
+static int tidesdb_unified_source_advance_to_cf(tidesdb_merge_source_t *source, int forward)
+{
+    skip_list_cursor_t *cursor = source->source.unified.cursor;
+    const uint8_t *prefix = source->source.unified.prefix;
+
+    while (1)
+    {
+        uint8_t *key, *value;
+        size_t key_size, value_size;
+        int64_t ttl;
+        uint8_t deleted;
+        uint64_t seq;
+
+        if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                          &deleted, &seq) != 0)
+        {
+            return 0;
+        }
+
+        /* check if key starts with our CF prefix */
+        if (key_size >= TDB_UNIFIED_CF_PREFIX_SIZE &&
+            memcmp(key, prefix, TDB_UNIFIED_CF_PREFIX_SIZE) == 0)
+        {
+            /* strip the prefix when creating the kv_pair */
+            const uint8_t *real_key = key + TDB_UNIFIED_CF_PREFIX_SIZE;
+            const size_t real_key_size = key_size - TDB_UNIFIED_CF_PREFIX_SIZE;
+            source->current_kv = tidesdb_kv_pair_create(real_key, real_key_size, value, value_size,
+                                                        ttl, seq, deleted);
+            return 1;
+        }
+
+        /* if key prefix > our prefix and we are going forward, no more entries for this CF */
+        if (forward && key_size >= TDB_UNIFIED_CF_PREFIX_SIZE &&
+            memcmp(key, prefix, TDB_UNIFIED_CF_PREFIX_SIZE) > 0)
+        {
+            return 0;
+        }
+
+        /* if key prefix < our prefix and we are going backward, no more entries for this CF */
+        if (!forward && key_size >= TDB_UNIFIED_CF_PREFIX_SIZE &&
+            memcmp(key, prefix, TDB_UNIFIED_CF_PREFIX_SIZE) < 0)
+        {
+            return 0;
+        }
+
+        /* advance cursor past this non-matching entry */
+        int rc = forward ? skip_list_cursor_next(cursor) : skip_list_cursor_prev(cursor);
+        if (rc != 0) return 0;
+    }
+}
+
+/**
+ * tidesdb_merge_source_from_unified_memtable
+ * create a merge source from a unified memtable filtered to a specific CF.
+ * keys in the unified skip list are prefixed with 4-byte BE CF index.
+ * this source seeks to the CF's key range and strips the prefix on output.
+ */
+static tidesdb_merge_source_t *tidesdb_merge_source_from_unified_memtable(
+    skip_list_t *memtable, tidesdb_column_family_config_t *config,
+    tidesdb_immutable_memtable_t *imm, uint32_t cf_index)
+{
+    tidesdb_merge_source_t *source = calloc(1, sizeof(tidesdb_merge_source_t));
+    if (!source) return NULL;
+
+    source->type = MERGE_SOURCE_UNIFIED_MEMTABLE;
+    source->config = config;
+    source->source.unified.imm = imm;
+    source->source.unified.cf_index = cf_index;
+    tdb_encode_be32(cf_index, source->source.unified.prefix);
+    source->is_cached = 0;
+
+    if (imm)
+    {
+        tidesdb_immutable_memtable_ref(imm);
+    }
+
+    if (skip_list_cursor_init(&source->source.unified.cursor, memtable) != 0)
+    {
+        if (imm) tidesdb_immutable_memtable_unref(imm);
+        free(source);
+        return NULL;
+    }
+
+    /* seek to the start of this CF's key range.
+     * skip_list_cursor_seek positions before target, cursor_next moves to first >= target.
+     * then advance_to_cf filters to entries matching our CF prefix. */
+    if (skip_list_cursor_seek(source->source.unified.cursor, source->source.unified.prefix,
+                              TDB_UNIFIED_CF_PREFIX_SIZE) == 0 &&
+        skip_list_cursor_next(source->source.unified.cursor) == 0)
+    {
+        tidesdb_unified_source_advance_to_cf(source, 1);
+    }
+
+    return source;
+}
+
+/**
  * tidesdb_txn_ops_sort_ctx_t
  * context for qsort_r comparator when sorting transaction ops indices
  * @param ops pointer to the transaction ops array
@@ -7476,6 +7589,14 @@ static void tidesdb_merge_source_free(tidesdb_merge_source_t *source)
          * txn and cf are borrowed pointers, not owned */
         free(source->source.txn_ops.sorted_indices);
     }
+    else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+    {
+        skip_list_cursor_free(source->source.unified.cursor);
+        if (source->source.unified.imm)
+        {
+            tidesdb_immutable_memtable_unref(source->source.unified.imm);
+        }
+    }
     else
     {
         if (source->source.sstable.current_rc_block)
@@ -7529,6 +7650,16 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             {
                 source->current_kv =
                     tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
+                return TDB_SUCCESS;
+            }
+        }
+    }
+    else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+    {
+        if (skip_list_cursor_next(source->source.unified.cursor) == 0)
+        {
+            if (tidesdb_unified_source_advance_to_cf(source, 1))
+            {
                 return TDB_SUCCESS;
             }
         }
@@ -7788,6 +7919,16 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             {
                 source->current_kv =
                     tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
+                return TDB_SUCCESS;
+            }
+        }
+    }
+    else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+    {
+        if (skip_list_cursor_prev(source->source.unified.cursor) == 0)
+        {
+            if (tidesdb_unified_source_advance_to_cf(source, 0))
+            {
                 return TDB_SUCCESS;
             }
         }
@@ -17052,6 +17193,7 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
         *last_cf = cf;
     }
 
+    /* check per-CF active memtable */
     tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     int mt_refed = tidesdb_memtable_try_ref(mt);
 
@@ -17061,6 +17203,33 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
         return TDB_ERR_CONFLICT;
     }
     if (mt_refed) tidesdb_immutable_memtable_unref(mt);
+
+    /* check unified memtable if enabled (data lives there, not in per-CF memtable) */
+    if (txn->db->unified_mt.enabled)
+    {
+        tidesdb_memtable_t *umt =
+            atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
+        int umt_refed = tidesdb_memtable_try_ref(umt);
+        if (umt_refed)
+        {
+            /* build prefixed key for unified skip list lookup */
+            uint8_t pk_stack[256];
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
+            uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
+            if (pk)
+            {
+                size_t pk_size = tdb_build_prefixed_key(cf->unified_cf_index, key, key_size, pk);
+                if (tidesdb_txn_check_seq_conflict(umt->skip_list, pk, pk_size, threshold_seq))
+                {
+                    if (pk != pk_stack) free(pk);
+                    tidesdb_immutable_memtable_unref(umt);
+                    return TDB_ERR_CONFLICT;
+                }
+                if (pk != pk_stack) free(pk);
+            }
+            tidesdb_immutable_memtable_unref(umt);
+        }
+    }
 
     for (size_t i = 0; i < *imm_count; i++)
     {
@@ -17729,10 +17898,28 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
         return rc;
     }
 
-    /* for multi-op transactions, apply each op with prefixed key */
-    for (int i = 0; i < txn->num_ops; i++)
+    /* for multi-op transactions, apply each op with prefixed key.
+     * we deduplicate same-key writes (last write wins) to avoid the skip list's
+     * duplicate sequence rejection when the same key is written multiple times
+     * within the same transaction (e.g. INSERT then UPDATE on the same row). */
+    for (int i = txn->num_ops - 1; i >= 0; i--)
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
+
+        /* check if a later op in this txn writes to the same CF + key (supersedes this one) */
+        int is_superseded = 0;
+        for (int j = i + 1; j < txn->num_ops; j++)
+        {
+            const tidesdb_txn_op_t *later = &txn->ops[j];
+            if (later->cf == op->cf && later->key_size == op->key_size &&
+                memcmp(later->key, op->key, op->key_size) == 0)
+            {
+                is_superseded = 1;
+                break;
+            }
+        }
+        if (is_superseded) continue;
+
         const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
         TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack3);
         if (!prefixed) return TDB_ERR_MEMORY;
@@ -18819,8 +19006,10 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     }
 
     /* we cache memtable sources on the iterator for reuse across seeks.
-     * this eliminates per-seek malloc/free + cursor_init + goto_first overhead */
-    const int mt_capacity = 2 + (int)imm_count + (txn->num_ops > 0 ? 1 : 0);
+     * this eliminates per-seek malloc/free + cursor_init + goto_first overhead.
+     * +1 for unified memtable source when in unified mode */
+    const int has_unified = txn->db->unified_mt.enabled ? 1 : 0;
+    const int mt_capacity = 2 + (int)imm_count + (txn->num_ops > 0 ? 1 : 0) + has_unified;
     (*iter)->cached_mt_sources = malloc(mt_capacity * sizeof(tidesdb_merge_source_t *));
     (*iter)->num_cached_mt_sources = 0;
 
@@ -18837,6 +19026,46 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             if (memtable_source->current_kv != NULL)
             {
                 tidesdb_merge_heap_add_source((*iter)->heap, memtable_source);
+            }
+        }
+
+        /* unified memtable mode, we add the shared skip list as a merge source
+         * with CF-prefix filtering so iterator only sees this CF's entries.
+         * we use try_ref to safely pin the unified memtable before creating the
+         * cursor, preventing use-after-free if the memtable rotates between our
+         * atomic_load and the source creation's internal ref call. */
+        if (txn->db->unified_mt.enabled)
+        {
+            tidesdb_memtable_t *umt =
+                atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
+            if (!umt || !tidesdb_memtable_try_ref(umt))
+            {
+                /* retry once if rotation raced with our load */
+                umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
+                if (umt) tidesdb_memtable_try_ref(umt);
+            }
+            if (umt && umt->skip_list)
+            {
+                tidesdb_merge_source_t *unified_source = tidesdb_merge_source_from_unified_memtable(
+                    umt->skip_list, &cf->config, umt, cf->unified_cf_index);
+                /* source creation adds its own ref via imm, release our try_ref */
+                atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
+                if (unified_source)
+                {
+                    unified_source->is_cached = 1;
+                    ((tidesdb_merge_source_t **)(*iter)
+                         ->cached_mt_sources)[(*iter)->num_cached_mt_sources++] = unified_source;
+
+                    if (unified_source->current_kv != NULL)
+                    {
+                        tidesdb_merge_heap_add_source((*iter)->heap, unified_source);
+                    }
+                }
+            }
+            else if (umt)
+            {
+                /* try_ref succeeded but no skip_list, release */
+                atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
             }
         }
 
@@ -19400,7 +19629,7 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
                 return TDB_ERR_CORRUPTION;
             }
 
-            /* zero-copy: block keys/values point into cached_data, so keep it alive.
+            /* zero-copy block keys/values point into cached_data, so keep it alive.
              * data_ref is freed when the block is freed. */
             kb->data_ref = cached_data;
             *kb_out = kb;
@@ -19433,7 +19662,7 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
     }
 
     tidesdb_klog_block_t *kb = NULL;
-    /* zero-copy: keys/values point into data buffer (decompressed or bmblock->data).
+    /* zero-copy keys/values point into data buffer (decompressed or bmblock->data).
      * the caller keeps these alive via decompressed_out and bmblock_out. */
     if (tidesdb_klog_block_deserialize(data, data_size, &kb, 1) != 0 || !kb)
     {
@@ -20194,7 +20423,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
-    /* we detect forward-monotonic seeks (new target >= last result) BEFORE freeing
+    /* we detect forward-monotonic seeks (new target >= last result) before freeing
      * iter->current. when the seek target advances forward, each source's current_kv
      * that is already >= target is still the correct "first entry >= target" answer
      * because no entries exist between the old target and current_kv (by definition of
@@ -20277,7 +20506,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
     {
         tidesdb_merge_source_t *source = temp_sources[i];
 
-        /* fast path: on forward-monotonic seeks, if source already has a key >= target,
+        /* on forward-monotonic seeks, if source already has a key >= target,
          * it is still the correct first entry >= target. skip the expensive re-seek. */
         if (forward_monotonic && source->current_kv != NULL)
         {
@@ -20296,6 +20525,24 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             tidesdb_iter_seek_memtable_source(source, key, key_size, 1);
+        }
+        else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+        {
+            /* build prefixed key and seek, then strip prefix via advance_to_cf */
+            uint8_t pk_stack[256];
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
+            uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
+            if (pk)
+            {
+                tdb_build_prefixed_key(source->source.unified.cf_index, key, key_size, pk);
+                skip_list_cursor_t *cursor = source->source.unified.cursor;
+                if (skip_list_cursor_seek(cursor, pk, pk_total) == 0 &&
+                    skip_list_cursor_next(cursor) == 0)
+                {
+                    tidesdb_unified_source_advance_to_cf(source, 1);
+                }
+                if (pk != pk_stack) free(pk);
+            }
         }
         else if (source->type == MERGE_SOURCE_BTREE)
         {
@@ -20323,7 +20570,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
-    /* backward-monotonic detection: new target <= last result means sources
+    /* new target <= last result means sources
      * with current_kv->key <= target are still correctly positioned */
     int backward_monotonic = 0;
     const skip_list_comparator_fn cmp_fn = iter->heap->comparator;
@@ -20394,7 +20641,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
     {
         tidesdb_merge_source_t *source = temp_sources[i];
 
-        /* fast path: on backward-monotonic seeks, if source already has key <= target,
+        /*  on backward-monotonic seeks, if source already has key <= target,
          * it is still the correct last entry <= target. skip the expensive re-seek. */
         if (backward_monotonic && source->current_kv != NULL)
         {
@@ -20413,6 +20660,22 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             tidesdb_iter_seek_memtable_source(source, key, key_size, -1);
+        }
+        else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+        {
+            uint8_t pk_stack[256];
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
+            uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
+            if (pk)
+            {
+                tdb_build_prefixed_key(source->source.unified.cf_index, key, key_size, pk);
+                skip_list_cursor_t *cursor = source->source.unified.cursor;
+                if (skip_list_cursor_seek_for_prev(cursor, pk, pk_total) == 0)
+                {
+                    tidesdb_unified_source_advance_to_cf(source, 0);
+                }
+                if (pk != pk_stack) free(pk);
+            }
         }
         else if (source->type == MERGE_SOURCE_BTREE)
         {
@@ -20525,6 +20788,19 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                     source->current_kv =
                         tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
                 }
+            }
+        }
+        else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+        {
+            /* we seek to end of this CF's key range-- prefix with all-0xFF suffix.
+             * then scan backward to find first entry matching our prefix. */
+            uint8_t end_prefix[TDB_UNIFIED_CF_PREFIX_SIZE];
+            const uint32_t next_cf = source->source.unified.cf_index + 1;
+            tdb_encode_be32(next_cf, end_prefix);
+            if (skip_list_cursor_seek_for_prev(source->source.unified.cursor, end_prefix,
+                                               TDB_UNIFIED_CF_PREFIX_SIZE) == 0)
+            {
+                tidesdb_unified_source_advance_to_cf(source, 0);
             }
         }
         else if (source->type == MERGE_SOURCE_BTREE)

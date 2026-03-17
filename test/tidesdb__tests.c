@@ -24721,10 +24721,12 @@ static void test_unified_snapshot_commit(void)
 
     const char *many_cf_names[] = {"mcf_0", "mcf_1", "mcf_2", "mcf_3", "mcf_4",  "mcf_5",
                                    "mcf_6", "mcf_7", "mcf_8", "mcf_9", "mcf_10", "mcf_11"};
+    tidesdb_column_family_config_t mcf_config = tidesdb_default_column_family_config();
+    mcf_config.write_buffer_size = 256 * 1024; /* small per-CF buffer for 32-bit ASAN CI */
     tidesdb_column_family_t *mcfs[12];
     for (int i = 0; i < 12; i++)
     {
-        ASSERT_EQ(tidesdb_create_column_family(db, many_cf_names[i], &cf_config), 0);
+        ASSERT_EQ(tidesdb_create_column_family(db, many_cf_names[i], &mcf_config), 0);
         mcfs[i] = tidesdb_get_column_family(db, many_cf_names[i]);
         ASSERT_TRUE(mcfs[i] != NULL);
     }

@@ -24715,7 +24715,7 @@ static void test_unified_snapshot_commit(void)
     tidesdb_config_t cfg2 = tidesdb_default_config();
     cfg2.db_path = TEST_DB_PATH;
     cfg2.unified_memtable = 1;
-    cfg2.unified_memtable_write_buffer_size = 128 * 1024 * 1024;
+    cfg2.unified_memtable_write_buffer_size = 4 * 1024 * 1024; /* keep small for 32-bit ASAN CI */
     db = NULL;
     ASSERT_EQ(tidesdb_open(&cfg2, &db), 0);
 

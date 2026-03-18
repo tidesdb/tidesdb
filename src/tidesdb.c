@@ -16150,10 +16150,6 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     op->is_delete = 0;
     op->cf = cf;
 
-    /* track transaction memory for global pressure accounting */
-    const int64_t op_mem = (int64_t)(key_size + value_size);
-    atomic_fetch_add_explicit(&txn->db->txn_memory_bytes, op_mem, memory_order_relaxed);
-
     txn->num_ops++;
 
     if (txn->num_ops == TDB_TXN_WRITE_HASH_THRESHOLD && !txn->write_set_hash)
@@ -16797,9 +16793,6 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
     op->ttl = 0;
     op->is_delete = 1;
     op->cf = cf;
-
-    /* track transaction memory for global pressure accounting */
-    atomic_fetch_add_explicit(&txn->db->txn_memory_bytes, (int64_t)key_size, memory_order_relaxed);
 
     txn->num_ops++;
 
@@ -17873,6 +17866,7 @@ static uint8_t *tidesdb_txn_serialize_wal_unified(const tidesdb_txn_t *txn, size
  * tidesdb_txn_apply_ops_to_unified_memtable
  * apply all transaction operations to the unified skip list with prefixed keys
  * keys are prefixed with 4-byte BE CF index for isolation
+ * uses O(n) hash-based dedup (same as non-unified path) + skip_list_put_batch
  * @param txn transaction
  * @param memtable unified skip list
  * @return TDB_SUCCESS on success, error code on failure
@@ -17882,6 +17876,7 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
 {
     if (txn->num_ops == 0) return TDB_SUCCESS;
 
+    /* single-op fast path -- skip dedup and batch overhead entirely */
     if (txn->num_ops == 1)
     {
         const tidesdb_txn_op_t *op = &txn->ops[0];
@@ -17898,42 +17893,303 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
         return rc;
     }
 
-    /* for multi-op transactions, apply each op with prefixed key.
-     * we deduplicate same-key writes (last write wins) to avoid the skip list's
-     * duplicate sequence rejection when the same key is written multiple times
-     * within the same transaction (e.g. INSERT then UPDATE on the same row). */
-    for (int i = txn->num_ops - 1; i >= 0; i--)
+    const int num_ops = txn->num_ops;
+
+    /* small-txn path -- O(n²) dedup is acceptable for tiny batches, we use stack batch + put_batch
+     */
+    if (num_ops < TDB_TXN_DEDUP_SKIP_THRESHOLD)
+    {
+        skip_list_batch_entry_t stack_batch[TDB_TXN_DEDUP_SKIP_THRESHOLD];
+        /* prefixed key storage on the stack for small txns */
+        uint8_t pk_buf[TDB_TXN_DEDUP_SKIP_THRESHOLD * (TDB_UNIFIED_CF_PREFIX_SIZE + 256)];
+        size_t pk_buf_used = 0;
+        int batch_idx = 0;
+
+        for (int i = num_ops - 1; i >= 0; i--)
+        {
+            const tidesdb_txn_op_t *op = &txn->ops[i];
+
+            int is_superseded = 0;
+            for (int j = i + 1; j < num_ops; j++)
+            {
+                const tidesdb_txn_op_t *later = &txn->ops[j];
+                if (later->cf == op->cf && later->key_size == op->key_size &&
+                    memcmp(later->key, op->key, op->key_size) == 0)
+                {
+                    is_superseded = 1;
+                    break;
+                }
+            }
+            if (is_superseded) continue;
+
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+            uint8_t *pk_dest = pk_buf + pk_buf_used;
+            if (pk_buf_used + pk_total > sizeof(pk_buf))
+            {
+                /* too large for stack, we use individual puts */
+                TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack_fb);
+                if (!prefixed) return TDB_ERR_MEMORY;
+                size_t pk_size = tdb_build_prefixed_key(op->cf->unified_cf_index, op->key,
+                                                        op->key_size, prefixed);
+                int rc =
+                    skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
+                                           op->ttl, txn->commit_seq, op->is_delete);
+                TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack_fb);
+                if (rc != 0) return TDB_ERR_MEMORY;
+                continue;
+            }
+
+            tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, pk_dest);
+            pk_buf_used += pk_total;
+
+            stack_batch[batch_idx].key = pk_dest;
+            stack_batch[batch_idx].key_size = pk_total;
+            stack_batch[batch_idx].value = op->value;
+            stack_batch[batch_idx].value_size = op->value_size;
+            stack_batch[batch_idx].ttl = op->ttl;
+            stack_batch[batch_idx].seq = txn->commit_seq;
+            stack_batch[batch_idx].deleted = op->is_delete;
+            batch_idx++;
+        }
+
+        if (batch_idx > 0)
+        {
+            if (skip_list_put_batch(memtable, stack_batch, batch_idx) < 0) return TDB_ERR_MEMORY;
+        }
+        return TDB_SUCCESS;
+    }
+
+    /* large-txn path -- O(n) hash-based dedup + skip_list_put_batch with prefixed keys
+     * mirrors the non-unified tidesdb_txn_apply_ops_to_memtable hash path
+     * we use power-of-2 hash size so slot = hash & mask (avoids expensive div) */
+    int dedup_hash_size = num_ops * TDB_TXN_DEDUP_HASH_MULTIPLIER;
+    if (dedup_hash_size < TDB_TXN_DEDUP_MIN_HASH_SIZE)
+        dedup_hash_size = TDB_TXN_DEDUP_MIN_HASH_SIZE;
+    /* round up to next power of 2 */
+    {
+        int v = dedup_hash_size - 1;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        dedup_hash_size = v + 1;
+    }
+    const uint32_t dedup_hash_mask = (uint32_t)(dedup_hash_size - 1);
+
+    typedef struct
+    {
+        const uint8_t *key;
+        size_t key_size;
+        const tidesdb_column_family_t *cf;
+        int op_idx;
+    } unified_dedup_entry_t;
+
+    unified_dedup_entry_t *dedup_hash = calloc(dedup_hash_size, sizeof(unified_dedup_entry_t));
+
+    int *used_slots = NULL;
+    const int used_slots_capacity = num_ops < TDB_TXN_DEDUP_MAX_TRACKED ? num_ops : 0;
+    if (used_slots_capacity > 0) used_slots = malloc(used_slots_capacity * sizeof(int));
+
+    if (!dedup_hash)
+    {
+        /* write all ops without dedup */
+        free(used_slots);
+        for (int i = 0; i < num_ops; i++)
+        {
+            const tidesdb_txn_op_t *op = &txn->ops[i];
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+            TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack_ndd);
+            if (!prefixed) return TDB_ERR_MEMORY;
+            size_t pk_size =
+                tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, prefixed);
+            int rc = skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
+                                            op->ttl, txn->commit_seq, op->is_delete);
+            TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack_ndd);
+            if (rc != 0) return TDB_ERR_MEMORY;
+        }
+        return TDB_SUCCESS;
+    }
+
+    int used_slot_count = 0;
+
+    /* build hash from newest to oldest (last write wins) */
+    for (int i = num_ops - 1; i >= 0; i--)
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
 
-        /* check if a later op in this txn writes to the same CF + key (supersedes this one) */
-        int is_superseded = 0;
-        for (int j = i + 1; j < txn->num_ops; j++)
+        /* hash includes CF index to distinguish same-key across different CFs */
+        uint8_t hash_buf[TDB_UNIFIED_CF_PREFIX_SIZE + 256];
+        uint8_t *hash_key;
+        size_t hash_key_size = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+        if (hash_key_size <= sizeof(hash_buf))
         {
-            const tidesdb_txn_op_t *later = &txn->ops[j];
-            if (later->cf == op->cf && later->key_size == op->key_size &&
-                memcmp(later->key, op->key, op->key_size) == 0)
+            hash_key = hash_buf;
+        }
+        else
+        {
+            hash_key = malloc(hash_key_size);
+            if (!hash_key) continue;
+        }
+        tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, hash_key);
+
+        const uint32_t hash = XXH32(hash_key, hash_key_size, TDB_TXN_HASH_SEED);
+        int slot = (int)(hash & dedup_hash_mask);
+
+        int inserted = 0;
+        int is_duplicate = 0;
+        for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
+        {
+            if (dedup_hash[slot].key == NULL)
             {
-                is_superseded = 1;
+                dedup_hash[slot].key = op->key;
+                dedup_hash[slot].key_size = op->key_size;
+                dedup_hash[slot].cf = op->cf;
+                dedup_hash[slot].op_idx = i;
+                inserted = 1;
+                if (used_slots && used_slot_count < used_slots_capacity)
+                    used_slots[used_slot_count++] = slot;
                 break;
             }
+            if (dedup_hash[slot].cf == op->cf && dedup_hash[slot].key_size == op->key_size &&
+                memcmp(dedup_hash[slot].key, op->key, op->key_size) == 0)
+            {
+                is_duplicate = 1;
+                break;
+            }
+            slot = (slot + 1) & (int)dedup_hash_mask;
         }
-        if (is_superseded) continue;
 
-        const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
-        TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack3);
-        if (!prefixed) return TDB_ERR_MEMORY;
-        size_t pk_size =
-            tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, prefixed);
-        int rc = skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
-                                        op->ttl, txn->commit_seq, op->is_delete);
-        TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack3);
-        if (rc != 0)
+        if (hash_key != hash_buf) free(hash_key);
+
+        if (!inserted && !is_duplicate)
         {
-            return TDB_ERR_MEMORY;
+            /* probe chain exhausted, insert without dedup */
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+            TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack_probe);
+            if (!prefixed) continue;
+            size_t pk_size =
+                tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, prefixed);
+            (void)skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
+                                         op->ttl, txn->commit_seq, op->is_delete);
+            TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack_probe);
         }
     }
-    return TDB_SUCCESS;
+
+    /* collect deduplicated ops and apply via skip_list_put_batch */
+    const int dedup_count = used_slots ? used_slot_count : num_ops;
+    int result = TDB_SUCCESS;
+
+    /* allocate prefixed key storage + batch entries */
+    skip_list_batch_entry_t *batch_entries = malloc(dedup_count * sizeof(skip_list_batch_entry_t));
+    /* estimate max prefixed key storage needed */
+    size_t pk_arena_size = 0;
+    if (used_slots && used_slot_count > 0)
+    {
+        for (int i = 0; i < used_slot_count; i++)
+        {
+            pk_arena_size +=
+                TDB_UNIFIED_CF_PREFIX_SIZE + txn->ops[dedup_hash[used_slots[i]].op_idx].key_size;
+        }
+    }
+    else
+    {
+        for (int slot = 0; slot < dedup_hash_size; slot++)
+        {
+            if (dedup_hash[slot].key != NULL)
+                pk_arena_size +=
+                    TDB_UNIFIED_CF_PREFIX_SIZE + txn->ops[dedup_hash[slot].op_idx].key_size;
+        }
+    }
+
+    uint8_t *pk_arena = NULL;
+    if (batch_entries) pk_arena = malloc(pk_arena_size);
+
+    if (!batch_entries || !pk_arena)
+    {
+        free(batch_entries);
+        free(pk_arena);
+        /* individual puts */
+        if (used_slots && used_slot_count > 0)
+        {
+            for (int i = 0; i < used_slot_count; i++)
+            {
+                const tidesdb_txn_op_t *op = &txn->ops[dedup_hash[used_slots[i]].op_idx];
+                const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+                TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack_fb2);
+                if (!prefixed) continue;
+                size_t pk_size = tdb_build_prefixed_key(op->cf->unified_cf_index, op->key,
+                                                        op->key_size, prefixed);
+                (void)skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
+                                             op->ttl, txn->commit_seq, op->is_delete);
+                TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack_fb2);
+            }
+        }
+        free(dedup_hash);
+        free(used_slots);
+        return TDB_SUCCESS;
+    }
+
+    int batch_idx = 0;
+    size_t pk_arena_used = 0;
+
+    if (used_slots && used_slot_count > 0)
+    {
+        for (int i = 0; i < used_slot_count; i++)
+        {
+            const int slot = used_slots[i];
+            const tidesdb_txn_op_t *op = &txn->ops[dedup_hash[slot].op_idx];
+            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+
+            uint8_t *pk_dest = pk_arena + pk_arena_used;
+            tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, pk_dest);
+            pk_arena_used += pk_total;
+
+            batch_entries[batch_idx].key = pk_dest;
+            batch_entries[batch_idx].key_size = pk_total;
+            batch_entries[batch_idx].value = op->value;
+            batch_entries[batch_idx].value_size = op->value_size;
+            batch_entries[batch_idx].ttl = op->ttl;
+            batch_entries[batch_idx].seq = txn->commit_seq;
+            batch_entries[batch_idx].deleted = op->is_delete;
+            batch_idx++;
+        }
+    }
+    else
+    {
+        for (int slot = 0; slot < dedup_hash_size; slot++)
+        {
+            if (dedup_hash[slot].key != NULL)
+            {
+                const tidesdb_txn_op_t *op = &txn->ops[dedup_hash[slot].op_idx];
+                const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+
+                uint8_t *pk_dest = pk_arena + pk_arena_used;
+                tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, pk_dest);
+                pk_arena_used += pk_total;
+
+                batch_entries[batch_idx].key = pk_dest;
+                batch_entries[batch_idx].key_size = pk_total;
+                batch_entries[batch_idx].value = op->value;
+                batch_entries[batch_idx].value_size = op->value_size;
+                batch_entries[batch_idx].ttl = op->ttl;
+                batch_entries[batch_idx].seq = txn->commit_seq;
+                batch_entries[batch_idx].deleted = op->is_delete;
+                batch_idx++;
+            }
+        }
+    }
+
+    if (batch_idx > 0)
+    {
+        if (skip_list_put_batch(memtable, batch_entries, batch_idx) < 0) result = TDB_ERR_MEMORY;
+    }
+
+    free(batch_entries);
+    free(pk_arena);
+    free(dedup_hash);
+    free(used_slots);
+    return result;
 }
 
 /**
@@ -18844,17 +19100,10 @@ int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name)
     const int saved_num_ops = txn->savepoint_op_counts[savepoint_idx];
     const int saved_num_cfs = txn->savepoint_cf_counts[savepoint_idx];
 
-    /* we free ops appended after the savepoint and release their memory tracking */
-    int64_t freed_mem = 0;
+    /* we free ops appended after the savepoint */
     for (int i = saved_num_ops; i < txn->num_ops; i++)
     {
-        freed_mem += (int64_t)(txn->ops[i].key_size + txn->ops[i].value_size);
         free(txn->ops[i].key); /* coalesced buffer owns key+value */
-    }
-
-    if (freed_mem > 0 && txn->db)
-    {
-        atomic_fetch_sub_explicit(&txn->db->txn_memory_bytes, freed_mem, memory_order_relaxed);
     }
 
     /* we truncate back to savepoint -- ops[0..saved_num_ops-1] are untouched (append-only) */

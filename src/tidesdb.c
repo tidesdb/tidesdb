@@ -641,7 +641,32 @@ typedef struct
             block_manager_block_t *current_block_data;
             tidesdb_ref_counted_block_t *current_rc_block;
             uint8_t *decompressed_data;
+            clock_cache_entry_t *cache_pin; /* zero-copy cache pin (holds reader ref) */
             int current_entry_idx;
+            /* 2-slot deserialized block stash -- this avoids re-parsing varint headers
+             * when alternating between 2 blocks (A-B-A-B pattern).
+             * slots are written round-robin, checked linearly. */
+            struct
+            {
+                tidesdb_klog_block_t *block;
+                clock_cache_entry_t *pin;
+                uint64_t position;
+            } block_stash[2];
+            /* lazy block -- raw bytes pinned from cache, not yet deserialized.
+             * seek uses O(log N) block-index binary search on raw bytes
+             * instead of O(N) full varint deserialization.  full deserialize
+             * is deferred to first next()/prev() call. */
+            struct
+            {
+                const uint8_t *data;       /* pinned raw cache data */
+                size_t size;               /* raw data size */
+                clock_cache_entry_t *pin;  /* cache pin keeping data alive */
+                const uint8_t *block_data; /* data past block index header */
+                size_t block_data_size;
+                const uint8_t *idx_base; /* block index entries */
+                uint32_t idx_count;      /* number of index entries */
+                int entry_idx;           /* found entry index for next/prev */
+            } lazy;
         } sstable;
 
         struct
@@ -1052,6 +1077,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
                                                                       tidesdb_sstable_t *sst);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
                                                                tidesdb_sstable_t *sst);
+static void tidesdb_iter_clear_block_stash(tidesdb_merge_source_t *source);
+static void tidesdb_iter_clear_lazy(tidesdb_merge_source_t *source);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
                                                                  tidesdb_sstable_t *sst);
 static void tidesdb_merge_source_free(tidesdb_merge_source_t *source);
@@ -1208,9 +1235,6 @@ static size_t tidesdb_block_cache_key(const char *cf_name, const char *klog_file
  * tidesdb_cache_raw_block_put
  * caches raw block bytes (compressed or uncompressed) directly in the clock cache.
  * raw bytes are stored inline -- no ref counting needed, no deserialization overhead.
- * this gives ~20x smaller cache entries vs caching deserialized blocks, dramatically
- * improving cache hit rates (e.g., 87% vs 3.7% for 64MB cache with 80MB dataset).
- * uses clock_cache_put_new since we just confirmed the key was absent (cache miss).
  * @param db the database
  * @param cf_name column family name
  * @param klog_filename filename portion of klog path (past last separator)
@@ -1237,20 +1261,26 @@ static int tidesdb_cache_raw_block_put(tidesdb_t *db, const char *cf_name,
 }
 
 /**
- * tidesdb_cache_raw_block_get
- * retrieves cached raw block bytes (allocates a copy -- caller must free).
+ * tidesdb_cache_raw_block_get_pinned
+ * zero-copy cache access -- returns a direct pointer into the cache entry's payload
+ * without malloc or memcpy.  the cache entry is pinned (reader ref held) so it
+ * cannot be evicted while the caller uses the data.  caller MUST call
+ * clock_cache_release(*pin_out) when done with the returned pointer.
  * @param db the database
  * @param cf_name column family name
- * @param klog_filename filename portion of klog path (past last separator)
+ * @param klog_filename filename portion of klog path
  * @param block_position position of block in file
  * @param out_size output parameter for the size of the returned data
- * @return allocated copy of raw block bytes (caller must free), or NULL on miss
+ * @param pin_out output parameter for cache entry handle (caller must release)
+ * @return const pointer into cache payload, or NULL on miss
  */
-static uint8_t *tidesdb_cache_raw_block_get(tidesdb_t *db, const char *cf_name,
-                                            const char *klog_filename,
-                                            const uint64_t block_position, size_t *out_size)
+static const uint8_t *tidesdb_cache_raw_block_get_pinned(tidesdb_t *db, const char *cf_name,
+                                                         const char *klog_filename,
+                                                         const uint64_t block_position,
+                                                         size_t *out_size,
+                                                         clock_cache_entry_t **pin_out)
 {
-    if (!db || !db->clock_cache || !cf_name || !klog_filename || !out_size) return NULL;
+    if (!db || !db->clock_cache || !cf_name || !klog_filename || !out_size || !pin_out) return NULL;
 
     char cache_key[TDB_CACHE_KEY_SIZE];
     const size_t key_len = tidesdb_block_cache_key(cf_name, klog_filename, block_position,
@@ -1258,13 +1288,16 @@ static uint8_t *tidesdb_cache_raw_block_get(tidesdb_t *db, const char *cf_name,
     if (key_len == 0) return NULL;
 
     size_t payload_len = 0;
-    uint8_t *data = clock_cache_get(db->clock_cache, cache_key, key_len, &payload_len);
+    clock_cache_entry_t *entry = NULL;
+    const uint8_t *data =
+        clock_cache_get_zero_copy(db->clock_cache, cache_key, key_len, &payload_len, &entry);
     if (!data || payload_len == 0)
     {
         return NULL;
     }
 
     *out_size = payload_len;
+    *pin_out = entry;
     return data;
 }
 
@@ -2907,7 +2940,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     /* we use arena allocation -- single malloc for entire block structure
      * layout -- block_struct | entries[] | keys[] | inline_values[] | key_data | value_data
      * when zero_copy=1, keys/values point directly into the source data buffer
-     * instead of being copied, eliminating the memcpy overhead (~23% of CPU in seeks).
+     * instead of being copied, eliminating the memcpy overhead.
      * the caller must keep the source data buffer alive for the block's lifetime.
      * this reduces malloc calls from O(N) to O(1) per block */
     const uint8_t *ptr = data;
@@ -3120,12 +3153,24 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     if (num_entries > 0)
     {
         const uint32_t last_idx = num_entries - 1;
-        (*block)->max_key = malloc((*block)->entries[last_idx].key_size);
-        if ((*block)->max_key)
+        if (zero_copy)
         {
-            memcpy((*block)->max_key, (*block)->keys[last_idx],
-                   (*block)->entries[last_idx].key_size);
+            /* in zero-copy mode, keys[last_idx] points into the source buffer
+             * which is kept alive by the caller.  iterator seeks use
+             * keys[num_entries-1] directly, so max_key is not needed.
+             * skip the malloc+memcpy to eliminate the last per-block allocation. */
+            (*block)->max_key = NULL;
             (*block)->max_key_size = (*block)->entries[last_idx].key_size;
+        }
+        else
+        {
+            (*block)->max_key = malloc((*block)->entries[last_idx].key_size);
+            if ((*block)->max_key)
+            {
+                memcpy((*block)->max_key, (*block)->keys[last_idx],
+                       (*block)->entries[last_idx].key_size);
+                (*block)->max_key_size = (*block)->entries[last_idx].key_size;
+            }
         }
     }
 
@@ -5445,7 +5490,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     /* we check bloom filter for early exit (after range check since bloom is more expensive).
      * skip_bloom is set when boundary search at L1+ already identified this sstable,
-     * making the bloom check redundant (saves ~8% of total CPU). */
+     * making the bloom check redundant. */
     if (sst->bloom_filter && !skip_bloom)
     {
         PROFILE_INC(db, bloom_checks);
@@ -5521,10 +5566,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         const uint64_t block_position = klog_cursor->current_pos;
 
-        /* we search raw serialized bytes directly without full deserialization.
-         * uses zero-copy cache access to eliminate the 30KB malloc+memcpy that was
-         * consuming 56% of CPU. pins the cache entry, searches in-place, then releases. */
-
         /* we get decompressed block bytes (zero-copy from cache, or from disk) */
         const uint8_t *search_data = NULL;
         size_t search_data_size = 0;
@@ -5598,7 +5639,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (search_rc == 0)
         {
-            /* found -- build kv pair from the single entry.
+            /* found -- we build kv pair from the single entry.
              * pointers (found_key, found_value) point into cache memory (pinned),
              * so tidesdb_kv_pair_create copies them before we release the pin. */
             const int is_tombstone = (found_entry.flags & TDB_KV_FLAG_TOMBSTONE);
@@ -7269,8 +7310,11 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
     source->source.sstable.current_block_data = NULL; /* no block data yet */
     source->source.sstable.current_rc_block = NULL;   /* no ref-counted block yet */
     source->source.sstable.decompressed_data = NULL;  /* no decompressed data yet */
-    source->source.sstable.current_block = NULL;      /* no current block yet */
-    source->current_kv = NULL;                        /* no current kv yet */
+    source->source.sstable.cache_pin = NULL;          /* no cache pin yet */
+    memset(source->source.sstable.block_stash, 0, sizeof(source->source.sstable.block_stash));
+    memset(&source->source.sstable.lazy, 0, sizeof(source->source.sstable.lazy));
+    source->source.sstable.current_block = NULL; /* no current block yet */
+    source->current_kv = NULL;                   /* no current kv yet */
     source->config = sst->config;
 
     /* we only read data blocks, not the metadata block at the end */
@@ -7302,7 +7346,6 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
             tidesdb_read_block(db, sst, source->source.sstable.klog_cursor);
         if (!block)
         {
-            /* no block available */
             tidesdb_sstable_unref(db, sst);
             block_manager_cursor_free(source->source.sstable.klog_cursor);
             block_manager_cursor_free(source->source.sstable.vlog_cursor);
@@ -7326,15 +7369,11 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
 
         if (klog_block && klog_block->num_entries > 0)
         {
-            /* deserialization succeeded, now safe to store block */
             source->source.sstable.current_block = klog_block;
             source->source.sstable.current_block_data = block;
             source->source.sstable.current_entry_idx = 0;
 
-            /* we create KV pair from first entry */
             const uint8_t *value = klog_block->inline_values[0];
-
-            /* if not inline, read from vlog */
             uint8_t *vlog_value = NULL;
             if (klog_block->entries[0].vlog_offset > 0)
             {
@@ -7348,10 +7387,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
                 klog_block->keys[0], klog_block->entries[0].key_size, value,
                 klog_block->entries[0].value_size, klog_block->entries[0].ttl,
                 klog_block->entries[0].seq, klog_block->entries[0].flags & TDB_KV_FLAG_TOMBSTONE);
-
             free(vlog_value);
 
-            /* if kv pair creation failed, clean up and return NULL */
             if (!source->current_kv)
             {
                 tidesdb_klog_block_free(klog_block);
@@ -7363,11 +7400,9 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
                 return NULL;
             }
 
-            /* dont free decompressed or release block,we're still using the deserialized data */
             return source;
         }
 
-        /* empty block, clean up and return NULL */
         if (klog_block) tidesdb_klog_block_free(klog_block);
         if (block) block_manager_block_release(block);
         tidesdb_sstable_unref(db, sst);
@@ -7556,6 +7591,98 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
 }
 
 /**
+ * tidesdb_merge_source_from_sstable_lazy
+ * creates an SST merge source without reading the first block from disk.
+ * the source starts with current_kv=NULL; the first seek() call will
+ * read blocks on demand. only used by the iterator path
+ * since compaction needs the initial block read.
+ * @param db database instance
+ * @param sst sstable
+ * @return merge source or NULL on error
+ */
+static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_lazy(tidesdb_t *db,
+                                                                      tidesdb_sstable_t *sst)
+{
+    if (sst->use_btree)
+    {
+        return tidesdb_merge_source_from_btree(db, sst);
+    }
+
+    tidesdb_merge_source_t *source = malloc(sizeof(tidesdb_merge_source_t));
+    if (!source) return NULL;
+
+    source->type = MERGE_SOURCE_SSTABLE;
+    source->source.sstable.sst = sst;
+    source->source.sstable.db = db;
+    source->is_cached = 0;
+
+    tidesdb_sstable_ref(sst);
+
+    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    {
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    tidesdb_block_managers_t bms;
+    if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
+    {
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    if (block_manager_cursor_init(&source->source.sstable.klog_cursor, bms.klog_bm) != 0)
+    {
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    if (block_manager_cursor_init(&source->source.sstable.vlog_cursor, bms.vlog_bm) != 0)
+    {
+        tidesdb_sstable_unref(db, sst);
+        block_manager_cursor_free(source->source.sstable.klog_cursor);
+        free(source);
+        return NULL;
+    }
+
+    source->source.sstable.current_block_data = NULL;
+    source->source.sstable.current_rc_block = NULL;
+    source->source.sstable.decompressed_data = NULL;
+    source->source.sstable.cache_pin = NULL;
+    memset(source->source.sstable.block_stash, 0, sizeof(source->source.sstable.block_stash));
+    memset(&source->source.sstable.lazy, 0, sizeof(source->source.sstable.lazy));
+    source->source.sstable.current_block = NULL;
+    source->current_kv = NULL; /* lazy: no initial block read */
+    source->config = sst->config;
+
+    if (sst->num_klog_blocks == 0)
+    {
+        tidesdb_sstable_unref(db, sst);
+        block_manager_cursor_free(source->source.sstable.klog_cursor);
+        block_manager_cursor_free(source->source.sstable.vlog_cursor);
+        free(source);
+        return NULL;
+    }
+
+    /* position cursor at first data block but don't read it */
+    if (block_manager_cursor_goto_first(source->source.sstable.klog_cursor) != 0 ||
+        (sst->klog_data_end_offset > 0 &&
+         source->source.sstable.klog_cursor->current_pos >= sst->klog_data_end_offset))
+    {
+        tidesdb_sstable_unref(db, sst);
+        block_manager_cursor_free(source->source.sstable.klog_cursor);
+        block_manager_cursor_free(source->source.sstable.vlog_cursor);
+        free(source);
+        return NULL;
+    }
+
+    return source;
+}
+
+/**
  * tidesdb_merge_source_free
  * free a merge source
  * @param source merge source to free
@@ -7607,6 +7734,12 @@ static void tidesdb_merge_source_free(tidesdb_merge_source_t *source)
         {
             tidesdb_klog_block_free(source->source.sstable.current_block);
         }
+        if (source->source.sstable.cache_pin)
+        {
+            clock_cache_release(source->source.sstable.cache_pin);
+        }
+        tidesdb_iter_clear_block_stash(source);
+        tidesdb_iter_clear_lazy(source);
         if (source->source.sstable.decompressed_data)
         {
             free(source->source.sstable.decompressed_data);
@@ -7723,6 +7856,31 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
     }
     else
     {
+        /* if we have a lazy (not-yet-deserialized) block, deserialize it now
+         * so we can advance to the next entry */
+        if (source->source.sstable.lazy.data && !source->source.sstable.current_block)
+        {
+            /* strip block index header and deserialize */
+            const uint8_t *deser_ptr = source->source.sstable.lazy.block_data;
+            size_t deser_size = source->source.sstable.lazy.block_data_size;
+
+            tidesdb_klog_block_t *kb = NULL;
+            if (tidesdb_klog_block_deserialize(deser_ptr, deser_size, &kb, 1) == 0 && kb)
+            {
+                kb->data_ref = NULL; /* lazy.pin keeps raw data alive */
+                source->source.sstable.current_block = kb;
+                /* transfer lazy pin to cache_pin so release_block handles cleanup */
+                source->source.sstable.cache_pin = source->source.sstable.lazy.pin;
+                source->source.sstable.lazy.pin = NULL;
+                tidesdb_iter_clear_lazy(source);
+            }
+            else
+            {
+                tidesdb_iter_clear_lazy(source);
+                return TDB_ERR_CORRUPTION;
+            }
+        }
+
         /* we advance to next entry in current block or next block */
         source->source.sstable.current_entry_idx++;
 
@@ -7778,6 +7936,11 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             tidesdb_klog_block_free(source->source.sstable.current_block);
         }
         source->source.sstable.current_block = NULL;
+        if (source->source.sstable.cache_pin)
+        {
+            clock_cache_release(source->source.sstable.cache_pin);
+            source->source.sstable.cache_pin = NULL;
+        }
         if (source->source.sstable.decompressed_data)
         {
             free(source->source.sstable.decompressed_data);
@@ -19545,7 +19708,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_sstable_t *sst = ssts_array[i];
 
-            tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
+            tidesdb_merge_source_t *sst_source =
+                tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
             if (sst_source)
             {
                 /* we mark as cached so it wont be freed when popped from heap */
@@ -19720,7 +19884,7 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
     for (int i = 0; i < sst_count; i++)
     {
         tidesdb_sstable_t *sst = ssts_array[i];
-        tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
+        tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
         if (sst_source)
         {
             sst_source->is_cached = 1;
@@ -19796,6 +19960,74 @@ static void tidesdb_iter_seek_memtable_source(tidesdb_merge_source_t *source, co
  * release current block resources from an sstable source
  * @param source the sstable source
  */
+/**
+ * tidesdb_iter_clear_block_stash
+ * free all entries in the 2-slot deserialized block stash
+ */
+static void tidesdb_iter_clear_block_stash(tidesdb_merge_source_t *source)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        if (source->source.sstable.block_stash[i].block)
+        {
+            tidesdb_klog_block_free(source->source.sstable.block_stash[i].block);
+            source->source.sstable.block_stash[i].block = NULL;
+        }
+        if (source->source.sstable.block_stash[i].pin)
+        {
+            clock_cache_release(source->source.sstable.block_stash[i].pin);
+            source->source.sstable.block_stash[i].pin = NULL;
+        }
+    }
+}
+
+/**
+ * tidesdb_iter_clear_lazy
+ * release lazy block state (pinned raw cache data)
+ */
+static void tidesdb_iter_clear_lazy(tidesdb_merge_source_t *source)
+{
+    if (source->source.sstable.lazy.pin)
+    {
+        clock_cache_release(source->source.sstable.lazy.pin);
+    }
+    memset(&source->source.sstable.lazy, 0, sizeof(source->source.sstable.lazy));
+}
+
+/**
+ * tidesdb_iter_stash_block
+ * stash a cache-origin block into the 2-slot round-robin stash.
+ * evicts the oldest entry if both slots are full.
+ */
+static void tidesdb_iter_stash_block(tidesdb_merge_source_t *source, tidesdb_klog_block_t *block,
+                                     clock_cache_entry_t *pin, uint64_t position)
+{
+    /* find an empty slot, or evict slot 0 (shift slot 1 down) */
+    int slot = -1;
+    for (int i = 0; i < 2; i++)
+    {
+        if (!source->source.sstable.block_stash[i].block)
+        {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0)
+    {
+        /* both full! we evict slot 0, shift slot 1 to slot 0 */
+        tidesdb_klog_block_free(source->source.sstable.block_stash[0].block);
+        if (source->source.sstable.block_stash[0].pin)
+            clock_cache_release(source->source.sstable.block_stash[0].pin);
+        source->source.sstable.block_stash[0] = source->source.sstable.block_stash[1];
+        slot = 1;
+    }
+
+    source->source.sstable.block_stash[slot].block = block;
+    source->source.sstable.block_stash[slot].pin = pin;
+    source->source.sstable.block_stash[slot].position = position;
+}
+
 static void tidesdb_iter_release_sst_source_block(tidesdb_merge_source_t *source)
 {
     if (source->source.sstable.current_rc_block)
@@ -19808,6 +20040,14 @@ static void tidesdb_iter_release_sst_source_block(tidesdb_merge_source_t *source
         tidesdb_klog_block_free(source->source.sstable.current_block);
     }
     source->source.sstable.current_block = NULL;
+
+    if (source->source.sstable.cache_pin)
+    {
+        clock_cache_release(source->source.sstable.cache_pin);
+        source->source.sstable.cache_pin = NULL;
+    }
+
+    tidesdb_iter_clear_lazy(source);
 
     if (source->source.sstable.decompressed_data)
     {
@@ -19838,18 +20078,23 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
                                         block_manager_cursor_t *cursor, const char *cf_name,
                                         const int has_cf_name, tidesdb_klog_block_t **kb_out,
                                         block_manager_block_t **bmblock_out,
-                                        uint8_t **decompressed_out)
+                                        uint8_t **decompressed_out,
+                                        clock_cache_entry_t **cache_pin_out)
 {
     *kb_out = NULL;
     *bmblock_out = NULL;
     *decompressed_out = NULL;
+    if (cache_pin_out) *cache_pin_out = NULL;
 
-    /* we try raw-byte cache first */
+    /* we try raw-byte cache first -- zero-copy path pins the cache entry
+     * so keys/values can point directly into cache memory without malloc+memcpy.
+     */
     if (sst->db->clock_cache && has_cf_name)
     {
         size_t cached_size = 0;
-        uint8_t *cached_data = tidesdb_cache_raw_block_get(sst->db, cf_name, sst->klog_filename,
-                                                           cursor->current_pos, &cached_size);
+        clock_cache_entry_t *pin = NULL;
+        const uint8_t *cached_data = tidesdb_cache_raw_block_get_pinned(
+            sst->db, cf_name, sst->klog_filename, cursor->current_pos, &cached_size, &pin);
         if (cached_data)
         {
             /* cached data may be in indexed format (from tidesdb_sstable_get path)
@@ -19874,14 +20119,16 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
             tidesdb_klog_block_t *kb = NULL;
             if (tidesdb_klog_block_deserialize(deser_ptr, deser_size, &kb, 1) != 0 || !kb)
             {
-                free(cached_data);
+                clock_cache_release(pin);
                 return TDB_ERR_CORRUPTION;
             }
 
-            /* zero-copy block keys/values point into cached_data, so keep it alive.
-             * data_ref is freed when the block is freed. */
-            kb->data_ref = cached_data;
+            /*** zero-copy block keys/values point into the pinned cache entry.
+             **  data_ref is NULL -- the cache pin keeps the data alive.
+             *   caller releases pin via cache_pin_out when the block is freed. */
+            kb->data_ref = NULL;
             *kb_out = kb;
+            if (cache_pin_out) *cache_pin_out = pin;
             return TDB_SUCCESS;
         }
     }
@@ -19903,11 +20150,24 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
         }
     }
 
-    /* cache DECOMPRESSED bytes so cache hits skip LZ4 entirely */
+    /* cache INDEXED block data so future cache hits can use O(log N)
+     * block-index binary search instead of O(N) full deserialization.
+     * falls back to caching raw data if index build fails. */
     if (sst->db->clock_cache && has_cf_name)
     {
-        tidesdb_cache_raw_block_put(sst->db, cf_name, sst->klog_filename, cursor->current_pos, data,
-                                    data_size);
+        uint8_t *indexed_data = NULL;
+        size_t indexed_size = 0;
+        if (tidesdb_build_indexed_block_data(data, data_size, &indexed_data, &indexed_size) == 0)
+        {
+            tidesdb_cache_raw_block_put(sst->db, cf_name, sst->klog_filename, cursor->current_pos,
+                                        indexed_data, indexed_size);
+            free(indexed_data);
+        }
+        else
+        {
+            tidesdb_cache_raw_block_put(sst->db, cf_name, sst->klog_filename, cursor->current_pos,
+                                        data, data_size);
+        }
     }
 
     tidesdb_klog_block_t *kb = NULL;
@@ -20178,8 +20438,208 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
         else if (cmp_last < 0)
         {
             /* sequential advance hint -- target is past current block.
-             * try advancing cursor to next block directly instead of going through
-             * block index lookup. this saves a binary search for monotonically advancing seeks. */
+             * stash the block before releasing so we can reuse it if a future
+             * seek returns to this position. */
+            if (source->source.sstable.cache_pin && !source->source.sstable.current_block_data &&
+                !source->source.sstable.decompressed_data)
+            {
+                tidesdb_iter_stash_block(source, source->source.sstable.current_block,
+                                         source->source.sstable.cache_pin, cursor->current_pos);
+                source->source.sstable.current_block = NULL;
+                source->source.sstable.cache_pin = NULL;
+            }
+            tidesdb_iter_release_sst_source_block(source);
+            if (sst->klog_data_end_offset > 0 && cursor->current_pos < sst->klog_data_end_offset &&
+                block_manager_cursor_next(cursor) == 0 &&
+                cursor->current_pos < sst->klog_data_end_offset)
+            {
+                goto scan_blocks;
+            }
+            return;
+        }
+    }
+    else if (source->source.sstable.lazy.data && source->source.sstable.lazy.idx_count > 0)
+    {
+        /** block is pinned but not deserialized.
+         *  we use block index to check if target is within this block's key range. */
+        const uint8_t *idx_base = source->source.sstable.lazy.idx_base;
+        const uint32_t idx_count = source->source.sstable.lazy.idx_count;
+        const uint8_t *bdata = source->source.sstable.lazy.block_data;
+
+        const uint8_t *first_ie = idx_base;
+        const uint32_t fk_off = decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_KEY_OFF);
+        const uint32_t fk_sz = decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_KEY_SIZE);
+        const uint8_t *last_ie = idx_base + (idx_count - 1) * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+        const uint32_t lk_off = decode_uint32_le_compat(last_ie + TDB_BLOCK_IDX_KEY_OFF);
+        const uint32_t lk_sz = decode_uint32_le_compat(last_ie + TDB_BLOCK_IDX_KEY_SIZE);
+
+        const int cmp_first = comparator_fn(bdata + fk_off, fk_sz, key, key_size, comparator_ctx);
+        const int cmp_last = comparator_fn(bdata + lk_off, lk_sz, key, key_size, comparator_ctx);
+
+        if (cmp_first <= 0 && cmp_last >= 0)
+        {
+            /* target is within this lazy block -- binary search via block index */
+            int32_t left = 0, right = (int32_t)idx_count - 1, found = -1;
+            while (left <= right)
+            {
+                const int32_t mid = left + (right - left) / 2;
+                const uint8_t *ie = idx_base + mid * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                const uint32_t k_off = decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_OFF);
+                const uint32_t k_sz = decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_SIZE);
+                const int cmp = comparator_fn(bdata + k_off, k_sz, key, key_size, comparator_ctx);
+                if (cmp >= 0)
+                {
+                    found = mid;
+                    right = mid - 1;
+                }
+                else
+                {
+                    left = mid + 1;
+                }
+            }
+
+            if (found >= 0)
+            {
+                /* extract entry metadata from raw data */
+                const uint8_t *fie = idx_base + found * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                const uint32_t e_off = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_ENTRY_OFF);
+                const uint32_t k_off = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_KEY_OFF);
+                const uint32_t k_sz = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_KEY_SIZE);
+
+                const uint8_t *eptr = bdata + e_off;
+                size_t erem = source->source.sstable.lazy.block_data_size - e_off;
+                uint8_t flags = *eptr++;
+                erem--;
+                uint64_t ks, vs;
+                int br = decode_varint(eptr, &ks, (int)erem);
+                eptr += br;
+                erem -= br;
+                br = decode_varint(eptr, &vs, (int)erem);
+                eptr += br;
+                erem -= br;
+                /* read abs_seq from index */
+                const uint32_t seq_lo = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_LO);
+                const uint32_t seq_hi = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_HI);
+                const uint64_t seq = ((uint64_t)seq_hi << 32) | seq_lo;
+                /* skip seq varint */
+                uint64_t dummy;
+                br = decode_varint(eptr, &dummy, (int)erem);
+                eptr += br;
+                erem -= br;
+                int64_t ttl = 0;
+                if (flags & TDB_KV_FLAG_HAS_TTL)
+                {
+                    ttl = decode_int64_le_compat(eptr);
+                    eptr += sizeof(int64_t);
+                    erem -= sizeof(int64_t);
+                }
+                uint64_t vlog_offset = 0;
+                if (flags & TDB_KV_FLAG_HAS_VLOG)
+                {
+                    br = decode_varint(eptr, &vlog_offset, (int)erem);
+                }
+
+                const uint8_t *fkey = bdata + k_off;
+                const uint8_t *fvalue = NULL;
+                if (!(flags & TDB_KV_FLAG_HAS_VLOG) && vs > 0)
+                {
+                    fvalue = fkey + k_sz;
+                }
+
+                /* handle vlog values */
+                uint8_t *vlog_value = NULL;
+                if (vlog_offset > 0)
+                {
+                    if (tidesdb_vlog_read_value(iter->cf->db, sst, vlog_offset, (size_t)vs,
+                                                &vlog_value) == TDB_SUCCESS)
+                    {
+                        fvalue = vlog_value;
+                    }
+                }
+
+                if (source->current_kv)
+                {
+                    tidesdb_kv_pair_free(source->current_kv);
+                    source->current_kv = NULL;
+                }
+                source->current_kv =
+                    tidesdb_kv_pair_create(fkey, (size_t)k_sz, fvalue, (size_t)vs, ttl, seq,
+                                           (flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                free(vlog_value);
+
+                source->source.sstable.lazy.entry_idx = found;
+                source->source.sstable.current_entry_idx = found;
+                /* cache block size so cursor_next skips pread */
+                cursor->current_block_size = source->source.sstable.lazy.block_data_size;
+                cursor->block_size_valid = 1;
+                return;
+            }
+        }
+        else if (cmp_first > 0)
+        {
+            /* target is before this lazy block -- use first entry */
+            const uint32_t e_off = decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_ENTRY_OFF);
+            const uint8_t *eptr = bdata + e_off;
+            size_t erem = source->source.sstable.lazy.block_data_size - e_off;
+            uint8_t flags = *eptr++;
+            erem--;
+            uint64_t ks, vs;
+            int br = decode_varint(eptr, &ks, (int)erem);
+            eptr += br;
+            erem -= br;
+            br = decode_varint(eptr, &vs, (int)erem);
+            eptr += br;
+            erem -= br;
+            const uint32_t seq_lo = decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_SEQ_LO);
+            const uint32_t seq_hi = decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_SEQ_HI);
+            const uint64_t seq = ((uint64_t)seq_hi << 32) | seq_lo;
+            uint64_t dummy;
+            br = decode_varint(eptr, &dummy, (int)erem);
+            eptr += br;
+            erem -= br;
+            int64_t ttl = 0;
+            if (flags & TDB_KV_FLAG_HAS_TTL)
+            {
+                ttl = decode_int64_le_compat(eptr);
+                eptr += sizeof(int64_t);
+                erem -= sizeof(int64_t);
+            }
+            uint64_t vlog_offset = 0;
+            if (flags & TDB_KV_FLAG_HAS_VLOG)
+            {
+                br = decode_varint(eptr, &vlog_offset, (int)erem);
+            }
+            const uint8_t *fvalue = NULL;
+            if (!(flags & TDB_KV_FLAG_HAS_VLOG) && vs > 0)
+            {
+                fvalue = bdata + fk_off + fk_sz;
+            }
+            uint8_t *vlog_value = NULL;
+            if (vlog_offset > 0)
+            {
+                if (tidesdb_vlog_read_value(iter->cf->db, sst, vlog_offset, (size_t)vs,
+                                            &vlog_value) == TDB_SUCCESS)
+                {
+                    fvalue = vlog_value;
+                }
+            }
+            if (source->current_kv)
+            {
+                tidesdb_kv_pair_free(source->current_kv);
+                source->current_kv = NULL;
+            }
+            source->current_kv =
+                tidesdb_kv_pair_create(bdata + fk_off, (size_t)fk_sz, fvalue, (size_t)vs, ttl, seq,
+                                       (flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+            free(vlog_value);
+            source->source.sstable.lazy.entry_idx = 0;
+            source->source.sstable.current_entry_idx = 0;
+            return;
+        }
+        else if (cmp_last < 0)
+        {
+            /* target past lazy block -- release and try sequential advance */
+            tidesdb_iter_clear_lazy(source);
             tidesdb_iter_release_sst_source_block(source);
             if (sst->klog_data_end_offset > 0 && cursor->current_pos < sst->klog_data_end_offset &&
                 block_manager_cursor_next(cursor) == 0 &&
@@ -20191,6 +20651,16 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
         }
     }
 
+    /* stash cache-origin block before releasing so a subsequent seek
+     * to the same block position can skip deserialization entirely */
+    if (source->source.sstable.current_block && source->source.sstable.cache_pin &&
+        !source->source.sstable.current_block_data && !source->source.sstable.decompressed_data)
+    {
+        tidesdb_iter_stash_block(source, source->source.sstable.current_block,
+                                 source->source.sstable.cache_pin, cursor->current_pos);
+        source->source.sstable.current_block = NULL;
+        source->source.sstable.cache_pin = NULL;
+    }
     tidesdb_iter_release_sst_source_block(source);
 
     /* we use block index to find starting position */
@@ -20223,79 +20693,271 @@ scan_blocks:;
             break;
         }
 
-        tidesdb_klog_block_t *kb = NULL;
-        block_manager_block_t *bmblock = NULL;
-        uint8_t *decompressed = NULL;
-
-        const int read_result = tidesdb_iter_read_klog_block(sst, cursor, cf_name, has_cf_name, &kb,
-                                                             &bmblock, &decompressed);
-        if (read_result != TDB_SUCCESS)
+        /* we try zero-copy block-index binary search on cached raw bytes.
+         * this does O(log N) key comparisons and parses only the 1 matched entry,
+         * instead of O(N) full varint deserialization of all entries.
+         * only works for indexed cache hits; falls back to full deserialize otherwise. */
+        if (sst->db->clock_cache && has_cf_name)
         {
-            if (block_manager_cursor_next(cursor) != 0) break;
-            continue;
-        }
-        blocks_scanned++;
+            size_t cached_size = 0;
+            clock_cache_entry_t *lazy_pin = NULL;
+            const uint8_t *cached = tidesdb_cache_raw_block_get_pinned(
+                sst->db, cf_name, sst->klog_filename, cursor->current_pos, &cached_size, &lazy_pin);
 
-        /* we check if first key > target (first entry is the answer) */
-        const int cmp_first =
-            comparator_fn(kb->keys[0], kb->entries[0].key_size, key, key_size, comparator_ctx);
-
-        if (cmp_first > 0)
-        {
-            source->source.sstable.current_block_data = bmblock;
-            source->source.sstable.current_rc_block = NULL;
-            source->source.sstable.current_block = kb;
-            source->source.sstable.decompressed_data = decompressed;
-            source->source.sstable.current_entry_idx = 0;
-            source->current_kv = tidesdb_iter_create_kv_from_block(iter, sst, kb, 0);
-            return;
-        }
-
-        /* we check if target could be in this block */
-        const int cmp_last =
-            comparator_fn(kb->keys[kb->num_entries - 1], kb->entries[kb->num_entries - 1].key_size,
-                          key, key_size, comparator_ctx);
-
-        if (cmp_last >= 0)
-        {
-            /* we binary search for first entry >= target */
-            int left = 0;
-            int right = (int)kb->num_entries - 1;
-            int result_idx = (int)kb->num_entries;
-
-            while (left <= right)
+            if (cached && cached_size >= TDB_BLOCK_INDEX_HDR_BASE &&
+                decode_uint32_le_compat(cached) == TDB_BLOCK_INDEX_MAGIC)
             {
-                const int mid = left + (right - left) / 2;
-                const int cmp = comparator_fn(kb->keys[mid], kb->entries[mid].key_size, key,
-                                              key_size, comparator_ctx);
+                const uint32_t hdr_size = decode_uint32_le_compat(cached + 4);
+                const uint32_t idx_count = decode_uint32_le_compat(cached + 8);
 
-                if (cmp >= 0)
+                if (idx_count > 0 && hdr_size < cached_size)
                 {
-                    result_idx = mid;
-                    right = mid - 1;
-                }
-                else
-                {
-                    left = mid + 1;
+                    const uint8_t *idx_base = cached + TDB_BLOCK_INDEX_HDR_BASE;
+                    const uint8_t *bdata = cached + hdr_size;
+                    const size_t bdata_size = cached_size - hdr_size;
+
+                    /* check first key to see if target is before this block */
+                    const uint8_t *first_ie = idx_base;
+                    const uint32_t fk_off =
+                        decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_KEY_OFF);
+                    const uint32_t fk_sz =
+                        decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_KEY_SIZE);
+                    const int cmp_first =
+                        comparator_fn(bdata + fk_off, fk_sz, key, key_size, comparator_ctx);
+
+                    /* binary search for first entry >= target (or entry 0 if target
+                     * is before this block) */
+                    int32_t found = -1;
+                    if (cmp_first > 0)
+                    {
+                        found = 0; /* target before block -- first entry is answer */
+                    }
+                    else
+                    {
+                        /* check last key */
+                        const uint8_t *last_ie =
+                            idx_base + (idx_count - 1) * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                        const uint32_t lk_off =
+                            decode_uint32_le_compat(last_ie + TDB_BLOCK_IDX_KEY_OFF);
+                        const uint32_t lk_sz =
+                            decode_uint32_le_compat(last_ie + TDB_BLOCK_IDX_KEY_SIZE);
+                        const int cmp_last =
+                            comparator_fn(bdata + lk_off, lk_sz, key, key_size, comparator_ctx);
+
+                        if (cmp_last >= 0)
+                        {
+                            /* target within block -- binary search via block index */
+                            int32_t lo = 0, hi = (int32_t)idx_count - 1;
+                            while (lo <= hi)
+                            {
+                                const int32_t mid = lo + (hi - lo) / 2;
+                                const uint8_t *ie = idx_base + mid * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                                const uint32_t k_off =
+                                    decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_OFF);
+                                const uint32_t k_sz =
+                                    decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_SIZE);
+                                const int cmp = comparator_fn(bdata + k_off, k_sz, key, key_size,
+                                                              comparator_ctx);
+                                if (cmp >= 0)
+                                {
+                                    found = mid;
+                                    hi = mid - 1;
+                                }
+                                else
+                                {
+                                    lo = mid + 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if (found >= 0)
+                    {
+                        /* found entry >= target via lazy block-index search.
+                         * extract single entry from raw data -- O(1) per entry
+                         * instead of O(N) full deserialize. */
+                        const uint8_t *fie = idx_base + found * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                        const uint32_t e_off =
+                            decode_uint32_le_compat(fie + TDB_BLOCK_IDX_ENTRY_OFF);
+                        const uint32_t mk_off =
+                            decode_uint32_le_compat(fie + TDB_BLOCK_IDX_KEY_OFF);
+                        const uint32_t mk_sz =
+                            decode_uint32_le_compat(fie + TDB_BLOCK_IDX_KEY_SIZE);
+                        const uint8_t *eptr = bdata + e_off;
+                        size_t erem = bdata_size - e_off;
+                        uint8_t flags = *eptr++;
+                        erem--;
+                        uint64_t ks_v, vs_v;
+                        int br = decode_varint(eptr, &ks_v, (int)erem);
+                        eptr += br;
+                        erem -= br;
+                        br = decode_varint(eptr, &vs_v, (int)erem);
+                        eptr += br;
+                        erem -= br;
+                        const uint32_t sq_lo = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_LO);
+                        const uint32_t sq_hi = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_HI);
+                        const uint64_t seq = ((uint64_t)sq_hi << 32) | sq_lo;
+                        uint64_t seq_dummy;
+                        br = decode_varint(eptr, &seq_dummy, (int)erem);
+                        eptr += br;
+                        erem -= br;
+                        int64_t ttl = 0;
+                        if (flags & TDB_KV_FLAG_HAS_TTL)
+                        {
+                            ttl = decode_int64_le_compat(eptr);
+                            eptr += sizeof(int64_t);
+                            erem -= sizeof(int64_t);
+                        }
+                        uint64_t vlog_off = 0;
+                        if (flags & TDB_KV_FLAG_HAS_VLOG)
+                        {
+                            br = decode_varint(eptr, &vlog_off, (int)erem);
+                        }
+                        const uint8_t *rkey = bdata + mk_off;
+                        const uint8_t *rval = NULL;
+                        if (!(flags & TDB_KV_FLAG_HAS_VLOG) && vs_v > 0) rval = rkey + mk_sz;
+                        uint8_t *vlog_val = NULL;
+                        if (vlog_off > 0 &&
+                            tidesdb_vlog_read_value(iter->cf->db, sst, vlog_off, (size_t)vs_v,
+                                                    &vlog_val) == TDB_SUCCESS)
+                            rval = vlog_val;
+
+                        if (source->current_kv)
+                        {
+                            tidesdb_kv_pair_free(source->current_kv);
+                            source->current_kv = NULL;
+                        }
+                        source->current_kv =
+                            tidesdb_kv_pair_create(rkey, (size_t)mk_sz, rval, (size_t)vs_v, ttl,
+                                                   seq, (flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                        free(vlog_val);
+
+                        /* store lazy state for future fast-path + deferred deserialize */
+                        tidesdb_iter_clear_lazy(source);
+                        source->source.sstable.lazy.data = cached;
+                        source->source.sstable.lazy.size = cached_size;
+                        source->source.sstable.lazy.pin = lazy_pin;
+                        source->source.sstable.lazy.block_data = bdata;
+                        source->source.sstable.lazy.block_data_size = bdata_size;
+                        source->source.sstable.lazy.idx_base = idx_base;
+                        source->source.sstable.lazy.idx_count = idx_count;
+                        source->source.sstable.lazy.entry_idx = found;
+                        source->source.sstable.current_entry_idx = found;
+                        /* cache block size so cursor_next skips pread */
+                        cursor->current_block_size = bdata_size;
+                        cursor->block_size_valid = 1;
+                        return;
+                    }
+
+                    /* target past this block -- we release pin and try next */
+                    clock_cache_release(lazy_pin);
+                    blocks_scanned++;
+                    if (block_manager_cursor_next(cursor) != 0) break;
+                    continue;
                 }
             }
 
-            if ((uint32_t)result_idx < kb->num_entries)
+            /* non-indexed cache hit or too small -- we release pin, fall through to full
+             * deserialize */
+            if (lazy_pin) clock_cache_release(lazy_pin);
+        }
+
+        /* non-indexed block or cache miss */
+        {
+            tidesdb_klog_block_t *kb = NULL;
+            block_manager_block_t *bmblock = NULL;
+            uint8_t *decompressed = NULL;
+            clock_cache_entry_t *pin = NULL;
+
+            /* check stash first */
+            const uint64_t scan_pos = cursor->current_pos;
+            int stash_hit = 0;
+            for (int si = 0; si < 2; si++)
+            {
+                if (source->source.sstable.block_stash[si].block &&
+                    source->source.sstable.block_stash[si].position == scan_pos)
+                {
+                    kb = source->source.sstable.block_stash[si].block;
+                    pin = source->source.sstable.block_stash[si].pin;
+                    source->source.sstable.block_stash[si].block = NULL;
+                    source->source.sstable.block_stash[si].pin = NULL;
+                    stash_hit = 1;
+                    break;
+                }
+            }
+
+            if (!stash_hit)
+            {
+                const int read_result = tidesdb_iter_read_klog_block(
+                    sst, cursor, cf_name, has_cf_name, &kb, &bmblock, &decompressed, &pin);
+                if (read_result != TDB_SUCCESS)
+                {
+                    if (block_manager_cursor_next(cursor) != 0) break;
+                    continue;
+                }
+            }
+            blocks_scanned++;
+
+            const int cmp_first =
+                comparator_fn(kb->keys[0], kb->entries[0].key_size, key, key_size, comparator_ctx);
+
+            if (cmp_first > 0)
             {
                 source->source.sstable.current_block_data = bmblock;
                 source->source.sstable.current_rc_block = NULL;
                 source->source.sstable.current_block = kb;
                 source->source.sstable.decompressed_data = decompressed;
-                source->source.sstable.current_entry_idx = result_idx;
-                source->current_kv = tidesdb_iter_create_kv_from_block(iter, sst, kb, result_idx);
+                source->source.sstable.cache_pin = pin;
+                source->source.sstable.current_entry_idx = 0;
+                source->current_kv = tidesdb_iter_create_kv_from_block(iter, sst, kb, 0);
                 return;
             }
-        }
 
-        /* we release and try next block */
-        tidesdb_klog_block_free(kb);
-        if (decompressed) free(decompressed);
-        if (bmblock) block_manager_block_release(bmblock);
+            const int cmp_last = comparator_fn(kb->keys[kb->num_entries - 1],
+                                               kb->entries[kb->num_entries - 1].key_size, key,
+                                               key_size, comparator_ctx);
+
+            if (cmp_last >= 0)
+            {
+                int left = 0;
+                int right = (int)kb->num_entries - 1;
+                int result_idx = (int)kb->num_entries;
+
+                while (left <= right)
+                {
+                    const int mid = left + (right - left) / 2;
+                    const int cmp = comparator_fn(kb->keys[mid], kb->entries[mid].key_size, key,
+                                                  key_size, comparator_ctx);
+                    if (cmp >= 0)
+                    {
+                        result_idx = mid;
+                        right = mid - 1;
+                    }
+                    else
+                    {
+                        left = mid + 1;
+                    }
+                }
+
+                if ((uint32_t)result_idx < kb->num_entries)
+                {
+                    source->source.sstable.current_block_data = bmblock;
+                    source->source.sstable.current_rc_block = NULL;
+                    source->source.sstable.current_block = kb;
+                    source->source.sstable.decompressed_data = decompressed;
+                    source->source.sstable.cache_pin = pin;
+                    source->source.sstable.current_entry_idx = result_idx;
+                    source->current_kv =
+                        tidesdb_iter_create_kv_from_block(iter, sst, kb, result_idx);
+                    return;
+                }
+            }
+
+            tidesdb_klog_block_free(kb);
+            if (pin) clock_cache_release(pin);
+            if (decompressed) free(decompressed);
+            if (bmblock) block_manager_block_release(bmblock);
+        }
 
         if (block_manager_cursor_next(cursor) != 0) break;
     }
@@ -20486,6 +21148,7 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
     int last_valid_idx = -1;
     block_manager_block_t *last_valid_bmblock = NULL;
     uint8_t *last_valid_decompressed = NULL;
+    clock_cache_entry_t *last_valid_pin = NULL;
 
     int blocks_scanned = 0;
 
@@ -20499,9 +21162,10 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         tidesdb_klog_block_t *kb = NULL;
         block_manager_block_t *bmblock = NULL;
         uint8_t *decompressed = NULL;
+        clock_cache_entry_t *pin = NULL;
 
         const int read_result = tidesdb_iter_read_klog_block(sst, cursor, cf_name, has_cf_name, &kb,
-                                                             &bmblock, &decompressed);
+                                                             &bmblock, &decompressed, &pin);
         if (read_result != TDB_SUCCESS)
         {
             if (block_manager_cursor_next(cursor) != 0) break;
@@ -20516,6 +21180,7 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         if (cmp_first > 0)
         {
             tidesdb_klog_block_free(kb);
+            if (pin) clock_cache_release(pin);
             if (decompressed) free(decompressed);
             if (bmblock) block_manager_block_release(bmblock);
             break;
@@ -20547,6 +21212,7 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         {
             /* we clean up previous candidate */
             if (last_valid_block) tidesdb_klog_block_free(last_valid_block);
+            if (last_valid_pin) clock_cache_release(last_valid_pin);
             if (last_valid_decompressed) free(last_valid_decompressed);
             if (last_valid_bmblock) block_manager_block_release(last_valid_bmblock);
 
@@ -20554,10 +21220,12 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
             last_valid_idx = result_idx;
             last_valid_bmblock = bmblock;
             last_valid_decompressed = decompressed;
+            last_valid_pin = pin;
         }
         else
         {
             tidesdb_klog_block_free(kb);
+            if (pin) clock_cache_release(pin);
             if (decompressed) free(decompressed);
             if (bmblock) block_manager_block_release(bmblock);
         }
@@ -20572,9 +21240,15 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         source->source.sstable.current_block_data = last_valid_bmblock;
         source->source.sstable.current_rc_block = NULL;
         source->source.sstable.decompressed_data = last_valid_decompressed;
+        source->source.sstable.cache_pin = last_valid_pin;
         source->source.sstable.current_entry_idx = last_valid_idx;
         source->current_kv =
             tidesdb_iter_create_kv_from_block(iter, sst, last_valid_block, last_valid_idx);
+    }
+    else
+    {
+        /* no valid block found -- we release any leftover pin */
+        if (last_valid_pin) clock_cache_release(last_valid_pin);
     }
 }
 
@@ -20676,8 +21350,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
      * iter->current. when the seek target advances forward, each source's current_kv
      * that is already >= target is still the correct "first entry >= target" answer
      * because no entries exist between the old target and current_kv (by definition of
-     * the previous seek). this lets us skip ~(N-1) redundant source re-seeks per call
-     * on sequential/near-sequential access patterns. */
+     * the previous seek). */
     int forward_monotonic = 0;
     const skip_list_comparator_fn cmp_fn = iter->heap->comparator;
     void *cmp_ctx = iter->heap->comparator_ctx;
@@ -20952,7 +21625,62 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
 {
     if (!iter) return TDB_ERR_INVALID_ARGS;
 
-    /* we pop from heap until we find a valid entry */
+    /* add any lazy cached SST sources (not yet in heap) so they participate */
+    for (int ci = 0; ci < iter->num_cached_sources; ci++)
+    {
+        tidesdb_merge_source_t *cs = iter->cached_sources[ci];
+        if (cs && cs->type == MERGE_SOURCE_SSTABLE && !cs->current_kv)
+        {
+            /* we position at first entry via block read */
+            tidesdb_iter_release_sst_source_block(cs);
+            tidesdb_iter_clear_lazy(cs);
+
+            tidesdb_sstable_t *sst = cs->source.sstable.sst;
+            block_manager_cursor_t *kc = cs->source.sstable.klog_cursor;
+            block_manager_cursor_goto_first(kc);
+
+            if (sst->klog_data_end_offset == 0 || kc->current_pos < sst->klog_data_end_offset)
+            {
+                block_manager_block_t *block = tidesdb_read_block(cs->source.sstable.db, sst, kc);
+                if (block)
+                {
+                    const uint8_t *data = block->data;
+                    size_t data_size = block->size;
+                    tidesdb_klog_block_t *kb = NULL;
+                    if (tidesdb_klog_block_deserialize(data, data_size, &kb, 0) == 0 && kb &&
+                        kb->num_entries > 0)
+                    {
+                        cs->source.sstable.current_block = kb;
+                        cs->source.sstable.current_block_data = block;
+                        cs->source.sstable.current_entry_idx = 0;
+
+                        const uint8_t *val = kb->inline_values[0];
+                        uint8_t *vv = NULL;
+                        if (kb->entries[0].vlog_offset > 0)
+                        {
+                            tidesdb_vlog_read_value(cs->source.sstable.db, sst,
+                                                    kb->entries[0].vlog_offset,
+                                                    kb->entries[0].value_size, &vv);
+                            val = vv;
+                        }
+                        cs->current_kv = tidesdb_kv_pair_create(
+                            kb->keys[0], kb->entries[0].key_size, val, kb->entries[0].value_size,
+                            kb->entries[0].ttl, kb->entries[0].seq,
+                            kb->entries[0].flags & TDB_KV_FLAG_TOMBSTONE);
+                        free(vv);
+
+                        if (cs->current_kv) tidesdb_merge_heap_add_source(iter->heap, cs);
+                    }
+                    else
+                    {
+                        if (kb) tidesdb_klog_block_free(kb);
+                        block_manager_block_release(block);
+                    }
+                }
+            }
+        }
+    }
+
     tidesdb_kv_pair_free(iter->current);
     iter->current = NULL;
     iter->valid = 0;
@@ -21013,7 +21741,32 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
     iter->valid = 0;
     iter->direction = -1; /* set to backward */
 
-    /* we position all sources at their last entries */
+    /* we position all sources at their last entries.
+     * iterate both heap sources AND cached sources (lazy SST sources
+     * that weren't added to heap because current_kv was NULL). */
+    const int total_sources = iter->heap->num_sources;
+
+    /* also process cached SST sources not in the heap */
+    for (int ci = 0; ci < iter->num_cached_sources; ci++)
+    {
+        tidesdb_merge_source_t *cs = iter->cached_sources[ci];
+        /* we check if already in heap */
+        int in_heap = 0;
+        for (int hi = 0; hi < total_sources; hi++)
+        {
+            if (iter->heap->sources[hi] == cs)
+            {
+                in_heap = 1;
+                break;
+            }
+        }
+        if (!in_heap && cs->type == MERGE_SOURCE_SSTABLE)
+        {
+            /* add to heap so it gets positioned below */
+            tidesdb_merge_heap_add_source(iter->heap, cs);
+        }
+    }
+
     for (int i = 0; i < iter->heap->num_sources; i++)
     {
         tidesdb_merge_source_t *source = iter->heap->sources[i];
@@ -22194,7 +22947,7 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
                         remaining -= value_size_u64;
                     }
 
-                    /* build prefixed key and insert into unified memtable */
+                    /* we build prefixed key and insert into unified memtable */
                     const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
                     TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack4);
                     if (!prefixed) break;
@@ -22400,7 +23153,7 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     memcpy((*stats)->config, &cf->config, sizeof(tidesdb_column_family_config_t));
 
     /* we count memtable keys */
-    uint64_t memtable_keys = active_mt ? (uint64_t)skip_list_count_entries(active_mt) : 0;
+    const uint64_t memtable_keys = active_mt ? (uint64_t)skip_list_count_entries(active_mt) : 0;
     uint64_t total_keys = memtable_keys;
     uint64_t total_data_size = 0;
     uint64_t total_klog_size = 0;
@@ -22991,8 +23744,8 @@ static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
     FILE *src = tdb_fopen(src_path, "rb");
     if (!src)
     {
-        /* ENOENT   -- file was deleted between readdir/stat and fopen
-         * EACCES   -- on Windows, file may be in NTFS "delete pending" state
+        /* ENOENT      file was deleted between readdir/stat and fopen
+         * EACCES      on Windows, file may be in NTFS "delete pending" state
          *         from concurrent compaction -- treat as transient */
         if (errno == ENOENT || errno == EACCES) return TDB_SUCCESS;
         return TDB_ERR_IO;
@@ -24138,7 +24891,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     if (last_sep)
     {
         char parent_dir[TDB_MAX_PATH_LEN];
-        size_t parent_len = last_sep - ini_file;
+        const size_t parent_len = last_sep - ini_file;
         if (parent_len < TDB_MAX_PATH_LEN)
         {
             memcpy(parent_dir, ini_file, parent_len);

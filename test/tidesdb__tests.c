@@ -24764,6 +24764,131 @@ static void test_unified_snapshot_commit(void)
     cleanup_test_dir();
 }
 
+static void test_perf_cached_iter_seek(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.block_cache_size = 64 * 1024 * 1024;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "perf_seek_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "perf_seek_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_KEYS = 2000;
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[256];
+        snprintf(key, sizeof(key), "perf_seek_%06d", i);
+        memset(value, 'X', sizeof(value));
+        snprintf(value, sizeof(value), "val_%06d_pad_to_fill_block_space_more_data", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+    for (int w = 0; w < 200; w++)
+    {
+        if (!atomic_load(&cf->is_flushing) && queue_size(db->flush_queue) == 0) break;
+        usleep(20000);
+    }
+
+    tidesdb_compact(cf);
+    for (int w = 0; w < 200; w++)
+    {
+        if (!atomic_load(&cf->is_compacting)) break;
+        usleep(20000);
+    }
+
+    int total_ssts = 0;
+    int num_levels = atomic_load(&cf->num_active_levels);
+    for (int l = 0; l < num_levels; l++)
+    {
+        if (cf->levels[l]) total_ssts += atomic_load(&cf->levels[l]->num_sstables);
+    }
+    printf("  seeded %d keys, %d SSTables across %d levels\n", NUM_KEYS, total_ssts, num_levels);
+    ASSERT_TRUE(total_ssts >= 1);
+
+    /* warm the cache*/
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+        ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+        int scanned = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            scanned++;
+            tidesdb_iter_next(iter);
+        }
+        printf("  cache warm scan: %d keys\n", scanned);
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+    }
+
+    const int NUM_SEEKS = 50000;
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    int found = 0;
+    for (int i = 0; i < NUM_SEEKS; i++)
+    {
+        /* cross-block seek pattern: alternates between low and high key ranges
+         * to force block boundary crossings (simulates MariaDB index lookups) */
+        int key_idx =
+            (i & 1) ? ((i * 37) % (NUM_KEYS / 2)) : (NUM_KEYS / 2 + (i * 53) % (NUM_KEYS / 2));
+        char seek_key[64];
+        snprintf(seek_key, sizeof(seek_key), "perf_seek_%06d", key_idx);
+        tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key) + 1);
+        if (tidesdb_iter_valid(iter))
+        {
+            uint8_t *key = NULL;
+            size_t ks = 0;
+            tidesdb_iter_key(iter, &key, &ks);
+            found++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+
+    double elapsed_ms =
+        (t_end.tv_sec - t_start.tv_sec) * 1000.0 + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+    double seeks_per_sec = (double)NUM_SEEKS / (elapsed_ms / 1000.0);
+
+    printf("  %d seeks in %.1f ms (%.0f seeks/sec), %d found\n", NUM_SEEKS, elapsed_ms,
+           seeks_per_sec, found);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    ASSERT_TRUE(found > NUM_SEEKS / 2);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -25101,6 +25226,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_four_cf_single_txn, tests_passed);
     RUN_TEST(test_unified_iter_unflushed, tests_passed);
     RUN_TEST(test_unified_snapshot_commit, tests_passed);
+    RUN_TEST(test_perf_cached_iter_seek, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

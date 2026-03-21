@@ -16528,46 +16528,79 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             tidesdb_immutable_memtable_unref(umt);
         }
 
-        /* search unified immutable memtables (newest first) */
+        /* we search unified immutable memtables (newest first).
+         * we snapshot pointers under a single rwlock acquisition to avoid
+         * per-element locking overhead. */
         if (txn->db->unified_mt.immutables)
         {
             const size_t uimm_count = queue_size(txn->db->unified_mt.immutables);
-            for (size_t qi = uimm_count; qi > 0; qi--)
+            if (uimm_count > 0)
             {
-                tidesdb_memtable_t *imm_mt =
-                    (tidesdb_memtable_t *)queue_peek_at(txn->db->unified_mt.immutables, qi - 1);
-                if (!imm_mt || !imm_mt->skip_list) continue;
-                if (atomic_load_explicit(&imm_mt->flushed, memory_order_acquire)) continue;
-
-                int mr = skip_list_get_with_seq_ref(
-                    imm_mt->skip_list, prefixed_key, pk_size, &temp_val, &temp_val_size, &ttl_u,
-                    &deleted_u, &found_seq_u, snapshot_seq, visibility_check,
-                    visibility_check ? txn->db->commit_status : NULL);
-                if (mr == 0)
+                /* we snapshot immutable pointers under one lock */
+                tidesdb_memtable_t *uimm_stack[16];
+                tidesdb_memtable_t **uimm_ptrs = uimm_stack;
+                if (uimm_count > 16)
                 {
-                    if (deleted_u)
+                    uimm_ptrs = malloc(uimm_count * sizeof(tidesdb_memtable_t *));
+                    if (!uimm_ptrs) uimm_ptrs = uimm_stack;
+                }
+
+                size_t snap_count = 0;
+                queue_t *uq = txn->db->unified_mt.immutables;
+                pthread_rwlock_rdlock(&uq->read_lock);
+                {
+                    queue_node_t *cur = uq->head->next;
+                    size_t max = (uimm_ptrs == uimm_stack) ? 16 : uimm_count;
+                    for (size_t i = 0; i < max && cur != NULL; i++, cur = cur->next)
                     {
-                        unified_rc = TDB_ERR_NOT_FOUND;
-                        goto unified_memtable_done;
+                        uimm_ptrs[i] = (tidesdb_memtable_t *)cur->data;
+                        snap_count++;
                     }
-                    if (ttl_u <= 0 || ttl_u > now_u)
+                }
+                pthread_rwlock_unlock(&uq->read_lock);
+
+                /* we search snapshot lock-free (newest first) */
+                for (size_t qi = snap_count; qi > 0; qi--)
+                {
+                    tidesdb_memtable_t *imm_mt = uimm_ptrs[qi - 1];
+                    if (!imm_mt || !imm_mt->skip_list) continue;
+                    if (atomic_load_explicit(&imm_mt->flushed, memory_order_acquire)) continue;
+
+                    int mr = skip_list_get_with_seq_ref(
+                        imm_mt->skip_list, prefixed_key, pk_size, &temp_val, &temp_val_size, &ttl_u,
+                        &deleted_u, &found_seq_u, snapshot_seq, visibility_check,
+                        visibility_check ? txn->db->commit_status : NULL);
+                    if (mr == 0)
                     {
-                        *value = malloc(temp_val_size);
-                        if (!*value)
+                        if (deleted_u)
                         {
-                            unified_rc = TDB_ERR_MEMORY;
+                            unified_rc = TDB_ERR_NOT_FOUND;
+                            if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
                             goto unified_memtable_done;
                         }
-                        memcpy(*value, temp_val, temp_val_size);
-                        *value_size = temp_val_size;
-                        PROFILE_INC(txn->db, immutable_hits);
-                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
-                        unified_rc = TDB_SUCCESS;
+                        if (ttl_u <= 0 || ttl_u > now_u)
+                        {
+                            *value = malloc(temp_val_size);
+                            if (!*value)
+                            {
+                                unified_rc = TDB_ERR_MEMORY;
+                                if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
+                                goto unified_memtable_done;
+                            }
+                            memcpy(*value, temp_val, temp_val_size);
+                            *value_size = temp_val_size;
+                            PROFILE_INC(txn->db, immutable_hits);
+                            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
+                            unified_rc = TDB_SUCCESS;
+                            if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
+                            goto unified_memtable_done;
+                        }
+                        unified_rc = TDB_ERR_NOT_FOUND;
+                        if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
                         goto unified_memtable_done;
                     }
-                    unified_rc = TDB_ERR_NOT_FOUND;
-                    goto unified_memtable_done;
                 }
+                if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
             }
         }
 

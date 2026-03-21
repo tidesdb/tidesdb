@@ -207,7 +207,7 @@ static int truncate_to_header(block_manager_t *bm)
 {
     if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
 
-    /* ftruncate is not covered by O_DSYNC, always sync truncation */
+    /* ftruncate is not covered by O_DSYNC, we always sync truncation */
     if (is_sync_full(bm))
     {
         fdatasync(bm->fd);
@@ -235,7 +235,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         return -1;
     }
 
-    /* initialize atomic variable to prevent reading uninitialized memory */
+    /* we initialize atomic variable to prevent reading uninitialized memory */
     atomic_init(&new_bm->current_file_size, 0);
 
     new_bm->sync_mode = sync_mode;
@@ -676,7 +676,7 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     if (rc == 0)
     {
         /* heap-allocated cursors are used for sequential iteration
-         * hint to OS for read-ahead optimization */
+         * we hint to OS for read-ahead optimization */
         set_file_sequential_hint(bm->fd);
     }
     return rc;
@@ -743,7 +743,7 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
     const uint32_t block_size = decode_uint32_le_compat(size_buf);
     if (block_size == 0) return -1; /* invalid block */
 
-    /* cache the block size for subsequent cursor_next call */
+    /* we cache the block size for subsequent cursor_next call */
     cursor->current_block_size = block_size;
     cursor->block_size_valid = 1;
 
@@ -770,7 +770,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (BM_UNLIKELY(!bm)) return NULL;
 
-    /* cache fd to avoid repeated struct dereference */
+    /* we cache fd to avoid repeated struct dereference */
     const int fd = bm->fd;
 
     /* we read header (size + checksum) first */
@@ -797,7 +797,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     }
 
-    /* pread data directly into block->data -- no intermediate buffer or memcpy */
+    /* we use pread data directly into block->data -- no intermediate buffer or memcpy */
     const off_t data_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     if (BM_UNLIKELY(pread(fd, block->data, block_size, data_offset) != (ssize_t)block_size))
     {
@@ -820,7 +820,15 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 {
     if (!cursor) return NULL;
 
-    return block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+    block_manager_block_t *block =
+        block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+    if (block)
+    {
+        /* cache block size so cursor_next skips the pread for size header */
+        cursor->current_block_size = block->size;
+        cursor->block_size_valid = 1;
+    }
+    return block;
 }
 
 block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t *cursor,
@@ -848,7 +856,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         if (block_size == 0) return NULL;
     }
 
-    /* if block is smaller than max_bytes, read full block */
+    /* if block is smaller than max_bytes, we read full block */
     if (block_size <= max_bytes)
     {
         return block_manager_read_block_at_offset(bm, offset);
@@ -930,7 +938,7 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     const uint32_t prev_block_size = decode_uint32_le_compat(footer_buf);
     const uint32_t footer_magic = decode_uint32_le_compat(footer_buf + 4);
 
-    /* validate footer magic */
+    /* we validate footer magic */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || prev_block_size == 0)
     {
         return -1;
@@ -1022,10 +1030,10 @@ int block_manager_truncate(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    /* truncate to header-only (preserves valid header, single sync) */
+    /* we truncate to header-only (preserves valid header, single sync) */
     if (truncate_to_header(bm) != 0) return -1;
 
-    /* reopen fd to clear kernel page cache state after truncation */
+    /* we reopen fd to clear kernel page cache state after truncation */
     if (reopen_fd(bm) != 0) return -1;
 
     return 0;
@@ -1089,7 +1097,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
     const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
     if (next_block_pos >= file_size) return 1;
 
-    /*we try to read next block size -- if we can't, we're at last block */
+    /* we try to read next block size -- if we can't, we're at last block */
     unsigned char next_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     const ssize_t read_result =
         pread(cursor->bm->fd, next_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)next_block_pos);
@@ -1138,7 +1146,7 @@ int block_manager_count_blocks(block_manager_t *bm)
 
     (void)block_manager_cursor_init_stack(&cursor, bm);
 
-    /* sequential scan -- hint for read-ahead */
+    /* sequential scan -- we hint for read-ahead */
     set_file_sequential_hint(bm->fd);
 
     while (block_manager_cursor_next(&cursor) == 0)
@@ -1159,7 +1167,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
 
     atomic_store(&bm->current_file_size, file_size);
 
-    /* if file is empty, write header */
+    /* if file is empty, we write header */
     if (file_size == 0)
     {
         if (write_header(bm->fd) != 0)
@@ -1189,7 +1197,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
         return truncate_to_header(bm);
     }
 
-    /* fast O(1) validation, read footer of last block */
+    /* O(1) validation, read footer of last block */
     unsigned char footer_buf[BLOCK_MANAGER_FOOTER_SIZE];
     const off_t footer_offset = (off_t)(file_size - BLOCK_MANAGER_FOOTER_SIZE);
     const ssize_t n = pread(bm->fd, footer_buf, BLOCK_MANAGER_FOOTER_SIZE, footer_offset);
@@ -1266,7 +1274,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
         return 0;
     }
 
-    /* footer magic is valid, verify size matches header */
+    /* the footer magic is valid, we verify size matches header */
     const uint64_t min_required =
         (uint64_t)BLOCK_MANAGER_FOOTER_SIZE + footer_size + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     if (file_size < min_required + BLOCK_MANAGER_HEADER_SIZE)

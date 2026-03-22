@@ -197,7 +197,20 @@ static inline size_t tdb_build_prefixed_key(uint32_t cf_index, const uint8_t *ke
 #define TDB_INITIAL_TXN_READ_SET_CAPACITY  16
 #define TDB_INITIAL_TXN_CF_CAPACITY        4
 #define TDB_INITIAL_TXN_SAVEPOINT_CAPACITY 4
-#define TDB_INITIAL_BLOCK_INDEX_CAPACITY   16
+
+/* stack buffer sizes for hot-path allocations */
+#define TDB_STACK_IMM_SNAPSHOT    16  /* stack slots for unified immutable snapshot */
+#define TDB_STACK_COMMIT_HOOK_OPS 16  /* stack slots for commit hook operations */
+#define TDB_STACK_ITER_SOURCES    16  /* stack slots for iterator temp_sources */
+#define TDB_STACK_PREFIX_KEY      256 /* stack buffer for prefixed key construction */
+
+/* byte sizes for encoding */
+#define TDB_BE32_SIZE          4  /* big-endian uint32 encoding size */
+#define TDB_SHA256_DIGEST_SIZE 32 /* SHA256 raw digest bytes */
+
+/* default column family config values */
+#define TDB_DEFAULT_OBJECT_TARGET_FILE_SIZE (256 * 1024 * 1024)
+#define TDB_INITIAL_BLOCK_INDEX_CAPACITY    16
 
 /* create write set hash table at this many ops */
 #define TDB_TXN_WRITE_HASH_THRESHOLD 64
@@ -1991,7 +2004,10 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD,
         .use_btree = 0,
         .commit_hook_fn = NULL,
-        .commit_hook_ctx = NULL};
+        .commit_hook_ctx = NULL,
+        .object_target_file_size = TDB_DEFAULT_OBJECT_TARGET_FILE_SIZE,
+        .object_lazy_compaction = 0,
+        .object_prefetch_compaction = 1};
 }
 
 tidesdb_config_t tidesdb_default_config(void)
@@ -2010,7 +2026,9 @@ tidesdb_config_t tidesdb_default_config(void)
                               .unified_memtable_skip_list_max_level = 0,
                               .unified_memtable_skip_list_probability = 0,
                               .unified_memtable_sync_mode = 0,
-                              .unified_memtable_sync_interval_us = 0};
+                              .unified_memtable_sync_interval_us = 0,
+                              .object_store = NULL,
+                              .object_store_config = NULL};
 }
 
 /**
@@ -2956,7 +2974,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
     /* arena layout:
      * block_struct | entries[] | keys_ptrs[] | values_ptrs[]
-     * when !zero_copy, also: | key_data | value_data */
+     * when !zero_copy, also-- | key_data | value_data */
     const size_t hdr_size = sizeof(tidesdb_klog_block_t) +
                             (num_entries * sizeof(tidesdb_klog_entry_t)) +
                             (num_entries * sizeof(uint8_t *)) + /* keys array */
@@ -3284,6 +3302,357 @@ static int tidesdb_sstable_get_block_managers(const tidesdb_t *db, tidesdb_sstab
 }
 
 /**
+ * tdb_path_to_object_key
+ * convert a local file path to an object store key by stripping the db_path prefix.
+ * e.g. "/var/lib/tidesdb/mycf/L1_42.klog" -> "mycf/L1_42.klog"
+ * @param db database instance (used to determine db_path prefix)
+ * @param local_path absolute local file path to convert
+ * @param key_out output buffer for the resulting object key
+ * @param key_buf_size size of the key_out buffer
+ */
+static void tdb_path_to_object_key(const tidesdb_t *db, const char *local_path, char *key_out,
+                                   size_t key_buf_size)
+{
+    const char *base = db->db_path;
+    size_t base_len = strlen(base);
+    const char *rel = local_path + base_len;
+    if (*rel == '/' || *rel == '\\') rel++;
+    snprintf(key_out, key_buf_size, "%s", rel);
+}
+
+/**
+ * tdb_upload_job_t
+ * background upload job for the async upload pipeline
+ * @param local_path local file path of the file to upload
+ * @param object_key object store key derived from local_path
+ * @param wal_generation WAL generation to fence after upload (0 = no fence)
+ */
+typedef struct
+{
+    char local_path[TDB_MAX_PATH_LEN];
+    char object_key[TDB_MAX_PATH_LEN];
+    uint64_t wal_generation; /* WAL gen to fence after upload (0 = no fence) */
+} tdb_upload_job_t;
+
+/**
+ * tdb_upload_worker_thread
+ * background thread that dequeues upload jobs and calls connector->put
+ * @param arg pointer to the tidesdb_t instance
+ * @return NULL on thread exit
+ */
+static void *tdb_upload_worker_thread(void *arg)
+{
+    tidesdb_t *db = (tidesdb_t *)arg;
+
+    while (1)
+    {
+        tdb_upload_job_t *job = (tdb_upload_job_t *)queue_dequeue_wait(db->upload_queue);
+        if (!job) break; /* NULL = shutdown signal */
+
+        if (db->object_store && db->object_store->put)
+        {
+            int rc = db->object_store->put(db->object_store->ctx, job->object_key, job->local_path);
+            if (rc == 0)
+            {
+                atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
+
+                /* update WAL fence if this upload advances it */
+                if (job->wal_generation > 0)
+                {
+                    uint64_t cur =
+                        atomic_load_explicit(&db->last_uploaded_gen, memory_order_relaxed);
+                    while (job->wal_generation > cur)
+                    {
+                        if (atomic_compare_exchange_weak_explicit(
+                                &db->last_uploaded_gen, &cur, job->wal_generation,
+                                memory_order_release, memory_order_relaxed))
+                            break;
+                    }
+                }
+            }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Background upload failed: %s", job->object_key);
+            }
+        }
+
+        free(job);
+    }
+
+    return NULL;
+}
+
+/**
+ * tdb_objstore_enqueue_upload
+ * enqueue a file for background upload. non-blocking.
+ * @param db database instance
+ * @param local_path local file path to upload
+ * @param wal_generation WAL generation to fence after upload (0 = no fence)
+ */
+static void tdb_objstore_enqueue_upload(tidesdb_t *db, const char *local_path,
+                                        uint64_t wal_generation)
+{
+    if (!db->object_store || !db->upload_queue || !local_path) return;
+
+    tdb_upload_job_t *job = malloc(sizeof(tdb_upload_job_t));
+    if (!job) return;
+
+    snprintf(job->local_path, sizeof(job->local_path), "%s", local_path);
+    tdb_path_to_object_key(db, local_path, job->object_key, sizeof(job->object_key));
+    job->wal_generation = wal_generation;
+
+    if (queue_enqueue(db->upload_queue, job) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to enqueue upload job: %s", job->object_key);
+        free(job);
+    }
+}
+
+/**
+ * tdb_objstore_upload_file_sync
+ * upload a local file synchronously (blocks until complete).
+ * used for small metadata files (config.ini, MANIFEST) that must be
+ * visible immediately after the call returns.
+ * @param db database instance
+ * @param local_path local file path to upload
+ */
+static void tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path)
+{
+    if (!db->object_store || !local_path) return;
+    char key[TDB_MAX_PATH_LEN];
+    tdb_path_to_object_key(db, local_path, key, sizeof(key));
+    if (db->object_store->put(db->object_store->ctx, key, local_path) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync upload failed: %s", key);
+    }
+}
+
+/**
+ * tdb_objstore_upload_file
+ * upload a local file to the object store.
+ * uses async pipeline for sstable data files, falls back to synchronous.
+ * @param db database instance
+ * @param local_path local file path to upload
+ */
+static void tdb_objstore_upload_file(tidesdb_t *db, const char *local_path)
+{
+    if (!db->object_store || !local_path) return;
+
+    /* use async pipeline if upload queue exists */
+    if (db->upload_queue)
+    {
+        tdb_objstore_enqueue_upload(db, local_path, 0);
+        return;
+    }
+
+    /* fallback to synchronous upload */
+    char key[TDB_MAX_PATH_LEN];
+    tdb_path_to_object_key(db, local_path, key, sizeof(key));
+    if (db->object_store->put(db->object_store->ctx, key, local_path) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store upload failed: %s", key);
+    }
+}
+
+/**
+ * tdb_objstore_delete_file
+ * delete an object from the object store corresponding to a local path.
+ * @param db database instance
+ * @param local_path local file path whose corresponding object should be deleted
+ */
+static void tdb_objstore_delete_file(tidesdb_t *db, const char *local_path)
+{
+    if (!db->object_store || !local_path) return;
+    char key[TDB_MAX_PATH_LEN];
+    tdb_path_to_object_key(db, local_path, key, sizeof(key));
+    db->object_store->delete_object(db->object_store->ctx, key);
+}
+
+/**
+ * tdb_objstore_download_if_missing
+ * download a file from object store if it does not exist locally.
+ * creates intermediate directories as needed.
+ * @param db database instance
+ * @param local_path local file path to check and potentially download
+ * @return 0 if file is available locally (existed or downloaded), -1 on error
+ */
+static int tdb_objstore_download_if_missing(tidesdb_t *db, const char *local_path)
+{
+    if (!db->object_store) return 0;
+
+    struct stat st;
+    if (stat(local_path, &st) == 0)
+    {
+        /* file exists locally */
+        if (db->local_cache) tdb_local_cache_touch(db->local_cache, local_path);
+        return 0;
+    }
+
+    /* create parent directory if needed */
+    char dir_buf[TDB_MAX_PATH_LEN];
+    snprintf(dir_buf, sizeof(dir_buf), "%s", local_path);
+    char *last_sep = strrchr(dir_buf, '/');
+#ifdef _WIN32
+    char *last_bsep = strrchr(dir_buf, '\\');
+    if (last_bsep && (!last_sep || last_bsep > last_sep)) last_sep = last_bsep;
+#endif
+    if (last_sep)
+    {
+        *last_sep = '\0';
+        mkdir(dir_buf, 0755);
+    }
+
+    char key[TDB_MAX_PATH_LEN];
+    tdb_path_to_object_key(db, local_path, key, sizeof(key));
+
+    /* we check if object exists in store before attempting download.
+     * during flush, new sstables are being created locally for the first time
+     * and don't exist in the object store yet -- that's not an error. */
+    if (db->object_store->exists(db->object_store->ctx, key, NULL) != 1)
+    {
+        return 0; /* not in object store -- let block_manager_open create it locally */
+    }
+
+    if (db->object_store->get(db->object_store->ctx, key, local_path) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store download failed: %s", key);
+        return -1;
+    }
+
+    if (db->local_cache) tdb_local_cache_track(db->local_cache, local_path);
+    return 0;
+}
+
+/**
+ * tdb_objstore_upload_manifest
+ * upload the MANIFEST file to object store after a commit.
+ * @param db database instance
+ * @param cf column family whose MANIFEST should be uploaded
+ */
+static void tdb_objstore_upload_manifest(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    if (!db->object_store || !cf || !cf->manifest || cf->manifest->path[0] == '\0') return;
+    /* MANIFEST must be uploaded synchronously -- it's small and readers need
+     * to see the updated inventory immediately for consistency */
+    tdb_objstore_upload_file_sync(db, cf->manifest->path);
+}
+
+/**
+ * tdb_cf_discovery_ctx_t
+ * context for cold-start CF discovery from object store
+ * @param cf_names array of discovered column family names
+ * @param count number of CFs discovered so far
+ */
+typedef struct
+{
+    char cf_names[256][TDB_MAX_CF_NAME_LEN]; /* discovered CF names */
+    int count;
+} tdb_cf_discovery_ctx_t;
+
+/**
+ * tdb_cf_discovery_cb
+ * list callback that extracts CF names from MANIFEST object keys
+ * @param key object key from the list operation
+ * @param size object size in bytes (unused)
+ * @param cb_ctx pointer to tdb_cf_discovery_ctx_t
+ */
+static void tdb_cf_discovery_cb(const char *key, size_t size, void *cb_ctx)
+{
+    (void)size;
+    tdb_cf_discovery_ctx_t *ctx = (tdb_cf_discovery_ctx_t *)cb_ctx;
+
+    /* we look for MANIFEST files-- "cf_name/MANIFEST" */
+    const char *manifest_suffix = "/MANIFEST";
+    size_t key_len = strlen(key);
+    size_t suffix_len = strlen(manifest_suffix);
+
+    if (key_len > suffix_len && strcmp(key + key_len - suffix_len, manifest_suffix) == 0)
+    {
+        if (ctx->count >= 256) return;
+
+        /* extract CF name (everything before "/MANIFEST") */
+        size_t cf_len = key_len - suffix_len;
+        if (cf_len >= TDB_MAX_CF_NAME_LEN) return;
+
+        memcpy(ctx->cf_names[ctx->count], key, cf_len);
+        ctx->cf_names[ctx->count][cf_len] = '\0';
+        ctx->count++;
+    }
+}
+
+/**
+ * tdb_objstore_cold_start_discover
+ * on cold start (no local CF directories), discover CFs from the object store
+ * by listing MANIFEST objects, then download config.ini + MANIFEST for each.
+ * the actual sstable data is not downloaded -- it will be fetched on demand
+ * via tidesdb_sstable_ensure_open when queries arrive.
+ * @param db database instance with object_store configured
+ */
+static void tdb_objstore_cold_start_discover(tidesdb_t *db)
+{
+    if (!db->object_store) return;
+
+    /* we list all objects to find CF names via their MANIFEST files */
+    tdb_cf_discovery_ctx_t discovery = {.count = 0};
+    db->object_store->list(db->object_store->ctx, "", tdb_cf_discovery_cb, &discovery);
+
+    if (discovery.count == 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Object store cold start: no CFs found in remote store");
+        return;
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Object store cold start: discovered %d CFs in remote store",
+                  discovery.count);
+
+    for (int i = 0; i < discovery.count; i++)
+    {
+        const char *cf_name = discovery.cf_names[i];
+
+        /* create local CF directory */
+        char cf_dir[TDB_MAX_PATH_LEN];
+        snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
+        mkdir(cf_dir, 0755);
+
+        /* download config.ini */
+        char config_key[TDB_MAX_PATH_LEN];
+        snprintf(config_key, sizeof(config_key),
+                 "%s/" TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT, cf_name);
+        char config_local[TDB_MAX_PATH_LEN];
+        snprintf(config_local, sizeof(config_local),
+                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                 cf_dir);
+        db->object_store->get(db->object_store->ctx, config_key, config_local);
+
+        /* download MANIFEST */
+        char manifest_key[TDB_MAX_PATH_LEN];
+        snprintf(manifest_key, sizeof(manifest_key), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME,
+                 cf_name);
+        char manifest_local[TDB_MAX_PATH_LEN];
+        snprintf(manifest_local, sizeof(manifest_local),
+                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_dir);
+        db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Object store cold start: downloaded config + MANIFEST for CF '%s'", cf_name);
+    }
+}
+
+/**
+ * tdb_objstore_delete_listed_cb
+ * list callback that deletes each enumerated object during CF drop
+ * @param key object key to delete
+ * @param size object size in bytes (unused)
+ * @param cb_ctx pointer to tidesdb_objstore_t connector
+ */
+static void tdb_objstore_delete_listed_cb(const char *key, size_t size, void *cb_ctx)
+{
+    (void)size;
+    tidesdb_objstore_t *store = (tidesdb_objstore_t *)cb_ctx;
+    store->delete_object(store->ctx, key);
+}
+
+/**
  * tidesdb_sstable_ensure_open
  * ensures an sstable's block managers are open, using the cache
  * @param db database instance
@@ -3299,6 +3668,12 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (sst->klog_bm && sst->vlog_bm)
     {
         return 0; /* already open */
+    }
+
+    if (db->object_store)
+    {
+        if (tdb_objstore_download_if_missing(db, sst->klog_path) != 0) return -1;
+        if (tdb_objstore_download_if_missing(db, sst->vlog_path) != 0) return -1;
     }
 
     /* we track whether the sstable was fully closed (evicted by reaper) so we can
@@ -3559,6 +3934,17 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
      * during compaction */
     if (atomic_load_explicit(&sst->marked_for_deletion, memory_order_acquire))
     {
+        /* we delete from object store before local unlink */
+        if (sst->db && sst->db->object_store)
+        {
+            tdb_objstore_delete_file(sst->db, sst->klog_path);
+            tdb_objstore_delete_file(sst->db, sst->vlog_path);
+        }
+        if (sst->db && sst->db->local_cache)
+        {
+            tdb_local_cache_remove(sst->db->local_cache, sst->klog_path);
+            tdb_local_cache_remove(sst->db->local_cache, sst->vlog_path);
+        }
         tdb_unlink(sst->klog_path);
         tdb_unlink(sst->vlog_path);
     }
@@ -5606,9 +5992,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             search_data = raw_block->data;
             search_data_size = raw_block->size;
 
-            /* cache INDEXED block data -- prepend key offset index so future
-             * cache hits skip the O(N) Phase 1 linear scan in search_raw.
-             * falls back to caching raw data if index build fails. */
             if (db->clock_cache && has_cf_name)
             {
                 uint8_t *indexed_data = NULL;
@@ -6300,6 +6683,20 @@ static void tidesdb_defer_removed_sst_unref(tidesdb_t *db, tidesdb_level_t *leve
  */
 static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *sst)
 {
+    /* we upload sstable files before adding to level.
+     * the files are already written and closed by the caller.
+     * upload happens synchronously */
+    if (sst->db && sst->db->object_store)
+    {
+        tdb_objstore_upload_file(sst->db, sst->klog_path);
+        tdb_objstore_upload_file(sst->db, sst->vlog_path);
+        if (sst->db->local_cache)
+        {
+            tdb_local_cache_track(sst->db->local_cache, sst->klog_path);
+            tdb_local_cache_track(sst->db->local_cache, sst->vlog_path);
+        }
+    }
+
     tidesdb_sstable_ref(sst);
 
     while (1)
@@ -7655,7 +8052,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_lazy(tidesdb_t 
     memset(source->source.sstable.block_stash, 0, sizeof(source->source.sstable.block_stash));
     memset(&source->source.sstable.lazy, 0, sizeof(source->source.sstable.lazy));
     source->source.sstable.current_block = NULL;
-    source->current_kv = NULL; /* lazy: no initial block read */
+    source->current_kv = NULL; /* lazy, no initial block read */
     source->config = sst->config;
 
     if (sst->num_klog_blocks == 0)
@@ -8801,6 +9198,7 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
                               " (error: %d)",
                               sst->id, manifest_result);
             }
+            tdb_objstore_upload_manifest(cf->db, cf);
         }
         else
         {
@@ -11879,6 +12277,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                           "CF '%s' failed to commit manifest for SSTable %" PRIu64 " (error: %d)",
                           cf->name, work->sst_id, manifest_result);
         }
+        tdb_objstore_upload_manifest(db, cf);
 
         /* we check file count in addition to size
          * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to
@@ -12884,6 +13283,16 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     memcpy(&(*db)->config, config, sizeof(tidesdb_config_t));
 
+    /* object store mode requires unified memtable */
+    if ((*db)->config.object_store != NULL && !(*db)->config.unified_memtable)
+    {
+        (*db)->config.unified_memtable = 1;
+    }
+
+    /* store connector reference for runtime access */
+    (*db)->object_store = (*db)->config.object_store;
+    (*db)->local_cache = NULL;
+
     _tidesdb_log_level = config->log_level;
 
     /* we initialize log file to NULL (stderr) by default */
@@ -13262,8 +13671,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     atomic_store_explicit(&(*db)->cached_current_time, tdb_get_current_time(),
                           memory_order_seq_cst);
 
-    /* we initialize unified memtable state */
-    (*db)->unified_mt.enabled = config->unified_memtable;
+    /* we initialize unified memtable state (use (*db)->config which may have been
+     * modified by object store enforcement above, not the original config pointer) */
+    (*db)->unified_mt.enabled = (*db)->config.unified_memtable;
     if ((*db)->unified_mt.enabled)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable mode enabled");
@@ -13667,6 +14077,53 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     else
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread created");
+    }
+
+    /* we initialize local file cache for object store mode */
+    if ((*db)->object_store)
+    {
+        const char *cache_dir = ((*db)->config.object_store_config &&
+                                 (*db)->config.object_store_config->local_cache_path)
+                                    ? (*db)->config.object_store_config->local_cache_path
+                                    : (*db)->db_path;
+        size_t cache_max = (*db)->config.object_store_config
+                               ? (*db)->config.object_store_config->local_cache_max_bytes
+                               : 0;
+
+        (*db)->local_cache = calloc(1, sizeof(tdb_local_cache_t));
+        if ((*db)->local_cache)
+        {
+            tdb_local_cache_init((*db)->local_cache, cache_dir, cache_max);
+        }
+
+        /* we initialize async upload pipeline */
+        int num_upload_threads = (*db)->config.object_store_config
+                                     ? (*db)->config.object_store_config->max_concurrent_uploads
+                                     : 4;
+        if (num_upload_threads <= 0) num_upload_threads = 4;
+
+        (*db)->upload_queue = queue_new();
+        atomic_init(&(*db)->last_uploaded_gen, 0);
+        atomic_init(&(*db)->total_uploads, 0);
+
+        if ((*db)->upload_queue)
+        {
+            (*db)->num_upload_threads = num_upload_threads;
+            (*db)->upload_threads = calloc(num_upload_threads, sizeof(pthread_t));
+            if ((*db)->upload_threads)
+            {
+                for (int i = 0; i < num_upload_threads; i++)
+                {
+                    pthread_create(&(*db)->upload_threads[i], NULL, tdb_upload_worker_thread, *db);
+                }
+            }
+        }
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Object store mode enabled (connector=%s, cache_dir=%s, "
+                      "upload_threads=%d)",
+                      (*db)->object_store->name ? (*db)->object_store->name : "unknown", cache_dir,
+                      num_upload_threads);
     }
 
     atomic_store(&(*db)->is_open, 1);
@@ -14205,6 +14662,44 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Released database directory lock");
     }
 
+    /* shut down upload pipeline before destroying connector */
+    if (db->upload_queue)
+    {
+        /* send NULL poison pills to stop worker threads */
+        for (int i = 0; i < db->num_upload_threads; i++)
+        {
+            queue_enqueue(db->upload_queue, NULL);
+        }
+        /* join all upload threads */
+        if (db->upload_threads)
+        {
+            for (int i = 0; i < db->num_upload_threads; i++)
+            {
+                pthread_join(db->upload_threads[i], NULL);
+            }
+            free(db->upload_threads);
+            db->upload_threads = NULL;
+        }
+        queue_free(db->upload_queue);
+        db->upload_queue = NULL;
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Upload pipeline stopped (%" PRIu64 " total uploads)",
+                      atomic_load(&db->total_uploads));
+    }
+
+    /* we clean up object store resources */
+    if (db->local_cache)
+    {
+        tdb_local_cache_destroy(db->local_cache);
+        free(db->local_cache);
+        db->local_cache = NULL;
+    }
+    if (db->object_store && db->object_store->destroy)
+    {
+        db->object_store->destroy(db->object_store->ctx);
+        db->object_store = NULL;
+    }
+
     TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
 
     /* we close log file if it was opened (protected by log mutex) */
@@ -14707,6 +15202,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         /* non-fatal, continue */
     }
 
+    /* we upload config.ini to object store (sync -- small file, must be visible immediately) */
+    if (db->object_store && save_result == TDB_SUCCESS)
+    {
+        tdb_objstore_upload_file_sync(db, config_path);
+    }
+
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);
 
     /* we start sync thread if this CF needs interval syncing and thread isn't running
@@ -14822,6 +15323,15 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
 
     /* we invalidate all block cache entries for this column family before freeing */
     tidesdb_invalidate_block_cache_for_cf(db, cf_to_drop->name);
+
+    /* we delete all objects for this CF from object store */
+    if (db->object_store)
+    {
+        char prefix[TDB_MAX_PATH_LEN];
+        snprintf(prefix, sizeof(prefix), "%s/", cf_to_drop->name);
+        db->object_store->list(db->object_store->ctx, prefix, tdb_objstore_delete_listed_cb,
+                               db->object_store);
+    }
 
     const int result = remove_directory(cf_to_drop->directory);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Deleted column family directory: %s (result: %d)",
@@ -16537,9 +17047,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             if (uimm_count > 0)
             {
                 /* we snapshot immutable pointers under one lock */
-                tidesdb_memtable_t *uimm_stack[16];
+                tidesdb_memtable_t *uimm_stack[TDB_STACK_IMM_SNAPSHOT];
                 tidesdb_memtable_t **uimm_ptrs = uimm_stack;
-                if (uimm_count > 16)
+                if (uimm_count > TDB_STACK_IMM_SNAPSHOT)
                 {
                     uimm_ptrs = malloc(uimm_count * sizeof(tidesdb_memtable_t *));
                     if (!uimm_ptrs) uimm_ptrs = uimm_stack;
@@ -16550,7 +17060,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 pthread_rwlock_rdlock(&uq->read_lock);
                 {
                     queue_node_t *cur = uq->head->next;
-                    size_t max = (uimm_ptrs == uimm_stack) ? 16 : uimm_count;
+                    size_t max = (uimm_ptrs == uimm_stack) ? TDB_STACK_IMM_SNAPSHOT : uimm_count;
                     for (size_t i = 0; i < max && cur != NULL; i++, cur = cur->next)
                     {
                         uimm_ptrs[i] = (tidesdb_memtable_t *)cur->data;
@@ -18511,6 +19021,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
                         atomic_store(&current_cf->manifest->sequence,
                                      atomic_load(&current_cf->next_sstable_id));
                         tidesdb_manifest_commit(current_cf->manifest, current_cf->manifest->path);
+                        tdb_objstore_upload_manifest(db, current_cf);
 
                         TDB_DEBUG_LOG(TDB_LOG_INFO,
                                       "Unified flush: CF '%s' SSTable %" PRIu64
@@ -18638,6 +19149,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
                 atomic_store(&current_cf->manifest->sequence,
                              atomic_load(&current_cf->next_sstable_id));
                 tidesdb_manifest_commit(current_cf->manifest, current_cf->manifest->path);
+                tdb_objstore_upload_manifest(db, current_cf);
 
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "Unified flush: CF '%s' SSTable %" PRIu64 " written (%d entries)",
@@ -18934,10 +19446,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
             if (hook_op_count == 0) continue;
 
-            tidesdb_commit_op_t stack_hook_ops[16];
+            tidesdb_commit_op_t stack_hook_ops[TDB_STACK_COMMIT_HOOK_OPS];
             tidesdb_commit_op_t *hook_ops =
-                hook_op_count <= 16 ? stack_hook_ops
-                                    : malloc(hook_op_count * sizeof(tidesdb_commit_op_t));
+                hook_op_count <= TDB_STACK_COMMIT_HOOK_OPS
+                    ? stack_hook_ops
+                    : malloc(hook_op_count * sizeof(tidesdb_commit_op_t));
             if (!hook_ops) continue;
 
             int idx = 0;
@@ -21434,7 +21947,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
     }
     else
     {
-        const int new_cap = total_sources > 16 ? total_sources : 16;
+        const int new_cap =
+            total_sources > TDB_STACK_ITER_SOURCES ? total_sources : TDB_STACK_ITER_SOURCES;
         void **new_arr = realloc(iter->temp_sources, new_cap * sizeof(tidesdb_merge_source_t *));
         if (!new_arr) return TDB_ERR_MEMORY;
         iter->temp_sources = new_arr;
@@ -21571,7 +22085,8 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
     }
     else
     {
-        const int new_cap = total_sources > 16 ? total_sources : 16;
+        const int new_cap =
+            total_sources > TDB_STACK_ITER_SOURCES ? total_sources : TDB_STACK_ITER_SOURCES;
         void **new_arr = realloc(iter->temp_sources, new_cap * sizeof(tidesdb_merge_source_t *));
         if (!new_arr) return TDB_ERR_MEMORY;
         iter->temp_sources = new_arr;
@@ -21769,14 +22284,19 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
 {
     if (!iter) return TDB_ERR_INVALID_ARGS;
 
+    /* find the maximum key across all sources, then use seek_for_prev
+     * to position correctly.  seek_for_prev aligns ALL sources at the
+     * target key, ensuring tombstones from every source are visible.
+     * this avoids the bug where seek_to_last's pop loop over-retreats
+     * a tombstone source, causing its tombstones to be missed when
+     * prev() later encounters the corresponding data entries. */
+
+    /* first, find the max key by positioning all sources at their last entries */
     tidesdb_kv_pair_free(iter->current);
     iter->current = NULL;
     iter->valid = 0;
-    iter->direction = -1; /* set to backward */
+    iter->direction = -1;
 
-    /* we position all sources at their last entries.
-     * iterate both heap sources AND cached sources (lazy SST sources
-     * that weren't added to heap because current_kv was NULL). */
     const int total_sources = iter->heap->num_sources;
 
     /* also process cached SST sources not in the heap */
@@ -21989,56 +22509,27 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
         }
     }
 
-    /* we build max-heap (for backward iteration) and find largest key */
+    /* find the max key across all sources from the heap */
     for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
     {
         heap_sift_down_max(iter->heap, i);
     }
 
-    /* we get the largest (last) key, handling tombstones */
-    while (iter->heap->num_sources > 0 && iter->heap->sources[0]->current_kv)
+    /* get the max key from the heap top */
+    if (iter->heap->num_sources == 0 || !iter->heap->sources[0]->current_kv)
     {
-        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop_max(iter->heap);
-        if (!kv) break;
-
-        const int visible = tidesdb_iter_kv_visible(iter, kv);
-        if (visible == -1)
-        {
-            /* tombstone -- we skip all versions of this key */
-            const uint8_t *tombstone_key = kv->key;
-            const size_t tombstone_key_size = kv->entry.key_size;
-
-            /* we pop and discard all entries with the same key */
-            while (!tidesdb_merge_heap_empty(iter->heap))
-            {
-                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
-                if (!peek) break;
-
-                const int cmp =
-                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
-                                           tombstone_key_size, iter->heap->comparator_ctx);
-                if (cmp != 0) break;
-
-                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop_max(iter->heap);
-                tidesdb_kv_pair_free(dup);
-            }
-
-            tidesdb_kv_pair_free(kv);
-            continue;
-        }
-
-        if (visible == 0)
-        {
-            tidesdb_kv_pair_free(kv);
-            continue;
-        }
-
-        iter->current = kv;
-        iter->valid = 1;
-        return TDB_SUCCESS;
+        return TDB_ERR_NOT_FOUND;
     }
 
-    return TDB_ERR_NOT_FOUND;
+    tidesdb_kv_pair_t *max_kv = iter->heap->sources[0]->current_kv;
+    uint8_t *max_key = max_kv->key;
+    size_t max_key_size = max_kv->entry.key_size;
+
+    /* delegate to seek_for_prev which positions ALL sources at max_key
+     * and handles tombstone visibility correctly across all sources.
+     * this avoids the bug where the pop loop over-retreats a tombstone
+     * source, causing its tombstones to be missed during prev(). */
+    return tidesdb_iter_seek_for_prev(iter, max_key, max_key_size);
 }
 
 int tidesdb_iter_next(tidesdb_iter_t *iter)
@@ -22642,6 +23133,7 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering SSTables from directory: %s", cf->directory);
 
+    int local_sst_count = 0;
     DIR *dir = opendir(cf->directory);
     if (!dir) return TDB_ERR_IO;
 
@@ -22651,9 +23143,83 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
         if (strstr(entry->d_name, TDB_SSTABLE_KLOG_EXT) != NULL)
         {
             tidesdb_recover_single_sstable(cf, entry);
+            local_sst_count++;
         }
     }
     closedir(dir);
+
+    /* if no local .klog files were found but the MANIFEST
+     * has sstable entries, reconstruct sstable structs from MANIFEST metadata.
+     * the actual .klog/.vlog files will be downloaded on demand via ensure_open. */
+    if (local_sst_count == 0 && cf->db && cf->db->object_store && cf->manifest)
+    {
+        int manifest_count = cf->manifest->num_entries;
+        if (manifest_count > 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' cold start: reconstructing %d SSTables from MANIFEST", cf->name,
+                          manifest_count);
+
+            for (int i = 0; i < manifest_count; i++)
+            {
+                tidesdb_manifest_entry_t *me = &cf->manifest->entries[i];
+
+                /* we construct sst path from level + id */
+                char sst_base[MAX_FILE_PATH_LENGTH];
+                snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
+                         cf->directory, me->level);
+
+                tidesdb_sstable_t *sst =
+                    tidesdb_sstable_create(cf->db, sst_base, me->id, &cf->config);
+                if (!sst) continue;
+
+                sst->num_entries = me->num_entries;
+                sst->klog_size = me->size_bytes;
+                sst->db = cf->db;
+
+                /* we download and load sst metadata (bloom filter, block index,
+                 * min/max key) from the klog file on object store.
+                 * ensure_open handles the download, sstable_load reads metadata. */
+                if (tidesdb_sstable_ensure_open(cf->db, sst) == 0)
+                {
+                    if (tidesdb_sstable_load(cf->db, sst) == 0)
+                    {
+                        /* we close block managers after loading metadata --
+                         * they'll reopen on demand via ensure_open */
+                        if (sst->klog_bm)
+                        {
+                            block_manager_close(sst->klog_bm);
+                            sst->klog_bm = NULL;
+                        }
+                        if (sst->vlog_bm)
+                        {
+                            block_manager_close(sst->vlog_bm);
+                            sst->vlog_bm = NULL;
+                        }
+                    }
+                }
+
+                /* we ensure level exists */
+                int level_idx = me->level - 1;
+                if (level_idx >= 0 && level_idx < atomic_load(&cf->num_active_levels) &&
+                    cf->levels[level_idx])
+                {
+                    tidesdb_level_add_sstable(cf->levels[level_idx], sst);
+
+                    /* we update next_sstable_id to avoid collisions */
+                    uint64_t cur_next =
+                        atomic_load_explicit(&cf->next_sstable_id, memory_order_relaxed);
+                    if (me->id >= cur_next)
+                    {
+                        atomic_store_explicit(&cf->next_sstable_id, me->id + 1,
+                                              memory_order_relaxed);
+                    }
+                }
+
+                tidesdb_sstable_unref(cf->db, sst);
+            }
+        }
+    }
 
     /* we sort level 0 sstables by ID so newer sstables (higher ID) are at higher
      * array indices -- tidesdb_txn_get searches level 0 in reverse order
@@ -23040,6 +23606,14 @@ static int tidesdb_recover_database(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting database recovery from: %s", db->db_path);
 
+    /*** if local directory is empty or missing but
+     **  object store has data, discover CFs from remote and download their
+     *   config.ini + MANIFEST before scanning locally */
+    if (db->object_store)
+    {
+        tdb_objstore_cold_start_discover(db);
+    }
+
     DIR *dir = opendir(db->db_path);
     if (!dir)
     {
@@ -23370,6 +23944,24 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
             atomic_load_explicit(&db->unified_mt.next_cf_index, memory_order_relaxed);
         stats->unified_wal_generation =
             atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
+    }
+
+    /* object store stats */
+    stats->object_store_enabled = (db->object_store != NULL);
+    if (db->object_store)
+    {
+        stats->object_store_connector = db->object_store->name;
+        stats->last_uploaded_generation =
+            atomic_load_explicit(&db->last_uploaded_gen, memory_order_relaxed);
+        stats->total_uploads = atomic_load_explicit(&db->total_uploads, memory_order_relaxed);
+        if (db->upload_queue) stats->upload_queue_depth = queue_size(db->upload_queue);
+        if (db->local_cache)
+        {
+            stats->local_cache_bytes_used =
+                atomic_load_explicit(&db->local_cache->current_bytes, memory_order_relaxed);
+            stats->local_cache_bytes_max = db->local_cache->max_bytes;
+            stats->local_cache_num_files = db->local_cache->num_entries;
+        }
     }
 
     return TDB_SUCCESS;

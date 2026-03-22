@@ -28,7 +28,9 @@
 #include "compat.h"
 #include "compress.h"
 #include "ini.h"
+#include "local_cache.h"
 #include "manifest.h"
+#include "objstore.h"
 #include "queue.h"
 #include "skip_list.h"
 
@@ -324,6 +326,10 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param use_btree use btree for klog, faster reads depending on workload
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
+ * @param object_target_file_size target file size for object store compaction (bytes, 0=auto)
+ * @param object_lazy_compaction lazy compaction flag (1 = less aggressive, 0 = aggressive)
+ * @param object_prefetch_compaction prefetch compaction flag (1 = download all inputs before merge,
+ * 0 = stream)
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -354,6 +360,9 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
+    size_t object_target_file_size;
+    int object_lazy_compaction;
+    int object_prefetch_compaction;
 } tidesdb_column_family_config_t;
 
 /**
@@ -392,6 +401,8 @@ typedef struct tidesdb_comparator_entry_t
  * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
  * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
+ * @param object_store object store instance (NULL = local only, default)
+ * @param object_store_config object store configuration (NULL = use defaults)
  */
 typedef struct tidesdb_config_t
 {
@@ -410,6 +421,8 @@ typedef struct tidesdb_config_t
     float unified_memtable_skip_list_probability;
     int unified_memtable_sync_mode;
     uint64_t unified_memtable_sync_interval_us;
+    tidesdb_objstore_t *object_store;
+    tidesdb_objstore_config_t *object_store_config;
 } tidesdb_config_t;
 
 /**
@@ -644,6 +657,13 @@ struct tidesdb_level_t
  * @param lock_fd file descriptor for lock file
  * @param log_file file descriptor for log file
  * @param read_stats read profiling statistics (only when TDB_ENABLE_READ_PROFILING is defined)
+ * @param object_store active object store connector (NULL = local only)
+ * @param local_cache local file cache manager for object store mode
+ * @param upload_threads background upload thread pool for async sstable uploads
+ * @param num_upload_threads number of upload threads
+ * @param upload_queue queue of upload jobs (tdb_upload_job_t)
+ * @param last_uploaded_gen highest WAL generation confirmed uploaded to object store
+ * @param total_uploads lifetime count of objects uploaded to object store
  */
 struct tidesdb_t
 {
@@ -712,6 +732,15 @@ struct tidesdb_t
         _Atomic(uint32_t) next_cf_index;
         _Atomic(uint64_t) wal_generation;
     } unified_mt;
+
+    /* object store mode runtime state */
+    tidesdb_objstore_t *object_store;    /* active connector (NULL = local only) */
+    tdb_local_cache_t *local_cache;      /* local file cache manager */
+    pthread_t *upload_threads;           /* background upload thread pool */
+    int num_upload_threads;              /* number of upload threads */
+    queue_t *upload_queue;               /* queue of tdb_upload_job_t */
+    _Atomic(uint64_t) last_uploaded_gen; /* highest WAL gen confirmed uploaded */
+    _Atomic(uint64_t) total_uploads;     /* lifetime upload count */
 };
 
 /**
@@ -930,6 +959,14 @@ typedef struct tidesdb_cache_stats_t
  * @param unified_is_flushing whether unified memtable is currently flushing/rotating
  * @param unified_next_cf_index next CF index to be assigned in unified mode
  * @param unified_wal_generation current unified WAL generation counter
+ * @param object_store_enabled whether object store mode is active
+ * @param object_store_connector connector name ("s3", "gcs", "fs", etc.)
+ * @param local_cache_bytes_used current local file cache usage in bytes
+ * @param local_cache_bytes_max configured maximum local cache size in bytes
+ * @param local_cache_num_files number of files tracked in local cache
+ * @param last_uploaded_generation highest WAL generation confirmed uploaded
+ * @param upload_queue_depth number of pending upload jobs in the queue
+ * @param total_uploads lifetime count of objects uploaded to object store
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -954,6 +991,14 @@ typedef struct tidesdb_db_stats_t
     int unified_is_flushing;
     uint32_t unified_next_cf_index;
     uint64_t unified_wal_generation;
+    int object_store_enabled;
+    const char *object_store_connector;
+    size_t local_cache_bytes_used;
+    size_t local_cache_bytes_max;
+    int local_cache_num_files;
+    uint64_t last_uploaded_generation;
+    size_t upload_queue_depth;
+    uint64_t total_uploads;
 } tidesdb_db_stats_t;
 
 /**
@@ -1522,15 +1567,15 @@ int tidesdb_backup(tidesdb_t *db, char *dir);
 
 /**
  * tidesdb_checkpoint
- * creates a lightweight checkpoint of the database using hard links for SSTable files.
- * this is much faster than a full backup since SSTable files (which are immutable) are
+ * creates a lightweight checkpoint of the database using hard links for sstable files.
+ * this is much faster than a full backup since sstable files (which are immutable) are
  * hard-linked rather than copied. only small metadata files (manifest, config) are copied.
  *
  * the checkpoint is a fully openable tidesdb database directory.
  *
  * algorithm:
  *   1. for each column family -- we flush memtable, halt compactions
- *   2. hard link all live SSTable files into the checkpoint directory
+ *   2. hard link all live sstable files into the checkpoint directory
  *   3. copy manifest and config files
  *   4. resume compactions
  *

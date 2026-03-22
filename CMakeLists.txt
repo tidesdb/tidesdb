@@ -14,7 +14,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 8.9.4)
+set(PROJECT_VERSION 9.0.0)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -25,6 +25,7 @@ configure_file(
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
+option(TIDESDB_WITH_S3 "build S3-compatible object store connector (requires libcurl + openssl)" OFF)
 # BUILD_SHARED_LIBS controls static vs shared library
 # Default to STATIC on Windows (avoids DLL export/import complexity), SHARED elsewhere
 # Windows users can override with -DBUILD_SHARED_LIBS=ON if needed, but may require
@@ -95,7 +96,16 @@ include_directories(external) # for external libraries linking internally
 # create library (respects BUILD_SHARED_LIBS option)
 # note: on Windows, STATIC is recommended to avoid DLL export/import complexity
 # users can override with -DBUILD_SHARED_LIBS=ON/OFF
-add_library(tidesdb src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c src/btree.c src/alloc.c external/xxhash.c external/ini.c)
+set(TIDESDB_SOURCES
+    src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c
+    src/manifest.c src/clock_cache.c src/queue.c src/buffer.c src/btree.c src/alloc.c
+    src/objstore_fs.c src/local_cache.c external/xxhash.c external/ini.c)
+
+if(TIDESDB_WITH_S3)
+    list(APPEND TIDESDB_SOURCES src/objstore_s3.c)
+endif()
+
+add_library(tidesdb ${TIDESDB_SOURCES})
 
 target_include_directories(tidesdb PRIVATE src)
 
@@ -200,6 +210,14 @@ if(APPLE)
     if(TIDESDB_WITH_JEMALLOC)
         target_link_libraries(tidesdb PUBLIC ${JEMALLOC_LIBRARIES})
         target_include_directories(tidesdb PUBLIC ${JEMALLOC_INCLUDE_DIRS})
+    endif()
+
+    if(TIDESDB_WITH_S3)
+        find_package(CURL REQUIRED)
+        find_package(OpenSSL REQUIRED)
+        target_compile_definitions(tidesdb PRIVATE TIDESDB_WITH_S3)
+        target_link_libraries(tidesdb PUBLIC CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
+        message(STATUS "Building with S3-compatible object store connector")
     endif()
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads

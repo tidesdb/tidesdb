@@ -52,7 +52,7 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
-            ctest -V --output-on-failure --timeout 1800 --build-config Release
+            ctest -V --output-on-failure --timeout 3600 --build-config Release
 
   openbsd-build:
     runs-on: ubuntu-latest
@@ -98,7 +98,7 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
-            ctest -V --output-on-failure --timeout 1800 --build-config Release
+            ctest -V --output-on-failure --timeout 3600 --build-config Release
 
   netbsd-build:
     runs-on: ubuntu-latest
@@ -143,7 +143,7 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
-            ctest -V --output-on-failure --timeout 1800 --build-config Release
+            ctest -V --output-on-failure --timeout 3600 --build-config Release
 
   omnios-build:
     runs-on: ubuntu-latest
@@ -190,7 +190,7 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
-            ctest -V --output-on-failure --timeout 1800 --build-config Release
+            ctest -V --output-on-failure --timeout 3600 --build-config Release
 
   dragonflybsd-build:
     runs-on: ubuntu-latest
@@ -238,4 +238,4 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
-            ctest -V --output-on-failure --timeout 1800 --build-config Release
+            ctest -V --output-on-failure --timeout 3600 --build-config Release

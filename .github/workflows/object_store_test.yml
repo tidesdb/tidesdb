@@ -24,12 +24,8 @@ jobs:
           --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
-          --entrypoint ""
-        # minio server runs via command override
-        # using /data as storage path
-        volumes:
-          - /tmp/minio-data:/data
+          --health-retries 10
+          --health-start-period 10s
 
     steps:
       - uses: actions/checkout@v4
@@ -40,16 +36,8 @@ jobs:
           sudo apt-get install -y cmake build-essential liblz4-dev libzstd-dev libsnappy-dev \
             libcurl4-openssl-dev libssl-dev
 
-      - name: Start MinIO server
-        run: |
-          # the service container runs minio but we need to start it with the server command
-          docker exec $(docker ps -q --filter ancestor=minio/minio:latest) \
-            minio server /data &
-          sleep 3
-
       - name: Create test bucket
         run: |
-          # install mc (minio client)
           curl -sL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
           chmod +x /tmp/mc
           /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
@@ -82,6 +70,4 @@ jobs:
           TIDESDB_S3_SECRET_KEY: minioadmin
         run: |
           cd build
-          # S3 integration tests use environment variables to connect to MinIO
-          # these tests are conditional on TIDESDB_S3_ENDPOINT being set
-          ./tidesdb_tests test_objstore_s3 || echo "S3 tests not avail"
+          ./tidesdb_tests test_objstore_s3 || echo "S3 integration tests not yet implemented"

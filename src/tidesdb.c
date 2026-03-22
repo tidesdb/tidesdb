@@ -14816,11 +14816,15 @@ int tidesdb_close(tidesdb_t *db)
     /* shut down upload pipeline before destroying connector */
     if (db->upload_queue)
     {
-        /* send NULL poison pills to stop worker threads */
+        /* send NULL poison pills to stop worker threads, then signal all waiters.
+         * queue_enqueue only signals when the queue transitions from empty to non-empty,
+         * so rapid enqueue of multiple NULLs may only wake one waiter. the shutdown
+         * broadcast ensures all blocked workers wake up immediately. */
         for (int i = 0; i < db->num_upload_threads; i++)
         {
             queue_enqueue(db->upload_queue, NULL);
         }
+        queue_shutdown(db->upload_queue);
         /* join all upload threads */
         if (db->upload_threads)
         {

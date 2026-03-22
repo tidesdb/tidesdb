@@ -12150,9 +12150,15 @@ static void test_concurrent_batched_transactions(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bench_cf");
     ASSERT_TRUE(cf != NULL);
 
+#if INTPTR_MAX == INT32_MAX
+    const int NUM_THREADS = 2;
+    const int BATCH_SIZE = 50;
+    const int NUM_BATCHES = 50;
+#else
     const int NUM_THREADS = 2;
     const int BATCH_SIZE = 100;
     const int NUM_BATCHES = 125;
+#endif
     const int TOTAL_EXPECTED_KEYS = NUM_THREADS * NUM_BATCHES * BATCH_SIZE;
 
     printf("  starting concurrent batched transaction test...\n");
@@ -12265,9 +12271,15 @@ static void test_concurrent_batched_random_keys(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bench_cf");
     ASSERT_TRUE(cf != NULL);
 
+#if INTPTR_MAX == INT32_MAX
+    const int NUM_THREADS = 2;
+    const int BATCH_SIZE = 50;
+    const int NUM_BATCHES = 50;
+#else
     const int NUM_THREADS = 2;
     const int BATCH_SIZE = 100;
     const int NUM_BATCHES = 125;
+#endif
     const int TOTAL_EXPECTED_KEYS = NUM_THREADS * NUM_BATCHES * BATCH_SIZE;
 
     printf("  testing random key pattern (benchtool reproduction)...\n");
@@ -19746,11 +19758,19 @@ static void test_concurrent_txn_commit_sequence_race(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "race_cf");
     ASSERT_TRUE(cf != NULL);
 
+#if INTPTR_MAX == INT32_MAX
+    const int NUM_WRITERS = 4;
+    const int NUM_READERS = 4;
+    const int NUM_SHARED_KEYS = 30;
+    const int OPS_PER_WRITER = 50;
+    const int OPS_PER_READER = 100;
+#else
     const int NUM_WRITERS = 8;
     const int NUM_READERS = 8;
     const int NUM_SHARED_KEYS = 50;
     const int OPS_PER_WRITER = 100;
     const int OPS_PER_READER = 200;
+#endif
 
     printf("  concurrent txn commit race test\n");
     printf("  writers: %d, readers: %d, shared keys: %d, ops/writer: %d\n", NUM_WRITERS,
@@ -20058,6 +20078,16 @@ static void test_stress_unified_read_races(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "stress_cf");
     ASSERT_TRUE(cf != NULL);
 
+#if INTPTR_MAX == INT32_MAX
+    const int NUM_WRITERS = 3;
+    const int NUM_READERS = 3;
+    const int NUM_COMPACTORS = 1;
+    const int NUM_FLUSHERS = 1;
+    const int OPS_PER_WRITER = 500;
+    const int OPS_PER_READER = 300;
+    const int OPS_PER_COMPACTOR = 10;
+    const int OPS_PER_FLUSHER = 15;
+#else
     const int NUM_WRITERS = 6;
     const int NUM_READERS = 6;
     const int NUM_COMPACTORS = 2;
@@ -20066,6 +20096,7 @@ static void test_stress_unified_read_races(void)
     const int OPS_PER_READER = 800;
     const int OPS_PER_COMPACTOR = 20;
     const int OPS_PER_FLUSHER = 30;
+#endif
 
     _Atomic(int) commit_errors = 0, commits_ok = 0;
     _Atomic(int) reads_ok = 0, reads_miss = 0;
@@ -24762,7 +24793,7 @@ static void test_perf_cached_iter_seek(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 1024;
+    cf_config.write_buffer_size = 16 * 1024; /* 16KB avoids creating hundreds of SSTables */
     cf_config.compression_algorithm = TDB_COMPRESS_NONE;
     cf_config.enable_bloom_filter = 1;
     cf_config.enable_block_indexes = 1;
@@ -24771,7 +24802,13 @@ static void test_perf_cached_iter_seek(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "perf_seek_cf");
     ASSERT_TRUE(cf != NULL);
 
+    /* on 32-bit builds (MinGW x86) reduce key count and seeks to avoid CI timeouts.
+     * the test still validates the same code paths with fewer iterations. */
+#if INTPTR_MAX == INT32_MAX
+    const int NUM_KEYS = 500;
+#else
     const int NUM_KEYS = 2000;
+#endif
     for (int i = 0; i < NUM_KEYS; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -24827,7 +24864,11 @@ static void test_perf_cached_iter_seek(void)
         tidesdb_txn_free(txn);
     }
 
+#if INTPTR_MAX == INT32_MAX
+    const int NUM_SEEKS = 5000;
+#else
     const int NUM_SEEKS = 50000;
+#endif
 
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);

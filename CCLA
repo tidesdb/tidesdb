@@ -1,0 +1,231 @@
+TidesDB Corporation — Corporate Contributor License Agreement (CCLA)
+=====================================================================
+
+This Corporate Contributor License Agreement ("Agreement") clarifies the
+intellectual property license granted with contributions from a corporation or
+other legal entity ("You") to projects owned and managed by TidesDB Corporation
+("We", "Us", or "the Company"), a corporation incorporated under the laws of
+Ontario, Canada.
+
+This Agreement covers contributions to the TidesDB project and the TideSQL
+project (collectively, the "Projects").
+
+Please read this Agreement carefully. By signing this Agreement, You agree to
+be bound by the terms below on behalf of the entity You represent.
+
+
+1. Definitions
+--------------
+
+"Contribution" means any original work of authorship, including any modification
+or addition to an existing work, that is intentionally submitted by You or any
+of Your Designated Employees to a Project for inclusion in, or documentation of,
+that Project.
+
+"Submit" means any form of electronic, verbal, or written communication sent to
+a Project or its representatives, including but not limited to source code,
+documentation, issues, pull requests, and communications on mailing lists,
+forums, or chat channels operated by the Project. A communication is not a
+Contribution if it is conspicuously marked or otherwise designated in writing as
+"Not a Contribution."
+
+"Designated Employee" means any employee, contractor, or agent of Your entity
+whom You authorize to make Contributions on Your behalf. You are responsible for
+maintaining a current list of Designated Employees, which You may update by
+written notice to the Company.
+
+
+2. Grant of Copyright License
+-----------------------------
+
+You hereby grant to the Company, and to recipients of software distributed by
+the Company, a perpetual, worldwide, non-exclusive, no-charge, royalty-free,
+irrevocable copyright license to reproduce, prepare derivative works of,
+publicly display, publicly perform, sublicense, relicense, and distribute
+Contributions made by You and Your Designated Employees and such derivative
+works, in source code and object code form, under any license terms the Company
+chooses, including but not limited to the applicable Project's current
+open-source license or any proprietary, commercial, or other open-source
+license.
+
+
+3. Grant of Patent License
+--------------------------
+
+You hereby grant to the Company, and to recipients of software distributed by
+the Company, a perpetual, worldwide, non-exclusive, no-charge, royalty-free,
+irrevocable (except as stated in this section) patent license to make, have
+made, use, offer to sell, sell, import, and otherwise transfer any Contribution,
+where such license applies only to those patent claims licensable by You that
+are necessarily infringed by the Contribution alone or by combination of the
+Contribution with the Project to which such Contribution was submitted.
+
+If You or Your agent or exclusive licensee institute patent litigation against
+any entity (including a cross-claim or counterclaim in a lawsuit) alleging that
+a Project or a Contribution incorporated in a Project constitutes direct or
+contributory patent infringement, then any patent licenses granted to You under
+this Agreement for that Contribution or Project shall terminate as of the date
+such litigation is filed.
+
+
+4. Outbound License and Dual Licensing
+---------------------------------------
+
+You acknowledge and agree that the Company may distribute the Projects and
+Contributions under any license or combination of licenses that the Company
+selects, including but not limited to:
+
+  (a) The current open-source license for TidesDB (Mozilla Public License
+      v2.0);
+  (b) The current open-source license for TideSQL (GNU General Public License,
+      version 2);
+  (c) Any future open-source license the Company may adopt for either Project;
+  (d) A proprietary or commercial license offered by the Company.
+
+This dual-licensing or multi-licensing right is a core purpose of this
+Agreement. You understand that the Company may simultaneously offer the Projects
+under open-source and commercial terms, and that Contributions may be included
+in both open-source and commercial distributions.
+
+This Agreement does not alter or reduce Your rights or the rights of Your
+Designated Employees to use Contributions for any purpose.
+
+
+5. Ownership
+------------
+
+You retain ownership of the copyright in Contributions made by You and Your
+Designated Employees. This Agreement does not require You to assign copyright to
+the Company. Nothing in this Agreement shall be construed as transferring
+ownership of Contributions to the Company. The rights granted herein are
+licenses, not assignments.
+
+
+6. Moral Rights
+---------------
+
+To the fullest extent permitted by applicable law, You agree to cause Your
+Designated Employees to irrevocably waive and agree not to assert any and all
+moral rights they may have in their Contributions, including but not limited to
+the right of integrity, the right of attribution, and the right to restrain
+modification, as recognized under the Copyright Act (Canada) or any similar
+laws in any jurisdiction. Where moral rights cannot be waived under applicable
+law, You agree to ensure that such rights are not exercised in a manner that
+would interfere with the Company's exercise of the rights granted in this
+Agreement.
+
+
+7. Representations and Warranties
+----------------------------------
+
+You represent and warrant that:
+
+  (a) You are a legal entity duly organized and in good standing under the laws
+      of Your jurisdiction of incorporation or formation.
+
+  (b) The person signing this Agreement is authorized to do so on behalf of
+      Your entity.
+
+  (c) You have the authority to bind Your entity and Your Designated Employees
+      to the terms of this Agreement.
+
+  (d) Each Contribution made by You or Your Designated Employees is an original
+      creation or You have sufficient rights to submit it under the terms of
+      this Agreement.
+
+  (e) You have taken all necessary steps to ensure that any intellectual
+      property rights that Your entity may hold in Contributions made by Your
+      Designated Employees (including rights arising under employment
+      agreements, invention assignment agreements, or similar policies) are
+      properly licensed under this Agreement.
+
+  (f) You are not aware of any pending or threatened claims, liens, or
+      encumbrances related to any Contributions that would limit or conflict
+      with the licenses granted in this Agreement.
+
+  (g) If a Contribution incorporates any work of a third party, the Designated
+      Employee will identify the complete details of the third-party work,
+      including its license, in the description accompanying the Contribution.
+
+
+8. Designated Employees
+-----------------------
+
+You will maintain a list of Designated Employees authorized to make
+Contributions on Your behalf. You may update this list at any time by written
+notice to the Company. Only individuals identified as Designated Employees are
+covered by this Corporate CLA. Contributions by individuals not on the list are
+not covered by this Agreement and must be submitted under an Individual CLA.
+
+Initial Designated Employees:
+
+  Name                    GitHub Username         Email
+  ______________________  ______________________  ______________________
+  ______________________  ______________________  ______________________
+  ______________________  ______________________  ______________________
+  ______________________  ______________________  ______________________
+
+
+9. No Support Obligation
+------------------------
+
+Neither You nor Your Designated Employees are expected to provide support for
+Contributions unless separately agreed. Except as set forth herein, Contributions
+are provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied.
+
+
+10. Governing Law and Dispute Resolution
+-----------------------------------------
+
+This Agreement is governed by and construed in accordance with the laws of the
+Province of Ontario and the federal laws of Canada applicable therein, without
+regard to conflict-of-law provisions. Any dispute arising under or in connection
+with this Agreement shall be subject to the exclusive jurisdiction of the courts
+of the Province of Ontario, Canada.
+
+
+11. Entire Agreement and Amendments
+------------------------------------
+
+This Agreement constitutes the entire agreement between You and the Company
+regarding Contributions by You and Your Designated Employees to the Projects
+and supersedes all prior negotiations, representations, or agreements relating
+to the subject matter hereof. The Company may update this Agreement from time to
+time. Any updated terms will apply only to Contributions submitted after the
+updated Agreement is published. Contributions submitted under a prior version of
+this Agreement remain governed by that prior version.
+
+
+12. Term and Termination
+------------------------
+
+This Agreement is effective upon execution and continues until terminated. Either
+party may terminate this Agreement by giving thirty (30) days written notice to
+the other party. Termination does not affect the licenses granted for
+Contributions made prior to termination, which survive in perpetuity.
+
+
+13. Acceptance
+--------------
+
+This Agreement is effective when signed by an authorized representative of Your
+entity.
+
+
+Entity name:              ____________________________________
+
+Address:                  ____________________________________
+
+                          ____________________________________
+
+Authorized representative
+  name:                   ____________________________________
+
+Title:                    ____________________________________
+
+Email:                    ____________________________________
+
+Date:                     ____________________________________
+
+Signature:                ____________________________________

@@ -14694,9 +14694,13 @@ int tidesdb_close(tidesdb_t *db)
         free(db->local_cache);
         db->local_cache = NULL;
     }
-    if (db->object_store && db->object_store->destroy)
+    if (db->object_store)
     {
-        db->object_store->destroy(db->object_store->ctx);
+        if (db->object_store->destroy)
+        {
+            db->object_store->destroy(db->object_store->ctx);
+        }
+        free(db->object_store);
         db->object_store = NULL;
     }
 

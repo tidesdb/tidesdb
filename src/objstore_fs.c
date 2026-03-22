@@ -292,7 +292,18 @@ static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t ro
         {
             const char *relative = full + root_len;
             if (*relative == '/' || *relative == '\\') relative++;
-            cb(relative, (size_t)fd.size, cb_ctx);
+
+            /* normalize backslashes to forward slashes so object keys are
+             * platform-independent (e.g. "cf_name/MANIFEST" not "cf_name\MANIFEST") */
+            char normalized[TDB_FS_MAX_PATH];
+            strncpy(normalized, relative, sizeof(normalized) - 1);
+            normalized[sizeof(normalized) - 1] = '\0';
+            for (char *p = normalized; *p; p++)
+            {
+                if (*p == '\\') *p = '/';
+            }
+
+            cb(normalized, (size_t)fd.size, cb_ctx);
             count++;
         }
     } while (_findnext(handle, &fd) == 0);

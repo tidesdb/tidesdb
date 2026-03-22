@@ -506,13 +506,8 @@ static ssize_t s3_range_get(void *ctx, const char *key, uint64_t offset, void *b
     char empty_sha[TDB_S3_HASH_HEX_LEN];
     sha256_hex("", 0, empty_sha);
 
-    /* add Range header to canonical and signed headers */
-    char range_canonical[128];
-    snprintf(range_canonical, sizeof(range_canonical), "range:bytes=%" PRIu64 "-%" PRIu64 "\n",
-             offset, offset + size - 1);
-
-    struct curl_slist *headers =
-        s3_sign_request(s3, "GET", key, empty_sha, range_canonical, ";range");
+    /* sign without Range header -- S3/MinIO does not require Range to be signed */
+    struct curl_slist *headers = s3_sign_request(s3, "GET", key, empty_sha, NULL, NULL);
 
     char range_hdr[128];
     snprintf(range_hdr, sizeof(range_hdr), "Range: bytes=%" PRIu64 "-%" PRIu64, offset,

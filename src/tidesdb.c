@@ -23355,7 +23355,16 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
                  * the block managers it opened since sstable_load opens its own.
                  * without this close, load overwrites sst->klog_bm/vlog_bm with its
                  * own local BMs, leaking the ensure_open allocations. */
-                if (tidesdb_sstable_ensure_open(cf->db, sst) == 0)
+                if (tidesdb_sstable_ensure_open(cf->db, sst) != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "CF '%s' cold start: SSTable %d (L%d) not available in "
+                                  "object store, skipping (partial upload?)",
+                                  cf->name, (int)me->id, me->level);
+                    tidesdb_sstable_unref(cf->db, sst);
+                    continue;
+                }
+
                 {
                     /* close BMs from ensure_open before load opens its own */
                     if (sst->klog_bm)

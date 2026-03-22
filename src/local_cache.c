@@ -21,21 +21,17 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "xxhash.h"
+
 /**
  * cache_hash
- * FNV-1a hash of a file path, masked to fit the bucket array
+ * XXH32 hash of a file path for bucket lookup
  * @param path file path to hash
  * @return hash value
  */
 static uint32_t cache_hash(const char *path)
 {
-    uint32_t h = 2166136261u;
-    for (const char *p = path; *p; p++)
-    {
-        h ^= (uint8_t)*p;
-        h *= 16777619u;
-    }
-    return h;
+    return XXH32(path, strlen(path), 0);
 }
 
 /**

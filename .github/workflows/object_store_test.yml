@@ -12,29 +12,21 @@ jobs:
     runs-on: ubuntu-latest
     name: Object Store Integration Tests
 
-    services:
-      minio:
-        image: minio/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 10s
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Start MinIO
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential liblz4-dev libzstd-dev libsnappy-dev \
-            libcurl4-openssl-dev libssl-dev
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            echo "waiting for minio ($i)..."
+            sleep 2
+          done
 
       - name: Create test bucket
         run: |
@@ -42,6 +34,12 @@ jobs:
           chmod +x /tmp/mc
           /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
           /tmp/mc mb local/tidesdb-test || true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential liblz4-dev libzstd-dev libsnappy-dev \
+            libcurl4-openssl-dev libssl-dev
 
       - name: Build TidesDB with S3 connector
         run: |
@@ -71,3 +69,7 @@ jobs:
         run: |
           cd build
           ./tidesdb_tests test_objstore_s3 || echo "S3 integration tests not yet implemented"
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true

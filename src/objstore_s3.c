@@ -64,6 +64,35 @@
 #define TDB_S3_DEFAULT_REGION "us-east-1"
 
 /**
+ * s3_uri_encode
+ * URI-encode a string per the SigV4 spec. encodes all bytes except unreserved
+ * characters (A-Z, a-z, 0-9, '-', '.', '_', '~'). forward slashes are encoded
+ * as %2F since this is used for query parameter values, not object key paths.
+ * @param src input string
+ * @param dst output buffer
+ * @param dst_size size of output buffer
+ */
+static void s3_uri_encode(const char *src, char *dst, size_t dst_size)
+{
+    static const char *unreserved =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    size_t pos = 0;
+    for (; *src && pos + 3 < dst_size; src++)
+    {
+        if (strchr(unreserved, *src))
+        {
+            dst[pos++] = *src;
+        }
+        else
+        {
+            snprintf(dst + pos, dst_size - pos, "%%%02X", (unsigned char)*src);
+            pos += 3;
+        }
+    }
+    dst[pos] = '\0';
+}
+
+/**
  * s3_ctx_t
  * internal context for the S3 connector, holding credentials and endpoint config
  * @param endpoint S3 endpoint hostname
@@ -735,18 +764,26 @@ static int s3_list(void *ctx, const char *prefix,
 
         /* ListObjectsV2: prefix goes in query string, not in the URL path.
          * the canonical URI is just /<bucket> (path-style) or / (virtual-hosted).
-         * the canonical query string must include all query parameters sorted alphabetically. */
+         * the canonical query string must include all query parameters sorted
+         * alphabetically with URI-encoded values per the SigV4 spec. */
         char url[TDB_S3_MAX_PATH * 2];
         const char *scheme = s3->use_ssl ? "https" : "http";
 
+        /* URI-encode prefix and continuation token for query string */
+        char encoded_prefix[TDB_S3_MAX_PATH * 3];
+        s3_uri_encode(full_prefix, encoded_prefix, sizeof(encoded_prefix));
+
+        char encoded_token[TDB_S3_CONT_TOKEN_MAX * 3];
+        if (continuation_token[0])
+            s3_uri_encode(continuation_token, encoded_token, sizeof(encoded_token));
+
         /* build canonical query string (params sorted alphabetically) */
-        char canonical_qs[TDB_S3_MAX_PATH * 2];
+        char canonical_qs[TDB_S3_MAX_PATH * 4];
         if (continuation_token[0])
             snprintf(canonical_qs, sizeof(canonical_qs),
-                     "continuation-token=%s&list-type=2&prefix=%s", continuation_token,
-                     full_prefix);
+                     "continuation-token=%s&list-type=2&prefix=%s", encoded_token, encoded_prefix);
         else
-            snprintf(canonical_qs, sizeof(canonical_qs), "list-type=2&prefix=%s", full_prefix);
+            snprintf(canonical_qs, sizeof(canonical_qs), "list-type=2&prefix=%s", encoded_prefix);
 
         if (s3->use_path_style)
         {

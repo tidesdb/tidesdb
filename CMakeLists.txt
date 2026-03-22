@@ -212,13 +212,6 @@ if(APPLE)
         target_include_directories(tidesdb PUBLIC ${JEMALLOC_INCLUDE_DIRS})
     endif()
 
-    if(TIDESDB_WITH_S3)
-        find_package(CURL REQUIRED)
-        find_package(OpenSSL REQUIRED)
-        target_compile_definitions(tidesdb PRIVATE TIDESDB_WITH_S3)
-        target_link_libraries(tidesdb PUBLIC CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
-        message(STATUS "Building with S3-compatible object store connector")
-    endif()
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
     target_link_libraries(tidesdb PUBLIC
@@ -383,6 +376,15 @@ else()
     endif()
 endif()
 
+# S3 connector (platform-independent, requires libcurl + openssl)
+if(TIDESDB_WITH_S3)
+    find_package(CURL REQUIRED)
+    find_package(OpenSSL REQUIRED)
+    target_compile_definitions(tidesdb PRIVATE TIDESDB_WITH_S3)
+    target_link_libraries(tidesdb PUBLIC CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
+    message(STATUS "Building with S3-compatible object store connector")
+endif()
+
 install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
@@ -537,6 +539,9 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(buffer_tests test/buffer__tests.c)
     add_executable(btree_tests test/btree__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
+    if(TIDESDB_WITH_S3)
+        target_compile_definitions(tidesdb_tests PRIVATE TIDESDB_WITH_S3)
+    endif()
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
     # pass benchmark configuration as compile definitions

@@ -36,6 +36,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Easy pluggable custom allocator support
 - Column family commit hooks 
 - Optionally can configure engine to have unified memtable for all column families
+- Object store mode with S3-compatible storage, local file caching, and node-failure recovery
 
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/)

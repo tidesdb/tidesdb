@@ -68,7 +68,7 @@ jobs:
           TIDESDB_S3_SECRET_KEY: minioadmin
         run: |
           cd build
-          ./tidesdb_tests test_objstore_s3 || echo "S3 integration tests not yet implemented"
+          ./tidesdb_tests test_objstore_s3_minio
 
       - name: Stop MinIO
         if: always()

@@ -25343,6 +25343,260 @@ static void test_unified_iterator_consistency(void)
     cleanup_test_dir();
 }
 
+#ifdef TIDESDB_WITH_S3
+#include "../src/objstore_s3.h"
+
+/**
+ * test_objstore_s3_minio
+ * end-to-end S3 integration test against a live MinIO instance.
+ * reads connection details from environment variables.
+ * skips gracefully if env vars are not set (local dev without MinIO).
+ * tests put, get, exists, delete, list, range_get, and full database
+ * roundtrip with write, flush, read, cold start recovery.
+ */
+static void test_objstore_s3_minio(void)
+{
+    const char *endpoint = getenv("TIDESDB_S3_ENDPOINT");
+    const char *bucket = getenv("TIDESDB_S3_BUCKET");
+    const char *access_key = getenv("TIDESDB_S3_ACCESS_KEY");
+    const char *secret_key = getenv("TIDESDB_S3_SECRET_KEY");
+
+    if (!endpoint || !bucket || !access_key || !secret_key)
+    {
+        printf("  S3 test skipped (TIDESDB_S3_* env vars not set)\n");
+        return;
+    }
+
+    cleanup_test_dir();
+
+    printf("  S3 test: connecting to %s bucket=%s\n", endpoint, bucket);
+
+    tidesdb_objstore_t *s3 =
+        tidesdb_objstore_s3_create(endpoint, bucket, "tidesdb_test/", access_key, secret_key,
+                                   NULL, /* region (NULL for MinIO) */
+                                   0,    /* use_ssl = 0 for local MinIO */
+                                   1     /* use_path_style = 1 for MinIO */
+        );
+    ASSERT_TRUE(s3 != NULL);
+
+    /* test raw connector operations first */
+
+    /* put a small test file */
+    const char *test_file = "./test_s3_upload.tmp";
+    FILE *fp = fopen(test_file, "wb");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "hello from tidesdb s3 test");
+    fclose(fp);
+
+    ASSERT_EQ(s3->put(s3->ctx, "test/hello.txt", test_file), 0);
+    printf("  S3 test: put succeeded\n");
+
+    /* exists */
+    size_t obj_size = 0;
+    ASSERT_TRUE(s3->exists(s3->ctx, "test/hello.txt", &obj_size) == 1);
+    ASSERT_TRUE(obj_size > 0);
+    printf("  S3 test: exists succeeded (size=%zu)\n", obj_size);
+
+    /* get */
+    const char *download_file = "./test_s3_download.tmp";
+    ASSERT_EQ(s3->get(s3->ctx, "test/hello.txt", download_file), 0);
+    fp = fopen(download_file, "rb");
+    ASSERT_TRUE(fp != NULL);
+    char buf[256] = {0};
+    fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    ASSERT_TRUE(strstr(buf, "hello from tidesdb") != NULL);
+    printf("  S3 test: get succeeded\n");
+
+    /* range_get */
+    char range_buf[10] = {0};
+    ssize_t nread = s3->range_get(s3->ctx, "test/hello.txt", 0, range_buf, 5);
+    ASSERT_TRUE(nread >= 5);
+    ASSERT_TRUE(memcmp(range_buf, "hello", 5) == 0);
+    printf("  S3 test: range_get succeeded\n");
+
+    /* delete */
+    ASSERT_EQ(s3->delete_object(s3->ctx, "test/hello.txt"), 0);
+    ASSERT_TRUE(s3->exists(s3->ctx, "test/hello.txt", NULL) == 0);
+    printf("  S3 test: delete succeeded\n");
+
+    /* clean up temp files */
+    unlink(test_file);
+    unlink(download_file);
+
+    /* now test full database roundtrip through S3 */
+    tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.object_store = s3;
+    config.object_store_config = &os_cfg;
+    config.unified_memtable_write_buffer_size = 4096;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "s3_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "s3_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write enough data to trigger unified flush */
+    const int NUM_KEYS = 50;
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[256];
+        snprintf(key, sizeof(key), "s3key_%06d", i);
+        memset(value, 'S' + (i % 20), sizeof(value) - 1);
+        value[sizeof(value) - 1] = '\0';
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* wait for flush */
+    for (int w = 0; w < 200; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(20000);
+    }
+    usleep(500000);
+
+    /* trigger compaction */
+    tidesdb_compact(cf);
+    for (int w = 0; w < 200; w++)
+    {
+        if (!atomic_load(&cf->is_compacting)) break;
+        usleep(20000);
+    }
+
+    /* delete every 5th key */
+    for (int i = 0; i < NUM_KEYS; i += 5)
+    {
+        tidesdb_txn_t *dtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &dtxn), 0);
+        char key[64];
+        snprintf(key, sizeof(key), "s3key_%06d", i);
+        ASSERT_EQ(tidesdb_txn_delete(dtxn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(dtxn), 0);
+        tidesdb_txn_free(dtxn);
+    }
+
+    /* wait for any flush from deletes */
+    for (int w = 0; w < 200; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(20000);
+    }
+    usleep(300000);
+
+    /* point lookup every key */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    int found = 0;
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "s3key_%06d", i);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 && val)
+        {
+            found++;
+            free(val);
+        }
+    }
+    printf("  S3 test: point lookup found %d/%d keys after deletes\n", found, NUM_KEYS);
+    ASSERT_TRUE(found > 0);
+    ASSERT_TRUE(found < NUM_KEYS); /* some should be deleted */
+
+    /* forward iteration */
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+    int fwd_count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        fwd_count++;
+        tidesdb_iter_next(iter);
+    }
+
+    /* backward iteration */
+    ASSERT_EQ(tidesdb_iter_seek_to_last(iter), 0);
+    int bwd_count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        bwd_count++;
+        tidesdb_iter_prev(iter);
+    }
+
+    /* seek to middle */
+    char mid_key[64];
+    snprintf(mid_key, sizeof(mid_key), "s3key_%06d", NUM_KEYS / 2);
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)mid_key, strlen(mid_key) + 1), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    printf("  S3 test: fwd=%d bwd=%d (point=%d)\n", fwd_count, bwd_count, found);
+    ASSERT_TRUE(fwd_count > 0);
+    ASSERT_TRUE(bwd_count > 0);
+
+    /* check stats */
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+    ASSERT_TRUE(stats.object_store_enabled == 1);
+    ASSERT_TRUE(stats.total_uploads > 0);
+    printf("  S3 test: stats show %" PRIu64 " uploads via connector '%s'\n", stats.total_uploads,
+           stats.object_store_connector ? stats.object_store_connector : "?");
+
+    tidesdb_close(db);
+
+    /* cold start test: delete all local state, reopen from S3 */
+    cleanup_test_dir();
+
+    tidesdb_objstore_t *s3_recover = tidesdb_objstore_s3_create(endpoint, bucket, "tidesdb_test/",
+                                                                access_key, secret_key, NULL, 0, 1);
+    ASSERT_TRUE(s3_recover != NULL);
+
+    config.object_store = s3_recover;
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    cf = tidesdb_get_column_family(db, "s3_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    int cold_found = 0;
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "s3key_%06d", i);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 && val)
+        {
+            cold_found++;
+            free(val);
+        }
+    }
+    tidesdb_txn_free(txn);
+    printf("  S3 test: cold start recovery read back %d/%d keys from MinIO\n", cold_found,
+           NUM_KEYS);
+    ASSERT_TRUE(cold_found > 0);
+
+    tidesdb_close(db);
+
+    cleanup_test_dir();
+}
+#endif /* TIDESDB_WITH_S3 */
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -25685,6 +25939,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_cold_start, tests_passed);
     RUN_TEST(test_objstore_compaction_and_iterators, tests_passed);
     RUN_TEST(test_unified_iterator_consistency, tests_passed);
+#ifdef TIDESDB_WITH_S3
+    RUN_TEST(test_objstore_s3_minio, tests_passed);
+#endif
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

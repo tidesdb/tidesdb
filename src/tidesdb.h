@@ -743,6 +743,7 @@ struct tidesdb_t
     _Atomic(uint64_t) last_uploaded_gen;     /* highest WAL gen confirmed uploaded */
     _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
     _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
+    uint64_t last_wal_sync_size;             /* WAL file size at last object store sync */
 };
 
 /**

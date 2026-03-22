@@ -76,6 +76,8 @@ typedef struct tidesdb_objstore_t tidesdb_objstore_t;
  * @param sync_manifest_to_object upload MANIFEST after each compaction (default 1)
  * @param replicate_wal upload closed WAL segments for node-failure recovery (default 1)
  * @param wal_upload_sync 0 = background WAL upload (default), 1 = block flush until uploaded
+ * @param wal_sync_threshold_bytes sync active WAL when it grows by this many bytes (default 1MB, 0
+ * = off)
  */
 typedef struct
 {
@@ -90,6 +92,7 @@ typedef struct
     int sync_manifest_to_object;
     int replicate_wal;
     int wal_upload_sync;
+    size_t wal_sync_threshold_bytes;
 } tidesdb_objstore_config_t;
 
 tidesdb_objstore_config_t tidesdb_objstore_default_config(void);

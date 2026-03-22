@@ -160,6 +160,11 @@ typedef struct
  * @param sync_manifest_to_object whether to upload MANIFEST after each compaction (default 1)
  * @param replicate_wal whether to upload closed WAL segments (default 1)
  * @param wal_upload_sync 0 for background WAL upload (default), 1 to block flush
+ * @param wal_sync_threshold_bytes sync active WAL to object store when it grows by this many bytes
+ *        since the last sync (default 1MB, 0 = disable periodic WAL sync). uses the block manager
+ *        atomic file size for lock-free detection. the reaper thread checks every cycle (~100ms)
+ *        and uploads when the threshold is exceeded, bounding the data loss window to the
+ *        write volume rather than wall clock time
  */
 typedef struct
 {
@@ -176,9 +181,11 @@ typedef struct
     size_t multipart_part_size;   /* multipart chunk size (default 8MB) */
 
     /* durability */
-    int sync_manifest_to_object; /* upload MANIFEST after each compaction (default 1) */
-    int replicate_wal;           /* upload closed WAL segments (default 1) */
-    int wal_upload_sync;         /* 0 = background WAL upload (default), 1 = block flush */
+    int sync_manifest_to_object;     /* upload MANIFEST after each compaction (default 1) */
+    int replicate_wal;               /* upload closed WAL segments (default 1) */
+    int wal_upload_sync;             /* 0 = background WAL upload (default), 1 = block flush */
+    size_t wal_sync_threshold_bytes; /* sync WAL when it grows by this many bytes (default 1MB, 0 =
+                                        off) */
 } tidesdb_objstore_config_t;
 
 /**

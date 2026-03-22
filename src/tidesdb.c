@@ -3376,6 +3376,27 @@ static void *tdb_upload_worker_thread(void *arg)
                 }
             }
 
+            /* verify upload landed by checking the object exists with correct size */
+            if (rc == 0)
+            {
+                struct stat local_st;
+                if (stat(job->local_path, &local_st) == 0)
+                {
+                    size_t remote_size = 0;
+                    int verify = db->object_store->exists(db->object_store->ctx, job->object_key,
+                                                          &remote_size);
+                    if (verify != 1 || remote_size != (size_t)local_st.st_size)
+                    {
+                        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                      "Upload verification failed for %s (local=%zu, remote=%zu, "
+                                      "exists=%d)",
+                                      job->object_key, (size_t)local_st.st_size, remote_size,
+                                      verify);
+                        rc = -1;
+                    }
+                }
+            }
+
             if (rc == 0)
             {
                 atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
@@ -3584,9 +3605,11 @@ static int tdb_objstore_download_if_missing(tidesdb_t *db, const char *local_pat
 static void tdb_objstore_upload_manifest(tidesdb_t *db, tidesdb_column_family_t *cf)
 {
     if (!db->object_store || !cf || !cf->manifest || cf->manifest->path[0] == '\0') return;
-    /* MANIFEST must be uploaded synchronously -- it's small and readers need
-     * to see the updated inventory immediately for consistency */
-    tdb_objstore_upload_file_sync(db, cf->manifest->path);
+    /* MANIFEST is uploaded via the async pipeline to avoid blocking flush workers.
+     * the local MANIFEST is always up to date for same-node readers. remote readers
+     * doing cold start will see it after the upload completes. the async queue
+     * preserves ordering so the MANIFEST always reflects the latest SSTable inventory. */
+    tdb_objstore_upload_file(db, cf->manifest->path);
 }
 
 /**
@@ -3633,11 +3656,64 @@ static void tdb_cf_discovery_cb(const char *key, size_t size, void *cb_ctx)
 }
 
 /**
+ * tdb_cold_start_download_arg_t
+ * thread argument for parallel cold start CF metadata downloads
+ * @param db database instance
+ * @param cf_name column family name to download
+ */
+typedef struct
+{
+    tidesdb_t *db;
+    const char *cf_name;
+} tdb_cold_start_download_arg_t;
+
+/**
+ * tdb_cold_start_download_worker
+ * download config.ini + MANIFEST for a single CF (runs on a worker thread)
+ * @param arg pointer to tdb_cold_start_download_arg_t
+ * @return NULL
+ */
+static void *tdb_cold_start_download_worker(void *arg)
+{
+    tdb_cold_start_download_arg_t *ctx = (tdb_cold_start_download_arg_t *)arg;
+    tidesdb_t *db = ctx->db;
+    const char *cf_name = ctx->cf_name;
+
+    /* create local CF directory */
+    char cf_dir[TDB_MAX_PATH_LEN];
+    snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
+    mkdir(cf_dir, 0755);
+
+    /* download config.ini */
+    char config_key[TDB_MAX_PATH_LEN];
+    snprintf(config_key, sizeof(config_key),
+             "%s/" TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT, cf_name);
+    char config_local[TDB_MAX_PATH_LEN];
+    snprintf(config_local, sizeof(config_local),
+             "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+             cf_dir);
+    db->object_store->get(db->object_store->ctx, config_key, config_local);
+
+    /* download MANIFEST */
+    char manifest_key[TDB_MAX_PATH_LEN];
+    snprintf(manifest_key, sizeof(manifest_key), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_name);
+    char manifest_local[TDB_MAX_PATH_LEN];
+    snprintf(manifest_local, sizeof(manifest_local),
+             "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_dir);
+    db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Object store cold start: downloaded config + MANIFEST for CF '%s'",
+                  cf_name);
+
+    return NULL;
+}
+
+/**
  * tdb_objstore_cold_start_discover
  * on cold start (no local CF directories), discover CFs from the object store
- * by listing MANIFEST objects, then download config.ini + MANIFEST for each.
- * the actual sstable data is not downloaded -- it will be fetched on demand
- * via tidesdb_sstable_ensure_open when queries arrive.
+ * by listing MANIFEST objects, then download config.ini + MANIFEST for each
+ * in parallel. the actual sstable data is not downloaded -- it will be fetched
+ * on demand via tidesdb_sstable_ensure_open when queries arrive.
  * @param db database instance with object_store configured
  */
 static void tdb_objstore_cold_start_discover(tidesdb_t *db)
@@ -3657,36 +3733,29 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Object store cold start: discovered %d CFs in remote store",
                   discovery.count);
 
-    for (int i = 0; i < discovery.count; i++)
+    /* download config + MANIFEST for all CFs in parallel */
+    tdb_cold_start_download_arg_t args[256];
+    pthread_t threads[256];
+    int launched = 0;
+
+    for (int i = 0; i < discovery.count && i < 256; i++)
     {
-        const char *cf_name = discovery.cf_names[i];
+        args[i].db = db;
+        args[i].cf_name = discovery.cf_names[i];
+        if (pthread_create(&threads[i], NULL, tdb_cold_start_download_worker, &args[i]) == 0)
+        {
+            launched++;
+        }
+        else
+        {
+            /* fallback to synchronous download if thread creation fails */
+            tdb_cold_start_download_worker(&args[i]);
+        }
+    }
 
-        /* create local CF directory */
-        char cf_dir[TDB_MAX_PATH_LEN];
-        snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
-        mkdir(cf_dir, 0755);
-
-        /* download config.ini */
-        char config_key[TDB_MAX_PATH_LEN];
-        snprintf(config_key, sizeof(config_key),
-                 "%s/" TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT, cf_name);
-        char config_local[TDB_MAX_PATH_LEN];
-        snprintf(config_local, sizeof(config_local),
-                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
-                 cf_dir);
-        db->object_store->get(db->object_store->ctx, config_key, config_local);
-
-        /* download MANIFEST */
-        char manifest_key[TDB_MAX_PATH_LEN];
-        snprintf(manifest_key, sizeof(manifest_key), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME,
-                 cf_name);
-        char manifest_local[TDB_MAX_PATH_LEN];
-        snprintf(manifest_local, sizeof(manifest_local),
-                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_dir);
-        db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
-
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "Object store cold start: downloaded config + MANIFEST for CF '%s'", cf_name);
+    for (int i = 0; i < launched; i++)
+    {
+        pthread_join(threads[i], NULL);
     }
 }
 
@@ -13020,6 +13089,34 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
         }
 
+        /* periodic WAL sync to object store -- read the WAL's atomic file size
+         * lock-free and upload when the delta since last sync exceeds the
+         * configured threshold. this bounds the data loss window to the write
+         * volume (e.g. 1MB of new data) rather than wall clock time. during
+         * idle periods no syncs occur. during bursts syncs fire more frequently.
+         * the WAL is append-only so uploading a snapshot mid-write is safe. */
+        if (db->object_store && db->unified_mt.enabled)
+        {
+            size_t threshold = db->config.object_store_config
+                                   ? db->config.object_store_config->wal_sync_threshold_bytes
+                                   : 0;
+            if (threshold > 0)
+            {
+                tidesdb_memtable_t *umt =
+                    atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
+                if (umt && umt->wal)
+                {
+                    uint64_t wal_size =
+                        atomic_load_explicit(&umt->wal->current_file_size, memory_order_relaxed);
+                    if (wal_size >= db->last_wal_sync_size + threshold)
+                    {
+                        tdb_objstore_upload_file_sync(db, umt->wal->file_path);
+                        db->last_wal_sync_size = wal_size;
+                    }
+                }
+            }
+        }
+
         int current_open = atomic_load(&db->num_open_sstables);
         int max_open = (int)db->config.max_open_sstables;
 
@@ -14158,6 +14255,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_init(&(*db)->last_uploaded_gen, 0);
         atomic_init(&(*db)->total_uploads, 0);
         atomic_init(&(*db)->total_upload_failures, 0);
+        (*db)->last_wal_sync_size = 0;
 
         if ((*db)->upload_queue)
         {
@@ -19336,6 +19434,9 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable rotated (gen=%" PRIu64 ", WAL=%s)", new_gen,
                   uwal_path);
+
+    /* reset WAL sync tracker since the new WAL starts empty */
+    db->last_wal_sync_size = 0;
 
     return TDB_SUCCESS;
 }

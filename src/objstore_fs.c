@@ -45,6 +45,7 @@
 #define TDB_OBJSTORE_DEFAULT_SYNC_MANIFEST       1
 #define TDB_OBJSTORE_DEFAULT_REPLICATE_WAL       1
 #define TDB_OBJSTORE_DEFAULT_WAL_UPLOAD_SYNC     0
+#define TDB_OBJSTORE_DEFAULT_WAL_SYNC_THRESHOLD  (1024 * 1024) /* 1MB */
 
 /**
  * fs_ctx_t
@@ -397,6 +398,7 @@ tidesdb_objstore_config_t tidesdb_objstore_default_config(void)
         .sync_manifest_to_object = TDB_OBJSTORE_DEFAULT_SYNC_MANIFEST,
         .replicate_wal = TDB_OBJSTORE_DEFAULT_REPLICATE_WAL,
         .wal_upload_sync = TDB_OBJSTORE_DEFAULT_WAL_UPLOAD_SYNC,
+        .wal_sync_threshold_bytes = TDB_OBJSTORE_DEFAULT_WAL_SYNC_THRESHOLD,
     };
 }
 

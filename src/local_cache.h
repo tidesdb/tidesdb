@@ -21,15 +21,18 @@
 
 #include "compat.h"
 
-#define TDB_LOCAL_CACHE_MAX_PATH 4096
+#define TDB_LOCAL_CACHE_MAX_PATH     4096
+#define TDB_LOCAL_CACHE_HASH_BUCKETS 256 /* power of 2 for bitmask lookup */
 
 /**
  * tdb_cache_entry_t
- * doubly-linked LRU list node tracking a cached file
+ * doubly-linked LRU list node tracking a cached file, also chained in a hash bucket
  * @param path file path of the cached file
  * @param size size of the cached file in bytes
  * @param prev pointer to the previous entry in the LRU list
  * @param next pointer to the next entry in the LRU list
+ * @param hash_next pointer to the next entry in the same hash bucket
+ * @param hash value of the path hash (cached to avoid recomputation on remove)
  */
 typedef struct tdb_cache_entry
 {
@@ -37,20 +40,24 @@ typedef struct tdb_cache_entry
     size_t size;
     struct tdb_cache_entry *prev;
     struct tdb_cache_entry *next;
+    struct tdb_cache_entry *hash_next;
+    uint32_t hash;
 } tdb_cache_entry_t;
 
 /**
  * tdb_local_cache_t
- * local file cache manager with LRU eviction for object store mode.
+ * local file cache manager with hash-indexed LRU eviction for object store mode.
  * tracks which SSTable files are cached locally and evicts cold files
- * when the cache exceeds max_bytes.
+ * when the cache exceeds max_bytes. uses a hash table for O(1) lookups
+ * and a doubly-linked LRU list for eviction ordering.
  * @param cache_dir directory path for cached files
  * @param max_bytes maximum cache size in bytes (0 = unlimited)
  * @param current_bytes atomic counter of current cache size in bytes
- * @param lock mutex protecting the LRU list
+ * @param lock mutex protecting the LRU list and hash table
  * @param lru_head pointer to the most recently used entry
  * @param lru_tail pointer to the least recently used entry (eviction candidate)
  * @param num_entries number of entries currently in the cache
+ * @param buckets hash table buckets for O(1) path lookups
  */
 typedef struct
 {
@@ -61,6 +68,7 @@ typedef struct
     tdb_cache_entry_t *lru_head; /* most recently used */
     tdb_cache_entry_t *lru_tail; /* least recently used (eviction candidate) */
     int num_entries;
+    tdb_cache_entry_t *buckets[TDB_LOCAL_CACHE_HASH_BUCKETS];
 } tdb_local_cache_t;
 
 /**

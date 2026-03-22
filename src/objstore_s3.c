@@ -199,20 +199,23 @@ static void s3_build_host(const s3_ctx_t *ctx, char *host, size_t host_size)
 }
 
 /**
- * s3_sign_request
- * create AWS SigV4 signed HTTP headers for an S3 request
+ * s3_sign_raw
+ * create AWS SigV4 signed HTTP headers given explicit canonical URI and query string.
+ * this is the low-level signing function used by both object operations and list requests.
  * @param ctx S3 connector context
  * @param method HTTP method (GET, PUT, DELETE, HEAD)
- * @param key object key
+ * @param canonical_uri the URI path component of the request (e.g. "/bucket/key")
+ * @param canonical_query_string the query string component (alphabetically sorted, or "")
  * @param content_sha256 hex-encoded SHA256 of the request body
  * @param extra_headers_canonical additional canonical headers (or NULL)
  * @param extra_signed_headers additional signed header names (or NULL)
  * @return curl_slist of signed headers (caller must free with curl_slist_free_all)
  */
-static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *method, const char *key,
-                                          const char *content_sha256,
-                                          const char *extra_headers_canonical,
-                                          const char *extra_signed_headers)
+static struct curl_slist *s3_sign_raw(const s3_ctx_t *ctx, const char *method,
+                                      const char *canonical_uri, const char *canonical_query_string,
+                                      const char *content_sha256,
+                                      const char *extra_headers_canonical,
+                                      const char *extra_signed_headers)
 {
     char date8[TDB_S3_DATE_LEN], timestamp[TDB_S3_TIMESTAMP_LEN];
     s3_get_timestamp(date8, timestamp);
@@ -220,26 +223,13 @@ static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *metho
     char host[TDB_S3_HOST_BUF];
     s3_build_host(ctx, host, sizeof(host));
 
-    /* canonical URI */
-    char canonical_uri[TDB_S3_MAX_PATH];
-    char full_key[TDB_S3_MAX_PATH];
-    if (ctx->prefix[0])
-        snprintf(full_key, sizeof(full_key), "%s%s", ctx->prefix, key);
-    else
-        snprintf(full_key, sizeof(full_key), "%s", key);
-
-    if (ctx->use_path_style)
-        snprintf(canonical_uri, sizeof(canonical_uri), "/%s/%s", ctx->bucket, full_key);
-    else
-        snprintf(canonical_uri, sizeof(canonical_uri), "/%s", full_key);
-
     /* canonical request */
-    char canonical_request[TDB_S3_MAX_PATH * 2];
+    char canonical_request[TDB_S3_MAX_PATH * 4];
     snprintf(canonical_request, sizeof(canonical_request),
-             "%s\n%s\n\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n%s\n"
+             "%s\n%s\n%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n%s\n"
              "host;x-amz-content-sha256;x-amz-date%s\n%s",
-             method, canonical_uri, host, content_sha256, timestamp,
-             extra_headers_canonical ? extra_headers_canonical : "",
+             method, canonical_uri, canonical_query_string ? canonical_query_string : "", host,
+             content_sha256, timestamp, extra_headers_canonical ? extra_headers_canonical : "",
              extra_signed_headers ? extra_signed_headers : "", content_sha256);
 
     char canonical_hash[TDB_S3_HASH_HEX_LEN];
@@ -288,6 +278,40 @@ static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *metho
     headers = curl_slist_append(headers, auth_header);
 
     return headers;
+}
+
+/**
+ * s3_sign_request
+ * create AWS SigV4 signed HTTP headers for an S3 object request.
+ * computes the canonical URI from the key and connector prefix,
+ * then delegates to s3_sign_raw with an empty query string.
+ * @param ctx S3 connector context
+ * @param method HTTP method (GET, PUT, DELETE, HEAD)
+ * @param key object key
+ * @param content_sha256 hex-encoded SHA256 of the request body
+ * @param extra_headers_canonical additional canonical headers (or NULL)
+ * @param extra_signed_headers additional signed header names (or NULL)
+ * @return curl_slist of signed headers (caller must free with curl_slist_free_all)
+ */
+static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *method, const char *key,
+                                          const char *content_sha256,
+                                          const char *extra_headers_canonical,
+                                          const char *extra_signed_headers)
+{
+    char full_key[TDB_S3_MAX_PATH];
+    if (ctx->prefix[0])
+        snprintf(full_key, sizeof(full_key), "%s%s", ctx->prefix, key);
+    else
+        snprintf(full_key, sizeof(full_key), "%s", key);
+
+    char canonical_uri[TDB_S3_MAX_PATH];
+    if (ctx->use_path_style)
+        snprintf(canonical_uri, sizeof(canonical_uri), "/%s/%s", ctx->bucket, full_key);
+    else
+        snprintf(canonical_uri, sizeof(canonical_uri), "/%s", full_key);
+
+    return s3_sign_raw(ctx, method, canonical_uri, "", content_sha256, extra_headers_canonical,
+                       extra_signed_headers);
 }
 
 /**
@@ -709,24 +733,41 @@ static int s3_list(void *ctx, const char *prefix,
         else
             snprintf(full_prefix, sizeof(full_prefix), "%s", prefix);
 
-        /* ListObjectsV2 uses query string, signed with empty canonical URI */
+        /* ListObjectsV2: prefix goes in query string, not in the URL path.
+         * the canonical URI is just /<bucket> (path-style) or / (virtual-hosted).
+         * the canonical query string must include all query parameters sorted alphabetically. */
         char url[TDB_S3_MAX_PATH * 2];
         const char *scheme = s3->use_ssl ? "https" : "http";
+
+        /* build canonical query string (params sorted alphabetically) */
+        char canonical_qs[TDB_S3_MAX_PATH * 2];
+        if (continuation_token[0])
+            snprintf(canonical_qs, sizeof(canonical_qs),
+                     "continuation-token=%s&list-type=2&prefix=%s", continuation_token,
+                     full_prefix);
+        else
+            snprintf(canonical_qs, sizeof(canonical_qs), "list-type=2&prefix=%s", full_prefix);
+
         if (s3->use_path_style)
         {
-            snprintf(url, sizeof(url), "%s://%s/%s?list-type=2&prefix=%s%s%s", scheme, s3->endpoint,
-                     s3->bucket, full_prefix, continuation_token[0] ? "&continuation-token=" : "",
-                     continuation_token[0] ? continuation_token : "");
+            snprintf(url, sizeof(url), "%s://%s/%s?%s", scheme, s3->endpoint, s3->bucket,
+                     canonical_qs);
         }
         else
         {
-            snprintf(url, sizeof(url), "%s://%s.%s/?list-type=2&prefix=%s%s%s", scheme, s3->bucket,
-                     s3->endpoint, full_prefix, continuation_token[0] ? "&continuation-token=" : "",
-                     continuation_token[0] ? continuation_token : "");
+            snprintf(url, sizeof(url), "%s://%s.%s/?%s", scheme, s3->bucket, s3->endpoint,
+                     canonical_qs);
         }
 
-        /* we sign as GET on "/" or "/bucket" with empty body */
-        struct curl_slist *headers = s3_sign_request(s3, "GET", "", empty_sha, NULL, NULL);
+        /* sign with the correct canonical URI (bucket path only, no object prefix) */
+        char canonical_uri[TDB_S3_MAX_PATH];
+        if (s3->use_path_style)
+            snprintf(canonical_uri, sizeof(canonical_uri), "/%s", s3->bucket);
+        else
+            snprintf(canonical_uri, sizeof(canonical_uri), "/");
+
+        struct curl_slist *headers =
+            s3_sign_raw(s3, "GET", canonical_uri, canonical_qs, empty_sha, NULL, NULL);
 
         s3_response_buf_t resp = {
             .data = malloc(TDB_S3_RESPONSE_INIT), .size = 0, .capacity = TDB_S3_RESPONSE_INIT};

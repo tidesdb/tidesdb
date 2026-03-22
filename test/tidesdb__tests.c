@@ -25346,6 +25346,13 @@ static void test_unified_iterator_consistency(void)
 #ifdef TIDESDB_WITH_S3
 #include "../src/objstore_s3.h"
 
+static void tdb_cf_list_noop_cb(const char *key, size_t size, void *cb_ctx)
+{
+    (void)key;
+    (void)size;
+    (void)cb_ctx;
+}
+
 /**
  * test_objstore_s3_minio
  * end-to-end S3 integration test against a live MinIO instance.
@@ -25414,6 +25421,11 @@ static void test_objstore_s3_minio(void)
     ASSERT_TRUE(nread >= 5);
     ASSERT_TRUE(memcmp(range_buf, "hello", 5) == 0);
     printf("  S3 test: range_get succeeded\n");
+
+    /* list */
+    int list_count = s3->list(s3->ctx, "", tdb_cf_list_noop_cb, NULL);
+    ASSERT_TRUE(list_count >= 1);
+    printf("  S3 test: list succeeded (count=%d)\n", list_count);
 
     /* delete */
     ASSERT_EQ(s3->delete_object(s3->ctx, "test/hello.txt"), 0);

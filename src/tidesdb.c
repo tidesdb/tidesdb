@@ -23192,26 +23192,26 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
                 sst->klog_size = me->size_bytes;
                 sst->db = cf->db;
 
-                /* we download and load sst metadata (bloom filter, block index,
-                 * min/max key) from the klog file on object store.
-                 * ensure_open handles the download, sstable_load reads metadata. */
+                /* we download sst files from object store via ensure_open, then close
+                 * the block managers it opened since sstable_load opens its own.
+                 * without this close, load overwrites sst->klog_bm/vlog_bm with its
+                 * own local BMs, leaking the ensure_open allocations. */
                 if (tidesdb_sstable_ensure_open(cf->db, sst) == 0)
                 {
-                    if (tidesdb_sstable_load(cf->db, sst) == 0)
+                    /* close BMs from ensure_open before load opens its own */
+                    if (sst->klog_bm)
                     {
-                        /* we close block managers after loading metadata --
-                         * they'll reopen on demand via ensure_open */
-                        if (sst->klog_bm)
-                        {
-                            block_manager_close(sst->klog_bm);
-                            sst->klog_bm = NULL;
-                        }
-                        if (sst->vlog_bm)
-                        {
-                            block_manager_close(sst->vlog_bm);
-                            sst->vlog_bm = NULL;
-                        }
+                        block_manager_close(sst->klog_bm);
+                        sst->klog_bm = NULL;
                     }
+                    if (sst->vlog_bm)
+                    {
+                        block_manager_close(sst->vlog_bm);
+                        sst->vlog_bm = NULL;
+                    }
+                    atomic_fetch_sub(&cf->db->num_open_sstables, 1);
+
+                    tidesdb_sstable_load(cf->db, sst);
                 }
 
                 /* we ensure level exists */

@@ -355,6 +355,14 @@ static inline size_t tdb_build_prefixed_key(uint32_t cf_index, const uint8_t *ke
 #define TDB_DISK_SPACE_CHECK_INTERVAL_SECONDS   60
 #define TDB_NO_CF_SYNC_SLEEP_US                 100000
 
+/* object store retry constants */
+#define TDB_UPLOAD_MAX_RETRIES          3
+#define TDB_UPLOAD_INITIAL_BACKOFF_US   100000 /* 100ms */
+#define TDB_UPLOAD_BACKOFF_MULTIPLIER   4      /* 100ms -> 400ms -> 1600ms */
+#define TDB_DOWNLOAD_MAX_RETRIES        3
+#define TDB_DOWNLOAD_INITIAL_BACKOFF_US 50000 /* 50ms */
+#define TDB_DOWNLOAD_BACKOFF_MULTIPLIER 4     /* 50ms -> 200ms -> 800ms */
+
 /* klog block configuration */
 #define TDB_KLOG_BLOCK_INITIAL_CAPACITY 512
 
@@ -3351,7 +3359,23 @@ static void *tdb_upload_worker_thread(void *arg)
 
         if (db->object_store && db->object_store->put)
         {
-            int rc = db->object_store->put(db->object_store->ctx, job->object_key, job->local_path);
+            int rc = -1;
+            unsigned int backoff_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
+            for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
+            {
+                rc = db->object_store->put(db->object_store->ctx, job->object_key, job->local_path);
+                if (rc == 0) break;
+
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload attempt %d/%d failed: %s", attempt + 1,
+                              TDB_UPLOAD_MAX_RETRIES, job->object_key);
+
+                if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES)
+                {
+                    usleep(backoff_us);
+                    backoff_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
+                }
+            }
+
             if (rc == 0)
             {
                 atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
@@ -3372,7 +3396,9 @@ static void *tdb_upload_worker_thread(void *arg)
             }
             else
             {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Background upload failed: %s", job->object_key);
+                atomic_fetch_add_explicit(&db->total_upload_failures, 1, memory_order_relaxed);
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Upload permanently failed after %d attempts: %s",
+                              TDB_UPLOAD_MAX_RETRIES, job->object_key);
             }
         }
 
@@ -3507,16 +3533,42 @@ static int tdb_objstore_download_if_missing(tidesdb_t *db, const char *local_pat
 
     /* we check if object exists in store before attempting download.
      * during flush, new sstables are being created locally for the first time
-     * and don't exist in the object store yet -- that's not an error. */
-    if (db->object_store->exists(db->object_store->ctx, key, NULL) != 1)
+     * and don't exist in the object store yet -- that's not an error.
+     * exists() returns 0 (not found), 1 (found), -1 (error).
+     * on error (-1) we fall through to attempt the download anyway
+     * since the store may be reachable for get but not head. */
+    int exists_rc = db->object_store->exists(db->object_store->ctx, key, NULL);
+    if (exists_rc == 0)
     {
-        return 0; /* not in object store -- let block_manager_open create it locally */
+        return 0; /* confirmed not in object store -- let block_manager_open create it */
     }
 
-    if (db->object_store->get(db->object_store->ctx, key, local_path) != 0)
+    /* exists_rc == 1 (found) or -1 (error) -- attempt download with retry */
     {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store download failed: %s", key);
-        return -1;
+        int get_rc = -1;
+        unsigned int backoff_us = TDB_DOWNLOAD_INITIAL_BACKOFF_US;
+        for (int attempt = 0; attempt < TDB_DOWNLOAD_MAX_RETRIES; attempt++)
+        {
+            get_rc = db->object_store->get(db->object_store->ctx, key, local_path);
+            if (get_rc == 0) break;
+
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Download attempt %d/%d failed: %s", attempt + 1,
+                          TDB_DOWNLOAD_MAX_RETRIES, key);
+
+            if (attempt + 1 < TDB_DOWNLOAD_MAX_RETRIES)
+            {
+                usleep(backoff_us);
+                backoff_us *= TDB_DOWNLOAD_BACKOFF_MULTIPLIER;
+            }
+        }
+
+        if (get_rc != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Object store download permanently failed after %d attempts: %s",
+                          TDB_DOWNLOAD_MAX_RETRIES, key);
+            return -1;
+        }
     }
 
     if (db->local_cache) tdb_local_cache_track(db->local_cache, local_path);
@@ -14105,6 +14157,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         (*db)->upload_queue = queue_new();
         atomic_init(&(*db)->last_uploaded_gen, 0);
         atomic_init(&(*db)->total_uploads, 0);
+        atomic_init(&(*db)->total_upload_failures, 0);
 
         if ((*db)->upload_queue)
         {
@@ -14122,7 +14175,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Object store mode enabled (connector=%s, cache_dir=%s, "
                       "upload_threads=%d)",
-                      (*db)->object_store->name ? (*db)->object_store->name : "unknown", cache_dir,
+                      tidesdb_objstore_backend_name((*db)->object_store->backend), cache_dir,
                       num_upload_threads);
     }
 
@@ -14683,8 +14736,9 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->upload_queue);
         db->upload_queue = NULL;
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Upload pipeline stopped (%" PRIu64 " total uploads)",
-                      atomic_load(&db->total_uploads));
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Upload pipeline stopped (%" PRIu64 " uploads, %" PRIu64 " failures)",
+                      atomic_load(&db->total_uploads), atomic_load(&db->total_upload_failures));
     }
 
     /* we clean up object store resources */
@@ -23965,10 +24019,12 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
     stats->object_store_enabled = (db->object_store != NULL);
     if (db->object_store)
     {
-        stats->object_store_connector = db->object_store->name;
+        stats->object_store_connector = tidesdb_objstore_backend_name(db->object_store->backend);
         stats->last_uploaded_generation =
             atomic_load_explicit(&db->last_uploaded_gen, memory_order_relaxed);
         stats->total_uploads = atomic_load_explicit(&db->total_uploads, memory_order_relaxed);
+        stats->total_upload_failures =
+            atomic_load_explicit(&db->total_upload_failures, memory_order_relaxed);
         if (db->upload_queue) stats->upload_queue_depth = queue_size(db->upload_queue);
         if (db->local_cache)
         {

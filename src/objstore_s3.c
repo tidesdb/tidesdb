@@ -932,7 +932,7 @@ tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char 
         return NULL;
     }
 
-    store->name = "s3";
+    store->backend = TDB_BACKEND_S3;
     store->put = s3_put;
     store->get = s3_get;
     store->range_get = s3_range_get;

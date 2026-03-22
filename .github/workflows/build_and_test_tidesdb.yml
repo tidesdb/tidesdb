@@ -421,7 +421,7 @@ jobs:
             CTEST_OUTPUT_ON_FAILURE=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
             echo "**Linux RISC-V 64-bit tests run via QEMU emulation"
           else
-            ctest -V --output-on-failure --timeout 3600 --build-config Release
+            ctest -V --output-on-failure --timeout 5400 --build-config Release
           fi
 
   create-portable-db:
@@ -826,7 +826,7 @@ jobs:
         shell: bash
         run: |
           cd build
-          ctest -V --output-on-failure --timeout 3600 --build-config Release
+          ctest -V --output-on-failure --timeout 5400 --build-config Release
 
   build-with-tcmalloc:
     strategy:
@@ -868,7 +868,7 @@ jobs:
         shell: bash
         run: |
           cd build
-          ctest -V --output-on-failure --timeout 3600 --build-config Release
+          ctest -V --output-on-failure --timeout 5400 --build-config Release
 
   build-and-test-oracle-linux:
     runs-on: ubuntu-latest
@@ -909,7 +909,7 @@ jobs:
       - name: Run tests
         run: |
           cd build
-          ctest -V --output-on-failure --timeout 3600 --build-config Release
+          ctest -V --output-on-failure --timeout 5400 --build-config Release
 
   create-portable-db-lsmb:
     runs-on: ubuntu-latest

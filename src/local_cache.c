@@ -126,6 +126,52 @@ static tdb_cache_entry_t *cache_find(tdb_local_cache_t *cache, const char *path)
  * @param bytes_needed number of bytes needed for the new entry
  * caller must hold cache->lock
  */
+/**
+ * cache_evict_partner
+ * if the victim is a .klog or .vlog file, find and evict its partner so
+ * SSTable file pairs are always evicted together. prevents a state where
+ * one half of the pair is cached but the other must be re-downloaded.
+ * @param cache the cache manager
+ * @param victim the entry being evicted
+ * @param current pointer to the running byte counter (updated on partner eviction)
+ * caller must hold cache->lock
+ */
+static void cache_evict_partner(tdb_local_cache_t *cache, const tdb_cache_entry_t *victim,
+                                size_t *current)
+{
+    size_t vlen = strlen(victim->path);
+    if (vlen < 5) return;
+
+    const char *ext = victim->path + vlen - 5;
+    const char *partner_ext = NULL;
+
+    if (strcmp(ext, ".klog") == 0)
+        partner_ext = ".vlog";
+    else if (strcmp(ext, ".vlog") == 0)
+        partner_ext = ".klog";
+
+    if (!partner_ext) return;
+
+    char partner_path[TDB_LOCAL_CACHE_MAX_PATH];
+    memcpy(partner_path, victim->path, vlen - 5);
+    memcpy(partner_path + vlen - 5, partner_ext, 5);
+    partner_path[vlen] = '\0';
+
+    tdb_cache_entry_t *partner = cache_find(cache, partner_path);
+    if (!partner) return;
+
+    cache_unlink(cache, partner);
+#ifdef _WIN32
+    _unlink(partner->path);
+#else
+    unlink(partner->path);
+#endif
+    *current -= partner->size;
+    atomic_store_explicit(&cache->current_bytes, *current, memory_order_relaxed);
+    cache->num_entries--;
+    free(partner);
+}
+
 static void cache_evict(tdb_local_cache_t *cache, size_t bytes_needed)
 {
     if (cache->max_bytes == 0) return; /* unlimited */
@@ -146,6 +192,10 @@ static void cache_evict(tdb_local_cache_t *cache, size_t bytes_needed)
         current -= victim->size;
         atomic_store_explicit(&cache->current_bytes, current, memory_order_relaxed);
         cache->num_entries--;
+
+        /* evict the klog/vlog partner so SSTable pairs stay together */
+        cache_evict_partner(cache, victim, &current);
+
         free(victim);
     }
 }

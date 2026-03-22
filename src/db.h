@@ -23,6 +23,17 @@
 #include <stdint.h>
 #include <time.h>
 
+/**
+ * tidesdb_objstore_backend_t
+ * identifies the object store backend in use
+ */
+typedef enum
+{
+    TDB_BACKEND_FS = 0,
+    TDB_BACKEND_S3 = 1,
+    TDB_BACKEND_UNKNOWN = 99
+} tidesdb_objstore_backend_t;
+
 /** opaque types for FFI bindings (Java, etc.) */
 struct tidesdb_t
 {
@@ -392,6 +403,7 @@ typedef struct tidesdb_cache_stats_t
  * @param last_uploaded_generation highest WAL generation confirmed uploaded
  * @param upload_queue_depth number of pending upload jobs in the queue
  * @param total_uploads lifetime count of objects uploaded to object store
+ * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -424,6 +436,7 @@ typedef struct tidesdb_db_stats_t
     uint64_t last_uploaded_generation;
     size_t upload_queue_depth;
     uint64_t total_uploads;
+    uint64_t total_upload_failures;
 } tidesdb_db_stats_t;
 
 /**** system default configuration functions */

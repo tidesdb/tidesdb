@@ -664,6 +664,7 @@ struct tidesdb_level_t
  * @param upload_queue queue of upload jobs (tdb_upload_job_t)
  * @param last_uploaded_gen highest WAL generation confirmed uploaded to object store
  * @param total_uploads lifetime count of objects uploaded to object store
+ * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
  */
 struct tidesdb_t
 {
@@ -734,13 +735,14 @@ struct tidesdb_t
     } unified_mt;
 
     /* object store mode runtime state */
-    tidesdb_objstore_t *object_store;    /* active connector (NULL = local only) */
-    tdb_local_cache_t *local_cache;      /* local file cache manager */
-    pthread_t *upload_threads;           /* background upload thread pool */
-    int num_upload_threads;              /* number of upload threads */
-    queue_t *upload_queue;               /* queue of tdb_upload_job_t */
-    _Atomic(uint64_t) last_uploaded_gen; /* highest WAL gen confirmed uploaded */
-    _Atomic(uint64_t) total_uploads;     /* lifetime upload count */
+    tidesdb_objstore_t *object_store;        /* active connector (NULL = local only) */
+    tdb_local_cache_t *local_cache;          /* local file cache manager */
+    pthread_t *upload_threads;               /* background upload thread pool */
+    int num_upload_threads;                  /* number of upload threads */
+    queue_t *upload_queue;                   /* queue of tdb_upload_job_t */
+    _Atomic(uint64_t) last_uploaded_gen;     /* highest WAL gen confirmed uploaded */
+    _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
+    _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
 };
 
 /**
@@ -967,6 +969,7 @@ typedef struct tidesdb_cache_stats_t
  * @param last_uploaded_generation highest WAL generation confirmed uploaded
  * @param upload_queue_depth number of pending upload jobs in the queue
  * @param total_uploads lifetime count of objects uploaded to object store
+ * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -999,6 +1002,7 @@ typedef struct tidesdb_db_stats_t
     uint64_t last_uploaded_generation;
     size_t upload_queue_depth;
     uint64_t total_uploads;
+    uint64_t total_upload_failures;
 } tidesdb_db_stats_t;
 
 /**

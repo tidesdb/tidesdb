@@ -22,12 +22,43 @@
 #include "compat.h"
 
 /**
+ * tidesdb_objstore_backend_t
+ * identifies the object store backend in use.
+ * prevents misuse by restricting to known, supported backends.
+ */
+typedef enum
+{
+    TDB_BACKEND_FS = 0, /* filesystem connector (local/NFS, always available) */
+    TDB_BACKEND_S3 = 1, /* S3-compatible (AWS S3, MinIO, requires TIDESDB_WITH_S3) */
+    TDB_BACKEND_UNKNOWN = 99
+} tidesdb_objstore_backend_t;
+
+/**
+ * tidesdb_objstore_backend_name
+ * return a human-readable string for a backend enum value
+ * @param backend backend enum value
+ * @return static string (e.g. "fs", "s3", "unknown")
+ */
+static inline const char *tidesdb_objstore_backend_name(tidesdb_objstore_backend_t backend)
+{
+    switch (backend)
+    {
+        case TDB_BACKEND_FS:
+            return "fs";
+        case TDB_BACKEND_S3:
+            return "s3";
+        default:
+            return "unknown";
+    }
+}
+
+/**
  * tidesdb_objstore_t
  * pluggable object store connector interface.
  * each function receives the opaque ctx pointer set at registration.
  * object keys are path-like strings (e.g. "cf_name/L1_100.klog").
  * connectors must be thread-safe -- multiple threads may call concurrently.
- * @param name connector name for logging (e.g. "s3", "gcs", "azure", "fs")
+ * @param backend identifies the object store backend
  * @param put function pointer to upload an object from a local file
  * @param get function pointer to download an object to a local file
  * @param range_get function pointer to download a byte range into a buffer
@@ -39,7 +70,7 @@
  */
 typedef struct
 {
-    const char *name; /* connector name for logging (e.g. "s3", "gcs", "azure", "fs") */
+    tidesdb_objstore_backend_t backend; /* identifies the object store backend */
 
     /**
      * put -- upload an object from a local file path.

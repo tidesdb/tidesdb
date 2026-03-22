@@ -430,7 +430,7 @@ tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir)
         return NULL;
     }
 
-    store->name = "fs";
+    store->backend = TDB_BACKEND_FS;
     store->put = fs_put;
     store->get = fs_get;
     store->range_get = fs_range_get;

@@ -200,7 +200,7 @@ static ssize_t fs_range_get(void *ctx, const char *key, uint64_t offset, void *b
     char full[TDB_FS_MAX_PATH];
     fs_full_path(fs, key, full, sizeof(full));
 
-    int fd = open(full, O_RDONLY);
+    int fd = open(full, O_RDONLY, 0);
     if (fd < 0) return -1;
 
     ssize_t nread = pread(fd, buf, size, (off_t)offset);

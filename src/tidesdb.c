@@ -22522,14 +22522,25 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
     }
 
     tidesdb_kv_pair_t *max_kv = iter->heap->sources[0]->current_kv;
-    uint8_t *max_key = max_kv->key;
-    size_t max_key_size = max_kv->entry.key_size;
+    const size_t max_key_size = max_kv->entry.key_size;
+
+    /* copy the max key to a local buffer before calling seek_for_prev.
+     * seek_for_prev frees source->current_kv (which IS max_kv), so the
+     * pointer would dangle if we passed it directly. */
+    uint8_t key_stack[TDB_ITER_STACK_KEY_SIZE];
+    uint8_t *max_key_copy =
+        max_key_size <= sizeof(key_stack) ? key_stack : (uint8_t *)malloc(max_key_size);
+    if (!max_key_copy) return TDB_ERR_MEMORY;
+    memcpy(max_key_copy, max_kv->key, max_key_size);
 
     /* delegate to seek_for_prev which positions ALL sources at max_key
      * and handles tombstone visibility correctly across all sources.
      * this avoids the bug where the pop loop over-retreats a tombstone
      * source, causing its tombstones to be missed during prev(). */
-    return tidesdb_iter_seek_for_prev(iter, max_key, max_key_size);
+    const int result = tidesdb_iter_seek_for_prev(iter, max_key_copy, max_key_size);
+
+    if (max_key_copy != key_stack) free(max_key_copy);
+    return result;
 }
 
 int tidesdb_iter_next(tidesdb_iter_t *iter)

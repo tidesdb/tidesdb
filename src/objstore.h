@@ -165,6 +165,10 @@ typedef struct
  *        atomic file size for lock-free detection. the reaper thread checks every cycle (~100ms)
  *        and uploads when the threshold is exceeded, bounding the data loss window to the
  *        write volume rather than wall clock time
+ * @param wal_sync_on_commit upload WAL after every txn commit for RPO=0 replication (default 0)
+ * @param replica_mode enable read-only replica mode (default 0)
+ * @param replica_sync_interval_us MANIFEST poll interval in microseconds (default 5000000)
+ * @param replica_replay_wal replay WAL for near-real-time reads on replicas (default 1)
  */
 typedef struct
 {
@@ -186,6 +190,13 @@ typedef struct
     int wal_upload_sync;             /* 0 = background WAL upload (default), 1 = block flush */
     size_t wal_sync_threshold_bytes; /* sync WAL when it grows by this many bytes (default 1MB, 0 =
                                         off) */
+
+    /* sync-on-commit and replica */
+    int wal_sync_on_commit; /* upload WAL after every txn commit for RPO=0 (default 0) */
+    int replica_mode;       /* enable read-only replica mode (default 0) */
+    uint64_t
+        replica_sync_interval_us; /* MANIFEST poll interval in microseconds (default 5000000) */
+    int replica_replay_wal;       /* replay WAL for near-real-time reads (default 1) */
 } tidesdb_objstore_config_t;
 
 /**

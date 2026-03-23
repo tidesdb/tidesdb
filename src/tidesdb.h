@@ -135,6 +135,7 @@ typedef enum
 #define TDB_ERR_INVALID_DB   -10
 #define TDB_ERR_UNKNOWN      -11
 #define TDB_ERR_LOCKED       -12
+#define TDB_ERR_READONLY     -13
 
 #ifdef TDB_ENABLE_READ_PROFILING
 /**
@@ -665,6 +666,8 @@ struct tidesdb_level_t
  * @param last_uploaded_gen highest WAL generation confirmed uploaded to object store
  * @param total_uploads lifetime count of objects uploaded to object store
  * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
+ * @param replica_mode 1 if running as read-only replica, 0 if primary
+ * @param replica_sync_counter reaper cycle counter for MANIFEST poll throttling
  */
 struct tidesdb_t
 {
@@ -744,6 +747,10 @@ struct tidesdb_t
     _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
     _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
     uint64_t last_wal_sync_size;             /* WAL file size at last object store sync */
+
+    /* replica mode runtime state */
+    _Atomic(int) replica_mode; /* 1 = read-only replica, 0 = primary */
+    int replica_sync_counter;  /* reaper cycle counter for MANIFEST poll */
 };
 
 /**
@@ -971,6 +978,7 @@ typedef struct tidesdb_cache_stats_t
  * @param upload_queue_depth number of pending upload jobs in the queue
  * @param total_uploads lifetime count of objects uploaded to object store
  * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
+ * @param replica_mode whether running in read-only replica mode
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -1004,6 +1012,7 @@ typedef struct tidesdb_db_stats_t
     size_t upload_queue_depth;
     uint64_t total_uploads;
     uint64_t total_upload_failures;
+    int replica_mode;
 } tidesdb_db_stats_t;
 
 /**
@@ -1059,6 +1068,15 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
  * @return 0 on success, -n on failure
  */
 int tidesdb_close(tidesdb_t *db);
+
+/**
+ * tidesdb_promote_to_primary
+ * switch a read-only replica to primary mode. performs a final WAL replay
+ * and MANIFEST sync, then enables write acceptance.
+ * @param db database handle in replica mode
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS if not a replica
+ */
+int tidesdb_promote_to_primary(tidesdb_t *db);
 
 #ifdef TDB_ENABLE_READ_PROFILING
 /**

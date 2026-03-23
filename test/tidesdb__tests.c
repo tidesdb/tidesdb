@@ -24395,7 +24395,6 @@ static void test_unified_four_cf_single_txn(void)
         ASSERT_TRUE(cfs[i] != NULL);
     }
 
-    /* seed 1000 rows per CF (mimics sysbench prepare phase) */
     for (int i = 0; i < 1000; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -25394,6 +25393,486 @@ static void tdb_cf_list_noop_cb(const char *key, size_t size, void *cb_ctx)
     (void)cb_ctx;
 }
 
+static void test_objstore_paired_eviction(void)
+{
+    cleanup_test_dir();
+    const char *objstore_dir = "./test_objstore_evict";
+    remove_directory(objstore_dir);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(store != NULL);
+
+    tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+    os_cfg.local_cache_max_bytes = 1; /* 1 byte limit forces immediate eviction */
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.object_store = store;
+    config.object_store_config = &os_cfg;
+    config.unified_memtable_write_buffer_size = 4096;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "evict_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "evict_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write enough to trigger flush */
+    for (int i = 0; i < 20; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[128];
+        snprintf(key, sizeof(key), "ekey_%04d", i);
+        snprintf(value, sizeof(value), "eval_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    for (int w = 0; w < 200; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(20000);
+    }
+    usleep(200000);
+
+    /* with 1 byte cache limit, files should be evicted but data still readable
+     * via range_get from the object store */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    int found = 0;
+    for (int i = 0; i < 20; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "ekey_%04d", i);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 && val)
+        {
+            found++;
+            free(val);
+        }
+    }
+    tidesdb_txn_free(txn);
+    printf("  paired eviction: read %d/20 keys after cache eviction\n", found);
+    ASSERT_TRUE(found > 0);
+
+    tidesdb_close(db);
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
+static void test_objstore_stats(void)
+{
+    cleanup_test_dir();
+    const char *objstore_dir = "./test_objstore_stats";
+    remove_directory(objstore_dir);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(store != NULL);
+
+    tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.object_store = store;
+    config.object_store_config = &os_cfg;
+    config.unified_memtable_write_buffer_size = 4096;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "stats_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "stats_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write enough data with large values to trigger multiple flushes */
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[256];
+        snprintf(key, sizeof(key), "skey_%04d", i);
+        memset(value, 'S' + (i % 20), sizeof(value) - 1);
+        value[sizeof(value) - 1] = '\0';
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    for (int w = 0; w < 200; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(20000);
+    }
+    /* wait for async uploads to complete (SSTable uploads + MANIFEST) */
+    for (int w = 0; w < 100; w++)
+    {
+        if (db->upload_queue && queue_size(db->upload_queue) == 0) break;
+        usleep(50000);
+    }
+    usleep(200000);
+
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+    ASSERT_TRUE(stats.object_store_enabled == 1);
+    ASSERT_TRUE(stats.total_uploads > 0);
+    ASSERT_TRUE(stats.total_upload_failures == 0);
+    ASSERT_TRUE(stats.replica_mode == 0);
+    ASSERT_TRUE(stats.object_store_connector != NULL);
+    printf("  objstore stats: enabled=%d uploads=%" PRIu64 " failures=%" PRIu64
+           " connector=%s replica=%d\n",
+           stats.object_store_enabled, stats.total_uploads, stats.total_upload_failures,
+           stats.object_store_connector, stats.replica_mode);
+
+    tidesdb_close(db);
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
+static void test_objstore_frozen_point_lookup(void)
+{
+    cleanup_test_dir();
+    const char *objstore_dir = "./test_objstore_frozen";
+    remove_directory(objstore_dir);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(store != NULL);
+
+    tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.object_store = store;
+    config.object_store_config = &os_cfg;
+    config.unified_memtable_write_buffer_size = 4096;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "frozen_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "frozen_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write and flush */
+    for (int i = 0; i < 30; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[128];
+        snprintf(key, sizeof(key), "fkey_%04d", i);
+        snprintf(value, sizeof(value), "fval_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* wait for flush and upload */
+    for (int w = 0; w < 200; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(20000);
+    }
+    usleep(500000);
+
+    /* delete local SSTable files to simulate frozen state.
+     * the block managers may be open so close them first via the reaper. */
+    int num_levels = atomic_load(&cf->num_active_levels);
+    for (int l = 0; l < num_levels; l++)
+    {
+        if (!cf->levels[l]) continue;
+        int num_ssts = atomic_load(&cf->levels[l]->num_sstables);
+        tidesdb_sstable_t **ssts =
+            atomic_load_explicit(&cf->levels[l]->sstables, memory_order_acquire);
+        for (int s = 0; s < num_ssts; s++)
+        {
+            if (!ssts[s]) continue;
+            /* close block managers if open */
+            if (ssts[s]->klog_bm)
+            {
+                block_manager_close(ssts[s]->klog_bm);
+                ssts[s]->klog_bm = NULL;
+            }
+            if (ssts[s]->vlog_bm)
+            {
+                block_manager_close(ssts[s]->vlog_bm);
+                ssts[s]->vlog_bm = NULL;
+            }
+            /* delete local files */
+            if (ssts[s]->klog_path) unlink(ssts[s]->klog_path);
+            if (ssts[s]->vlog_path) unlink(ssts[s]->vlog_path);
+        }
+    }
+
+    /* point lookups should still work via range_get from object store */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    int found = 0;
+    for (int i = 0; i < 30; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "fkey_%04d", i);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 && val)
+        {
+            found++;
+            free(val);
+        }
+    }
+    tidesdb_txn_free(txn);
+    printf("  frozen point lookup: read %d/30 keys via range_get\n", found);
+    ASSERT_TRUE(found > 0);
+
+    tidesdb_close(db);
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
+static void test_objstore_wal_sync_on_commit(void)
+{
+    cleanup_test_dir();
+    const char *objstore_dir = "./test_objstore_walsync";
+    remove_directory(objstore_dir);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(store != NULL);
+
+    tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+    os_cfg.wal_sync_on_commit = 1;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.object_store = store;
+    config.object_store_config = &os_cfg;
+    config.unified_memtable_write_buffer_size = 4096;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "walsync_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "walsync_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 20; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[128];
+        snprintf(key, sizeof(key), "wskey_%04d", i);
+        snprintf(value, sizeof(value), "wsval_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    for (int w = 0; w < 200; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(20000);
+    }
+    usleep(200000);
+    tidesdb_close(db);
+
+    cleanup_test_dir();
+
+    tidesdb_objstore_t *store2 = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(store2 != NULL);
+    tidesdb_objstore_config_t os_cfg2 = tidesdb_objstore_default_config();
+    tidesdb_config_t config2 = tidesdb_default_config();
+    config2.db_path = TEST_DB_PATH;
+    config2.object_store = store2;
+    config2.object_store_config = &os_cfg2;
+    config2.unified_memtable_write_buffer_size = 4096;
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config2, &db), 0);
+
+    cf = tidesdb_get_column_family(db, "walsync_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *rtxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &rtxn), 0);
+    int found = 0;
+    for (int i = 0; i < 20; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "wskey_%04d", i);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(rtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 && val)
+        {
+            found++;
+            free(val);
+        }
+    }
+    tidesdb_txn_free(rtxn);
+    printf("  wal_sync_on_commit: cold start read %d/20 keys\n", found);
+    ASSERT_TRUE(found > 0);
+
+    tidesdb_close(db);
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
+static void test_replica_mode(void)
+{
+    cleanup_test_dir();
+
+    const char *objstore_dir = "./test_replica_store";
+    remove_directory(objstore_dir);
+
+    {
+        tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+        ASSERT_TRUE(store != NULL);
+
+        tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+        os_cfg.wal_sync_on_commit = 1; /* sync WAL on every commit for replica freshness */
+
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.object_store = store;
+        config.object_store_config = &os_cfg;
+        config.unified_memtable_write_buffer_size = 4096;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "replica_cf", &cf_config), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "replica_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        for (int i = 0; i < 30; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[64], value[128];
+            snprintf(key, sizeof(key), "rkey_%04d", i);
+            snprintf(value, sizeof(value), "rval_%04d", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        /* wait for flush */
+        for (int w = 0; w < 200; w++)
+        {
+            if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing))
+                break;
+            usleep(20000);
+        }
+        usleep(200000);
+
+        tidesdb_close(db);
+    }
+
+    printf("  replica: primary wrote 30 keys and uploaded to store\n");
+
+    /*  open as replica and verify reads work and writes are rejected */
+    cleanup_test_dir();
+
+    {
+        tidesdb_objstore_t *store2 = tidesdb_objstore_fs_create(objstore_dir);
+        ASSERT_TRUE(store2 != NULL);
+
+        tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+        os_cfg.replica_mode = 1;
+        os_cfg.replica_replay_wal = 1;
+        os_cfg.replica_sync_interval_us = 100000; /* 100ms for fast test */
+
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.object_store = store2;
+        config.object_store_config = &os_cfg;
+        config.unified_memtable_write_buffer_size = 4096;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+        /* verify replica mode is active */
+        tidesdb_db_stats_t stats;
+        ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+        ASSERT_TRUE(stats.replica_mode == 1);
+
+        /* cold start should have discovered the CF */
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "replica_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        /* read data */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        int found = 0;
+        for (int i = 0; i < 30; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "rkey_%04d", i);
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 &&
+                val)
+            {
+                found++;
+                free(val);
+            }
+        }
+        tidesdb_txn_free(txn);
+        printf("  replica: read back %d/30 keys\n", found);
+        ASSERT_TRUE(found > 0);
+
+        /* verify writes are rejected */
+        tidesdb_txn_t *wtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &wtxn), 0);
+        int put_rc = tidesdb_txn_put(wtxn, cf, (uint8_t *)"blocked", 8, (uint8_t *)"nope", 5, 0);
+        ASSERT_EQ(put_rc, TDB_ERR_READONLY);
+        printf("  replica: write correctly rejected with TDB_ERR_READONLY\n");
+        tidesdb_txn_free(wtxn);
+
+        /* we promote to primary and verify writes work */
+        ASSERT_EQ(tidesdb_promote_to_primary(db), 0);
+
+        tidesdb_txn_t *ptxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &ptxn), 0);
+        ASSERT_EQ(tidesdb_txn_put(ptxn, cf, (uint8_t *)"promoted_key", 13,
+                                  (uint8_t *)"promoted_val", 13, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(ptxn), 0);
+        tidesdb_txn_free(ptxn);
+        printf("  replica: promoted to primary, write succeeded\n");
+
+        /* verify the promoted write is readable */
+        tidesdb_txn_t *rtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &rtxn), 0);
+        uint8_t *pval = NULL;
+        size_t pval_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(rtxn, cf, (uint8_t *)"promoted_key", 13, &pval, &pval_size), 0);
+        ASSERT_TRUE(pval != NULL);
+        free(pval);
+        tidesdb_txn_free(rtxn);
+
+        tidesdb_close(db);
+    }
+
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
 /**
  * test_objstore_s3_minio
  * end-to-end S3 integration test against a live MinIO instance.
@@ -25992,6 +26471,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_cold_start, tests_passed);
     RUN_TEST(test_objstore_compaction_and_iterators, tests_passed);
     RUN_TEST(test_unified_iterator_consistency, tests_passed);
+    RUN_TEST(test_objstore_paired_eviction, tests_passed);
+    RUN_TEST(test_objstore_stats, tests_passed);
+    RUN_TEST(test_objstore_frozen_point_lookup, tests_passed);
+    RUN_TEST(test_objstore_wal_sync_on_commit, tests_passed);
+    RUN_TEST(test_replica_mode, tests_passed);
 #ifdef TIDESDB_WITH_S3
     RUN_TEST(test_objstore_s3_minio, tests_passed);
 #endif

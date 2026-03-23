@@ -78,6 +78,10 @@ typedef struct tidesdb_objstore_t tidesdb_objstore_t;
  * @param wal_upload_sync 0 = background WAL upload (default), 1 = block flush until uploaded
  * @param wal_sync_threshold_bytes sync active WAL when it grows by this many bytes (default 1MB, 0
  * = off)
+ * @param wal_sync_on_commit upload WAL after every txn commit for RPO=0 replication (default 0)
+ * @param replica_mode enable read-only replica mode (default 0)
+ * @param replica_sync_interval_us MANIFEST poll interval in microseconds (default 5000000)
+ * @param replica_replay_wal replay WAL for near-real-time reads on replicas (default 1)
  */
 typedef struct
 {
@@ -93,6 +97,10 @@ typedef struct
     int replicate_wal;
     int wal_upload_sync;
     size_t wal_sync_threshold_bytes;
+    int wal_sync_on_commit;
+    int replica_mode;
+    uint64_t replica_sync_interval_us;
+    int replica_replay_wal;
 } tidesdb_objstore_config_t;
 
 tidesdb_objstore_config_t tidesdb_objstore_default_config(void);
@@ -152,6 +160,7 @@ typedef enum
 #define TDB_ERR_INVALID_DB   -10
 #define TDB_ERR_UNKNOWN      -11
 #define TDB_ERR_LOCKED       -12
+#define TDB_ERR_READONLY     -13
 
 /** configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
@@ -407,6 +416,7 @@ typedef struct tidesdb_cache_stats_t
  * @param upload_queue_depth number of pending upload jobs in the queue
  * @param total_uploads lifetime count of objects uploaded to object store
  * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
+ * @param replica_mode whether running in read-only replica mode
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -440,6 +450,7 @@ typedef struct tidesdb_db_stats_t
     size_t upload_queue_depth;
     uint64_t total_uploads;
     uint64_t total_upload_failures;
+    int replica_mode;
 } tidesdb_db_stats_t;
 
 /**** system default configuration functions */
@@ -681,5 +692,13 @@ int tidesdb_sync_wal(tidesdb_column_family_t *cf);
  * @return connector handle or NULL on error
  */
 tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir);
+
+/**
+ * tidesdb_promote_to_primary
+ * switch a read-only replica to primary mode
+ * @param db database handle in replica mode
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS if not a replica
+ */
+int tidesdb_promote_to_primary(tidesdb_t *db);
 
 #endif /* __TIDESDB_DB_H__ */

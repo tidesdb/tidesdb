@@ -360,7 +360,7 @@ static int fs_list(void *ctx, const char *prefix,
                    void (*cb)(const char *key, size_t size, void *cb_ctx), void *cb_ctx)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char dir_path[TDB_FS_MAX_PATH];
+    char dir_path[TDB_FS_MAX_PATH + TDB_FS_MAX_PATH];
 
     snprintf(dir_path, sizeof(dir_path), "%s/%s", fs->root_dir, prefix);
 

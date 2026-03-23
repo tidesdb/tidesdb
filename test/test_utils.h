@@ -37,7 +37,7 @@ static UNUSED int tests_skipped = 0;
     } while (0)
 
 /* disable format-truncation warnings for test utilities. all path buffers use 1024 bytes */
-#ifndef _MSC_VER
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #endif
@@ -113,7 +113,7 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
     }
 }
 
-#ifndef _MSC_VER
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
 

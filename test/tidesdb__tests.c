@@ -25383,16 +25383,6 @@ static void test_unified_iterator_consistency(void)
     cleanup_test_dir();
 }
 
-#ifdef TIDESDB_WITH_S3
-#include "../src/objstore_s3.h"
-
-static void tdb_cf_list_noop_cb(const char *key, size_t size, void *cb_ctx)
-{
-    (void)key;
-    (void)size;
-    (void)cb_ctx;
-}
-
 static void test_objstore_paired_eviction(void)
 {
     cleanup_test_dir();
@@ -25871,6 +25861,16 @@ static void test_replica_mode(void)
 
     remove_directory(objstore_dir);
     cleanup_test_dir();
+}
+
+#ifdef TIDESDB_WITH_S3
+#include "../src/objstore_s3.h"
+
+static void tdb_cf_list_noop_cb(const char *key, size_t size, void *cb_ctx)
+{
+    (void)key;
+    (void)size;
+    (void)cb_ctx;
 }
 
 /**

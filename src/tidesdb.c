@@ -4261,8 +4261,8 @@ static void *tdb_cold_start_download_worker(void *arg)
     tidesdb_t *db = ctx->db;
     const char *cf_name = ctx->cf_name;
 
-    /* create local CF directory */
-    char cf_dir[TDB_MAX_PATH_LEN];
+    /* create local CF directory (leave room for /config.ini and /MANIFEST suffixes) */
+    char cf_dir[TDB_MAX_PATH_LEN - 32];
     snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
     mkdir(cf_dir, 0755);
 

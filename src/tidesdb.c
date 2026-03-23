@@ -3376,8 +3376,10 @@ static void *tdb_upload_worker_thread(void *arg)
                 }
             }
 
-            /* verify upload landed by checking the object exists with correct size */
-            if (rc == 0)
+            /* verify upload landed by checking the object exists with correct size.
+             * skip size verification for MANIFEST files since they are mutable and
+             * may grow between upload and the exists check due to concurrent flushes. */
+            if (rc == 0 && !strstr(job->object_key, "MANIFEST"))
             {
                 struct stat local_st;
                 if (stat(job->local_path, &local_st) == 0)

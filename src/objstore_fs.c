@@ -168,7 +168,7 @@ static int fs_copy_file(const char *src_path, const char *dst_path)
 static int fs_put(void *ctx, const char *key, const char *local_path)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char full[TDB_FS_MAX_PATH];
+    char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
     return fs_copy_file(local_path, full);
 }
@@ -184,7 +184,7 @@ static int fs_put(void *ctx, const char *key, const char *local_path)
 static int fs_get(void *ctx, const char *key, const char *local_path)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char full[TDB_FS_MAX_PATH];
+    char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
     return fs_copy_file(full, local_path);
 }
@@ -202,7 +202,7 @@ static int fs_get(void *ctx, const char *key, const char *local_path)
 static ssize_t fs_range_get(void *ctx, const char *key, uint64_t offset, void *buf, size_t size)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char full[TDB_FS_MAX_PATH];
+    char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
 
     int fd = open(full, O_RDONLY, 0);
@@ -223,7 +223,7 @@ static ssize_t fs_range_get(void *ctx, const char *key, uint64_t offset, void *b
 static int fs_delete_object(void *ctx, const char *key)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char full[TDB_FS_MAX_PATH];
+    char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
 
 #ifdef _WIN32
@@ -245,7 +245,7 @@ static int fs_delete_object(void *ctx, const char *key)
 static int fs_exists(void *ctx, const char *key, size_t *size_out)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char full[TDB_FS_MAX_PATH];
+    char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
 
     struct stat st;
@@ -286,7 +286,7 @@ static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t ro
     {
         if (fd.name[0] == '.') continue;
 
-        char full[TDB_FS_MAX_PATH];
+        char full[TDB_FS_MAX_PATH * 2];
         snprintf(full, sizeof(full), "%s\\%s", dir_path, fd.name);
 
         if (fd.attrib & _A_SUBDIR)
@@ -323,7 +323,7 @@ static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t ro
     {
         if (ent->d_name[0] == '.') continue;
 
-        char full[TDB_FS_MAX_PATH];
+        char full[TDB_FS_MAX_PATH * 2];
         snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
 
         struct stat st;

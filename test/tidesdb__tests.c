@@ -8296,10 +8296,10 @@ static void test_iterator_read_own_uncommitted_writes(void)
               0);
 
     /* we create iterator within the transaction -- should see all sources merged:
-     * sstable: 00, 10, 20, 30, 40
-     * memtable: 05, 15, 25, 35, 45
-     * uncommitted: 02, 12, 22, 32, 42 + overwrite of 10
-     * expected order: 00, 02, 05, 10(uncommitted), 12, 15, 20, 22, 25, 30, 32, 35, 40, 42, 45
+     * sstable          -- 00, 10, 20, 30, 40
+     * memtable         -- 05, 15, 25, 35, 45
+     * uncommitted      -- 02, 12, 22, 32, 42 + overwrite of 10
+     * expected order   -- 00, 02, 05, 10(uncommitted), 12, 15, 20, 22, 25, 30, 32, 35, 40, 42, 45
      */
     tidesdb_iter_t *iter = NULL;
     ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
@@ -8444,11 +8444,11 @@ static void test_iterator_uncommitted_deletes(void)
     /* also delete a memtable key */
     ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_15", 7), 0);
 
-    /* we create iterator -- uncommitted deletes should mask committed values
-     * sstable: 00, 10, 20, 30, 40
-     * memtable: 05, 15, 25, 35, 45
-     * uncommitted deletes: 10, 15, 20, 30
-     * expected visible: 00, 05, 25, 35, 40, 45 */
+    /* we create iterator   -- uncommitted deletes should mask committed values
+     * sstable              -- 00, 10, 20, 30, 40
+     * memtable             -- 05, 15, 25, 35, 45
+     * uncommitted deletes  -- 10, 15, 20, 30
+     * expected visible     -- 00, 05, 25, 35, 40, 45 */
     tidesdb_iter_t *iter = NULL;
     ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
     ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
@@ -8575,7 +8575,7 @@ static void test_txn_get_uncommitted_delete_masks_uncommitted_put(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* in same txn: put then delete then get */
+    /* in same txn -- put then delete then get */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -8614,7 +8614,7 @@ static void test_txn_get_put_after_delete(void)
     ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
     tidesdb_txn_free(txn1);
 
-    /* in same txn: delete then put with new value then get */
+    /* in same txn -- delete then put with new value then get */
     tidesdb_txn_t *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
     ASSERT_EQ(tidesdb_txn_delete(txn2, cf, key, sizeof(key)), 0);
@@ -8646,7 +8646,7 @@ static void test_txn_get_multiple_puts_same_key(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* in same txn: put key three times, get should return last value */
+    /* in same txn -- put key three times, get should return last value */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -8707,7 +8707,7 @@ static void test_iter_seek_preserves_txn_ops(void)
     ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_C", 6), 0);
     ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)"key_F", 6, (uint8_t *)"val_F", 6, 0), 0);
 
-    /* expected visible: A, B(new), D, E, F  (C deleted) */
+    /* expected visible -- A, B(new), D, E, F  (C deleted) */
 
     /* we create iterator and seek_to_first */
     tidesdb_iter_t *iter = NULL;
@@ -20005,7 +20005,7 @@ static void *unified_reader_thread(void *arg)
             char key[64];
             if (k < 3)
             {
-                /* shared keys: likely in active memtable or recently rotated immutable */
+                /* shared keys -- likely in active memtable or recently rotated immutable */
                 snprintf(key, sizeof(key), "shared_%06d", (i * 3 + k) % 40);
             }
             else
@@ -23177,7 +23177,7 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
     printf("  multi-CF mixed isolation cross-txn: errors=%d\n", final_errors);
     ASSERT_EQ(final_errors, 0);
 
-    /* verify: all committed cross-CF writes are present in both CFs */
+    /* verify -- all committed cross-CF writes are present in both CFs */
     tidesdb_txn_t *vtxn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
     int found_x = 0, found_y = 0, mismatch = 0;
@@ -23809,7 +23809,7 @@ static void test_unified_flush_to_sstable(void)
     /* wait for background flushes to complete */
     usleep(500000);
 
-    /* we verify all keys still readable (from memtable or SSTable) */
+    /* we verify all keys still readable (from memtable or sstable) */
     for (int i = 0; i < 200; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -23931,7 +23931,7 @@ static void test_unified_multi_cf_many_keys(void)
         tidesdb_txn_free(txn);
     }
 
-    /* verify isolation: same key has different values in each CF */
+    /* verify isolation -- same key has different values in each CF */
     for (int i = 0; i < 100; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -24414,7 +24414,7 @@ static void test_unified_four_cf_single_txn(void)
     }
     printf("  seeded 1000 rows x 4 CFs\n");
 
-    /* sysbench-like pattern: UPDATE t1 + UPDATE t2 + DELETE t3 + INSERT t4
+    /* sysbench-like pattern -- UPDATE t1 + UPDATE t2 + DELETE t3 + INSERT t4
      * this is the pattern that triggers the 4-CF unified commit bug */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -24509,7 +24509,7 @@ static void test_unified_four_cf_single_txn(void)
     free(rv);
     tidesdb_txn_free(txn);
 
-    /* stress: 100 rounds of 4-CF sysbench txns */
+    /* stress -- 100 rounds of 4-CF sysbench txns */
     for (int r = 0; r < 100; r++)
     {
         txn = NULL;
@@ -24792,7 +24792,7 @@ static void test_perf_cached_iter_seek(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 16 * 1024; /* 16KB avoids creating hundreds of SSTables */
+    cf_config.write_buffer_size = 16 * 1024; /* 16KB avoids creating hundreds of sstables */
     cf_config.compression_algorithm = TDB_COMPRESS_NONE;
     cf_config.enable_bloom_filter = 1;
     cf_config.enable_block_indexes = 1;
@@ -25503,7 +25503,7 @@ static void test_objstore_stats(void)
         if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
         usleep(20000);
     }
-    /* wait for async uploads to complete (SSTable uploads + MANIFEST) */
+    /* wait for async uploads to complete (sstable uploads + MANIFEST) */
     for (int w = 0; w < 100; w++)
     {
         if (db->upload_queue && queue_size(db->upload_queue) == 0) break;
@@ -25576,7 +25576,7 @@ static void test_objstore_frozen_point_lookup(void)
     }
     usleep(500000);
 
-    /* delete local SSTable files to simulate frozen state.
+    /* delete local sstable files to simulate frozen state.
      * the block managers may be open so close them first via the reaper. */
     int num_levels = atomic_load(&cf->num_active_levels);
     for (int l = 0; l < num_levels; l++)
@@ -25775,7 +25775,7 @@ static void test_replica_mode(void)
 
     printf("  replica: primary wrote 30 keys and uploaded to store\n");
 
-    /*  open as replica and verify reads work and writes are rejected */
+    /* we open as replica and verify reads work and writes are rejected */
     cleanup_test_dir();
 
     {
@@ -25796,7 +25796,7 @@ static void test_replica_mode(void)
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&config, &db), 0);
 
-        /* verify replica mode is active */
+        /* we verify replica mode is active */
         tidesdb_db_stats_t stats;
         ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
         ASSERT_TRUE(stats.replica_mode == 1);
@@ -25805,7 +25805,7 @@ static void test_replica_mode(void)
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "replica_cf");
         ASSERT_TRUE(cf != NULL);
 
-        /* read data */
+        /* we read data */
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
         int found = 0;
@@ -25873,14 +25873,6 @@ static void tdb_cf_list_noop_cb(const char *key, size_t size, void *cb_ctx)
     (void)cb_ctx;
 }
 
-/**
- * test_objstore_s3_minio
- * end-to-end S3 integration test against a live MinIO instance.
- * reads connection details from environment variables.
- * skips gracefully if env vars are not set (local dev without MinIO).
- * tests put, get, exists, delete, list, range_get, and full database
- * roundtrip with write, flush, read, cold start recovery.
- */
 static void test_objstore_s3_minio(void)
 {
     const char *endpoint = getenv("TIDESDB_S3_ENDPOINT");
@@ -26089,7 +26081,7 @@ static void test_objstore_s3_minio(void)
 
     tidesdb_close(db);
 
-    /* cold start test: delete all local state, reopen from S3 */
+    /* cold start test -- we delete all local state, reopen from S3 */
     cleanup_test_dir();
 
     tidesdb_objstore_t *s3_recover = tidesdb_objstore_s3_create(endpoint, bucket, "tidesdb_test/",

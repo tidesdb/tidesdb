@@ -445,6 +445,42 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     return offset;
 }
 
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t size)
+{
+    if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
+
+    const size_t total_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size + BLOCK_MANAGER_FOOTER_SIZE;
+
+    const uint32_t checksum = compute_checksum(data, size);
+
+    const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
+
+    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
+    encode_uint32_le_compat(header, size);
+    encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
+
+    unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
+    encode_uint32_le_compat(footer, size);
+    encode_uint32_le_compat(footer + 4, BLOCK_MANAGER_FOOTER_MAGIC);
+
+    struct iovec iov[3];
+    iov[0].iov_base = header;
+    iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    iov[1].iov_base = (void *)data;
+    iov[1].iov_len = size;
+    iov[2].iov_base = footer;
+    iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
+
+    if (BM_UNLIKELY(pwritev(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size)) return -1;
+
+    if (is_sync_full(bm) && !odsync_available())
+    {
+        if (fdatasync(bm->fd) != 0) return -1;
+    }
+
+    return offset;
+}
+
 int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t **blocks,
                                     const size_t count, int64_t *offsets)
 {

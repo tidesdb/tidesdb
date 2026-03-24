@@ -925,8 +925,258 @@ void test_block_manager_open_safety()
     }
 }
 
+/**
+ * test_block_manager_write_raw
+ * verifies that block_manager_write_raw produces the same on-disk format
+ * as block_manager_block_write, and that blocks written with write_raw
+ * are correctly readable via cursor_read after close+reopen.
+ */
+void test_block_manager_write_raw(void)
+{
+    /* --- 1. basic write + read back ----------------------------------- */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char payload[] = "hello_write_raw_test";
+    const uint32_t payload_size = (uint32_t)(strlen(payload) + 1);
+
+    int64_t offset = block_manager_write_raw(bm, payload, payload_size);
+    ASSERT_TRUE(offset >= 0);
+
+    /* read it back immediately via cursor */
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset) == 0);
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(block->size, payload_size);
+    ASSERT_EQ(memcmp(block->data, payload, payload_size), 0);
+    block_manager_block_free(block);
+    block_manager_cursor_free(cursor);
+
+    /* close and reopen to verify persistence */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset) == 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(block->size, payload_size);
+    ASSERT_EQ(memcmp(block->data, payload, payload_size), 0);
+    block_manager_block_free(block);
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("test_write_raw.db");
+
+    /* --- 2. multiple raw writes + sequential cursor iteration --------- */
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const int num_entries = 20;
+    char bufs[20][64];
+    for (int i = 0; i < num_entries; i++)
+    {
+        snprintf(bufs[i], sizeof(bufs[i]), "raw_entry_%04d", i);
+        int64_t off = block_manager_write_raw(bm, bufs[i], (uint32_t)(strlen(bufs[i]) + 1));
+        ASSERT_TRUE(off >= 0);
+    }
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    int count = 0;
+    do
+    {
+        block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        char expected[64];
+        snprintf(expected, sizeof(expected), "raw_entry_%04d", count);
+        ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        block_manager_block_free(block);
+        count++;
+    } while (block_manager_cursor_next(cursor) == 0);
+
+    ASSERT_EQ(count, num_entries);
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("test_write_raw.db");
+
+    /* --- 3. interleave write_raw and block_write ---------------------- */
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char raw_data[] = "from_write_raw";
+    const char blk_data[] = "from_block_write";
+
+    int64_t off_raw = block_manager_write_raw(bm, raw_data, (uint32_t)(strlen(raw_data) + 1));
+    ASSERT_TRUE(off_raw >= 0);
+
+    block_manager_block_t *blk = block_manager_block_create(strlen(blk_data) + 1, (void *)blk_data);
+    ASSERT_TRUE(blk != NULL);
+    int64_t off_blk = block_manager_block_write(bm, blk);
+    ASSERT_TRUE(off_blk >= 0);
+    block_manager_block_free(blk);
+
+    int64_t off_raw2 = block_manager_write_raw(bm, raw_data, (uint32_t)(strlen(raw_data) + 1));
+    ASSERT_TRUE(off_raw2 >= 0);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    /* block 0-- raw_data */
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(strcmp((char *)block->data, raw_data), 0);
+    block_manager_block_free(block);
+
+    /* block 1-- blk_data */
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(strcmp((char *)block->data, blk_data), 0);
+    block_manager_block_free(block);
+
+    /* block 2-- raw_data again */
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(strcmp((char *)block->data, raw_data), 0);
+    block_manager_block_free(block);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("test_write_raw.db");
+
+    /* --- 4. edge cases ------------------------------------------------ */
+    ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* NULL bm, NULL data, zero size should all return -1 */
+    ASSERT_EQ(block_manager_write_raw(NULL, raw_data, 10), -1);
+    ASSERT_EQ(block_manager_write_raw(bm, NULL, 10), -1);
+    ASSERT_EQ(block_manager_write_raw(bm, raw_data, 0), -1);
+
+    /* single-byte payload */
+    uint8_t one_byte = 0xAB;
+    int64_t off_one = block_manager_write_raw(bm, &one_byte, 1);
+    ASSERT_TRUE(off_one >= 0);
+
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)off_one) == 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_TRUE(block->size == 1);
+    ASSERT_TRUE(((uint8_t *)block->data)[0] == 0xAB);
+    block_manager_block_free(block);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("test_write_raw.db");
+}
+
 #define NUM_BLOCKS 100000
 #define BLOCK_SIZE 256
+
+/**
+ * benchmark_block_manager_write_raw
+ * compares write throughput of block_manager_write_raw vs block_manager_block_write
+ * and verifies data integrity of all blocks written via write_raw.
+ */
+void benchmark_block_manager_write_raw(void)
+{
+    const int bench_blocks = NUM_BLOCKS;
+    const int bench_size = BLOCK_SIZE;
+
+    /* pre-generate random block data */
+    uint8_t **data = malloc(bench_blocks * sizeof(uint8_t *));
+    ASSERT_TRUE(data != NULL);
+    for (int i = 0; i < bench_blocks; i++)
+    {
+        data[i] = malloc(bench_size);
+        ASSERT_TRUE(data[i] != NULL);
+        for (int j = 0; j < bench_size - 20; j++)
+        {
+            data[i][j] = (uint8_t)(rand() % 256); /* NOLINT(cert-msc30-c,cert-msc50-cpp) */
+        }
+        snprintf((char *)(data[i] + bench_size - 20), 20, "raw_%d", i);
+    }
+
+    /* --- benchmark block_write (baseline) ----------------------------- */
+    block_manager_t *bm = NULL;
+    (void)remove("bench_raw_baseline.db");
+    ASSERT_TRUE(block_manager_open(&bm, "bench_raw_baseline.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    clock_t t0 = clock();
+    for (int i = 0; i < bench_blocks; i++)
+    {
+        block_manager_block_t *blk = block_manager_block_create(bench_size, data[i]);
+        ASSERT_TRUE(blk != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, blk) >= 0);
+        block_manager_block_free(blk);
+    }
+    clock_t t1 = clock();
+    double baseline_sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("bench_raw_baseline.db");
+
+    /* --- benchmark write_raw ------------------------------------------ */
+    (void)remove("bench_raw_new.db");
+    ASSERT_TRUE(block_manager_open(&bm, "bench_raw_new.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    int64_t *offsets = malloc(bench_blocks * sizeof(int64_t));
+    ASSERT_TRUE(offsets != NULL);
+
+    t0 = clock();
+    for (int i = 0; i < bench_blocks; i++)
+    {
+        offsets[i] = block_manager_write_raw(bm, data[i], (uint32_t)bench_size);
+        ASSERT_TRUE(offsets[i] >= 0);
+    }
+    t1 = clock();
+    double raw_sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
+
+    printf(BOLDWHITE "Benchmark: write_raw vs block_write (%d x %d bytes)\n" RESET, bench_blocks,
+           bench_size);
+    printf(CYAN "  block_write: %.3f sec (%.2f MB/s)\n", baseline_sec,
+           baseline_sec > 0 ? (bench_blocks * bench_size) / (baseline_sec * 1024 * 1024) : 0.0);
+    printf("  write_raw:   %.3f sec (%.2f MB/s)\n" RESET, raw_sec,
+           raw_sec > 0 ? (bench_blocks * bench_size) / (raw_sec * 1024 * 1024) : 0.0);
+
+    /* --- verify all blocks written by write_raw ----------------------- */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "bench_raw_new.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    int verified = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+
+        char expected_id[20];
+        snprintf(expected_id, sizeof(expected_id), "raw_%d", verified);
+        ASSERT_TRUE(
+            memcmp((char *)block->data + bench_size - 20, expected_id, strlen(expected_id)) == 0);
+        ASSERT_EQ(block->size, (uint64_t)bench_size);
+
+        block_manager_block_free(block);
+        verified++;
+    } while (block_manager_cursor_next(cursor) == 0);
+
+    ASSERT_EQ(verified, bench_blocks);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("bench_raw_new.db");
+
+    free(offsets);
+    for (int i = 0; i < bench_blocks; i++) free(data[i]);
+    free(data);
+}
 
 void benchmark_block_manager()
 {
@@ -1258,7 +1508,6 @@ void benchmark_block_manager_iteration(void)
         block_manager_close(bm);
         ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
-        /* Phase 2: cursor_next iteration only (no data read) */
         block_manager_cursor_t *cursor;
         ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
@@ -1284,7 +1533,6 @@ void benchmark_block_manager_iteration(void)
 
         block_manager_cursor_free(cursor);
 
-        /* Phase 3: full read + verify (cursor_read every block) */
         block_manager_cursor_t *read_cursor;
         ASSERT_TRUE(block_manager_cursor_init(&read_cursor, bm) == 0);
 
@@ -2222,6 +2470,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_block_create, tests_passed);
     RUN_TEST(test_block_manager_block_write, tests_passed);
     RUN_TEST(test_block_manager_block_write_batch, tests_passed);
+    RUN_TEST(test_block_manager_write_raw, tests_passed);
     RUN_TEST(test_block_manager_block_write_close_reopen_read, tests_passed);
     RUN_TEST(test_block_manager_truncate, tests_passed);
     RUN_TEST(test_block_manager_count_blocks, tests_passed);
@@ -2262,6 +2511,7 @@ int main(int argc, char **argv)
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);
+    RUN_TEST(benchmark_block_manager_write_raw, tests_passed);
     RUN_TEST(benchmark_block_manager_iteration, tests_passed);
     RUN_TEST(benchmark_block_manager_parallel_write, tests_passed);
 

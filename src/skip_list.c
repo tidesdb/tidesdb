@@ -278,20 +278,12 @@ static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, con
  */
 static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const uint8_t *key2)
 {
-    /* we compare high 8 bytes first -- the most discriminating for sorted data */
-    uint64_t v1_hi, v2_hi;
-    memcpy(&v1_hi, key1, sizeof(uint64_t));
-    memcpy(&v2_hi, key2, sizeof(uint64_t));
-
-    if (v1_hi != v2_hi) return (v1_hi < v2_hi) ? -1 : 1;
-
-    /* only load low bytes if high bytes are equal */
-    uint64_t v1_lo, v2_lo;
-    memcpy(&v1_lo, key1 + 8, sizeof(uint64_t));
-    memcpy(&v2_lo, key2 + 8, sizeof(uint64_t));
-
-    if (v1_lo != v2_lo) return (v1_lo < v2_lo) ? -1 : 1;
-    return 0;
+    /* we use memcmp for correctness -- byte-order-independent lexicographic comparison.
+     * native uint64_t comparison would give wrong results on little-endian because
+     * the first byte (most significant for memcmp) lands in the least significant
+     * position of the loaded integer. */
+    const int cmp = memcmp(key1, key2, 16);
+    return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
 }
 
 /**
@@ -303,26 +295,12 @@ static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const ui
  */
 static inline int skip_list_compare_keys_32_inline(const uint8_t *key1, const uint8_t *key2)
 {
-    /* we compare 8 bytes at a time, early exit on first difference */
-    uint64_t v1, v2;
-
-    memcpy(&v1, key1, sizeof(uint64_t));
-    memcpy(&v2, key2, sizeof(uint64_t));
-    if (v1 != v2) return (v1 < v2) ? -1 : 1;
-
-    memcpy(&v1, key1 + 8, sizeof(uint64_t));
-    memcpy(&v2, key2 + 8, sizeof(uint64_t));
-    if (v1 != v2) return (v1 < v2) ? -1 : 1;
-
-    memcpy(&v1, key1 + 16, sizeof(uint64_t));
-    memcpy(&v2, key2 + 16, sizeof(uint64_t));
-    if (v1 != v2) return (v1 < v2) ? -1 : 1;
-
-    memcpy(&v1, key1 + 24, sizeof(uint64_t));
-    memcpy(&v2, key2 + 24, sizeof(uint64_t));
-    if (v1 != v2) return (v1 < v2) ? -1 : 1;
-
-    return 0;
+    /* we use memcmp for correctness -- byte-order-independent lexicographic comparison.
+     * native uint64_t comparison would give wrong results on little-endian because
+     * the first byte (most significant for memcmp) lands in the least significant
+     * position of the loaded integer. */
+    const int cmp = memcmp(key1, key2, 32);
+    return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
 }
 
 /**
@@ -394,8 +372,6 @@ static inline int skip_list_compare_keys_inline(const skip_list_t *list, const u
             /* we use switch for common key sizes to help branch predictor */
             switch (key1_size)
             {
-                case 8:
-                    return skip_list_compare_keys_numeric_inline(key1, key2);
                 case 16:
                     return skip_list_compare_keys_16_inline(key1, key2);
                 case 32:

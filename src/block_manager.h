@@ -169,6 +169,18 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
 
 /**
+ * block_manager_write_raw
+ * write raw data directly to the block manager without allocating a block_manager_block_t.
+ * avoids the malloc/memcpy/free cycle of block_create + block_write + block_release.
+ * the data pointer only needs to be valid during this call.
+ * @param bm the block manager
+ * @param data pointer to the data to write
+ * @param size size of the data in bytes
+ * @return the offset where the block was written, or -1 on failure
+ */
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t size);
+
+/**
  * block_manager_block_write_batch
  * writes multiple blocks in a single I/O operation for better performance
  * @param bm the block manager to write the blocks to

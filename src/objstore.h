@@ -149,7 +149,7 @@ typedef struct
  * configuration for object store mode behavior.
  * passed to tidesdb_config_t.object_store_config.
  * NULL means use defaults.
- * @param local_cache_path local directory for cached SSTable files (NULL = use db_path)
+ * @param local_cache_path local directory for cached sstable files (NULL = use db_path)
  * @param local_cache_max_bytes maximum cache size in bytes (0 = unlimited)
  * @param cache_on_read whether to cache downloaded files locally (default 1)
  * @param cache_on_write whether to keep local copy after upload (default 1)
@@ -172,31 +172,22 @@ typedef struct
  */
 typedef struct
 {
-    /* local cache settings */
-    const char *local_cache_path; /* local dir for cached SSTable files (NULL = use db_path) */
-    size_t local_cache_max_bytes; /* max cache size in bytes (0 = unlimited) */
-    int cache_on_read;            /* cache downloaded files locally (default 1) */
-    int cache_on_write;           /* keep local copy after upload (default 1) */
-
-    /* upload behavior */
-    int max_concurrent_uploads;   /* parallel upload threads (default 4) */
-    int max_concurrent_downloads; /* parallel download threads (default 8) */
-    size_t multipart_threshold;   /* use multipart above this size (default 64MB) */
-    size_t multipart_part_size;   /* multipart chunk size (default 8MB) */
-
-    /* durability */
-    int sync_manifest_to_object;     /* upload MANIFEST after each compaction (default 1) */
-    int replicate_wal;               /* upload closed WAL segments (default 1) */
-    int wal_upload_sync;             /* 0 = background WAL upload (default), 1 = block flush */
-    size_t wal_sync_threshold_bytes; /* sync WAL when it grows by this many bytes (default 1MB, 0 =
-                                        off) */
-
-    /* sync-on-commit and replica */
-    int wal_sync_on_commit; /* upload WAL after every txn commit for RPO=0 (default 0) */
-    int replica_mode;       /* enable read-only replica mode (default 0) */
-    uint64_t
-        replica_sync_interval_us; /* MANIFEST poll interval in microseconds (default 5000000) */
-    int replica_replay_wal;       /* replay WAL for near-real-time reads (default 1) */
+    const char *local_cache_path;
+    size_t local_cache_max_bytes;
+    int cache_on_read;
+    int cache_on_write;
+    int max_concurrent_uploads;
+    int max_concurrent_downloads;
+    size_t multipart_threshold;
+    size_t multipart_part_size;
+    int sync_manifest_to_object;
+    int replicate_wal;
+    int wal_upload_sync;
+    size_t wal_sync_threshold_bytes;
+    int wal_sync_on_commit;
+    int replica_mode;
+    uint64_t replica_sync_interval_us;
+    int replica_replay_wal;
 } tidesdb_objstore_config_t;
 
 /**

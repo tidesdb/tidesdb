@@ -24,6 +24,58 @@
 #define BM_UNLIKELY(x) TDB_UNLIKELY(x)
 #define BM_LIKELY(x)   TDB_LIKELY(x)
 
+/* thread-local reusable pread buffer to avoid page faults on every block read. */
+#define BM_READ_BUF_INITIAL_SIZE (128 * 1024)
+
+static pthread_key_t bm_tls_key;
+static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
+
+typedef struct
+{
+    uint8_t *buf;
+    size_t capacity;
+} bm_tls_read_buf_t;
+
+static void bm_tls_destructor(void *ptr)
+{
+    if (ptr)
+    {
+        bm_tls_read_buf_t *tls = (bm_tls_read_buf_t *)ptr;
+        free(tls->buf);
+        free(tls);
+    }
+}
+
+static void bm_tls_init_key(void)
+{
+    pthread_key_create(&bm_tls_key, bm_tls_destructor);
+}
+
+static uint8_t *bm_get_read_buf(size_t needed)
+{
+    pthread_once(&bm_tls_once, bm_tls_init_key);
+
+    bm_tls_read_buf_t *tls = (bm_tls_read_buf_t *)pthread_getspecific(bm_tls_key);
+    if (!tls)
+    {
+        tls = (bm_tls_read_buf_t *)calloc(1, sizeof(bm_tls_read_buf_t));
+        if (!tls) return NULL;
+        pthread_setspecific(bm_tls_key, tls);
+    }
+
+    if (BM_LIKELY(needed <= tls->capacity)) return tls->buf;
+
+    size_t new_size = tls->capacity ? tls->capacity : BM_READ_BUF_INITIAL_SIZE;
+    while (new_size < needed) new_size *= 2;
+
+    uint8_t *new_buf = (uint8_t *)realloc(tls->buf, new_size);
+    if (!new_buf) return NULL;
+
+    tls->buf = new_buf;
+    tls->capacity = new_size;
+    return new_buf;
+}
+
 /**
  *
  *  * * * * * * * * * *
@@ -355,6 +407,7 @@ block_manager_block_t *block_manager_block_create(const uint64_t size, const voi
 
     block->size = size;
     atomic_init(&block->ref_count, 1);
+    block->inline_data = 0;
 
     block->data = malloc(size);
     if (!block->data)
@@ -384,6 +437,7 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
     block->size = size;
     block->data = data;
     atomic_init(&block->ref_count, 1);
+    block->inline_data = 0;
     return block;
 }
 
@@ -481,37 +535,19 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t 
     return offset;
 }
 
+/* maximum iovecs per pwritev call, POSIX minimum is 16, Linux uses 1024 */
+#ifndef BM_IOV_MAX
+#define BM_IOV_MAX 1024
+#endif
+
 int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t **blocks,
                                     const size_t count, int64_t *offsets)
 {
     if (BM_UNLIKELY(!bm || !blocks || count == 0 || !offsets)) return -1;
 
-    /* we calculate total size needed for all blocks */
+    /* we calculate total size needed and count valid blocks */
     size_t total_batch_size = 0;
-    for (size_t i = 0; i < count; i++)
-    {
-        if (!blocks[i]) continue;
-        if (blocks[i]->size > UINT32_MAX) return -1;
-
-        const size_t block_total =
-            BLOCK_MANAGER_BLOCK_HEADER_SIZE + blocks[i]->size + BLOCK_MANAGER_FOOTER_SIZE;
-        total_batch_size += block_total;
-    }
-
-    if (total_batch_size == 0) return 0;
-
-    /* we atomically allocate space for all blocks at once */
-    const int64_t base_offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_batch_size);
-
-    /* we allocate combined buffer for all blocks */
-    unsigned char *write_buffer = malloc(total_batch_size);
-    if (!write_buffer) return -1;
-
-    /* we serialize all blocks into the combined buffer */
-    size_t buf_offset = 0;
-    int64_t current_offset = base_offset;
-    int success_count = 0;
-
+    size_t valid_count = 0;
     for (size_t i = 0; i < count; i++)
     {
         if (!blocks[i])
@@ -519,51 +555,90 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
             offsets[i] = -1;
             continue;
         }
+        if (blocks[i]->size > UINT32_MAX) return -1;
+
+        total_batch_size +=
+            BLOCK_MANAGER_BLOCK_HEADER_SIZE + blocks[i]->size + BLOCK_MANAGER_FOOTER_SIZE;
+        valid_count++;
+    }
+
+    if (total_batch_size == 0) return 0;
+
+    /* we atomically allocate space for all blocks at once */
+    const int64_t base_offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_batch_size);
+
+    const size_t meta_size =
+        valid_count * (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE);
+    const size_t iov_count = valid_count * 3;
+    unsigned char *alloc = malloc(meta_size + iov_count * sizeof(struct iovec));
+    if (!alloc) return -1;
+
+    unsigned char *meta_buf = alloc;
+    struct iovec *iov = (struct iovec *)(alloc + meta_size);
+
+    /* we build iovecs, header and footer go into meta_buf, data points directly to block->data */
+    int64_t current_offset = base_offset;
+    size_t iov_idx = 0;
+    size_t meta_idx = 0;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        if (!blocks[i]) continue;
 
         block_manager_block_t *block = blocks[i];
         const size_t block_total =
             BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
 
-        /* we record offset for this block */
         offsets[i] = current_offset;
 
-        /* we compute checksum */
+        /* we encode header and footer into contiguous metadata buffer */
+        unsigned char *hdr =
+            meta_buf + meta_idx * (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE);
+        unsigned char *ftr = hdr + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+
         const uint32_t checksum = compute_checksum(block->data, block->size);
+        encode_uint32_le_compat(hdr, (uint32_t)block->size);
+        encode_uint32_le_compat(hdr + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
+        encode_uint32_le_compat(ftr, (uint32_t)block->size);
+        encode_uint32_le_compat(ftr + 4, BLOCK_MANAGER_FOOTER_MAGIC);
 
-        /* we serialize block -- [size(4)][checksum(4)][data][size(4)][magic(4)] */
-        encode_uint32_le_compat(write_buffer + buf_offset, (uint32_t)block->size);
-        buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
+        iov[iov_idx].iov_base = hdr;
+        iov[iov_idx].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+        iov[iov_idx + 1].iov_base = block->data;
+        iov[iov_idx + 1].iov_len = block->size;
+        iov[iov_idx + 2].iov_base = ftr;
+        iov[iov_idx + 2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-        encode_uint32_le_compat(write_buffer + buf_offset, checksum);
-        buf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
-
-        memcpy(write_buffer + buf_offset, block->data, block->size);
-        buf_offset += block->size;
-
-        /* we write footer */
-        encode_uint32_le_compat(write_buffer + buf_offset, (uint32_t)block->size);
-        buf_offset += 4;
-
-        encode_uint32_le_compat(write_buffer + buf_offset, BLOCK_MANAGER_FOOTER_MAGIC);
-        buf_offset += 4;
-
+        iov_idx += 3;
+        meta_idx++;
         current_offset += (int64_t)block_total;
-        success_count++;
     }
 
-    /* we perform single atomic write for all blocks */
-    const ssize_t written = pwrite(bm->fd, write_buffer, total_batch_size, base_offset);
-    free(write_buffer);
+    /* we write in BM_IOV_MAX-sized chunks for batches that exceed the iovec limit */
+    size_t iov_done = 0;
+    off_t write_offset = (off_t)base_offset;
 
-    if (written != (ssize_t)total_batch_size)
+    while (iov_done < iov_idx)
     {
-        /* we mark all offsets as failed */
-        for (size_t i = 0; i < count; i++)
+        int chunk = (int)(iov_idx - iov_done);
+        if (chunk > BM_IOV_MAX) chunk = BM_IOV_MAX;
+
+        ssize_t expected = 0;
+        for (int j = 0; j < chunk; j++) expected += (ssize_t)iov[iov_done + j].iov_len;
+
+        const ssize_t written = pwritev(bm->fd, iov + iov_done, chunk, write_offset);
+        if (written != expected)
         {
-            offsets[i] = -1;
+            free(alloc);
+            for (size_t i = 0; i < count; i++) offsets[i] = -1;
+            return -1;
         }
-        return -1;
+
+        write_offset += written;
+        iov_done += (size_t)chunk;
     }
+
+    free(alloc);
 
     /* we sync if needed */
     if (is_sync_full(bm) && !odsync_available())
@@ -574,7 +649,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         }
     }
 
-    return success_count;
+    return (int)valid_count;
 }
 
 int block_manager_write_at(block_manager_t *bm, const int64_t offset, const uint8_t *data,
@@ -614,19 +689,18 @@ int block_manager_update_checksum(block_manager_t *bm, const int64_t block_offse
     const uint32_t block_size = decode_uint32_le_compat(size_buf);
     if (block_size == 0) return -1;
 
-    uint8_t *data = malloc(block_size);
+    /* we use thread-local buffer to avoid page faults from fresh malloc pages */
+    uint8_t *data = bm_get_read_buf(block_size);
     if (!data) return -1;
 
     const off_t data_offset = block_offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     if (pread(bm->fd, data, block_size, data_offset) != (ssize_t)block_size)
     {
-        free(data);
         return -1;
     }
 
     /* we compute new checksum */
     const uint32_t new_checksum = compute_checksum(data, block_size);
-    free(data);
 
     unsigned char checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
     encode_uint32_le_compat(checksum_buf, new_checksum);
@@ -653,7 +727,7 @@ void block_manager_block_free(block_manager_block_t *block)
 {
     if (!block) return;
 
-    if (block->data) free(block->data);
+    if (!block->inline_data && block->data) free(block->data);
     free(block);
 }
 
@@ -806,7 +880,6 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (BM_UNLIKELY(!bm)) return NULL;
 
-    /* we cache fd to avoid repeated struct dereference */
     const int fd = bm->fd;
 
     /* we read header (size + checksum) first */
@@ -821,34 +894,24 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     const uint32_t stored_checksum =
         decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
 
-    block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
+    uint8_t *read_buf = bm_get_read_buf(block_size);
+    if (BM_UNLIKELY(!read_buf)) return NULL;
+
+    const off_t data_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    if (BM_UNLIKELY(pread(fd, read_buf, block_size, data_offset) != (ssize_t)block_size))
+        return NULL;
+
+    if (BM_UNLIKELY(verify_checksum(read_buf, block_size, stored_checksum) != 0)) return NULL;
+
+    block_manager_block_t *block = malloc(sizeof(block_manager_block_t) + block_size);
     if (!block) return NULL;
 
     block->size = block_size;
+    block->data = (uint8_t *)(block + 1);
+    block->inline_data = 1;
     atomic_init(&block->ref_count, 1);
-    block->data = malloc(block_size);
-    if (BM_UNLIKELY(!block->data))
-    {
-        free(block);
-        return NULL;
-    }
 
-    /* we use pread data directly into block->data -- no intermediate buffer or memcpy */
-    const off_t data_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (BM_UNLIKELY(pread(fd, block->data, block_size, data_offset) != (ssize_t)block_size))
-    {
-        free(block->data);
-        free(block);
-        return NULL;
-    }
-
-    if (verify_checksum(block->data, block_size, stored_checksum) != 0)
-    {
-        free(block->data);
-        free(block);
-        return NULL;
-    }
-
+    memcpy(block->data, read_buf, block_size);
     return block;
 }
 
@@ -903,6 +966,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
 
     block->size = max_bytes;
     atomic_init(&block->ref_count, 1);
+    block->inline_data = 0;
     block->data = malloc(max_bytes);
     if (!block->data)
     {
@@ -1129,16 +1193,9 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size + BLOCK_MANAGER_FOOTER_SIZE;
     const uint64_t next_block_pos = cursor->current_pos + total_block_size;
 
-    /* we check against cached file size first to avoid syscall */
+    /* we check against cached file size, if there's no room after this block, we're at last */
     const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
-    if (next_block_pos >= file_size) return 1;
-
-    /* we try to read next block size -- if we can't, we're at last block */
-    unsigned char next_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-    const ssize_t read_result =
-        pread(cursor->bm->fd, next_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)next_block_pos);
-
-    return (read_result != BLOCK_MANAGER_SIZE_FIELD_SIZE) ? 1 : 0;
+    return (next_block_pos >= file_size) ? 1 : 0;
 }
 
 int block_manager_get_size(block_manager_t *bm, uint64_t *size)
@@ -1176,18 +1233,70 @@ int block_manager_count_blocks(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    /* we use stack cursor to avoid heap allocation */
-    block_manager_cursor_t cursor;
-    int count = 0;
+    const uint64_t file_size = atomic_load(&bm->current_file_size);
+    if (file_size <= BLOCK_MANAGER_HEADER_SIZE) return 0;
 
-    (void)block_manager_cursor_init_stack(&cursor, bm);
-
-    /* sequential scan -- we hint for read-ahead */
     set_file_sequential_hint(bm->fd);
 
-    while (block_manager_cursor_next(&cursor) == 0)
+    /* buffered scan where we read 64KB chunks so thousands of block headers are parsed per syscall.
+     * we only need the first 4 bytes of each block (size field) to compute the skip distance. */
+    enum
     {
-        count++;
+        COUNT_BUF = 64 * 1024
+    };
+    uint8_t *buf = bm_get_read_buf(COUNT_BUF);
+    if (!buf)
+    {
+        /* fallback to per-block pread via cursor */
+        block_manager_cursor_t c;
+        int n = 0;
+        (void)block_manager_cursor_init_stack(&c, bm);
+        while (block_manager_cursor_next(&c) == 0) n++;
+        return n;
+    }
+
+    int count = 0;
+    uint64_t pos = BLOCK_MANAGER_HEADER_SIZE;
+
+    while (pos < file_size)
+    {
+        size_t want = COUNT_BUF;
+        if (pos + want > file_size) want = (size_t)(file_size - pos);
+
+        const ssize_t got = pread(bm->fd, buf, want, (off_t)pos);
+        if (got < (ssize_t)BLOCK_MANAGER_SIZE_FIELD_SIZE) break;
+
+        size_t off = 0;
+        while (off + BLOCK_MANAGER_SIZE_FIELD_SIZE <= (size_t)got)
+        {
+            const uint32_t bsz = decode_uint32_le_compat(buf + off);
+            if (bsz == 0) return count;
+
+            const size_t total =
+                BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)bsz + BLOCK_MANAGER_FOOTER_SIZE;
+
+            if (off + total > (size_t)got)
+            {
+                /* block straddles buffer edge, we break to re-read from this block's start */
+                break;
+            }
+
+            off += total;
+            count++;
+        }
+
+        /* we advance file position by bytes consumed.
+         * if off == 0, one block is larger than the buffer, we read its size and skip. */
+        if (off == 0)
+        {
+            const uint32_t bsz = decode_uint32_le_compat(buf);
+            pos += BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)bsz + BLOCK_MANAGER_FOOTER_SIZE;
+            count++;
+        }
+        else
+        {
+            pos += off;
+        }
     }
 
     return count;
@@ -1424,23 +1533,27 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
 
     if (BM_UNLIKELY(block_size == 0)) return -1; /* invalid block */
 
-    uint8_t *block_data = malloc(block_size);
-    if (BM_UNLIKELY(!block_data)) return -1;
+    /** we pread into thread-local buffer to avoid page faults on fresh anonymous pages.
+     *  we verify checksum before allocating the caller's output buffer. */
+    uint8_t *read_buf = bm_get_read_buf(block_size);
+    if (BM_UNLIKELY(!read_buf)) return -1;
 
-    /* we pread data directly into block_data -- no intermediate buffer or memcpy */
     const off_t data_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (BM_UNLIKELY(pread(fd, block_data, block_size, data_offset) != (ssize_t)block_size))
+    if (BM_UNLIKELY(pread(fd, read_buf, block_size, data_offset) != (ssize_t)block_size))
     {
-        free(block_data);
         return -1;
     }
 
-    if (verify_checksum(block_data, block_size, expected_checksum) != 0)
+    if (verify_checksum(read_buf, block_size, expected_checksum) != 0)
     {
-        free(block_data);
         return -1; /* checksum mismatch */
     }
 
+    /* checksum was ok, we allocate output buffer and copy from warm TLS buffer */
+    uint8_t *block_data = malloc(block_size);
+    if (BM_UNLIKELY(!block_data)) return -1;
+
+    memcpy(block_data, read_buf, block_size);
     *data = block_data;
     *data_size = block_size;
     return 0;

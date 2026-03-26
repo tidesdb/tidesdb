@@ -47,7 +47,7 @@ typedef struct tdb_cache_entry
 /**
  * tdb_local_cache_t
  * local file cache manager with hash-indexed LRU eviction for object store mode.
- * tracks which SSTable files are cached locally and evicts cold files
+ * tracks which sstable files are cached locally and evicts cold files
  * when the cache exceeds max_bytes. uses a hash table for O(1) lookups
  * and a doubly-linked LRU list for eviction ordering.
  * @param cache_dir directory path for cached files
@@ -65,8 +65,8 @@ typedef struct
     size_t max_bytes; /* 0 = unlimited */
     _Atomic(size_t) current_bytes;
     pthread_mutex_t lock;
-    tdb_cache_entry_t *lru_head; /* most recently used */
-    tdb_cache_entry_t *lru_tail; /* least recently used (eviction candidate) */
+    tdb_cache_entry_t *lru_head;
+    tdb_cache_entry_t *lru_tail;
     int num_entries;
     tdb_cache_entry_t *buckets[TDB_LOCAL_CACHE_HASH_BUCKETS];
 } tdb_local_cache_t;

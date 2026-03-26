@@ -701,4 +701,7 @@ tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir);
  */
 int tidesdb_promote_to_primary(tidesdb_t *db);
 
+int tidesdb_iter_key_value(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size, uint8_t **value,
+                           size_t *value_size);
+
 #endif /* __TIDESDB_DB_H__ */

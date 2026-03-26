@@ -23,6 +23,9 @@
 
 #include "xxhash.h"
 
+#define TDB_LOCAL_CACHE_KLOG_EXT ".klog"
+#define TDB_LOCAL_CACHE_VLOG_EXT ".vlog"
+
 /**
  * cache_hash
  * XXH32 hash of a file path for bucket lookup
@@ -216,8 +219,8 @@ static void cache_remove_entry(tdb_local_cache_t *cache, tdb_cache_entry_t *entr
 
 /**
  * cache_evict_partner
- * if the victim is a .klog or .vlog file, find and evict its partner so
- * SSTable file pairs are always evicted together
+ * if the victim is a TDB_LOCAL_CACHE_KLOG_EXT or TDB_LOCAL_CACHE_VLOG_EXT file, find and evict its
+ * partner so sstable file pairs are always evicted together
  * @param cache the cache manager
  * @param victim the entry being evicted
  * @param current pointer to the running byte counter
@@ -232,10 +235,10 @@ static void cache_evict_partner(tdb_local_cache_t *cache, const tdb_cache_entry_
     const char *ext = victim->path + vlen - 5;
     const char *partner_ext = NULL;
 
-    if (strcmp(ext, ".klog") == 0)
-        partner_ext = ".vlog";
-    else if (strcmp(ext, ".vlog") == 0)
-        partner_ext = ".klog";
+    if (strcmp(ext, TDB_LOCAL_CACHE_KLOG_EXT) == 0)
+        partner_ext = TDB_LOCAL_CACHE_VLOG_EXT;
+    else if (strcmp(ext, TDB_LOCAL_CACHE_VLOG_EXT) == 0)
+        partner_ext = TDB_LOCAL_CACHE_KLOG_EXT;
 
     if (!partner_ext) return;
 
@@ -269,7 +272,7 @@ static void cache_evict(tdb_local_cache_t *cache, size_t bytes_needed)
         tdb_cache_entry_t *victim = cache->lru_tail;
         cache_remove_entry(cache, victim, &current, 1);
 
-        /* evict the klog/vlog partner so SSTable pairs stay together */
+        /* we evict the klog/vlog partner so sstable pairs stay together */
         cache_evict_partner(cache, victim, &current);
 
         free(victim);
@@ -288,18 +291,18 @@ int tdb_local_cache_track(tdb_local_cache_t *cache, const char *local_path)
 
     pthread_mutex_lock(&cache->lock);
 
-    /* check if already tracked via hash lookup (O(1)) */
+    /* we check if already tracked via hash lookup (O(1)) */
     tdb_cache_entry_t *existing = hash_find(cache, local_path, h);
     if (existing)
     {
-        /* move to head (touch) */
+        /* we move to head (touch) */
         lru_unlink(cache, existing);
         lru_push_head(cache, existing);
         pthread_mutex_unlock(&cache->lock);
         return 0;
     }
 
-    /* evict if needed */
+    /* we evict if needed */
     cache_evict(cache, file_size);
 
     tdb_cache_entry_t *entry = calloc(1, sizeof(tdb_cache_entry_t));

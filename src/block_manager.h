@@ -21,7 +21,7 @@
 #include "compat.h"
 
 /* max file path length for block manager file(s) */
-#define MAX_FILE_PATH_LENGTH 1024 * 4
+#define MAX_FILE_PATH_LENGTH (1024 * 4)
 
 /* TDB in hex */
 #define BLOCK_MANAGER_MAGIC 0x544442
@@ -97,12 +97,14 @@ typedef struct
  * @param size the size of the data in the block
  * @param data the data in the block
  * @param ref_count atomic reference count for safe concurrent access
+ * @param inline_data 1 if data is allocated inline with this struct (single allocation)
  */
 typedef struct
 {
     uint64_t size;
     void *data;
     _Atomic(uint32_t) ref_count;
+    uint8_t inline_data;
 } block_manager_block_t;
 
 /**

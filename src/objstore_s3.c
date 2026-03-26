@@ -559,7 +559,7 @@ static ssize_t s3_range_get(void *ctx, const char *key, uint64_t offset, void *b
     char empty_sha[TDB_S3_HASH_HEX_LEN];
     sha256_hex("", 0, empty_sha);
 
-    /* sign without Range header -- S3/MinIO does not require Range to be signed */
+    /* we sign without Range header -- S3/MinIO does not require Range to be signed */
     struct curl_slist *headers = s3_sign_request(s3, "GET", key, empty_sha, NULL, NULL);
 
     char range_hdr[128];
@@ -762,7 +762,7 @@ static int s3_list(void *ctx, const char *prefix,
         else
             snprintf(full_prefix, sizeof(full_prefix), "%s", prefix);
 
-        /* ListObjectsV2: prefix goes in query string, not in the URL path.
+        /* ListObjectsV2 -- prefix goes in query string, not in the URL path.
          * the canonical URI is just /<bucket> (path-style) or / (virtual-hosted).
          * the canonical query string must include all query parameters sorted
          * alphabetically with URI-encoded values per the SigV4 spec. */
@@ -777,7 +777,7 @@ static int s3_list(void *ctx, const char *prefix,
         if (continuation_token[0])
             s3_uri_encode(continuation_token, encoded_token, sizeof(encoded_token));
 
-        /* build canonical query string (params sorted alphabetically) */
+        /* we build canonical query string (params sorted alphabetically) */
         char canonical_qs[TDB_S3_MAX_PATH * 4];
         if (continuation_token[0])
             snprintf(canonical_qs, sizeof(canonical_qs),
@@ -796,7 +796,7 @@ static int s3_list(void *ctx, const char *prefix,
                      canonical_qs);
         }
 
-        /* sign with the correct canonical URI (bucket path only, no object prefix) */
+        /* we sign with the correct canonical URI (bucket path only, no object prefix) */
         char canonical_uri[TDB_S3_MAX_PATH];
         if (s3->use_path_style)
             snprintf(canonical_uri, sizeof(canonical_uri), "/%s", s3->bucket);

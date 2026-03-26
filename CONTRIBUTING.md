@@ -15,7 +15,7 @@ Agreement.
 **Individual contributors** must agree to the
 [TidesDB Individual Contributor License Agreement (CLA)](CLA).
 
-**Corporate contributors** — if your employer or organization has rights to the
+**Corporate contributors** - if your employer or organization has rights to the
 intellectual property you create (e.g., through an employment or contractor
 agreement), your employer must execute the
 [Corporate Contributor License Agreement (CCLA)](CCLA) before your contributions

@@ -45,6 +45,7 @@ typedef struct
     size_t max_bytes;
     size_t num_partitions;
     size_t slots_per_partition;
+    size_t avg_entry_size; /* expected average entry size in bytes (0 = use default 100) */
     clock_cache_evict_fn evict_callback;
 } cache_config_t;
 

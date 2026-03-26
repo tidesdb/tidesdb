@@ -1375,6 +1375,19 @@ int tidesdb_iter_key(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size);
 int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size);
 
 /**
+ * tidesdb_iter_key_value
+ * gets both key and value from an iterator in a single call
+ * @param iter iterator handle
+ * @param key pointer to key
+ * @param key_size pointer to size of key
+ * @param value pointer to value
+ * @param value_size pointer to size of value
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_iter_key_value(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size, uint8_t **value,
+                           size_t *value_size);
+
+/**
  * tidesdb_iter_free
  * frees an iterator
  * @param iter iterator handle

@@ -21529,10 +21529,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                         tidesdb_sstable_unref(cf->db, ssts_array[k]);
                     }
                     sst_count = sst_count_before_level;
-                    if (level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
-                    {
-                        need_retry = 1;
-                    }
+                    need_retry = 1;
                     break;
                 }
 
@@ -21566,9 +21563,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                     tidesdb_sstable_t **current_ssts =
                         atomic_load_explicit(&level->sstables, memory_order_acquire);
 
-                    if (current_ssts != sstables && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+                    if (current_ssts != sstables)
                     {
-                        /* array was swapped -- we release refs and retry (bounded) */
+                        /* array was swapped -- we release refs and retry */
                         for (int k = sst_count_before_level; k < sst_count; k++)
                         {
                             tidesdb_sstable_unref(cf->db, ssts_array[k]);
@@ -21578,7 +21575,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                         break;
                     }
 
-                    /* array unchanged or retries exhausted -- we skip dead sstable */
+                    /* array unchanged -- we skip dead sstable */
                     continue;
                 }
                 ssts_array[sst_count++] = sst;
@@ -21731,10 +21728,7 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
                 for (int k = sst_count_before_level; k < sst_count; k++)
                     tidesdb_sstable_unref(cf->db, ssts_array[k]);
                 sst_count = sst_count_before_level;
-                if (level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
-                {
-                    need_retry = 1;
-                }
+                need_retry = 1;
                 break;
             }
 
@@ -21746,7 +21740,7 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
                     tidesdb_sstable_t **current_ssts =
                         atomic_load_explicit(&level->sstables, memory_order_acquire);
 
-                    if (current_ssts != sstables && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+                    if (current_ssts != sstables)
                     {
                         for (int k = sst_count_before_level; k < sst_count; k++)
                             tidesdb_sstable_unref(cf->db, ssts_array[k]);
@@ -21755,7 +21749,7 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
                         break;
                     }
 
-                    /* the array unchanged or retries exhausted -- we skip dead sstable */
+                    /* the array unchanged -- we skip dead sstable */
                     continue;
                 }
 

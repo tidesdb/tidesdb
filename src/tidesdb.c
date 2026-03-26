@@ -4420,21 +4420,17 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
     /* we find the latest WAL in the object store by listing uwal_ prefix */
     uint64_t wal_gen = atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
 
-    /* we try current generation first, fall back to gen 0 */
     char wal_key[TDB_MAX_PATH_LEN];
     char wal_local[TDB_MAX_PATH_LEN];
     snprintf(wal_local, sizeof(wal_local), "%s" PATH_SEPARATOR "replica_wal_tmp.log", db->db_path);
 
+    /* we try current generation first */
     int found = 0;
-    for (uint64_t g = wal_gen; g <= wal_gen; g++)
+    snprintf(wal_key, sizeof(wal_key), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
+             TDB_U64_CAST(wal_gen));
+    if (db->object_store->get(db->object_store->ctx, wal_key, wal_local) == 0)
     {
-        snprintf(wal_key, sizeof(wal_key), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
-                 TDB_U64_CAST(g));
-        if (db->object_store->get(db->object_store->ctx, wal_key, wal_local) == 0)
-        {
-            found = 1;
-            break;
-        }
+        found = 1;
     }
 
     /* we also try gen 0 if current gen failed */
@@ -21589,20 +21585,15 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             tdb_objstore_prefetch_sstables(cf->db, ssts_array, sst_count);
         }
 
-        /****** we use eager source creation for local mode with manageable sstable counts.
-         *****  lazy sources defer first-block reads to seek time, which is beneficial for
-         ****   lazy sources defer first-block reads to seek time, which avoids the
-         ***    O(N) eager deserialize cost at iterator creation.  this matters for
-         **     workloads that recreate iterators frequently (e.g. MariaDB index_read_map). */
-        const int use_lazy = 1;
-
+        /* lazy sources defer first-block reads to seek time, which avoids the
+         * O(N) eager deserialize cost at iterator creation. this matters for
+         * workloads that recreate iterators frequently (e.g. MariaDB index_read_map). */
         for (int i = 0; i < sst_count; i++)
         {
             tidesdb_sstable_t *sst = ssts_array[i];
 
             tidesdb_merge_source_t *sst_source =
-                use_lazy ? tidesdb_merge_source_from_sstable_lazy(cf->db, sst)
-                         : tidesdb_merge_source_from_sstable(cf->db, sst);
+                tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
             if (sst_source)
             {
                 /* we mark as cached so it wont be freed when popped from heap */
@@ -21780,14 +21771,10 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
         tdb_objstore_prefetch_sstables(cf->db, ssts_array, sst_count);
     }
 
-    const int use_lazy_seek = 1;
-
     for (int i = 0; i < sst_count; i++)
     {
         tidesdb_sstable_t *sst = ssts_array[i];
-        tidesdb_merge_source_t *sst_source =
-            use_lazy_seek ? tidesdb_merge_source_from_sstable_lazy(cf->db, sst)
-                          : tidesdb_merge_source_from_sstable(cf->db, sst);
+        tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
         if (sst_source)
         {
             sst_source->is_cached = 1;

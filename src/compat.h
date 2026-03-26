@@ -1795,25 +1795,40 @@ static inline void tdb_set_thread_name(const char *name)
 #endif
 
 /* cross-platform pwritev for scatter-gather I/O
- * POSIX systems (Linux, macOS, BSDs) have native pwritev in <sys/uio.h>
- * Windows falls back to sequential pwrite calls */
+ * Linux and modern BSDs have native pwritev in <sys/uio.h>
+ * macOS added pwritev in 10.16/11.0 (Big Sur)
+ * older macOS and Windows fall back to sequential pwrite calls */
 #ifdef _WIN32
 struct iovec
 {
     void *iov_base;
     size_t iov_len;
 };
+#define TDB_NEED_PWRITEV_FALLBACK 1
+#else
+#include <sys/uio.h>
+/* macOS < 11.0 does not have pwritev. MAC_OS_X_VERSION_10_16 == 101600 == Big Sur.
+ * check for the availability macro; if it does not exist, assume the platform is old enough
+ * to lack pwritev. */
+#if defined(__APPLE__)
+#include <AvailabilityMacros.h>
+#if !defined(MAC_OS_X_VERSION_10_16) || MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_10_16
+#define TDB_NEED_PWRITEV_FALLBACK 1
+#endif
+#endif
+#endif
 
+#ifdef TDB_NEED_PWRITEV_FALLBACK
 /*
  * pwritev
- * scatter-gather write at offset (Windows fallback using sequential pwrite)
+ * scatter-gather write at offset (fallback using sequential pwrite)
  * @param fd the file descriptor
  * @param iov array of iovec buffers
  * @param iovcnt number of iovec entries
  * @param offset the file offset to write at
  * @return total bytes written, or -1 on error
  */
-static inline ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+static inline ssize_t tdb_pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
     ssize_t total = 0;
     for (int i = 0; i < iovcnt; i++)
@@ -1825,8 +1840,7 @@ static inline ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t
     }
     return total;
 }
-#else
-#include <sys/uio.h>
+#define pwritev tdb_pwritev
 #endif
 
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */

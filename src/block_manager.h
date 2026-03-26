@@ -50,7 +50,7 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
 
-/* block footer for fast validation: size + magic */
+/* block footer for fast validation -- size + magic */
 #define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
 #define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
 
@@ -197,7 +197,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
 /**
  * block_manager_write_at
  * writes raw bytes at a specific offset (for patching existing data)
- * WARNING: use with care - this bypasses block checksums
+ * WARNING: use with care -- this bypasses block checksums
  * @param bm the block manager
  * @param offset the file offset to write at
  * @param data the data to write

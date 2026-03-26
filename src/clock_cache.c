@@ -450,7 +450,7 @@ static void free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
  * evict_for_space
  * CLOCK eviction that targets VALID entries to free memory.
  * skips EMPTY slots (unlike clock_evict which returns them).
- * uses two passes: first pass clears ref_bits, second pass evicts.
+ * uses two passes -- first pass clears ref_bits, second pass evicts.
  * @param cache the cache
  * @param partition the partition
  * @return 1 if an entry was evicted, 0 if no evictable entry found

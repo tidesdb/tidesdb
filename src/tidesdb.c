@@ -18367,6 +18367,10 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         visibility_check = tidesdb_visibility_check_callback;
     }
 
+    /* we cache current time once for consistent TTL checks throughout this read.
+     * declared here so both the unified goto path and the normal path see it. */
+    const int64_t now = (int64_t)atomic_load(&txn->db->cached_current_time);
+
     /* unified memtable read path -- we search shared skip list with prefixed key */
     if (txn->db->unified_mt.enabled)
     {
@@ -18522,9 +18526,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     skip_list_t *active_mt = active_mt_refed ? active_mt_struct->skip_list : NULL;
 
     atomic_thread_fence(memory_order_acquire);
-
-    /* we cache current time once for consistent TTL checks throughout this read */
-    const int64_t now = (int64_t)atomic_load(&txn->db->cached_current_time);
 
     const uint8_t *temp_value;
     size_t temp_value_size;
@@ -21584,7 +21585,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
 
             if (!ssts_array) break; /* allocation failed */
-            if (need_retry)
+            if (need_retry && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
             {
                 level_retries++;
                 goto retry_level;
@@ -21771,7 +21772,7 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
 
         atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
 
-        if (need_retry)
+        if (need_retry && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
         {
             level_retries++;
             goto retry_level;

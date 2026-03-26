@@ -349,30 +349,6 @@ static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_
  */
 static void skip_list_free_version(const skip_list_t *list, skip_list_version_t *version);
 
-/* forward declaration -- used by skip_list_compare_keys_inline */
-static inline int skip_list_compare_keys_with_type(skip_list_cmp_type_t cmp_type,
-                                                   const skip_list_t *list, const uint8_t *key1,
-                                                   size_t key1_size, const uint8_t *key2,
-                                                   size_t key2_size);
-
-/**
- * skip_list_compare_keys_inline
- * inline comparator for hot paths
- * uses cmp_type enum to avoid function pointer comparison overhead
- * @param list skip list
- * @param key1 first key
- * @param key1_size size of first key
- * @param key2 second key
- * @param key2_size size of second key
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
- */
-static inline int skip_list_compare_keys_inline(const skip_list_t *list, const uint8_t *key1,
-                                                const size_t key1_size, const uint8_t *key2,
-                                                const size_t key2_size)
-{
-    return skip_list_compare_keys_with_type(list->cmp_type, list, key1, key1_size, key2, key2_size);
-}
-
 /**
  * skip_list_compare_keys_with_type
  * hot-path comparator that accepts cmp_type as a register parameter

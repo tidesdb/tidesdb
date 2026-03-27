@@ -9,16 +9,26 @@
 ### Contributor License Agreement (CLA)
 
 To ensure TidesDB can be widely adopted and supported by individuals and
-organizations, new contributions require agreement to the
-[TidesDB Contributor License Agreement (CLA)](CLA.md).
+organizations, new contributions require agreement to a Contributor License
+Agreement.
+
+**Individual contributors** must agree to the
+[TidesDB Individual Contributor License Agreement (CLA)](CLA).
+
+**Corporate contributors** - if your employer or organization has rights to the
+intellectual property you create (e.g., through an employment or contractor
+agreement), your employer must execute the
+[Corporate Contributor License Agreement (CCLA)](CCLA) before your contributions
+can be accepted. Contact cla@tidesdb.com to initiate the corporate signing
+process.
 
 - Contributions made **before January 31st, 2025** are governed solely by the
   Developer Certificate of Origin (DCO).
 - Contributions made **on or after January 31st, 2025** require both:
     - A Signed-off-by commit (DCO), and
-    - Agreement to the CLA.
+    - Agreement to the CLA (individual) or CCLA (corporate).
 
-The CLA does **not** change the open source license of TidesDB.
+The CLA and CCLA do **not** change the open source license of TidesDB.
 All contributions remain distributed under the Mozilla Public License v2.0 (MPLv2).
 
 ---

@@ -21,7 +21,7 @@
 #include "compat.h"
 
 /* max file path length for block manager file(s) */
-#define MAX_FILE_PATH_LENGTH 1024 * 4
+#define MAX_FILE_PATH_LENGTH (1024 * 4)
 
 /* TDB in hex */
 #define BLOCK_MANAGER_MAGIC 0x544442
@@ -50,7 +50,7 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
 
-/* block footer for fast validation: size + magic */
+/* block footer for fast validation -- size + magic */
 #define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
 #define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
 
@@ -97,12 +97,14 @@ typedef struct
  * @param size the size of the data in the block
  * @param data the data in the block
  * @param ref_count atomic reference count for safe concurrent access
+ * @param inline_data 1 if data is allocated inline with this struct (single allocation)
  */
 typedef struct
 {
     uint64_t size;
     void *data;
     _Atomic(uint32_t) ref_count;
+    uint8_t inline_data;
 } block_manager_block_t;
 
 /**
@@ -169,6 +171,18 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
 
 /**
+ * block_manager_write_raw
+ * write raw data directly to the block manager without allocating a block_manager_block_t.
+ * avoids the malloc/memcpy/free cycle of block_create + block_write + block_release.
+ * the data pointer only needs to be valid during this call.
+ * @param bm the block manager
+ * @param data pointer to the data to write
+ * @param size size of the data in bytes
+ * @return the offset where the block was written, or -1 on failure
+ */
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t size);
+
+/**
  * block_manager_block_write_batch
  * writes multiple blocks in a single I/O operation for better performance
  * @param bm the block manager to write the blocks to
@@ -183,7 +197,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
 /**
  * block_manager_write_at
  * writes raw bytes at a specific offset (for patching existing data)
- * WARNING: use with care - this bypasses block checksums
+ * WARNING: use with care -- this bypasses block checksums
  * @param bm the block manager
  * @param offset the file offset to write at
  * @param data the data to write

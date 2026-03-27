@@ -23,6 +23,17 @@
 #include <stdint.h>
 #include <time.h>
 
+/**
+ * tidesdb_objstore_backend_t
+ * identifies the object store backend in use
+ */
+typedef enum
+{
+    TDB_BACKEND_FS = 0,
+    TDB_BACKEND_S3 = 1,
+    TDB_BACKEND_UNKNOWN = 99
+} tidesdb_objstore_backend_t;
+
 /** opaque types for FFI bindings (Java, etc.) */
 struct tidesdb_t
 {
@@ -40,11 +51,59 @@ struct tidesdb_iter_t
 {
     int _opaque;
 };
+struct tidesdb_objstore_t
+{
+    int _opaque;
+};
 
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 typedef struct tidesdb_txn_t tidesdb_txn_t;
 typedef struct tidesdb_iter_t tidesdb_iter_t;
+typedef struct tidesdb_objstore_t tidesdb_objstore_t;
+
+/**
+ * tidesdb_objstore_config_t
+ * configuration for object store mode behavior
+ * @param local_cache_path local directory for cached SSTable files (NULL = use db_path)
+ * @param local_cache_max_bytes max local cache size in bytes (0 = unlimited)
+ * @param cache_on_read cache downloaded files locally (default 1)
+ * @param cache_on_write keep local copy after upload (default 1)
+ * @param max_concurrent_uploads parallel upload threads (default 4)
+ * @param max_concurrent_downloads parallel download threads (default 8)
+ * @param multipart_threshold use multipart upload above this size (default 64MB)
+ * @param multipart_part_size multipart chunk size (default 8MB)
+ * @param sync_manifest_to_object upload MANIFEST after each compaction (default 1)
+ * @param replicate_wal upload closed WAL segments for node-failure recovery (default 1)
+ * @param wal_upload_sync 0 = background WAL upload (default), 1 = block flush until uploaded
+ * @param wal_sync_threshold_bytes sync active WAL when it grows by this many bytes (default 1MB, 0
+ * = off)
+ * @param wal_sync_on_commit upload WAL after every txn commit for RPO=0 replication (default 0)
+ * @param replica_mode enable read-only replica mode (default 0)
+ * @param replica_sync_interval_us MANIFEST poll interval in microseconds (default 5000000)
+ * @param replica_replay_wal replay WAL for near-real-time reads on replicas (default 1)
+ */
+typedef struct
+{
+    const char *local_cache_path;
+    size_t local_cache_max_bytes;
+    int cache_on_read;
+    int cache_on_write;
+    int max_concurrent_uploads;
+    int max_concurrent_downloads;
+    size_t multipart_threshold;
+    size_t multipart_part_size;
+    int sync_manifest_to_object;
+    int replicate_wal;
+    int wal_upload_sync;
+    size_t wal_sync_threshold_bytes;
+    int wal_sync_on_commit;
+    int replica_mode;
+    uint64_t replica_sync_interval_us;
+    int replica_replay_wal;
+} tidesdb_objstore_config_t;
+
+tidesdb_objstore_config_t tidesdb_objstore_default_config(void);
 
 /** debug logging levels */
 typedef enum
@@ -101,6 +160,7 @@ typedef enum
 #define TDB_ERR_INVALID_DB   -10
 #define TDB_ERR_UNKNOWN      -11
 #define TDB_ERR_LOCKED       -12
+#define TDB_ERR_READONLY     -13
 
 /** configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
@@ -178,6 +238,9 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param use_btree whether btree is used
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
+ * @param object_target_file_size target SSTable size in object store mode (default 256MB, 0=auto)
+ * @param object_lazy_compaction 1 = compact less aggressively in object store mode (default 0)
+ * @param object_prefetch_compaction 1 = download all inputs before merge (default 1)
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -208,6 +271,9 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
+    size_t object_target_file_size;
+    int object_lazy_compaction;
+    int object_prefetch_compaction;
 } tidesdb_column_family_config_t;
 
 /**
@@ -230,6 +296,8 @@ typedef struct tidesdb_column_family_config_t
  * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
  * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
+ * @param object_store pluggable object store connector (NULL = local only, default)
+ * @param object_store_config object store behavior configuration (NULL = use defaults)
  */
 typedef struct tidesdb_config_t
 {
@@ -248,6 +316,8 @@ typedef struct tidesdb_config_t
     float unified_memtable_skip_list_probability;
     int unified_memtable_sync_mode;
     uint64_t unified_memtable_sync_interval_us;
+    tidesdb_objstore_t *object_store;
+    tidesdb_objstore_config_t *object_store_config;
 } tidesdb_config_t;
 
 /**
@@ -337,6 +407,16 @@ typedef struct tidesdb_cache_stats_t
  * @param unified_is_flushing whether unified memtable is currently flushing/rotating
  * @param unified_next_cf_index next CF index to be assigned in unified mode
  * @param unified_wal_generation current unified WAL generation counter
+ * @param object_store_enabled whether object store mode is active
+ * @param object_store_connector connector name ("s3", "gcs", "fs", etc.)
+ * @param local_cache_bytes_used current local file cache usage in bytes
+ * @param local_cache_bytes_max configured maximum local cache size in bytes
+ * @param local_cache_num_files number of files tracked in local cache
+ * @param last_uploaded_generation highest WAL generation confirmed uploaded
+ * @param upload_queue_depth number of pending upload jobs in the queue
+ * @param total_uploads lifetime count of objects uploaded to object store
+ * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
+ * @param replica_mode whether running in read-only replica mode
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -361,6 +441,16 @@ typedef struct tidesdb_db_stats_t
     int unified_is_flushing;
     uint32_t unified_next_cf_index;
     uint64_t unified_wal_generation;
+    int object_store_enabled;
+    const char *object_store_connector;
+    size_t local_cache_bytes_used;
+    size_t local_cache_bytes_max;
+    int local_cache_num_files;
+    uint64_t last_uploaded_generation;
+    size_t upload_queue_depth;
+    uint64_t total_uploads;
+    uint64_t total_upload_failures;
+    int replica_mode;
 } tidesdb_db_stats_t;
 
 /**** system default configuration functions */
@@ -591,5 +681,27 @@ int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t
 void tidesdb_free(void *ptr);
 
 int tidesdb_sync_wal(tidesdb_column_family_t *cf);
+
+/**** object store connector factories */
+
+/**
+ * tidesdb_objstore_fs_create
+ * create a filesystem-backed object store connector for testing and local replication
+ * stores objects as files under root_dir mirroring the key path structure
+ * @param root_dir directory to store objects in
+ * @return connector handle or NULL on error
+ */
+tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir);
+
+/**
+ * tidesdb_promote_to_primary
+ * switch a read-only replica to primary mode
+ * @param db database handle in replica mode
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS if not a replica
+ */
+int tidesdb_promote_to_primary(tidesdb_t *db);
+
+int tidesdb_iter_key_value(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size, uint8_t **value,
+                           size_t *value_size);
 
 #endif /* __TIDESDB_DB_H__ */

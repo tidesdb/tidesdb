@@ -1,0 +1,75 @@
+name: Object Store Tests (MinIO)
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  objstore-test:
+    runs-on: ubuntu-latest
+    name: Object Store Integration Tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            echo "waiting for minio ($i)..."
+            sleep 2
+          done
+
+      - name: Create test bucket
+        run: |
+          curl -sL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          chmod +x /tmp/mc
+          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
+          /tmp/mc mb local/tidesdb-test || true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential liblz4-dev libzstd-dev libsnappy-dev \
+            libcurl4-openssl-dev libssl-dev
+
+      - name: Build TidesDB with S3 connector
+        run: |
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_S3=ON -DTIDESDB_WITH_SANITIZER=OFF
+          cmake --build . -j$(nproc)
+
+      - name: Run standard test suite
+        run: |
+          cd build
+          ./tidesdb_tests
+
+      - name: Run object store tests (filesystem connector)
+        run: |
+          cd build
+          ./tidesdb_tests test_objstore_fs_roundtrip
+          ./tidesdb_tests test_objstore_cold_start
+          ./tidesdb_tests test_objstore_compaction_and_iterators
+          ./tidesdb_tests test_unified_iterator_consistency
+
+      - name: Run object store tests (MinIO S3 connector)
+        env:
+          TIDESDB_S3_ENDPOINT: localhost:9000
+          TIDESDB_S3_BUCKET: tidesdb-test
+          TIDESDB_S3_ACCESS_KEY: minioadmin
+          TIDESDB_S3_SECRET_KEY: minioadmin
+        run: |
+          cd build
+          ./tidesdb_tests test_objstore_s3_minio
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true

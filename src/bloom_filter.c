@@ -32,6 +32,15 @@
 #define BF_SET_BIT(bitset, bit) ((bitset)[BF_WORD_INDEX(bit)] |= (1ULL << BF_BIT_INDEX(bit)))
 #define BF_GET_BIT(bitset, bit) (((bitset)[BF_WORD_INDEX(bit)] >> BF_BIT_INDEX(bit)) & 1ULL)
 
+/* lemire's fast range reduction maps a uniform uint32_t hash into [0, range)
+ * without integer division. it uses a single 64-bit multiply + shift.
+ * not a true modulo but produces a uniform distribution, which is all
+ * a bloom filter needs. */
+static inline uint32_t bf_fast_range(const uint32_t hash, const uint32_t range)
+{
+    return (uint32_t)(((uint64_t)hash * (uint64_t)range) >> 32);
+}
+
 /**
  * bf_hash_inline
  * static inline version of bloom_filter_hash for internal use
@@ -171,14 +180,19 @@ void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size
     const unsigned int m = bf->m;
     uint64_t *const bitset = bf->bitset;
 
-    /* we add a key to the bloom filter using H hash functions */
+    const uint32_t h1 = bf_hash_inline(entry, size, 0);
+    const uint32_t h2 = bf_hash_inline(entry, size, 1);
+
     for (unsigned int i = 0; i < h; i++)
     {
-        const uint32_t hash = bf_hash_inline(entry, size, i);
-        const size_t index = hash % m;
+        const uint32_t hash = h1 + i * h2;
+        const uint32_t index = bf_fast_range(hash, m);
         BF_SET_BIT(bitset, index);
     }
 }
+
+/* maximum entries to batch in one cache-friendly pass */
+#define BF_BATCH_CHUNK 256
 
 void bloom_filter_add_batch(const bloom_filter_t *bf, const uint8_t **entries, const size_t *sizes,
                             const size_t count)
@@ -191,20 +205,54 @@ void bloom_filter_add_batch(const bloom_filter_t *bf, const uint8_t **entries, c
     const unsigned int m = bf->m;
     uint64_t *const bitset = bf->bitset;
 
-    /* we process entries in batch for better cache locality
-     * by keeping bitset access patterns more predictable */
-    for (size_t e = 0; e < count; e++)
+    /* we pre-compute all bit indices for a chunk of entries,
+     * sort them, then set bits in ascending order for sequential cache line access.
+     * this converts random bitset writes into a mostly-sequential pattern. */
+
+    uint32_t indices[BF_BATCH_CHUNK * 20];
+    const unsigned int probes_per_entry = (h > 20) ? 20 : h;
+
+    for (size_t base = 0; base < count; base += BF_BATCH_CHUNK)
     {
-        const uint8_t *entry = entries[e];
-        const size_t size = sizes[e];
+        size_t chunk = count - base;
+        if (chunk > BF_BATCH_CHUNK) chunk = BF_BATCH_CHUNK;
 
-        if (BLOOM_UNLIKELY(entry == NULL || size == 0)) continue;
-
-        for (unsigned int i = 0; i < h; i++)
+        /* we compute all bit indices for this chunk */
+        size_t n_indices = 0;
+        for (size_t e = 0; e < chunk; e++)
         {
-            const uint32_t hash = bf_hash_inline(entry, size, i);
-            const size_t index = hash % m;
-            BF_SET_BIT(bitset, index);
+            const uint8_t *entry = entries[base + e];
+            const size_t sz = sizes[base + e];
+
+            if (BLOOM_UNLIKELY(entry == NULL || sz == 0)) continue;
+
+            const uint32_t h1 = bf_hash_inline(entry, sz, 0);
+            const uint32_t h2 = bf_hash_inline(entry, sz, 1);
+
+            for (unsigned int i = 0; i < probes_per_entry; i++)
+            {
+                indices[n_indices++] = bf_fast_range(h1 + i * h2, m);
+            }
+        }
+
+        /* we insertion sort the indices for cache-friendly bitset access.
+         * the array is small (<=5120 entries) so insertion sort beats qsort overhead. */
+        for (size_t i = 1; i < n_indices; i++)
+        {
+            const uint32_t key = indices[i];
+            size_t j = i;
+            while (j > 0 && indices[j - 1] > key)
+            {
+                indices[j] = indices[j - 1];
+                j--;
+            }
+            indices[j] = key;
+        }
+
+        /* we set bits in sorted order */
+        for (size_t i = 0; i < n_indices; i++)
+        {
+            BF_SET_BIT(bitset, indices[i]);
         }
     }
 }
@@ -219,12 +267,15 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
     const unsigned int m = bf->m;
     const uint64_t *const bitset = bf->bitset;
 
-    /* we check if a key is in the bloom filter using H hash functions
-     * early exit on first zero bit (likely case for negative lookups) */
+    /* k-mitzenmacher + fast range reduction
+     * 2 hashes + h cheap probes instead of h full hashes + h divisions */
+    const uint32_t h1 = bf_hash_inline(entry, size, 0);
+    const uint32_t h2 = bf_hash_inline(entry, size, 1);
+
     for (unsigned int i = 0; i < h; i++)
     {
-        const uint32_t hash = bf_hash_inline(entry, size, i);
-        const size_t index = hash % m;
+        const uint32_t hash = h1 + i * h2;
+        const uint32_t index = bf_fast_range(hash, m);
         if (BLOOM_LIKELY(!BF_GET_BIT(bitset, index)))
         {
             return 0; /* definitely not in set */
@@ -282,8 +333,8 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     }
 
     /* we allocate worst-case size
-     * -- header        -- 3 varint32s (m, h, non_zero_count) = 15 bytes max
-     * -- sparse data   -- each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
+     * -- header            3 varint32s (m, h, non_zero_count) = 15 bytes max
+     * -- sparse data       each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
      */
     const size_t max_size = 15 + non_zero_count * 15;
     uint8_t *buffer = malloc(max_size);
@@ -309,12 +360,10 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
         }
     }
 
-    /* return actual size used */
+    /* we return actual size used, no realloc shrink since the overallocation
+     * is at most 15 bytes per non-zero word and glibc typically won't release it anyway */
     *out_size = ptr - buffer;
-
-    /* we shrink buffer to actual size */
-    uint8_t *final_buffer = realloc(buffer, *out_size);
-    return final_buffer ? final_buffer : buffer;
+    return buffer;
 }
 
 bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
@@ -364,7 +413,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
         ptr = decode_varint32(ptr, &index);
         ptr = decode_varint64(ptr, &value);
 
-        /* validate index is within bounds */
+        /* we validate index is within bounds */
         if (index >= (uint32_t)size_in_words)
         {
             free(bitset);

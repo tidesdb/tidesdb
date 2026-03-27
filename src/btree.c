@@ -2180,6 +2180,8 @@ void btree_set_node_cache(btree_t *tree, clock_cache_t *cache)
 clock_cache_t *btree_create_node_cache(const size_t max_bytes)
 {
     cache_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.avg_entry_size = BTREE_DEFAULT_NODE_SIZE;
     clock_cache_compute_config(max_bytes, &config);
     config.evict_callback = btree_node_cache_evict_callback;
     return clock_cache_create(&config);

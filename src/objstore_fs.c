@@ -154,6 +154,11 @@ static int fs_copy_file(const char *src_path, const char *dst_path)
 
     fclose(dst);
     fclose(src);
+
+    /** we remove partial destination file on failure so stale corrupt files
+     *  do not prevent re-download on subsequent attempts */
+    if (rc != 0) unlink(dst_path);
+
     return rc;
 }
 

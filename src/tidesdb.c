@@ -3707,6 +3707,15 @@ static void tdb_path_to_object_key(const tidesdb_t *db, const char *local_path, 
 {
     const char *base = db->db_path;
     size_t base_len = strlen(base);
+    size_t path_len = strlen(local_path);
+
+    /* we guard against local_path that does not start with db_path */
+    if (path_len <= base_len || strncmp(local_path, base, base_len) != 0)
+    {
+        snprintf(key_out, key_buf_size, "%s", local_path);
+        return;
+    }
+
     const char *rel = local_path + base_len;
     if (*rel == '/' || *rel == '\\') rel++;
     snprintf(key_out, key_buf_size, "%s", rel);
@@ -3854,10 +3863,21 @@ static void tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path)
     if (!db->object_store || !local_path) return;
     char key[TDB_MAX_PATH_LEN];
     tdb_path_to_object_key(db, local_path, key, sizeof(key));
-    if (db->object_store->put(db->object_store->ctx, key, local_path) != 0)
+
+    /* we retry with  exponential backoff matching the async upload worker */
+    const int max_retries = 3;
+    int delay_us = 100000; /* 100ms initial */
+    for (int attempt = 0; attempt < max_retries; attempt++)
     {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync upload failed: %s", key);
+        if (db->object_store->put(db->object_store->ctx, key, local_path) == 0) return;
+
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync upload attempt %d/%d failed: %s",
+                      attempt + 1, max_retries, key);
+        if (attempt + 1 < max_retries) usleep(delay_us);
+        delay_us *= 4;
     }
+    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync upload failed after %d attempts: %s",
+                  max_retries, key);
 }
 
 /**
@@ -4108,7 +4128,10 @@ static int tidesdb_vlog_range_get_value(tidesdb_t *db, tidesdb_sstable_t *sst, u
     if (hread < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE) return TDB_ERR_IO;
 
     const uint32_t block_size = decode_uint32_le_compat(header);
-    if (block_size == 0) return TDB_ERR_CORRUPTION;
+    if (block_size == 0 || block_size > UINT32_MAX / 2) return TDB_ERR_CORRUPTION;
+
+    const uint32_t stored_checksum =
+        decode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE);
 
     uint8_t *block_data = malloc(block_size);
     if (!block_data) return TDB_ERR_MEMORY;
@@ -4122,7 +4145,14 @@ static int tidesdb_vlog_range_get_value(tidesdb_t *db, tidesdb_sstable_t *sst, u
         return TDB_ERR_IO;
     }
 
-    if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
+    /* w everify checksum (XXH32 with seed 0, matching block_manager) */
+    if (XXH32(block_data, block_size, 0) != stored_checksum)
+    {
+        free(block_data);
+        return TDB_ERR_CORRUPTION;
+    }
+
+    if (sst->config && sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         size_t decompressed_size;
         uint8_t *decompressed = decompress_data(block_data, block_size, &decompressed_size,
@@ -4253,7 +4283,7 @@ static void tdb_objstore_prefetch_sstables(tidesdb_t *db, tidesdb_sstable_t **ss
 
         for (int i = 0; i < batch; i++)
         {
-            if (pthread_create(&threads[i], NULL, tdb_prefetch_worker, &args[idx + i]) == 0)
+            if (pthread_create(&threads[launched], NULL, tdb_prefetch_worker, &args[idx + i]) == 0)
             {
                 launched++;
             }
@@ -4658,7 +4688,11 @@ static void *tdb_cold_start_download_worker(void *arg)
     snprintf(config_local, sizeof(config_local),
              "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
              cf_dir);
-    db->object_store->get(db->object_store->ctx, config_key, config_local);
+    if (db->object_store->get(db->object_store->ctx, config_key, config_local) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "Object store cold start: failed to download config for CF '%s'", cf_name);
+    }
 
     /* we download MANIFEST */
     char manifest_key[TDB_MAX_PATH_LEN];
@@ -4666,7 +4700,11 @@ static void *tdb_cold_start_download_worker(void *arg)
     char manifest_local[TDB_MAX_PATH_LEN];
     snprintf(manifest_local, sizeof(manifest_local),
              "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_dir);
-    db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
+    if (db->object_store->get(db->object_store->ctx, manifest_key, manifest_local) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "Object store cold start: failed to download MANIFEST for CF '%s'", cf_name);
+    }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Object store cold start: downloaded config + MANIFEST for CF '%s'",
                   cf_name);
@@ -4708,7 +4746,7 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
     {
         args[i].db = db;
         args[i].cf_name = discovery.cf_names[i];
-        if (pthread_create(&threads[i], NULL, tdb_cold_start_download_worker, &args[i]) == 0)
+        if (pthread_create(&threads[launched], NULL, tdb_cold_start_download_worker, &args[i]) == 0)
         {
             launched++;
         }
@@ -16126,6 +16164,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     {
         int wait_result = wait_for_open(db);
         if (wait_result != TDB_SUCCESS) return wait_result;
+
+        if (atomic_load(&db->replica_mode)) return TDB_ERR_READONLY;
     }
 
     if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
@@ -16631,6 +16671,7 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
                                                const tidesdb_column_family_t *cf)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
+    if (atomic_load(&db->replica_mode)) return TDB_ERR_READONLY;
 
     tidesdb_column_family_t *cf_to_drop = NULL;
 

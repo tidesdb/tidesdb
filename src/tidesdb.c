@@ -4625,14 +4625,14 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
     tidesdb_memtable_t *umt = atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
     if (!umt || !umt->skip_list) return;
 
-    /* list all available WAL objects in the object store */
+    /* we list all available WAL objects in the object store */
     tdb_wal_discovery_ctx_t discovery = {.count = 0};
     db->object_store->list(db->object_store->ctx, TDB_UNIFIED_WAL_PREFIX, tdb_wal_discovery_cb,
                            &discovery);
 
     if (discovery.count == 0) return;
 
-    /* sort generations ascending for ordered replay */
+    /* we sort generations ascending for ordered replay */
     for (int i = 0; i < discovery.count - 1; i++)
     {
         for (int j = i + 1; j < discovery.count; j++)
@@ -4646,7 +4646,7 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
         }
     }
 
-    /* derive remote generation from the highest discovered WAL */
+    /* we derive remote generation from the highest discovered WAL */
     uint64_t remote_gen = discovery.generations[discovery.count - 1];
     uint64_t local_gen = atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
     if (remote_gen > local_gen)
@@ -14373,7 +14373,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
         }
 
-        /* clean up old WAL files that have been confirmed uploaded (async path).
+        /* we clean up old WAL files that have been confirmed uploaded (async path).
          * iterate from last_wal_cleanup_gen+1 up to last_uploaded_gen, deleting
          * local WAL files that are no longer needed. skip the current active gen. */
         if (db->object_store && db->unified_mt.enabled && db->config.object_store_config &&
@@ -21940,10 +21940,37 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
 
         atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
 
-        if (need_retry && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+        if (need_retry)
         {
-            level_retries++;
-            goto retry_level;
+            if (level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+            {
+                level_retries++;
+                goto retry_level;
+            }
+
+            atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
+
+            sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
+            num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            for (int j = 0; j < num_ssts; j++)
+            {
+                tidesdb_sstable_t *sst = sstables[j];
+                if (sst && tidesdb_sstable_try_ref(sst))
+                {
+                    tidesdb_sstable_t **new_array =
+                        realloc(ssts_array, (sst_count + 1) * sizeof(tidesdb_sstable_t *));
+                    if (!new_array)
+                    {
+                        tidesdb_sstable_unref(cf->db, sst);
+                        break;
+                    }
+                    ssts_array = new_array;
+                    ssts_array[sst_count++] = sst;
+                }
+            }
+
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
         }
     }
 

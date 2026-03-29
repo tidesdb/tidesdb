@@ -121,7 +121,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KV_FLAG_HAS_TTL   0x02
 #define TDB_KV_FLAG_HAS_VLOG  0x04
 #define TDB_KV_FLAG_DELTA_SEQ 0x08
-#define TDB_KV_FLAG_BORROWED  0x40 /* kv points into block data, do not free */
+#define TDB_KV_FLAG_BORROWED  0x40
 #define TDB_KV_FLAG_ARENA     0x80
 
 #define TDB_LOG_FILE               "LOG"
@@ -130,6 +130,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_UNIFIED_WAL_PREFIX     "uwal_"
 #define TDB_UNIFIED_WAL_MAGIC      0x55AAU
 #define TDB_UNIFIED_CF_PREFIX_SIZE 4
+#define TDB_REPLICA_WAL_TMP        "replica_wal_tmp.log"
+#define TDB_REPLICA_MANIFEST_TMP   "MANIFEST.replica_tmp"
 #define TDB_PREFIXED_KEY_STACK_MAX 256
 
 /* stack-with-heap-fallback for prefixed keys */
@@ -174,7 +176,7 @@ static inline size_t tdb_build_prefixed_key(uint32_t cf_index, const uint8_t *ke
 #define TDB_LOCK_FILE                   "LOCK"
 #define TDB_CACHE_KEY_SIZE              64
 #define TDB_KLOG_BLOCK_STACK_ENTRIES    256 /* stack buffer size for small klog block index */
-#define TDB_BLOCK_INDEX_MAGIC           0x4B494459 /* "KIDY" - indexed block cache header */
+#define TDB_BLOCK_INDEX_MAGIC           0x4B494459 /* "KIDY" -- indexed block cache header */
 #define TDB_BLOCK_INDEX_HDR_BASE        12         /* magic(4) + header_size(4) + num_entries(4) */
 #define TDB_BLOCK_INDEX_ENTRY_STRIDE \
     20 /* entry_off(4) + key_off(4) + key_size(4) + seq_lo(4) + seq_hi(4) */
@@ -348,6 +350,7 @@ static inline size_t tdb_build_prefixed_key(uint32_t cf_index, const uint8_t *ke
 #define TDB_NANOSECONDS_PER_MICROSECOND 1000
 
 #define TDB_MAX_TXN_CFS                         256
+#define TDB_MAX_CF_DISCOVERY                    256
 #define TDB_MAX_PATH_LEN                        4096
 #define TDB_MAX_TXN_OPS                         100000
 #define TDB_MEMORY_PERCENTAGE                   0.6
@@ -1189,7 +1192,7 @@ static void tidesdb_block_release(tidesdb_ref_counted_block_t *rc_block)
     int old_count = atomic_fetch_sub_explicit(&rc_block->ref_count, 1, memory_order_release);
     if (old_count == 1)
     {
-        /* last reference released, safe to free */
+        /* last reference released, its safe to free */
         atomic_thread_fence(memory_order_acquire);
         if (rc_block->block)
         {
@@ -2111,7 +2114,7 @@ static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv)
 {
     if (!kv) return;
 
-    /* borrowed kv pairs point into block data — nothing to free */
+    /* borrowed kv pairs point into block data -- nothing to free */
     if (kv->entry.flags & TDB_KV_FLAG_BORROWED) return;
 
     /* arena-allocated KV pairs use single allocation for struct + key + value
@@ -4324,7 +4327,7 @@ static void tdb_replica_sync_manifests(tidesdb_t *db)
         char remote_key[TDB_MAX_PATH_LEN];
         snprintf(remote_key, sizeof(remote_key), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME, cf->name);
         char tmp_path[TDB_MAX_PATH_LEN];
-        snprintf(tmp_path, sizeof(tmp_path), "%s" PATH_SEPARATOR "MANIFEST.replica_tmp",
+        snprintf(tmp_path, sizeof(tmp_path), "%s" PATH_SEPARATOR TDB_REPLICA_MANIFEST_TMP,
                  cf->directory);
 
         if (db->object_store->get(db->object_store->ctx, remote_key, tmp_path) != 0) continue;
@@ -4436,54 +4439,60 @@ static void tdb_replica_sync_manifests(tidesdb_t *db)
 }
 
 /**
- * tdb_replica_replay_wal
- * download the latest unified WAL from the object store and replay entries
- * into the unified memtable for near-real-time reads. uses sequence numbers
- * for idempotent replay so entries already present are skipped.
- * does not write a local WAL since the replica memtable is ephemeral.
- * @param db database instance in replica mode
+ * tdb_wal_discovery_ctx_t
+ * context for WAL generation discovery from object store list() callback
  */
-static void tdb_replica_replay_wal(tidesdb_t *db)
+#define TDB_WAL_DISCOVERY_MAX 256
+
+typedef struct
 {
-    if (!db->unified_mt.enabled || !db->object_store) return;
+    uint64_t generations[TDB_WAL_DISCOVERY_MAX];
+    int count;
+} tdb_wal_discovery_ctx_t;
 
-    tidesdb_memtable_t *umt = atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
-    if (!umt || !umt->skip_list) return;
+/**
+ * tdb_wal_discovery_cb
+ * list() callback that extracts WAL generation numbers from object keys
+ * matching the pattern uwal_<N>.log
+ */
+static void tdb_wal_discovery_cb(const char *key, size_t size, void *cb_ctx)
+{
+    (void)size;
+    tdb_wal_discovery_ctx_t *ctx = (tdb_wal_discovery_ctx_t *)cb_ctx;
+    if (ctx->count >= TDB_WAL_DISCOVERY_MAX) return;
 
-    /* we find the latest WAL in the object store by listing uwal_ prefix */
-    uint64_t wal_gen = atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
+    const size_t prefix_len = sizeof(TDB_UNIFIED_WAL_PREFIX) - 1;
+    if (strncmp(key, TDB_UNIFIED_WAL_PREFIX, prefix_len) != 0) return;
 
-    char wal_key[TDB_MAX_PATH_LEN];
-    char wal_local[TDB_MAX_PATH_LEN];
-    snprintf(wal_local, sizeof(wal_local), "%s" PATH_SEPARATOR "replica_wal_tmp.log", db->db_path);
-
-    /* we try current generation first */
-    int found = 0;
-    snprintf(wal_key, sizeof(wal_key), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
-             TDB_U64_CAST(wal_gen));
-    if (db->object_store->get(db->object_store->ctx, wal_key, wal_local) == 0)
+    const char *num_start = key + prefix_len;
+    char *end = NULL;
+    unsigned long long gen = strtoull(num_start, &end, 10);
+    if (end && strcmp(end, TDB_WAL_EXT) == 0)
     {
-        found = 1;
+        ctx->generations[ctx->count++] = (uint64_t)gen;
     }
+}
 
-    /* we also try gen 0 if current gen failed */
-    if (!found && wal_gen > 0)
-    {
-        snprintf(wal_key, sizeof(wal_key), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
-                 TDB_U64_CAST(0));
-        if (db->object_store->get(db->object_store->ctx, wal_key, wal_local) == 0)
-        {
-            found = 1;
-        }
-    }
-
-    if (!found) return;
-
+/**
+ * tdb_replica_replay_single_wal
+ * replay entries from a single downloaded WAL file into the unified memtable.
+ * uses sequence numbers for idempotent replay so entries already present are skipped.
+ * does not write a local WAL since the replica memtable is ephemeral.
+ * @param db database instance
+ * @param wal_local local path to the downloaded WAL file
+ * @param umt unified memtable to replay into
+ * @param max_seq_inout pointer to max sequence number (updated in place)
+ * @return number of entries replayed
+ */
+static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
+                                         tidesdb_memtable_t *umt, uint64_t *max_seq_inout)
+{
+    (void)db;
     block_manager_t *wal = NULL;
     if (block_manager_open(&wal, wal_local, TDB_SYNC_NONE) != 0)
     {
         tdb_unlink(wal_local);
-        return;
+        return 0;
     }
 
     block_manager_cursor_t *cursor = NULL;
@@ -4491,10 +4500,10 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
     {
         block_manager_close(wal);
         tdb_unlink(wal_local);
-        return;
+        return 0;
     }
 
-    uint64_t max_seq = atomic_load_explicit(&db->global_seq, memory_order_acquire);
+    uint64_t max_seq = *max_seq_inout;
     int replayed = 0;
 
     if (block_manager_cursor_goto_first(cursor) == 0)
@@ -4596,15 +4605,83 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
     block_manager_close(wal);
     tdb_unlink(wal_local);
 
+    *max_seq_inout = max_seq;
+    return replayed;
+}
+
+/**
+ * tdb_replica_replay_wal
+ * discover all unified WAL files in the object store via list(), download and
+ * replay each one in generation order into the unified memtable for near-real-time
+ * reads. uses the list() callback to find all available WAL segments and derives
+ * the current generation from the highest discovered WAL. sequence numbers
+ * ensure idempotent replay.
+ * @param db database instance in replica mode
+ */
+static void tdb_replica_replay_wal(tidesdb_t *db)
+{
+    if (!db->unified_mt.enabled || !db->object_store) return;
+
+    tidesdb_memtable_t *umt = atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
+    if (!umt || !umt->skip_list) return;
+
+    /* list all available WAL objects in the object store */
+    tdb_wal_discovery_ctx_t discovery = {.count = 0};
+    db->object_store->list(db->object_store->ctx, TDB_UNIFIED_WAL_PREFIX, tdb_wal_discovery_cb,
+                           &discovery);
+
+    if (discovery.count == 0) return;
+
+    /* sort generations ascending for ordered replay */
+    for (int i = 0; i < discovery.count - 1; i++)
+    {
+        for (int j = i + 1; j < discovery.count; j++)
+        {
+            if (discovery.generations[j] < discovery.generations[i])
+            {
+                uint64_t tmp = discovery.generations[i];
+                discovery.generations[i] = discovery.generations[j];
+                discovery.generations[j] = tmp;
+            }
+        }
+    }
+
+    /* derive remote generation from the highest discovered WAL */
+    uint64_t remote_gen = discovery.generations[discovery.count - 1];
+    uint64_t local_gen = atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
+    if (remote_gen > local_gen)
+    {
+        atomic_store_explicit(&db->unified_mt.wal_generation, remote_gen, memory_order_relaxed);
+    }
+
+    char wal_local[TDB_MAX_PATH_LEN];
+    snprintf(wal_local, sizeof(wal_local), "%s" PATH_SEPARATOR TDB_REPLICA_WAL_TMP, db->db_path);
+
+    uint64_t max_seq = atomic_load_explicit(&db->global_seq, memory_order_acquire);
+    int total_replayed = 0;
+
+    for (int wi = 0; wi < discovery.count; wi++)
+    {
+        char wal_key[TDB_MAX_PATH_LEN];
+        snprintf(wal_key, sizeof(wal_key), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
+                 TDB_U64_CAST(discovery.generations[wi]));
+
+        if (db->object_store->get(db->object_store->ctx, wal_key, wal_local) != 0) continue;
+
+        int n = tdb_replica_replay_single_wal(db, wal_local, umt, &max_seq);
+        total_replayed += n;
+    }
+
     if (max_seq > atomic_load_explicit(&db->global_seq, memory_order_acquire))
     {
         atomic_store_explicit(&db->global_seq, max_seq + 1, memory_order_release);
     }
 
-    if (replayed > 0)
+    if (total_replayed > 0)
     {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica WAL replay: %d new entries (max_seq=%" PRIu64 ")",
-                      replayed, max_seq);
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Replica WAL replay: %d new entries across %d WALs (max_seq=%" PRIu64 ")",
+                      total_replayed, discovery.count, max_seq);
     }
 }
 
@@ -4616,7 +4693,7 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
  */
 typedef struct
 {
-    char cf_names[256][TDB_MAX_CF_NAME_LEN]; /* discovered CF names */
+    char cf_names[TDB_MAX_CF_DISCOVERY][TDB_MAX_CF_NAME_LEN]; /* discovered CF names */
     int count;
 } tdb_cf_discovery_ctx_t;
 
@@ -4639,7 +4716,7 @@ static void tdb_cf_discovery_cb(const char *key, size_t size, void *cb_ctx)
 
     if (key_len > suffix_len && strcmp(key + key_len - suffix_len, manifest_suffix) == 0)
     {
-        if (ctx->count >= 256) return;
+        if (ctx->count >= TDB_MAX_CF_DISCOVERY) return;
 
         /* we extract CF name (everything before "/MANIFEST") */
         size_t cf_len = key_len - suffix_len;
@@ -4738,11 +4815,11 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
                   discovery.count);
 
     /* we download config + MANIFEST for all CFs in parallel */
-    tdb_cold_start_download_arg_t args[256];
-    pthread_t threads[256];
+    tdb_cold_start_download_arg_t args[TDB_MAX_CF_DISCOVERY];
+    pthread_t threads[TDB_MAX_CF_DISCOVERY];
     int launched = 0;
 
-    for (int i = 0; i < discovery.count && i < 256; i++)
+    for (int i = 0; i < discovery.count && i < TDB_MAX_CF_DISCOVERY; i++)
     {
         args[i].db = db;
         args[i].cf_name = discovery.cf_names[i];
@@ -7932,13 +8009,13 @@ static void tidesdb_defer_removed_sst_unref(tidesdb_t *db, tidesdb_level_t *leve
  */
 static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *sst)
 {
-    /* we upload sstable files before adding to level.
-     * the files are already written and closed by the caller.
-     * upload happens synchronously */
+    /* we upload sstable files synchronously before tracking in the local cache.
+     * this ensures the object store has a copy before cache eviction can delete
+     * the local file (the eviction path unlinks cold files from disk). */
     if (sst->db && sst->db->object_store)
     {
-        tdb_objstore_upload_file(sst->db, sst->klog_path);
-        tdb_objstore_upload_file(sst->db, sst->vlog_path);
+        tdb_objstore_upload_file_sync(sst->db, sst->klog_path);
+        tdb_objstore_upload_file_sync(sst->db, sst->vlog_path);
         if (sst->db->local_cache)
         {
             tdb_local_cache_track(sst->db->local_cache, sst->klog_path);
@@ -9578,7 +9655,7 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
 
             if (e->vlog_offset > 0)
             {
-                /* vlog values require a separate read+alloc — fall back to owned kv */
+                /* vlog values require a separate read+alloc -- fall back to owned kv */
                 uint8_t *vlog_value = NULL;
                 tidesdb_vlog_read_value(source->source.sstable.db, source->source.sstable.sst,
                                         e->vlog_offset, e->value_size, &vlog_value);
@@ -14296,6 +14373,30 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
         }
 
+        /* clean up old WAL files that have been confirmed uploaded (async path).
+         * iterate from last_wal_cleanup_gen+1 up to last_uploaded_gen, deleting
+         * local WAL files that are no longer needed. skip the current active gen. */
+        if (db->object_store && db->unified_mt.enabled && db->config.object_store_config &&
+            db->config.object_store_config->replicate_wal &&
+            !db->config.object_store_config->wal_upload_sync)
+        {
+            uint64_t uploaded_gen =
+                atomic_load_explicit(&db->last_uploaded_gen, memory_order_acquire);
+            uint64_t current_gen =
+                atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
+
+            for (uint64_t g = db->last_wal_cleanup_gen + 1; g <= uploaded_gen && g < current_gen;
+                 g++)
+            {
+                char old_wal[TDB_MAX_PATH_LEN];
+                snprintf(old_wal, sizeof(old_wal),
+                         "%s" PATH_SEPARATOR TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
+                         db->db_path, TDB_U64_CAST(g));
+                tdb_unlink(old_wal); /* no-op if file already gone */
+            }
+            if (uploaded_gen > db->last_wal_cleanup_gen) db->last_wal_cleanup_gen = uploaded_gen;
+        }
+
         /* replica MANIFEST sync and WAL replay. throttled by replica_sync_interval_us
          * converted to reaper cycle count (each cycle is TDB_SSTABLE_REAPER_SLEEP_US). */
         if (atomic_load_explicit(&db->replica_mode, memory_order_relaxed) && db->object_store)
@@ -15466,6 +15567,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_init(&(*db)->total_uploads, 0);
         atomic_init(&(*db)->total_upload_failures, 0);
         (*db)->last_wal_sync_size = 0;
+        (*db)->last_wal_cleanup_gen = 0;
 
         if ((*db)->upload_queue)
         {
@@ -15872,6 +15974,38 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->compaction_queue);
     }
 
+    /* we shut down upload pipeline before cleaning up unified memtable state,
+     * so that any async WAL uploads enqueued during flush complete before
+     * the local WAL files are deleted below */
+    if (db->upload_queue)
+    {
+        /***** we send NULL poison pills to stop worker threads, then signal all waiters.
+         ****  queue_enqueue only signals when the queue transitions from empty to non-empty,
+         ***   so rapid enqueue of multiple NULLs may only wake one waiter. the shutdown
+         **    broadcast ensures all blocked workers wake up immediately. */
+        for (int i = 0; i < db->num_upload_threads; i++)
+        {
+            queue_enqueue(db->upload_queue, NULL);
+        }
+        queue_shutdown(db->upload_queue);
+        /* we join all upload threads */
+        if (db->upload_threads)
+        {
+            for (int i = 0; i < db->num_upload_threads; i++)
+            {
+                pthread_join(db->upload_threads[i], NULL);
+            }
+            free(db->upload_threads);
+            db->upload_threads = NULL;
+        }
+        queue_free(db->upload_queue);
+        db->upload_queue = NULL;
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Upload pipeline stopped (%" PRIu64 " uploads, %" PRIu64 " failures)",
+                      atomic_load(&db->total_uploads), atomic_load(&db->total_upload_failures));
+    }
+
     /* we clean up unified memtable state if enabled */
     if (db->unified_mt.enabled)
     {
@@ -16021,36 +16155,6 @@ int tidesdb_close(tidesdb_t *db)
         tdb_file_unlock(db->lock_fd);
         close(db->lock_fd);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Released database directory lock");
-    }
-
-    /* we shut down upload pipeline before destroying connector */
-    if (db->upload_queue)
-    {
-        /***** we send NULL poison pills to stop worker threads, then signal all waiters.
-         ****  queue_enqueue only signals when the queue transitions from empty to non-empty,
-         ***   so rapid enqueue of multiple NULLs may only wake one waiter. the shutdown
-         **    broadcast ensures all blocked workers wake up immediately. */
-        for (int i = 0; i < db->num_upload_threads; i++)
-        {
-            queue_enqueue(db->upload_queue, NULL);
-        }
-        queue_shutdown(db->upload_queue);
-        /* we join all upload threads */
-        if (db->upload_threads)
-        {
-            for (int i = 0; i < db->num_upload_threads; i++)
-            {
-                pthread_join(db->upload_threads[i], NULL);
-            }
-            free(db->upload_threads);
-            db->upload_threads = NULL;
-        }
-        queue_free(db->upload_queue);
-        db->upload_queue = NULL;
-
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "Upload pipeline stopped (%" PRIu64 " uploads, %" PRIu64 " failures)",
-                      atomic_load(&db->total_uploads), atomic_load(&db->total_upload_failures));
     }
 
     /* we clean up object store resources */
@@ -19329,7 +19433,7 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
         if (umt_refed)
         {
             /* we build prefixed key for unified skip list lookup */
-            uint8_t pk_stack[256];
+            uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
             const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
             uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
             if (pk)
@@ -20024,7 +20128,8 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
     {
         skip_list_batch_entry_t stack_batch[TDB_TXN_DEDUP_SKIP_THRESHOLD];
         /* prefixed key storage on the stack for small txns */
-        uint8_t pk_buf[TDB_TXN_DEDUP_SKIP_THRESHOLD * (TDB_UNIFIED_CF_PREFIX_SIZE + 256)];
+        uint8_t pk_buf[TDB_TXN_DEDUP_SKIP_THRESHOLD *
+                       (TDB_UNIFIED_CF_PREFIX_SIZE + TDB_PREFIXED_KEY_STACK_MAX)];
         size_t pk_buf_used = 0;
         int batch_idx = 0;
 
@@ -20142,7 +20247,7 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
         const tidesdb_txn_op_t *op = &txn->ops[i];
 
         /* the hash includes CF index to distinguish same-key across different CFs */
-        uint8_t hash_buf[TDB_UNIFIED_CF_PREFIX_SIZE + 256];
+        uint8_t hash_buf[TDB_UNIFIED_CF_PREFIX_SIZE + TDB_PREFIXED_KEY_STACK_MAX];
         uint8_t *hash_key;
         size_t hash_key_size = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
         if (hash_key_size <= sizeof(hash_buf))
@@ -20592,15 +20697,37 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
     if (temp_sl) skip_list_free(temp_sl);
     skip_list_cursor_free(cursor);
 
-    /* we clean up unified WAL if on */
+    /* we clean up unified WAL -- upload closed segment to object store if configured,
+     * then delete the local file. respects replicate_wal and wal_upload_sync config. */
     if (umt_imm->wal)
     {
         char *wal_path = tdb_strdup(umt_imm->wal->file_path);
+        uint64_t imm_gen = umt_imm->generation;
         block_manager_close(umt_imm->wal);
         umt_imm->wal = NULL;
         if (wal_path)
         {
-            tdb_unlink(wal_path);
+            if (db->object_store && db->config.object_store_config &&
+                db->config.object_store_config->replicate_wal)
+            {
+                if (db->config.object_store_config->wal_upload_sync)
+                {
+                    /* sync: block until upload completes, then delete locally */
+                    tdb_objstore_upload_file_sync(db, wal_path);
+                    tdb_unlink(wal_path);
+                }
+                else
+                {
+                    /* async: enqueue upload with WAL gen for fence tracking.
+                     * do NOT delete -- reaper cleans up after upload confirms */
+                    tdb_objstore_enqueue_upload(db, wal_path, imm_gen);
+                }
+            }
+            else
+            {
+                /* no object store or replicate_wal disabled -- just delete */
+                tdb_unlink(wal_path);
+            }
             free(wal_path);
         }
     }
@@ -23361,7 +23488,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
         else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
         {
             /* we build prefixed key and seek, then strip prefix via advance_to_cf */
-            uint8_t pk_stack[256];
+            uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
             const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
             uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
             if (pk)
@@ -23496,7 +23623,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
         }
         else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
         {
-            uint8_t pk_stack[256];
+            uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
             const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
             uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
             if (pk)
@@ -24811,12 +24938,22 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
         return TDB_ERR_MEMORY;
     }
 
+    /* we build the active WAL filename so we can skip it during recovery --
+     * the active WAL was already truncated at open and must not be deleted */
+    char active_wal_name[TDB_MAX_PATH_LEN];
+    snprintf(
+        active_wal_name, sizeof(active_wal_name), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
+        TDB_U64_CAST(atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed)));
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL)
     {
         if (strstr(entry->d_name, TDB_UNIFIED_WAL_PREFIX) == entry->d_name &&
             strstr(entry->d_name, TDB_WAL_EXT) != NULL)
         {
+            /* skip the active WAL -- it was just truncated and is in use */
+            if (strcmp(entry->d_name, active_wal_name) == 0) continue;
+
             const size_t path_len = strlen(db->db_path) + strlen(entry->d_name) + 2;
             char *wal_path = malloc(path_len);
             if (wal_path)
@@ -25430,6 +25567,34 @@ int tidesdb_purge(tidesdb_t *db)
     int first_err = TDB_SUCCESS;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "purge: starting full database purge");
+
+    /* we flush unified active memtable before per-CF purge so that the resulting
+     * ssts are included in the per-CF compaction pass that follows */
+    if (db->unified_mt.enabled)
+    {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&db->unified_mt.is_flushing, &expected, 1,
+                                                    memory_order_acquire, memory_order_relaxed))
+        {
+            tidesdb_memtable_t *umt =
+                atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
+            if (umt && umt->skip_list && skip_list_count_entries(umt->skip_list) > 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "purge: rotating unified memtable");
+                tidesdb_unified_memtable_rotate(db);
+            }
+            atomic_store_explicit(&db->unified_mt.is_flushing, 0, memory_order_release);
+        }
+
+        /* wait for the unified flush to complete before per-CF work */
+        for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS * 4; i++)
+        {
+            const size_t fq = db->flush_queue ? queue_size(db->flush_queue) : 0;
+            int pending = atomic_load_explicit(&db->flush_pending_count, memory_order_acquire);
+            if (fq == 0 && pending == 0) break;
+            usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        }
+    }
 
     /* purge each CF -- flush + compact */
     pthread_rwlock_rdlock(&db->cf_list_lock);

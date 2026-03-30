@@ -26185,8 +26185,8 @@ static void test_objstore_s3_minio(void)
     fp = fopen(download_file, "rb");
     ASSERT_TRUE(fp != NULL);
     char buf[256] = {0};
-    size_t nread = fread(buf, 1, sizeof(buf) - 1, fp);
-    (void)nread;
+    size_t fread_n = fread(buf, 1, sizeof(buf) - 1, fp);
+    (void)fread_n;
     fclose(fp);
     ASSERT_TRUE(strstr(buf, "hello from tidesdb") != NULL);
     printf("  S3 test: get succeeded\n");

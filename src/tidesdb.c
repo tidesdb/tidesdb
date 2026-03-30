@@ -19114,12 +19114,34 @@ unified_sst_search:;
                 tidesdb_sstable_t **current_sstables =
                     atomic_load_explicit(&level->sstables, memory_order_acquire);
 
-                if (current_sstables != sstables && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+                if (current_sstables != sstables)
                 {
-                    /** array was swapped! we retry with fresh array (bounded)
-                     *  reset best-match state since old array is gone */
+                    if (level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+                    {
+                        /** array was swapped! we retry with fresh array (bounded)
+                         *  reset best-match state since old array is gone */
+                        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+                        level_retries++;
+
+                        if (best_value)
+                        {
+                            free(best_value);
+                            best_value = NULL;
+                        }
+                        best_found = 0;
+                        best_seq = 0;
+
+                        for (int b = 0; b < retry_backoff; b++) cpu_pause();
+                        if (retry_backoff < TDB_SST_RETRY_MAX_SPINS) retry_backoff <<= 1;
+
+                        goto retry_level;
+                    }
+
+                    /* retries exhausted but array was swapped. restart with the
+                     * current array to avoid using stale sstable pointers. reset
+                     * retry counter but only allow one restart to prevent infinite
+                     * loops under pathological compaction. */
                     atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
-                    level_retries++;
 
                     if (best_value)
                     {
@@ -19128,14 +19150,12 @@ unified_sst_search:;
                     }
                     best_found = 0;
                     best_seq = 0;
-
-                    for (int b = 0; b < retry_backoff; b++) cpu_pause();
-                    if (retry_backoff < TDB_SST_RETRY_MAX_SPINS) retry_backoff <<= 1;
+                    level_retries = TDB_SST_RETRY_MAX_LEVEL_RETRIES - 1;
 
                     goto retry_level;
                 }
 
-                /*** array unchanged or retries exhausted, thus we skip dead sstable
+                /*** array unchanged, thus we skip dead sstable
                  **  this prevents livelock under heavy compaction
                  *   the merged result is accessible at this or deeper levels */
                 continue;

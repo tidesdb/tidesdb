@@ -303,8 +303,8 @@ static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t ro
             const char *relative = full + root_len;
             if (*relative == '/' || *relative == '\\') relative++;
 
-            /* normalize backslashes to forward slashes so object keys are
-             * platform-independent (e.g. "cf_name/MANIFEST" not "cf_name\MANIFEST") */
+            /** the must normalize backslashes to forward slashes so object keys are
+             *  platform-independent (e.g. "cf_name/MANIFEST" not "cf_name\MANIFEST") */
             char normalized[TDB_FS_MAX_PATH];
             strncpy(normalized, relative, sizeof(normalized) - 1);
             normalized[sizeof(normalized) - 1] = '\0';

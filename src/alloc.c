@@ -16,6 +16,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <stdatomic.h>
 #include <stdlib.h>
 
 /* we use thin wrappers instead of taking addresses of stdlib functions directly
@@ -49,12 +50,12 @@ tidesdb_allocator_t tidesdb_allocator = {
     .free_fn = real_free,
 };
 
-int tidesdb_initialized = 0;
+_Atomic(int) tidesdb_initialized = 0;
 
 int tidesdb_init(tidesdb_malloc_fn malloc_fn, tidesdb_calloc_fn calloc_fn,
                  tidesdb_realloc_fn realloc_fn, tidesdb_free_fn free_fn)
 {
-    if (tidesdb_initialized)
+    if (atomic_load_explicit(&tidesdb_initialized, memory_order_acquire))
     {
         return -1;
     }
@@ -63,23 +64,30 @@ int tidesdb_init(tidesdb_malloc_fn malloc_fn, tidesdb_calloc_fn calloc_fn,
     tidesdb_allocator.calloc_fn = calloc_fn ? calloc_fn : real_calloc;
     tidesdb_allocator.realloc_fn = realloc_fn ? realloc_fn : real_realloc;
     tidesdb_allocator.free_fn = free_fn ? free_fn : real_free;
-    tidesdb_initialized = 1;
+
+    /* we release fence ensures all function pointer writes are visible before
+     * any thread sees initialized=1 and starts calling through them */
+    atomic_store_explicit(&tidesdb_initialized, 1, memory_order_release);
 
     return 0;
 }
 
 void tidesdb_finalize(void)
 {
+    /** we set initialized to 0 first with release semantics so concurrent readers
+     *  see the flag change before we overwrite the function pointers */
+    atomic_store_explicit(&tidesdb_initialized, 0, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst);
+
     tidesdb_allocator.malloc_fn = real_malloc;
     tidesdb_allocator.calloc_fn = real_calloc;
     tidesdb_allocator.realloc_fn = real_realloc;
     tidesdb_allocator.free_fn = real_free;
-    tidesdb_initialized = 0;
 }
 
 void tidesdb_ensure_initialized(void)
 {
-    if (!tidesdb_initialized)
+    if (!atomic_load_explicit(&tidesdb_initialized, memory_order_acquire))
     {
         tidesdb_init(NULL, NULL, NULL, NULL);
     }

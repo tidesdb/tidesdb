@@ -1113,6 +1113,9 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
                                                                       tidesdb_sstable_t *sst);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
                                                                tidesdb_sstable_t *sst);
+static int tidesdb_btree_read_vlog_value(block_manager_cursor_t *vlog_cursor, uint64_t vlog_offset,
+                                         const tidesdb_column_family_config_t *config,
+                                         uint8_t **value_out, size_t *value_size_out);
 static void tidesdb_iter_clear_block_stash(tidesdb_merge_source_t *source);
 static void tidesdb_iter_clear_lazy(tidesdb_merge_source_t *source);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
@@ -3619,6 +3622,8 @@ static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
         return TDB_ERR_IO;
     }
 
+    if (block_size == 0 || block_size > UINT32_MAX / 2) return TDB_ERR_CORRUPTION;
+
     uint8_t *block_data = malloc(block_size);
     if (!block_data)
     {
@@ -3632,7 +3637,7 @@ static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
         return TDB_ERR_IO;
     }
 
-    if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
+    if (sst->config && sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         size_t decompressed_size;
         uint8_t *decompressed = decompress_data(block_data, block_size, &decompressed_size,
@@ -6172,11 +6177,29 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
             continue;
         }
 
-        /* write value to vlog and get offset */
+        /* write value to vlog and get offset. we compress the value if the column
+         * family uses compression, matching the compaction merge path and the
+         * block-based klog flush path (tidesdb_write_vlog_entry). */
         uint64_t vlog_offset = 0;
         if (value && value_size > 0 && !deleted)
         {
-            block_manager_block_t *vlog_block = block_manager_block_create(value_size, value);
+            const uint8_t *final_data = value;
+            size_t final_size = value_size;
+            uint8_t *compressed = NULL;
+
+            if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
+            {
+                size_t compressed_size;
+                compressed = compress_data(value, value_size, &compressed_size,
+                                           sst->config->compression_algorithm);
+                if (compressed)
+                {
+                    final_data = compressed;
+                    final_size = compressed_size;
+                }
+            }
+
+            block_manager_block_t *vlog_block = block_manager_block_create(final_size, final_data);
             if (vlog_block)
             {
                 int64_t offset = block_manager_block_write(vlog_bm, vlog_block);
@@ -6186,6 +6209,7 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
                 }
                 block_manager_block_release(vlog_block);
             }
+            free(compressed);
         }
 
         /* we add to btree */
@@ -6971,22 +6995,15 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
             return TDB_ERR_IO;
         }
 
-        block_manager_cursor_goto(&vlog_cursor, vlog_offset);
-        block_manager_block_t *vlog_block = block_manager_cursor_read(&vlog_cursor);
-        if (!vlog_block)
+        uint8_t *vlog_value = NULL;
+        size_t vlog_value_size = 0;
+        if (tidesdb_btree_read_vlog_value(&vlog_cursor, vlog_offset, sst->config, &vlog_value,
+                                          &vlog_value_size) != 0)
         {
             return TDB_ERR_IO;
         }
-
-        value = malloc(vlog_block->size);
-        if (!value)
-        {
-            block_manager_block_free(vlog_block);
-            return TDB_ERR_MEMORY;
-        }
-        memcpy(value, vlog_block->data, vlog_block->size);
-        value_size = vlog_block->size;
-        block_manager_block_free(vlog_block);
+        value = vlog_value;
+        value_size = vlog_value_size;
     }
 
     /* we create kv pair */
@@ -9173,6 +9190,57 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
 }
 
 /**
+ * tidesdb_btree_read_vlog_value
+ * read and decompress a value from the vlog via a btree vlog cursor.
+ * handles the cursor_goto + cursor_read + decompression sequence that
+ * is shared across all btree vlog read sites (seek, advance, point lookup).
+ * @param vlog_cursor block manager cursor positioned on the vlog file
+ * @param vlog_offset byte offset of the vlog block
+ * @param config column family config (for compression algorithm)
+ * @param value_out receives the (decompressed) value data (caller must free)
+ * @param value_size_out receives the value size
+ * @return 0 on success, -1 on failure
+ */
+static int tidesdb_btree_read_vlog_value(block_manager_cursor_t *vlog_cursor, uint64_t vlog_offset,
+                                         const tidesdb_column_family_config_t *config,
+                                         uint8_t **value_out, size_t *value_size_out)
+{
+    block_manager_cursor_goto(vlog_cursor, vlog_offset);
+    block_manager_block_t *vlog_block = block_manager_cursor_read(vlog_cursor);
+    if (!vlog_block) return -1;
+
+    uint8_t *data = vlog_block->data;
+    size_t data_size = vlog_block->size;
+
+    /* we decompress if the column family uses compression */
+    if (config && config->compression_algorithm != TDB_COMPRESS_NONE)
+    {
+        size_t decompressed_size;
+        uint8_t *decompressed =
+            decompress_data(data, data_size, &decompressed_size, config->compression_algorithm);
+        block_manager_block_free(vlog_block);
+        if (!decompressed) return -1;
+
+        *value_out = decompressed;
+        *value_size_out = decompressed_size;
+        return 0;
+    }
+
+    /* uncompressed -- copy raw block data */
+    uint8_t *copy = malloc(data_size);
+    if (!copy)
+    {
+        block_manager_block_free(vlog_block);
+        return -1;
+    }
+    memcpy(copy, data, data_size);
+    *value_out = copy;
+    *value_size_out = data_size;
+    block_manager_block_free(vlog_block);
+    return 0;
+}
+
+/**
  * tidesdb_merge_source_from_btree
  * create a merge source from a btree-based sstable
  * @param db database instance
@@ -9291,25 +9359,21 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
     uint8_t *vlog_value = NULL;
     if (vlog_offset > 0)
     {
-        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
-        block_manager_block_t *vlog_block =
-            block_manager_cursor_read(source->source.btree.vlog_cursor);
-        if (vlog_block)
+        if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
+                                          source->config, &vlog_value, &actual_value_size) == 0)
         {
-            vlog_value = malloc(vlog_block->size);
-            if (vlog_value)
-            {
-                memcpy(vlog_value, vlog_block->data, vlog_block->size);
-                actual_value = vlog_value;
-                actual_value_size = vlog_block->size;
-            }
-            block_manager_block_free(vlog_block);
+            actual_value = vlog_value;
+        }
+        else
+        {
+            actual_value = NULL;
+            actual_value_size = 0;
         }
     }
 
     source->current_kv =
         tidesdb_kv_pair_create(key, key_size, actual_value, actual_value_size, ttl, seq, deleted);
-    free(vlog_value); /* only free vlog_value if we allocated it */
+    free(vlog_value);
 
     if (!source->current_kv)
     {
@@ -9567,25 +9631,22 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                 uint8_t *vlog_value = NULL;
                 if (vlog_offset > 0)
                 {
-                    block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
-                    block_manager_block_t *vlog_block =
-                        block_manager_cursor_read(source->source.btree.vlog_cursor);
-                    if (vlog_block)
+                    if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
+                                                      source->config, &vlog_value,
+                                                      &actual_value_size) == 0)
                     {
-                        vlog_value = malloc(vlog_block->size);
-                        if (vlog_value)
-                        {
-                            memcpy(vlog_value, vlog_block->data, vlog_block->size);
-                            actual_value = vlog_value;
-                            actual_value_size = vlog_block->size;
-                        }
-                        block_manager_block_free(vlog_block);
+                        actual_value = vlog_value;
+                    }
+                    else
+                    {
+                        actual_value = NULL;
+                        actual_value_size = 0;
                     }
                 }
 
                 source->current_kv = tidesdb_kv_pair_create(key, key_size, actual_value,
                                                             actual_value_size, ttl, seq, deleted);
-                free(vlog_value); /* only free vlog_value if we allocated it */
+                free(vlog_value);
                 return TDB_SUCCESS;
             }
         }
@@ -9884,25 +9945,22 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 uint8_t *vlog_value = NULL;
                 if (vlog_offset > 0)
                 {
-                    block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
-                    block_manager_block_t *vlog_block =
-                        block_manager_cursor_read(source->source.btree.vlog_cursor);
-                    if (vlog_block)
+                    if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
+                                                      source->config, &vlog_value,
+                                                      &actual_value_size) == 0)
                     {
-                        vlog_value = malloc(vlog_block->size);
-                        if (vlog_value)
-                        {
-                            memcpy(vlog_value, vlog_block->data, vlog_block->size);
-                            actual_value = vlog_value;
-                            actual_value_size = vlog_block->size;
-                        }
-                        block_manager_block_free(vlog_block);
+                        actual_value = vlog_value;
+                    }
+                    else
+                    {
+                        actual_value = NULL;
+                        actual_value_size = 0;
                     }
                 }
 
                 source->current_kv = tidesdb_kv_pair_create(key, key_size, actual_value,
                                                             actual_value_size, ttl, seq, deleted);
-                free(vlog_value); /* we only free vlog_value if we allocated it */
+                free(vlog_value);
                 return TDB_SUCCESS;
             }
         }
@@ -22379,25 +22437,21 @@ static void tidesdb_iter_seek_btree_source_forward(tidesdb_merge_source_t *sourc
     uint8_t *vlog_value = NULL;
     if (vlog_offset > 0)
     {
-        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
-        block_manager_block_t *vlog_block =
-            block_manager_cursor_read(source->source.btree.vlog_cursor);
-        if (vlog_block)
+        if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
+                                          source->config, &vlog_value, &actual_value_size) == 0)
         {
-            vlog_value = malloc(vlog_block->size);
-            if (vlog_value)
-            {
-                memcpy(vlog_value, vlog_block->data, vlog_block->size);
-                actual_value = vlog_value;
-                actual_value_size = vlog_block->size;
-            }
-            block_manager_block_free(vlog_block);
+            actual_value = vlog_value;
+        }
+        else
+        {
+            actual_value = NULL;
+            actual_value_size = 0;
         }
     }
 
     source->current_kv = tidesdb_kv_pair_create(found_key, found_key_size, actual_value,
                                                 actual_value_size, ttl, seq, deleted);
-    free(vlog_value); /* only free vlog_value if we allocated it */
+    free(vlog_value);
 }
 
 /**
@@ -22454,25 +22508,21 @@ static void tidesdb_iter_seek_btree_source_backward(tidesdb_merge_source_t *sour
     uint8_t *vlog_value = NULL;
     if (vlog_offset > 0)
     {
-        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
-        block_manager_block_t *vlog_block =
-            block_manager_cursor_read(source->source.btree.vlog_cursor);
-        if (vlog_block)
+        if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
+                                          source->config, &vlog_value, &actual_value_size) == 0)
         {
-            vlog_value = malloc(vlog_block->size);
-            if (vlog_value)
-            {
-                memcpy(vlog_value, vlog_block->data, vlog_block->size);
-                actual_value = vlog_value;
-                actual_value_size = vlog_block->size;
-            }
-            block_manager_block_free(vlog_block);
+            actual_value = vlog_value;
+        }
+        else
+        {
+            actual_value = NULL;
+            actual_value_size = 0;
         }
     }
 
     source->current_kv = tidesdb_kv_pair_create(found_key, found_key_size, actual_value,
                                                 actual_value_size, ttl, seq, deleted);
-    free(vlog_value); /* only free vlog_value if we allocated it */
+    free(vlog_value);
 }
 
 /**
@@ -23893,19 +23943,16 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                     uint8_t *vlog_value = NULL;
                     if (vlog_offset > 0)
                     {
-                        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
-                        block_manager_block_t *vlog_block =
-                            block_manager_cursor_read(source->source.btree.vlog_cursor);
-                        if (vlog_block)
+                        if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor,
+                                                          vlog_offset, source->config, &vlog_value,
+                                                          &actual_value_size) == 0)
                         {
-                            vlog_value = malloc(vlog_block->size);
-                            if (vlog_value)
-                            {
-                                memcpy(vlog_value, vlog_block->data, vlog_block->size);
-                                actual_value = vlog_value;
-                                actual_value_size = vlog_block->size;
-                            }
-                            block_manager_block_free(vlog_block);
+                            actual_value = vlog_value;
+                        }
+                        else
+                        {
+                            actual_value = NULL;
+                            actual_value_size = 0;
                         }
                     }
 

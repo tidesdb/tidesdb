@@ -25863,6 +25863,243 @@ static void test_replica_mode(void)
     cleanup_test_dir();
 }
 
+static void test_primary_replica_failover(void)
+{
+    cleanup_test_dir();
+
+    const char *objstore_dir = "./test_failover_store";
+    remove_directory(objstore_dir);
+
+    const int NUM_KEYS_PHASE1 = 50;
+    const int NUM_KEYS_PHASE2 = 20;
+
+    /* primary writes data to two CFs */
+    {
+        tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+        ASSERT_TRUE(store != NULL);
+
+        tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+        os_cfg.wal_sync_on_commit = 1;
+
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.object_store = store;
+        config.object_store_config = &os_cfg;
+        config.unified_memtable_write_buffer_size = 4096;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "failover_cf1", &cf_config), 0);
+        tidesdb_column_family_t *cf1 = tidesdb_get_column_family(db, "failover_cf1");
+        ASSERT_TRUE(cf1 != NULL);
+
+        /* write first batch to cf1 */
+        for (int i = 0; i < NUM_KEYS_PHASE1; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[64], value[128];
+            snprintf(key, sizeof(key), "fkey_%04d", i);
+            snprintf(value, sizeof(value), "fval_%04d", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf1, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        /* create second CF mid-flight (replica must discover this) */
+        ASSERT_EQ(tidesdb_create_column_family(db, "failover_cf2", &cf_config), 0);
+        tidesdb_column_family_t *cf2 = tidesdb_get_column_family(db, "failover_cf2");
+        ASSERT_TRUE(cf2 != NULL);
+
+        for (int i = 0; i < 10; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[64], value[128];
+            snprintf(key, sizeof(key), "cf2key_%04d", i);
+            snprintf(value, sizeof(value), "cf2val_%04d", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf2, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        /* wait for flushes */
+        for (int w = 0; w < 200; w++)
+        {
+            if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing))
+                break;
+            usleep(20000);
+        }
+        usleep(200000);
+
+        tidesdb_close(db);
+        printf("  failover: primary wrote %d keys to cf1, 10 keys to cf2\n", NUM_KEYS_PHASE1);
+    }
+
+    /* replica opens, syncs, reads, promotes, writes */
+    cleanup_test_dir();
+
+    {
+        tidesdb_objstore_t *store2 = tidesdb_objstore_fs_create(objstore_dir);
+        ASSERT_TRUE(store2 != NULL);
+
+        tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+        os_cfg.replica_mode = 1;
+        os_cfg.replica_replay_wal = 1;
+        os_cfg.replica_sync_interval_us = 100000; /* 100ms */
+
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.object_store = store2;
+        config.object_store_config = &os_cfg;
+        config.unified_memtable_write_buffer_size = 4096;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+        /* wait for at least one sync cycle */
+        usleep(300000);
+
+        /* verify both CFs were discovered */
+        tidesdb_column_family_t *cf1 = tidesdb_get_column_family(db, "failover_cf1");
+        ASSERT_TRUE(cf1 != NULL);
+        tidesdb_column_family_t *cf2 = tidesdb_get_column_family(db, "failover_cf2");
+        ASSERT_TRUE(cf2 != NULL);
+        printf("  failover: replica discovered both CFs\n");
+
+        /* read cf1 data */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        int found_cf1 = 0;
+        for (int i = 0; i < NUM_KEYS_PHASE1; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "fkey_%04d", i);
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, cf1, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 &&
+                val)
+            {
+                found_cf1++;
+                free(val);
+            }
+        }
+        tidesdb_txn_free(txn);
+        printf("  failover: replica read %d/%d keys from cf1\n", found_cf1, NUM_KEYS_PHASE1);
+        ASSERT_TRUE(found_cf1 > 0);
+
+        /* read cf2 data */
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        int found_cf2 = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "cf2key_%04d", i);
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, cf2, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 &&
+                val)
+            {
+                found_cf2++;
+                free(val);
+            }
+        }
+        tidesdb_txn_free(txn);
+        printf("  failover: replica read %d/10 keys from cf2\n", found_cf2);
+        ASSERT_TRUE(found_cf2 > 0);
+
+        /* verify writes rejected in replica mode */
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf1, (uint8_t *)"blocked", 8, (uint8_t *)"no", 3, 0),
+                  TDB_ERR_READONLY);
+        tidesdb_txn_free(txn);
+
+        /* promote to primary */
+        ASSERT_EQ(tidesdb_promote_to_primary(db), 0);
+        printf("  failover: promoted to primary\n");
+
+        /* write new data immediately after promotion */
+        for (int i = 0; i < NUM_KEYS_PHASE2; i++)
+        {
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[64], value[128];
+            snprintf(key, sizeof(key), "newkey_%04d", i);
+            snprintf(value, sizeof(value), "newval_%04d", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf1, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+        printf("  failover: wrote %d new keys after promotion\n", NUM_KEYS_PHASE2);
+
+        /* write to cf2 after promotion */
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf2, (uint8_t *)"cf2_promoted", 13, (uint8_t *)"cf2_pval", 9, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        /* verify all data readable: old cf1 + new cf1 + cf2 */
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        int total_cf1 = 0;
+        for (int i = 0; i < NUM_KEYS_PHASE1; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "fkey_%04d", i);
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, cf1, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 &&
+                val)
+            {
+                total_cf1++;
+                free(val);
+            }
+        }
+        for (int i = 0; i < NUM_KEYS_PHASE2; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "newkey_%04d", i);
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, cf1, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0 &&
+                val)
+            {
+                total_cf1++;
+                free(val);
+            }
+        }
+
+        uint8_t *cf2_pval = NULL;
+        size_t cf2_pval_size = 0;
+        int cf2_promoted_ok =
+            tidesdb_txn_get(txn, cf2, (uint8_t *)"cf2_promoted", 13, &cf2_pval, &cf2_pval_size);
+
+        tidesdb_txn_free(txn);
+
+        printf("  failover: verified %d/%d total cf1 keys (old + new)\n", total_cf1,
+               NUM_KEYS_PHASE1 + NUM_KEYS_PHASE2);
+        ASSERT_TRUE(total_cf1 >= NUM_KEYS_PHASE2); /* at minimum the new keys must be there */
+        ASSERT_EQ(cf2_promoted_ok, 0);
+        ASSERT_TRUE(cf2_pval != NULL);
+        free(cf2_pval);
+        printf("  failover: cf2 post-promotion write verified\n");
+
+        tidesdb_close(db);
+    }
+
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
 #ifdef TIDESDB_WITH_S3
 #include "../src/objstore_s3.h"
 
@@ -26468,6 +26705,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_frozen_point_lookup, tests_passed);
     RUN_TEST(test_objstore_wal_sync_on_commit, tests_passed);
     RUN_TEST(test_replica_mode, tests_passed);
+    RUN_TEST(test_primary_replica_failover, tests_passed);
 #ifdef TIDESDB_WITH_S3
     RUN_TEST(test_objstore_s3_minio, tests_passed);
 #endif

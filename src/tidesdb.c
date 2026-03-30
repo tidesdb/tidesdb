@@ -14589,6 +14589,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             if (++db->replica_sync_counter >= cycles_per_sync)
             {
                 db->replica_sync_counter = 0;
+                atomic_store_explicit(&db->replica_sync_in_progress, 1, memory_order_release);
+
                 tdb_replica_sync_manifests(db);
 
                 if (db->config.object_store_config &&
@@ -14596,6 +14598,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 {
                     tdb_replica_replay_wal(db);
                 }
+
+                atomic_store_explicit(&db->replica_sync_in_progress, 0, memory_order_release);
             }
         }
 
@@ -14930,6 +14934,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         ((*db)->config.object_store_config && (*db)->config.object_store_config->replica_mode) ? 1
                                                                                                : 0);
     (*db)->replica_sync_counter = 0;
+    atomic_init(&(*db)->replica_sync_in_progress, 0);
 
     _tidesdb_log_level = config->log_level;
 
@@ -16382,6 +16387,17 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Promoting replica to primary mode");
 
+    /* wait for any in-progress reaper sync cycle to complete before promotion.
+     * the reaper holds cf_list_lock as rdlock during sync -- if we flip
+     * replica_mode while the sync is mid-flight, query threads that need
+     * cf_list_lock as wrlock will block until the sync finishes, causing
+     * apparent hangs on the first query after promotion. */
+    for (int i = 0; i < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS; i++)
+    {
+        if (!atomic_load_explicit(&db->replica_sync_in_progress, memory_order_acquire)) break;
+        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+    }
+
     /* final MANIFEST sync and WAL replay to catch last writes from old primary */
     if (db->object_store)
     {
@@ -16758,18 +16774,11 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_INVALID_ARGS;
     }
 
-    size_t base_capacity = config->write_buffer_size * config->level_size_ratio;
-
     /* we initialize fixed levels array -- create min_levels, rest are NULL */
     for (int i = 0; i < min_levels; i++)
     {
-        size_t level_capacity = base_capacity;
-        /* we calculate capacity
-         * C_i = write_buffer_size * T^i */
-        for (int j = 1; j <= i; j++)
-        {
-            level_capacity *= config->level_size_ratio;
-        }
+        size_t level_capacity = tidesdb_calculate_level_capacity(
+            i + 1, config->write_buffer_size * config->level_size_ratio, config->level_size_ratio);
 
         cf->levels[i] = tidesdb_level_create(i + 1, level_capacity);
         if (!cf->levels[i])

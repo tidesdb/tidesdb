@@ -750,8 +750,9 @@ struct tidesdb_t
     uint64_t last_wal_cleanup_gen;           /* highest WAL gen cleaned up by reaper */
 
     /* replica mode runtime state */
-    _Atomic(int) replica_mode; /* 1 = read-only replica, 0 = primary */
-    int replica_sync_counter;  /* reaper cycle counter for MANIFEST poll */
+    _Atomic(int) replica_mode;             /* 1 = read-only replica, 0 = primary */
+    int replica_sync_counter;              /* reaper cycle counter for MANIFEST poll */
+    _Atomic(int) replica_sync_in_progress; /* 1 while reaper is running sync cycle */
 };
 
 /**

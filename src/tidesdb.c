@@ -17120,25 +17120,61 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         }
     }
 
-    /* we wait for any in-progress flush to complete */
+    /* we mark CF for deletion to reject new writes while draining in-flight
+     * operations. the flag is cleared after rename completes. in unified mode
+     * this prevents new txn_put calls from targeting this CF. in per-CF mode
+     * it also prevents new memtable writes. */
+    atomic_store_explicit(&cf->marked_for_deletion, 1, memory_order_release);
+
+    /* in per-CF mode, flush the active memtable to rotate the WAL. this ensures
+     * any in-flight commit that already loaded active_mt->wal finishes writing
+     * to the old WAL before we close it. we release cf_list_lock during flush
+     * so other CFs are not blocked. in unified mode the per-CF WAL is dormant
+     * (commits go through the unified WAL) so the flush is only needed to
+     * persist memtable data before directory rename. */
+    pthread_rwlock_unlock(&db->cf_list_lock);
+    tidesdb_flush_memtable_internal(cf, 0, 1);
+
+    /* unbounded flush wait matching tidesdb_drop_column_family -- the flush
+     * worker holds live pointers to cf and will dereference them until flush
+     * I/O completes. a bounded wait risks use-after-free. */
     int wait_count = 0;
-    while (tidesdb_is_flushing(cf) && wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+    while (tidesdb_is_flushing(cf))
     {
-        pthread_rwlock_unlock(&db->cf_list_lock);
         usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
         wait_count++;
-        pthread_rwlock_wrlock(&db->cf_list_lock);
+        if (wait_count % 100 == 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' rename waiting for flush to complete (waited %d ms)", cf->name,
+                          wait_count * (TDB_CLOSE_FLUSH_WAIT_SLEEP_US / 1000));
+        }
     }
 
-    /* we wait for any in-progress compaction to complete */
+    /* unbounded compaction wait */
     wait_count = 0;
-    while (tidesdb_is_compacting(cf) && wait_count < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS)
+    while (tidesdb_is_compacting(cf))
     {
-        pthread_rwlock_unlock(&db->cf_list_lock);
         usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
         wait_count++;
-        pthread_rwlock_wrlock(&db->cf_list_lock);
+        if (wait_count % 100 == 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' rename waiting for compaction to complete (waited %d ms)",
+                          cf->name, wait_count * (TDB_COMPACTION_FLUSH_WAIT_SLEEP_US / 1000));
+        }
     }
+
+    /* drain flush queue so all pending work is done before closing handles */
+    for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS * 4; i++)
+    {
+        const size_t fq = db->flush_queue ? queue_size(db->flush_queue) : 0;
+        int pending = atomic_load_explicit(&db->flush_pending_count, memory_order_acquire);
+        if (fq == 0 && pending == 0) break;
+        usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+    }
+
+    pthread_rwlock_wrlock(&db->cf_list_lock);
 
     /* we invalidate all block cache entries for the old CF name before renaming */
     tidesdb_invalidate_block_cache_for_cf(db, old_name);
@@ -17149,6 +17185,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                            PATH_SEPARATOR, new_name);
     if (written < 0 || (size_t)written >= sizeof(new_directory))
     {
+        atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_INVALID_ARGS;
     }
@@ -17159,12 +17196,14 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         TDB_DEBUG_LOG(TDB_LOG_ERROR,
                       "Cannot rename CF '%s' to '%s': destination directory already exists",
                       old_name, new_name);
+        atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_EXISTS;
     }
 
-    /* on windows, we must close all file handles before renaming directory
-     * close the active memtable's WAL */
+    /* close the active memtable's WAL. safe because the flush above rotated
+     * the memtable and we drained all in-flight operations, so no thread can
+     * be writing to this WAL. */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     block_manager_t *old_wal = NULL;
     uint64_t old_wal_id = 0;
@@ -17228,6 +17267,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                      cf->directory, old_wal_id);
             block_manager_open(&active_mt->wal, wal_path, cf->config.sync_mode);
         }
+        atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_IO;
     }
@@ -17255,6 +17295,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     {
         /* we try to revert directory rename */
         atomic_rename_dir(new_directory, cf->directory);
+        atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_MEMORY;
     }
@@ -17266,6 +17307,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         free(new_name_copy);
         /* we try to revert directory rename */
         atomic_rename_dir(new_directory, cf->directory);
+        atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_MEMORY;
     }
@@ -17363,6 +17405,9 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
 
     free(old_name_ptr);
     free(old_dir_ptr);
+
+    /* clear the deletion mark now that rename is complete */
+    atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Successfully renamed column family: %s -> %s", old_name, new_name);
 

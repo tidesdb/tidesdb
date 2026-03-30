@@ -25,6 +25,19 @@
 #define TEST_DB_BACKUP_PATH               "./test_tidesdb_backup"
 #define TEST_DB_CHECKPOINT_PATH           "./test_tidesdb_checkpoint"
 
+/**
+ * is_running_under_qemu
+ * detect QEMU usermode emulation at runtime.
+ * QEMU sets QEMU_LD_PREFIX when running with -L (cross-arch sysroot).
+ * tests that swap global allocator state or exhaust memory are unreliable
+ * under QEMU due to incomplete atomic and signal emulation.
+ * @return 1 if running under QEMU, 0 otherwise
+ */
+static int is_running_under_qemu(void)
+{
+    return getenv("QEMU_LD_PREFIX") != NULL || getenv("QEMU_CPU") != NULL;
+}
+
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -89,6 +102,12 @@ static void test_custom_free(void *ptr)
 
 static void test_custom_allocator(void)
 {
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
     cleanup_test_dir();
 
     /* we ensure TidesDB is initialized with system allocator first
@@ -20935,6 +20954,12 @@ static void oom_free(void *ptr)
 
 static void test_oom_exhaustion(void)
 {
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
     /* we ensure saved_* are populated */
     tidesdb_ensure_initialized();
     if (!saved_malloc)

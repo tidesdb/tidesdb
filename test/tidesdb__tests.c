@@ -27,15 +27,16 @@
 
 /**
  * is_running_under_qemu
- * detect QEMU usermode emulation at runtime.
- * QEMU sets QEMU_LD_PREFIX when running with -L (cross-arch sysroot).
- * tests that swap global allocator state or exhaust memory are unreliable
- * under QEMU due to incomplete atomic and signal emulation.
- * @return 1 if running under QEMU, 0 otherwise
+ * detect QEMU usermode emulation at runtime via the TIDESDB_QEMU_SKIP
+ * environment variable. set this in CI workflows that run tests under
+ * qemu usermode emulation. tests that swap global allocator state or
+ * exhaust memory are unreliable under qemu due to incomplete atomic
+ * and pthread emulation.
+ * @return 1 if skip is requested, 0 otherwise
  */
 static int is_running_under_qemu(void)
 {
-    return getenv("QEMU_LD_PREFIX") != NULL || getenv("QEMU_CPU") != NULL;
+    return getenv("TIDESDB_QEMU_SKIP") != NULL;
 }
 
 static int tests_passed = 0;
@@ -26184,7 +26185,8 @@ static void test_objstore_s3_minio(void)
     fp = fopen(download_file, "rb");
     ASSERT_TRUE(fp != NULL);
     char buf[256] = {0};
-    fread(buf, 1, sizeof(buf) - 1, fp);
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, fp);
+    (void)nread;
     fclose(fp);
     ASSERT_TRUE(strstr(buf, "hello from tidesdb") != NULL);
     printf("  S3 test: get succeeded\n");

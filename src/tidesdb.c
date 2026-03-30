@@ -21995,10 +21995,43 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
 
             if (!ssts_array) break; /* allocation failed */
-            if (need_retry && level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+            if (need_retry)
             {
-                level_retries++;
-                goto retry_level;
+                if (level_retries < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+                {
+                    level_retries++;
+                    goto retry_level;
+                }
+
+                /* retries exhausted due to heavy concurrent compaction. we take one
+                 * final pass that collects whatever ssts we can ref from the
+                 * current array snapshot, ignoring further array swaps. a ref'd
+                 * sst is always safe to read even after removal from the level.
+                 * skipping the level entirely would lose data that may not yet
+                 * appear in a lower level. */
+                atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
+
+                sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
+                num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+                for (int j = 0; j < num_ssts; j++)
+                {
+                    tidesdb_sstable_t *sst = sstables[j];
+                    if (sst && tidesdb_sstable_try_ref(sst))
+                    {
+                        tidesdb_sstable_t **new_arr =
+                            realloc(ssts_array, (sst_count + 1) * sizeof(tidesdb_sstable_t *));
+                        if (!new_arr)
+                        {
+                            tidesdb_sstable_unref(cf->db, sst);
+                            break;
+                        }
+                        ssts_array = new_arr;
+                        ssts_array[sst_count++] = sst;
+                    }
+                }
+
+                atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
             }
         }
     }

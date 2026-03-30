@@ -20653,6 +20653,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
     /* we process entries grouped by CF prefix */
     do
     {
+    reprocess_current_entry:;
         uint8_t *raw_key, *value;
         size_t raw_key_size, value_size;
         int64_t ttl;
@@ -20766,16 +20767,27 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
             {
                 TDB_DEBUG_LOG(TDB_LOG_WARN,
                               "Unified flush: CF index %u not found, skipping entries", cf_index);
-                /* we skip all entries with this CF index */
+                /* we skip all entries with this CF index by peeking ahead via
+                 * cursor_next + cursor_get. the inner loop breaks when it sees a
+                 * different cf_index, leaving the cursor on the first entry of the
+                 * next CF. we then use 'goto' to re-enter the outer do body at the
+                 * top so that entry is processed (not skipped by the outer
+                 * while cursor_next). */
+                int found_next = 0;
                 while (skip_list_cursor_next(cursor) == 0)
                 {
                     if (skip_list_cursor_get_with_seq(cursor, &raw_key, &raw_key_size, &value,
                                                       &value_size, &ttl, &deleted, &seq) != 0)
                         break;
                     if (raw_key_size < TDB_UNIFIED_CF_PREFIX_SIZE) break;
-                    if (tdb_decode_be32(raw_key) != cf_index) break;
+                    if (tdb_decode_be32(raw_key) != cf_index)
+                    {
+                        found_next = 1;
+                        break;
+                    }
                 }
-                continue;
+                if (found_next) goto reprocess_current_entry;
+                break; /* cursor exhausted */
             }
 
             /*** we create temp skip list for this CF's entries

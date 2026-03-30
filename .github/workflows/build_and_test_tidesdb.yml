@@ -412,11 +412,9 @@ jobs:
         run: |
           cd build
           if [ "${{ matrix.arch }}" == "ppc" ]; then
-            TIDESDB_QEMU_SKIP=1 CTEST_OUTPUT_ON_FAILURE=1 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests || true
-            echo "**Linux PowerPC tests run via QEMU emulation"
+            echo "**Linux PowerPC 32-bit: build verified, runtime tests skipped (QEMU usermode PPC emulation segfaults on pthreads/atomics)"
           elif [ "${{ matrix.arch }}" == "ppc-macos" ]; then
-            TIDESDB_QEMU_SKIP=1 CTEST_OUTPUT_ON_FAILURE=1 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests || true
-            echo "**macOS PowerPC (G5) cross-compiled binary run via QEMU emulation"
+            echo "**macOS PowerPC (G5): build verified, runtime tests skipped (QEMU usermode PPC emulation segfaults on pthreads/atomics)"
           elif [ "${{ matrix.arch }}" == "riscv64" ]; then
             CTEST_OUTPUT_ON_FAILURE=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
             echo "**Linux RISC-V 64-bit tests run via QEMU emulation"

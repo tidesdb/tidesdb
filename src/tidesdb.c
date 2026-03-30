@@ -1118,6 +1118,8 @@ static int tidesdb_btree_read_vlog_value(block_manager_cursor_t *vlog_cursor, ui
                                          uint8_t **value_out, size_t *value_size_out);
 static void tidesdb_iter_clear_block_stash(tidesdb_merge_source_t *source);
 static void tidesdb_iter_clear_lazy(tidesdb_merge_source_t *source);
+static tidesdb_column_family_t *tidesdb_get_column_family_internal(tidesdb_t *db, const char *name);
+static void tdb_replica_discover_new_cfs(tidesdb_t *db);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
                                                                  tidesdb_sstable_t *sst);
 static void tidesdb_merge_source_free(tidesdb_merge_source_t *source);
@@ -4322,6 +4324,9 @@ static void tdb_objstore_prefetch_sstables(tidesdb_t *db, tidesdb_sstable_t **ss
  */
 static void tdb_replica_sync_manifests(tidesdb_t *db)
 {
+    /* discover and create any new CFs the primary added since last sync */
+    tdb_replica_discover_new_cfs(db);
+
     pthread_rwlock_rdlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
     {
@@ -4492,10 +4497,10 @@ static void tdb_wal_discovery_cb(const char *key, size_t size, void *cb_ctx)
 static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
                                          tidesdb_memtable_t *umt, uint64_t *max_seq_inout)
 {
-    (void)db;
     block_manager_t *wal = NULL;
     if (block_manager_open(&wal, wal_local, TDB_SYNC_NONE) != 0)
     {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica WAL replay: failed to open %s", wal_local);
         tdb_unlink(wal_local);
         return 0;
     }
@@ -4503,12 +4508,14 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
     block_manager_cursor_t *cursor = NULL;
     if (block_manager_cursor_init(&cursor, wal) != 0)
     {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica WAL replay: failed to init cursor for %s", wal_local);
         block_manager_close(wal);
         tdb_unlink(wal_local);
         return 0;
     }
 
     uint64_t max_seq = *max_seq_inout;
+    uint32_t max_cf_index = 0;
     int replayed = 0;
 
     if (block_manager_cursor_goto_first(cursor) == 0)
@@ -4535,6 +4542,7 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
             while (remaining > TDB_UNIFIED_CF_PREFIX_SIZE)
             {
                 uint32_t cf_index = tdb_decode_be32(ptr);
+                if (cf_index > max_cf_index) max_cf_index = cf_index;
                 ptr += TDB_UNIFIED_CF_PREFIX_SIZE;
                 remaining -= TDB_UNIFIED_CF_PREFIX_SIZE;
 
@@ -4610,6 +4618,22 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
     block_manager_close(wal);
     tdb_unlink(wal_local);
 
+    /* ensure next_cf_index is past any cf_index seen in the WAL so that
+     * future CF creation via MANIFEST sync does not collide */
+    if (db->unified_mt.enabled && max_cf_index > 0)
+    {
+        uint32_t needed = max_cf_index + 1;
+        uint32_t current =
+            atomic_load_explicit(&db->unified_mt.next_cf_index, memory_order_relaxed);
+        while (needed > current)
+        {
+            if (atomic_compare_exchange_weak_explicit(&db->unified_mt.next_cf_index, &current,
+                                                      needed, memory_order_relaxed,
+                                                      memory_order_relaxed))
+                break;
+        }
+    }
+
     *max_seq_inout = max_seq;
     return replayed;
 }
@@ -4625,17 +4649,30 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
  */
 static void tdb_replica_replay_wal(tidesdb_t *db)
 {
-    if (!db->unified_mt.enabled || !db->object_store) return;
+    if (!db->unified_mt.enabled || !db->object_store)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Replica WAL replay skipped (unified=%d, object_store=%p)",
+                      db->unified_mt.enabled, (void *)db->object_store);
+        return;
+    }
 
     tidesdb_memtable_t *umt = atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
-    if (!umt || !umt->skip_list) return;
+    if (!umt || !umt->skip_list)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica WAL replay skipped: unified memtable not ready");
+        return;
+    }
 
     /* we list all available WAL objects in the object store */
     tdb_wal_discovery_ctx_t discovery = {.count = 0};
     db->object_store->list(db->object_store->ctx, TDB_UNIFIED_WAL_PREFIX, tdb_wal_discovery_cb,
                            &discovery);
 
-    if (discovery.count == 0) return;
+    if (discovery.count == 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Replica WAL replay: no WAL files found in object store");
+        return;
+    }
 
     /* we sort generations ascending for ordered replay */
     for (int i = 0; i < discovery.count - 1; i++)
@@ -4842,6 +4879,89 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
     for (int i = 0; i < launched; i++)
     {
         pthread_join(threads[i], NULL);
+    }
+}
+
+/**
+ * tdb_replica_discover_new_cfs
+ * discover column families in the object store that do not exist locally
+ * and create them. uses the same list() + MANIFEST key pattern as cold start
+ * discovery but runs during periodic replica sync so new CFs created by the
+ * primary after the replica started are picked up.
+ * @param db database instance in replica mode
+ */
+static void tdb_replica_discover_new_cfs(tidesdb_t *db)
+{
+    if (!db->object_store) return;
+
+    tdb_cf_discovery_ctx_t discovery = {.count = 0};
+    db->object_store->list(db->object_store->ctx, "", tdb_cf_discovery_cb, &discovery);
+
+    for (int i = 0; i < discovery.count; i++)
+    {
+        const char *cf_name = discovery.cf_names[i];
+
+        /* skip CFs that already exist locally */
+        pthread_rwlock_rdlock(&db->cf_list_lock);
+        tidesdb_column_family_t *existing = tidesdb_get_column_family_internal(db, cf_name);
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        if (existing) continue;
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync: discovered new CF '%s' in object store",
+                      cf_name);
+
+        /* download config.ini */
+        char cf_dir[TDB_MAX_PATH_LEN];
+        snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
+        mkdir(cf_dir, 0755);
+
+        char config_key[TDB_MAX_PATH_LEN];
+        snprintf(config_key, sizeof(config_key),
+                 "%s/" TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT, cf_name);
+        char config_local[TDB_MAX_PATH_LEN];
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+        snprintf(config_local, sizeof(config_local),
+                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                 cf_dir);
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        if (db->object_store->get(db->object_store->ctx, config_key, config_local) == 0)
+        {
+            tidesdb_cf_config_load_from_ini(config_local, cf_name, &cf_config);
+        }
+
+        /* download MANIFEST so the sync loop can process it */
+        char manifest_key[TDB_MAX_PATH_LEN];
+        snprintf(manifest_key, sizeof(manifest_key), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME,
+                 cf_name);
+        char manifest_local[TDB_MAX_PATH_LEN];
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+        snprintf(manifest_local, sizeof(manifest_local),
+                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_dir);
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
+        db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
+
+        int rc = tidesdb_create_column_family(db, cf_name, &cf_config);
+        if (rc == TDB_SUCCESS)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync: created new CF '%s'", cf_name);
+        }
+        else if (rc != TDB_ERR_EXISTS)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica sync: failed to create CF '%s' (err=%d)", cf_name,
+                          rc);
+        }
     }
 }
 
@@ -25102,10 +25222,12 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
                     }
                 }
 
+                uint32_t max_cf_index_seen = 0;
                 while (remaining > TDB_UNIFIED_CF_PREFIX_SIZE)
                 {
                     /* we read cf_index */
                     uint32_t cf_index = tdb_decode_be32(ptr);
+                    if (cf_index > max_cf_index_seen) max_cf_index_seen = cf_index;
                     ptr += TDB_UNIFIED_CF_PREFIX_SIZE;
                     remaining -= TDB_UNIFIED_CF_PREFIX_SIZE;
 
@@ -25170,6 +25292,21 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
 
                     if (seq_value > max_seq) max_seq = seq_value;
                     total_entries++;
+                }
+
+                /* ensure next_cf_index is past any cf_index seen in the WAL */
+                if (max_cf_index_seen > 0)
+                {
+                    uint32_t needed = max_cf_index_seen + 1;
+                    uint32_t current =
+                        atomic_load_explicit(&db->unified_mt.next_cf_index, memory_order_relaxed);
+                    while (needed > current)
+                    {
+                        if (atomic_compare_exchange_weak_explicit(
+                                &db->unified_mt.next_cf_index, &current, needed,
+                                memory_order_relaxed, memory_order_relaxed))
+                            break;
+                    }
                 }
 
                 block_manager_block_release(block);
@@ -25583,6 +25720,37 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
 int tidesdb_purge_cf(tidesdb_column_family_t *cf)
 {
     if (!cf || !cf->db) return TDB_ERR_INVALID_ARGS;
+
+    /* if unified memtable mode is enabled, rotate it first so that any
+     * entries belonging to this CF are moved to the flush queue.
+     * same pattern as tidesdb_purge() but scoped to a single CF call. */
+    tidesdb_t *db = cf->db;
+    if (db->unified_mt.enabled)
+    {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&db->unified_mt.is_flushing, &expected, 1,
+                                                    memory_order_acquire, memory_order_relaxed))
+        {
+            tidesdb_memtable_t *umt =
+                atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
+            if (umt && umt->skip_list && skip_list_count_entries(umt->skip_list) > 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "purge_cf: rotating unified memtable for CF '%s'",
+                              cf->name);
+                tidesdb_unified_memtable_rotate(db);
+            }
+            atomic_store_explicit(&db->unified_mt.is_flushing, 0, memory_order_release);
+        }
+
+        /* wait for unified flush to complete */
+        for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS * 4; i++)
+        {
+            const size_t fq = db->flush_queue ? queue_size(db->flush_queue) : 0;
+            int pending = atomic_load_explicit(&db->flush_pending_count, memory_order_acquire);
+            if (fq == 0 && pending == 0) break;
+            usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        }
+    }
 
     /* we wait for any in-progress flush to finish */
     for (int i = 0; i < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS; i++)

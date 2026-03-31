@@ -19,6 +19,7 @@
 #ifndef __ALLOC_H__
 #define __ALLOC_H__
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,7 +74,7 @@ typedef struct tidesdb_allocator_t
 } tidesdb_allocator_t;
 
 extern tidesdb_allocator_t tidesdb_allocator;
-extern int tidesdb_initialized;
+extern _Atomic(int) tidesdb_initialized;
 
 /**
  * tidesdb_init

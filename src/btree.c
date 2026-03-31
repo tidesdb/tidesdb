@@ -586,8 +586,16 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
     size_t keys_start = off;
     for (uint32_t i = 0; i < leaf->num_entries; i++)
     {
-        /* we write key offset as little-endian uint16 */
-        const uint16_t key_off = (uint16_t)(off - keys_start);
+        /* we write key offset as little-endian uint16. if the keys section exceeds
+         * 64KB the offset wraps and deserialization will read garbage. */
+        const size_t raw_off = off - keys_start;
+        if (raw_off > UINT16_MAX)
+        {
+            free(prefix_lens);
+            free(suffix_lens);
+            return -1;
+        }
+        const uint16_t key_off = (uint16_t)raw_off;
         buffer[indirection_table_pos + i * 2] = (uint8_t)(key_off & 0xFF);
         buffer[indirection_table_pos + i * 2 + 1] = (uint8_t)((key_off >> 8) & 0xFF);
         memcpy(buffer + off, leaf->keys[i] + prefix_lens[i], suffix_lens[i]);
@@ -1007,6 +1015,11 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
         }
         else
         {
+            fprintf(stderr,
+                    "btree: node decompression failed at offset %" PRId64
+                    " (expected_size=%u, got=%zu, compressed=%zu, algo=%d)\n",
+                    offset, original_size, decompressed ? decompressed_size : 0, compressed_size,
+                    compression_algo);
             free(decompressed);
             block_manager_block_free(block);
             return -1;
@@ -1113,7 +1126,7 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
 
     if (entry) clock_cache_release(entry);
 
-    /* cache miss -- we read from disk (block manager handles checksum verification) */
+    /* cache miss! we read from disk (block manager handles checksum verification) */
     block_manager_cursor_t cursor;
     if (block_manager_cursor_init_stack(&cursor, tree->bm) != 0) return -1;
 
@@ -1145,7 +1158,7 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
             /* we only patch prev_offset and next_offset for leaf nodes, not internal nodes */
             if (decompressed[0] == BTREE_NODE_LEAF)
             {
-                /* we calculate position -- type(1) + num_entries(varint) */
+                /* we calculate position, type(1) + num_entries(varint) */
                 size_t pos = 1;
                 uint64_t num_entries;
                 pos += btree_varint_decode(decompressed + pos, &num_entries);
@@ -1158,6 +1171,11 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
         }
         else
         {
+            fprintf(stderr,
+                    "btree: cached node decompression failed at offset %" PRId64
+                    " (expected_size=%u, got=%zu, compressed=%zu, algo=%d)\n",
+                    offset, original_size, decompressed ? decompressed_size : 0, compressed_size,
+                    tree->config.compression_algo);
             free(decompressed);
             block_manager_block_free(block);
             return -1;
@@ -1418,10 +1436,10 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
         return -1;
     }
 
-    /* leaf nodes are written without compression during build phase
-     * because we need to backpatch next_offset links after all leaves are written.
-     * compression is applied during the backpatch phase after patching.
-     * use from_buffer to transfer ownership and avoid redundant malloc+memcpy */
+    /**** leaf nodes are written without compression during build phase
+     ***  because we need to backpatch next_offset links after all leaves are written.
+     **   compression is applied during the backpatch phase after patching.
+     *    we use from_buffer to transfer ownership and avoid redundant malloc+memcpy */
     block_manager_block_t *block =
         block_manager_block_create_from_buffer(serialized_size, serialized);
 
@@ -1584,9 +1602,10 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
                 return -1;
             }
 
-            /* we compress if compression is enabled
-             * format -- [original_size:4][prev_offset:8][next_offset:8][compressed_data]
-             * internal nodes use prev_offset=-1 and next_offset=-1 (unused) for consistent format
+            /**** we compress if compression is enabled
+             ***  format -- [original_size:4][prev_offset:8][next_offset:8][compressed_data]
+             **   internal nodes use prev_offset=-1 and next_offset=-1 (unused) for consistent
+             *format
              */
             const uint8_t *final_data = serialized;
             size_t final_size = serialized_size;
@@ -1600,8 +1619,8 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
                                   (compression_algorithm)builder->config.compression_algo);
                 if (compressed)
                 {
-                    /* we create block with header:
-                     * [original_size:4][prev_offset:8][next_offset:8][compressed_data] */
+                    /** we create block with header:
+                     *  [original_size:4][prev_offset:8][next_offset:8][compressed_data] */
                     const size_t header_size = 4 + 8 + 8;
                     final_size = header_size + compressed_size;
                     block_with_header = malloc(final_size);

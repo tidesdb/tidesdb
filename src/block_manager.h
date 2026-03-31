@@ -41,7 +41,7 @@
 #define BLOCK_MANAGER_HEADER_SIZE  8
 
 /* block field sizes */
-/* block size field (uint32_t) -- supports blocks up to 4GB */
+/* block size field (uint32_t) -- supports blocks up to 4GB, though try to keep it under! */
 #define BLOCK_MANAGER_SIZE_FIELD_SIZE 4
 /* xxHash32 = 4 bytes (sufficient for block-level checksums) */
 #define BLOCK_MANAGER_CHECKSUM_LENGTH 4

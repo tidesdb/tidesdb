@@ -30,7 +30,7 @@
 #include <time.h>
 
 /* path and buffer size constants */
-#define TDB_S3_MAX_PATH      4096
+#define TDB_S3_MAX_PATH      8192
 #define TDB_S3_MAX_HEADER    2048
 #define TDB_S3_DATE_LEN      9  /* YYYYMMDD + NUL */
 #define TDB_S3_TIMESTAMP_LEN 17 /* YYYYMMDDTHHMMSSZ + NUL */
@@ -50,15 +50,16 @@
 #define TDB_S3_HTTP_PARTIAL  206
 #define TDB_S3_HTTP_REDIRECT 300
 
-/* signing and response buffers */
+/* signing and response buffers. host and key_date buffers must be large
+ * enough for concatenated bucket+endpoint or "AWS4"+secret_key strings. */
 #define TDB_S3_SCOPE_BUF      128
 #define TDB_S3_STS_BUF        512
-#define TDB_S3_HOST_BUF       512
+#define TDB_S3_HOST_BUF       1024
 #define TDB_S3_RESPONSE_INIT  4096
 #define TDB_S3_CONT_TOKEN_MAX 1024
 #define TDB_S3_XML_TAG_BUF    128
 #define TDB_S3_SIZE_BUF       32
-#define TDB_S3_KEY_DATE_BUF   128
+#define TDB_S3_KEY_DATE_BUF   256
 
 /* default region when none specified */
 #define TDB_S3_DEFAULT_REGION "us-east-1"
@@ -197,6 +198,10 @@ static void s3_signing_key(const char *secret_key, const char *date8, const char
  * @param url output URL buffer
  * @param url_size size of the URL buffer
  */
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 static void s3_build_url(const s3_ctx_t *ctx, const char *key, char *url, size_t url_size)
 {
     const char *scheme = ctx->use_ssl ? "https" : "http";
@@ -211,6 +216,9 @@ static void s3_build_url(const s3_ctx_t *ctx, const char *key, char *url, size_t
     else
         snprintf(url, url_size, "%s://%s.%s/%s", scheme, ctx->bucket, ctx->endpoint, full_key);
 }
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
 
 /**
  * s3_build_host
@@ -322,6 +330,10 @@ static struct curl_slist *s3_sign_raw(const s3_ctx_t *ctx, const char *method,
  * @param extra_signed_headers additional signed header names (or NULL)
  * @return curl_slist of signed headers (caller must free with curl_slist_free_all)
  */
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *method, const char *key,
                                           const char *content_sha256,
                                           const char *extra_headers_canonical,
@@ -333,7 +345,7 @@ static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *metho
     else
         snprintf(full_key, sizeof(full_key), "%s", key);
 
-    char canonical_uri[TDB_S3_MAX_PATH];
+    char canonical_uri[TDB_S3_MAX_PATH + 256];
     if (ctx->use_path_style)
         snprintf(canonical_uri, sizeof(canonical_uri), "/%s/%s", ctx->bucket, full_key);
     else
@@ -342,6 +354,9 @@ static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *metho
     return s3_sign_raw(ctx, method, canonical_uri, "", content_sha256, extra_headers_canonical,
                        extra_signed_headers);
 }
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
 
 /**
  * s3_write_ctx_t
@@ -436,7 +451,15 @@ static int s3_put(void *ctx, const char *key, const char *local_path)
         fclose(fp);
         return -1;
     }
-    if (file_size > 0) fread(file_data, 1, file_size, fp);
+    if (file_size > 0)
+    {
+        if (fread(file_data, 1, file_size, fp) != (size_t)file_size)
+        {
+            free(file_data);
+            fclose(fp);
+            return -1;
+        }
+    }
     fclose(fp);
 
     char content_sha[TDB_S3_HASH_HEX_LEN];
@@ -743,6 +766,10 @@ static size_t s3_write_to_response(void *ptr, size_t size, size_t nmemb, void *u
  * @param cb_ctx opaque context passed to callback
  * @return number of objects listed, -1 on error
  */
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 static int s3_list(void *ctx, const char *prefix,
                    void (*cb)(const char *key, size_t size, void *cb_ctx), void *cb_ctx)
 {
@@ -766,7 +793,7 @@ static int s3_list(void *ctx, const char *prefix,
          * the canonical URI is just /<bucket> (path-style) or / (virtual-hosted).
          * the canonical query string must include all query parameters sorted
          * alphabetically with URI-encoded values per the SigV4 spec. */
-        char url[TDB_S3_MAX_PATH * 2];
+        char url[TDB_S3_MAX_PATH + TDB_S3_CONT_TOKEN_MAX * 2];
         const char *scheme = s3->use_ssl ? "https" : "http";
 
         /* URI-encode prefix and continuation token for query string */
@@ -893,6 +920,9 @@ static int s3_list(void *ctx, const char *prefix,
 
     return count;
 }
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
 
 /**
  * s3_destroy

@@ -1017,7 +1017,7 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* already at first block position, can't go back */
+    /* we are already at first block position, we can't go back */
     if (cursor->current_pos <= BLOCK_MANAGER_HEADER_SIZE) return -1;
 
     const uint64_t prev_footer_end = cursor->current_pos;

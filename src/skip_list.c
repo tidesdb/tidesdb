@@ -269,38 +269,113 @@ static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, con
     return (v1 < v2) ? -1 : (v1 > v2);
 }
 
+/* portable byte-swap for lexicographic integer comparison on little-endian.
+ * memcmp compares bytes left-to-right (big-endian order), so we byte-swap
+ * before integer comparison to match memcmp semantics on little-endian. */
+#if defined(__GNUC__) || defined(__clang__)
+#define SKIP_LIST_BSWAP32(x) __builtin_bswap32(x)
+#define SKIP_LIST_BSWAP64(x) __builtin_bswap64(x)
+#elif defined(_MSC_VER)
+#define SKIP_LIST_BSWAP32(x) _byteswap_ulong(x)
+#define SKIP_LIST_BSWAP64(x) _byteswap_uint64(x)
+#else
+static inline uint32_t SKIP_LIST_BSWAP32(uint32_t x)
+{
+    return ((x >> 24) & 0xFF) | ((x >> 8) & 0xFF00) | ((x << 8) & 0xFF0000) |
+           ((x << 24) & 0xFF000000);
+}
+static inline uint64_t SKIP_LIST_BSWAP64(uint64_t x)
+{
+    return ((uint64_t)SKIP_LIST_BSWAP32((uint32_t)x) << 32) |
+           SKIP_LIST_BSWAP32((uint32_t)(x >> 32));
+}
+#endif
+
+/* detect endianness at compile time */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define SKIP_LIST_IS_BIG_ENDIAN 1
+#else
+#define SKIP_LIST_IS_BIG_ENDIAN 0
+#endif
+
+/**
+ * skip_list_compare_keys_4_inline
+ * fast inline lexicographic comparison for 4-byte keys
+ * uses byte-swapped integer comparison to avoid memcmp function call
+ */
+static inline int skip_list_compare_keys_4_inline(const uint8_t *key1, const uint8_t *key2)
+{
+    uint32_t a, b;
+    memcpy(&a, key1, 4);
+    memcpy(&b, key2, 4);
+#if !SKIP_LIST_IS_BIG_ENDIAN
+    a = SKIP_LIST_BSWAP32(a);
+    b = SKIP_LIST_BSWAP32(b);
+#endif
+    return (a < b) ? -1 : (a > b);
+}
+
+/**
+ * skip_list_compare_keys_8_inline
+ * fast inline lexicographic comparison for 8-byte keys
+ * uses byte-swapped integer comparison to avoid memcmp function call
+ */
+static inline int skip_list_compare_keys_8_inline(const uint8_t *key1, const uint8_t *key2)
+{
+    uint64_t a, b;
+    memcpy(&a, key1, 8);
+    memcpy(&b, key2, 8);
+#if !SKIP_LIST_IS_BIG_ENDIAN
+    a = SKIP_LIST_BSWAP64(a);
+    b = SKIP_LIST_BSWAP64(b);
+#endif
+    return (a < b) ? -1 : (a > b);
+}
+
 /**
  * skip_list_compare_keys_16_inline
- * fast inline comparison for 16-byte keys
- * @param key1 first key
- * @param key2 second key
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
+ * fast inline lexicographic comparison for 16-byte keys
+ * compares first 8 bytes with early exit, avoiding second half when keys diverge early
  */
 static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const uint8_t *key2)
 {
-    /* we use memcmp for correctness -- byte-order-independent lexicographic comparison.
-     * native uint64_t comparison would give wrong results on little-endian because
-     * the first byte (most significant for memcmp) lands in the least significant
-     * position of the loaded integer. */
-    const int cmp = memcmp(key1, key2, 16);
-    return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
+    uint64_t a, b;
+    memcpy(&a, key1, 8);
+    memcpy(&b, key2, 8);
+#if !SKIP_LIST_IS_BIG_ENDIAN
+    a = SKIP_LIST_BSWAP64(a);
+    b = SKIP_LIST_BSWAP64(b);
+#endif
+    if (a != b) return (a < b) ? -1 : 1;
+
+    memcpy(&a, key1 + 8, 8);
+    memcpy(&b, key2 + 8, 8);
+#if !SKIP_LIST_IS_BIG_ENDIAN
+    a = SKIP_LIST_BSWAP64(a);
+    b = SKIP_LIST_BSWAP64(b);
+#endif
+    return (a < b) ? -1 : (a > b);
 }
 
 /**
  * skip_list_compare_keys_32_inline
- * fast inline comparison for 32-byte keys
- * @param key1 first key
- * @param key2 second key
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
+ * fast inline lexicographic comparison for 32-byte keys
+ * compares in 8-byte chunks with early exit
  */
 static inline int skip_list_compare_keys_32_inline(const uint8_t *key1, const uint8_t *key2)
 {
-    /* we use memcmp for correctness -- byte-order-independent lexicographic comparison.
-     * native uint64_t comparison would give wrong results on little-endian because
-     * the first byte (most significant for memcmp) lands in the least significant
-     * position of the loaded integer. */
-    const int cmp = memcmp(key1, key2, 32);
-    return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
+    for (int i = 0; i < 32; i += 8)
+    {
+        uint64_t a, b;
+        memcpy(&a, key1 + i, 8);
+        memcpy(&b, key2 + i, 8);
+#if !SKIP_LIST_IS_BIG_ENDIAN
+        a = SKIP_LIST_BSWAP64(a);
+        b = SKIP_LIST_BSWAP64(b);
+#endif
+        if (a != b) return (a < b) ? -1 : 1;
+    }
+    return 0;
 }
 
 /**
@@ -365,9 +440,15 @@ static inline int skip_list_compare_keys_with_type(const skip_list_cmp_type_t cm
     {
         if (SKIP_LIST_LIKELY(key1_size == key2_size))
         {
-            /* we use switch for common key sizes to help branch predictor */
+            /* we use switch for common key sizes to avoid memcmp function call overhead.
+             * 4/8 byte keys use byte-swapped integer comparison (no function call).
+             * 16/32 byte keys use chunked comparison with early exit. */
             switch (key1_size)
             {
+                case 4:
+                    return skip_list_compare_keys_4_inline(key1, key2);
+                case 8:
+                    return skip_list_compare_keys_8_inline(key1, key2);
                 case 16:
                     return skip_list_compare_keys_16_inline(key1, key2);
                 case 32:
@@ -1772,7 +1853,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     }
 
     skip_list_node_t *recheck = atomic_load_explicit(&update[0]->forward[0], memory_order_acquire);
-    if (recheck != NULL && !NODE_IS_SENTINEL(recheck))
+    if (recheck != existing && recheck != NULL && !NODE_IS_SENTINEL(recheck))
     {
         int cmp = skip_list_compare_keys_with_type(cmp_type, list, recheck->key, recheck->key_size,
                                                    key, key_size);

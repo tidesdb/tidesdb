@@ -161,6 +161,17 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
 void *queue_peek_at(queue_t *queue, size_t index);
 
 /**
+ * queue_snapshot
+ * copy all data pointers into a caller-provided array in a single O(n) traversal.
+ * acquires read lock once, avoiding the O(n^2) cost of repeated queue_peek_at calls.
+ * @param queue the queue
+ * @param out array to fill (must have room for at least max_items elements)
+ * @param max_items maximum number of items to copy
+ * @return number of items actually copied
+ */
+size_t queue_snapshot(queue_t *queue, void **out, size_t max_items);
+
+/**
  * queue_shutdown
  * signal shutdown to all waiting threads without freeing the queue
  * threads blocked in queue_dequeue_wait will return NULL

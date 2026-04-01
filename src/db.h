@@ -238,7 +238,8 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param use_btree whether btree is used
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size reserved for API compatibility, not used
+ * @param object_target_file_size reserved for API compatibility, not used.. will be retired
+ * completely
  * @param object_lazy_compaction 1 = compact less aggressively in object store mode (default 0)
  * @param object_prefetch_compaction 1 = download all inputs before merge (default 1)
  */

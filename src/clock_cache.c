@@ -99,6 +99,13 @@ static int detect_l3_groups(int num_cpus, uint8_t *cpu_to_group)
  * @param hash the key hash
  * @return partition index local to the calling thread's L3 group
  */
+/** re-probe interval for thread migration detection.
+ * every N calls we re-read the CPU ID to catch OS thread migrations
+ * across CCX/NUMA boundaries. 4096 keeps the amortized cost negligible
+ * (~one getcpu every few thousand cache ops) while catching migrations
+ * within seconds under normal access rates. */
+#define CLOCK_CACHE_GROUP_REPROBE_INTERVAL 4096
+
 static inline size_t get_local_partition(const clock_cache_t *cache, uint64_t hash)
 {
     if (cache->num_groups <= 1)
@@ -107,9 +114,11 @@ static inline size_t get_local_partition(const clock_cache_t *cache, uint64_t ha
     }
 
     static THREAD_LOCAL int cached_group = -1;
+    static THREAD_LOCAL unsigned int reprobe_counter = 0;
     int group = cached_group;
-    if (TDB_UNLIKELY(group < 0))
+    if (TDB_UNLIKELY(group < 0 || ++reprobe_counter >= CLOCK_CACHE_GROUP_REPROBE_INTERVAL))
     {
+        reprobe_counter = 0;
         const int cpu = tdb_get_cpu_id();
         group = (cpu >= 0 && cpu < cache->max_cpus) ? (int)cache->cpu_to_group[cpu] : 0;
         cached_group = group;
@@ -117,6 +126,23 @@ static inline size_t get_local_partition(const clock_cache_t *cache, uint64_t ha
 
     const size_t local_idx = (size_t)(hash & cache->local_partition_mask);
     return (size_t)group * cache->partitions_per_group + local_idx;
+}
+
+/**
+ * clock_cache_sum_bytes
+ * compute total bytes across all partitions by summing per-partition counters.
+ * avoids contention on a single global atomic in the put/evict hot paths.
+ * @param cache the cache
+ * @return total bytes used
+ */
+static inline size_t clock_cache_sum_bytes(const clock_cache_t *cache)
+{
+    size_t total = 0;
+    for (size_t i = 0; i < cache->num_partitions; i++)
+    {
+        total += atomic_load_explicit(&cache->partitions[i].bytes_used, memory_order_relaxed);
+    }
+    return total;
 }
 
 /**
@@ -440,7 +466,6 @@ static void free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
     const size_t freed_bytes = entry_size(klen, plen) + ext_bytes;
     atomic_fetch_sub_explicit(&partition->occupied_count, 1, memory_order_relaxed);
     atomic_fetch_sub_explicit(&partition->bytes_used, freed_bytes, memory_order_relaxed);
-    atomic_fetch_sub_explicit(&cache->total_bytes, freed_bytes, memory_order_relaxed);
 
     /* we transition to empty state */
     atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
@@ -609,8 +634,10 @@ static int ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition
 
     /* we check global byte budget (not per-partition) to avoid premature eviction
      * when hash distribution is uneven. a hot partition can use more than its "fair share"
-     * as long as the total cache stays within budget. */
-    const size_t global_bytes = atomic_load_explicit(&cache->total_bytes, memory_order_relaxed);
+     * as long as the total cache stays within budget.
+     * we sum per-partition bytes_used instead of reading a single global atomic
+     * to eliminate contention on the put/evict hot paths at high core counts. */
+    const size_t global_bytes = clock_cache_sum_bytes(cache);
     if (global_bytes + required_bytes <= cache->max_bytes && occupied < partition->evict_threshold)
     {
         return 0;
@@ -626,7 +653,7 @@ static int ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition
         while (cur_global + required_bytes > cache->max_bytes && evict_rounds < max_evictions)
         {
             if (!evict_for_space(cache, partition)) break;
-            cur_global = atomic_load_explicit(&cache->total_bytes, memory_order_relaxed);
+            cur_global = clock_cache_sum_bytes(cache);
             evict_rounds++;
         }
     }
@@ -943,7 +970,6 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
 
     atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
-    atomic_fetch_add_explicit(&cache->total_bytes, entry_bytes, memory_order_relaxed);
 
     hash_table_insert(partition, hash, slot_idx);
 
@@ -1015,7 +1041,6 @@ int clock_cache_put_new(clock_cache_t *cache, const char *key, size_t key_len, c
 
     atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
-    atomic_fetch_add_explicit(&cache->total_bytes, entry_bytes, memory_order_relaxed);
 
     hash_table_insert(partition, hash, slot_idx);
 
@@ -1175,7 +1200,6 @@ void clock_cache_clear(clock_cache_t *cache)
     {
         atomic_store_explicit(&cache->partitions[i].bytes_used, 0, memory_order_relaxed);
     }
-    atomic_store_explicit(&cache->total_bytes, 0, memory_order_relaxed);
 }
 
 void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)

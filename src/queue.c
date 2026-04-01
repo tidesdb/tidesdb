@@ -485,6 +485,25 @@ void *queue_peek_at(queue_t *queue, const size_t index)
     return data;
 }
 
+size_t queue_snapshot(queue_t *queue, void **out, size_t max_items)
+{
+    if (QUEUE_UNLIKELY(!queue || !out || max_items == 0)) return 0;
+
+    pthread_rwlock_rdlock(&queue->read_lock);
+
+    size_t count = 0;
+    const queue_node_t *current = queue->head->next;
+    while (QUEUE_LIKELY(current != NULL) && count < max_items)
+    {
+        out[count++] = current->data;
+        current = current->next;
+    }
+
+    pthread_rwlock_unlock(&queue->read_lock);
+
+    return count;
+}
+
 void queue_shutdown(queue_t *queue)
 {
     if (queue == NULL) return;

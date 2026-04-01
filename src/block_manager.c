@@ -30,52 +30,6 @@
 static pthread_key_t bm_tls_key;
 static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
 
-typedef struct
-{
-    uint8_t *buf;
-    size_t capacity;
-} bm_tls_read_buf_t;
-
-static void bm_tls_destructor(void *ptr)
-{
-    if (ptr)
-    {
-        bm_tls_read_buf_t *tls = (bm_tls_read_buf_t *)ptr;
-        free(tls->buf);
-        free(tls);
-    }
-}
-
-static void bm_tls_init_key(void)
-{
-    pthread_key_create(&bm_tls_key, bm_tls_destructor);
-}
-
-static uint8_t *bm_get_read_buf(size_t needed)
-{
-    pthread_once(&bm_tls_once, bm_tls_init_key);
-
-    bm_tls_read_buf_t *tls = (bm_tls_read_buf_t *)pthread_getspecific(bm_tls_key);
-    if (!tls)
-    {
-        tls = (bm_tls_read_buf_t *)calloc(1, sizeof(bm_tls_read_buf_t));
-        if (!tls) return NULL;
-        pthread_setspecific(bm_tls_key, tls);
-    }
-
-    if (BM_LIKELY(needed <= tls->capacity)) return tls->buf;
-
-    size_t new_size = tls->capacity ? tls->capacity : BM_READ_BUF_INITIAL_SIZE;
-    while (new_size < needed) new_size *= 2;
-
-    uint8_t *new_buf = (uint8_t *)realloc(tls->buf, new_size);
-    if (!new_buf) return NULL;
-
-    tls->buf = new_buf;
-    tls->capacity = new_size;
-    return new_buf;
-}
-
 /**
  *
  *  * * * * * * * * * *
@@ -117,6 +71,52 @@ static uint8_t *bm_get_read_buf(size_t needed)
  * block_manager_block_acquire/release provide thread-safe ref management
  * global block cache in tidesdb.c uses these functions for safe sharing
  */
+
+typedef struct
+{
+    uint8_t *buf;
+    size_t capacity;
+} bm_tls_read_buf_t;
+
+static void bm_tls_destructor(void *ptr)
+{
+    if (ptr)
+    {
+        bm_tls_read_buf_t *tls = (bm_tls_read_buf_t *)ptr;
+        free(tls->buf);
+        free(tls);
+    }
+}
+
+static void bm_tls_init_key(void)
+{
+    pthread_key_create(&bm_tls_key, bm_tls_destructor);
+}
+
+static uint8_t *bm_get_read_buf(const size_t needed)
+{
+    pthread_once(&bm_tls_once, bm_tls_init_key);
+
+    bm_tls_read_buf_t *tls = (bm_tls_read_buf_t *)pthread_getspecific(bm_tls_key);
+    if (!tls)
+    {
+        tls = (bm_tls_read_buf_t *)calloc(1, sizeof(bm_tls_read_buf_t));
+        if (!tls) return NULL;
+        pthread_setspecific(bm_tls_key, tls);
+    }
+
+    if (BM_LIKELY(needed <= tls->capacity)) return tls->buf;
+
+    size_t new_size = tls->capacity ? tls->capacity : BM_READ_BUF_INITIAL_SIZE;
+    while (new_size < needed) new_size *= 2;
+
+    uint8_t *new_buf = (uint8_t *)realloc(tls->buf, new_size);
+    if (!new_buf) return NULL;
+
+    tls->buf = new_buf;
+    tls->capacity = new_size;
+    return new_buf;
+}
 
 /**
  * odsync_available
@@ -487,7 +487,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     if (BM_UNLIKELY(pwritev(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size)) return -1;
 
     /* if O_DSYNC is available and was used at open time, pwrite already synced
-     * otherwise fall back to explicit fdatasync for durability */
+     * otherwise we fall back to explicit fdatasync for durability */
     if (is_sync_full(bm) && !odsync_available())
     {
         if (fdatasync(bm->fd) != 0)
@@ -499,7 +499,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     return offset;
 }
 
-int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t size)
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uint32_t size)
 {
     if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
 
@@ -923,7 +923,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
     if (block)
     {
-        /* cache block size so cursor_next skips the pread for size header */
+        /* we cache block size so cursor_next skips the pread for size header */
         cursor->current_block_size = block->size;
         cursor->block_size_valid = 1;
     }
@@ -931,7 +931,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 }
 
 block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t *cursor,
-                                                         size_t max_bytes)
+                                                         const size_t max_bytes)
 {
     if (!cursor) return NULL;
     if (max_bytes == 0) return block_manager_cursor_read(cursor);

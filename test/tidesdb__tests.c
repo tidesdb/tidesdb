@@ -6071,7 +6071,7 @@ static void test_dynamic_capacity_adjustment(void)
 
     /* write enough data to fill Level 2 and trigger level addition
      * each key+value is ~160 bytes, need 400+ bytes in L2
-     * write many keys to ensure data flows through L0→L1→L2 via compaction */
+     * write many keys to ensure data flows through L0->L1->L2 via compaction */
     int total_keys_written = 0;
 
     printf("Writing keys to trigger level growth...\n");

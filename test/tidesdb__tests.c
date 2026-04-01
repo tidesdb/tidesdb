@@ -5956,7 +5956,7 @@ static void test_boundary_partitioning(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "boundary_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write keys with specific patterns to test boundary detection
+    /* we write keys with specific patterns to test boundary detection
      * we use lexicographically distributed keys */
     int num_keys = 120;
     for (int i = 0; i < num_keys; i++)
@@ -5965,7 +5965,7 @@ static void test_boundary_partitioning(void)
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
         char key[32], value[128];
-        /* create keys that span alphabet for good boundary distribution */
+        /* we create keys that span alphabet for good boundary distribution */
         char prefix = 'a' + (i % 26);
         snprintf(key, sizeof(key), "%c_boundary_key_%04d", prefix, i);
         snprintf(value, sizeof(value), "boundary_value_%04d_padding", i);
@@ -5983,7 +5983,7 @@ static void test_boundary_partitioning(void)
         }
     }
 
-    /* wait for all background operations to complete
+    /*we  wait for all background operations to complete
      * flushes can trigger auto-compactions, so we need to wait for everything to settle */
     for (int i = 0; i < 200; i++)
     {
@@ -5997,10 +5997,10 @@ static void test_boundary_partitioning(void)
         }
     }
 
-    /* trigger explicit compaction */
+    /* we trigger explicit compaction */
     tidesdb_compact(cf);
 
-    /* wait for compaction and any cascading operations to complete */
+    /* we wait for compaction and any cascading operations to complete */
     for (int i = 0; i < 200; i++)
     {
         usleep(50000);
@@ -6019,7 +6019,7 @@ static void test_boundary_partitioning(void)
         }
     }
 
-    /* verify all keys are still accessible after boundary-based partitioning */
+    /* we verify all keys are still accessible after boundary-based partitioning */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 

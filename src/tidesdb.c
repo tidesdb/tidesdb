@@ -212,8 +212,7 @@ static inline size_t tdb_build_prefixed_key(uint32_t cf_index, const uint8_t *ke
 #define TDB_SHA256_DIGEST_SIZE 32 /* SHA256 raw digest bytes */
 
 /* default column family config values */
-#define TDB_DEFAULT_OBJECT_TARGET_FILE_SIZE (256 * 1024 * 1024)
-#define TDB_INITIAL_BLOCK_INDEX_CAPACITY    16
+#define TDB_INITIAL_BLOCK_INDEX_CAPACITY 16
 
 /* create write set hash table at this many ops */
 #define TDB_TXN_WRITE_HASH_THRESHOLD 64
@@ -1129,6 +1128,13 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                                          int target_level);
 static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level);
 static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level);
+static int tdb_partitioned_merge_finalize_sst(tidesdb_column_family_t *cf, tidesdb_sstable_t *sst,
+                                              block_manager_t *klog_bm, block_manager_t *vlog_bm,
+                                              bloom_filter_t *bloom,
+                                              tidesdb_block_index_t *block_indexes,
+                                              uint64_t entry_count, uint64_t klog_block_num,
+                                              uint64_t vlog_block_num, uint64_t max_seq,
+                                              int end_level, int partition);
 static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
                                                  block_manager_t *klog_bm, block_manager_t *vlog_bm,
@@ -2035,7 +2041,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .use_btree = 0,
         .commit_hook_fn = NULL,
         .commit_hook_ctx = NULL,
-        .object_target_file_size = TDB_DEFAULT_OBJECT_TARGET_FILE_SIZE,
+        .object_target_file_size = 0, /* reserved, not used */
         .object_lazy_compaction = 0,
         .object_prefetch_compaction = 1};
 }
@@ -6438,7 +6444,6 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
         }
     }
 
-    /* write metadata block */
     uint64_t klog_size_before_metadata;
     uint64_t vlog_size_before_metadata;
     block_manager_get_size(klog_bm, &klog_size_before_metadata);
@@ -12275,6 +12280,192 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
  * @param end_level end level
  * @return 0 on success, -1 on failure
  */
+
+/**
+ * tdb_partitioned_merge_finalize_sst
+ * finalize an output sstable during partitioned merge.
+ * writes aux blocks (index, bloom, metadata), closes block managers,
+ * adds to target level, and commits manifest.
+ * used both for normal partition completion and mid-partition file_max splits.
+ *
+ * @param cf column family
+ * @param sst sstable to finalize (takes ownership, caller must not use after)
+ * @param klog_bm klog block manager (closed on return)
+ * @param vlog_bm vlog block manager (closed on return)
+ * @param bloom bloom filter (ownership transferred to sst)
+ * @param block_indexes block index (ownership transferred to sst)
+ * @param entry_count number of entries written
+ * @param klog_block_num number of klog blocks written
+ * @param vlog_block_num number of vlog blocks written
+ * @param max_seq maximum sequence number seen
+ * @param end_level 1-indexed target level number
+ * @param partition partition index (for logging)
+ * @return 0 on success, -1 on failure
+ */
+static int tdb_partitioned_merge_finalize_sst(tidesdb_column_family_t *cf, tidesdb_sstable_t *sst,
+                                              block_manager_t *klog_bm, block_manager_t *vlog_bm,
+                                              bloom_filter_t *bloom,
+                                              tidesdb_block_index_t *block_indexes,
+                                              uint64_t entry_count, uint64_t klog_block_num,
+                                              uint64_t vlog_block_num, uint64_t max_seq,
+                                              int end_level, int partition)
+{
+    sst->num_klog_blocks = klog_block_num;
+    sst->num_vlog_blocks = vlog_block_num;
+    sst->num_entries = entry_count;
+    sst->max_seq = max_seq;
+
+    block_manager_get_size(klog_bm, &sst->klog_data_end_offset);
+
+    if (entry_count > 0)
+    {
+        if (block_indexes)
+        {
+            sst->block_indexes = block_indexes;
+            size_t index_size;
+            uint8_t *index_data = compact_block_index_serialize(sst->block_indexes, &index_size);
+            if (index_data)
+            {
+                block_manager_block_t *index_block =
+                    block_manager_block_create(index_size, index_data);
+                if (index_block)
+                {
+                    block_manager_block_write(klog_bm, index_block);
+                    block_manager_block_release(index_block);
+                }
+                free(index_data);
+            }
+        }
+        else
+        {
+            uint8_t empty_index_data[5];
+            encode_uint32_le_compat(empty_index_data, 0);
+            empty_index_data[4] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN;
+            block_manager_block_t *empty_index = block_manager_block_create(5, empty_index_data);
+            if (empty_index)
+            {
+                block_manager_block_write(klog_bm, empty_index);
+                block_manager_block_release(empty_index);
+            }
+        }
+        if (bloom)
+        {
+            sst->bloom_filter = bloom;
+            size_t bloom_size;
+            uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+            if (bloom_data)
+            {
+                block_manager_block_t *bloom_block =
+                    block_manager_block_create(bloom_size, bloom_data);
+                if (bloom_block)
+                {
+                    block_manager_block_write(klog_bm, bloom_block);
+                    block_manager_block_release(bloom_block);
+                }
+                free(bloom_data);
+            }
+        }
+        else
+        {
+            uint8_t empty_bloom_data[1] = {0};
+            block_manager_block_t *empty_bloom = block_manager_block_create(1, empty_bloom_data);
+            if (empty_bloom)
+            {
+                block_manager_block_write(klog_bm, empty_bloom);
+                block_manager_block_release(empty_bloom);
+            }
+        }
+    }
+
+    uint64_t klog_size_before_metadata;
+    uint64_t vlog_size_before_metadata;
+    block_manager_get_size(klog_bm, &klog_size_before_metadata);
+    block_manager_get_size(vlog_bm, &vlog_size_before_metadata);
+    sst->klog_size = klog_size_before_metadata;
+    sst->vlog_size = vlog_size_before_metadata;
+
+    uint8_t *metadata_data = NULL;
+    size_t metadata_size = 0;
+    if (entry_count > 0 && sstable_metadata_serialize(sst, &metadata_data, &metadata_size) == 0)
+    {
+        block_manager_block_t *metadata_block =
+            block_manager_block_create(metadata_size, metadata_data);
+        if (metadata_block)
+        {
+            block_manager_block_write(klog_bm, metadata_block);
+            block_manager_block_release(metadata_block);
+        }
+        free(metadata_data);
+    }
+
+    block_manager_get_size(klog_bm, &sst->klog_size);
+    block_manager_get_size(vlog_bm, &sst->vlog_size);
+
+    /* close write handles */
+    block_manager_close(klog_bm);
+    block_manager_close(vlog_bm);
+
+    atomic_thread_fence(memory_order_seq_cst);
+
+    if (entry_count > 0)
+    {
+        int current_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+        int target_level_num = end_level;
+        int target_idx = -1;
+        for (int i = 0; i < current_num_levels; i++)
+        {
+            if (cf->levels[i]->level_num == target_level_num)
+            {
+                target_idx = i;
+                break;
+            }
+        }
+
+        if (target_idx < 0 || target_idx >= current_num_levels)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Partitioned merge partition %d, target level %d not found "
+                          "(current_num_levels=%d), data would be lost!",
+                          partition, target_level_num, current_num_levels);
+            tidesdb_sstable_unref(cf->db, sst);
+            return -1;
+        }
+
+        tidesdb_level_add_sstable(cf->levels[target_idx], sst);
+        tidesdb_bump_sstable_layout_version(cf);
+
+        tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num, sst->id,
+                                     sst->num_entries, sst->klog_size + sst->vlog_size);
+        atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+        int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+        if (manifest_result != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Partitioned merge partition %d: Failed to commit manifest for "
+                          "SSTable %" PRIu64 " (error: %d)",
+                          partition, sst->id, manifest_result);
+        }
+
+        tdb_objstore_upload_manifest(cf->db, cf);
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Partitioned merge partition %d finalized SSTable %" PRIu64 " with %" PRIu64
+                      " entries, %" PRIu64 " klog blocks",
+                      partition, sst->id, sst->num_entries, sst->num_klog_blocks);
+        tidesdb_sstable_unref(cf->db, sst);
+    }
+    else
+    {
+        if (bloom) bloom_filter_free(bloom);
+        if (block_indexes) compact_block_index_free(block_indexes);
+        remove(sst->klog_path);
+        remove(sst->vlog_path);
+        tidesdb_sstable_unref(cf->db, sst);
+    }
+
+    return 0;
+}
+
 static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level)
 {
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
@@ -12362,6 +12553,20 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         {
             memcpy(boundaries[i], largest_sstables[i]->min_key, boundary_sizes[i]);
         }
+    }
+
+    /**** spooky paper algorithm 2 -- when merging into the largest level,
+     ***  cap output sstable size at file_max = C_X (capacity of the dividing level).
+     **   this bounds transient space-amp to 1/T. when not targeting the largest level,
+     *    file_max is 0 which disables splitting. */
+    const int targeting_largest = (end_idx == num_levels - 1);
+    size_t file_max = 0;
+    if (targeting_largest && start_idx >= 0 && start_idx < num_levels)
+    {
+        file_max = atomic_load_explicit(&cf->levels[start_idx]->capacity, memory_order_acquire);
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Partitioned merge targeting largest level, file_max=%zu (C_X at level %d)",
+                      file_max, start_idx + 1);
     }
 
     /* we merge one partition at a time */
@@ -12754,6 +12959,98 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     free(block_last_key);
                     block_first_key = NULL;
                     block_last_key = NULL;
+
+                    /*** spooky file_max splits if output exceeds C_X, finalize this
+                     **  sstable and start a new one within the same partition.
+                     *   per algorithm 2 of the spooky paper. */
+                    if (file_max > 0 && entry_count > 0)
+                    {
+                        uint64_t current_klog_size = atomic_load(&klog_bm->current_file_size);
+                        if (current_klog_size >= file_max)
+                        {
+                            /* we assign min/max keys to current sst before finalizing */
+                            new_sst->min_key = first_key;
+                            new_sst->min_key_size = first_key_size;
+                            new_sst->max_key = last_key;
+                            new_sst->max_key_size = last_key_size;
+                            first_key = NULL;
+                            last_key = NULL;
+
+                            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                          "Partition %d: SSTable %" PRIu64
+                                          " reached file_max (%zu >= %zu), splitting",
+                                          partition, new_sst->id, (size_t)current_klog_size,
+                                          file_max);
+
+                            tdb_partitioned_merge_finalize_sst(
+                                cf, new_sst, klog_bm, vlog_bm, bloom, block_indexes, entry_count,
+                                klog_block_num, vlog_block_num, max_seq, end_level, partition);
+
+                            /* we create replacement sst for remaining entries in this partition */
+                            uint64_t split_id = atomic_fetch_add(&cf->next_sstable_id, 1);
+                            char split_path[MAX_FILE_PATH_LENGTH];
+                            snprintf(split_path, sizeof(split_path),
+                                     "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX
+                                     "%d" TDB_LEVEL_PARTITION_PREFIX "%d",
+                                     cf->directory, end_level + 1, partition);
+
+                            new_sst =
+                                tidesdb_sstable_create(cf->db, split_path, split_id, &cf->config);
+                            if (!new_sst)
+                            {
+                                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                              "Partition %d: failed to create split SSTable",
+                                              partition);
+                                /* we drain remaining heap entries for this partition */
+                                while (!tidesdb_merge_heap_empty(heap))
+                                {
+                                    tidesdb_kv_pair_t *drain = tidesdb_merge_heap_pop(heap, NULL);
+                                    if (drain)
+                                        tidesdb_kv_pair_free(drain);
+                                    else
+                                        break;
+                                }
+                                break;
+                            }
+
+                            klog_bm = NULL;
+                            vlog_bm = NULL;
+                            block_manager_open(
+                                &klog_bm, new_sst->klog_path,
+                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                      ? TDB_SYNC_FULL
+                                                      : cf->config.sync_mode));
+                            block_manager_open(
+                                &vlog_bm, new_sst->vlog_path,
+                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                      ? TDB_SYNC_FULL
+                                                      : cf->config.sync_mode));
+
+                            bloom = NULL;
+                            block_indexes = NULL;
+                            if (cf->config.enable_bloom_filter)
+                            {
+                                bloom_filter_new(&bloom, cf->config.bloom_fpr,
+                                                 (int)estimated_entries);
+                            }
+                            if (cf->config.enable_block_indexes && !cf->config.use_btree)
+                            {
+                                block_indexes = compact_block_index_create(
+                                    estimated_entries, cf->config.block_index_prefix_len,
+                                    comparator_fn, comparator_ctx);
+                            }
+
+                            /* we reset per-sst counters */
+                            entry_count = 0;
+                            klog_block_num = 0;
+                            vlog_block_num = 0;
+                            max_seq = 0;
+                            first_key = NULL;
+                            first_key_size = 0;
+                            last_key = NULL;
+                            last_key_size = 0;
+                        }
+                    }
                 }
 
                 tidesdb_kv_pair_free(kv);
@@ -12789,16 +13086,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                         block_manager_block_create(final_size, final_data);
                     if (block)
                     {
-                        /* we capture file position before writing the block */
                         uint64_t block_file_position = atomic_load(&klog_bm->current_file_size);
-
                         block_manager_block_write(klog_bm, block);
                         block_manager_block_release(block);
 
-                        /* we add final block to index after writing with file position */
                         if (block_indexes && block_first_key && block_last_key)
                         {
-                            /* we sample every Nth block (ratio validated to be >= 1) */
                             if (klog_block_num % cf->config.index_sample_ratio == 0)
                             {
                                 compact_block_index_add(block_indexes, block_first_key,
@@ -12814,222 +13107,18 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             }
 
             tidesdb_klog_block_free(klog_block);
-
-            /* we cleanup block tracking */
             free(block_first_key);
             free(block_last_key);
 
-            new_sst->num_klog_blocks = klog_block_num;
-            new_sst->num_vlog_blocks = vlog_block_num;
-
-            new_sst->num_entries = entry_count;
-            new_sst->max_seq = max_seq;
+            /* we assign min/max keys and finalize via helper */
             new_sst->min_key = first_key;
             new_sst->min_key_size = first_key_size;
             new_sst->max_key = last_key;
             new_sst->max_key_size = last_key_size;
 
-            /* we capture klog file offset where data blocks end (before writing
-             * index/bloom/metadata)
-             */
-            block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
-
-            /* we write auxiliary structures (always write, even if empty, to maintain consistent
-             * file structure) */
-            if (entry_count > 0)
-            {
-                /* we write index block */
-                if (block_indexes)
-                {
-                    new_sst->block_indexes = block_indexes;
-
-                    size_t index_size;
-                    uint8_t *index_data =
-                        compact_block_index_serialize(new_sst->block_indexes, &index_size);
-                    if (index_data)
-                    {
-                        block_manager_block_t *index_block =
-                            block_manager_block_create(index_size, index_data);
-                        if (index_block)
-                        {
-                            block_manager_block_write(klog_bm, index_block);
-                            block_manager_block_release(index_block);
-                        }
-                        free(index_data);
-                    }
-                }
-                else
-                {
-                    /* we write empty index block as placeholder (5 bytes -- count=0 + prefix_len)
-                     */
-                    uint8_t empty_index_data[5];
-                    encode_uint32_le_compat(empty_index_data, 0);             /* count = 0 */
-                    empty_index_data[4] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN; /* prefix_len */
-                    block_manager_block_t *empty_index =
-                        block_manager_block_create(5, empty_index_data);
-                    if (empty_index)
-                    {
-                        block_manager_block_write(klog_bm, empty_index);
-                        block_manager_block_release(empty_index);
-                    }
-                }
-
-                if (bloom)
-                {
-                    new_sst->bloom_filter = bloom;
-
-                    size_t bloom_size;
-                    uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-                    if (bloom_data)
-                    {
-                        TDB_DEBUG_LOG(
-                            TDB_LOG_INFO,
-                            "Partitioned merge partition %d bloom filter serialized to %zu bytes",
-                            partition, bloom_size);
-                        block_manager_block_t *bloom_block =
-                            block_manager_block_create(bloom_size, bloom_data);
-                        if (bloom_block)
-                        {
-                            block_manager_block_write(klog_bm, bloom_block);
-                            block_manager_block_release(bloom_block);
-                        }
-                        free(bloom_data);
-                    }
-                    else
-                    {
-                        TDB_DEBUG_LOG(
-                            TDB_LOG_ERROR,
-                            "Partitioned merge partition %d bloom filter serialization failed",
-                            partition);
-                    }
-                }
-                else
-                {
-                    /* we write empty bloom block as placeholder (1 byte -- size=0) */
-                    uint8_t empty_bloom_data[1] = {0};
-                    block_manager_block_t *empty_bloom =
-                        block_manager_block_create(1, empty_bloom_data);
-                    if (empty_bloom)
-                    {
-                        block_manager_block_write(klog_bm, empty_bloom);
-                        block_manager_block_release(empty_bloom);
-                    }
-                }
-            }
-
-            /* we get file sizes before metadata write for serialization */
-            uint64_t klog_size_before_metadata;
-            uint64_t vlog_size_before_metadata;
-            block_manager_get_size(klog_bm, &klog_size_before_metadata);
-            block_manager_get_size(vlog_bm, &vlog_size_before_metadata);
-
-            /* we temporarily set sizes for metadata serialization */
-            new_sst->klog_size = klog_size_before_metadata;
-            new_sst->vlog_size = vlog_size_before_metadata;
-
-            /* we write metadata block as the last block -- only if we have entries */
-            uint8_t *metadata_data = NULL;
-            size_t metadata_size = 0;
-            if (entry_count > 0 &&
-                sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
-            {
-                block_manager_block_t *metadata_block =
-                    block_manager_block_create(metadata_size, metadata_data);
-                if (metadata_block)
-                {
-                    block_manager_block_write(klog_bm, metadata_block);
-                    block_manager_block_release(metadata_block);
-                }
-                free(metadata_data);
-            }
-
-            block_manager_get_size(klog_bm, &new_sst->klog_size);
-            block_manager_get_size(vlog_bm, &new_sst->vlog_size);
-
-            /* we close write handles before adding to level */
-            if (klog_bm)
-            {
-                block_manager_close(klog_bm);
-                new_sst->klog_bm = NULL;
-            }
-            if (vlog_bm)
-            {
-                block_manager_close(vlog_bm);
-                new_sst->vlog_bm = NULL;
-            }
-
-            /* we ensure all writes are visible before making sstable discoverable */
-            atomic_thread_fence(memory_order_seq_cst);
-
-            /* we add to level if not empty */
-            if (entry_count > 0)
-            {
-                /* we reload num_levels as DCA may have changed it */
-                int current_num_levels =
-                    atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-
-                /* we find the target level by level_num, not by stale array index
-                 * partitioned merge writes to end_level (the largest level being merged) */
-                int target_level_num = end_level;
-                int target_idx = -1;
-                for (int i = 0; i < current_num_levels; i++)
-                {
-                    if (cf->levels[i]->level_num == target_level_num)
-                    {
-                        target_idx = i;
-                        break;
-                    }
-                }
-
-                if (target_idx < 0 || target_idx >= current_num_levels)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                  "Partitioned merge partition %d, target level %d not found "
-                                  "(current_num_levels=%d), data would be lost!",
-                                  partition, target_level_num, current_num_levels);
-                    tidesdb_sstable_unref(cf->db, new_sst);
-                    tidesdb_merge_heap_free(heap);
-                    continue;
-                }
-
-                tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
-                tidesdb_bump_sstable_layout_version(cf);
-
-                tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
-                                             new_sst->id, new_sst->num_entries,
-                                             new_sst->klog_size + new_sst->vlog_size);
-                atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
-                if (manifest_result != 0)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                  "Partitioned merge partition %d: Failed to commit manifest for "
-                                  "SSTable %" PRIu64 " (error: %d)",
-                                  partition, new_sst->id, manifest_result);
-                }
-
-                tdb_objstore_upload_manifest(cf->db, cf);
-
-                TDB_DEBUG_LOG(TDB_LOG_INFO,
-                              "Partitioned merge partition %d complete, created SSTable %" PRIu64
-                              " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64
-                              " vlog blocks",
-                              partition, new_sst->id, new_sst->num_entries,
-                              new_sst->num_klog_blocks, new_sst->num_vlog_blocks);
-                tidesdb_sstable_unref(cf->db, new_sst);
-            }
-            else
-            {
-                TDB_DEBUG_LOG(
-                    TDB_LOG_INFO,
-                    "Partitioned merge partition %d no entries, skipping SSTable creation",
-                    partition);
-                if (bloom) bloom_filter_free(bloom);
-                if (block_indexes) compact_block_index_free(block_indexes);
-                remove(new_sst->klog_path);
-                remove(new_sst->vlog_path);
-                tidesdb_sstable_unref(cf->db, new_sst);
-            }
+            tdb_partitioned_merge_finalize_sst(cf, new_sst, klog_bm, vlog_bm, bloom, block_indexes,
+                                               entry_count, klog_block_num, vlog_block_num, max_seq,
+                                               end_level, partition);
         }
 
         tidesdb_merge_heap_free(heap);

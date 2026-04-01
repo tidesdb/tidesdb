@@ -22141,10 +22141,20 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     tidesdb_immutable_memtable_t **imm_snapshot =
         tidesdb_snapshot_immutable_memtables(cf, &imm_count);
 
-    /* we now load active memtable, any keys that rotated are already in our snapshot */
+    /* we pin the active memtable with try_ref to prevent use-after-free
+     * if rotation+flush races between our load and merge_source_from_memtable's ref.
+     * without try_ref, the memtable could rotate to immutable, flush, and free
+     * before the unconditional ref in merge_source_from_memtable fires. */
     tidesdb_memtable_t *active_mt_struct =
         atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
+    if (active_mt_struct && !tidesdb_memtable_try_ref(active_mt_struct))
+    {
+        /* rotation raced with our load, retry once */
+        active_mt_struct = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+        if (active_mt_struct) tidesdb_memtable_try_ref(active_mt_struct);
+    }
+    skip_list_t *active_mt =
+        (active_mt_struct && active_mt_struct->skip_list) ? active_mt_struct->skip_list : NULL;
 
     /* we ensure consistent view */
     atomic_thread_fence(memory_order_acquire);
@@ -22166,8 +22176,15 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
 
     if ((*iter)->cached_mt_sources)
     {
-        tidesdb_merge_source_t *memtable_source =
-            tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
+        tidesdb_merge_source_t *memtable_source = NULL;
+        if (active_mt_struct && active_mt)
+        {
+            memtable_source =
+                tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
+        }
+        /* release our try_ref pin -- merge_source_from_memtable took its own ref */
+        if (active_mt_struct) tidesdb_immutable_memtable_unref(active_mt_struct);
+
         if (memtable_source)
         {
             memtable_source->is_cached = 1;

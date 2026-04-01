@@ -3919,6 +3919,7 @@ static void tdb_objstore_upload_file(tidesdb_t *db, const char *local_path)
 /**
  * tdb_objstore_delete_file
  * delete an object from the object store corresponding to a local path.
+ * retries with exponential backoff on transient failures.
  * @param db database instance
  * @param local_path local file path whose corresponding object should be deleted
  */
@@ -3927,7 +3928,19 @@ static void tdb_objstore_delete_file(tidesdb_t *db, const char *local_path)
     if (!db->object_store || !local_path) return;
     char key[TDB_MAX_PATH_LEN];
     tdb_path_to_object_key(db, local_path, key, sizeof(key));
-    db->object_store->delete_object(db->object_store->ctx, key);
+
+    unsigned int delay_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
+    for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
+    {
+        if (db->object_store->delete_object(db->object_store->ctx, key) == 0) return;
+
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store delete attempt %d/%d failed: %s", attempt + 1,
+                      TDB_UPLOAD_MAX_RETRIES, key);
+        if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES) usleep(delay_us);
+        delay_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
+    }
+    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store delete failed after %d attempts: %s",
+                  TDB_UPLOAD_MAX_RETRIES, key);
 }
 
 /**
@@ -10833,6 +10846,14 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return collect_result;
     }
 
+    /*** we prefetch input sstables in parallel when object store mode is active
+     **  and object_prefetch_compaction is enabled. this avoids serial on-demand
+     *   downloads during merge source creation. */
+    if (cf->db->object_store && cf->config.object_prefetch_compaction)
+    {
+        tdb_objstore_prefetch_sstables(cf->db, ssts_array, sst_count);
+    }
+
     tidesdb_add_ssts_to_merge_heap(cf->db, ssts_array, sst_count, heap, sstables_to_delete);
     free(ssts_array);
 
@@ -11432,6 +11453,10 @@ merge_complete:;
                               new_sst->id, manifest_result);
             }
 
+            /** we upload manifest to object store so replicas and cold-start nodes
+             * can see the new sstable before old inputs are cleaned up */
+            tdb_objstore_upload_manifest(cf->db, cf);
+
             tidesdb_sstable_unref(cf->db, new_sst);
         }
     }
@@ -11549,6 +11574,12 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return collect_result;
+    }
+
+    /* we prefetch input sstables before partition loop */
+    if (cf->db->object_store && cf->config.object_prefetch_compaction)
+    {
+        tdb_objstore_prefetch_sstables(cf->db, ssts_array, sst_count);
     }
 
     for (int i = 0; i < sst_count; i++)
@@ -12208,6 +12239,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                   partition, new_sst->id, manifest_result);
                 }
 
+                tdb_objstore_upload_manifest(cf->db, cf);
+
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
         }
@@ -12296,6 +12329,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return collect_result;
+    }
+
+    /* we prefetch input sstables before partition loop */
+    if (cf->db->object_store && cf->config.object_prefetch_compaction)
+    {
+        tdb_objstore_prefetch_sstables(cf->db, ssts_array, sst_count);
     }
 
     for (int i = 0; i < sst_count; i++)
@@ -12968,6 +13007,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                                   "SSTable %" PRIu64 " (error: %d)",
                                   partition, new_sst->id, manifest_result);
                 }
+
+                tdb_objstore_upload_manifest(cf->db, cf);
 
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "Partitioned merge partition %d complete, created SSTable %" PRIu64
@@ -13848,8 +13889,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
         int should_compact = 0;
         const char *trigger_reason = NULL;
 
+        /* in object store mode with lazy compaction, double the file count
+         * trigger to reduce compaction frequency and thus remote I/O */
+        int effective_file_trigger = cf->config.l1_file_count_trigger;
+        if (db->object_store && cf->config.object_lazy_compaction)
+        {
+            effective_file_trigger *= 2;
+        }
+
         /* file count trigger at level 1 */
-        if (num_l1_sstables >= cf->config.l1_file_count_trigger)
+        if (num_l1_sstables >= effective_file_trigger)
         {
             should_compact = 1;
             trigger_reason = "file count";
@@ -27327,6 +27376,18 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->use_btree = (int)strtol(value, NULL, 10);
     }
+    else if (strcmp(name, "object_target_file_size") == 0)
+    {
+        ctx->config->object_target_file_size = (size_t)strtoull(value, NULL, 10);
+    }
+    else if (strcmp(name, "object_lazy_compaction") == 0)
+    {
+        ctx->config->object_lazy_compaction = (int)strtol(value, NULL, 10);
+    }
+    else if (strcmp(name, "object_prefetch_compaction") == 0)
+    {
+        ctx->config->object_prefetch_compaction = (int)strtol(value, NULL, 10);
+    }
     else if (strcmp(name, "comparator_name") == 0)
     {
         strncpy(ctx->config->comparator_name, value, TDB_MAX_COMPARATOR_NAME - 1);
@@ -27416,6 +27477,9 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "l0_queue_stall_threshold = %d\n", config->l0_queue_stall_threshold);
     fprintf(fp, "min_disk_space = %" PRIu64 "\n", config->min_disk_space);
     fprintf(fp, "use_btree = %d\n", config->use_btree);
+    fprintf(fp, "object_target_file_size = %zu\n", config->object_target_file_size);
+    fprintf(fp, "object_lazy_compaction = %d\n", config->object_lazy_compaction);
+    fprintf(fp, "object_prefetch_compaction = %d\n", config->object_prefetch_compaction);
 
     fprintf(fp, "comparator_name = %s\n", config->comparator_name);
     if (config->comparator_ctx_str[0] != '\0')

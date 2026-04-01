@@ -9864,11 +9864,125 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
     }
     else
     {
-        /* if we have a lazy (not-yet-deserialized) block, we deserialize it now
-         * so we can advance to the next entry */
+        /* if we have a lazy (not-yet-deserialized) block with an index,
+         * parse only the next entry from raw data instead of deserializing
+         * the entire block. this replaces the O(N) full deserialization
+         * with O(1) per-entry parsing using the pre-built index. */
         if (source->source.sstable.lazy.data && !source->source.sstable.current_block)
         {
-            /* we strip block index header and deserialize */
+            /* we parse one entry at a time from raw bytes */
+            if (source->source.sstable.lazy.idx_count > 0 && source->source.sstable.lazy.idx_base)
+            {
+                source->source.sstable.lazy.entry_idx++;
+                const int idx = source->source.sstable.lazy.entry_idx;
+                const int count = (int)source->source.sstable.lazy.idx_count;
+
+                if (idx < count)
+                {
+                    /* we parse single entry from index */
+                    const uint8_t *idx_base = source->source.sstable.lazy.idx_base;
+                    const uint8_t *bdata = source->source.sstable.lazy.block_data;
+                    const size_t bdata_size = source->source.sstable.lazy.block_data_size;
+                    const uint8_t *fie = idx_base + idx * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                    const uint32_t e_off = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_ENTRY_OFF);
+                    const uint32_t mk_off = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_KEY_OFF);
+                    const uint32_t mk_sz = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_KEY_SIZE);
+                    const uint32_t sq_lo = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_LO);
+                    const uint32_t sq_hi = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_HI);
+
+                    if (e_off < bdata_size)
+                    {
+                        const uint8_t *eptr = bdata + e_off;
+                        size_t erem = bdata_size - e_off;
+                        const uint8_t flags = *eptr++;
+                        erem--;
+
+                        uint64_t ks, vs;
+                        int br = decode_varint(eptr, &ks, (int)erem);
+                        eptr += br;
+                        erem -= br;
+                        br = decode_varint(eptr, &vs, (int)erem);
+                        eptr += br;
+                        erem -= br;
+
+                        /* we skip seq varint to reach ttl/vlog */
+                        uint64_t seq_skip;
+                        br = decode_varint(eptr, &seq_skip, (int)erem);
+                        eptr += br;
+                        erem -= br;
+
+                        int64_t ttl = 0;
+                        if (flags & TDB_KV_FLAG_HAS_TTL)
+                        {
+                            if (erem >= sizeof(int64_t))
+                            {
+                                ttl = decode_int64_le_compat(eptr);
+                                eptr += sizeof(int64_t);
+                                erem -= sizeof(int64_t);
+                            }
+                        }
+
+                        uint64_t vlog_offset = 0;
+                        if (flags & TDB_KV_FLAG_HAS_VLOG)
+                        {
+                            uint64_t vo;
+                            decode_varint(eptr, &vo, (int)erem);
+                            vlog_offset = vo;
+                        }
+
+                        const uint64_t abs_seq = ((uint64_t)sq_hi << 32) | sq_lo;
+                        const uint8_t *key_ptr = bdata + mk_off;
+
+                        if (vlog_offset > 0)
+                        {
+                            uint8_t *vlog_value = NULL;
+                            tidesdb_vlog_read_value(source->source.sstable.db,
+                                                    source->source.sstable.sst, vlog_offset,
+                                                    (size_t)vs, &vlog_value);
+                            source->current_kv =
+                                tidesdb_kv_pair_create(key_ptr, mk_sz, vlog_value, (size_t)vs, ttl,
+                                                       abs_seq, flags & TDB_KV_FLAG_TOMBSTONE);
+                            free(vlog_value);
+                        }
+                        else
+                        {
+                            tidesdb_kv_pair_t *ikv = &source->inline_kv;
+                            ikv->entry.flags =
+                                (flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_BORROWED;
+                            ikv->entry.key_size = mk_sz;
+                            ikv->entry.value_size = (uint32_t)vs;
+                            ikv->entry.seq = abs_seq;
+                            ikv->entry.ttl = ttl;
+                            ikv->entry.vlog_offset = 0;
+                            ikv->key = (uint8_t *)key_ptr;
+                            ikv->value = (vs > 0) ? (uint8_t *)(bdata + mk_off + mk_sz) : NULL;
+                            source->current_kv = ikv;
+                        }
+
+                        /* we prefetch next block when we reach the last entry */
+                        if (idx + 1 >= count)
+                        {
+                            const tidesdb_sstable_t *sst = source->source.sstable.sst;
+                            block_manager_cursor_t *kc = source->source.sstable.klog_cursor;
+                            if (sst->klog_bm && kc &&
+                                (sst->klog_data_end_offset == 0 ||
+                                 kc->current_pos < sst->klog_data_end_offset))
+                            {
+                                prefetch_file_region(sst->klog_bm->fd, (off_t)kc->current_pos,
+                                                     (off_t)TDB_KLOG_BLOCK_SIZE);
+                            }
+                        }
+
+                        return TDB_SUCCESS;
+                    }
+                }
+
+                /* exhausted indexed lazy block, we clear and fall through to next block */
+                tidesdb_iter_clear_lazy(source);
+                goto advance_next_block;
+            }
+
+            /* non-indexed lazy block, we fall back to full deserialization */
             const uint8_t *deser_ptr = source->source.sstable.lazy.block_data;
             size_t deser_size = source->source.sstable.lazy.block_data_size;
 
@@ -9877,10 +9991,6 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             {
                 kb->data_ref = NULL;
                 source->source.sstable.current_block = kb;
-
-                /* we transfer ownership from lazy to source so release_block handles cleanup.
-                 * cache-origin blocks transfer the pin; disk-origin blocks transfer
-                 * the bmblock and decompressed buffer pointers. */
                 source->source.sstable.cache_pin = source->source.sstable.lazy.pin;
                 source->source.sstable.lazy.pin = NULL;
                 source->source.sstable.current_block_data = source->source.sstable.lazy.bmblock;
@@ -9902,16 +10012,11 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
         const tidesdb_klog_block_t *kb = source->source.sstable.current_block;
         if (kb && (uint32_t)source->source.sstable.current_entry_idx < kb->num_entries)
         {
-            /**** we point directly into the deserialized block data
-             ***  using the embedded inline_kv to avoid malloc+memcpy per advance.
-             **   the block data stays alive (pinned via cache_pin or current_block_data)
-             *    until the next block boundary crossing or source cleanup. */
             const int idx = source->source.sstable.current_entry_idx;
             const tidesdb_klog_entry_t *e = &kb->entries[idx];
 
             if (e->vlog_offset > 0)
             {
-                /* vlog values require a separate read+alloc -- fall back to owned kv */
                 uint8_t *vlog_value = NULL;
                 tidesdb_vlog_read_value(source->source.sstable.db, source->source.sstable.sst,
                                         e->vlog_offset, e->value_size, &vlog_value);
@@ -9930,10 +10035,6 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                 source->current_kv = ikv;
             }
 
-            /* we prefetch next block when we reach the last entry in this block.
-             * this issues a non-blocking POSIX_FADV_WILLNEED so the OS begins
-             * reading the next block into the page cache before we need it,
-             * hiding I/O latency for sequential iteration across block boundaries. */
             if ((uint32_t)(idx + 1) >= kb->num_entries)
             {
                 const tidesdb_sstable_t *sst = source->source.sstable.sst;
@@ -9949,6 +10050,7 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             return TDB_SUCCESS;
         }
 
+    advance_next_block:
         if (source->source.sstable.current_rc_block)
         {
             tidesdb_block_release(source->source.sstable.current_rc_block);
@@ -23578,7 +23680,10 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
                 found_entry.seq, (found_entry.flags & TDB_KV_FLAG_TOMBSTONE) != 0);
             free(vlog_value);
 
-            /* we set up lazy state, the full deserialization is deferred to next() */
+            /* we set up lazy state, the full deserialization is deferred to next().
+             * if the block is in indexed format, we extract index base and count
+             * so merge_source_advance can parse entries incrementally without
+             * full block deserialization. */
             tidesdb_iter_clear_lazy(source);
             source->source.sstable.lazy.data = raw_data;
             source->source.sstable.lazy.size = raw_size;
@@ -23587,6 +23692,19 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
             source->source.sstable.lazy.block_data_size = block_data_size;
             source->source.sstable.lazy.idx_base = NULL;
             source->source.sstable.lazy.idx_count = 0;
+
+            /* we extract index pointers from indexed format for incremental advance */
+            if (raw_size >= TDB_BLOCK_INDEX_HDR_BASE)
+            {
+                const uint32_t magic = decode_uint32_le_compat(raw_data);
+                if (magic == TDB_BLOCK_INDEX_MAGIC)
+                {
+                    const uint32_t idx_cnt = decode_uint32_le_compat(raw_data + 8);
+                    source->source.sstable.lazy.idx_base = raw_data + TDB_BLOCK_INDEX_HDR_BASE;
+                    source->source.sstable.lazy.idx_count = idx_cnt;
+                }
+            }
+
             source->source.sstable.lazy.entry_idx = found_idx;
             source->source.sstable.lazy.bmblock = bmblock;
             source->source.sstable.lazy.decompressed = decompressed;

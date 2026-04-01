@@ -327,7 +327,8 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param use_btree use btree for klog, faster reads depending on workload
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size target file size for object store compaction (bytes, 0=auto)
+ * @param object_target_file_size reserved for API compatibility, not used (file_max is derived from
+ * level geometry per spooky algorithm 2)
  * @param object_lazy_compaction lazy compaction flag (1 = less aggressive, 0 = aggressive)
  * @param object_prefetch_compaction prefetch compaction flag (1 = download all inputs before merge,
  * 0 = stream)
@@ -361,7 +362,7 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
-    size_t object_target_file_size;
+    size_t object_target_file_size; /* reserved, not used */
     int object_lazy_compaction;
     int object_prefetch_compaction;
 } tidesdb_column_family_config_t;

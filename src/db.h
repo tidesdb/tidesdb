@@ -238,7 +238,8 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param use_btree whether btree is used
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size target SSTable size in object store mode (default 256MB, 0=auto)
+ * @param object_target_file_size reserved for API compatibility, not used.. will be retired
+ * completely
  * @param object_lazy_compaction 1 = compact less aggressively in object store mode (default 0)
  * @param object_prefetch_compaction 1 = download all inputs before merge (default 1)
  */
@@ -271,7 +272,7 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
-    size_t object_target_file_size;
+    size_t object_target_file_size; /* reserved, not used */
     int object_lazy_compaction;
     int object_prefetch_compaction;
 } tidesdb_column_family_config_t;

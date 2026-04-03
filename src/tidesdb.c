@@ -16137,7 +16137,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     pthread_rwlock_unlock(&(*db)->cf_list_lock);
 
     pthread_mutex_init(&(*db)->sync_thread_mutex, NULL);
-#ifndef _WIN32
+#if defined(__linux__)
     {
         pthread_condattr_t cattr;
         pthread_condattr_init(&cattr);

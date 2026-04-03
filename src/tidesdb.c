@@ -21,6 +21,9 @@
 
 #include <errno.h>
 #include <stdarg.h>
+#ifndef _WIN32
+#include <signal.h>
+#endif
 
 #include "xxhash.h"
 
@@ -5003,7 +5006,7 @@ static void tdb_replica_discover_new_cfs(tidesdb_t *db)
         /* we temporarily clear replica_mode so tidesdb_create_column_family
          * does not reject the call with TDB_ERR_READONLY. this is safe because
          * we are the reaper thread creating a CF that the primary already wrote
-         * to the object store — not a user-initiated write. */
+         * to the object store, not a user-initiated write. */
         int was_replica = atomic_exchange(&db->replica_mode, 0);
         int rc = tidesdb_create_column_family(db, cf_name, &cf_config);
         if (was_replica) atomic_store(&db->replica_mode, 1);
@@ -14538,6 +14541,16 @@ static void *tidesdb_sync_worker_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
     tdb_set_thread_name(TDB_THREAD_PREFIX "sync");
+#ifndef _WIN32
+    {
+        sigset_t timer_signals;
+        sigemptyset(&timer_signals);
+        sigaddset(&timer_signals, SIGALRM);
+        sigaddset(&timer_signals, SIGVTALRM);
+        sigaddset(&timer_signals, SIGPROF);
+        pthread_sigmask(SIG_BLOCK, &timer_signals, NULL);
+    }
+#endif
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread started");
 
     while (atomic_load(&db->sync_thread_active))
@@ -14667,6 +14680,24 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
     tdb_set_thread_name(TDB_THREAD_PREFIX "reaper");
+
+    /* block timer signals so pthread_cond_timedwait is not repeatedly
+     * interrupted by the host process's timer handlers (e.g. MariaDB's
+     * SIGALRM). without this the futex restarts on every signal delivery
+     * and never times out. we only block timer-related signals to keep
+     * crash signals (SIGSEGV, SIGBUS, SIGABRT) and termination signals
+     * (SIGTERM, SIGINT) deliverable for clean shutdown and diagnostics. */
+#ifndef _WIN32
+    {
+        sigset_t timer_signals;
+        sigemptyset(&timer_signals);
+        sigaddset(&timer_signals, SIGALRM);
+        sigaddset(&timer_signals, SIGVTALRM);
+        sigaddset(&timer_signals, SIGPROF);
+        pthread_sigmask(SIG_BLOCK, &timer_signals, NULL);
+    }
+#endif
+
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Reaper thread started");
 
     while (atomic_load(&db->sstable_reaper_active))

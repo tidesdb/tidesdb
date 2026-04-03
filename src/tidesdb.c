@@ -360,6 +360,8 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_DOWNLOAD_MAX_RETRIES        3
 #define TDB_DOWNLOAD_INITIAL_BACKOFF_US 50000 /* 50ms */
 #define TDB_DOWNLOAD_BACKOFF_MULTIPLIER 4     /* 50ms -> 200ms -> 800ms */
+#define TDB_LIST_MAX_RETRIES            4
+#define TDB_LIST_INITIAL_BACKOFF_US     50000 /* 50ms */
 
 /* klog block configuration */
 #define TDB_KLOG_BLOCK_INITIAL_CAPACITY 512
@@ -4862,7 +4864,13 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
 
     /* we list all objects to find CF names via their MANIFEST files */
     tdb_cf_discovery_ctx_t discovery = {.count = 0};
-    db->object_store->list(db->object_store->ctx, "", tdb_cf_discovery_cb, &discovery);
+    int list_rc =
+        db->object_store->list(db->object_store->ctx, "", tdb_cf_discovery_cb, &discovery);
+    if (list_rc < 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store cold start: list failed (rc=%d)", list_rc);
+        return;
+    }
 
     if (discovery.count == 0)
     {
@@ -4912,7 +4920,30 @@ static void tdb_replica_discover_new_cfs(tidesdb_t *db)
     if (!db->object_store) return;
 
     tdb_cf_discovery_ctx_t discovery = {.count = 0};
-    db->object_store->list(db->object_store->ctx, "", tdb_cf_discovery_cb, &discovery);
+    int list_rc = -1;
+    unsigned int backoff_us = TDB_LIST_INITIAL_BACKOFF_US;
+
+    for (int attempt = 0; attempt < TDB_LIST_MAX_RETRIES; attempt++)
+    {
+        discovery.count = 0;
+        list_rc =
+            db->object_store->list(db->object_store->ctx, "", tdb_cf_discovery_cb, &discovery);
+        if (list_rc >= 0) break;
+
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica sync: object store list attempt %d/%d failed",
+                      attempt + 1, TDB_LIST_MAX_RETRIES);
+        if (attempt + 1 < TDB_LIST_MAX_RETRIES) usleep(backoff_us);
+        backoff_us *= 2;
+    }
+
+    if (list_rc < 0)
+    {
+        TDB_DEBUG_LOG(
+            TDB_LOG_WARN,
+            "Replica sync: object store list failed after %d attempts, skipping discovery",
+            TDB_LIST_MAX_RETRIES);
+        return;
+    }
 
     for (int i = 0; i < discovery.count; i++)
     {
@@ -4969,7 +5000,14 @@ static void tdb_replica_discover_new_cfs(tidesdb_t *db)
 #endif
         db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
 
+        /* we temporarily clear replica_mode so tidesdb_create_column_family
+         * does not reject the call with TDB_ERR_READONLY. this is safe because
+         * we are the reaper thread creating a CF that the primary already wrote
+         * to the object store — not a user-initiated write. */
+        int was_replica = atomic_exchange(&db->replica_mode, 0);
         int rc = tidesdb_create_column_family(db, cf_name, &cf_config);
+        if (was_replica) atomic_store(&db->replica_mode, 1);
+
         if (rc == TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync: created new CF '%s'", cf_name);
@@ -14967,9 +15005,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             int cycles_per_sync = (int)(sync_interval_us / TDB_SSTABLE_REAPER_SLEEP_US);
             if (cycles_per_sync < 1) cycles_per_sync = 1;
 
-            if (++db->replica_sync_counter >= cycles_per_sync)
+            if (atomic_fetch_add(&db->replica_sync_counter, 1) + 1 >= cycles_per_sync)
             {
-                db->replica_sync_counter = 0;
+                atomic_store(&db->replica_sync_counter, 0);
                 atomic_store_explicit(&db->replica_sync_in_progress, 1, memory_order_release);
 
                 tdb_replica_sync_manifests(db);
@@ -15314,7 +15352,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         &(*db)->replica_mode,
         ((*db)->config.object_store_config && (*db)->config.object_store_config->replica_mode) ? 1
                                                                                                : 0);
-    (*db)->replica_sync_counter = 0;
+    atomic_init(&(*db)->replica_sync_counter, 0);
     atomic_init(&(*db)->replica_sync_in_progress, 0);
 
     _tidesdb_log_level = config->log_level;

@@ -752,7 +752,7 @@ struct tidesdb_t
 
     /* replica mode runtime state */
     _Atomic(int) replica_mode;             /* 1 = read-only replica, 0 = primary */
-    int replica_sync_counter;              /* reaper cycle counter for MANIFEST poll */
+    _Atomic(int) replica_sync_counter;     /* reaper cycle counter for MANIFEST poll */
     _Atomic(int) replica_sync_in_progress; /* 1 while reaper is running sync cycle */
 };
 

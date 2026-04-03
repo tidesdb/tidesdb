@@ -5000,7 +5000,14 @@ static void tdb_replica_discover_new_cfs(tidesdb_t *db)
 #endif
         db->object_store->get(db->object_store->ctx, manifest_key, manifest_local);
 
+        /* we temporarily clear replica_mode so tidesdb_create_column_family
+         * does not reject the call with TDB_ERR_READONLY. this is safe because
+         * we are the reaper thread creating a CF that the primary already wrote
+         * to the object store — not a user-initiated write. */
+        int was_replica = atomic_exchange(&db->replica_mode, 0);
         int rc = tidesdb_create_column_family(db, cf_name, &cf_config);
+        if (was_replica) atomic_store(&db->replica_mode, 1);
+
         if (rc == TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync: created new CF '%s'", cf_name);

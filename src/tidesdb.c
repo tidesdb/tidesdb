@@ -14584,7 +14584,7 @@ static void *tidesdb_sync_worker_thread(void *arg)
         }
 
         struct timespec ts;
-#ifndef _WIN32
+#if defined(__linux__)
         clock_gettime(CLOCK_MONOTONIC, &ts);
 #else
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -14710,7 +14710,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
 
         struct timespec ts;
-#ifndef _WIN32
+#if defined(__linux__)
         clock_gettime(CLOCK_MONOTONIC, &ts);
 #else
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -16176,7 +16176,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
 
     pthread_mutex_init(&(*db)->reaper_thread_mutex, NULL);
-#ifndef _WIN32
+#if defined(__linux__)
     {
         pthread_condattr_t cattr;
         pthread_condattr_init(&cattr);

@@ -179,6 +179,42 @@ btree_arena_t *btree_arena_create(void)
     return arena;
 }
 
+btree_arena_t *btree_arena_create_sized(size_t initial_capacity)
+{
+    if (initial_capacity < BTREE_ARENA_MIN_BLOCK_SIZE)
+        initial_capacity = BTREE_ARENA_MIN_BLOCK_SIZE;
+
+    initial_capacity = (initial_capacity + 7) & ~(size_t)7;
+
+    btree_arena_t *arena = malloc(sizeof(btree_arena_t));
+    if (!arena) return NULL;
+
+    btree_arena_block_t *block = malloc(sizeof(btree_arena_block_t));
+    if (!block)
+    {
+        free(arena);
+        return NULL;
+    }
+
+    block->data = malloc(initial_capacity);
+    if (!block->data)
+    {
+        free(block);
+        free(arena);
+        return NULL;
+    }
+
+    block->size = initial_capacity;
+    block->used = 0;
+    block->next = NULL;
+
+    arena->current = block;
+    arena->blocks = block;
+    arena->total_allocated = initial_capacity;
+
+    return arena;
+}
+
 /**
  * btree_arena_alloc
  * allocates memory from the arena with 8-byte alignment
@@ -734,22 +770,38 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
 
         if (n->num_entries > 0)
         {
-            n->entries = btree_arena_alloc(arena, n->num_entries * sizeof(btree_entry_t));
-            n->keys = btree_arena_alloc(arena, n->num_entries * sizeof(uint8_t *));
-            n->key_sizes = btree_arena_alloc(arena, n->num_entries * sizeof(size_t));
-            n->values = btree_arena_alloc(arena, n->num_entries * sizeof(uint8_t *));
+            const uint32_t ne = n->num_entries;
 
-            if (!n->entries || !n->keys || !n->key_sizes || !n->values) return -1;
+            /* single arena alloc for all 4 metadata arrays */
+            const size_t entries_sz = ne * sizeof(btree_entry_t);
+            const size_t keys_ptr_sz = ne * sizeof(uint8_t *);
+            const size_t key_sizes_sz = ne * sizeof(size_t);
+            const size_t values_ptr_sz = ne * sizeof(uint8_t *);
+            const size_t meta_total = entries_sz + keys_ptr_sz + key_sizes_sz + values_ptr_sz;
+            uint8_t *meta_buf = btree_arena_alloc(arena, meta_total);
+            if (!meta_buf) return -1;
 
-            memset(n->entries, 0, n->num_entries * sizeof(btree_entry_t));
-            memset(n->keys, 0, n->num_entries * sizeof(uint8_t *));
-            memset(n->key_sizes, 0, n->num_entries * sizeof(size_t));
-            memset(n->values, 0, n->num_entries * sizeof(uint8_t *));
+            n->entries = (btree_entry_t *)meta_buf;
+            n->keys = (uint8_t **)(meta_buf + entries_sz);
+            n->key_sizes = (size_t *)(meta_buf + entries_sz + keys_ptr_sz);
+            n->values = (uint8_t **)(meta_buf + entries_sz + keys_ptr_sz + key_sizes_sz);
+
+            /* only values needs zeroing (sparse -- vlog entries have no inline value) */
+            memset(n->values, 0, values_ptr_sz);
+
+            /* single arena alloc for all 3 temp arrays */
+            const size_t offsets_sz = ne * sizeof(uint16_t);
+            const size_t lens_sz = ne * sizeof(size_t);
+            const size_t temp_total = offsets_sz + lens_sz + lens_sz;
+            uint8_t *temp_buf = btree_arena_alloc(arena, temp_total);
+            if (!temp_buf) return -1;
+
+            uint16_t *key_offsets = (uint16_t *)temp_buf;
+            size_t *prefix_lens = (size_t *)(temp_buf + offsets_sz);
+            size_t *suffix_lens = (size_t *)(temp_buf + offsets_sz + lens_sz);
 
             /* we read key indirection table (stored as little-endian uint16) */
-            uint16_t *key_offsets = btree_arena_alloc(arena, n->num_entries * sizeof(uint16_t));
-            if (!key_offsets) return -1;
-            for (uint32_t i = 0; i < n->num_entries; i++)
+            for (uint32_t i = 0; i < ne; i++)
             {
                 key_offsets[i] = (uint16_t)(data[off] | (data[off + 1] << 8));
                 off += 2;
@@ -759,13 +811,8 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             uint64_t base_seq;
             off += btree_varint_decode(data + off, &base_seq);
 
-            /* we temporary arrays for prefix/suffix lengths (arena allocated) */
-            size_t *prefix_lens = btree_arena_alloc(arena, n->num_entries * sizeof(size_t));
-            size_t *suffix_lens = btree_arena_alloc(arena, n->num_entries * sizeof(size_t));
-            if (!prefix_lens || !suffix_lens) return -1;
-
             /* we read entry metadata */
-            for (uint32_t i = 0; i < n->num_entries; i++)
+            for (uint32_t i = 0; i < ne; i++)
             {
                 uint64_t prefix_len, suffix_len, value_size, vlog_offset;
                 int64_t seq_delta, ttl;
@@ -788,12 +835,22 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
                 n->key_sizes[i] = n->entries[i].key_size;
             }
 
+            /* single arena alloc for all key data, then carve up with pointers */
+            size_t total_key_bytes = 0;
+            for (uint32_t i = 0; i < ne; i++)
+            {
+                total_key_bytes += ((size_t)n->entries[i].key_size + 7) & ~(size_t)7;
+            }
+
+            uint8_t *key_buf = btree_arena_alloc(arena, total_key_bytes);
+            if (!key_buf) return -1;
+
             /* we reconstruct keys from prefix-compressed format */
             const size_t keys_start = off;
-            for (uint32_t i = 0; i < n->num_entries; i++)
+            size_t key_buf_off = 0;
+            for (uint32_t i = 0; i < ne; i++)
             {
-                n->keys[i] = btree_arena_alloc(arena, n->entries[i].key_size);
-                if (!n->keys[i]) return -1;
+                n->keys[i] = key_buf + key_buf_off;
 
                 /* we copy prefix from previous key */
                 if (i > 0 && prefix_lens[i] > 0)
@@ -804,25 +861,41 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
                 /* we copy suffix from serialized data */
                 const size_t suffix_pos = keys_start + key_offsets[i];
                 memcpy(n->keys[i] + prefix_lens[i], data + suffix_pos, suffix_lens[i]);
+
+                key_buf_off += ((size_t)n->entries[i].key_size + 7) & ~(size_t)7;
             }
 
             /* we advance past all key data */
-            for (uint32_t i = 0; i < n->num_entries; i++)
+            for (uint32_t i = 0; i < ne; i++)
             {
                 off += suffix_lens[i];
             }
 
-            /* we read inline values */
-            for (uint32_t i = 0; i < n->num_entries; i++)
+            /* single arena alloc for all inline values, then point each into it */
+            size_t total_inline_bytes = 0;
+            for (uint32_t i = 0; i < ne; i++)
             {
                 if (n->entries[i].vlog_offset == 0 && n->entries[i].value_size > 0)
+                    total_inline_bytes += n->entries[i].value_size;
+            }
+
+            if (total_inline_bytes > 0)
+            {
+                uint8_t *val_buf = btree_arena_alloc(arena, total_inline_bytes);
+                if (!val_buf) return -1;
+                memcpy(val_buf, data + off, total_inline_bytes);
+
+                size_t val_off = 0;
+                for (uint32_t i = 0; i < ne; i++)
                 {
-                    n->values[i] = btree_arena_alloc(arena, n->entries[i].value_size);
-                    if (!n->values[i]) return -1;
-                    memcpy(n->values[i], data + off, n->entries[i].value_size);
-                    off += n->entries[i].value_size;
+                    if (n->entries[i].vlog_offset == 0 && n->entries[i].value_size > 0)
+                    {
+                        n->values[i] = val_buf + val_off;
+                        val_off += n->entries[i].value_size;
+                    }
                 }
             }
+            off += total_inline_bytes;
         }
     }
     else if (n->type == BTREE_NODE_INTERNAL)
@@ -830,18 +903,17 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
         const uint32_t num_keys = n->num_entries;
         const uint32_t num_children = num_keys + 1;
 
-        n->child_offsets = btree_arena_alloc(arena, num_children * sizeof(int64_t));
-        n->keys = btree_arena_alloc(arena, num_keys * sizeof(uint8_t *));
-        n->key_sizes = btree_arena_alloc(arena, num_keys * sizeof(size_t));
+        /* single arena alloc for child_offsets + keys ptrs + key_sizes */
+        const size_t child_sz = num_children * sizeof(int64_t);
+        const size_t ikeys_ptr_sz = num_keys * sizeof(uint8_t *);
+        const size_t ikey_sizes_sz = num_keys * sizeof(size_t);
+        const size_t internal_total = child_sz + ikeys_ptr_sz + ikey_sizes_sz;
+        uint8_t *ibuf = btree_arena_alloc(arena, internal_total);
+        if (!ibuf) return -1;
 
-        if (!n->child_offsets || (num_keys > 0 && (!n->keys || !n->key_sizes))) return -1;
-
-        memset(n->child_offsets, 0, num_children * sizeof(int64_t));
-        if (num_keys > 0)
-        {
-            memset(n->keys, 0, num_keys * sizeof(uint8_t *));
-            memset(n->key_sizes, 0, num_keys * sizeof(size_t));
-        }
+        n->child_offsets = (int64_t *)ibuf;
+        n->keys = (num_keys > 0) ? (uint8_t **)(ibuf + child_sz) : NULL;
+        n->key_sizes = (num_keys > 0) ? (size_t *)(ibuf + child_sz + ikeys_ptr_sz) : NULL;
 
         int64_t base_offset = decode_int64_le_compat(data + off);
         off += 8;
@@ -864,12 +936,26 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             n->key_sizes[i] = (size_t)key_size;
         }
 
+        /* single arena alloc for all separator key data */
+        size_t total_ikey_bytes = 0;
         for (uint32_t i = 0; i < num_keys; i++)
         {
-            n->keys[i] = btree_arena_alloc(arena, n->key_sizes[i]);
-            if (!n->keys[i]) return -1;
-            memcpy(n->keys[i], data + off, n->key_sizes[i]);
-            off += n->key_sizes[i];
+            total_ikey_bytes += (n->key_sizes[i] + 7) & ~(size_t)7;
+        }
+
+        if (total_ikey_bytes > 0)
+        {
+            uint8_t *ikey_buf = btree_arena_alloc(arena, total_ikey_bytes);
+            if (!ikey_buf) return -1;
+
+            size_t ikey_off = 0;
+            for (uint32_t i = 0; i < num_keys; i++)
+            {
+                n->keys[i] = ikey_buf + ikey_off;
+                memcpy(n->keys[i], data + off, n->key_sizes[i]);
+                off += n->key_sizes[i];
+                ikey_off += (n->key_sizes[i] + 7) & ~(size_t)7;
+            }
         }
     }
 
@@ -1027,8 +1113,10 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
     }
 
     /* we use arena allocation to eliminate N+7 individual malloc/free per node read
-     * btree_node_free will destroy the arena via O(1) bulk deallocation */
-    btree_arena_t *arena = btree_arena_create();
+     * btree_node_free will destroy the arena via O(1) bulk deallocation.
+     * we size the arena to data_size * 2 since deserialized form (pointers, arrays)
+     * is typically 1-2x the serialized size. avoids 64KB default for small nodes. */
+    btree_arena_t *arena = btree_arena_create_sized(data_size * 2);
     if (!arena)
     {
         free(decompressed);
@@ -1183,7 +1271,7 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     }
 
     btree_node_t *new_node = NULL;
-    btree_arena_t *node_arena = btree_arena_create();
+    btree_arena_t *node_arena = btree_arena_create_sized(data_size * 2);
     if (!node_arena)
     {
         free(decompressed);
@@ -1207,7 +1295,7 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     /* rc_count = 2, 1 for cache ownership + 1 for caller */
     atomic_store_explicit(&new_node->rc_count, 2, memory_order_relaxed);
 
-    /* we account for actual memory cost: node struct + arena allocations.
+    /* we account for actual memory cost i.e node struct + arena allocations.
      * without this the cache treats every node as 0 bytes and never evicts,
      * causing unbounded memory growth under btree workloads. */
     const size_t node_cost = sizeof(btree_node_t) + node_arena->total_allocated;

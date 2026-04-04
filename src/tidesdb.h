@@ -539,6 +539,7 @@ struct tidesdb_column_family_t
  * @param cached_comparator_fn cached comparator function for fast iteration
  * @param cached_comparator_ctx cached comparator context for fast iteration
  * @param is_reverse flag indicating sstable is reverse sorted
+ * @param cache_key_prefix globally unique prefix for btree node cache keys 
  */
 struct tidesdb_sstable_t
 {
@@ -576,7 +577,7 @@ struct tidesdb_sstable_t
     skip_list_comparator_fn cached_comparator_fn;
     void *cached_comparator_ctx;
     int is_reverse;
-    uint64_t cache_key_prefix; /* globally unique prefix for btree node cache keys */
+    uint64_t cache_key_prefix;
 };
 
 /**

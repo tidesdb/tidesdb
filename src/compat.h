@@ -2416,8 +2416,8 @@ static inline uint8_t *serialize_kv_varint(uint8_t *ptr, const uint8_t *key, uin
 
 /*
  * serialize_kv_varint_ex
- * serialize key-value pair with flags and varint length prefixes (for SSTables)
- * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl)
+ * serialize key-value pair with flags and varint length prefixes (for sstables)
+ * format is flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl)
  * @param ptr output buffer (must have enough space)
  * @param flags flags byte (e.g., tombstone marker)
  * @param key key data
@@ -2534,7 +2534,7 @@ static inline const uint8_t *deserialize_kv_varint(const uint8_t *ptr, const uin
 
 /*
  * deserialize_kv_varint_ex
- * deserialize key-value pair with flags and varint length prefixes (for SSTables)
+ * deserialize key-value pair with flags and varint length prefixes (for sstables)
  * @param ptr input buffer
  * @param end end of input buffer (for bounds checking)
  * @param flags output flags byte

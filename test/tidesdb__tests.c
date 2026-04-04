@@ -26190,7 +26190,7 @@ static void test_btree_multi_cf_vlog_isolation(void)
         tidesdb_txn_free(txn);
     }
 
-    /* we force flush to SSTables */
+    /* we force flush to sstables */
     tidesdb_purge_cf(cf_small);
     tidesdb_purge_cf(cf_large);
 

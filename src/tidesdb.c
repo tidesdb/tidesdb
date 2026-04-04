@@ -5186,7 +5186,7 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
              TDB_U64_CAST(id));
 
     /* we use XXH64 of the klog path as the btree node cache key prefix.
-     * this is globally unique across CFs (includes CF directory + SSTable ID),
+     * this is globally unique across CFs (includes CF directory + sstable id),
      * unlike sst->id which is per-CF and can collide in the shared node cache. */
     sst->cache_key_prefix = XXH64(sst->klog_path, strlen(sst->klog_path), 0);
 

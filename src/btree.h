@@ -262,7 +262,7 @@ struct btree_t
 
 /**
  * btree_stats_t
- * statistics for a single B+tree (per-SSTable)
+ * statistics for a single B+tree (per-sstable)
  * @param entry_count total number of entries
  * @param node_count total number of nodes
  * @param height tree height (1 = single leaf, 2+ = has internal nodes)

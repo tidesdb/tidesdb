@@ -15253,7 +15253,6 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         if (candidate_count == 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN, "Reaper: no closeable SSTables found");
             if (!use_stack) free(candidates);
             continue;
         }

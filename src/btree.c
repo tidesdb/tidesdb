@@ -1202,12 +1202,17 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     }
 
     new_node->block_offset = offset;
+    new_node->arena = node_arena;
 
     /* rc_count = 2, 1 for cache ownership + 1 for caller */
     atomic_store_explicit(&new_node->rc_count, 2, memory_order_relaxed);
 
+    /* we account for actual memory cost: node struct + arena allocations.
+     * without this the cache treats every node as 0 bytes and never evicts,
+     * causing unbounded memory growth under btree workloads. */
+    const size_t node_cost = sizeof(btree_node_t) + node_arena->total_allocated;
     clock_cache_put(tree->node_cache, cache_key, (size_t)key_len, &new_node, sizeof(btree_node_t *),
-                    0);
+                    node_cost);
 
     *node = new_node;
     return 0;

@@ -656,6 +656,33 @@ static int ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition
             cur_global = clock_cache_sum_bytes(cache);
             evict_rounds++;
         }
+
+        /* if local partition eviction wasn't enough, try other partitions.
+         * this handles the case where entries are spread across many partitions
+         * and a single partition can't free enough to meet the global byte budget
+         * (common with large external_bytes like btree nodes). */
+        if (cur_global + required_bytes > cache->max_bytes)
+        {
+            const size_t local_idx = (size_t)(partition - cache->partitions);
+            for (size_t p = 1; p < cache->num_partitions; p++)
+            {
+                const size_t other_idx = (local_idx + p) & (cache->num_partitions - 1);
+                clock_cache_partition_t *other = &cache->partitions[other_idx];
+                const size_t other_occ =
+                    atomic_load_explicit(&other->occupied_count, memory_order_relaxed);
+                if (other_occ == 0) continue;
+
+                size_t rounds = 0;
+                while (rounds < other_occ)
+                {
+                    if (!evict_for_space(cache, other)) break;
+                    rounds++;
+                    const size_t now = clock_cache_sum_bytes(cache);
+                    if (now + required_bytes <= cache->max_bytes) goto eviction_done;
+                }
+            }
+        eviction_done:;
+        }
     }
 
     /* slot-count-based eviction -- prevent hash table overload */
@@ -683,10 +710,11 @@ void clock_cache_compute_config(const size_t max_bytes, cache_config_t *config)
     num_partitions = p;
 
     /* slot count is sized for hash table efficiency (low load factor), not for byte budget.
-     * eviction is driven by bytes_used, not slot count. use a small avg_entry_size to
-     * ensure enough slots exist for the hash table to probe efficiently even when the
-     * actual entries are large (64KB+ blocks). */
-    const size_t avg_entry_size = CLOCK_CACHE_AVG_ENTRY_SIZE;
+     * when caller specifies avg_entry_size (e.g., btree 64KB nodes), use it to avoid
+     * creating vastly more slots than entries that will fit in the byte budget.
+     * otherwise use a small default so that many small entries probe efficiently. */
+    const size_t avg_entry_size =
+        (config->avg_entry_size > 0) ? config->avg_entry_size : CLOCK_CACHE_AVG_ENTRY_SIZE;
     size_t total_entries = max_bytes / avg_entry_size;
     if (total_entries < num_partitions) total_entries = num_partitions;
 

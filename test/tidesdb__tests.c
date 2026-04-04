@@ -26133,7 +26133,7 @@ static void test_btree_multi_cf_vlog_isolation(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.unified_memtable = 1;
-    config.unified_memtable_write_buffer_size = 32768;
+    config.unified_memtable_write_buffer_size = 256 * 1024;
     config.log_level = TDB_LOG_WARN;
 
     tidesdb_t *db = NULL;
@@ -26142,7 +26142,7 @@ static void test_btree_multi_cf_vlog_isolation(void)
     /* btree with small values (inline, under threshold) */
     tidesdb_column_family_config_t cfg1 = tidesdb_default_column_family_config();
     cfg1.use_btree = 1;
-    cfg1.write_buffer_size = 32768;
+    cfg1.write_buffer_size = 256 * 1024;
     cfg1.klog_value_threshold = 512;
     cfg1.compression_algorithm = TDB_COMPRESS_NONE;
     ASSERT_EQ(tidesdb_create_column_family(db, "bt_small", &cfg1), 0);
@@ -26150,7 +26150,7 @@ static void test_btree_multi_cf_vlog_isolation(void)
     /* btree with large values (vlog, over threshold) */
     tidesdb_column_family_config_t cfg2 = tidesdb_default_column_family_config();
     cfg2.use_btree = 1;
-    cfg2.write_buffer_size = 32768;
+    cfg2.write_buffer_size = 256 * 1024;
     cfg2.klog_value_threshold = 512;
     cfg2.compression_algorithm = TDB_COMPRESS_NONE;
     ASSERT_EQ(tidesdb_create_column_family(db, "bt_large", &cfg2), 0);

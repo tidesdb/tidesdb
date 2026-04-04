@@ -4820,6 +4820,7 @@ static void *tdb_cold_start_download_worker(void *arg)
     char cf_dir[TDB_MAX_PATH_LEN - 32];
     snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
     mkdir(cf_dir, TDB_DIR_PERMISSIONS);
+    tdb_sync_directory(db->db_path);
 
     /* we download config.ini */
     char config_key[TDB_MAX_PATH_LEN];
@@ -4965,6 +4966,7 @@ static void tdb_replica_discover_new_cfs(tidesdb_t *db)
         char cf_dir[TDB_MAX_PATH_LEN];
         snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "%s", db->db_path, cf_name);
         mkdir(cf_dir, 0755);
+        tdb_sync_directory(db->db_path);
 
         char config_key[TDB_MAX_PATH_LEN];
         snprintf(config_key, sizeof(config_key),
@@ -5337,6 +5339,23 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
         }
         tdb_unlink(sst->klog_path);
         tdb_unlink(sst->vlog_path);
+
+        /* we sync the parent directory to persist the unlink operations */
+        if (sst->klog_path)
+        {
+            char dir_buf[TDB_MAX_PATH_LEN];
+            strncpy(dir_buf, sst->klog_path, sizeof(dir_buf) - 1);
+            dir_buf[sizeof(dir_buf) - 1] = '\0';
+            char *sep = strrchr(dir_buf, '/');
+#ifdef _WIN32
+            if (!sep) sep = strrchr(dir_buf, '\\');
+#endif
+            if (sep)
+            {
+                *sep = '\0';
+                tdb_sync_directory(dir_buf);
+            }
+        }
     }
 
     free(sst->klog_path);
@@ -14291,6 +14310,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             block_manager_close(wal);
             imm->wal = NULL;
             tdb_unlink(wal_path_to_delete);
+            tdb_sync_directory(cf->directory);
             free(wal_path_to_delete);
         }
 
@@ -17561,6 +17581,9 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Deleted column family directory: %s (result: %d)",
                   cf_to_drop->directory, result);
 
+    /* we sync parent directory to persist the directory removal */
+    tdb_sync_directory(db->db_path);
+
     tidesdb_column_family_free(cf_to_drop);
 
     return TDB_SUCCESS;
@@ -18221,6 +18244,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
             return TDB_ERR_IO;
         }
     }
+
+    /* we sync CF directory to persist new WAL file entry */
+    if (new_wal) tdb_sync_directory(cf->directory);
 
     /* we create new tidesdb_memtable_t structure pairing skip_list and wal */
     tidesdb_memtable_t *new_mt = malloc(sizeof(tidesdb_memtable_t));
@@ -21508,6 +21534,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
                     /* sync block until upload completes, we then delete locally */
                     tdb_objstore_upload_file_sync(db, wal_path);
                     tdb_unlink(wal_path);
+                    tdb_sync_directory(db->db_path);
                 }
                 else
                 {
@@ -21520,6 +21547,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
             {
                 /* no object store or replicate_wal disabled -- just delete */
                 tdb_unlink(wal_path);
+                tdb_sync_directory(db->db_path);
             }
             free(wal_path);
         }
@@ -21575,6 +21603,9 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
         skip_list_free(new_sl);
         return TDB_ERR_IO;
     }
+
+    /* we sync db directory to persist new unified WAL file entry */
+    tdb_sync_directory(db->db_path);
 
     tidesdb_memtable_t *new_mt = malloc(sizeof(tidesdb_memtable_t));
     if (!new_mt)

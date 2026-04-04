@@ -26126,6 +26126,153 @@ static void test_primary_replica_failover(void)
     cleanup_test_dir();
 }
 
+static void test_btree_multi_cf_vlog_isolation(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 32768;
+    config.log_level = TDB_LOG_WARN;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    /* btree with small values (inline, under threshold) */
+    tidesdb_column_family_config_t cfg1 = tidesdb_default_column_family_config();
+    cfg1.use_btree = 1;
+    cfg1.write_buffer_size = 32768;
+    cfg1.klog_value_threshold = 512;
+    cfg1.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "bt_small", &cfg1), 0);
+
+    /* btree with large values (vlog, over threshold) */
+    tidesdb_column_family_config_t cfg2 = tidesdb_default_column_family_config();
+    cfg2.use_btree = 1;
+    cfg2.write_buffer_size = 32768;
+    cfg2.klog_value_threshold = 512;
+    cfg2.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "bt_large", &cfg2), 0);
+
+    tidesdb_column_family_t *cf_small = tidesdb_get_column_family(db, "bt_small");
+    tidesdb_column_family_t *cf_large = tidesdb_get_column_family(db, "bt_large");
+    ASSERT_TRUE(cf_small != NULL);
+    ASSERT_TRUE(cf_large != NULL);
+
+    const int NUM = 500;
+    const int SMALL_SIZE = 64;
+    const int LARGE_SIZE = 2048;
+
+    uint8_t *small_val = malloc(SMALL_SIZE);
+    uint8_t *large_val = malloc(LARGE_SIZE);
+    ASSERT_TRUE(small_val != NULL && large_val != NULL);
+
+    /* we write same keys to both CFs with different value sizes */
+    for (int i = 0; i < NUM; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "shared_key_%06d", i);
+
+        /* we fill with deterministic patterns */
+        for (int j = 0; j < SMALL_SIZE; j++) small_val[j] = (uint8_t)((i * 17 + j * 3) & 0xFF);
+        for (int j = 0; j < LARGE_SIZE; j++) large_val[j] = (uint8_t)((i * 41 + j * 11) & 0xFF);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_small, (uint8_t *)key, strlen(key) + 1, small_val,
+                                  SMALL_SIZE, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_large, (uint8_t *)key, strlen(key) + 1, large_val,
+                                  LARGE_SIZE, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we force flush to SSTables */
+    tidesdb_purge_cf(cf_small);
+    tidesdb_purge_cf(cf_large);
+
+    /* we wait for background flush */
+    for (int w = 0; w < 100; w++)
+    {
+        if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
+        usleep(50000);
+    }
+    usleep(500000);
+
+    /* we verify CF1 (small values, inline) */
+    printf("  verifying small CF (%d entries, %d bytes each)...\n", NUM, SMALL_SIZE);
+    int small_ok = 0;
+    for (int i = 0; i < NUM; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "shared_key_%06d", i);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+        int rc = tidesdb_txn_get(txn, cf_small, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+        tidesdb_txn_free(txn);
+
+        if (rc != 0)
+        {
+            printf("  FAIL: key %d not found (rc=%d)\n", i, rc);
+            ASSERT_EQ(rc, 0);
+        }
+        if (rs != (size_t)SMALL_SIZE)
+        {
+            printf("  FAIL: key %d size mismatch: got %zu expected %d, value=%p\n", i, rs,
+                   SMALL_SIZE, (void *)rv);
+            if (rv && rs > 0)
+            {
+                printf("  first bytes: %02x %02x %02x %02x\n", rv[0], rs > 1 ? rv[1] : 0,
+                       rs > 2 ? rv[2] : 0, rs > 3 ? rv[3] : 0);
+            }
+            free(rv);
+            ASSERT_EQ(rs, (size_t)SMALL_SIZE);
+        }
+
+        for (int j = 0; j < SMALL_SIZE; j++) small_val[j] = (uint8_t)((i * 17 + j * 3) & 0xFF);
+        ASSERT_TRUE(memcmp(rv, small_val, SMALL_SIZE) == 0);
+        free(rv);
+        small_ok++;
+    }
+    printf("  small CF: %d/%d OK\n", small_ok, NUM);
+
+    /* we verify CF2 (large values, vlog) */
+    printf("  verifying large CF (%d entries, %d bytes each)...\n", NUM, LARGE_SIZE);
+    int large_ok = 0;
+    for (int i = 0; i < NUM; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "shared_key_%06d", i);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+        int rc = tidesdb_txn_get(txn, cf_large, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+        tidesdb_txn_free(txn);
+
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(rs, (size_t)LARGE_SIZE);
+
+        for (int j = 0; j < LARGE_SIZE; j++) large_val[j] = (uint8_t)((i * 41 + j * 11) & 0xFF);
+        ASSERT_TRUE(memcmp(rv, large_val, LARGE_SIZE) == 0);
+        free(rv);
+        large_ok++;
+    }
+    printf("  large CF: %d/%d OK\n", large_ok, NUM);
+
+    free(small_val);
+    free(large_val);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 #ifdef TIDESDB_WITH_S3
 #include "../src/objstore_s3.h"
 
@@ -26731,6 +26878,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_stats, tests_passed);
     RUN_TEST(test_objstore_frozen_point_lookup, tests_passed);
     RUN_TEST(test_objstore_wal_sync_on_commit, tests_passed);
+    RUN_TEST(test_btree_multi_cf_vlog_isolation, tests_passed);
     RUN_TEST(test_replica_mode, tests_passed);
     RUN_TEST(test_primary_replica_failover, tests_passed);
 #ifdef TIDESDB_WITH_S3

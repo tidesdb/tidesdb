@@ -576,6 +576,7 @@ struct tidesdb_sstable_t
     skip_list_comparator_fn cached_comparator_fn;
     void *cached_comparator_ctx;
     int is_reverse;
+    uint64_t cache_key_prefix; /* globally unique prefix for btree node cache keys */
 };
 
 /**

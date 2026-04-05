@@ -68,7 +68,8 @@ typedef struct btree_arena_t btree_arena_t;
  * simple arena allocator for btree nodes to reduce malloc/free overhead
  * allocations are bump-pointer style, freed all at once when arena is destroyed
  */
-#define BTREE_ARENA_BLOCK_SIZE (64 * 1024) /* 64KB blocks */
+#define BTREE_ARENA_BLOCK_SIZE     (64 * 1024) /* 64KB blocks */
+#define BTREE_ARENA_MIN_BLOCK_SIZE 256         /* minimum arena block size */
 
 typedef struct btree_arena_block_t
 {
@@ -95,10 +96,19 @@ struct btree_arena_t
 
 /**
  * btree_arena_create
- * creates a new arena allocator
+ * creates a new arena allocator with default block size (64KB)
  * @return new arena or NULL on failure
  */
 btree_arena_t *btree_arena_create(void);
+
+/**
+ * btree_arena_create_sized
+ * creates a new arena allocator with a specific initial capacity
+ * used to right-size arenas for deserialized nodes to reduce memory waste
+ * @param initial_capacity initial block size in bytes (clamped to minimum 256)
+ * @return new arena or NULL on failure
+ */
+btree_arena_t *btree_arena_create_sized(size_t initial_capacity);
 
 /**
  * btree_arena_alloc
@@ -262,7 +272,7 @@ struct btree_t
 
 /**
  * btree_stats_t
- * statistics for a single B+tree (per-SSTable)
+ * statistics for a single B+tree (per-sstable)
  * @param entry_count total number of entries
  * @param node_count total number of nodes
  * @param height tree height (1 = single leaf, 2+ = has internal nodes)

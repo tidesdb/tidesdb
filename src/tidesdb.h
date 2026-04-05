@@ -201,8 +201,11 @@ typedef enum
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
 #define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN      16
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES \
-    256 /* x2 each sstable has 2 fds, so really the default is 512 */
+#if defined(__OpenBSD__)
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES 64 /* x2 OpenBSD has lower default fd limits */
+#else
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES 256 /* x2 each sstable has 2 fds, so really 512 */
+#endif
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE (1024 * 64)
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US       128000
@@ -539,6 +542,7 @@ struct tidesdb_column_family_t
  * @param cached_comparator_fn cached comparator function for fast iteration
  * @param cached_comparator_ctx cached comparator context for fast iteration
  * @param is_reverse flag indicating sstable is reverse sorted
+ * @param cache_key_prefix globally unique prefix for btree node cache keys
  */
 struct tidesdb_sstable_t
 {
@@ -576,6 +580,7 @@ struct tidesdb_sstable_t
     skip_list_comparator_fn cached_comparator_fn;
     void *cached_comparator_ctx;
     int is_reverse;
+    uint64_t cache_key_prefix;
 };
 
 /**

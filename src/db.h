@@ -65,7 +65,7 @@ typedef struct tidesdb_objstore_t tidesdb_objstore_t;
 /**
  * tidesdb_objstore_config_t
  * configuration for object store mode behavior
- * @param local_cache_path local directory for cached SSTable files (NULL = use db_path)
+ * @param local_cache_path local directory for cached sstable files (NULL = use db_path)
  * @param local_cache_max_bytes max local cache size in bytes (0 = unlimited)
  * @param cache_on_read cache downloaded files locally (default 1)
  * @param cache_on_write keep local copy after upload (default 1)

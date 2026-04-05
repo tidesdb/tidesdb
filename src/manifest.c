@@ -396,6 +396,24 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         return -1;
     }
 
+    /* we sync the parent directory to ensure the rename is durable.
+     * without this, a crash after rename could lose the directory entry
+     * on POSIX systems that don't flush directory metadata automatically. */
+    {
+        char dir_buf[1024];
+        strncpy(dir_buf, path, sizeof(dir_buf) - 1);
+        dir_buf[sizeof(dir_buf) - 1] = '\0';
+        char *last_sep = strrchr(dir_buf, '/');
+#ifdef _WIN32
+        if (!last_sep) last_sep = strrchr(dir_buf, '\\');
+#endif
+        if (last_sep)
+        {
+            *last_sep = '\0';
+            tdb_sync_directory(dir_buf);
+        }
+    }
+
     /* we reopen for reading */
     manifest->fp = tdb_fopen(path, "r");
 

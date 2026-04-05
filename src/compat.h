@@ -3264,4 +3264,61 @@ static inline time_t tdb_get_current_time(void)
 #endif
 }
 
+/**
+ * tdb_gmtime_r
+ * cross-platform thread-safe gmtime
+ * @param timep pointer to time_t value
+ * @param result pointer to struct tm to fill
+ * @return pointer to result on success, NULL on failure
+ */
+static inline struct tm *tdb_gmtime_r(const time_t *timep, struct tm *result)
+{
+#if defined(_WIN32)
+    return (gmtime_s(result, timep) == 0) ? result : NULL;
+#else
+    return gmtime_r(timep, result);
+#endif
+}
+
+/**
+ * tdb_fmemopen
+ * cross-platform fmemopen
+ * opens a memory buffer as a FILE stream for reading
+ * @param buf pointer to memory buffer
+ * @param size size of buffer in bytes
+ * @param mode fopen mode string (e.g. "rb")
+ * @return FILE pointer or NULL on failure
+ */
+static inline FILE *tdb_fmemopen(void *buf, size_t size, const char *mode)
+{
+#if defined(_WIN32)
+    /* windows has no fmemopen -- we write to a temp file and reopen */
+    (void)mode;
+    char temp_path[MAX_PATH];
+    char temp_file[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, temp_path) == 0) return NULL;
+    if (GetTempFileNameA(temp_path, "tdb", 0, temp_file) == 0) return NULL;
+
+    FILE *fp = fopen(temp_file, "wb");
+    if (!fp) return NULL;
+
+    if (size > 0 && buf)
+    {
+        if (fwrite(buf, 1, size, fp) != size)
+        {
+            fclose(fp);
+            DeleteFileA(temp_file);
+            return NULL;
+        }
+    }
+    fclose(fp);
+
+    fp = fopen(temp_file, "rb");
+    DeleteFileA(temp_file); /* the file stays open until fclose */
+    return fp;
+#else
+    return fmemopen(buf, size, mode);
+#endif
+}
+
 #endif /* __COMPAT_H__ */

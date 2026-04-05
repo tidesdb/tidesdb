@@ -162,7 +162,7 @@ static void s3_get_timestamp(char *date8, char *timestamp16)
 {
     time_t now = time(NULL);
     struct tm gm;
-    gmtime_r(&now, &gm);
+    tdb_gmtime_r(&now, &gm);
     strftime(date8, TDB_S3_DATE_LEN, "%Y%m%d", &gm);
     strftime(timestamp16, TDB_S3_TIMESTAMP_LEN, "%Y%m%dT%H%M%SZ", &gm);
 }
@@ -477,7 +477,7 @@ static int s3_put(void *ctx, const char *key, const char *local_path)
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_discard);
 
-    FILE *mem_fp = fmemopen(file_data, file_size > 0 ? file_size : 1, "rb");
+    FILE *mem_fp = tdb_fmemopen(file_data, file_size > 0 ? file_size : 1, "rb");
     curl_easy_setopt(curl, CURLOPT_READDATA, mem_fp);
 
     CURLcode res = curl_easy_perform(curl);

@@ -79,7 +79,7 @@ void test_local_cache_track_single(void)
 
     tdb_local_cache_destroy(&cache);
     remove(path);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_track_multiple(void)
@@ -113,7 +113,7 @@ void test_local_cache_track_multiple(void)
     remove(path_a);
     remove(path_b);
     remove(path_c);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_track_duplicate(void)
@@ -137,7 +137,7 @@ void test_local_cache_track_duplicate(void)
 
     tdb_local_cache_destroy(&cache);
     remove(path);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_track_nonexistent(void)
@@ -185,7 +185,7 @@ void test_local_cache_touch(void)
     remove(path_a);
     remove(path_b);
     remove(path_c);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_touch_nonexistent(void)
@@ -247,7 +247,7 @@ void test_local_cache_remove(void)
     remove(path_a);
     remove(path_b);
     remove(path_c);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_remove_nonexistent(void)
@@ -296,7 +296,7 @@ void test_local_cache_eviction(void)
     tdb_local_cache_destroy(&cache);
     remove(path_b);
     remove(path_c);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_eviction_unlimited(void)
@@ -321,7 +321,7 @@ void test_local_cache_eviction_unlimited(void)
     tdb_local_cache_destroy(&cache);
     remove(path_a);
     remove(path_b);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_klog_vlog_pair_eviction(void)
@@ -358,7 +358,7 @@ void test_local_cache_klog_vlog_pair_eviction(void)
 
     tdb_local_cache_destroy(&cache);
     remove(klog_b);
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_null_args(void)
@@ -447,7 +447,7 @@ void test_local_cache_lru_ordering(void)
     {
         remove(paths[i]);
     }
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 void test_local_cache_many_entries(void)
@@ -487,7 +487,7 @@ void test_local_cache_many_entries(void)
     {
         remove(paths[i]);
     }
-    remove(TEST_CACHE_DIR);
+    remove_directory(TEST_CACHE_DIR);
 }
 
 int main(int argc, char **argv)

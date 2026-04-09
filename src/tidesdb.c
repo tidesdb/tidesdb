@@ -68,7 +68,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
 
     const time_t sec = ts.tv_sec;
     struct tm tm_info;
-    tdb_localtime(&sec, &tm_info);
+    tdb_gmtime_r(&sec, &tm_info);
 
     const char *level_str = (level == TDB_LOG_DEBUG)   ? "DEBUG"
                             : (level == TDB_LOG_INFO)  ? "INFO"
@@ -80,8 +80,9 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
 
     FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
 
-    fprintf(log_out, "[%02d:%02d:%02d.%03d] [%s] %s:%d: ", tm_info.tm_hour, tm_info.tm_min,
-            tm_info.tm_sec, (int)(ts.tv_nsec / 1000000), level_str, file, line);
+    fprintf(log_out, "[%04d-%02d-%02dT%02d:%02d:%02d.%03dZ] [%s] %s:%d: ", tm_info.tm_year + 1900,
+            tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+            (int)(ts.tv_nsec / 1000000), level_str, file, line);
 
     va_list args;
     va_start(args, fmt);

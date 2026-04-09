@@ -14,7 +14,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 9.0.6)
+set(PROJECT_VERSION 9.0.7)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -538,9 +538,12 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(queue_tests test/queue__tests.c)
     add_executable(buffer_tests test/buffer__tests.c)
     add_executable(btree_tests test/btree__tests.c)
+    add_executable(local_cache_tests test/local_cache__tests.c)
+    add_executable(objstore_tests test/objstore__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     if(TIDESDB_WITH_S3)
         target_compile_definitions(tidesdb_tests PRIVATE TIDESDB_WITH_S3)
+        target_compile_definitions(objstore_tests PRIVATE TIDESDB_WITH_S3)
     endif()
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
@@ -593,7 +596,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests buffer_tests btree_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests buffer_tests btree_tests local_cache_tests objstore_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -607,6 +610,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME queue_tests COMMAND queue_tests)
     add_test(NAME buffer_tests COMMAND buffer_tests)
     add_test(NAME btree_tests COMMAND btree_tests)
+    add_test(NAME local_cache_tests COMMAND local_cache_tests)
+    add_test(NAME objstore_tests COMMAND objstore_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)

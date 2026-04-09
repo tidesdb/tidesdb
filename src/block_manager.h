@@ -309,14 +309,6 @@ void block_manager_cursor_free(block_manager_cursor_t *cursor);
 int block_manager_cursor_prev(block_manager_cursor_t *cursor);
 
 /**
- * block_manager_fsync_thread
- * fsync thread for block manager
- * @param arg the block manager
- * @return NULL
- */
-void *block_manager_fsync_thread(void *arg);
-
-/**
  * block_manager_truncate
  * truncates a block manager to 0 removing all blocks
  * @param bm the block manager to truncate

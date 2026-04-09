@@ -742,6 +742,161 @@ void test_bloom_filter_deserialize_corrupted_assertions(void)
     ASSERT_TRUE(bloom_filter_deserialize(crafted_h0) == NULL);
 }
 
+void test_bloom_filter_null_entry(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
+
+    /* add with NULL entry on valid bf should not crash */
+    bloom_filter_add(bf, NULL, 5);
+
+    /* contains with NULL entry on valid bf should return -1 */
+    ASSERT_EQ(bloom_filter_contains(bf, NULL, 5), -1);
+
+    /* add with valid entry but size 0 should not crash */
+    bloom_filter_add(bf, (const uint8_t *)"hello", 0);
+
+    /* contains with valid entry but size 0 should return -1 */
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"hello", 0), -1);
+
+    bloom_filter_free(bf);
+}
+
+void test_bloom_filter_is_full_null_bitset(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
+
+    /* we save and null out the bitset */
+    uint64_t *saved_bitset = bf->bitset;
+    bf->bitset = NULL;
+
+    ASSERT_EQ(bloom_filter_is_full(bf), -1);
+
+    /* we restore before free */
+    bf->bitset = saved_bitset;
+    bloom_filter_free(bf);
+}
+
+void test_bloom_filter_add_batch_chunked(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 1000), 0);
+
+    /* we use 300 entries to cross the 256 chunk boundary */
+    const int count = 300;
+    char keys[300][16];
+    const uint8_t *entries[300];
+    size_t sizes[300];
+
+    for (int i = 0; i < count; i++)
+    {
+        snprintf(keys[i], sizeof(keys[i]), "chunk_key_%d", i);
+        entries[i] = (const uint8_t *)keys[i];
+        sizes[i] = strlen(keys[i]);
+    }
+
+    bloom_filter_add_batch(bf, entries, sizes, count);
+
+    /* we verify all entries are found */
+    for (int i = 0; i < count; i++)
+    {
+        ASSERT_EQ(bloom_filter_contains(bf, entries[i], sizes[i]), 1);
+    }
+
+    bloom_filter_free(bf);
+}
+
+void test_bloom_filter_add_batch_null_entries(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
+
+    const uint8_t *entries[5];
+    size_t sizes[5];
+
+    entries[0] = (const uint8_t *)"valid_a";
+    sizes[0] = 7;
+    entries[1] = NULL;
+    sizes[1] = 5;
+    entries[2] = (const uint8_t *)"valid_b";
+    sizes[2] = 7;
+    entries[3] = (const uint8_t *)"zero_sz";
+    sizes[3] = 0;
+    entries[4] = (const uint8_t *)"valid_c";
+    sizes[4] = 7;
+
+    bloom_filter_add_batch(bf, entries, sizes, 5);
+
+    /* valid entries should be found */
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"valid_a", 7), 1);
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"valid_b", 7), 1);
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"valid_c", 7), 1);
+
+    bloom_filter_free(bf);
+}
+
+void test_bloom_filter_hash_key_sizes(void)
+{
+    /* we test key sizes 1-8 to exercise all hash code paths:
+     * 8-byte word loop, 4-byte word loop, and trailing 1/2/3 byte switch cases */
+    uint8_t key[8] = {0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48};
+    unsigned int hashes[8];
+
+    for (int sz = 1; sz <= 8; sz++)
+    {
+        hashes[sz - 1] = bloom_filter_hash(key, sz, 0);
+        ASSERT_TRUE(hashes[sz - 1] != 0);
+    }
+
+    /* different sizes should produce different hashes */
+    for (int i = 0; i < 7; i++)
+    {
+        ASSERT_NE(hashes[i], hashes[i + 1]);
+    }
+
+    /* we also test determinism for each size */
+    for (int sz = 1; sz <= 8; sz++)
+    {
+        unsigned int h = bloom_filter_hash(key, sz, 0);
+        ASSERT_EQ(h, hashes[sz - 1]);
+    }
+
+    /* we verify all sizes work correctly with add/contains */
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
+
+    for (int sz = 1; sz <= 8; sz++)
+    {
+        bloom_filter_add(bf, key, sz);
+        ASSERT_EQ(bloom_filter_contains(bf, key, sz), 1);
+    }
+
+    bloom_filter_free(bf);
+}
+
+void test_bloom_filter_deserialize_overflow_m(void)
+{
+    /* we craft a payload with m near UINT32_MAX to test overflow check */
+    uint8_t crafted[32];
+    uint8_t *ptr = crafted;
+    ptr = encode_varint32(ptr, UINT32_MAX); /* m near overflow */
+    ptr = encode_varint32(ptr, 1);          /* h = 1 */
+    ptr = encode_varint32(ptr, 0);          /* non_zero_count = 0 */
+
+    bloom_filter_t *bf = bloom_filter_deserialize(crafted);
+    ASSERT_TRUE(bf == NULL);
+
+    /* also test m = UINT32_MAX - 63 (exactly at the boundary) */
+    ptr = crafted;
+    ptr = encode_varint32(ptr, UINT32_MAX - 63); /* m = UINT32_MAX - BF_BITS_PER_WORD + 1 */
+    ptr = encode_varint32(ptr, 1);
+    ptr = encode_varint32(ptr, 0);
+
+    bf = bloom_filter_deserialize(crafted);
+    ASSERT_TRUE(bf == NULL);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -768,6 +923,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_bloom_filter_deserialize_oob_index, tests_passed);
     RUN_TEST(test_bloom_filter_serialize_roundtrip_size_in_words, tests_passed);
     RUN_TEST(test_bloom_filter_deserialize_corrupted_assertions, tests_passed);
+    RUN_TEST(test_bloom_filter_null_entry, tests_passed);
+    RUN_TEST(test_bloom_filter_is_full_null_bitset, tests_passed);
+    RUN_TEST(test_bloom_filter_add_batch_chunked, tests_passed);
+    RUN_TEST(test_bloom_filter_add_batch_null_entries, tests_passed);
+    RUN_TEST(test_bloom_filter_hash_key_sizes, tests_passed);
+    RUN_TEST(test_bloom_filter_deserialize_overflow_m, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

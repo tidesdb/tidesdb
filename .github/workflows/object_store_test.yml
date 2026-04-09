@@ -55,6 +55,7 @@ jobs:
       - name: Run object store tests (filesystem connector)
         run: |
           cd build
+          ./objstore_tests test_objstore_fs
           ./tidesdb_tests test_objstore_fs_roundtrip
           ./tidesdb_tests test_objstore_cold_start
           ./tidesdb_tests test_objstore_compaction_and_iterators
@@ -68,6 +69,7 @@ jobs:
           TIDESDB_S3_SECRET_KEY: minioadmin
         run: |
           cd build
+          ./objstore_tests test_objstore_s3_minio
           ./tidesdb_tests test_objstore_s3_minio
 
       - name: Stop MinIO

@@ -844,6 +844,660 @@ void test_btree_seek_edge_cases()
     (void)remove(TEST_BTREE_FILE);
 }
 
+void test_btree_arena(void)
+{
+    /* create default arena */
+    btree_arena_t *arena = btree_arena_create();
+    ASSERT_TRUE(arena != NULL);
+    ASSERT_TRUE(arena->total_allocated == BTREE_ARENA_BLOCK_SIZE);
+
+    /* alloc small chunks */
+    void *p1 = btree_arena_alloc(arena, 16);
+    ASSERT_TRUE(p1 != NULL);
+
+    void *p2 = btree_arena_alloc(arena, 128);
+    ASSERT_TRUE(p2 != NULL);
+    ASSERT_TRUE(p2 != p1);
+
+    /* reset and reuse */
+    btree_arena_reset(arena);
+    void *p3 = btree_arena_alloc(arena, 16);
+    ASSERT_TRUE(p3 != NULL);
+
+    btree_arena_destroy(arena);
+
+    /* create sized arena */
+    btree_arena_t *sized = btree_arena_create_sized(1024);
+    ASSERT_TRUE(sized != NULL);
+    ASSERT_TRUE(sized->total_allocated == 1024);
+
+    void *sp = btree_arena_alloc(sized, 512);
+    ASSERT_TRUE(sp != NULL);
+
+    btree_arena_destroy(sized);
+
+    /* sized arena with value below minimum gets clamped */
+    btree_arena_t *tiny = btree_arena_create_sized(1);
+    ASSERT_TRUE(tiny != NULL);
+    ASSERT_TRUE(tiny->total_allocated >= BTREE_ARENA_MIN_BLOCK_SIZE);
+
+    btree_arena_destroy(tiny);
+
+    /* alloc larger than block size forces new block */
+    arena = btree_arena_create();
+    ASSERT_TRUE(arena != NULL);
+    void *big = btree_arena_alloc(arena, BTREE_ARENA_BLOCK_SIZE + 1024);
+    ASSERT_TRUE(big != NULL);
+
+    btree_arena_destroy(arena);
+
+    /* NULL and zero-size edge cases */
+    ASSERT_TRUE(btree_arena_alloc(NULL, 16) == NULL);
+    arena = btree_arena_create();
+    ASSERT_TRUE(btree_arena_alloc(arena, 0) == NULL);
+    btree_arena_destroy(arena);
+
+    /* destroy/reset NULL should not crash */
+    btree_arena_destroy(NULL);
+    btree_arena_reset(NULL);
+}
+
+void test_btree_comparator_string(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = btree_comparator_string,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_STRING};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    const char *keys[] = {"apple", "banana", "cherry", "date", "elderberry"};
+    for (int i = 0; i < 5; i++)
+    {
+        char value[32];
+        snprintf(value, sizeof(value), "val_%s", keys[i]);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)keys[i], strlen(keys[i]) + 1,
+                                      (uint8_t *)value, strlen(value) + 1, 0, (uint64_t)i, 0,
+                                      0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+    ASSERT_EQ(tree->entry_count, 5);
+
+    /* lookup by string key */
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_TRUE(btree_get(tree, (uint8_t *)"cherry", 7, &value, &value_size, &vlog_offset, &seq,
+                          &ttl, &deleted) == 0);
+    ASSERT_EQ(strcmp((char *)value, "val_cherry"), 0);
+    free(value);
+
+    ASSERT_TRUE(btree_get(tree, (uint8_t *)"nonexistent", 12, &value, &value_size, &vlog_offset,
+                          &seq, &ttl, &deleted) != 0);
+
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_comparator_numeric(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = btree_comparator_numeric,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_NUMERIC};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    /* we add 8-byte numeric keys in sorted order */
+    for (uint64_t i = 0; i < 20; i++)
+    {
+        uint64_t key = i * 10;
+        char value[32];
+        snprintf(value, sizeof(value), "num_%" PRIu64, key);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)&key, sizeof(key), (uint8_t *)value,
+                                      strlen(value) + 1, 0, i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+    ASSERT_EQ(tree->entry_count, 20);
+
+    /* lookup by numeric key */
+    uint64_t search_key = 50;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_TRUE(btree_get(tree, (uint8_t *)&search_key, sizeof(search_key), &value, &value_size,
+                          &vlog_offset, &seq, &ttl, &deleted) == 0);
+    ASSERT_EQ(strcmp((char *)value, "num_50"), 0);
+    free(value);
+
+    /* non-existent numeric key */
+    uint64_t missing_key = 55;
+    ASSERT_TRUE(btree_get(tree, (uint8_t *)&missing_key, sizeof(missing_key), &value, &value_size,
+                          &vlog_offset, &seq, &ttl, &deleted) != 0);
+
+    /* cursor forward iteration should be in numeric order */
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+
+    uint64_t prev_key = 0;
+    int count = 0;
+    while (btree_cursor_valid(cursor))
+    {
+        uint8_t *k = NULL;
+        size_t ks = 0;
+        ASSERT_TRUE(btree_cursor_get(cursor, &k, &ks, NULL, NULL, NULL, NULL, NULL, NULL) == 0);
+        ASSERT_EQ(ks, sizeof(uint64_t));
+
+        uint64_t kval;
+        memcpy(&kval, k, sizeof(uint64_t));
+        if (count > 0) ASSERT_TRUE(kval > prev_key);
+        prev_key = kval;
+        count++;
+        btree_cursor_next(cursor);
+    }
+    ASSERT_EQ(count, 20);
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_get_stats(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = 4096,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    for (int i = 0; i < 200; i++)
+    {
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key%05d", i);
+        snprintf(value, sizeof(value), "value%05d", i);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0, (uint64_t)i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    btree_stats_t stats;
+    ASSERT_EQ(btree_get_stats(tree, &stats), 0);
+    ASSERT_EQ(stats.entry_count, 200);
+    ASSERT_TRUE(stats.node_count > 1);
+    ASSERT_TRUE(stats.height >= 1);
+    ASSERT_TRUE(stats.serialized_size > 0);
+
+    /* NULL args */
+    ASSERT_EQ(btree_get_stats(NULL, &stats), -1);
+    ASSERT_EQ(btree_get_stats(tree, NULL), -1);
+
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_cursor_seek_for_prev(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    /* keys with gaps: key10, key20, key30, key40, key50 */
+    for (int i = 1; i <= 5; i++)
+    {
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key%02d", i * 10);
+        snprintf(value, sizeof(value), "value%02d", i * 10);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0, (uint64_t)i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+
+    /* seek_for_prev to exact key */
+    ASSERT_EQ(btree_cursor_seek_for_prev(cursor, (uint8_t *)"key30", 6), 0);
+    ASSERT_TRUE(btree_cursor_valid(cursor));
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(btree_cursor_get(cursor, &key, &key_size, NULL, NULL, NULL, NULL, NULL, NULL), 0);
+    ASSERT_EQ(strcmp((char *)key, "key30"), 0);
+
+    /* seek_for_prev to key between existing keys, should position at key <= target */
+    ASSERT_EQ(btree_cursor_seek_for_prev(cursor, (uint8_t *)"key35", 6), 0);
+    ASSERT_TRUE(btree_cursor_valid(cursor));
+    ASSERT_EQ(btree_cursor_get(cursor, &key, &key_size, NULL, NULL, NULL, NULL, NULL, NULL), 0);
+    ASSERT_EQ(strcmp((char *)key, "key30"), 0);
+
+    /* seek_for_prev to key after last, should position at last */
+    ASSERT_EQ(btree_cursor_seek_for_prev(cursor, (uint8_t *)"key99", 6), 0);
+    ASSERT_TRUE(btree_cursor_valid(cursor));
+    ASSERT_EQ(btree_cursor_get(cursor, &key, &key_size, NULL, NULL, NULL, NULL, NULL, NULL), 0);
+    ASSERT_EQ(strcmp((char *)key, "key50"), 0);
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_cursor_has_next_has_prev(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    for (int i = 0; i < 3; i++)
+    {
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key%05d", i);
+        snprintf(value, sizeof(value), "value%05d", i);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0, (uint64_t)i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+
+    /* at first entry: has_prev=0, has_next=1 */
+    ASSERT_EQ(btree_cursor_has_prev(cursor), 0);
+    ASSERT_EQ(btree_cursor_has_next(cursor), 1);
+
+    /* advance to second */
+    ASSERT_EQ(btree_cursor_next(cursor), 0);
+    ASSERT_EQ(btree_cursor_has_prev(cursor), 1);
+    ASSERT_EQ(btree_cursor_has_next(cursor), 1);
+
+    /* advance to third (last) */
+    ASSERT_EQ(btree_cursor_next(cursor), 0);
+    ASSERT_EQ(btree_cursor_has_prev(cursor), 1);
+    ASSERT_EQ(btree_cursor_has_next(cursor), 0);
+
+    /* advance past end */
+    ASSERT_NE(btree_cursor_next(cursor), 0);
+    ASSERT_EQ(btree_cursor_has_next(cursor), 0);
+
+    /* NULL args */
+    ASSERT_EQ(btree_cursor_has_next(NULL), -1);
+    ASSERT_EQ(btree_cursor_has_prev(NULL), -1);
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_cursor_goto_first_explicit(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    for (int i = 0; i < 10; i++)
+    {
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key%05d", i);
+        snprintf(value, sizeof(value), "value%05d", i);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0, (uint64_t)i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+
+    /* advance past first few entries */
+    btree_cursor_next(cursor);
+    btree_cursor_next(cursor);
+    btree_cursor_next(cursor);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(btree_cursor_get(cursor, &key, &key_size, NULL, NULL, NULL, NULL, NULL, NULL), 0);
+    ASSERT_EQ(strcmp((char *)key, "key00003"), 0);
+
+    /* goto_first should reset to first entry */
+    ASSERT_EQ(btree_cursor_goto_first(cursor), 0);
+    ASSERT_TRUE(btree_cursor_valid(cursor));
+
+    ASSERT_EQ(btree_cursor_get(cursor, &key, &key_size, NULL, NULL, NULL, NULL, NULL, NULL), 0);
+    ASSERT_EQ(strcmp((char *)key, "key00000"), 0);
+
+    /* NULL arg */
+    ASSERT_EQ(btree_cursor_goto_first(NULL), -1);
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_get_entry_count(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    for (int i = 0; i < 15; i++)
+    {
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key%05d", i);
+        snprintf(value, sizeof(value), "value%05d", i);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0, (uint64_t)i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    ASSERT_EQ(btree_get_entry_count(tree), 15);
+    ASSERT_EQ(btree_get_entry_count(NULL), 0);
+
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_null_args(void)
+{
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    /* btree_builder_new NULL args */
+    btree_builder_t *builder = NULL;
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    ASSERT_EQ(btree_builder_new(NULL, bm, &config), -1);
+    ASSERT_EQ(btree_builder_new(&builder, NULL, &config), -1);
+    ASSERT_EQ(btree_builder_new(&builder, bm, NULL), -1);
+
+    /* btree_builder_add NULL args */
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+    ASSERT_EQ(btree_builder_add(NULL, (uint8_t *)"k", 1, (uint8_t *)"v", 1, 0, 0, 0, 0), -1);
+    ASSERT_EQ(btree_builder_add(builder, NULL, 1, (uint8_t *)"v", 1, 0, 0, 0, 0), -1);
+    ASSERT_EQ(btree_builder_add(builder, (uint8_t *)"k", 0, (uint8_t *)"v", 1, 0, 0, 0, 0), -1);
+    btree_builder_free(builder);
+
+    /* btree_open NULL args */
+    btree_t *tree = NULL;
+    ASSERT_EQ(btree_open(NULL, bm, &config, 0, 0, 0), -1);
+    ASSERT_EQ(btree_open(&tree, NULL, &config, 0, 0, 0), -1);
+    ASSERT_EQ(btree_open(&tree, bm, NULL, 0, 0, 0), -1);
+
+    /* btree_get NULL args */
+    ASSERT_EQ(btree_get(NULL, (uint8_t *)"k", 1, NULL, NULL, NULL, NULL, NULL, NULL), -1);
+
+    /* btree_get_min_key / btree_get_max_key NULL args */
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(btree_get_min_key(NULL, &key, &key_size), -1);
+    ASSERT_EQ(btree_get_max_key(NULL, &key, &key_size), -1);
+
+    /* btree_get_max_seq with NULL */
+    ASSERT_EQ(btree_get_max_seq(NULL), 0);
+
+    /* cursor NULL args */
+    btree_cursor_t *cursor = NULL;
+    ASSERT_EQ(btree_cursor_init(NULL, (btree_t *)1), -1);
+    ASSERT_EQ(btree_cursor_init(&cursor, NULL), -1);
+    ASSERT_EQ(btree_cursor_next(NULL), -1);
+    ASSERT_EQ(btree_cursor_prev(NULL), -1);
+    ASSERT_EQ(btree_cursor_seek(NULL, (uint8_t *)"k", 1), -1);
+    ASSERT_EQ(btree_cursor_seek_for_prev(NULL, (uint8_t *)"k", 1), -1);
+    ASSERT_EQ(btree_cursor_goto_first(NULL), -1);
+    ASSERT_EQ(btree_cursor_goto_last(NULL), -1);
+    ASSERT_EQ(btree_cursor_valid(NULL), -1);
+    ASSERT_EQ(btree_cursor_get(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), -1);
+
+    /* free with NULL should not crash */
+    btree_free(NULL);
+    btree_builder_free(NULL);
+    btree_cursor_free(NULL);
+    btree_node_free(NULL);
+
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_ttl_entries(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    /* add entries with various TTL values */
+    ASSERT_TRUE(
+        btree_builder_add(builder, (uint8_t *)"key_a", 6, (uint8_t *)"val_a", 6, 0, 1, 0, 0) == 0);
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_b", 6, (uint8_t *)"val_b", 6, 0, 2,
+                                  1000000, 0) == 0);
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_c", 6, (uint8_t *)"val_c", 6, 0, 3,
+                                  9999999, 0) == 0);
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+    ASSERT_EQ(tree->entry_count, 3);
+
+    /* verify TTL roundtrips through btree_get */
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_EQ(btree_get(tree, (uint8_t *)"key_a", 6, &value, &value_size, &vlog_offset, &seq, &ttl,
+                        &deleted),
+              0);
+    ASSERT_EQ(ttl, 0);
+    free(value);
+
+    ASSERT_EQ(btree_get(tree, (uint8_t *)"key_b", 6, &value, &value_size, &vlog_offset, &seq, &ttl,
+                        &deleted),
+              0);
+    ASSERT_EQ(ttl, 1000000);
+    free(value);
+
+    ASSERT_EQ(btree_get(tree, (uint8_t *)"key_c", 6, &value, &value_size, &vlog_offset, &seq, &ttl,
+                        &deleted),
+              0);
+    ASSERT_EQ(ttl, 9999999);
+    free(value);
+
+    /* verify TTL roundtrips through cursor */
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+
+    int64_t expected_ttls[] = {0, 1000000, 9999999};
+    int idx = 0;
+    while (btree_cursor_valid(cursor))
+    {
+        int64_t cursor_ttl = 0;
+        ASSERT_EQ(btree_cursor_get(cursor, NULL, NULL, NULL, NULL, NULL, NULL, &cursor_ttl, NULL),
+                  0);
+        ASSERT_EQ(cursor_ttl, expected_ttls[idx]);
+        idx++;
+        btree_cursor_next(cursor);
+    }
+    ASSERT_EQ(idx, 3);
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+void test_btree_vlog_offset_entries(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    /* add entry with inline value (vlog_offset=0) */
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_inline", 11, (uint8_t *)"inline_val", 11,
+                                  0, 1, 0, 0) == 0);
+
+    /* add entry with vlog reference (vlog_offset != 0, value can be NULL or a stub) */
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_vlog_1", 11, NULL, 0, 12345, 2, 0, 0) ==
+                0);
+
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_vlog_2", 11, NULL, 0, 99999, 3, 0, 0) ==
+                0);
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+    ASSERT_EQ(tree->entry_count, 3);
+
+    /* verify vlog_offset roundtrips through btree_get */
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_EQ(btree_get(tree, (uint8_t *)"key_inline", 11, &value, &value_size, &vlog_offset, &seq,
+                        &ttl, &deleted),
+              0);
+    ASSERT_EQ(vlog_offset, 0);
+    free(value);
+
+    ASSERT_EQ(btree_get(tree, (uint8_t *)"key_vlog_1", 11, &value, &value_size, &vlog_offset, &seq,
+                        &ttl, &deleted),
+              0);
+    ASSERT_EQ(vlog_offset, 12345);
+    if (value) free(value);
+
+    ASSERT_EQ(btree_get(tree, (uint8_t *)"key_vlog_2", 11, &value, &value_size, &vlog_offset, &seq,
+                        &ttl, &deleted),
+              0);
+    ASSERT_EQ(vlog_offset, 99999);
+    if (value) free(value);
+
+    /* verify vlog_offset roundtrips through cursor */
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+
+    uint64_t expected_offsets[] = {0, 12345, 99999};
+    int idx = 0;
+    while (btree_cursor_valid(cursor))
+    {
+        uint64_t cursor_vlog = 0;
+        ASSERT_EQ(btree_cursor_get(cursor, NULL, NULL, NULL, NULL, &cursor_vlog, NULL, NULL, NULL),
+                  0);
+        ASSERT_EQ(cursor_vlog, expected_offsets[idx]);
+        idx++;
+        btree_cursor_next(cursor);
+    }
+    ASSERT_EQ(idx, 3);
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
 void bench_btree_build()
 {
     int sizes[] = {1000, 10000, 100000};
@@ -1800,6 +2454,17 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_compression_two_leaves, tests_passed);
     RUN_TEST(test_btree_compression_three_leaves, tests_passed);
     RUN_TEST(test_btree_compression_cursor_bidirectional, tests_passed);
+    RUN_TEST(test_btree_arena, tests_passed);
+    RUN_TEST(test_btree_comparator_string, tests_passed);
+    RUN_TEST(test_btree_comparator_numeric, tests_passed);
+    RUN_TEST(test_btree_get_stats, tests_passed);
+    RUN_TEST(test_btree_cursor_seek_for_prev, tests_passed);
+    RUN_TEST(test_btree_cursor_has_next_has_prev, tests_passed);
+    RUN_TEST(test_btree_cursor_goto_first_explicit, tests_passed);
+    RUN_TEST(test_btree_get_entry_count, tests_passed);
+    RUN_TEST(test_btree_null_args, tests_passed);
+    RUN_TEST(test_btree_ttl_entries, tests_passed);
+    RUN_TEST(test_btree_vlog_offset_entries, tests_passed);
 
     RUN_TEST(bench_btree_build, tests_passed);
     RUN_TEST(bench_btree_get, tests_passed);

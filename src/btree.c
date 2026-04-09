@@ -789,8 +789,9 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             /* only values needs zeroing (sparse -- vlog entries have no inline value) */
             memset(n->values, 0, values_ptr_sz);
 
-            /* single arena alloc for all 3 temp arrays */
-            const size_t offsets_sz = ne * sizeof(uint16_t);
+            /* single arena alloc for all 3 temp arrays (align offsets_sz so size_t arrays
+             * start on an 8-byte boundary) */
+            const size_t offsets_sz = ((ne * sizeof(uint16_t)) + 7) & ~(size_t)7;
             const size_t lens_sz = ne * sizeof(size_t);
             const size_t temp_total = offsets_sz + lens_sz + lens_sz;
             uint8_t *temp_buf = btree_arena_alloc(arena, temp_total);

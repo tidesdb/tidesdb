@@ -148,7 +148,7 @@ jobs:
 
   omnios-build:
     runs-on: ubuntu-latest
-    name: OmniOS (Illumos) r151048
+    name: OmniOS (Illumos) r151054
 
     steps:
       - name: Checkout repository
@@ -157,16 +157,16 @@ jobs:
       - name: Build and test on OmniOS (Illumos)
         uses: vmactions/omnios-vm@v1
         with:
-          release: "r151048"
+          release: "r151054"
           usesh: true
           sync: rsync
           copyback: false
           prepare: |
             pkg install lz4 zstd || true
-            pkg set-publisher -G '*' -g https://pkg.omnios.org/r151048/extra extra.omnios || true
+            pkg set-publisher -G '*' -g https://pkg.omnios.org/r151054/extra extra.omnios || true
             for attempt in 1 2 3 4 5; do
               timeout 600 pkg install ooce/developer/cmake && break
-              echo "pkg install attempt $attempt failed or timed out, retrying in 60s..."
+              echo "pkg install attempt $attempt failed or timed out, retrying in 10s..."
               sleep 10
             done
           run: |

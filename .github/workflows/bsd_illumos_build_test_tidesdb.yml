@@ -2,24 +2,24 @@ name: BSD and Illumos TidesDB Build & Test
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
   workflow_dispatch:
 # tests on FreeBsd, OpenBsd, NetBsd, OmniOS (Illumos), and DragonFlyBSD
 jobs:
   freebsd-build:
     runs-on: ubuntu-latest
     name: FreeBSD 15.0 x64
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Build and test on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          release: '15.0'
+          release: "15.0"
           usesh: true
           sync: rsync
           copyback: false
@@ -31,7 +31,7 @@ jobs:
             echo "*=====================================*"
             uname -a
             freebsd-version
-            
+
             echo ""
             echo "*=====================================*"
             echo " Configure CMake"
@@ -40,13 +40,13 @@ jobs:
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=ON
-            
+
             echo ""
             echo "*=====================================*"
             echo " Build"
             echo "*=====================================*"
             cmake --build build --config Release
-            
+
             echo ""
             echo "*=====================================*"
             echo " Run Tests"
@@ -57,15 +57,15 @@ jobs:
   openbsd-build:
     runs-on: ubuntu-latest
     name: OpenBSD 7.8 x64
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Build and test on OpenBSD
         uses: vmactions/openbsd-vm@v1
         with:
-          release: '7.8'
+          release: "7.8"
           usesh: true
           sync: rsync
           copyback: false
@@ -77,7 +77,7 @@ jobs:
             echo " System Information"
             echo "*=====================================*"
             uname -a
-            
+
             echo ""
             echo "*=====================================*"
             echo " Configure CMake"
@@ -86,13 +86,13 @@ jobs:
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=ON
-            
+
             echo ""
             echo "*=====================================*"
             echo " Build"
             echo "*=====================================*"
             gmake -C build
-            
+
             echo ""
             echo "*=====================================*"
             echo " Run Tests"
@@ -103,15 +103,15 @@ jobs:
   netbsd-build:
     runs-on: ubuntu-latest
     name: NetBSD 10.1 x64
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Build and test on NetBSD
         uses: vmactions/netbsd-vm@v1
         with:
-          release: '10.1'
+          release: "10.1"
           usesh: true
           sync: rsync
           copyback: false
@@ -122,7 +122,7 @@ jobs:
             echo " System Information"
             echo "*=====================================*"
             uname -a
-            
+
             echo ""
             echo "*=====================================*"
             echo " Configure CMake"
@@ -132,13 +132,13 @@ jobs:
             # silently exit without running. build without sanitizer.
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON
-            
+
             echo ""
             echo "*=====================================*"
             echo " Build"
             echo "*=====================================*"
             cmake --build build --config Release
-            
+
             echo ""
             echo "*=====================================*"
             echo " Run Tests"
@@ -149,27 +149,31 @@ jobs:
   omnios-build:
     runs-on: ubuntu-latest
     name: OmniOS (Illumos) r151048
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Build and test on OmniOS (Illumos)
         uses: vmactions/omnios-vm@v1
         with:
-          release: 'r151048'
+          release: "r151048"
           usesh: true
           sync: rsync
           copyback: false
           prepare: |
             pkg set-publisher -G '*' -g https://pkg.omnios.org/r151048/extra extra.omnios || true
-            pkg install ooce/developer/cmake gcc13 lz4 zstd
+            for attempt in 1 2 3 4 5; do
+              pkg install ooce/developer/cmake gcc13 lz4 zstd && break
+              echo "pkg install attempt $attempt failed, retrying in 60s..."
+              sleep 30
+            done
           run: |
             echo "*=====================================*"
             echo " System Information"
             echo "*=====================================*"
             uname -a
-            
+
             echo ""
             echo "*=====================================*"
             echo " Configure CMake"
@@ -178,14 +182,14 @@ jobs:
             export PKG_CONFIG_PATH=/opt/ooce/lib/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=ON 
-            
+              -DTIDESDB_WITH_SANITIZER=ON
+
             echo ""
             echo "*=====================================*"
             echo " Build"
             echo "*=====================================*"
             cmake --build build --config Release
-            
+
             echo ""
             echo "*=====================================*"
             echo " Run Tests"
@@ -196,11 +200,11 @@ jobs:
   dragonflybsd-build:
     runs-on: ubuntu-latest
     name: DragonFlyBSD 6.4.2 x64
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Build and test on DragonFlyBSD
         uses: vmactions/dragonflybsd-vm@v1
         with:
@@ -218,7 +222,7 @@ jobs:
             echo " System Information"
             echo "*=====================================*"
             uname -a
-            
+
             echo ""
             echo "*=====================================*"
             echo " Configure CMake"
@@ -227,13 +231,13 @@ jobs:
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=ON
-            
+
             echo ""
             echo "*=====================================*"
             echo " Build"
             echo "*=====================================*"
             cmake --build build --config Release
-            
+
             echo ""
             echo "*=====================================*"
             echo " Run Tests"

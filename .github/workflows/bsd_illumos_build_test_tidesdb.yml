@@ -162,13 +162,8 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            pkg install lz4 zstd || true
             pkg set-publisher -G '*' -g https://pkg.omnios.org/r151054/extra extra.omnios || true
-            for attempt in 1 2 3 4 5; do
-              timeout 600 pkg install ooce/developer/cmake && break
-              echo "pkg install attempt $attempt failed or timed out, retrying in 10s..."
-              sleep 10
-            done
+            pkg install ooce/developer/cmake gcc13 lz4 zstd
           run: |
             echo "*=====================================*"
             echo " System Information"

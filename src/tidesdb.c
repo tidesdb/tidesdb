@@ -17624,15 +17624,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     pthread_rwlock_wrlock(&db->cf_list_lock);
 
     /* we find the CF to rename */
-    tidesdb_column_family_t *cf = NULL;
-    for (int i = 0; i < db->num_column_families; i++)
-    {
-        if (db->column_families[i] && strcmp(db->column_families[i]->name, old_name) == 0)
-        {
-            cf = db->column_families[i];
-            break;
-        }
-    }
+    tidesdb_column_family_t *cf = tidesdb_get_column_family_internal(db, old_name);
 
     if (!cf)
     {
@@ -17641,13 +17633,10 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     }
 
     /* we check if new name already exists */
-    for (int i = 0; i < db->num_column_families; i++)
+    if (tidesdb_get_column_family_internal(db, new_name))
     {
-        if (db->column_families[i] && strcmp(db->column_families[i]->name, new_name) == 0)
-        {
-            pthread_rwlock_unlock(&db->cf_list_lock);
-            return TDB_ERR_EXISTS;
-        }
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_EXISTS;
     }
 
     /* we mark CF for deletion to reject new writes while draining in-flight

@@ -34,6 +34,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 #ifdef _WIN32
 #define PATH_SEPARATOR "\\"
 #else
@@ -1842,6 +1846,37 @@ static inline ssize_t tdb_pwritev(int fd, const struct iovec *iov, int iovcnt, o
 }
 #define pwritev tdb_pwritev
 #endif
+
+/**
+ * bm_pwritev_safe
+ * wrapper around pwritev that blocks SIGALRM/SIGVTALRM/SIGPROF for the duration
+ * of the syscall. prevents EINTR from leaving a zero-filled hole in the file when
+ * the atomic offset reservation has already been committed.
+ * @param fd the file descriptor
+ * @param iov array of iovec buffers
+ * @param iovcnt number of iovec entries
+ * @param offset the file offset to write at
+ * @return total bytes written, or -1 on error
+ */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
+static ssize_t bm_pwritev_safe(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+#ifndef _WIN32
+    sigset_t block_set, old_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGALRM);
+    sigaddset(&block_set, SIGVTALRM);
+    sigaddset(&block_set, SIGPROF);
+    pthread_sigmask(SIG_BLOCK, &block_set, &old_set);
+    const ssize_t written = pwritev(fd, iov, iovcnt, offset);
+    pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+    return written;
+#else
+    return pwritev(fd, iov, iovcnt, offset);
+#endif
+}
 
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */
 #if !defined(_MSC_VER) || _MSC_VER >= 1930

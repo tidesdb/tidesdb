@@ -19,10 +19,6 @@
 
 #include "block_manager.h"
 
-#ifndef _WIN32
-#include <signal.h>
-#endif
-
 #include "xxhash.h"
 
 #define BM_UNLIKELY(x) TDB_UNLIKELY(x)
@@ -120,34 +116,6 @@ static uint8_t *bm_get_read_buf(const size_t needed)
     tls->buf = new_buf;
     tls->capacity = new_size;
     return new_buf;
-}
-
-/**
- * bm_pwritev_safe
- * wrapper around pwritev that blocks SIGALRM/SIGVTALRM/SIGPROF for the duration
- * of the syscall. prevents EINTR from leaving a zero-filled hole in the file when
- * the atomic offset reservation has already been committed.
- * @param fd the file descriptor
- * @param iov array of iovec buffers
- * @param iovcnt number of iovec entries
- * @param offset the file offset to write at
- * @return total bytes written, or -1 on error
- */
-static ssize_t bm_pwritev_safe(int fd, const struct iovec *iov, int iovcnt, off_t offset)
-{
-#ifndef _WIN32
-    sigset_t block_set, old_set;
-    sigemptyset(&block_set);
-    sigaddset(&block_set, SIGALRM);
-    sigaddset(&block_set, SIGVTALRM);
-    sigaddset(&block_set, SIGPROF);
-    pthread_sigmask(SIG_BLOCK, &block_set, &old_set);
-    const ssize_t written = pwritev(fd, iov, iovcnt, offset);
-    pthread_sigmask(SIG_SETMASK, &old_set, NULL);
-    return written;
-#else
-    return pwritev(fd, iov, iovcnt, offset);
-#endif
 }
 
 /**

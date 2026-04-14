@@ -26,6 +26,10 @@
 
 #include "compat.h"
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 /* snappy, lz4, zstd supported to use for compression purposes */
 /* snappy is not available on SunOS/OmniOS/Illumos */
 typedef enum

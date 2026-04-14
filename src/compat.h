@@ -1861,7 +1861,7 @@ static inline ssize_t tdb_pwritev(int fd, const struct iovec *iov, int iovcnt, o
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((unused))
 #endif
-static ssize_t tdb_pwritev_safe(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+static ssize_t tdb_pwritev_safe(int fd, const struct iovec* iov, int iovcnt, off_t offset)
 {
 #ifndef _WIN32
     sigset_t block_set, old_set;

@@ -309,6 +309,21 @@ void block_manager_cursor_free(block_manager_cursor_t *cursor);
 int block_manager_cursor_prev(block_manager_cursor_t *cursor);
 
 /**
+ * block_manager_cursor_skip_corrupt
+ * advances the cursor past a partially-written block at the current position.
+ *
+ * distinguishes two failure modes:
+ *   partial write (size > 0, footer magic absent); advances cursor, returns 0.
+ *   genuine corruption (size > 0, footer magic valid but checksum bad), returns -1.
+ *   zero-filled hole (size == 0) -- cannot determine block extent, returns -1.
+ *
+ * only call after block_manager_cursor_read returns NULL to attempt recovery.
+ * @param cursor the cursor positioned at the suspect block
+ * @return 0 if cursor was advanced past a partial write, -1 otherwise
+ */
+int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor);
+
+/**
  * block_manager_truncate
  * truncates a block manager to 0 removing all blocks
  * @param bm the block manager to truncate

@@ -19,6 +19,10 @@
 
 #include "block_manager.h"
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 #include "xxhash.h"
 
 #define BM_UNLIKELY(x) TDB_UNLIKELY(x)
@@ -116,6 +120,34 @@ static uint8_t *bm_get_read_buf(const size_t needed)
     tls->buf = new_buf;
     tls->capacity = new_size;
     return new_buf;
+}
+
+/**
+ * bm_pwritev_safe
+ * wrapper around pwritev that blocks SIGALRM/SIGVTALRM/SIGPROF for the duration
+ * of the syscall. prevents EINTR from leaving a zero-filled hole in the file when
+ * the atomic offset reservation has already been committed.
+ * @param fd the file descriptor
+ * @param iov array of iovec buffers
+ * @param iovcnt number of iovec entries
+ * @param offset the file offset to write at
+ * @return total bytes written, or -1 on error
+ */
+static ssize_t bm_pwritev_safe(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+#ifndef _WIN32
+    sigset_t block_set, old_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGALRM);
+    sigaddset(&block_set, SIGVTALRM);
+    sigaddset(&block_set, SIGPROF);
+    pthread_sigmask(SIG_BLOCK, &block_set, &old_set);
+    const ssize_t written = pwritev(fd, iov, iovcnt, offset);
+    pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+    return written;
+#else
+    return pwritev(fd, iov, iovcnt, offset);
+#endif
 }
 
 /**
@@ -484,7 +516,8 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(pwritev(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size)) return -1;
+    if (BM_UNLIKELY(bm_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
+        return -1;
 
     /* if O_DSYNC is available and was used at open time, pwrite already synced
      * otherwise we fall back to explicit fdatasync for durability */
@@ -525,7 +558,8 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(pwritev(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size)) return -1;
+    if (BM_UNLIKELY(bm_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
+        return -1;
 
     if (is_sync_full(bm) && !odsync_available())
     {
@@ -626,7 +660,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         ssize_t expected = 0;
         for (int j = 0; j < chunk; j++) expected += (ssize_t)iov[iov_done + j].iov_len;
 
-        const ssize_t written = pwritev(bm->fd, iov + iov_done, chunk, write_offset);
+        const ssize_t written = bm_pwritev_safe(bm->fd, iov + iov_done, chunk, write_offset);
         if (written != expected)
         {
             free(alloc);
@@ -866,6 +900,53 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
     if (!cursor) return -1;
 
     return (cursor->current_pos > BLOCK_MANAGER_HEADER_SIZE) ? 1 : 0;
+}
+
+int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return -1;
+
+    /* read the size field from the current position */
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+              (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+    {
+        return -1;
+    }
+
+    const uint32_t block_size = decode_uint32_le_compat(size_buf);
+    if (block_size == 0) return -1; /* zero-filled hole: extent unknown, cannot advance */
+
+    /* read footer magic to distinguish partial write from genuine corruption.
+     * footer layout: [footer_size(4)][footer_magic(4)].
+     * footer_magic sits at: current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE */
+    const off_t footer_magic_offset = (off_t)cursor->current_pos + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
+                                      (off_t)block_size + BLOCK_MANAGER_SIZE_FIELD_SIZE;
+    unsigned char magic_buf[4];
+    const ssize_t nread = pread(cursor->bm->fd, magic_buf, 4, footer_magic_offset);
+    if (nread != 4)
+    {
+        /* footer not present so file truncated mid-block; treat as partial write */
+        cursor->current_pos +=
+            BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
+        cursor->current_block_size = 0;
+        cursor->block_size_valid = 0;
+        cursor->block_index++;
+        return 0;
+    }
+
+    const uint32_t footer_magic = decode_uint32_le_compat(magic_buf);
+    if (footer_magic == BLOCK_MANAGER_FOOTER_MAGIC)
+    {
+        return -1;
+    }
+
+    cursor->current_pos +=
+        BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
+    cursor->current_block_size = 0;
+    cursor->block_size_valid = 0;
+    cursor->block_index++;
+    return 0;
 }
 
 /**

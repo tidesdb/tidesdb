@@ -484,7 +484,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(bm_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
+    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
         return -1;
 
     /* if O_DSYNC is available and was used at open time, pwrite already synced
@@ -526,7 +526,7 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(bm_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
+    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
         return -1;
 
     if (is_sync_full(bm) && !odsync_available())
@@ -628,7 +628,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         ssize_t expected = 0;
         for (int j = 0; j < chunk; j++) expected += (ssize_t)iov[iov_done + j].iov_len;
 
-        const ssize_t written = bm_pwritev_safe(bm->fd, iov + iov_done, chunk, write_offset);
+        const ssize_t written = tdb_pwritev_safe(bm->fd, iov + iov_done, chunk, write_offset);
         if (written != expected)
         {
             free(alloc);

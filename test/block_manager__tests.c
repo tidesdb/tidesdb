@@ -3076,6 +3076,10 @@ void test_block_manager_write_raw_signal_safe(void)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGALRM, &sa, &old_sa);
 
+    /* setitimer() rounds the request up to the kernel scheduler quantum; on
+     * macOS/BSD that can be several ms, so a fixed-count burst of SYNC_NONE
+     * writes may finish before any signal is delivered. Loop on wall-clock
+     * time and keep driving writes until at least one signal has landed. */
     struct itimerval itv;
     itv.it_interval.tv_sec  = 0;
     itv.it_interval.tv_usec = 500;
@@ -3091,10 +3095,13 @@ void test_block_manager_write_raw_signal_safe(void)
     const char *payload = "signal_safe_test_block_payload_data";
     const uint32_t size = (uint32_t)(strlen(payload) + 1);
     int failures = 0;
+    int iterations = 0;
 
-    for (int i = 0; i < 1000; i++)
+    const time_t deadline = time(NULL) + 5;
+    while ((iterations < 1000 || g_signal_count == 0) && time(NULL) < deadline)
     {
         if (block_manager_write_raw(bm, payload, size) < 0) failures++;
+        iterations++;
     }
 
     /* disarm timer and restore original handler before assertions */
@@ -3105,7 +3112,7 @@ void test_block_manager_write_raw_signal_safe(void)
     ASSERT_EQ(failures, 0);
     ASSERT_TRUE(g_signal_count > 0);
     printf("  [signal-safe] %d signals delivered, 0/%d write failures\n",
-           g_signal_count, 1000);
+           g_signal_count, iterations);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove(test_file);

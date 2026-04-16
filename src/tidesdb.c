@@ -4543,10 +4543,18 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
 
     if (block_manager_cursor_goto_first(cursor) == 0)
     {
-        do
+        while (1)
         {
             block_manager_block_t *block = block_manager_cursor_read(cursor);
-            if (!block) break;
+            if (!block)
+            {
+                if (block_manager_cursor_skip_corrupt(cursor) == 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica WAL replay: skipped partial write");
+                    continue;
+                }
+                break;
+            }
 
             const uint8_t *ptr = block->data;
             size_t remaining = block->size;
@@ -4634,7 +4642,9 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
             }
 
             block_manager_block_release(block);
-        } while (block_manager_cursor_next(cursor) == 0);
+
+            if (block_manager_cursor_next(cursor) != 0) break;
+        }
     }
 
     block_manager_cursor_free(cursor);
@@ -13767,10 +13777,21 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
     int entry_count = 0;
     if (block_manager_cursor_goto_first(cursor) == 0)
     {
-        do
+        while (1)
         {
             block_manager_block_t *block = block_manager_cursor_read(cursor);
-            if (!block) break;
+            if (!block)
+            {
+                /* partial write: header valid but footer absent -- skip slot and resume */
+                if (block_manager_cursor_skip_corrupt(cursor) == 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "CF '%s' WAL recovery: skipped partial write, resuming replay",
+                                  cf->name);
+                    continue;
+                }
+                break; /* genuine corruption or zero-filled hole; stop replay */
+            }
             block_count++;
 
             const uint8_t *ptr = block->data;
@@ -13891,7 +13912,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
             block_manager_block_release(block);
 
-        } while (block_manager_cursor_next(cursor) == 0);
+            if (block_manager_cursor_next(cursor) != 0) break;
+        }
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO,
@@ -13983,6 +14005,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
     snprintf(tname, sizeof(tname), TDB_THREAD_PREFIX "flush.%d", targ->index);
     tdb_set_thread_name(tname);
     free(targ);
+#ifndef _WIN32
+    {
+        sigset_t timer_signals;
+        sigemptyset(&timer_signals);
+        sigaddset(&timer_signals, SIGALRM);
+        sigaddset(&timer_signals, SIGVTALRM);
+        sigaddset(&timer_signals, SIGPROF);
+        pthread_sigmask(SIG_BLOCK, &timer_signals, NULL);
+    }
+#endif
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker thread started");
 
@@ -14494,6 +14526,16 @@ static void *tidesdb_compaction_worker_thread(void *arg)
     snprintf(tname, sizeof(tname), TDB_THREAD_PREFIX "compact.%d", targ->index);
     tdb_set_thread_name(tname);
     free(targ);
+#ifndef _WIN32
+    {
+        sigset_t timer_signals;
+        sigemptyset(&timer_signals);
+        sigaddset(&timer_signals, SIGALRM);
+        sigaddset(&timer_signals, SIGVTALRM);
+        sigaddset(&timer_signals, SIGPROF);
+        pthread_sigmask(SIG_BLOCK, &timer_signals, NULL);
+    }
+#endif
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction worker thread started");
 

@@ -19,6 +19,11 @@
 
 #include "../src/block_manager.h"
 #include "test_utils.h"
+#include "../external/xxhash.h"
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/time.h>
+#endif
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -2869,6 +2874,360 @@ void test_block_manager_cursor_read_partial_large_max(void)
     remove("test_partial_large.db");
 }
 
+void test_write_raw_hole_stops_replay(void)
+{
+    const char *test_file = "test_hole_stops_replay.db";
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload_a  = "block_A_payload";
+    const uint32_t size_a  = (uint32_t)(strlen(payload_a) + 1);
+    int64_t offset_a       = block_manager_write_raw(bm, payload_a, size_a);
+    ASSERT_TRUE(offset_a >= 0);
+
+    const char *payload_b  = "block_B_payload";
+    const uint32_t size_b  = (uint32_t)(strlen(payload_b) + 1);
+    int64_t offset_b       = block_manager_write_raw(bm, payload_b, size_b);
+    ASSERT_TRUE(offset_b >= 0);
+
+    const char *payload_c  = "block_C_payload";
+    const uint32_t size_c  = (uint32_t)(strlen(payload_c) + 1);
+    int64_t offset_c       = block_manager_write_raw(bm, payload_c, size_c);
+    ASSERT_TRUE(offset_c >= 0);
+
+    /*
+     * Simulate pwritev failure on block B by zeroing its entire reserved
+     * region.  On Linux the kernel fills unwritten regions with zeros when a
+     * file is extended via lseek/ftruncate; pwritev failure after the file
+     * counter was advanced leaves the same zero-filled gap.
+     */
+    const size_t b_total = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size_b + BLOCK_MANAGER_FOOTER_SIZE;
+    uint8_t *zeros = (uint8_t *)calloc(1, b_total);
+    ASSERT_TRUE(zeros != NULL);
+    ASSERT_TRUE(pwrite(bm->fd, zeros, b_total, (off_t)offset_b) == (ssize_t)b_total);
+    free(zeros);
+
+    /* close and reopen to model the crash-recovery / WAL-replay scenario */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    /* block A is readable via sequential scan */
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_a, size_a), 0);
+    block_manager_block_free(block);
+
+    /*
+     * cursor_next from A uses A's cached size to advance the file pointer to
+     * block B's offset.  It does NOT read B's content here, it just moves
+     * the cursor position.  Therefore it returns 0 (success).
+     */
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+
+    /*
+     * cursor_read at B's offset now reads the size field: 0x00000000.
+     * block_manager_read_block_at_offset treats size=0 as invalid and returns
+     * NULL.  This is the point where WAL replay must stop since it cannot
+     * distinguish the hole from a genuine write boundary.
+     */
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block == NULL);
+
+    /*
+     * cursor_next from the same (hole) position reads B's size field again
+     * (cache was invalidated since cursor_read returned NULL).  size=0 makes
+     * cursor_next return -1, confirming the cursor is permanently stuck.
+     */
+    ASSERT_EQ(block_manager_cursor_next(cursor), -1);
+
+    /*
+     * Prove block C is durably on disk despite being unreachable via sequential
+     * scan.  cursor_goto jumps directly to its known offset and reads it fine.
+     * This confirms the data loss is caused entirely by the hole, not by C
+     * having been corrupted.
+     */
+    ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset_c) == 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_c, size_c), 0);
+    block_manager_block_free(block);
+
+    printf("  [hole-stops-replay] block C at offset %" PRId64
+           " is on disk but unreachable from sequential scan\n",
+           offset_c);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
+/**
+ * test_write_raw_multiple_holes_stop_replay
+ *
+ * Extends the single-hole test: two consecutive failed pwritev calls leave
+ * two zero-filled holes.  Replay stops at the first hole, compounding data
+ * loss for every block written after it.
+ *
+ * File layout:  [A (valid)] [hole B] [hole D] [E (valid)]
+ * Expected:     cursor reads A, cursor_next returns -1 at hole B, E is lost.
+ */
+void test_write_raw_multiple_holes_stop_replay(void)
+{
+    const char *test_file = "test_multi_hole.db";
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload_a = "block_A";
+    const char *payload_b = "block_B_will_become_hole";
+    const char *payload_d = "block_D_will_become_hole";
+    const char *payload_e = "block_E_valid";
+
+    const uint32_t size_a = (uint32_t)(strlen(payload_a) + 1);
+    const uint32_t size_b = (uint32_t)(strlen(payload_b) + 1);
+    const uint32_t size_d = (uint32_t)(strlen(payload_d) + 1);
+    const uint32_t size_e = (uint32_t)(strlen(payload_e) + 1);
+
+    int64_t offset_a = block_manager_write_raw(bm, payload_a, size_a);
+    int64_t offset_b = block_manager_write_raw(bm, payload_b, size_b);
+    int64_t offset_d = block_manager_write_raw(bm, payload_d, size_d);
+    int64_t offset_e = block_manager_write_raw(bm, payload_e, size_e);
+
+    ASSERT_TRUE(offset_a >= 0);
+    ASSERT_TRUE(offset_b >= 0);
+    ASSERT_TRUE(offset_d >= 0);
+    ASSERT_TRUE(offset_e >= 0);
+
+    const size_t b_total = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size_b + BLOCK_MANAGER_FOOTER_SIZE;
+    const size_t d_total = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size_d + BLOCK_MANAGER_FOOTER_SIZE;
+
+    uint8_t *zeros_b = (uint8_t *)calloc(1, b_total);
+    uint8_t *zeros_d = (uint8_t *)calloc(1, d_total);
+    ASSERT_TRUE(zeros_b != NULL);
+    ASSERT_TRUE(zeros_d != NULL);
+
+    ASSERT_TRUE(pwrite(bm->fd, zeros_b, b_total, (off_t)offset_b) == (ssize_t)b_total);
+    ASSERT_TRUE(pwrite(bm->fd, zeros_d, d_total, (off_t)offset_d) == (ssize_t)d_total);
+
+    free(zeros_b);
+    free(zeros_d);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    /* block A is readable */
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_a, size_a), 0);
+    block_manager_block_free(block);
+
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block == NULL);
+
+    /* cursor_next from the hole confirms the cursor is stuck */
+    ASSERT_EQ(block_manager_cursor_next(cursor), -1);
+
+    /* block E is durably on disk but completely unreachable via sequential scan */
+    ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset_e) == 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_e, size_e), 0);
+    block_manager_block_free(block);
+
+    printf("  [multi-hole] replay stopped at first hole; block E at offset %" PRId64
+           " is unreachable\n",
+           offset_e);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
+#ifndef _WIN32
+static volatile int g_signal_count = 0;
+
+static void test_sigalrm_handler(int signum)
+{
+    (void)signum;
+    g_signal_count++;
+}
+
+void test_block_manager_write_raw_signal_safe(void)
+{
+    const char *test_file = "test_signal_safe.db";
+    (void)remove(test_file);
+
+    /* install non-SA_RESTART SIGALRM handler so EINTR would be visible */
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = test_sigalrm_handler;
+    sa.sa_flags   = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, &old_sa);
+
+    /* setitimer() rounds the request up to the kernel scheduler quantum; on
+     * macOS/BSD that can be several ms, so a fixed-count burst of SYNC_NONE
+     * writes may finish before any signal is delivered. Loop on wall-clock
+     * time and keep driving writes until at least one signal has landed. */
+    struct itimerval itv;
+    itv.it_interval.tv_sec  = 0;
+    itv.it_interval.tv_usec = 500;
+    itv.it_value.tv_sec     = 0;
+    itv.it_value.tv_usec    = 500;
+    setitimer(ITIMER_REAL, &itv, NULL);
+
+    g_signal_count = 0;
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload = "signal_safe_test_block_payload_data";
+    const uint32_t size = (uint32_t)(strlen(payload) + 1);
+    int failures = 0;
+    int iterations = 0;
+
+    const time_t deadline = time(NULL) + 5;
+    while ((iterations < 1000 || g_signal_count == 0) && time(NULL) < deadline)
+    {
+        if (block_manager_write_raw(bm, payload, size) < 0) failures++;
+        iterations++;
+    }
+
+    /* disarm timer and restore original handler before assertions */
+    memset(&itv, 0, sizeof(itv));
+    setitimer(ITIMER_REAL, &itv, NULL);
+    sigaction(SIGALRM, &old_sa, NULL);
+
+    ASSERT_EQ(failures, 0);
+    ASSERT_TRUE(g_signal_count > 0);
+    printf("  [signal-safe] %d signals delivered, 0/%d write failures\n",
+           g_signal_count, iterations);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+#endif /* !_WIN32 */
+
+void test_cursor_skip_corrupt_partial_write(void)
+{
+    const char *test_file = "test_skip_corrupt_partial.db";
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload_a = "block_A_ok";
+    const char *payload_b = "block_B_partial_write_victim";
+    const char *payload_c = "block_C_ok";
+
+    const uint32_t size_a = (uint32_t)(strlen(payload_a) + 1);
+    const uint32_t size_b = (uint32_t)(strlen(payload_b) + 1);
+    const uint32_t size_c = (uint32_t)(strlen(payload_c) + 1);
+
+    const int64_t offset_a = block_manager_write_raw(bm, payload_a, size_a);
+    const int64_t offset_b = block_manager_write_raw(bm, payload_b, size_b);
+    const int64_t offset_c = block_manager_write_raw(bm, payload_c, size_c);
+    ASSERT_TRUE(offset_a >= 0);
+    ASSERT_TRUE(offset_b >= 0);
+    ASSERT_TRUE(offset_c >= 0);
+
+    /* simulate partial write at B: leave header intact, zero data+footer.
+     * the header's size field stays valid (size_b); the footer magic becomes 0. */
+    const size_t zero_len = size_b + BLOCK_MANAGER_FOOTER_SIZE;
+    uint8_t *zeros = (uint8_t *)calloc(1, zero_len);
+    ASSERT_TRUE(zeros != NULL);
+    const off_t data_start = (off_t)offset_b + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    ASSERT_TRUE(pwrite(bm->fd, zeros, zero_len, data_start) == (ssize_t)zero_len);
+    free(zeros);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_a, size_a), 0);
+    block_manager_block_free(block);
+
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+
+    /* cursor_read(B) must fail: checksum mismatch on zeroed data */
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block == NULL);
+
+    /* skip the partial write -- must succeed because footer magic is absent */
+    ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), 0);
+
+    /* C is now current and readable */
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_c, size_c), 0);
+    block_manager_block_free(block);
+
+    printf("  [skip-corrupt] block C at offset %" PRId64
+           " recovered after skipping partial write at offset %" PRId64 "\n",
+           offset_c, offset_b);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
+void test_cursor_skip_corrupt_refuses_data_corruption(void)
+{
+    const char *test_file = "test_skip_corrupt_genuine.db";
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload = "fully_written_then_bit_flipped";
+    const uint32_t size = (uint32_t)(strlen(payload) + 1);
+
+    const int64_t offset = block_manager_write_raw(bm, payload, size);
+    ASSERT_TRUE(offset >= 0);
+
+    /* flip one byte in the middle of the data region */
+    const off_t flip_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (off_t)(size / 2);
+    uint8_t byte_val;
+    ASSERT_TRUE(pread(bm->fd, &byte_val, 1, flip_offset) == 1);
+    byte_val ^= 0xFFU;
+    ASSERT_TRUE(pwrite(bm->fd, &byte_val, 1, flip_offset) == 1);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    /* cursor_read must fail: checksum mismatch */
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block == NULL);
+
+    /* skip must be refused: footer magic is intact -> genuine corruption */
+    ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), -1);
+
+    printf("  [skip-corrupt] correctly refused to skip genuine corruption at offset %" PRId64 "\n",
+           offset);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -2923,6 +3282,14 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_cursor_init_stack_direct, tests_passed);
     RUN_TEST(test_block_manager_write_batch_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_cursor_read_partial_large_max, tests_passed);
+    RUN_TEST(test_write_raw_hole_stops_replay, tests_passed);
+    RUN_TEST(test_write_raw_multiple_holes_stop_replay, tests_passed);
+
+#ifndef _WIN32
+    RUN_TEST(test_block_manager_write_raw_signal_safe, tests_passed);
+#endif
+    RUN_TEST(test_cursor_skip_corrupt_partial_write, tests_passed);
+    RUN_TEST(test_cursor_skip_corrupt_refuses_data_corruption, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

@@ -409,7 +409,7 @@ void test_local_cache_lru_ordering(void)
         ASSERT_EQ(tdb_local_cache_track(&cache, paths[i]), 0);
     }
 
-    /* LRU order should be: head=4, 3, 2, 1, tail=0 */
+    /* LRU order should be head=4, 3, 2, 1, tail=0 */
     ASSERT_EQ(strcmp(cache.lru_head->path, paths[4]), 0);
     ASSERT_EQ(strcmp(cache.lru_tail->path, paths[0]), 0);
 

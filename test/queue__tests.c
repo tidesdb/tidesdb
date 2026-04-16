@@ -1159,7 +1159,6 @@ void benchmark_queue_foreach_peek_at_concurrent()
     printf("  Queue size: %d, Iterations per thread: %d\n", BENCH_FOREACH_PEEK_QUEUE_SIZE,
            BENCH_FOREACH_PEEK_ITERATIONS);
 
-    /* Benchmark queue_foreach with multiple threads */
     {
         pthread_t threads[BENCH_FOREACH_PEEK_NUM_THREADS];
         benchmark_foreach_peek_args_t args[BENCH_FOREACH_PEEK_NUM_THREADS];
@@ -1203,7 +1202,6 @@ void benchmark_queue_foreach_peek_at_concurrent()
                BENCH_FOREACH_PEEK_NUM_THREADS, ops_per_sec / 1e6, elapsed, total_visits);
     }
 
-    /* Benchmark queue_peek_at with multiple threads */
     {
         pthread_t threads[BENCH_FOREACH_PEEK_NUM_THREADS];
         benchmark_foreach_peek_args_t args[BENCH_FOREACH_PEEK_NUM_THREADS];

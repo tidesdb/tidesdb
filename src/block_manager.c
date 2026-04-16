@@ -1391,7 +1391,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
         return truncate_to_header(bm);
     }
 
-    /* O(1) validation, read footer of last block */
+    /* O(1) validation, we read footer of last block */
     unsigned char footer_buf[BLOCK_MANAGER_FOOTER_SIZE];
     const off_t footer_offset = (off_t)(file_size - BLOCK_MANAGER_FOOTER_SIZE);
     const ssize_t n = pread(bm->fd, footer_buf, BLOCK_MANAGER_FOOTER_SIZE, footer_offset);

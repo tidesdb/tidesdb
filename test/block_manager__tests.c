@@ -17,9 +17,9 @@
  * limitations under the License.
  */
 
+#include "../external/xxhash.h"
 #include "../src/block_manager.h"
 #include "test_utils.h"
-#include "../external/xxhash.h"
 #ifndef _WIN32
 #include <signal.h>
 #include <sys/time.h>
@@ -930,15 +930,8 @@ void test_block_manager_open_safety()
     }
 }
 
-/**
- * test_block_manager_write_raw
- * verifies that block_manager_write_raw produces the same on-disk format
- * as block_manager_block_write, and that blocks written with write_raw
- * are correctly readable via cursor_read after close+reopen.
- */
 void test_block_manager_write_raw(void)
 {
-    /* --- 1. basic write + read back ----------------------------------- */
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -948,7 +941,6 @@ void test_block_manager_write_raw(void)
     int64_t offset = block_manager_write_raw(bm, payload, payload_size);
     ASSERT_TRUE(offset >= 0);
 
-    /* read it back immediately via cursor */
     block_manager_cursor_t *cursor = NULL;
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
     ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset) == 0);
@@ -959,7 +951,6 @@ void test_block_manager_write_raw(void)
     block_manager_block_free(block);
     block_manager_cursor_free(cursor);
 
-    /* close and reopen to verify persistence */
     ASSERT_TRUE(block_manager_close(bm) == 0);
     ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -974,7 +965,6 @@ void test_block_manager_write_raw(void)
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_write_raw.db");
 
-    /* --- 2. multiple raw writes + sequential cursor iteration --------- */
     ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
     const int num_entries = 20;
@@ -1007,7 +997,6 @@ void test_block_manager_write_raw(void)
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_write_raw.db");
 
-    /* --- 3. interleave write_raw and block_write ---------------------- */
     ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
     const char raw_data[] = "from_write_raw";
@@ -1054,7 +1043,6 @@ void test_block_manager_write_raw(void)
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_write_raw.db");
 
-    /* --- 4. edge cases ------------------------------------------------ */
     ASSERT_TRUE(block_manager_open(&bm, "test_write_raw.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
     /* NULL bm, NULL data, zero size should all return -1 */
@@ -1083,11 +1071,6 @@ void test_block_manager_write_raw(void)
 #define NUM_BLOCKS 100000
 #define BLOCK_SIZE 256
 
-/**
- * benchmark_block_manager_write_raw
- * compares write throughput of block_manager_write_raw vs block_manager_block_write
- * and verifies data integrity of all blocks written via write_raw.
- */
 void benchmark_block_manager_write_raw(void)
 {
     const int bench_blocks = NUM_BLOCKS;
@@ -1107,7 +1090,6 @@ void benchmark_block_manager_write_raw(void)
         snprintf((char *)(data[i] + bench_size - 20), 20, "raw_%d", i);
     }
 
-    /* --- benchmark block_write (baseline) ----------------------------- */
     block_manager_t *bm = NULL;
     (void)remove("bench_raw_baseline.db");
     ASSERT_TRUE(block_manager_open(&bm, "bench_raw_baseline.db", BLOCK_MANAGER_SYNC_NONE) == 0);
@@ -1126,7 +1108,6 @@ void benchmark_block_manager_write_raw(void)
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("bench_raw_baseline.db");
 
-    /* --- benchmark write_raw ------------------------------------------ */
     (void)remove("bench_raw_new.db");
     ASSERT_TRUE(block_manager_open(&bm, "bench_raw_new.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -1149,7 +1130,6 @@ void benchmark_block_manager_write_raw(void)
     printf("  write_raw:   %.3f sec (%.2f MB/s)\n" RESET, raw_sec,
            raw_sec > 0 ? (bench_blocks * bench_size) / (raw_sec * 1024 * 1024) : 0.0);
 
-    /* --- verify all blocks written by write_raw ----------------------- */
     ASSERT_TRUE(block_manager_close(bm) == 0);
     ASSERT_TRUE(block_manager_open(&bm, "bench_raw_new.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -2882,19 +2862,19 @@ void test_write_raw_hole_stops_replay(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    const char *payload_a  = "block_A_payload";
-    const uint32_t size_a  = (uint32_t)(strlen(payload_a) + 1);
-    int64_t offset_a       = block_manager_write_raw(bm, payload_a, size_a);
+    const char *payload_a = "block_A_payload";
+    const uint32_t size_a = (uint32_t)(strlen(payload_a) + 1);
+    int64_t offset_a = block_manager_write_raw(bm, payload_a, size_a);
     ASSERT_TRUE(offset_a >= 0);
 
-    const char *payload_b  = "block_B_payload";
-    const uint32_t size_b  = (uint32_t)(strlen(payload_b) + 1);
-    int64_t offset_b       = block_manager_write_raw(bm, payload_b, size_b);
+    const char *payload_b = "block_B_payload";
+    const uint32_t size_b = (uint32_t)(strlen(payload_b) + 1);
+    int64_t offset_b = block_manager_write_raw(bm, payload_b, size_b);
     ASSERT_TRUE(offset_b >= 0);
 
-    const char *payload_c  = "block_C_payload";
-    const uint32_t size_c  = (uint32_t)(strlen(payload_c) + 1);
-    int64_t offset_c       = block_manager_write_raw(bm, payload_c, size_c);
+    const char *payload_c = "block_C_payload";
+    const uint32_t size_c = (uint32_t)(strlen(payload_c) + 1);
+    int64_t offset_c = block_manager_write_raw(bm, payload_c, size_c);
     ASSERT_TRUE(offset_c >= 0);
 
     /*
@@ -3072,7 +3052,7 @@ void test_block_manager_write_raw_signal_safe(void)
     struct sigaction sa, old_sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = test_sigalrm_handler;
-    sa.sa_flags   = 0;
+    sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGALRM, &sa, &old_sa);
 
@@ -3081,10 +3061,10 @@ void test_block_manager_write_raw_signal_safe(void)
      * writes may finish before any signal is delivered. Loop on wall-clock
      * time and keep driving writes until at least one signal has landed. */
     struct itimerval itv;
-    itv.it_interval.tv_sec  = 0;
+    itv.it_interval.tv_sec = 0;
     itv.it_interval.tv_usec = 500;
-    itv.it_value.tv_sec     = 0;
-    itv.it_value.tv_usec    = 500;
+    itv.it_value.tv_sec = 0;
+    itv.it_value.tv_usec = 500;
     setitimer(ITIMER_REAL, &itv, NULL);
 
     g_signal_count = 0;
@@ -3111,8 +3091,8 @@ void test_block_manager_write_raw_signal_safe(void)
 
     ASSERT_EQ(failures, 0);
     ASSERT_TRUE(g_signal_count > 0);
-    printf("  [signal-safe] %d signals delivered, 0/%d write failures\n",
-           g_signal_count, iterations);
+    printf("  [signal-safe] %d signals delivered, 0/%d write failures\n", g_signal_count,
+           iterations);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove(test_file);
@@ -3142,7 +3122,7 @@ void test_cursor_skip_corrupt_partial_write(void)
     ASSERT_TRUE(offset_b >= 0);
     ASSERT_TRUE(offset_c >= 0);
 
-    /* simulate partial write at B: leave header intact, zero data+footer.
+    /* simulate partial write at B leave header intact, zero data+footer.
      * the header's size field stays valid (size_b); the footer magic becomes 0. */
     const size_t zero_len = size_b + BLOCK_MANAGER_FOOTER_SIZE;
     uint8_t *zeros = (uint8_t *)calloc(1, zero_len);

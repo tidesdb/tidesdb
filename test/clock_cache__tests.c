@@ -2250,7 +2250,6 @@ static void *oltp_reader_thread(void *arg)
 
     while (!atomic_load(a->stop_flag))
     {
-        /* Zipfian pick from block keyspace */
         int block_id = zipf_pick(&rng, OLTP_NUM_BLOCKS);
         char key[32];
         snprintf(key, sizeof(key), "blk:%05d", block_id);
@@ -2454,7 +2453,6 @@ void test_realistic_working_set_shift(void)
             free(block);
         }
 
-        /* Zipfian reads within this epoch's range */
         int hits = 0;
         for (int i = 0; i < reads_per_epoch; i++)
         {

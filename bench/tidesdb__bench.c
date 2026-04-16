@@ -177,12 +177,12 @@ static uint8_t zipf_next(double zipf_exponent, double off, double imax)
     double xmin = 0.5;
     double xmax = imax + 0.5;
 
-    /* calculate hlow, hupp and tot_area */
+    /* we calculate hlow, hupp and tot_area */
     double hlow = calc_continuous_approximation(off, zipf_exponent, xmin);
     double hupp = calc_continuous_approximation(off, zipf_exponent, xmax);
     double tot_area = hupp - hlow;
 
-    /* Find next uint64 zipf value */
+    /* we find next uint64 zipf value */
     int accepted = 0;
     double u, k, c_area;
 
@@ -277,7 +277,7 @@ void add_to_ht(ht_key_t** head, uint8_t* ky, int* counter)
     assert(head != NULL);
     ht_key_t* k = NULL;
 
-    /* Check if key already exists and add if it doesn't */
+    /* we check if key already exists and add if it doesn't */
     HASH_FIND(hh, *head, ky, strlen((char*)ky), k);
     if (k == NULL)
     {
@@ -289,10 +289,10 @@ void add_to_ht(ht_key_t** head, uint8_t* ky, int* counter)
         }
 
         k->key = ky;
-        /* add to hash table */
+        /* we add to hash table */
         HASH_ADD_KEYPTR(hh, *head, k->key, strlen((char*)k->key), k);
 
-        /* new item added. increment counter. */
+        /* new item added now we increment counter. */
         *counter += 1;
     }
 }
@@ -332,7 +332,6 @@ int count_distinct_keys(uint8_t** key_arr, int num_operations)
         add_to_ht(&ht_head, key_arr[i], &count);
     }
 
-    /* clear and free */
     clear_ht(&ht_head);
 
     printf(BOLDMAGENTA "%d distinct keys found\n" RESET, count);
@@ -429,7 +428,7 @@ void* thread_get(void* arg)
             if (tidesdb_txn_get(txn, data->cf, data->keys[j], data->key_sizes[j], &value_out,
                                 &value_len) == 0)
             {
-                /* verify the value matches what we wrote */
+                /* we verify the value matches what we wrote */
                 if (value_len != data->value_sizes[j] ||
                     memcmp(value_out, data->values[j], value_len) != 0)
                 {

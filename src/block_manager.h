@@ -34,11 +34,8 @@
 #define BLOCK_MANAGER_MAGIC_SIZE 3
 /* version field size in bytes */
 #define BLOCK_MANAGER_VERSION_SIZE 1
-/* block_size field size in bytes */
-#define BLOCK_MANAGER_BLOCK_SIZE_SIZE 4
-/* padding field size in bytes */
-#define BLOCK_MANAGER_PADDING_SIZE 4
-#define BLOCK_MANAGER_HEADER_SIZE  8
+
+#define BLOCK_MANAGER_HEADER_SIZE 8
 
 /* block field sizes */
 /* block size field (uint32_t) -- supports blocks up to 4GB, though try to keep it under! */
@@ -88,6 +85,18 @@ typedef struct
     int sync_full_cached; /* cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL) */
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
+
+    /**** group-commit coalescer for block_manager_write_raw.
+     ***  kernel serializes concurrent buffered pwritev on one inode via i_rwsem.
+     **   we fold N concurrent small writes into one pwritev with an iovec of N
+     *    records -- same kernel lock, taken once, dramatic throughput win.
+     *
+     *    submit_head is a lock-free MPSC stack of pending submissions.
+     *    writer_busy is the leader-election flag (CAS 0 -> 1 to become leader).
+     *    writer_mtx / writer_cv coordinate follower wake-up after the leader
+     *    issues the coalesced pwritev (+ optional fdatasync). */
+    _Atomic(void *) submit_head;
+    _Atomic uint32_t writer_busy;
 } block_manager_t;
 
 /**

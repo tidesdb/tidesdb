@@ -1879,6 +1879,95 @@ tdb_pwritev_safe(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 #endif
 }
 
+/*** cross-platform futex-like wait/wake on an atomic int.
+ **  used to park and wake individual submissions in the block_manager
+ *   group-commit coalescer without needing a shared mutex.
+ *
+ *   semantics:
+ *     tdb_futex_wait_on_int(addr, expected): block if *addr == expected,
+ *       return when either *addr != expected or a wake arrives. may return
+ *       spuriously; caller must re-check the predicate in a loop.
+ *     tdb_futex_wake_on_int(addr): wake all waiters currently parked on addr.
+ *
+ *   linux    SYS_futex with FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE
+ *   windows  WaitOnAddress / WakeByAddressAll (synchapi.h, since Win8)
+ *   others   pthread fallback -- caller must also call tdb_waiter_init
+ *            on the submission's embedded pthread mutex/cond before use
+ */
+#if defined(__linux__)
+#include <limits.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+static inline void tdb_futex_wait_on_int(_Atomic int *addr, int expected)
+{
+    (void)syscall(SYS_futex, (int *)addr, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+}
+static inline void tdb_futex_wake_on_int(_Atomic int *addr)
+{
+    (void)syscall(SYS_futex, (int *)addr, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+#define TDB_HAS_DIRECT_FUTEX 1
+
+#elif defined(_WIN32)
+#include <synchapi.h>
+static inline void tdb_futex_wait_on_int(_Atomic int *addr, int expected)
+{
+    int e = expected;
+    (void)WaitOnAddress((volatile void *)addr, &e, sizeof(int), INFINITE);
+}
+static inline void tdb_futex_wake_on_int(_Atomic int *addr)
+{
+    WakeByAddressAll((void *)addr);
+}
+#define TDB_HAS_DIRECT_FUTEX 1
+
+#else
+/* generic POSIX fallback: caller embeds a pthread mutex/cond alongside the
+ * atomic int and uses tdb_waiter_* helpers below. direct futex-on-int is
+ * not available; callers must check TDB_HAS_DIRECT_FUTEX before using the
+ * wait_on_int/wake_on_int variants. */
+#define TDB_HAS_DIRECT_FUTEX 0
+#endif
+
+/* portable pthread-backed waiter used when TDB_HAS_DIRECT_FUTEX == 0.
+ * when futex/WaitOnAddress is available we don't need this at all. */
+#if !TDB_HAS_DIRECT_FUTEX
+typedef struct tdb_pthread_waiter
+{
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+} tdb_pthread_waiter_t;
+
+static inline int tdb_pthread_waiter_init(tdb_pthread_waiter_t *w)
+{
+    if (pthread_mutex_init(&w->mtx, NULL) != 0) return -1;
+    if (pthread_cond_init(&w->cv, NULL) != 0)
+    {
+        pthread_mutex_destroy(&w->mtx);
+        return -1;
+    }
+    return 0;
+}
+static inline void tdb_pthread_waiter_destroy(tdb_pthread_waiter_t *w)
+{
+    pthread_cond_destroy(&w->cv);
+    pthread_mutex_destroy(&w->mtx);
+}
+static inline void tdb_pthread_waiter_wait(tdb_pthread_waiter_t *w, _Atomic int *flag)
+{
+    pthread_mutex_lock(&w->mtx);
+    while (atomic_load_explicit(flag, memory_order_acquire) == 0)
+        pthread_cond_wait(&w->cv, &w->mtx);
+    pthread_mutex_unlock(&w->mtx);
+}
+static inline void tdb_pthread_waiter_signal(tdb_pthread_waiter_t *w)
+{
+    pthread_mutex_lock(&w->mtx);
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mtx);
+}
+#endif
+
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */
 #if !defined(_MSC_VER) || _MSC_VER >= 1930
 /*

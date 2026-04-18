@@ -235,7 +235,7 @@ void bloom_filter_add_batch(const bloom_filter_t *bf, const uint8_t **entries, c
             }
         }
 
-        /* we insertion sort the indices for cache-friendly bitset access.
+        /* we sort the indices for cache-friendly bitset access.
          * the array is small (<=5120 entries) so insertion sort beats qsort overhead. */
         for (size_t i = 1; i < n_indices; i++)
         {

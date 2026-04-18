@@ -290,6 +290,10 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     /* we initialize atomic variable to prevent reading uninitialized memory */
     atomic_init(&new_bm->current_file_size, 0);
 
+    /* group-commit coalescer state */
+    atomic_init(&new_bm->submit_head, NULL);
+    atomic_init(&new_bm->writer_busy, 0);
+
     new_bm->sync_mode = sync_mode;
     new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
 
@@ -464,9 +468,9 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     /* we atomically allocate space in file */
     const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
 
-    /* block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
-     * we use pwritev scatter-gather I/O to write header, data, and footer
-     * in a single syscall while avoiding copying block data into an intermediate buffer */
+    /*** block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
+     **  we use pwritev scatter-gather I/O to write header, data, and footer
+     *   in a single syscall while avoiding copying block data into an intermediate buffer */
     unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
     encode_uint32_le_compat(header, (uint32_t)block->size);
     encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
@@ -500,15 +504,219 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     return offset;
 }
 
-int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uint32_t size)
+/**** group-commit coalescer internals for block_manager_write_raw.
+ ***  threads submit a bm_wal_submission_t onto a lock-free MPSC stack. the
+ **   first thread to CAS writer_busy from 0 to 1 becomes the leader. the
+ *    leader drains the whole stack, reserves one contiguous offset for the
+ *    entire batch, assembles one iovec covering N records, and issues one
+ *    pwritev (plus one fdatasync if SYNC_FULL && !O_DSYNC). each follower's
+ *    assigned offset is written into its submission slot and the leader
+ *    futex-wakes each follower on its own submission's rc slot. followers
+ *    futex-wait on that slot.
+ *
+ *    no shared mutex or condvar -- each submission owns its own wake slot
+ *    so the wake-up path doesn't serialize on a shared lock.
+ *
+ *    durability contract: rc is set to 1 only after the pwritev (+ fdatasync
+ *    where applicable) has returned. a follower that observes rc != 0 has
+ *    the same durability guarantee as the original per-caller pwritev path.
+ */
+
+/* maximum iovecs per pwritev call, POSIX minimum is 16, Linux uses 1024 */
+#ifndef BM_IOV_MAX
+#define BM_IOV_MAX 1024
+#endif
+
+typedef struct bm_wal_submission
 {
-    if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
+    const void *data;
+    uint32_t size;
+    int64_t offset; /* filled in by leader before rc is set */
+    _Atomic int rc; /* 0 = pending, 1 = ok, -1 = error */
+    struct bm_wal_submission *next;
+#if !TDB_HAS_DIRECT_FUTEX
+    tdb_pthread_waiter_t waiter; /* only on platforms without futex/WaitOnAddress */
+#endif
+} bm_wal_submission_t;
 
-    const size_t total_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size + BLOCK_MANAGER_FOOTER_SIZE;
+/* wake one submission's waiter using whichever primitive the platform has */
+static inline void bm_sub_wake(bm_wal_submission_t *s)
+{
+#if TDB_HAS_DIRECT_FUTEX
+    tdb_futex_wake_on_int(&s->rc);
+#else
+    tdb_pthread_waiter_signal(&s->waiter);
+#endif
+}
 
+/* block until *rc != 0 (spurious wakeups tolerated via re-check) */
+static inline void bm_sub_wait(bm_wal_submission_t *s)
+{
+#if TDB_HAS_DIRECT_FUTEX
+    while (atomic_load_explicit(&s->rc, memory_order_acquire) == 0)
+        tdb_futex_wait_on_int(&s->rc, 0);
+#else
+    tdb_pthread_waiter_wait(&s->waiter, &s->rc);
+#endif
+}
+
+/* stack buffers avoid malloc in the leader for common batch sizes.
+ * 128 entries -> ~8KB stack (128*16 meta + 128*3*16 iovec) which comfortably
+ * covers typical contention (<= 128 concurrent writers) without heap alloc. */
+#define BM_COALESCE_STACK_COUNT 128
+
+static int bm_leader_drive_once(block_manager_t *bm)
+{
+    bm_wal_submission_t *batch =
+        atomic_exchange_explicit((_Atomic(bm_wal_submission_t *) *)&bm->submit_head,
+                                 (bm_wal_submission_t *)NULL, memory_order_acquire);
+    if (!batch) return 0;
+
+    /* reverse LIFO -> FIFO so offsets ascend in submission order */
+    bm_wal_submission_t *fifo = NULL;
+    size_t count = 0;
+    size_t total = 0;
+    while (batch)
+    {
+        bm_wal_submission_t *nxt = batch->next;
+        batch->next = fifo;
+        fifo = batch;
+        total += BLOCK_MANAGER_BLOCK_HEADER_SIZE + batch->size + BLOCK_MANAGER_FOOTER_SIZE;
+        count++;
+        batch = nxt;
+    }
+
+    /* reserve one contiguous offset for the whole batch */
+    const int64_t base = (int64_t)atomic_fetch_add(&bm->current_file_size, total);
+
+    /* per-entry header+footer buffers and iovec */
+    unsigned char stack_meta[BM_COALESCE_STACK_COUNT *
+                             (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE)];
+    struct iovec stack_iov[BM_COALESCE_STACK_COUNT * 3];
+    unsigned char *meta = stack_meta;
+    struct iovec *iov = stack_iov;
+    int meta_heap = 0, iov_heap = 0;
+
+    if (count > BM_COALESCE_STACK_COUNT)
+    {
+        meta = malloc(count * (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE));
+        iov = malloc(count * 3 * sizeof(struct iovec));
+        meta_heap = iov_heap = 1;
+        if (!meta || !iov)
+        {
+            if (meta_heap) free(meta);
+            if (iov_heap) free(iov);
+            /* snapshot next before each release -- see note in publish loop below */
+            for (bm_wal_submission_t *s = fifo; s;)
+            {
+                bm_wal_submission_t *nxt = s->next;
+                atomic_store_explicit(&s->rc, -1, memory_order_release);
+                bm_sub_wake(s);
+                s = nxt;
+            }
+            return 1;
+        }
+    }
+
+    {
+        size_t i = 0;
+        int64_t cur = base;
+        for (bm_wal_submission_t *s = fifo; s; s = s->next, i++)
+        {
+            unsigned char *hdr =
+                meta + i * (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE);
+            unsigned char *ftr = hdr + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+            const uint32_t cksum = compute_checksum(s->data, s->size);
+            encode_uint32_le_compat(hdr, s->size);
+            encode_uint32_le_compat(hdr + BLOCK_MANAGER_SIZE_FIELD_SIZE, cksum);
+            encode_uint32_le_compat(ftr, s->size);
+            encode_uint32_le_compat(ftr + 4, BLOCK_MANAGER_FOOTER_MAGIC);
+
+            iov[i * 3 + 0].iov_base = hdr;
+            iov[i * 3 + 0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+            iov[i * 3 + 1].iov_base = (void *)s->data;
+            iov[i * 3 + 1].iov_len = s->size;
+            iov[i * 3 + 2].iov_base = ftr;
+            iov[i * 3 + 2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
+
+            s->offset = cur;
+            cur += BLOCK_MANAGER_BLOCK_HEADER_SIZE + s->size + BLOCK_MANAGER_FOOTER_SIZE;
+        }
+    }
+
+    /* single pwritev for the whole batch, chunked if iov exceeds IOV_MAX */
+    int failed = 0;
+    {
+        const size_t iov_total = count * 3;
+        size_t iov_done = 0;
+        int64_t write_offset = base;
+        while (iov_done < iov_total)
+        {
+            size_t chunk = iov_total - iov_done;
+            if (chunk > BM_IOV_MAX) chunk = BM_IOV_MAX;
+            size_t expected = 0;
+            for (size_t j = 0; j < chunk; j++) expected += iov[iov_done + j].iov_len;
+            const ssize_t nw =
+                tdb_pwritev_safe(bm->fd, iov + iov_done, (int)chunk, (off_t)write_offset);
+            if (nw != (ssize_t)expected)
+            {
+                failed = 1;
+                break;
+            }
+            iov_done += chunk;
+            write_offset += (int64_t)expected;
+        }
+    }
+
+    /* durability: if SYNC_FULL without O_DSYNC, fdatasync covers the whole batch */
+    if (!failed && is_sync_full(bm) && !odsync_available())
+    {
+        if (fdatasync(bm->fd) != 0) failed = 1;
+    }
+
+    /*** publish result + wake each submitter individually.
+     **  CRITICAL: submissions live on follower stacks. the moment we set
+     *   rc != 0 for a follower, that follower can return and its stack
+     *   frame can be reused on its next call, clobbering s->next. we MUST
+     *   snapshot s->next before releasing each follower. */
+    for (bm_wal_submission_t *s = fifo; s;)
+    {
+        bm_wal_submission_t *nxt = s->next;
+        atomic_store_explicit(&s->rc, failed ? -1 : 1, memory_order_release);
+        bm_sub_wake(s);
+        s = nxt;
+    }
+
+    if (meta_heap) free(meta);
+    if (iov_heap) free(iov);
+    return 1;
+}
+
+/* leader "drive until quiet" -- requires writer_busy == 1 on entry */
+static void bm_leader_drive_until_quiet(block_manager_t *bm)
+{
+    for (;;)
+    {
+        (void)bm_leader_drive_once(bm);
+
+        atomic_store_explicit(&bm->writer_busy, 0u, memory_order_release);
+
+        if (atomic_load_explicit((_Atomic(bm_wal_submission_t *) *)&bm->submit_head,
+                                 memory_order_acquire) == NULL)
+            return;
+
+        uint32_t again = 0;
+        if (!atomic_compare_exchange_strong_explicit(&bm->writer_busy, &again, 1u,
+                                                     memory_order_acquire, memory_order_relaxed))
+            return;
+    }
+}
+
+static int64_t bm_fast_write_single(block_manager_t *bm, const void *data, uint32_t size)
+{
+    const size_t total = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size + BLOCK_MANAGER_FOOTER_SIZE;
     const uint32_t checksum = compute_checksum(data, size);
-
-    const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
+    const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total);
 
     unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
     encode_uint32_le_compat(header, size);
@@ -526,21 +734,127 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
-        return -1;
-
-    if (is_sync_full(bm) && !odsync_available())
+    int failed = 0;
+    if (tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total) failed = 1;
+    if (!failed && is_sync_full(bm) && !odsync_available())
     {
-        if (fdatasync(bm->fd) != 0) return -1;
+        if (fdatasync(bm->fd) != 0) failed = 1;
     }
 
-    return offset;
+    /* release busy; pick up any late arrivals that queued during our write */
+    atomic_store_explicit(&bm->writer_busy, 0u, memory_order_release);
+    if (atomic_load_explicit((_Atomic(bm_wal_submission_t *) *)&bm->submit_head,
+                             memory_order_acquire) != NULL)
+    {
+        uint32_t e = 0;
+        if (atomic_compare_exchange_strong_explicit(&bm->writer_busy, &e, 1u, memory_order_acquire,
+                                                    memory_order_relaxed))
+        {
+            bm_leader_drive_until_quiet(bm);
+        }
+    }
+
+    return failed ? (int64_t)-1 : offset;
 }
 
-/* maximum iovecs per pwritev call, POSIX minimum is 16, Linux uses 1024 */
-#ifndef BM_IOV_MAX
-#define BM_IOV_MAX 1024
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uint32_t size)
+{
+    if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
+
+    /**** 1T fast path
+     ***  if we can atomically grab writer_busy AND the submission queue is
+     **   empty, bypass the coalescer entirely and do a direct pwritev.
+     *    under no contention this is the original single-pwritev code path
+     *    with one extra CAS -- and avoids queue/wait/wake overhead. */
+    {
+        uint32_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&bm->writer_busy, &expected, 1u,
+                                                    memory_order_acquire, memory_order_relaxed))
+        {
+            if (atomic_load_explicit((_Atomic(bm_wal_submission_t *) *)&bm->submit_head,
+                                     memory_order_acquire) == NULL)
+            {
+                return bm_fast_write_single(bm, data, size);
+            }
+            /* queue non-empty -- we already hold writer_busy, push our sub,
+             * then drive (we are leader; do not try to CAS again below). */
+            bm_wal_submission_t sub0;
+            sub0.data = data;
+            sub0.size = size;
+            sub0.offset = -1;
+            sub0.next = NULL;
+            atomic_init(&sub0.rc, 0);
+#if !TDB_HAS_DIRECT_FUTEX
+            if (tdb_pthread_waiter_init(&sub0.waiter) != 0)
+            {
+                atomic_store_explicit(&bm->writer_busy, 0u, memory_order_release);
+                return -1;
+            }
 #endif
+            {
+                bm_wal_submission_t *head = atomic_load_explicit(
+                    (_Atomic(bm_wal_submission_t *) *)&bm->submit_head, memory_order_relaxed);
+                do
+                {
+                    sub0.next = head;
+                } while (!atomic_compare_exchange_weak_explicit(
+                    (_Atomic(bm_wal_submission_t *) *)&bm->submit_head, &head, &sub0,
+                    memory_order_release, memory_order_relaxed));
+            }
+            bm_leader_drive_until_quiet(bm);
+            const int rc0 = atomic_load_explicit(&sub0.rc, memory_order_acquire);
+#if !TDB_HAS_DIRECT_FUTEX
+            tdb_pthread_waiter_destroy(&sub0.waiter);
+#endif
+            return (rc0 == 1) ? sub0.offset : (int64_t)-1;
+        }
+        /* busy was already held by someone else -- fall through to follower */
+    }
+
+    /**** coalesced path
+     ***  push our submission, wait on its wake slot. a concurrent leader
+     **   (or a freshly-elected one if the previous leader just released)
+     *    will observe and write our submission. */
+    bm_wal_submission_t sub;
+    sub.data = data;
+    sub.size = size;
+    sub.offset = -1;
+    sub.next = NULL;
+    atomic_init(&sub.rc, 0);
+#if !TDB_HAS_DIRECT_FUTEX
+    if (tdb_pthread_waiter_init(&sub.waiter) != 0) return -1;
+#endif
+
+    {
+        bm_wal_submission_t *head = atomic_load_explicit(
+            (_Atomic(bm_wal_submission_t *) *)&bm->submit_head, memory_order_relaxed);
+        do
+        {
+            sub.next = head;
+        } while (!atomic_compare_exchange_weak_explicit(
+            (_Atomic(bm_wal_submission_t *) *)&bm->submit_head, &head, &sub, memory_order_release,
+            memory_order_relaxed));
+    }
+
+    /*** the leader may have just released -- try to become leader ourselves.
+     **  if we win, drive and process (including our own sub). otherwise wait. */
+    uint32_t expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&bm->writer_busy, &expected, 1u,
+                                                memory_order_acquire, memory_order_relaxed))
+    {
+        bm_leader_drive_until_quiet(bm);
+    }
+    else
+    {
+        bm_sub_wait(&sub);
+    }
+
+    const int rc = atomic_load_explicit(&sub.rc, memory_order_acquire);
+#if !TDB_HAS_DIRECT_FUTEX
+    tdb_pthread_waiter_destroy(&sub.waiter);
+#endif
+    return (rc == 1) ? sub.offset : (int64_t)-1;
+}
 
 int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t **blocks,
                                     const size_t count, int64_t *offsets)
@@ -787,8 +1101,8 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     const int rc = block_manager_cursor_init_stack(*cursor, bm);
     if (rc == 0)
     {
-        /* heap-allocated cursors are used for sequential iteration
-         * we hint to OS for read-ahead optimization */
+        /** heap-allocated cursors are used for sequential iteration
+         *  we hint to OS for read-ahead optimization */
         set_file_sequential_hint(bm->fd);
     }
     return rc;
@@ -883,11 +1197,11 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     }
 
     const uint32_t block_size = decode_uint32_le_compat(size_buf);
-    if (block_size == 0) return -1; /* zero-filled hole: extent unknown, cannot advance */
+    if (block_size == 0) return -1; /* zero-filled hole, extent unknown, cannot advance */
 
-    /* read footer magic to distinguish partial write from genuine corruption.
-     * footer layout: [footer_size(4)][footer_magic(4)].
-     * footer_magic sits at: current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE */
+    /*** read footer magic to distinguish partial write from genuine corruption.
+     **  footer layout           [footer_size(4)][footer_magic(4)].
+     *   footer_magic sits at    current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE */
     const off_t footer_magic_offset = (off_t)cursor->current_pos + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
                                       (off_t)block_size + BLOCK_MANAGER_SIZE_FIELD_SIZE;
     unsigned char magic_buf[4];

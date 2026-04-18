@@ -22,21 +22,25 @@
 /* we use thin wrappers instead of taking addresses of stdlib functions directly
  * on MSVC, malloc/calloc/realloc/free are __declspec(dllimport) and their
  * address is not guaranteed to be static (warning C4232) */
-static void *real_malloc(size_t size)
+static void *real_malloc(const size_t size)
 {
     return malloc(size);
 }
-static void *real_calloc(size_t count, size_t size)
+static void *real_calloc(const size_t count, const size_t size)
 {
+    if (count == 0 || size == 0)
+    {
+        return NULL;
+    }
     return calloc(count, size);
 }
-static void *real_realloc(void *ptr, size_t size)
+static void *real_realloc(void *ptr, const size_t size)
 {
     return realloc(ptr, size);
 }
 static void real_free(void *ptr)
 {
-    free(ptr);
+    if (ptr != NULL) free(ptr);
 }
 
 #include "alloc.h"

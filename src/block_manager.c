@@ -39,8 +39,8 @@ static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
  *  * * * * * * * * * *
  * HEADER             *
  *  * * * * * * * * * *
- * magic (3 bytes) 0x544442 "TDB"
- * version (1 byte) 7
+ * magic (3 bytes) 0x544442 "TDB" -- see BLOCK_MANAGER_MAGIC
+ * version (1 byte) -- see BLOCK_MANAGER_VERSION
  * padding (4 bytes) reserved
  *
  *  * * * * * * * * * *
@@ -166,6 +166,87 @@ static inline int verify_checksum(const void *data, const size_t size,
 }
 
 /**
+ * is_trailing_zero
+ * check whether the file region [start, end) consists entirely of zero bytes.
+ * used to distinguish preallocation tail (legitimate trailing zeros that should
+ * be tolerated by validation) from mid-write corruption (non-zero garbage).
+ * reads in chunks and stops early on the first non-zero byte.
+ * @param fd the file descriptor
+ * @param start start offset (inclusive)
+ * @param end   end offset (exclusive)
+ * @return 1 if all bytes in [start, end) are zero, 0 if any non-zero byte found, -1 on I/O error
+ */
+static int is_trailing_zero(const int fd, const uint64_t start, const uint64_t end)
+{
+    if (start >= end) return 1;
+
+    enum
+    {
+        SCAN_CHUNK = 64 * 1024
+    };
+    unsigned char buf[SCAN_CHUNK];
+
+    uint64_t pos = start;
+    while (pos < end)
+    {
+        size_t want = SCAN_CHUNK;
+        if ((uint64_t)want > end - pos) want = (size_t)(end - pos);
+
+        const ssize_t got = pread(fd, buf, want, (off_t)pos);
+        if (got <= 0) return -1;
+
+        for (ssize_t i = 0; i < got; i++)
+        {
+            if (buf[i] != 0) return 0;
+        }
+        pos += (uint64_t)got;
+    }
+    return 1;
+}
+
+/**
+ * maybe_extend_allocation
+ * extends the on-disk preallocation when a new reservation gets within LOWWATER of
+ * the current preallocated extent. multiple writers may race here; the loop is
+ * lock-free and at worst causes a redundant fallocate (idempotent on overlapping
+ * ranges). on platforms without preallocation support, the first failure stamps
+ * preallocated_size with UINT64_MAX so the slow path is never retaken.
+ * @param bm the block manager
+ * @param reservation_end one past the last byte just reserved by the caller
+ */
+static inline void maybe_extend_allocation(block_manager_t *bm, const uint64_t reservation_end)
+{
+    for (;;)
+    {
+        const uint64_t prealloc =
+            atomic_load_explicit(&bm->preallocated_size, memory_order_acquire);
+        if (BM_LIKELY(reservation_end + BLOCK_MANAGER_PREALLOC_LOWWATER <= prealloc)) return;
+
+        /* we round up to the next CHUNK boundary so successive extends stay aligned */
+        const uint64_t target =
+            ((reservation_end + BLOCK_MANAGER_PREALLOC_CHUNK - 1) / BLOCK_MANAGER_PREALLOC_CHUNK) *
+            BLOCK_MANAGER_PREALLOC_CHUNK;
+        if (target <= prealloc) return; /* another writer already extended past us */
+
+        if (tdb_preallocate_extent(bm->fd, (off_t)prealloc, (off_t)(target - prealloc)) != 0)
+        {
+            /** unsupported on this fs/platform, disable further attempts.
+             *  subsequent pwrites simply take the (slower) extending-write path. */
+            atomic_store_explicit(&bm->preallocated_size, UINT64_MAX, memory_order_release);
+            return;
+        }
+
+        uint64_t expected = prealloc;
+        if (atomic_compare_exchange_strong_explicit(&bm->preallocated_size, &expected, target,
+                                                    memory_order_release, memory_order_acquire))
+        {
+            return;
+        }
+        /* lost the CAS race; another writer also extended -- reload and re-check */
+    }
+}
+
+/**
  * write_header
  * write file header using pwrite
  * @param fd the file descriptor to write to
@@ -266,6 +347,9 @@ static int truncate_to_header(block_manager_t *bm)
     }
 
     atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
+    /** preallocation is invalidated by ftruncate; we reset to current size so the next
+     *  write triggers a fresh extend */
+    atomic_store(&bm->preallocated_size, BLOCK_MANAGER_HEADER_SIZE);
     return 0;
 }
 
@@ -289,6 +373,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
     /* we initialize atomic variable to prevent reading uninitialized memory */
     atomic_init(&new_bm->current_file_size, 0);
+    atomic_init(&new_bm->preallocated_size, 0);
 
     new_bm->sync_mode = sync_mode;
     new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
@@ -369,6 +454,9 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         }
     }
 
+    /* preallocated extent starts at the current file size; first write will extend it */
+    atomic_store(&new_bm->preallocated_size, atomic_load(&new_bm->current_file_size));
+
     *bm = new_bm;
     return 0;
 }
@@ -376,6 +464,16 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 int block_manager_close(block_manager_t *bm)
 {
     if (!bm) return -1;
+
+    /* preallocation advances logical EOF past actual data; trim back so next-open
+     * validation sees the real tail block instead of trailing zeros. crash recovery
+     * still has to tolerate trailing zeros (size_field == 0 marks the boundary). */
+    const uint64_t valid_size = atomic_load(&bm->current_file_size);
+    const uint64_t prealloc = atomic_load(&bm->preallocated_size);
+    if (prealloc != UINT64_MAX && prealloc > valid_size && bm->fd >= 0)
+    {
+        (void)ftruncate(bm->fd, (off_t)valid_size);
+    }
 
     /* final sync on close -- we really only needed if O_DSYNC wasnt used
      * with O_DSYNC, all writes are already durable */
@@ -445,7 +543,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 {
     if (BM_UNLIKELY(!bm || !block)) return -1;
 
-    /* block size is stored as uint32_t, so enforce 4GB limit */
+    /* block size is stored as uint32_t, thus enforced 4GB limit */
     if (BM_UNLIKELY(block->size > UINT32_MAX))
     {
         return -1;
@@ -464,16 +562,19 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     /* we atomically allocate space in file */
     const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
 
-    /* block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
-     * we use pwritev scatter-gather I/O to write header, data, and footer
-     * in a single syscall while avoiding copying block data into an intermediate buffer */
+    /* we extend on-disk preallocation ahead of writes so pwrite stays in-place */
+    (void)maybe_extend_allocation(bm, (uint64_t)offset + total_size);
+
+    /*** block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
+     **  we use pwritev scatter-gather I/O to write header, data, and footer
+     *   in a single syscall while avoiding copying block data into an intermediate buffer */
     unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
     encode_uint32_le_compat(header, (uint32_t)block->size);
     encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
 
     unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
     encode_uint32_le_compat(footer, (uint32_t)block->size);
-    encode_uint32_le_compat(footer + 4, BLOCK_MANAGER_FOOTER_MAGIC);
+    encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
 
     /* we write header + data + footer in a single pwritev call -- zero copy from block->data */
     struct iovec iov[3];
@@ -487,8 +588,8 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
         return -1;
 
-    /* if O_DSYNC is available and was used at open time, pwrite already synced
-     * otherwise we fall back to explicit fdatasync for durability */
+    /** if O_DSYNC is available and was used at open time, pwrite already synced
+     *  otherwise we fall back to explicit fdatasync for durability */
     if (is_sync_full(bm) && !odsync_available())
     {
         if (fdatasync(bm->fd) != 0)
@@ -510,13 +611,15 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
 
     const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
 
+    (void)maybe_extend_allocation(bm, (uint64_t)offset + total_size);
+
     unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
     encode_uint32_le_compat(header, size);
     encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
 
     unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
     encode_uint32_le_compat(footer, size);
-    encode_uint32_le_compat(footer + 4, BLOCK_MANAGER_FOOTER_MAGIC);
+    encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
 
     struct iovec iov[3];
     iov[0].iov_base = header;
@@ -569,6 +672,8 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
     /* we atomically allocate space for all blocks at once */
     const int64_t base_offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_batch_size);
 
+    (void)maybe_extend_allocation(bm, (uint64_t)base_offset + total_batch_size);
+
     const size_t meta_size =
         valid_count * (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE);
     const size_t iov_count = valid_count * 3;
@@ -602,7 +707,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         encode_uint32_le_compat(hdr, (uint32_t)block->size);
         encode_uint32_le_compat(hdr + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
         encode_uint32_le_compat(ftr, (uint32_t)block->size);
-        encode_uint32_le_compat(ftr + 4, BLOCK_MANAGER_FOOTER_MAGIC);
+        encode_uint32_le_compat(ftr + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
 
         iov[iov_idx].iov_base = hdr;
         iov[iov_idx].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
@@ -886,13 +991,15 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     if (block_size == 0) return -1; /* zero-filled hole: extent unknown, cannot advance */
 
     /* read footer magic to distinguish partial write from genuine corruption.
-     * footer layout: [footer_size(4)][footer_magic(4)].
+     * footer layout:
+     * [footer_size(BLOCK_MANAGER_CHECKSUM_LENGTH)][footer_magic(BLOCK_MANAGER_CHECKSUM_LENGTH)].
      * footer_magic sits at: current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE */
     const off_t footer_magic_offset = (off_t)cursor->current_pos + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
                                       (off_t)block_size + BLOCK_MANAGER_SIZE_FIELD_SIZE;
-    unsigned char magic_buf[4];
-    const ssize_t nread = pread(cursor->bm->fd, magic_buf, 4, footer_magic_offset);
-    if (nread != 4)
+    unsigned char magic_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
+    const ssize_t nread =
+        pread(cursor->bm->fd, magic_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, footer_magic_offset);
+    if (nread != BLOCK_MANAGER_CHECKSUM_LENGTH)
     {
         /* footer not present so file truncated mid-block; treat as partial write */
         cursor->current_pos +=
@@ -1085,7 +1192,8 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     }
 
     const uint32_t prev_block_size = decode_uint32_le_compat(footer_buf);
-    const uint32_t footer_magic = decode_uint32_le_compat(footer_buf + 4);
+    const uint32_t footer_magic =
+        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
 
     /* we validate footer magic */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || prev_block_size == 0)
@@ -1151,7 +1259,8 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
     }
 
     const uint32_t block_size = decode_uint32_le_compat(footer_buf);
-    const uint32_t footer_magic = decode_uint32_le_compat(footer_buf + 4);
+    const uint32_t footer_magic =
+        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
 
     /* we verify footer magic */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || block_size == 0)
@@ -1287,8 +1396,9 @@ int block_manager_count_blocks(block_manager_t *bm)
 
     set_file_sequential_hint(bm->fd);
 
-    /* buffered scan where we read 64KB chunks so thousands of block headers are parsed per syscall.
-     * we only need the first 4 bytes of each block (size field) to compute the skip distance. */
+    /** buffered scan where we read 64KB chunks so thousands of block headers are parsed per
+     * syscall. we only need the first 4 bytes of each block (size field) to compute the skip
+     * distance. */
     enum
     {
         COUNT_BUF = 64 * 1024
@@ -1334,8 +1444,8 @@ int block_manager_count_blocks(block_manager_t *bm)
             count++;
         }
 
-        /* we advance file position by bytes consumed.
-         * if off == 0, one block is larger than the buffer, we read its size and skip. */
+        /** we advance file position by bytes consumed.
+         *  if off == 0, one block is larger than the buffer, we read its size and skip. */
         if (off == 0)
         {
             const uint32_t bsz = decode_uint32_le_compat(buf);
@@ -1360,6 +1470,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
     if (get_file_size(bm->fd, &file_size) != 0) return -1;
 
     atomic_store(&bm->current_file_size, file_size);
+    atomic_store(&bm->preallocated_size, file_size);
 
     /* if file is empty, we write header */
     if (file_size == 0)
@@ -1408,50 +1519,79 @@ int block_manager_validate_last_block(block_manager_t *bm,
     }
 
     const uint32_t footer_size = decode_uint32_le_compat(footer_buf);
-    const uint32_t footer_magic = decode_uint32_le_compat(footer_buf + 4);
+    const uint32_t footer_magic =
+        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
 
     /* we check if footer is valid */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC)
     {
-        if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
-        {
-            return -1;
-        }
-
+        /*** the trailing region might be preallocation tail (zeros from fallocate after
+         **  the last valid block) rather than corruption. forward-scan to find the actual
+         *   data extent, then check whether the trailing region is all zeros to decide. */
         uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
         uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
+        int hit_corruption = 0; /* 1 = found non-zero garbage or partial block */
 
         while (scan_pos + min_block_size <= file_size)
         {
             unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
             if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
                 BLOCK_MANAGER_SIZE_FIELD_SIZE)
+            {
+                hit_corruption = 1;
                 break;
+            }
 
             const uint32_t block_size = decode_uint32_le_compat(size_buf);
-            if (block_size == 0) break;
+            if (block_size == 0) break; /* end of data; tail is either prealloc or hole */
 
             const uint64_t total_block_size =
                 BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size + BLOCK_MANAGER_FOOTER_SIZE;
-            if (scan_pos + total_block_size > file_size) break;
+            if (scan_pos + total_block_size > file_size)
+            {
+                hit_corruption = 1; /* declared size overruns file */
+                break;
+            }
 
             /* we verify footer of this block */
             const off_t block_footer_offset =
                 (off_t)(scan_pos + total_block_size - BLOCK_MANAGER_FOOTER_SIZE);
             if (pread(bm->fd, footer_buf, BLOCK_MANAGER_FOOTER_SIZE, block_footer_offset) !=
                 BLOCK_MANAGER_FOOTER_SIZE)
+            {
+                hit_corruption = 1;
                 break;
+            }
 
             const uint32_t block_footer_size = decode_uint32_le_compat(footer_buf);
-            const uint32_t block_footer_magic = decode_uint32_le_compat(footer_buf + 4);
+            const uint32_t block_footer_magic =
+                decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
 
             if (block_footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || block_footer_size != block_size)
+            {
+                hit_corruption = 1;
                 break;
+            }
 
             valid_size = scan_pos + total_block_size;
             scan_pos += total_block_size;
         }
 
+        /* if we stopped without explicit corruption, verify the trailing region is
+         * all zeros -- that confirms it's preallocation tail, not a partial write. */
+        const int trailing_zero =
+            hit_corruption ? 0 : is_trailing_zero(bm->fd, valid_size, file_size);
+
+        if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
+        {
+            if (hit_corruption || trailing_zero != 1) return -1;
+            /* preallocation tail is legitimate; don't truncate, just record true extent */
+            atomic_store(&bm->current_file_size, valid_size);
+            return 0;
+        }
+
+        /* permissive mode -- truncate trailing garbage OR preallocation tail so
+         * the file is always self-describing on next open */
         if (valid_size != file_size)
         {
             if (ftruncate(bm->fd, (off_t)valid_size) != 0) return -1;
@@ -1463,6 +1603,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
 
             if (reopen_fd(bm) != 0) return -1;
             atomic_store(&bm->current_file_size, valid_size);
+            atomic_store(&bm->preallocated_size, valid_size);
         }
 
         return 0;
@@ -1534,7 +1675,7 @@ int block_manager_get_block_size_at_offset(block_manager_t *bm, const uint64_t o
 {
     if (!bm || !size) return -1;
 
-    /* we read the size field from block header (first 4 bytes of block) */
+    /* we read the size field from block header */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     const ssize_t nread = pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset);
     if (nread != BLOCK_MANAGER_SIZE_FIELD_SIZE)

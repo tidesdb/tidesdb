@@ -2673,6 +2673,81 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
 }
 
 /*
+ * tdb_preallocate_extent
+ * extends the logical file size and reserves on-disk blocks for the new region
+ * ahead of writes, so that subsequent pwrites within the preallocated extent do
+ * NOT take the kernel's "write extends file" fast path. on Linux ext4 this
+ * avoids the per-inode i_rwsem write lock; equivalent locks exist on macOS APFS
+ * (vnode write lock) and Windows NTFS (file-extension lock).
+ *
+ * critical detail: the logical EOF (i_size) MUST advance, not just the on-disk
+ * extent allocation. on Linux, fallocate(KEEP_SIZE) reserves blocks but leaves
+ * i_size unchanged, and the kernel still treats writes past i_size as extending
+ * writes -- delivering no speedup. mode 0 advances i_size and initializes the
+ * extents so subsequent pwrites are fully in-place.
+ *
+ * the trailing region is zero-filled. the caller must ftruncate back to the
+ * actual data extent on clean close so next-open validation isn't confused by
+ * trailing zeros. crash recovery should tolerate trailing zeros as preallocation
+ * tail (size_field == 0 marks the boundary between data and preallocated region).
+ *
+ * platform behavior:
+ *   linux:   fallocate(fd, 0, off, len) -- advances i_size, initializes extents
+ *   macos:   fcntl(F_PREALLOCATE) reserves, then ftruncate advances logical EOF
+ *   windows: SetFileInformationByHandle(FileAllocationInfo) reserves, then
+ *            FileEndOfFileInfo advances EOF
+ *   other posix: posix_fallocate -- already advances EOF
+ *   fallback: returns -1, caller falls back to extending writes
+ *
+ * @param fd the file descriptor
+ * @param offset start of the region to preallocate (typically current EOF)
+ * @param len    number of bytes to preallocate
+ * @return 0 on success, -1 on failure (non-fatal -- caller can continue)
+ */
+static inline int tdb_preallocate_extent(int fd, off_t offset, off_t len)
+{
+#if defined(__linux__)
+    return fallocate(fd, 0, offset, len);
+#elif defined(__APPLE__)
+    /* reserve blocks past current EOF (offset param is implicit on macOS) */
+    (void)offset;
+    fstore_t fst;
+    fst.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
+    fst.fst_posmode = F_PEOFPOSMODE;
+    fst.fst_offset = 0;
+    fst.fst_length = len;
+    fst.fst_bytesalloc = 0;
+    if (fcntl(fd, F_PREALLOCATE, &fst) == -1)
+    {
+        /* contiguous request failed, retry allowing fragmentation */
+        fst.fst_flags = F_ALLOCATEALL;
+        if (fcntl(fd, F_PREALLOCATE, &fst) == -1) return -1;
+    }
+    /* advance logical EOF so writes within the new region don't take the
+     * extending-write lock */
+    return ftruncate(fd, offset + len);
+#elif defined(_WIN32)
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    FILE_ALLOCATION_INFO fai;
+    fai.AllocationSize.QuadPart = (LONGLONG)(offset + len);
+    if (!SetFileInformationByHandle(h, FileAllocationInfo, &fai, sizeof(fai))) return -1;
+    /* advance logical EOF -- otherwise NTFS still treats writes past EOF as extending */
+    FILE_END_OF_FILE_INFO eofi;
+    eofi.EndOfFile.QuadPart = (LONGLONG)(offset + len);
+    return SetFileInformationByHandle(h, FileEndOfFileInfo, &eofi, sizeof(eofi)) ? 0 : -1;
+#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+    int rc = posix_fallocate(fd, offset, len);
+    return rc == 0 ? 0 : -1;
+#else
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return -1;
+#endif
+}
+
+/*
  * set_file_sequential_hint
  * hints to the OS that file access will be sequential for read-ahead optimization
  * @param fd the file descriptor

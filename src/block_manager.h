@@ -34,10 +34,6 @@
 #define BLOCK_MANAGER_MAGIC_SIZE 3
 /* version field size in bytes */
 #define BLOCK_MANAGER_VERSION_SIZE 1
-/* block_size field size in bytes */
-#define BLOCK_MANAGER_BLOCK_SIZE_SIZE 4
-/* padding field size in bytes */
-#define BLOCK_MANAGER_PADDING_SIZE 4
 #define BLOCK_MANAGER_HEADER_SIZE  8
 
 /* block field sizes */
@@ -46,7 +42,7 @@
 /* xxHash32 = 4 bytes (sufficient for block-level checksums) */
 #define BLOCK_MANAGER_CHECKSUM_LENGTH 4
 
-/* block header is now just size + checksum (no overflow) */
+/* block header is now just size + checksum */
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
 
@@ -56,6 +52,13 @@
 
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
+
+/* preallocation tunables -- controls how aggressively we extend on-disk allocation
+ * ahead of writes to avoid the kernel's file-extending lock on every pwrite.
+ * extending writes serialize on the per-inode lock (e.g., ext4 i_rwsem) regardless
+ * of disjoint offsets, so we preallocate in chunks and let pwrites land in-place. */
+#define BLOCK_MANAGER_PREALLOC_CHUNK    (64ull * 1024 * 1024) /* extend by 64 MB at a time */
+#define BLOCK_MANAGER_PREALLOC_LOWWATER (4ull * 1024 * 1024)  /* trigger extend when 4 MB left */
 
 typedef enum
 {
@@ -79,6 +82,11 @@ typedef enum
  * @param sync_mode sync mode for this block manager
  * @param sync_full_cached cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL)
  * @param current_file_size track file size in memory to avoid syscalls
+ * @param preallocated_size on-disk allocation high water mark; pwrites within
+ *                          [HEADER_SIZE, preallocated_size) avoid extending the file
+ *                          and skip the kernel's per-inode write lock fast path.
+ *                          set to UINT64_MAX if preallocation is unsupported on this
+ *                          platform/fs to disable further attempts.
  */
 typedef struct
 {
@@ -88,6 +96,7 @@ typedef struct
     int sync_full_cached; /* cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL) */
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
+    ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;
 } block_manager_t;
 
 /**

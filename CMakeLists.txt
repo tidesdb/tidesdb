@@ -14,7 +14,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 9.0.8)
+set(PROJECT_VERSION 9.0.9)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -44,6 +44,11 @@ endif()
 
 if(MINGW)
     add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+endif()
+
+# expose glibc extensions on linux (fallocate, etc.) for compat.h helpers
+if(UNIX AND NOT APPLE)
+    add_compile_definitions(_GNU_SOURCE)
 endif()
 
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")

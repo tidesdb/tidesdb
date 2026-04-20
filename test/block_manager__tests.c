@@ -3208,6 +3208,209 @@ void test_cursor_skip_corrupt_refuses_data_corruption(void)
     (void)remove(test_file);
 }
 
+/* helper that returns file size or -1 on error */
+static int64_t test_file_size(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
+/* helper to extend a file with N zero bytes appended past current EOF */
+static int test_extend_with_zeros(const char *path, size_t extra_bytes)
+{
+    FILE *f = fopen(path, "a+b");
+    if (!f) return -1;
+    static const char zeros[4096] = {0};
+    while (extra_bytes > 0)
+    {
+        size_t chunk = extra_bytes > sizeof(zeros) ? sizeof(zeros) : extra_bytes;
+        if (fwrite(zeros, 1, chunk, f) != chunk)
+        {
+            fclose(f);
+            return -1;
+        }
+        extra_bytes -= chunk;
+    }
+    fclose(f);
+    return 0;
+}
+
+void test_block_manager_preallocation_extends_then_close_trims()
+{
+    const char *path = "prealloc_extend.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* we write a handful of small blocks; first write should trigger preallocation */
+    const uint64_t block_size = 100;
+    const int n_blocks = 5;
+    for (int i = 0; i < n_blocks; i++)
+    {
+        char data[100];
+        memset(data, 'a' + i, sizeof(data));
+        block_manager_block_t *block = block_manager_block_create(block_size, data);
+        ASSERT_TRUE(block != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+        (void)block_manager_block_free(block);
+    }
+
+    const uint64_t actual_data_size =
+        BLOCK_MANAGER_HEADER_SIZE + (uint64_t)n_blocks * (BLOCK_MANAGER_BLOCK_HEADER_SIZE +
+                                                          block_size + BLOCK_MANAGER_FOOTER_SIZE);
+
+    /* before close the file must be larger than the actual data extent (preallocation tail) */
+    const int64_t pre_close = test_file_size(path);
+    ASSERT_TRUE(pre_close > 0);
+    printf("  pre-close file_size=%" PRId64 ", actual_data=%" PRIu64 " (prealloc tail=%" PRId64
+           " bytes)\n",
+           pre_close, actual_data_size, pre_close - (int64_t)actual_data_size);
+    ASSERT_TRUE((uint64_t)pre_close > actual_data_size);
+
+    /* we close should ftruncate back to actual data extent */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    const int64_t post_close = test_file_size(path);
+    ASSERT_TRUE(post_close >= 0);
+    ASSERT_EQ((uint64_t)post_close, actual_data_size);
+
+    (void)remove(path);
+}
+
+void test_block_manager_strict_validation_accepts_prealloc_tail()
+{
+    const char *path = "prealloc_strict_ok.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const int n_blocks = 3;
+    for (int i = 0; i < n_blocks; i++)
+    {
+        char data[16] = {0};
+        snprintf(data, sizeof(data), "block%d", i);
+        block_manager_block_t *block = block_manager_block_create(sizeof(data), data);
+        ASSERT_TRUE(block != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+        (void)block_manager_block_free(block);
+    }
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    const int64_t clean_size = test_file_size(path);
+    ASSERT_TRUE(clean_size > 0);
+
+    /** we simulate post-crash state by re-extending the file with zeros to mimic preallocation
+     *  tail that would have survived a crash before clean close could trim it */
+    ASSERT_EQ(test_extend_with_zeros(path, 256 * 1024), 0);
+    ASSERT_TRUE(test_file_size(path) > clean_size);
+
+    /* STRICT validation must accept this -- the tail is all zeros, not corruption */
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_EQ(block_manager_validate_last_block(bm, BLOCK_MANAGER_STRICT_BLOCK_VALIDATION), 0);
+
+    /* current_file_size should be set to the actual data extent, not the inflated size */
+    uint64_t reported_size = 0;
+    ASSERT_EQ(block_manager_get_size(bm, &reported_size), 0);
+    ASSERT_EQ((int64_t)reported_size, clean_size);
+
+    /* and the original blocks are still readable */
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_EQ(block_manager_cursor_init(&cursor, bm), 0);
+    int read_count = 0;
+    for (int i = 0; i < n_blocks; i++)
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        ASSERT_TRUE(block != NULL);
+        char expected[16] = {0};
+        snprintf(expected, sizeof(expected), "block%d", i);
+        ASSERT_EQ(memcmp(block->data, expected, sizeof(expected)), 0);
+        (void)block_manager_block_free(block);
+        read_count++;
+        if (i < n_blocks - 1) ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+    }
+    ASSERT_EQ(read_count, n_blocks);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+void test_block_manager_strict_validation_rejects_garbage_tail()
+{
+    const char *path = "prealloc_strict_bad.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    for (int i = 0; i < 3; i++)
+    {
+        char data[16] = {0};
+        snprintf(data, sizeof(data), "block%d", i);
+        block_manager_block_t *block = block_manager_block_create(sizeof(data), data);
+        ASSERT_TRUE(block != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+        (void)block_manager_block_free(block);
+    }
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* we append non-zero garbage past the data -- distinct from preallocation tail */
+    FILE *f = fopen(path, "a+b");
+    ASSERT_TRUE(f != NULL);
+    unsigned char garbage[1024];
+    for (size_t i = 0; i < sizeof(garbage); i++) garbage[i] = (unsigned char)(0xAB ^ (i & 0xFF));
+    ASSERT_EQ(fwrite(garbage, sizeof(garbage), 1, f), 1u);
+    fclose(f);
+
+    /* STRICT validation must reject -- non-zero tail bytes signal real corruption */
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_EQ(block_manager_validate_last_block(bm, BLOCK_MANAGER_STRICT_BLOCK_VALIDATION), -1);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    (void)remove(path);
+}
+
+void test_block_manager_permissive_validation_truncates_prealloc_tail()
+{
+    const char *path = "prealloc_permissive.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const int n_blocks = 3;
+    for (int i = 0; i < n_blocks; i++)
+    {
+        char data[16] = {0};
+        snprintf(data, sizeof(data), "block%d", i);
+        block_manager_block_t *block = block_manager_block_create(sizeof(data), data);
+        ASSERT_TRUE(block != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+        (void)block_manager_block_free(block);
+    }
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    const int64_t clean_size = test_file_size(path);
+    ASSERT_TRUE(clean_size > 0);
+
+    /* we simulate surviving preallocation tail */
+    ASSERT_EQ(test_extend_with_zeros(path, 128 * 1024), 0);
+    ASSERT_TRUE(test_file_size(path) > clean_size);
+
+    /* PERMISSIVE validation should succeed AND trim the file back */
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_EQ(block_manager_validate_last_block(bm, BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION), 0);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* file on disk should now match the original clean size */
+    ASSERT_EQ(test_file_size(path), clean_size);
+
+    (void)remove(path);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -3270,6 +3473,11 @@ int main(int argc, char **argv)
 #endif
     RUN_TEST(test_cursor_skip_corrupt_partial_write, tests_passed);
     RUN_TEST(test_cursor_skip_corrupt_refuses_data_corruption, tests_passed);
+
+    RUN_TEST(test_block_manager_preallocation_extends_then_close_trims, tests_passed);
+    RUN_TEST(test_block_manager_strict_validation_accepts_prealloc_tail, tests_passed);
+    RUN_TEST(test_block_manager_strict_validation_rejects_garbage_tail, tests_passed);
+    RUN_TEST(test_block_manager_permissive_validation_truncates_prealloc_tail, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

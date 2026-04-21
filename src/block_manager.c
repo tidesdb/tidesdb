@@ -472,7 +472,13 @@ int block_manager_close(block_manager_t *bm)
     const uint64_t prealloc = atomic_load(&bm->preallocated_size);
     if (prealloc != UINT64_MAX && prealloc > valid_size && bm->fd >= 0)
     {
-        (void)ftruncate(bm->fd, (off_t)valid_size);
+        /* best-effort -- if it fails, next-open validate_last_block tolerates the
+         * trailing-zero preallocation tail. (void) cast doesn't suppress glibc's
+         * warn_unused_result, hence the explicit if. */
+        if (ftruncate(bm->fd, (off_t)valid_size) != 0)
+        {
+            /* swallow */
+        }
     }
 
     /* final sync on close -- we really only needed if O_DSYNC wasnt used

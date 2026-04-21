@@ -63,8 +63,9 @@ if(TIDESDB_WITH_SANITIZER)
         # debug flags for MSVC
         # MSVC ASAN can be unstable, so we only enable warnings for CI
         # suppress noisy warnings: 4311 (pointer truncation), 4244 (conversion), 4047 (pointer indirection)
-        # 4127 (constant expression in conditional), 4305 (type truncation)
-        add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305)
+        # 4127 (constant expression in conditional), 4305 (type truncation),
+        # 4702 (unreachable code -- triggered inside uthash macro expansions in the bench)
+        add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305 /wd4702)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
@@ -89,7 +90,8 @@ else()
         # 4459: declaration hides global declaration
         # 4700: uninitialized local variable used
         # 4013: undefined function (implicit declaration)
-        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700 /wd4013)
+        # 4702: unreachable code (triggered inside uthash macro expansions in the bench)
+        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700 /wd4013 /wd4702)
     elseif(MINGW)
         # MinGW/GCC flags without sanitizers
         add_compile_options(-std=c11)

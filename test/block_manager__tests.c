@@ -3261,17 +3261,40 @@ void test_block_manager_preallocation_extends_then_close_trims()
         BLOCK_MANAGER_HEADER_SIZE + (uint64_t)n_blocks * (BLOCK_MANAGER_BLOCK_HEADER_SIZE +
                                                           block_size + BLOCK_MANAGER_FOOTER_SIZE);
 
-    /* before close the file must be larger than the actual data extent (preallocation tail) */
     const int64_t pre_close = test_file_size(path);
     ASSERT_TRUE(pre_close > 0);
-    printf("  pre-close file_size=%" PRId64 ", actual_data=%" PRIu64 " (prealloc tail=%" PRId64
-           " bytes)\n",
-           pre_close, actual_data_size, pre_close - (int64_t)actual_data_size);
-    ASSERT_TRUE((uint64_t)pre_close > actual_data_size);
 
-    /* we close should ftruncate back to actual data extent */
+    /* preallocation may be unsupported by the underlying filesystem (notably ZFS on
+     * FreeBSD/illumos returns EINVAL from posix_fallocate, and DragonFly may lack it
+     * entirely). when unsupported, the block manager stamps preallocated_size with
+     * UINT64_MAX after the first failed extend, falls back to plain extending writes,
+     * and the file ends up exactly at actual_data_size. detect this at runtime and
+     * relax the tail-size assertion accordingly while still verifying that close
+     * preserves correctness in either path. */
+    const uint64_t prealloc_state = atomic_load(&bm->preallocated_size);
+    const int prealloc_supported = (prealloc_state != UINT64_MAX);
+
+    if (prealloc_supported)
+    {
+        printf("  pre-close file_size=%" PRId64 ", actual_data=%" PRIu64 " (prealloc tail=%" PRId64
+               " bytes)\n",
+               pre_close, actual_data_size, pre_close - (int64_t)actual_data_size);
+        ASSERT_TRUE((uint64_t)pre_close > actual_data_size);
+    }
+    else
+    {
+        printf(
+            "  preallocation unsupported on this fs/platform -- file size matches data, "
+            "skipping tail assertions (file_size=%" PRId64 ")\n",
+            pre_close);
+        ASSERT_EQ((uint64_t)pre_close, actual_data_size);
+    }
+
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
+    /* in the supported path close must trim back to actual_data_size; in the unsupported
+     * path close must leave the file alone (no spurious ftruncate). either way we expect
+     * the on-disk size to equal the actual data extent. */
     const int64_t post_close = test_file_size(path);
     ASSERT_TRUE(post_close >= 0);
     ASSERT_EQ((uint64_t)post_close, actual_data_size);

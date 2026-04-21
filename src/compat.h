@@ -39,6 +39,17 @@
 #endif
 
 #ifdef _WIN32
+/* require Windows Vista+ APIs (SetFileInformationByHandle, FILE_ALLOCATION_INFO,
+ * FILE_END_OF_FILE_INFO) used by tdb_preallocate_extent. defined before any
+ * windows.h include below so the right structure declarations are visible. */
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#if !defined(WINVER) || WINVER < 0x0600
+#undef WINVER
+#define WINVER 0x0600
+#endif
 #define PATH_SEPARATOR "\\"
 #else
 #define PATH_SEPARATOR "/"

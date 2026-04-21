@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef _OBJSTORE_H_
-#define _OBJSTORE_H_
+#ifndef __OBJSTORE_H__
+#define __OBJSTORE_H__
 
 #include "compat.h"
 
@@ -209,4 +209,4 @@ tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir);
 #include "objstore_s3.h"
 #endif
 
-#endif /* _OBJSTORE_H_ */
+#endif /* __OBJSTORE_H__ */

@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef _LOCAL_CACHE_H_
-#define _LOCAL_CACHE_H_
+#ifndef __LOCAL_CACHE_H__
+#define __LOCAL_CACHE_H__
 
 #include "compat.h"
 
@@ -116,4 +116,4 @@ void tdb_local_cache_touch(tdb_local_cache_t *cache, const char *local_path);
  */
 void tdb_local_cache_remove(tdb_local_cache_t *cache, const char *local_path);
 
-#endif /* _LOCAL_CACHE_H_ */
+#endif /* __LOCAL_CACHE_H__ */

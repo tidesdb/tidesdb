@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef _OBJSTORE_S3_H_
-#define _OBJSTORE_S3_H_
+#ifndef __OBJSTORE_S3_H__
+#define __OBJSTORE_S3_H__
 
 #include "objstore.h"
 
@@ -41,4 +41,4 @@ tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char 
                                                const char *secret_key, const char *region,
                                                int use_ssl, int use_path_style);
 
-#endif /* _OBJSTORE_S3_H_ */
+#endif /* __OBJSTORE_S3_H__ */

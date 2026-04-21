@@ -14,7 +14,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 9.0.8)
+set(PROJECT_VERSION 9.0.9)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -46,6 +46,11 @@ if(MINGW)
     add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
 endif()
 
+# expose glibc extensions on linux (fallocate, etc.) for compat.h helpers
+if(UNIX AND NOT APPLE)
+    add_compile_definitions(_GNU_SOURCE)
+endif()
+
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     if(NOT CMAKE_C_COMPILER_VERSION VERSION_LESS 11.0)
         add_compile_options(-Wno-psabi)
@@ -58,8 +63,9 @@ if(TIDESDB_WITH_SANITIZER)
         # debug flags for MSVC
         # MSVC ASAN can be unstable, so we only enable warnings for CI
         # suppress noisy warnings: 4311 (pointer truncation), 4244 (conversion), 4047 (pointer indirection)
-        # 4127 (constant expression in conditional), 4305 (type truncation)
-        add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305)
+        # 4127 (constant expression in conditional), 4305 (type truncation),
+        # 4702 (unreachable code -- triggered inside uthash macro expansions in the bench)
+        add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305 /wd4702)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
@@ -84,7 +90,8 @@ else()
         # 4459: declaration hides global declaration
         # 4700: uninitialized local variable used
         # 4013: undefined function (implicit declaration)
-        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700 /wd4013)
+        # 4702: unreachable code (triggered inside uthash macro expansions in the bench)
+        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700 /wd4013 /wd4702)
     elseif(MINGW)
         # MinGW/GCC flags without sanitizers
         add_compile_options(-std=c11)

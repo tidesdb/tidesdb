@@ -5243,33 +5243,6 @@ static void tidesdb_invalidate_btree_cache_for_sstable(tidesdb_t *db, uint64_t s
 }
 
 /**
- * tidesdb_invalidate_block_cache_for_sstable
- * invalidate all block cache entries for a specific sstable
- * block cache keys are formatted as "cf_name:filename:block_position"
- * e.g., "users:L2_1337.klog:0", "users:L2_1337.klog:65536"
- * @param db the database
- * @param cf_name column family name
- * @param klog_path path to klog file (used to extract filename)
- */
-static void tidesdb_invalidate_block_cache_for_sstable(tidesdb_t *db, const char *cf_name,
-                                                       const char *klog_path)
-{
-    if (!db || !db->clock_cache || !cf_name || !klog_path) return;
-
-    /* we extract filename from path (cross-platform, handles mixed separators) */
-    const char *last_fwd = strrchr(klog_path, '/');
-    const char *last_back = strrchr(klog_path, '\\');
-    const char *last_sep = (last_fwd > last_back) ? last_fwd : last_back;
-    const char *filename = last_sep ? last_sep + 1 : klog_path;
-
-    char prefix[TDB_CACHE_KEY_SIZE];
-    const int prefix_len = snprintf(prefix, sizeof(prefix), "%s:%s:", cf_name, filename);
-    if (prefix_len <= 0 || (size_t)prefix_len >= sizeof(prefix)) return;
-
-    clock_cache_delete_by_prefix(db->clock_cache, prefix, (size_t)prefix_len);
-}
-
-/**
  * tidesdb_invalidate_block_cache_for_cf
  * invalidate all block cache entries for a column family
  * @param db the database

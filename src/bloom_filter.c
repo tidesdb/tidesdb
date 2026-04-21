@@ -22,8 +22,8 @@
 #include <string.h>
 #include <tgmath.h>
 
-#define BLOOM_UNLIKELY(x) TDB_UNLIKELY(x)
-#define BLOOM_LIKELY(x)   TDB_LIKELY(x)
+#define BF_UNLIKELY(x) TDB_UNLIKELY(x)
+#define BF_LIKELY(x)   TDB_LIKELY(x)
 
 /* bit manipulation macros for packed bitset */
 #define BF_BITS_PER_WORD        64
@@ -31,6 +31,25 @@
 #define BF_BIT_INDEX(bit)       ((bit) % BF_BITS_PER_WORD)
 #define BF_SET_BIT(bitset, bit) ((bitset)[BF_WORD_INDEX(bit)] |= (1ULL << BF_BIT_INDEX(bit)))
 #define BF_GET_BIT(bitset, bit) (((bitset)[BF_WORD_INDEX(bit)] >> BF_BIT_INDEX(bit)) & 1ULL)
+
+/* hash mixing prime (murmur-family). chosen for good avalanche behavior in
+ * the multiplicative mix below. */
+#define BF_HASH_PRIME 0xc6a4a793u
+
+/* upper bound on the number of hash functions accepted by bloom_filter_new.
+ * derived h grows logarithmically with target false-positive rate; even at
+ * p = 1e-30 the formula yields h ~ 100, so this is a generous sanity ceiling
+ * to reject pathological configs (negative or absurdly large values from
+ * floating-point edge cases). typical real-world h is 7-15. */
+#define BF_MAX_HASH_FUNCTIONS 100
+
+/* varint worst-case sizes for serialization buffer math */
+#define BF_VARINT32_MAX_BYTES 5
+#define BF_VARINT64_MAX_BYTES 10
+/* serialized header is 3 varint32s -- m, h, non_zero_count */
+#define BF_SERIALIZE_HEADER_MAX_BYTES (3 * BF_VARINT32_MAX_BYTES)
+/* each non-zero word is encoded as varint32 index + varint64 value */
+#define BF_SERIALIZE_WORD_MAX_BYTES (BF_VARINT32_MAX_BYTES + BF_VARINT64_MAX_BYTES)
 
 /* lemire's fast range reduction maps a uniform uint32_t hash into [0, range)
  * without integer division. it uses a single 64-bit multiply + shift.
@@ -48,7 +67,7 @@ static inline uint32_t bf_fast_range(const uint32_t hash, const uint32_t range)
  */
 static inline uint32_t bf_hash_inline(const uint8_t *entry, const size_t size, const uint32_t seed)
 {
-    const uint32_t prime = 0xc6a4a793;
+    const uint32_t prime = BF_HASH_PRIME;
     const uint8_t *limit = entry + size;
     uint32_t h = seed ^ ((uint32_t)size * prime);
 
@@ -140,8 +159,9 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
      */
     const double h_double = ceil(((double)(*bf)->m) / n * M_LN2);
 
-    /* we validate h is reasonable (typically 1-20) */
-    if (h_double <= 0.0 || h_double > 100.0)
+    /* we validate h is reasonable -- typical real-world values are 7-15;
+     * BF_MAX_HASH_FUNCTIONS rejects pathological configs from FP edge cases */
+    if (h_double <= 0.0 || h_double > (double)BF_MAX_HASH_FUNCTIONS)
     {
         free(*bf);
         return -1;
@@ -172,8 +192,8 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 
 void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
-    if (BLOOM_UNLIKELY(bf == NULL)) return;
-    if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return;
+    if (BF_UNLIKELY(bf == NULL)) return;
+    if (BF_UNLIKELY(entry == NULL || size == 0)) return;
 
     /* we cache struct fields to avoid repeated memory access */
     const unsigned int h = bf->h;
@@ -191,76 +211,10 @@ void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size
     }
 }
 
-/* maximum entries to batch in one cache-friendly pass */
-#define BF_BATCH_CHUNK 256
-
-void bloom_filter_add_batch(const bloom_filter_t *bf, const uint8_t **entries, const size_t *sizes,
-                            const size_t count)
-{
-    if (BLOOM_UNLIKELY(bf == NULL)) return;
-    if (BLOOM_UNLIKELY(entries == NULL || sizes == NULL || count == 0)) return;
-
-    /* we cache struct fields to avoid repeated memory access */
-    const unsigned int h = bf->h;
-    const unsigned int m = bf->m;
-    uint64_t *const bitset = bf->bitset;
-
-    /* we pre-compute all bit indices for a chunk of entries,
-     * sort them, then set bits in ascending order for sequential cache line access.
-     * this converts random bitset writes into a mostly-sequential pattern. */
-
-    uint32_t indices[BF_BATCH_CHUNK * 20];
-    const unsigned int probes_per_entry = (h > 20) ? 20 : h;
-
-    for (size_t base = 0; base < count; base += BF_BATCH_CHUNK)
-    {
-        size_t chunk = count - base;
-        if (chunk > BF_BATCH_CHUNK) chunk = BF_BATCH_CHUNK;
-
-        /* we compute all bit indices for this chunk */
-        size_t n_indices = 0;
-        for (size_t e = 0; e < chunk; e++)
-        {
-            const uint8_t *entry = entries[base + e];
-            const size_t sz = sizes[base + e];
-
-            if (BLOOM_UNLIKELY(entry == NULL || sz == 0)) continue;
-
-            const uint32_t h1 = bf_hash_inline(entry, sz, 0);
-            const uint32_t h2 = bf_hash_inline(entry, sz, 1);
-
-            for (unsigned int i = 0; i < probes_per_entry; i++)
-            {
-                indices[n_indices++] = bf_fast_range(h1 + i * h2, m);
-            }
-        }
-
-        /* we insertion sort the indices for cache-friendly bitset access.
-         * the array is small (<=5120 entries) so insertion sort beats qsort overhead. */
-        for (size_t i = 1; i < n_indices; i++)
-        {
-            const uint32_t key = indices[i];
-            size_t j = i;
-            while (j > 0 && indices[j - 1] > key)
-            {
-                indices[j] = indices[j - 1];
-                j--;
-            }
-            indices[j] = key;
-        }
-
-        /* we set bits in sorted order */
-        for (size_t i = 0; i < n_indices; i++)
-        {
-            BF_SET_BIT(bitset, indices[i]);
-        }
-    }
-}
-
 int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
-    if (BLOOM_UNLIKELY(bf == NULL)) return -1;
-    if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return -1;
+    if (BF_UNLIKELY(bf == NULL)) return -1;
+    if (BF_UNLIKELY(entry == NULL || size == 0)) return -1;
 
     /* we cache struct fields to avoid repeated memory access */
     const unsigned int h = bf->h;
@@ -276,7 +230,7 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
     {
         const uint32_t hash = h1 + i * h2;
         const uint32_t index = bf_fast_range(hash, m);
-        if (BLOOM_LIKELY(!BF_GET_BIT(bitset, index)))
+        if (BF_LIKELY(!BF_GET_BIT(bitset, index)))
         {
             return 0; /* definitely not in set */
         }
@@ -286,11 +240,16 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
 
 int bloom_filter_is_full(const bloom_filter_t *bf)
 {
-    if (BLOOM_UNLIKELY(bf == NULL)) return -1;
-    if (BLOOM_UNLIKELY(bf->bitset == NULL)) return -1;
+    if (BF_UNLIKELY(bf == NULL)) return -1;
+    if (BF_UNLIKELY(bf->bitset == NULL)) return -1;
 
     const uint64_t *const bitset = bf->bitset;
     const unsigned int size_in_words = bf->size_in_words;
+
+    /*** prevents `size_in_words - 1` from underflowing as unsigned.
+     **  the constructor rejects size_in_words == 0, but a future refactor or a
+     *   deserialized filter that bypasses the constructor could produce one. */
+    if (BF_UNLIKELY(size_in_words == 0)) return -1;
 
     /* we check if all words are fully set */
     for (unsigned int i = 0; i < size_in_words - 1; i++)
@@ -313,7 +272,7 @@ int bloom_filter_is_full(const bloom_filter_t *bf)
 
 unsigned int bloom_filter_hash(const uint8_t *entry, const size_t size, const int seed)
 {
-    if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return 0;
+    if (BF_UNLIKELY(entry == NULL || size == 0)) return 0;
 
     return bf_hash_inline(entry, size, (uint32_t)seed);
 }
@@ -333,10 +292,11 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     }
 
     /* we allocate worst-case size
-     * -- header            3 varint32s (m, h, non_zero_count) = 15 bytes max
-     * -- sparse data       each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
+     * -- header            3 varint32s (m, h, non_zero_count)
+     * -- sparse data       each non-zero word = varint32 index + varint64 value
      */
-    const size_t max_size = 15 + non_zero_count * 15;
+    const size_t max_size =
+        BF_SERIALIZE_HEADER_MAX_BYTES + (size_t)non_zero_count * BF_SERIALIZE_WORD_MAX_BYTES;
     uint8_t *buffer = malloc(max_size);
     if (buffer == NULL)
     {

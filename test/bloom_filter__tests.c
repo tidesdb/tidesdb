@@ -512,80 +512,6 @@ void benchmark_bloom_filter()
     (void)bloom_filter_free(bf);
 }
 
-void test_bloom_filter_add_batch()
-{
-    bloom_filter_t *bf;
-    (void)bloom_filter_new(&bf, 0.01, 1000);
-
-    /* we test batch add with multiple keys */
-    const char *keys[] = {"batch_key1", "batch_key2", "batch_key3", "batch_key4", "batch_key5"};
-    const uint8_t *entries[5];
-    size_t sizes[5];
-
-    for (int i = 0; i < 5; i++)
-    {
-        entries[i] = (const uint8_t *)keys[i];
-        sizes[i] = strlen(keys[i]);
-    }
-
-    bloom_filter_add_batch(bf, entries, sizes, 5);
-
-    /* we verify all batch-added keys are found */
-    for (int i = 0; i < 5; i++)
-    {
-        ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)keys[i], strlen(keys[i])), 1);
-    }
-
-    /* we verify non-existent key is not found */
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"nonexistent", 11), 0);
-
-    (void)bloom_filter_free(bf);
-}
-
-void test_bloom_filter_batch_vs_single()
-{
-    /* we verify batch add produces same results as single add */
-    bloom_filter_t *bf_single;
-    bloom_filter_t *bf_batch;
-    (void)bloom_filter_new(&bf_single, 0.01, 1000);
-    (void)bloom_filter_new(&bf_batch, 0.01, 1000);
-
-    const char *keys[] = {"key_a", "key_b", "key_c", "key_d", "key_e"};
-    const uint8_t *entries[5];
-    size_t sizes[5];
-
-    /* we add to single filter one at a time */
-    for (int i = 0; i < 5; i++)
-    {
-        entries[i] = (const uint8_t *)keys[i];
-        sizes[i] = strlen(keys[i]);
-        bloom_filter_add(bf_single, entries[i], sizes[i]);
-    }
-
-    /* we add to batch filter all at once */
-    bloom_filter_add_batch(bf_batch, entries, sizes, 5);
-
-    /* we verify both filters have same results */
-    for (int i = 0; i < 5; i++)
-    {
-        ASSERT_EQ(bloom_filter_contains(bf_single, entries[i], sizes[i]), 1);
-        ASSERT_EQ(bloom_filter_contains(bf_batch, entries[i], sizes[i]), 1);
-    }
-
-    /* we verify bitsets are identical */
-    ASSERT_EQ(bf_single->m, bf_batch->m);
-    ASSERT_EQ(bf_single->h, bf_batch->h);
-    ASSERT_EQ(bf_single->size_in_words, bf_batch->size_in_words);
-
-    for (unsigned int i = 0; i < bf_single->size_in_words; i++)
-    {
-        ASSERT_EQ(bf_single->bitset[i], bf_batch->bitset[i]);
-    }
-
-    (void)bloom_filter_free(bf_single);
-    (void)bloom_filter_free(bf_batch);
-}
-
 void test_bloom_filter_hash_direct(void)
 {
     /* we test the public bloom_filter_hash function directly */
@@ -635,19 +561,6 @@ void test_bloom_filter_null_safety(void)
 
     /* bloom_filter_add with NULL bf should not crash */
     bloom_filter_add(NULL, (const uint8_t *)"key", 3);
-
-    /* bloom_filter_add_batch with NULL bf should not crash */
-    const uint8_t *entries[] = {(const uint8_t *)"key"};
-    size_t sizes[] = {3};
-    bloom_filter_add_batch(NULL, entries, sizes, 1);
-
-    /* bloom_filter_add_batch with NULL entries should not crash */
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
-    bloom_filter_add_batch(bf, NULL, sizes, 1);
-    bloom_filter_add_batch(bf, entries, NULL, 1);
-    bloom_filter_add_batch(bf, entries, sizes, 0);
-    bloom_filter_free(bf);
 
     /* bloom_filter_serialize with NULL */
     size_t out_size;
@@ -778,64 +691,6 @@ void test_bloom_filter_is_full_null_bitset(void)
     bloom_filter_free(bf);
 }
 
-void test_bloom_filter_add_batch_chunked(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 1000), 0);
-
-    /* we use 300 entries to cross the 256 chunk boundary */
-    const int count = 300;
-    char keys[300][16];
-    const uint8_t *entries[300];
-    size_t sizes[300];
-
-    for (int i = 0; i < count; i++)
-    {
-        snprintf(keys[i], sizeof(keys[i]), "chunk_key_%d", i);
-        entries[i] = (const uint8_t *)keys[i];
-        sizes[i] = strlen(keys[i]);
-    }
-
-    bloom_filter_add_batch(bf, entries, sizes, count);
-
-    /* we verify all entries are found */
-    for (int i = 0; i < count; i++)
-    {
-        ASSERT_EQ(bloom_filter_contains(bf, entries[i], sizes[i]), 1);
-    }
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_add_batch_null_entries(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
-
-    const uint8_t *entries[5];
-    size_t sizes[5];
-
-    entries[0] = (const uint8_t *)"valid_a";
-    sizes[0] = 7;
-    entries[1] = NULL;
-    sizes[1] = 5;
-    entries[2] = (const uint8_t *)"valid_b";
-    sizes[2] = 7;
-    entries[3] = (const uint8_t *)"zero_sz";
-    sizes[3] = 0;
-    entries[4] = (const uint8_t *)"valid_c";
-    sizes[4] = 7;
-
-    bloom_filter_add_batch(bf, entries, sizes, 5);
-
-    /* valid entries should be found */
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"valid_a", 7), 1);
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"valid_b", 7), 1);
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"valid_c", 7), 1);
-
-    bloom_filter_free(bf);
-}
-
 void test_bloom_filter_hash_key_sizes(void)
 {
     /* we test key sizes 1-8 to exercise all hash code paths:
@@ -915,8 +770,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_bloom_filter_binary_keys, tests_passed);
     RUN_TEST(test_bloom_filter_free_null, tests_passed);
     RUN_TEST(test_bloom_filter_large_capacity_random_keys, tests_passed);
-    RUN_TEST(test_bloom_filter_add_batch, tests_passed);
-    RUN_TEST(test_bloom_filter_batch_vs_single, tests_passed);
     RUN_TEST(test_bloom_filter_hash_direct, tests_passed);
     RUN_TEST(test_bloom_filter_is_full_true, tests_passed);
     RUN_TEST(test_bloom_filter_null_safety, tests_passed);
@@ -925,8 +778,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_bloom_filter_deserialize_corrupted_assertions, tests_passed);
     RUN_TEST(test_bloom_filter_null_entry, tests_passed);
     RUN_TEST(test_bloom_filter_is_full_null_bitset, tests_passed);
-    RUN_TEST(test_bloom_filter_add_batch_chunked, tests_passed);
-    RUN_TEST(test_bloom_filter_add_batch_null_entries, tests_passed);
     RUN_TEST(test_bloom_filter_hash_key_sizes, tests_passed);
     RUN_TEST(test_bloom_filter_deserialize_overflow_m, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);

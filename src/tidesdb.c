@@ -9074,6 +9074,100 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
 }
 
 /**
+ * tidesdb_merge_heap_pop_discard
+ * advance the top source without materializing a popped kv pair.
+ *
+ * equivalent to tidesdb_merge_heap_pop followed by tidesdb_kv_pair_free, but
+ * avoids the pop_buf memcpy for BORROWED sources. used by the tombstone-skip
+ * loop in tidesdb_iter_find_visible_entry where the popped entry is discarded
+ * immediately.
+ *
+ * returns 0 on success, -1 if the heap was empty.
+ */
+static int tidesdb_merge_heap_pop_discard(tidesdb_merge_heap_t *heap)
+{
+    if (heap->num_sources == 0) return -1;
+    tidesdb_merge_source_t *top = heap->sources[0];
+    if (!top->current_kv) return -1;
+
+    /* for ARENA/POP_BUF kvs we must free before the advance overwrites the
+     * pointer; for BORROWED (inline_kv) the free is a no-op, so we skip both
+     * the materialization and the free. */
+    if (!(top->current_kv->entry.flags & (TDB_KV_FLAG_BORROWED | TDB_KV_FLAG_POP_BUF)))
+    {
+        tidesdb_kv_pair_free(top->current_kv);
+    }
+    top->current_kv = NULL;
+
+    const int advance_result = tidesdb_merge_source_advance(top);
+    if (advance_result != 0)
+    {
+        heap->sources[0] = heap->sources[heap->num_sources - 1];
+        heap->num_sources--;
+        if (!top->is_cached) tidesdb_merge_source_free(top);
+    }
+
+    if (heap->num_sources > 1) heap_sift_down(heap, 0);
+    return 0;
+}
+
+/**
+ * tidesdb_iter_skip_tombstone_versions
+ * skip all heap entries whose key equals the just-popped tombstone's key.
+ *
+ * used by every tombstone-skip loop in the iterator (next, prev, seek_to_first,
+ * seek_to_last, find_visible_entry). copies the tombstone key into a stable
+ * buffer first, because kv->key may point into pop_buf which is reused by
+ * subsequent heap_pop calls for BORROWED sources. forward direction uses the
+ * pop_discard variant to avoid the pop_buf memcpy on every skip.
+ *
+ * returns TDB_SUCCESS, or TDB_ERR_MEMORY if a very large tombstone key cannot
+ * be copied to the fallback buffer.
+ */
+static int tidesdb_iter_skip_tombstone_versions(tidesdb_iter_t *iter, const tidesdb_kv_pair_t *kv,
+                                                const int direction)
+{
+    uint8_t tombstone_key_stack[TDB_PREFIXED_KEY_STACK_MAX];
+    uint8_t *tombstone_key;
+    const size_t tombstone_key_size = kv->entry.key_size;
+
+    if (tombstone_key_size <= sizeof(tombstone_key_stack))
+    {
+        memcpy(tombstone_key_stack, kv->key, tombstone_key_size);
+        tombstone_key = tombstone_key_stack;
+    }
+    else
+    {
+        tombstone_key = malloc(tombstone_key_size);
+        if (!tombstone_key) return TDB_ERR_MEMORY;
+        memcpy(tombstone_key, kv->key, tombstone_key_size);
+    }
+
+    while (!tidesdb_merge_heap_empty(iter->heap))
+    {
+        tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
+        if (!peek) break;
+
+        const int cmp = iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
+                                               tombstone_key_size, iter->heap->comparator_ctx);
+        if (cmp != 0) break;
+
+        if (direction > 0)
+        {
+            tidesdb_merge_heap_pop_discard(iter->heap);
+        }
+        else
+        {
+            tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop_max(iter->heap);
+            tidesdb_kv_pair_free(dup);
+        }
+    }
+
+    if (tombstone_key != tombstone_key_stack) free(tombstone_key);
+    return TDB_SUCCESS;
+}
+
+/**
  * tidesdb_merge_heap_empty
  * check if a merge heap is empty
  * @param heap merge heap to check
@@ -9082,6 +9176,39 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
 static int tidesdb_merge_heap_empty(const tidesdb_merge_heap_t *heap)
 {
     return heap->num_sources == 0;
+}
+
+/**
+ * tidesdb_memtable_source_set_inline_borrowed
+ * populate source->inline_kv with borrowed pointers into the skip-list node
+ * and set source->current_kv = &inline_kv with TDB_KV_FLAG_BORROWED.
+ *
+ * this avoids the per-advance malloc+memcpy+free of tidesdb_kv_pair_create
+ * on the memtable read path. heap_pop materializes a stable owned copy into
+ * pop_buf when the caller keeps the kv; tombstone-skip discards in
+ * tidesdb_iter_find_visible_entry free (no-op on borrowed) without a copy.
+ *
+ * key/value pointers are stable while the cursor holds this position, which
+ * is the same invariant the sstable inline_kv path already relies on. the
+ * iterator pins the memtable (active via try_ref, immutable via refcount)
+ * for its lifetime, so the node memory is not reclaimed under us.
+ */
+static inline void tidesdb_memtable_source_set_inline_borrowed(tidesdb_merge_source_t *source,
+                                                               const uint8_t *key, size_t key_size,
+                                                               const uint8_t *value,
+                                                               size_t value_size, int64_t ttl,
+                                                               uint64_t seq, uint8_t deleted)
+{
+    tidesdb_kv_pair_t *ikv = &source->inline_kv;
+    ikv->entry.flags = (deleted ? TDB_KV_FLAG_TOMBSTONE : 0) | TDB_KV_FLAG_BORROWED;
+    ikv->entry.key_size = (uint32_t)key_size;
+    ikv->entry.value_size = (uint32_t)value_size;
+    ikv->entry.ttl = ttl;
+    ikv->entry.seq = seq;
+    ikv->entry.vlog_offset = 0;
+    ikv->key = (uint8_t *)key;
+    ikv->value = (value_size > 0) ? (uint8_t *)value : NULL;
+    source->current_kv = ikv;
 }
 
 /**
@@ -9129,8 +9256,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
         if (skip_list_cursor_get_with_seq(source->source.memtable.cursor, &key, &key_size, &value,
                                           &value_size, &ttl, &deleted, &seq) == 0)
         {
-            source->current_kv =
-                tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
+            tidesdb_memtable_source_set_inline_borrowed(source, key, key_size, value, value_size,
+                                                        ttl, seq, deleted);
         }
     }
 
@@ -9165,11 +9292,11 @@ static int tidesdb_unified_source_advance_to_cf(tidesdb_merge_source_t *source, 
         if (key_size >= TDB_UNIFIED_CF_PREFIX_SIZE &&
             memcmp(key, prefix, TDB_UNIFIED_CF_PREFIX_SIZE) == 0)
         {
-            /* we strip the prefix when creating the kv_pair */
+            /* we strip the prefix by borrowing a pointer past it -- no copy */
             const uint8_t *real_key = key + TDB_UNIFIED_CF_PREFIX_SIZE;
             const size_t real_key_size = key_size - TDB_UNIFIED_CF_PREFIX_SIZE;
-            source->current_kv = tidesdb_kv_pair_create(real_key, real_key_size, value, value_size,
-                                                        ttl, seq, deleted);
+            tidesdb_memtable_source_set_inline_borrowed(source, real_key, real_key_size, value,
+                                                        value_size, ttl, seq, deleted);
             return 1;
         }
 
@@ -9958,8 +10085,8 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             if (skip_list_cursor_get_with_seq(source->source.memtable.cursor, &key, &key_size,
                                               &value, &value_size, &ttl, &deleted, &seq) == 0)
             {
-                source->current_kv =
-                    tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
+                tidesdb_memtable_source_set_inline_borrowed(source, key, key_size, value,
+                                                            value_size, ttl, seq, deleted);
                 return TDB_SUCCESS;
             }
         }
@@ -13977,7 +14104,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (!block)
             {
-                /* partial write: header valid but footer absent -- skip slot and resume */
+                /* partial write, header valid but footer absent -- skip slot and resume */
                 if (block_manager_cursor_skip_corrupt(cursor) == 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
@@ -23154,8 +23281,8 @@ static void tidesdb_iter_seek_memtable_source(tidesdb_merge_source_t *source, co
                 if (skip_list_cursor_get_with_seq(cursor, &k, &k_size, &v, &v_size, &ttl, &deleted,
                                                   &seq) == 0)
                 {
-                    source->current_kv =
-                        tidesdb_kv_pair_create(k, k_size, v, v_size, ttl, seq, deleted);
+                    tidesdb_memtable_source_set_inline_borrowed(source, k, k_size, v, v_size, ttl,
+                                                                seq, deleted);
                 }
             }
         }
@@ -23175,8 +23302,8 @@ static void tidesdb_iter_seek_memtable_source(tidesdb_merge_source_t *source, co
             if (skip_list_cursor_get_with_seq(cursor, &k, &k_size, &v, &v_size, &ttl, &deleted,
                                               &seq) == 0)
             {
-                source->current_kv =
-                    tidesdb_kv_pair_create(k, k_size, v, v_size, ttl, seq, deleted);
+                tidesdb_memtable_source_set_inline_borrowed(source, k, k_size, v, v_size, ttl, seq,
+                                                            deleted);
             }
         }
     }
@@ -24482,28 +24609,7 @@ static int tidesdb_iter_find_visible_entry(tidesdb_iter_t *iter, const int direc
         const int visible = tidesdb_iter_kv_visible(iter, kv);
         if (visible == -1)
         {
-            /*** tombstone -- we skip all versions of this key */
-            const uint8_t *tombstone_key = kv->key;
-            const size_t tombstone_key_size = kv->entry.key_size;
-
-            /* we pop and discard all entries with the same key */
-            while (!tidesdb_merge_heap_empty(iter->heap))
-            {
-                tidesdb_kv_pair_t *peek =
-                    iter->heap->sources[0]->current_kv; /* peek at top without popping */
-                if (!peek) break;
-
-                const int cmp =
-                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
-                                           tombstone_key_size, iter->heap->comparator_ctx);
-                if (cmp != 0) break; /* different key, stop skipping */
-
-                /* same key, we pop and discard */
-                tidesdb_kv_pair_t *dup = (direction > 0) ? tidesdb_merge_heap_pop(iter->heap, NULL)
-                                                         : tidesdb_merge_heap_pop_max(iter->heap);
-                tidesdb_kv_pair_free(dup);
-            }
-
+            tidesdb_iter_skip_tombstone_versions(iter, kv, direction);
             tidesdb_kv_pair_free(kv);
             continue;
         }
@@ -24874,25 +24980,7 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
         const int visible = tidesdb_iter_kv_visible(iter, kv);
         if (visible == -1)
         {
-            /* tombstone -- we skip all versions of this key */
-            const uint8_t *tombstone_key = kv->key;
-            const size_t tombstone_key_size = kv->entry.key_size;
-
-            /* we pop and discard all entries with the same key */
-            while (!tidesdb_merge_heap_empty(iter->heap))
-            {
-                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
-                if (!peek) break;
-
-                const int cmp =
-                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
-                                           tombstone_key_size, iter->heap->comparator_ctx);
-                if (cmp != 0) break;
-
-                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop(iter->heap, NULL);
-                tidesdb_kv_pair_free(dup);
-            }
-
+            tidesdb_iter_skip_tombstone_versions(iter, kv, 1);
             tidesdb_kv_pair_free(kv);
             continue;
         }
@@ -25231,25 +25319,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         const int visible = tidesdb_iter_kv_visible(iter, kv);
         if (visible == -1)
         {
-            /* tombstone -- we skip all versions of this key */
-            const uint8_t *tombstone_key = kv->key;
-            const size_t tombstone_key_size = kv->entry.key_size;
-
-            /* we pop and discard all entries with the same key */
-            while (!tidesdb_merge_heap_empty(iter->heap))
-            {
-                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
-                if (!peek) break;
-
-                const int cmp =
-                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
-                                           tombstone_key_size, iter->heap->comparator_ctx);
-                if (cmp != 0) break;
-
-                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop(iter->heap, NULL);
-                tidesdb_kv_pair_free(dup);
-            }
-
+            tidesdb_iter_skip_tombstone_versions(iter, kv, 1);
             tidesdb_kv_pair_free(kv);
             continue;
         }
@@ -25337,25 +25407,7 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         const int visible = tidesdb_iter_kv_visible(iter, kv);
         if (visible == -1)
         {
-            /* tombstone -- we skip all versions of this key */
-            const uint8_t *tombstone_key = kv->key;
-            const size_t tombstone_key_size = kv->entry.key_size;
-
-            /* we pop and discard all entries with the same key */
-            while (!tidesdb_merge_heap_empty(iter->heap))
-            {
-                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
-                if (!peek) break;
-
-                const int cmp =
-                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
-                                           tombstone_key_size, iter->heap->comparator_ctx);
-                if (cmp != 0) break;
-
-                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop_max(iter->heap);
-                tidesdb_kv_pair_free(dup);
-            }
-
+            tidesdb_iter_skip_tombstone_versions(iter, kv, -1);
             tidesdb_kv_pair_free(kv);
             continue;
         }

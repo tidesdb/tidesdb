@@ -136,6 +136,13 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KV_FLAG_ARENA    0x80
 #define TDB_KV_FLAG_POP_BUF  0x20 /* lives in reusable pop buffer, do not free */
 
+/* the kv entry-flag bits that describe tombstone-ness and must flow through
+ * every copy / materialisation path (pop_buf, inline_kv for sstable and
+ * memtable sources, kv_pair_create from an sstable entry, etc).  using this
+ * single mask prevents forgetting the single-delete bit at a site that only
+ * remembered the plain tombstone bit. */
+#define TDB_KV_TOMBSTONE_FLAG_MASK (TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE)
+
 #define TDB_LOG_FILE               "LOG"
 #define TDB_WAL_PREFIX             "wal_"
 #define TDB_WAL_EXT                ".log"
@@ -1224,6 +1231,7 @@ typedef struct
 
 static void *tidesdb_flush_worker_thread(void *arg);
 static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *umt_imm);
+static int tidesdb_unified_memtable_rotate(tidesdb_t *db);
 static void *tidesdb_compaction_worker_thread(void *arg);
 static void *tidesdb_sync_worker_thread(void *arg);
 static void *tidesdb_sstable_reaper_thread(void *arg);
@@ -8932,7 +8940,7 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
 
                 bkv->entry = result->entry;
                 bkv->entry.flags =
-                    (result->entry.flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_POP_BUF;
+                    (result->entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_POP_BUF;
                 bkv->key = buf + sizeof(tidesdb_kv_pair_t);
                 memcpy(bkv->key, result->key, ks);
                 if (vs > 0)
@@ -8951,14 +8959,15 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
                 result = tidesdb_kv_pair_create(result->key, result->entry.key_size, result->value,
                                                 result->entry.value_size, result->entry.ttl,
                                                 result->entry.seq,
-                                                result->entry.flags & TDB_KV_FLAG_TOMBSTONE);
+                                                result->entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK);
             }
         }
         else
         {
-            result = tidesdb_kv_pair_create(
-                result->key, result->entry.key_size, result->value, result->entry.value_size,
-                result->entry.ttl, result->entry.seq, result->entry.flags & TDB_KV_FLAG_TOMBSTONE);
+            result = tidesdb_kv_pair_create(result->key, result->entry.key_size, result->value,
+                                            result->entry.value_size, result->entry.ttl,
+                                            result->entry.seq,
+                                            result->entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK);
         }
     }
     top->current_kv = NULL;
@@ -9110,7 +9119,7 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
 
                 bkv->entry = result->entry;
                 bkv->entry.flags =
-                    (result->entry.flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_POP_BUF;
+                    (result->entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_POP_BUF;
                 bkv->key = buf + sizeof(tidesdb_kv_pair_t);
                 memcpy(bkv->key, result->key, ks);
                 if (vs > 0)
@@ -9130,14 +9139,15 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
                 result = tidesdb_kv_pair_create(result->key, result->entry.key_size, result->value,
                                                 result->entry.value_size, result->entry.ttl,
                                                 result->entry.seq,
-                                                result->entry.flags & TDB_KV_FLAG_TOMBSTONE);
+                                                result->entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK);
             }
         }
         else
         {
-            result = tidesdb_kv_pair_create(
-                result->key, result->entry.key_size, result->value, result->entry.value_size,
-                result->entry.ttl, result->entry.seq, result->entry.flags & TDB_KV_FLAG_TOMBSTONE);
+            result = tidesdb_kv_pair_create(result->key, result->entry.key_size, result->value,
+                                            result->entry.value_size, result->entry.ttl,
+                                            result->entry.seq,
+                                            result->entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK);
         }
     }
     top->current_kv = NULL;
@@ -9739,10 +9749,11 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
                 value = vlog_value;
             }
 
-            source->current_kv = tidesdb_kv_pair_create(
-                klog_block->keys[0], klog_block->entries[0].key_size, value,
-                klog_block->entries[0].value_size, klog_block->entries[0].ttl,
-                klog_block->entries[0].seq, klog_block->entries[0].flags & TDB_KV_FLAG_TOMBSTONE);
+            source->current_kv =
+                tidesdb_kv_pair_create(klog_block->keys[0], klog_block->entries[0].key_size, value,
+                                       klog_block->entries[0].value_size,
+                                       klog_block->entries[0].ttl, klog_block->entries[0].seq,
+                                       klog_block->entries[0].flags & TDB_KV_TOMBSTONE_FLAG_MASK);
             free(vlog_value);
 
             if (!source->current_kv)
@@ -10334,14 +10345,14 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                                     (size_t)vs, &vlog_value);
                             source->current_kv =
                                 tidesdb_kv_pair_create(key_ptr, mk_sz, vlog_value, (size_t)vs, ttl,
-                                                       abs_seq, flags & TDB_KV_FLAG_TOMBSTONE);
+                                                       abs_seq, flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                             free(vlog_value);
                         }
                         else
                         {
                             tidesdb_kv_pair_t *ikv = &source->inline_kv;
                             ikv->entry.flags =
-                                (flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_BORROWED;
+                                (flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_BORROWED;
                             ikv->entry.key_size = mk_sz;
                             ikv->entry.value_size = (uint32_t)vs;
                             ikv->entry.seq = abs_seq;
@@ -10415,14 +10426,14 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                         e->vlog_offset, e->value_size, &vlog_value);
                 source->current_kv =
                     tidesdb_kv_pair_create(kb->keys[idx], e->key_size, vlog_value, e->value_size,
-                                           e->ttl, e->seq, e->flags & TDB_KV_FLAG_TOMBSTONE);
+                                           e->ttl, e->seq, e->flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                 free(vlog_value);
             }
             else
             {
                 tidesdb_kv_pair_t *ikv = &source->inline_kv;
                 ikv->entry = *e;
-                ikv->entry.flags = (e->flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_BORROWED;
+                ikv->entry.flags = (e->flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_BORROWED;
                 ikv->key = kb->keys[idx];
                 ikv->value = (uint8_t *)kb->inline_values[idx];
                 source->current_kv = ikv;
@@ -10586,14 +10597,14 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                             vlog_offset, (size_t)vs, &vlog_value);
                                         source->current_kv = tidesdb_kv_pair_create(
                                             key_ptr, mk_sz, vlog_value, (size_t)vs, ttl, abs_seq,
-                                            flags & TDB_KV_FLAG_TOMBSTONE);
+                                            flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                                         free(vlog_value);
                                     }
                                     else
                                     {
                                         tidesdb_kv_pair_t *ikv = &source->inline_kv;
-                                        ikv->entry.flags =
-                                            (flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_BORROWED;
+                                        ikv->entry.flags = (flags & TDB_KV_TOMBSTONE_FLAG_MASK) |
+                                                           TDB_KV_FLAG_BORROWED;
                                         ikv->entry.key_size = mk_sz;
                                         ikv->entry.value_size = (uint32_t)vs;
                                         ikv->entry.seq = abs_seq;
@@ -10710,14 +10721,15 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                             e0->vlog_offset, e0->value_size, &vlog_value);
                     source->current_kv = tidesdb_kv_pair_create(
                         current_kb->keys[0], e0->key_size, vlog_value, e0->value_size, e0->ttl,
-                        e0->seq, (e0->flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                        e0->seq, e0->flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                     free(vlog_value);
                 }
                 else
                 {
                     tidesdb_kv_pair_t *ikv = &source->inline_kv;
                     ikv->entry = *e0;
-                    ikv->entry.flags = (e0->flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_BORROWED;
+                    ikv->entry.flags =
+                        (e0->flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_BORROWED;
                     ikv->key = current_kb->keys[0];
                     ikv->value = (uint8_t *)current_kb->inline_values[0];
                     source->current_kv = ikv;
@@ -10856,7 +10868,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                                         e->vlog_offset, e->value_size, &vlog_value);
                 source->current_kv =
                     tidesdb_kv_pair_create(kb->keys[idx], e->key_size, vlog_value, e->value_size,
-                                           e->ttl, e->seq, e->flags & TDB_KV_FLAG_TOMBSTONE);
+                                           e->ttl, e->seq, e->flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                 free(vlog_value);
             }
             else
@@ -10864,7 +10876,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 /* zero-copy borrowed */
                 tidesdb_kv_pair_t *ikv = &source->inline_kv;
                 ikv->entry = *e;
-                ikv->entry.flags = (e->flags & TDB_KV_FLAG_TOMBSTONE) | TDB_KV_FLAG_BORROWED;
+                ikv->entry.flags = (e->flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_BORROWED;
                 ikv->key = kb->keys[idx];
                 ikv->value = (uint8_t *)kb->inline_values[idx];
                 source->current_kv = ikv;
@@ -10987,7 +10999,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                     current_kb->keys[idx], current_kb->entries[idx].key_size, value,
                     current_kb->entries[idx].value_size, current_kb->entries[idx].ttl,
                     current_kb->entries[idx].seq,
-                    (current_kb->entries[idx].flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                    current_kb->entries[idx].flags & TDB_KV_TOMBSTONE_FLAG_MASK);
 
                 free(vlog_value);
                 return TDB_SUCCESS;
@@ -11740,10 +11752,10 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     uint8_t *block_last_key = NULL;
     size_t block_last_key_size = 0;
 
-    /* single-step lookahead: we buffer the pending first-for-key entry so a
-     * put+single-delete pair detected in the same merge input cancels together
-     * at any level instead of carrying the tombstone forward. same-key dedup,
-     * largest-level tombstone drop, and ttl drop fire when pending resolves. */
+    /**** single-step lookahead in which we buffer the pending first-for-key entry so a
+     ***  put+single-delete pair detected in the same merge input cancels together
+     **   at any level instead of carrying the tombstone forward. same-key dedup,
+     *    largest-level tombstone drop, and ttl drop fire when pending resolves. */
     tidesdb_kv_pair_t *pending = NULL;
     int pending_is_single_delete = 0;
     int pending_sd_paired_with_put = 0;
@@ -18589,7 +18601,28 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
 
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
-    return tidesdb_flush_memtable_internal(cf, 0, 0);
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+
+    /* callers of this public api want a flush to actually happen; the old
+     * "no-op below write_buffer threshold" behaviour made tidesdb_flush_memtable
+     * surprising for tests and tooling that just wanted to ensure any in-memory
+     * writes land on disk.  we pass force=1 so the memtable flushes regardless
+     * of its current size. */
+
+    /* in unified memtable mode the cf->active_memtable is a per-cf wrapper but
+     * the real active memtable lives on db->unified_mt.  we rotate the unified
+     * memtable so the current contents enqueue for flush, and then fall through
+     * to the per-cf flush path to cover any stragglers or immutable wrappers. */
+    if (cf->db && cf->db->config.unified_memtable)
+    {
+        const int rot_rc = tidesdb_unified_memtable_rotate(cf->db);
+        if (rot_rc != TDB_SUCCESS && rot_rc != TDB_ERR_LOCKED)
+        {
+            return rot_rc;
+        }
+    }
+
+    return tidesdb_flush_memtable_internal(cf, 0, 1);
 }
 
 int tidesdb_is_flushing(tidesdb_column_family_t *cf)
@@ -23760,7 +23793,8 @@ static tidesdb_kv_pair_t *tidesdb_iter_create_kv_from_block(const tidesdb_iter_t
 
     tidesdb_kv_pair_t *kv = tidesdb_kv_pair_create(
         kb->keys[idx], kb->entries[idx].key_size, value, kb->entries[idx].value_size,
-        kb->entries[idx].ttl, kb->entries[idx].seq, kb->entries[idx].flags & TDB_KV_FLAG_TOMBSTONE);
+        kb->entries[idx].ttl, kb->entries[idx].seq,
+        kb->entries[idx].flags & TDB_KV_TOMBSTONE_FLAG_MASK);
 
     free(vlog_value);
     return kv;
@@ -24088,7 +24122,7 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
                 }
                 source->current_kv =
                     tidesdb_kv_pair_create(fkey, (size_t)k_sz, fvalue, (size_t)vs, ttl, seq,
-                                           (flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                                           flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                 free(vlog_value);
 
                 source->source.sstable.lazy.entry_idx = found;
@@ -24154,7 +24188,7 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
             }
             source->current_kv =
                 tidesdb_kv_pair_create(bdata + fk_off, (size_t)fk_sz, fvalue, (size_t)vs, ttl, seq,
-                                       (flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                                       flags & TDB_KV_TOMBSTONE_FLAG_MASK);
             free(vlog_value);
             source->source.sstable.lazy.entry_idx = 0;
             source->source.sstable.current_entry_idx = 0;
@@ -24410,7 +24444,7 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
             }
             source->current_kv = tidesdb_kv_pair_create(
                 found_key, found_entry.key_size, value, found_entry.value_size, found_entry.ttl,
-                found_entry.seq, (found_entry.flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+                found_entry.seq, found_entry.flags & TDB_KV_TOMBSTONE_FLAG_MASK);
             free(vlog_value);
 
             /* we set up lazy state, the full deserialization is deferred to next().
@@ -25142,7 +25176,7 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
                         cs->current_kv = tidesdb_kv_pair_create(
                             kb->keys[0], kb->entries[0].key_size, val, kb->entries[0].value_size,
                             kb->entries[0].ttl, kb->entries[0].seq,
-                            kb->entries[0].flags & TDB_KV_FLAG_TOMBSTONE);
+                            kb->entries[0].flags & TDB_KV_TOMBSTONE_FLAG_MASK);
                         free(vv);
 
                         if (cs->current_kv) tidesdb_merge_heap_add_source(iter->heap, cs);
@@ -25393,7 +25427,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                                 kb->keys[idx], kb->entries[idx].key_size, value,
                                 kb->entries[idx].value_size, kb->entries[idx].ttl,
                                 kb->entries[idx].seq,
-                                kb->entries[idx].flags & TDB_KV_FLAG_TOMBSTONE);
+                                kb->entries[idx].flags & TDB_KV_TOMBSTONE_FLAG_MASK);
 
                             free(vlog_value);
                         }

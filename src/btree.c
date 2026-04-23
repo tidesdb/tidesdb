@@ -131,10 +131,10 @@ static inline size_t btree_signed_varint_decode(const uint8_t *buf, int64_t *val
  * @param len2 length of second key
  * @return the number of common prefix bytes
  */
-static inline size_t btree_compute_prefix_len(const uint8_t *key1, size_t len1, const uint8_t *key2,
-                                              size_t len2)
+static inline size_t btree_compute_prefix_len(const uint8_t *key1, const size_t len1,
+                                              const uint8_t *key2, const size_t len2)
 {
-    size_t min_len = (len1 < len2) ? len1 : len2;
+    const size_t min_len = (len1 < len2) ? len1 : len2;
     size_t prefix_len = 0;
     while (prefix_len < min_len && key1[prefix_len] == key2[prefix_len])
     {
@@ -358,7 +358,7 @@ int btree_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t
                             size_t key2_size, void *ctx)
 {
     (void)ctx;
-    size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
     const int cmp = memcmp(key1, key2, min_size);
     if (cmp != 0) return cmp < 0 ? -1 : 1;
     return (key1_size < key2_size) ? -1 : (key1_size > key2_size) ? 1 : 0;
@@ -1590,12 +1590,11 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
 
 int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t key_size,
                       const uint8_t *value, const size_t value_size, const uint64_t vlog_offset,
-                      const uint64_t seq, const int64_t ttl, const uint8_t deleted)
+                      const uint64_t seq, const int64_t ttl, const uint8_t entry_flags)
 {
     if (!builder || !key || key_size == 0) return -1;
 
-    uint8_t flags = 0;
-    if (deleted) flags |= BTREE_ENTRY_FLAG_TOMBSTONE;
+    uint8_t flags = entry_flags & (BTREE_ENTRY_FLAG_TOMBSTONE | BTREE_ENTRY_FLAG_SINGLE_DELETE);
     if (ttl != 0) flags |= BTREE_ENTRY_FLAG_HAS_TTL;
     if (vlog_offset > 0) flags |= BTREE_ENTRY_FLAG_VLOG_REF;
 
@@ -2202,7 +2201,12 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
     if (vlog_offset) *vlog_offset = entry->vlog_offset;
     if (seq) *seq = entry->seq;
     if (ttl) *ttl = entry->ttl;
-    if (deleted) *deleted = (entry->flags & BTREE_ENTRY_FLAG_TOMBSTONE) ? 1 : 0;
+    /* deleted returns the persisted tombstone/single-delete bits so compaction
+     * can distinguish single-delete from regular delete. the low bit still
+     * equals BTREE_ENTRY_FLAG_TOMBSTONE, so callers that treat *deleted as a
+     * bool keep working unchanged. */
+    if (deleted)
+        *deleted = entry->flags & (BTREE_ENTRY_FLAG_TOMBSTONE | BTREE_ENTRY_FLAG_SINGLE_DELETE);
 
     btree_node_done(node, using_cache);
     return 0;
@@ -2723,7 +2727,12 @@ int btree_cursor_get(btree_cursor_t *cursor, uint8_t **key, size_t *key_size, ui
     if (vlog_offset) *vlog_offset = entry->vlog_offset;
     if (seq) *seq = entry->seq;
     if (ttl) *ttl = entry->ttl;
-    if (deleted) *deleted = (entry->flags & BTREE_ENTRY_FLAG_TOMBSTONE) ? 1 : 0;
+    /* deleted returns the persisted tombstone/single-delete bits so compaction
+     * can distinguish single-delete from regular delete. the low bit still
+     * equals BTREE_ENTRY_FLAG_TOMBSTONE, so callers that treat *deleted as a
+     * bool keep working unchanged. */
+    if (deleted)
+        *deleted = entry->flags & (BTREE_ENTRY_FLAG_TOMBSTONE | BTREE_ENTRY_FLAG_SINGLE_DELETE);
 
     return 0;
 }

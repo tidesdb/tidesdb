@@ -1231,6 +1231,33 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
                        size_t key_size);
 
 /**
+ * tidesdb_txn_single_delete
+ * adds a single-delete operation to a transaction
+ *
+ * the caller promises that for this key there is at most one put between this
+ * single-delete and the previous single-delete (or the beginning). with that
+ * promise compaction is free to drop the put and the single-delete together
+ * the first merge that sees both, instead of carrying the tombstone forward
+ * until the largest level. this dramatically reduces tombstone accumulation
+ * for insert-once delete-once workloads and for secondary index maintenance.
+ *
+ * calling single-delete on a key that has been put more than once since the
+ * last single-delete is a contract violation and may expose older values.
+ * when in doubt, use tidesdb_txn_delete.
+ *
+ * for visibility and normal read semantics a single-delete behaves exactly
+ * like tidesdb_txn_delete.
+ *
+ * @param txn transaction handle
+ * @param cf column family to delete from
+ * @param key key to delete
+ * @param key_size size of key
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_single_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                              size_t key_size);
+
+/**
  * tidesdb_txn_rollback
  * rolls back a transaction
  * @param txn transaction handle

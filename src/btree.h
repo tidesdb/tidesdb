@@ -44,6 +44,10 @@
 #define BTREE_ENTRY_FLAG_TOMBSTONE 0x01
 #define BTREE_ENTRY_FLAG_HAS_TTL   0x02
 #define BTREE_ENTRY_FLAG_VLOG_REF  0x04 /* value is in vlog, not inline */
+#define BTREE_ENTRY_FLAG_SINGLE_DELETE       \
+    0x10 /* single-delete tombstone subtype, \
+          * always set alongside             \
+          * BTREE_ENTRY_FLAG_TOMBSTONE */
 
 /* default configuration */
 #define BTREE_DEFAULT_NODE_SIZE    (64 * 1024) /* 64KB target node size */
@@ -369,12 +373,15 @@ int btree_builder_new(btree_builder_t **builder, block_manager_t *bm, const btre
  * @param vlog_offset vlog offset if value is external (0 = inline)
  * @param seq sequence number
  * @param ttl time-to-live (0 = no expiry)
- * @param deleted tombstone flag
+ * @param entry_flags bitmask of BTREE_ENTRY_FLAG_* to persist on this entry
+ *                    (TOMBSTONE, SINGLE_DELETE). HAS_TTL and VLOG_REF are
+ *                    derived from ttl and vlog_offset. passing 1 (a bare
+ *                    tombstone) stays valid because 1 == TOMBSTONE.
  * @return 0 on success, -1 on failure
  */
 int btree_builder_add(btree_builder_t *builder, const uint8_t *key, size_t key_size,
                       const uint8_t *value, size_t value_size, uint64_t vlog_offset, uint64_t seq,
-                      int64_t ttl, uint8_t deleted);
+                      int64_t ttl, uint8_t entry_flags);
 
 /**
  * btree_builder_finish

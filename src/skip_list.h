@@ -84,6 +84,12 @@ struct skip_list_arena_t
 
 /* skip_list_version_t flag bits */
 #define SKIP_LIST_FLAG_DELETED 0x01 /* version is tombstone */
+#define SKIP_LIST_FLAG_SINGLE_DELETE                         \
+    0x02 /* tombstone subtype, always set together with      \
+          * SKIP_LIST_FLAG_DELETED. caller promises the key  \
+          * has been put at most once since the last         \
+          * single-delete or start, so put+single-delete can \
+          * be reaped together at compaction. */
 
 /**
  * skip_list_cmp_type_t
@@ -268,12 +274,12 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
  * @param value value data
  * @param value_size size of value
  * @param ttl time-to-live
- * @param deleted tombstone flag
+ * @param flags version flags (bitmask of SKIP_LIST_FLAG_*)
  * @return pointer to new node, NULL on failure
  */
 skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t key_size,
                                         const uint8_t *value, size_t value_size, int64_t ttl,
-                                        uint8_t deleted);
+                                        uint8_t flags);
 
 /**
  * skip_list_free_node
@@ -373,12 +379,15 @@ int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t 
  * @param value_size value size
  * @param ttl time-to-live
  * @param seq sequence number for MVCC
- * @param deleted whether this is a tombstone marker
+ * @param flags bitmask of SKIP_LIST_FLAG_*; 0 means a live put, SKIP_LIST_FLAG_DELETED
+ *              means a tombstone, optionally OR'd with SKIP_LIST_FLAG_SINGLE_DELETE.
+ *              passing 1 for a regular tombstone remains valid because the value 1
+ *              equals SKIP_LIST_FLAG_DELETED.
  * @return 0 on success, -1 on failure
  */
 int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
                            const uint8_t *value, size_t value_size, int64_t ttl, uint64_t seq,
-                           uint8_t deleted);
+                           uint8_t flags);
 
 /**
  * skip_list_delete
@@ -394,6 +403,11 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size, uin
 /**
  * skip_list_batch_entry_t
  * entry for batch put operations
+ *
+ * flags is a bitmask of SKIP_LIST_FLAG_*. a live put leaves flags = 0; a regular
+ * tombstone sets SKIP_LIST_FLAG_DELETED; a single-delete tombstone also sets
+ * SKIP_LIST_FLAG_SINGLE_DELETE on top. callers that previously set deleted = 1
+ * continue to work unchanged because the value 1 equals SKIP_LIST_FLAG_DELETED.
  */
 typedef struct
 {
@@ -403,7 +417,7 @@ typedef struct
     size_t value_size;
     uint64_t seq;
     int64_t ttl;
-    uint8_t deleted;
+    uint8_t flags;
 } skip_list_batch_entry_t;
 
 /**

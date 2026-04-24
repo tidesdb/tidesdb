@@ -666,13 +666,13 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
  * @param value value data
  * @param value_size size of value
  * @param ttl time-to-live
- * @param deleted tombstone flag
+ * @param flags version flags (bitmask of SKIP_LIST_FLAG_*)
  * @param seq sequence number for MVCC
  * @return pointer to new version, NULL on failure
  */
 static skip_list_version_t *skip_list_create_version(const skip_list_t *list, const uint8_t *value,
                                                      const size_t value_size, const int64_t ttl,
-                                                     const uint8_t deleted, uint64_t seq)
+                                                     const uint8_t flags, uint64_t seq)
 {
     /* we combine version struct + value data into a single allocation
      * this halves malloc calls and improves cache locality */
@@ -693,7 +693,7 @@ static skip_list_version_t *skip_list_create_version(const skip_list_t *list, co
         version->value_size = 0;
     }
 
-    atomic_init(&version->flags, deleted ? SKIP_LIST_FLAG_DELETED : 0);
+    atomic_init(&version->flags, flags);
     atomic_init(&version->seq, seq);
     version->ttl = ttl;
     atomic_init(&version->next, NULL);
@@ -758,7 +758,7 @@ static skip_list_node_t *skip_list_create_sentinel(const int level)
 
 skip_list_node_t *skip_list_create_node(const int level, const uint8_t *key, size_t key_size,
                                         const uint8_t *value, const size_t value_size,
-                                        const int64_t ttl, const uint8_t deleted)
+                                        const int64_t ttl, const uint8_t flags)
 {
     if (key == NULL || key_size == 0) return NULL;
 
@@ -775,15 +775,16 @@ skip_list_node_t *skip_list_create_node(const int level, const uint8_t *key, siz
     node->level = (uint8_t)level;
     node->node_flags = 0; /* not a sentinel */
 
+    const int is_tombstone = (flags & SKIP_LIST_FLAG_DELETED) != 0;
     skip_list_version_t *initial_version = NULL;
-    if (value != NULL || deleted)
+    if (value != NULL || is_tombstone)
     {
-        initial_version = skip_list_create_version(NULL, value, value_size, ttl, deleted, 0);
+        initial_version = skip_list_create_version(NULL, value, value_size, ttl, flags, 0);
         if (initial_version == NULL)
         {
             /* for non-tombstones, version creation failure is fatal
-             * for tombstones (deleted=true), NULL version is acceptable */
-            if (!deleted)
+             * for tombstones, NULL version is acceptable */
+            if (!is_tombstone)
             {
                 free(node);
                 return NULL;
@@ -1540,10 +1541,19 @@ int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, siz
     if (ttl != NULL) *ttl = version->ttl;
     if (seq != NULL) *seq = atomic_load_explicit(&version->seq, memory_order_acquire);
 
+    /* *deleted returns the version flag bits (SKIP_LIST_FLAG_*) so callers can
+     * see single-delete and not just plain tombstone.  the low bit is always set
+     * when the caller should treat this entry as a tombstone (tombstone or
+     * expired ttl), matching the old bool-like contract for existing callers. */
+    const uint8_t version_flags = atomic_load_explicit(&version->flags, memory_order_acquire);
+
     /* we check if version is invalid (expired or deleted) */
     if (skip_list_version_is_invalid_with_time(version, skip_list_get_current_time(cursor->list)))
     {
-        if (deleted != NULL) *deleted = 1;
+        if (deleted != NULL)
+        {
+            *deleted = SKIP_LIST_FLAG_DELETED | (version_flags & SKIP_LIST_FLAG_SINGLE_DELETE);
+        }
         *value = NULL;
         *value_size = 0;
         return 0;
@@ -1756,9 +1766,10 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
 
 int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
                            const uint8_t *value, size_t value_size, int64_t ttl, uint64_t seq,
-                           uint8_t deleted)
+                           uint8_t flags)
 {
-    if (list == NULL || key == NULL || key_size == 0 || (!deleted && value == NULL)) return -1;
+    const int is_tombstone = (flags & SKIP_LIST_FLAG_DELETED) != 0;
+    if (list == NULL || key == NULL || key_size == 0 || (!is_tombstone && value == NULL)) return -1;
 
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
     const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
@@ -1831,7 +1842,6 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                 return -1;
             }
 
-            const uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
             skip_list_version_t *new_version =
                 skip_list_create_version(list, value, value_size, ttl, flags, seq);
             if (new_version == NULL)
@@ -1867,7 +1877,6 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                 return -1;
             }
 
-            const uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
             skip_list_version_t *new_version =
                 skip_list_create_version(list, value, value_size, ttl, flags, seq);
             if (new_version == NULL)
@@ -1916,7 +1925,6 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     new_node->level = (uint8_t)new_level;
     new_node->node_flags = 0;
 
-    const uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
     skip_list_version_t *initial_version =
         skip_list_create_version(list, value, value_size, ttl, flags, seq);
     if (initial_version == NULL)
@@ -1956,9 +1964,8 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                     return -1;
                 }
 
-                const uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version =
-                    skip_list_create_version(list, value, value_size, ttl, version_flags, seq);
+                    skip_list_create_version(list, value, value_size, ttl, flags, seq);
                 if (new_version == NULL)
                 {
                     skip_list_free_node_internal(list, new_node);
@@ -2008,9 +2015,8 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                     return -1;
                 }
 
-                const uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version =
-                    skip_list_create_version(list, value, value_size, ttl, version_flags, seq);
+                    skip_list_create_version(list, value, value_size, ttl, flags, seq);
                 if (new_version == NULL)
                 {
                     skip_list_free_node_internal(list, new_node);
@@ -2129,7 +2135,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         const skip_list_batch_entry_t *entry = &entries[e];
 
         if (entry->key == NULL || entry->key_size == 0) continue;
-        if (!entry->deleted && entry->value == NULL) continue;
+        if (!(entry->flags & SKIP_LIST_FLAG_DELETED) && entry->value == NULL) continue;
 
         const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
 
@@ -2216,9 +2222,8 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
                     continue; /* skip this entry */
                 }
 
-                const uint8_t flags = entry->deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version = skip_list_create_version(
-                    list, entry->value, entry->value_size, entry->ttl, flags, entry->seq);
+                    list, entry->value, entry->value_size, entry->ttl, entry->flags, entry->seq);
                 if (new_version == NULL)
                 {
                     continue;
@@ -2261,9 +2266,8 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         new_node->level = (uint8_t)new_level;
         new_node->node_flags = 0;
 
-        const uint8_t flags = entry->deleted ? SKIP_LIST_FLAG_DELETED : 0;
         skip_list_version_t *initial_version = skip_list_create_version(
-            list, entry->value, entry->value_size, entry->ttl, flags, entry->seq);
+            list, entry->value, entry->value_size, entry->ttl, entry->flags, entry->seq);
         if (initial_version == NULL)
         {
             skip_list_dealloc(list, new_node);
@@ -2299,10 +2303,9 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
                         atomic_load_explicit(&next_at_0->versions, memory_order_acquire);
                     if (skip_list_validate_sequence(latest, entry->seq) == 0)
                     {
-                        const uint8_t version_flags = entry->deleted ? SKIP_LIST_FLAG_DELETED : 0;
                         skip_list_version_t *new_version =
                             skip_list_create_version(list, entry->value, entry->value_size,
-                                                     entry->ttl, version_flags, entry->seq);
+                                                     entry->ttl, entry->flags, entry->seq);
                         if (new_version != NULL)
                         {
                             if (skip_list_insert_version_cas(&next_at_0->versions, new_version,

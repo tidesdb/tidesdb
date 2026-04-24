@@ -2128,6 +2128,521 @@ static void test_compaction_with_deletes(void)
     cleanup_test_dir();
 }
 
+/* tidesdb_txn_single_delete -- basic read parity with tidesdb_txn_delete.
+ * single-delete tombstones must be indistinguishable from regular tombstones
+ * on the read path. */
+static void test_txn_single_delete_basic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    uint8_t key[] = "single_delete_key";
+    uint8_t value[] = "single_delete_value";
+    ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    ASSERT_EQ(tidesdb_txn_single_delete(txn2, cf, key, sizeof(key)), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
+    tidesdb_txn_free(txn2);
+
+    tidesdb_txn_t *txn3 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn3, cf, key, sizeof(key), &retrieved_value, &retrieved_size),
+              TDB_ERR_NOT_FOUND);
+    tidesdb_txn_free(txn3);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* helper used by the single-delete compaction tests -- waits for the flush
+ * queue to drain so subsequent compaction observes the flushed sstable. */
+static void wait_for_flush_queue_drain(tidesdb_t *db)
+{
+    const int max_wait = 100;
+    for (int i = 0; i < max_wait; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+}
+
+/* helper used by the single-delete compaction tests -- waits for an in-flight
+ * compaction to finish so we can assert on post-compaction state. */
+static void wait_for_compaction_idle(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    const int max_wait = 200;
+    for (int i = 0; i < max_wait; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        {
+            usleep(100000);
+            break;
+        }
+    }
+}
+
+/* single-delete + put pair-cancel at compaction.
+ *
+ * we lay down a sstable of puts and a separate sstable of matching single-
+ * deletes, then trigger compaction.  the pair-cancel rule drops both sides,
+ * so post-compaction total_keys must be strictly less than it would be if
+ * the tombstones had been preserved (which is what a regular tidesdb_txn_delete
+ * would do at any non-largest level).
+ *
+ * the small write_buffer_size makes each commit group a single flush, and
+ * periodic tidesdb_flush_memtable calls keep the put sstable and the single-
+ * delete sstable on disk before compaction runs. */
+static void test_single_delete_pair_cancel_at_compaction(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.level_size_ratio = 10;
+    cf_config.compression_algorithm = TDB_COMPRESS_LZ4;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "sd_pair_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sd_pair_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 200;
+
+    /* we write every key exactly once across several sstables */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key_%04d", i);
+        snprintf(value, sizeof(value), "value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 20 == 19)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_queue_drain(db);
+
+    /** single-delete every key so each key has exactly one put and one
+     *  single-delete on disk by the time compaction starts. */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "key_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_single_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 20 == 19)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_queue_drain(db);
+
+    tidesdb_compact(cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* every key must be gone to reads */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%04d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_TRUE(result != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* pair-cancel must have reaped both sides -- total_keys is at most the
+     * count of entries that never got paired (possible if some deletes and
+     * puts ended up in different compactions), but never the full 2*num_keys
+     * that regular tidesdb_txn_delete would preserve at a non-largest level. */
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_TRUE(stats->total_keys < (uint64_t)(2 * num_keys));
+    tidesdb_free_stats(stats);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* many sources + delete-all then iterate.
+ *
+ * this mirrors the shape of the iibench insert-then-delete workload in
+ * tidesql issue #122 writes spread across many sstables, followed by a
+ * sweep of single-delete tombstones over every key.  after compaction
+ * the iterator must return no visible entries, and the column family
+ * should have strictly less residue than the regular-delete path would
+ * leave behind. */
+static void test_single_delete_many_sources_iterate_empty(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.level_size_ratio = 10;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "sd_many_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sd_many_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 300;
+
+    /* write across many sstables so the merge sees many sources */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[32];
+        snprintf(key, sizeof(key), "k_%05d", i);
+        snprintf(value, sizeof(value), "v_%05d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 10 == 9)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(30000);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_queue_drain(db);
+
+    /* single-delete every key across a second sweep of sstables */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "k_%05d", i);
+
+        ASSERT_EQ(tidesdb_txn_single_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 10 == 9)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(30000);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_queue_drain(db);
+
+    tidesdb_compact(cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* iterating must see no visible entries */
+    tidesdb_txn_t *itxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &itxn), 0);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(itxn, cf, &it), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(tidesdb_iter_valid(it), 0);
+    tidesdb_iter_free(it);
+    tidesdb_txn_free(itxn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* single-delete then iterate without compaction.
+ *
+ * this checks that the visibility layer treats single-delete exactly like a
+ * regular tombstone a forward iterator over a cf whose keys have all been
+ * single-deleted must return no entries even before compaction has had a
+ * chance to pair-cancel. */
+static void test_single_delete_iterate_no_visible_entries(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "sd_iter_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sd_iter_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 50;
+
+    tidesdb_txn_t *put_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &put_txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        char value[32];
+        snprintf(key, sizeof(key), "iter_%03d", i);
+        snprintf(value, sizeof(value), "val_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(put_txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(put_txn), 0);
+    tidesdb_txn_free(put_txn);
+
+    tidesdb_txn_t *del_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &del_txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "iter_%03d", i);
+        ASSERT_EQ(tidesdb_txn_single_delete(del_txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(del_txn), 0);
+    tidesdb_txn_free(del_txn);
+
+    tidesdb_txn_t *itxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &itxn), 0);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(itxn, cf, &it), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(tidesdb_iter_valid(it), 0);
+    tidesdb_iter_free(it);
+    tidesdb_txn_free(itxn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* helper used by the head-to-head discrimination test -- counts the number
+ * of visible entries reachable through a forward iterator scan of the cf. */
+static int count_visible_entries(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    tidesdb_txn_t *itxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &itxn), 0);
+
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(itxn, cf, &it), 0);
+
+    int count = 0;
+    int rc = tidesdb_iter_seek_to_first(it);
+    while (rc == TDB_SUCCESS && tidesdb_iter_valid(it))
+    {
+        count++;
+        rc = tidesdb_iter_next(it);
+    }
+
+    tidesdb_iter_free(it);
+    tidesdb_txn_free(itxn);
+    return count;
+}
+
+/* helper used by the head-to-head discrimination test -- drives the same
+ * put-then-delete workload on a single column family.  use_single_delete
+ * selects which delete api to call for the delete sweep.  keys are grouped
+ * into num_batches batched commits per phase; every batch is flushed so
+ * each batch produces its own sstable, which keeps put versions and delete
+ * versions in separate sstables rather than collapsing them against each
+ * other in a single memtable. */
+static void run_put_then_delete_workload(tidesdb_t *db, tidesdb_column_family_t *cf, int num_keys,
+                                         int num_batches, int use_single_delete)
+{
+    const int per_batch = num_keys / num_batches;
+
+    for (int b = 0; b < num_batches; b++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        const int lo = b * per_batch;
+        const int hi = (b == num_batches - 1) ? num_keys : lo + per_batch;
+
+        for (int i = lo; i < hi; i++)
+        {
+            char key[32];
+            char value[64];
+            snprintf(key, sizeof(key), "key_%05d", i);
+            snprintf(value, sizeof(value), "value_%05d_xxxxxxxxxx", i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        tidesdb_flush_memtable(cf);
+        wait_for_flush_queue_drain(db);
+    }
+
+    for (int b = 0; b < num_batches; b++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        const int lo = b * per_batch;
+        const int hi = (b == num_batches - 1) ? num_keys : lo + per_batch;
+
+        for (int i = lo; i < hi; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "key_%05d", i);
+
+            if (use_single_delete)
+            {
+                ASSERT_EQ(tidesdb_txn_single_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+            }
+            else
+            {
+                ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+            }
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        tidesdb_flush_memtable(cf);
+        wait_for_flush_queue_drain(db);
+    }
+}
+
+/* single-delete vs regular delete head-to-head discrimination.
+ *
+ * both column families run the exact same put-then-delete workload across
+ * many sstables.  the only difference is whether the delete sweep uses
+ * tidesdb_txn_delete (baseline) or tidesdb_txn_single_delete.  after the
+ * same compaction invocation on each:
+ *
+ *   -- iterator counts on both cfs must be zero (read parity -- a tombstone
+ *     masks its put regardless of subtype)
+ *   -- stats->total_keys on the single-delete cf must be strictly less than
+ *     on the baseline cf (pair-cancel proof -- the single-delete path
+ *     reaped puts and their tombstones together, the baseline path had to
+ *     carry the tombstones forward because the merge target is not the
+ *     largest level)
+ *
+ * small write_buffer_size + periodic flushes guarantee many sstables at
+ * the source level so the compaction's merge input contains both the put
+ * sstables and the delete sstables for every key. */
+static void test_single_delete_vs_regular_delete_discriminates(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    /* large write_buffer + high l1 trigger -- every sstable comes from an
+     * explicit tidesdb_flush_memtable so the number of merge sources is
+     * exactly what the workload driver creates.  compression left at the
+     * default value because both cfs run the same config and we compare
+     * them to each other. */
+    cf_config.write_buffer_size = 64 * 1024 * 1024;
+    cf_config.level_size_ratio = 10;
+    cf_config.l1_file_count_trigger = 1024;
+    cf_config.l0_queue_stall_threshold = 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "baseline_delete_cf", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "single_delete_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf_baseline = tidesdb_get_column_family(db, "baseline_delete_cf");
+    tidesdb_column_family_t *cf_sd = tidesdb_get_column_family(db, "single_delete_cf");
+    ASSERT_TRUE(cf_baseline != NULL);
+    ASSERT_TRUE(cf_sd != NULL);
+
+    /* num_batches controls how many sstables each phase produces.
+     * total merge sources for the compaction = 2 * num_batches. */
+    const int num_keys = 1000;
+    const int num_batches = 10;
+
+    run_put_then_delete_workload(db, cf_baseline, num_keys, num_batches, 0);
+    run_put_then_delete_workload(db, cf_sd, num_keys, num_batches, 1);
+
+    tidesdb_compact(cf_baseline);
+    wait_for_compaction_idle(db, cf_baseline);
+    tidesdb_compact(cf_sd);
+    wait_for_compaction_idle(db, cf_sd);
+
+    /* read parity -- every key is gone from both cfs via iterator scan */
+    ASSERT_EQ(count_visible_entries(db, cf_baseline), 0);
+    ASSERT_EQ(count_visible_entries(db, cf_sd), 0);
+
+    /* read parity -- point lookups return not-found on both cfs */
+    tidesdb_txn_t *rtxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &rtxn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%05d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(rtxn, cf_baseline, (uint8_t *)key, strlen(key) + 1, &value,
+                                  &value_size),
+                  TDB_ERR_NOT_FOUND);
+        if (value)
+        {
+            free(value);
+            value = NULL;
+        }
+
+        ASSERT_EQ(
+            tidesdb_txn_get(rtxn, cf_sd, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+            TDB_ERR_NOT_FOUND);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(rtxn);
+
+    /* pair-cancel discrimination -- the single-delete cf must hold strictly
+     * fewer on-disk entries than the baseline cf.  baseline carries every
+     * tombstone forward because the compaction target is not the largest
+     * level; single-delete reaps both sides of each pair. */
+    tidesdb_stats_t *stats_baseline = NULL;
+    tidesdb_stats_t *stats_sd = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf_baseline, &stats_baseline), 0);
+    ASSERT_EQ(tidesdb_get_stats(cf_sd, &stats_sd), 0);
+    ASSERT_TRUE(stats_baseline != NULL);
+    ASSERT_TRUE(stats_sd != NULL);
+
+    ASSERT_TRUE(stats_sd->total_keys < stats_baseline->total_keys);
+
+    tidesdb_free_stats(stats_baseline);
+    tidesdb_free_stats(stats_sd);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_ttl_expiration(void)
 {
     cleanup_test_dir();
@@ -16734,11 +17249,18 @@ static void test_flush_below_size_threshold(void)
         tidesdb_txn_free(txn);
     }
 
+    /*** tidesdb_flush_memtable is a force-flush it rotates the active memtable
+     **  and enqueues it for the flush worker regardless of its current size.
+     *   we wait for the flush worker to drain then observe the new sstable. */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-    usleep(50000);
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0 && !tidesdb_is_flushing(cf)) break;
+    }
 
     int num_ssts = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-    ASSERT_EQ(num_ssts, 0);
+    ASSERT_EQ(num_ssts, 1);
 
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -26073,7 +26595,7 @@ static void test_primary_replica_failover(void)
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
 
-        /* verify all data readable: old cf1 + new cf1 + cf2 */
+        /* verify all data readable old cf1 + new cf1 + cf2 */
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
         int total_cf1 = 0;
@@ -26616,6 +27138,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_compression_zstd, tests_passed);
     RUN_TEST(test_compaction_basic, tests_passed);
     RUN_TEST(test_compaction_with_deletes, tests_passed);
+    RUN_TEST(test_txn_single_delete_basic, tests_passed);
+    RUN_TEST(test_single_delete_pair_cancel_at_compaction, tests_passed);
+    RUN_TEST(test_single_delete_many_sources_iterate_empty, tests_passed);
+    RUN_TEST(test_single_delete_iterate_no_visible_entries, tests_passed);
+    RUN_TEST(test_single_delete_vs_regular_delete_discriminates, tests_passed);
     RUN_TEST(test_concurrent_writes, tests_passed);
     RUN_TEST(test_empty_value, tests_passed);
     RUN_TEST(test_delete_nonexistent_key, tests_passed);

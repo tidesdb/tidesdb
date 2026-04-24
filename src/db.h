@@ -561,6 +561,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, uint8_t **value, size_t *value_size);
 int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                        size_t key_size);
+int tidesdb_txn_single_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                              size_t key_size);
 int tidesdb_txn_commit(tidesdb_txn_t *txn);
 int tidesdb_txn_rollback(tidesdb_txn_t *txn);
 int tidesdb_txn_reset(tidesdb_txn_t *txn, tidesdb_isolation_level_t isolation);

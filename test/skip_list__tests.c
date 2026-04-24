@@ -2101,7 +2101,7 @@ void test_skip_list_put_batch()
         entries[i].value_size = strlen(values[i]) + 1;
         entries[i].ttl = -1;
         entries[i].seq = (uint64_t)(i + 1);
-        entries[i].deleted = 0;
+        entries[i].flags = 0;
     }
 
     int result = skip_list_put_batch(list, entries, 5);
@@ -2152,7 +2152,7 @@ void test_skip_list_put_batch_sorted()
         entries[i].value_size = strlen(values[i]) + 1;
         entries[i].ttl = -1;
         entries[i].seq = (uint64_t)(i + 1);
-        entries[i].deleted = 0;
+        entries[i].flags = 0;
     }
 
     int result = skip_list_put_batch(list, entries, batch_size);
@@ -2217,7 +2217,7 @@ void benchmark_skip_list_batch_vs_single()
         entries[i].value_size = strlen(values[i]) + 1;
         entries[i].ttl = -1;
         entries[i].seq = (uint64_t)(i + 1);
-        entries[i].deleted = 0;
+        entries[i].flags = 0;
     }
 
     /* we benchmark single puts */
@@ -2229,7 +2229,7 @@ void benchmark_skip_list_batch_vs_single()
     {
         skip_list_put_with_seq(list_single, entries[i].key, entries[i].key_size, entries[i].value,
                                entries[i].value_size, entries[i].ttl, entries[i].seq,
-                               entries[i].deleted);
+                               entries[i].flags);
     }
     clock_t end_single = clock();
     double time_single = (double)(end_single - start_single) / CLOCKS_PER_SEC;
@@ -2317,7 +2317,7 @@ void test_skip_list_arena_batch()
         entries[i].value_size = strlen(values[i]) + 1;
         entries[i].ttl = -1;
         entries[i].seq = (uint64_t)(i + 1);
-        entries[i].deleted = 0;
+        entries[i].flags = 0;
     }
 
     ASSERT_EQ(skip_list_put_batch(list, entries, batch_size), batch_size);

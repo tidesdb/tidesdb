@@ -365,7 +365,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_MAX_TXN_CFS                         256
 #define TDB_MAX_CF_DISCOVERY                    256
 #define TDB_MAX_PATH_LEN                        4096
-#define TDB_MAX_TXN_OPS                         100000
+#define TDB_MAX_TXN_OPS                         INT_MAX
 #define TDB_MEMORY_PERCENTAGE                   0.6
 #define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32

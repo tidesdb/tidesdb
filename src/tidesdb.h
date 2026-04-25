@@ -327,6 +327,13 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param min_disk_space minimum free disk space required (bytes)
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
+ * @param tombstone_density_trigger ratio in [0.0, 1.0] above which any single sstable's
+ *                                  tombstone density (tombstone_count / num_entries) escalates
+ *                                  compaction priority; 0.0 disables the check (default).
+ *                                  sstables with fewer than tombstone_density_min_entries are
+ *                                  ignored to prevent tiny-sstable noise.
+ * @param tombstone_density_min_entries minimum entry count for an sstable to be considered by
+ *                                      the density trigger; 0 falls back to the default
  * @param use_btree use btree for klog, faster reads depending on workload
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
@@ -362,6 +369,8 @@ typedef struct tidesdb_column_family_config_t
     uint64_t min_disk_space;
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
+    double tombstone_density_trigger;
+    uint64_t tombstone_density_min_entries;
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
@@ -518,6 +527,8 @@ struct tidesdb_column_family_t
  * @param max_key maximum key in this sstable
  * @param max_key_size size of maximum key
  * @param num_entries total number of keys
+ * @param tombstone_count count of tombstone entries (TDB_KV_FLAG_TOMBSTONE) in this sstable.
+ *                       TDB_TOMBSTONE_COUNT_UNKNOWN means a legacy footer pre-dating the field.
  * @param num_klog_blocks number of blocks in klog
  * @param num_vlog_blocks number of blocks in vlog
  * @param klog_data_end_offset offset where data ends in klog (before footer)
@@ -556,6 +567,7 @@ struct tidesdb_sstable_t
     uint8_t *max_key;
     size_t max_key_size;
     uint64_t num_entries;
+    uint64_t tombstone_count;
     uint64_t num_klog_blocks;
     uint64_t num_vlog_blocks;
     uint64_t klog_data_end_offset;
@@ -908,6 +920,11 @@ struct tidesdb_iter_t
  * @param btree_total_nodes total b+tree nodes across all sstables
  * @param btree_max_height maximum tree height across all sstables
  * @param btree_avg_height average tree height across all sstables
+ * @param total_tombstones sum of tombstone_count across every sstable in the cf
+ * @param tombstone_ratio total_tombstones / total_keys (0.0 if total_keys is 0)
+ * @param level_tombstone_counts tombstone count per level (parallels level_key_counts)
+ * @param max_sst_density worst per-sstable tombstone density observed in the cf
+ * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
  */
 struct tidesdb_stats_t
 {
@@ -928,6 +945,12 @@ struct tidesdb_stats_t
     uint64_t btree_total_nodes;
     uint32_t btree_max_height;
     double btree_avg_height;
+    /* tombstone observability */
+    uint64_t total_tombstones;
+    double tombstone_ratio;
+    uint64_t *level_tombstone_counts;
+    double max_sst_density;
+    int max_sst_density_level;
 };
 
 /**

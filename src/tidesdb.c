@@ -199,17 +199,24 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BLOCK_INDEX_HDR_BASE        12         /* magic(4) + header_size(4) + num_entries(4) */
 #define TDB_BLOCK_INDEX_ENTRY_STRIDE \
     20 /* entry_off(4) + key_off(4) + key_size(4) + seq_lo(4) + seq_hi(4) */
-#define TDB_BLOCK_IDX_ENTRY_OFF          0  /* offset of entry_off within index entry */
-#define TDB_BLOCK_IDX_KEY_OFF            4  /* offset of key_off within index entry */
-#define TDB_BLOCK_IDX_KEY_SIZE           8  /* offset of key_size within index entry */
-#define TDB_BLOCK_IDX_SEQ_LO             12 /* offset of abs_seq low 32 bits */
-#define TDB_BLOCK_IDX_SEQ_HI             16 /* offset of abs_seq high 32 bits */
-#define TDB_SSTABLE_METADATA_MAGIC       0x5353544D
-#define TDB_SSTABLE_METADATA_HEADER_SIZE 84
-#define TDB_KLOG_BLOCK_SIZE              (64 * 1024)
-#define TDB_STACK_SSTS                   64
-#define TDB_ITER_STACK_KEY_SIZE          256
-#define TDB_BACKUP_COPY_BUFFER_SIZE      (256 * 1024)
+#define TDB_BLOCK_IDX_ENTRY_OFF             0  /* offset of entry_off within index entry */
+#define TDB_BLOCK_IDX_KEY_OFF               4  /* offset of key_off within index entry */
+#define TDB_BLOCK_IDX_KEY_SIZE              8  /* offset of key_size within index entry */
+#define TDB_BLOCK_IDX_SEQ_LO                12 /* offset of abs_seq low 32 bits */
+#define TDB_BLOCK_IDX_SEQ_HI                16 /* offset of abs_seq high 32 bits */
+#define TDB_SSTABLE_METADATA_MAGIC          0x5353544D
+#define TDB_SSTABLE_METADATA_HEADER_SIZE    84
+#define TDB_SSTABLE_METADATA_CHECKSUM_SIZE  8
+#define TDB_SSTABLE_METADATA_TOMBSTONE_SIZE 8
+#define TDB_SSTABLE_METADATA_FIXED_SIZE \
+    (TDB_SSTABLE_METADATA_HEADER_SIZE + TDB_SSTABLE_METADATA_CHECKSUM_SIZE)
+/* sentinel for tidesdb_sstable_t.tombstone_count when the footer was written before
+ * SSTABLE_FLAG_TOMBSTONE_COUNT existed. trigger and stats code skip such sstables. */
+#define TDB_TOMBSTONE_COUNT_UNKNOWN UINT64_MAX
+#define TDB_KLOG_BLOCK_SIZE         (64 * 1024)
+#define TDB_STACK_SSTS              64
+#define TDB_ITER_STACK_KEY_SIZE     256
+#define TDB_BACKUP_COPY_BUFFER_SIZE (256 * 1024)
 
 /* initial capacity values for dynamic arrays */
 #define TDB_INITIAL_MERGE_HEAP_CAPACITY    16
@@ -317,6 +324,12 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 /* default L0/L1 management configuration */
 #define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
 #define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD 20
+
+/* default tombstone density trigger configuration -- 0.0 disables the check, an sstable
+ * must hold at least TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES entries before its density
+ * counts toward the trigger so tiny sstables can't cause spurious compactions */
+#define TDB_DEFAULT_TOMBSTONE_DENSITY_TRIGGER     0.0
+#define TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES 1024
 
 /* backpressure timing configuration
  * */
@@ -1197,9 +1210,9 @@ static int tdb_partitioned_merge_finalize_sst(tidesdb_column_family_t *cf, tides
                                               block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                               bloom_filter_t *bloom,
                                               tidesdb_block_index_t *block_indexes,
-                                              uint64_t entry_count, uint64_t klog_block_num,
-                                              uint64_t vlog_block_num, uint64_t max_seq,
-                                              int end_level, int partition);
+                                              uint64_t entry_count, uint64_t tombstone_count,
+                                              uint64_t klog_block_num, uint64_t vlog_block_num,
+                                              uint64_t max_seq, int end_level, int partition);
 static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
                                                  block_manager_t *klog_bm, block_manager_t *vlog_bm,
@@ -1677,6 +1690,10 @@ typedef struct
 
 /* sstable metadata flags */
 #define SSTABLE_FLAG_BTREE 0x01 /* sstable uses btree format instead of klog blocks */
+#define SSTABLE_FLAG_TOMBSTONE_COUNT                           \
+    0x02 /* footer carries an 8-byte tombstone_count after the \
+          * btree section (or after max_key when use_btree=0)  \
+          * and before the trailing checksum */
 
 /**
  * sstable_metadata_serialize
@@ -1689,9 +1706,10 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 {
     if (!sst || !out_data || !out_size) return -1;
 
-    /* we calculate size -- header + keys + btree metadata (if applicable) + checksum */
+    /* we calculate size -- header + keys + btree metadata (if applicable) + tombstone count
+     * + checksum */
     const size_t header_size = TDB_SSTABLE_METADATA_HEADER_SIZE;
-    const size_t checksum_size = 8;
+    const size_t checksum_size = TDB_SSTABLE_METADATA_CHECKSUM_SIZE;
 
     /* btree metadata size -- root_offset(8) + first_leaf(8) + last_leaf(8) + node_count(8) +
      * height(4)
@@ -1702,8 +1720,10 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
         btree_meta_size = 8 + 8 + 8 + 8 + 4;
     }
 
-    const size_t total_size =
-        header_size + sst->min_key_size + sst->max_key_size + btree_meta_size + checksum_size;
+    const size_t tombstone_meta_size = TDB_SSTABLE_METADATA_TOMBSTONE_SIZE;
+
+    const size_t total_size = header_size + sst->min_key_size + sst->max_key_size +
+                              btree_meta_size + tombstone_meta_size + checksum_size;
 
     uint8_t *data = malloc(total_size);
     if (!data) return -1;
@@ -1734,8 +1754,9 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     encode_uint32_le_compat(ptr, sst->config->compression_algorithm);
     ptr += 4;
 
-    /* flags field -- we set SSTABLE_FLAG_BTREE if using btree */
-    uint32_t flags = 0;
+    /* flags field -- we set SSTABLE_FLAG_BTREE if using btree, and always set
+     * SSTABLE_FLAG_TOMBSTONE_COUNT for sstables produced by this build */
+    uint32_t flags = SSTABLE_FLAG_TOMBSTONE_COUNT;
     if (sst->use_btree)
     {
         flags |= SSTABLE_FLAG_BTREE;
@@ -1769,6 +1790,9 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
         ptr += 4;
     }
 
+    encode_uint64_le_compat(ptr, sst->tombstone_count);
+    ptr += 8;
+
     /* we compute and append checksum over everything except the checksum field itself */
     const size_t checksum_data_size = total_size - checksum_size;
     const uint64_t checksum = XXH64(data, checksum_data_size, 0);
@@ -1790,7 +1814,7 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_size,
                                         tidesdb_sstable_t *sst)
 {
-    if (!data || !sst || data_size < 92) return -1;
+    if (!data || !sst || data_size < TDB_SSTABLE_METADATA_FIXED_SIZE) return -1;
 
     const uint8_t *ptr = data;
 
@@ -1832,8 +1856,9 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     ptr += 4;
 
     const int use_btree = (flags & SSTABLE_FLAG_BTREE) ? 1 : 0;
+    const int has_tombstone_count = (flags & SSTABLE_FLAG_TOMBSTONE_COUNT) ? 1 : 0;
 
-    /* we calculate expected size based on whether btree metadata is present */
+    /* we calculate expected size based on which optional sections the flags promise */
     size_t btree_meta_size = 0;
 
     if (use_btree)
@@ -1843,7 +1868,11 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
         btree_meta_size = 8 + 8 + 8 + 8 + 4;
     }
 
-    const size_t expected_size = 92 + min_key_size + max_key_size + btree_meta_size;
+    const size_t tombstone_meta_size =
+        has_tombstone_count ? TDB_SSTABLE_METADATA_TOMBSTONE_SIZE : 0;
+
+    const size_t expected_size = TDB_SSTABLE_METADATA_FIXED_SIZE + min_key_size + max_key_size +
+                                 btree_meta_size + tombstone_meta_size;
     if (data_size != expected_size)
     {
         TDB_DEBUG_LOG(TDB_LOG_FATAL, "SSTable metadata size mismatch (expected: %zu, got: %zu)",
@@ -1852,11 +1881,11 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     }
 
     /* we verify checksum over everything except checksum field */
-    const size_t checksum_data_size = data_size - 8;
+    const size_t checksum_data_size = data_size - TDB_SSTABLE_METADATA_CHECKSUM_SIZE;
     const uint64_t computed_checksum = XXH64(data, checksum_data_size, 0);
 
     /* we checksum is at the end of the data */
-    const uint8_t *checksum_ptr = data + data_size - 8;
+    const uint8_t *checksum_ptr = data + data_size - TDB_SSTABLE_METADATA_CHECKSUM_SIZE;
     const uint64_t stored_checksum = decode_uint64_le_compat(checksum_ptr);
 
     if (computed_checksum != stored_checksum)
@@ -1934,6 +1963,16 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
         ptr += 8;
         sst->btree_height = decode_uint32_le_compat(ptr);
         ptr += 4;
+    }
+
+    if (has_tombstone_count)
+    {
+        sst->tombstone_count = decode_uint64_le_compat(ptr);
+        ptr += 8;
+    }
+    else
+    {
+        sst->tombstone_count = TDB_TOMBSTONE_COUNT_UNKNOWN;
     }
 
     return 0;
@@ -2104,6 +2143,8 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .min_disk_space = TDB_DEFAULT_MIN_DISK_SPACE,
         .l1_file_count_trigger = TDB_DEFAULT_L1_FILE_COUNT_TRIGGER,
         .l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD,
+        .tombstone_density_trigger = TDB_DEFAULT_TOMBSTONE_DENSITY_TRIGGER,
+        .tombstone_density_min_entries = TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES,
         .use_btree = 0,
         .commit_hook_fn = NULL,
         .commit_hook_ctx = NULL,
@@ -6405,6 +6446,7 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
     }
 
     uint64_t entry_count = 0;
+    uint64_t tombstone_count = 0;
     uint64_t max_seq = 0;
 
     while (skip_list_cursor_valid(cursor))
@@ -6484,6 +6526,7 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
 
         if (seq > max_seq) max_seq = seq;
         entry_count++;
+        if (entry_flags & BTREE_ENTRY_FLAG_TOMBSTONE) tombstone_count++;
 
         skip_list_cursor_next(cursor);
     }
@@ -6508,6 +6551,7 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
     sst->btree_node_count = tree->node_count;
     sst->btree_height = tree->height;
     sst->num_entries = entry_count;
+    sst->tombstone_count = tombstone_count;
     sst->max_seq = max_seq;
 
     /* we copy min/max keys */
@@ -6637,6 +6681,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
     }
 
     uint64_t entry_count = 0;
+    uint64_t tombstone_count = 0;
     uint64_t max_seq = 0;
     uint64_t vlog_block_num = 0;
 
@@ -6778,6 +6823,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                     }
 
                     entry_count++;
+                    if (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) tombstone_count++;
                 }
             }
 
@@ -6812,6 +6858,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
     sst->btree_node_count = tree->node_count;
     sst->btree_height = tree->height;
     sst->num_entries = entry_count;
+    sst->tombstone_count = tombstone_count;
     sst->max_seq = max_seq;
     sst->num_vlog_blocks = vlog_block_num;
 
@@ -6963,6 +7010,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     size_t first_key_size = 0;
     size_t last_key_size = 0;
     uint64_t entry_count = 0;
+    uint64_t tombstone_count = 0;
     uint64_t max_seq = 0;
     size_t block_first_key_size = 0;
     size_t block_last_key_size = 0;
@@ -7106,6 +7154,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
             sst->num_entries++;
             entry_count++;
+            if (kv_stack.entry.flags & TDB_KV_FLAG_TOMBSTONE) tombstone_count++;
 
         } while (skip_list_cursor_next(cursor) == 0);
     }
@@ -7137,6 +7186,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
     /* we finalize sstable metadata */
     sst->num_entries = entry_count;
+    sst->tombstone_count = tombstone_count;
     sst->num_klog_blocks = klog_block_num;
     sst->num_vlog_blocks = vlog_block_num;
     sst->min_key = first_key;
@@ -11954,6 +12004,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                 }
 
                 new_sst->num_entries++;
+                if (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) new_sst->tombstone_count++;
             }
 
             tidesdb_kv_pair_free(pending);
@@ -12525,6 +12576,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         tidesdb_klog_block_t *klog_block = tidesdb_klog_block_create();
 
         uint64_t entry_count = 0;
+        uint64_t tombstone_count = 0;
         uint64_t klog_block_num = 0;
         uint64_t vlog_block_num = 0;
         uint64_t max_seq = 0;
@@ -12781,6 +12833,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     }
 
                     entry_count++;
+                    if (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) tombstone_count++;
                 }
 
                 tidesdb_kv_pair_free(pending);
@@ -12855,6 +12908,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         new_sst->num_vlog_blocks = vlog_block_num;
 
         new_sst->num_entries = entry_count;
+        new_sst->tombstone_count = tombstone_count;
         new_sst->max_seq = max_seq;
         new_sst->min_key = first_key;
         new_sst->min_key_size = first_key_size;
@@ -13081,12 +13135,13 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 static int tdb_partitioned_merge_finalize_sst(
     tidesdb_column_family_t *cf, tidesdb_sstable_t *sst, block_manager_t *klog_bm,
     block_manager_t *vlog_bm, bloom_filter_t *bloom, tidesdb_block_index_t *block_indexes,
-    const uint64_t entry_count, const uint64_t klog_block_num, const uint64_t vlog_block_num,
-    const uint64_t max_seq, const int end_level, const int partition)
+    const uint64_t entry_count, const uint64_t tombstone_count, const uint64_t klog_block_num,
+    const uint64_t vlog_block_num, const uint64_t max_seq, const int end_level, const int partition)
 {
     sst->num_klog_blocks = klog_block_num;
     sst->num_vlog_blocks = vlog_block_num;
     sst->num_entries = entry_count;
+    sst->tombstone_count = tombstone_count;
     sst->max_seq = max_seq;
 
     block_manager_get_size(klog_bm, &sst->klog_data_end_offset);
@@ -13517,6 +13572,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* we merge and write entries in partition range */
             tidesdb_klog_block_t *klog_block = tidesdb_klog_block_create();
             uint64_t entry_count = 0;
+            uint64_t tombstone_count = 0;
             uint64_t klog_block_num = 0;
             uint64_t vlog_block_num = 0;
             uint64_t max_seq = 0;
@@ -13695,6 +13751,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 }
 
                 entry_count++;
+                if (kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) tombstone_count++;
 
                 if (tidesdb_klog_block_is_full(klog_block, TDB_KLOG_BLOCK_SIZE))
                 {
@@ -13778,7 +13835,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                             tdb_partitioned_merge_finalize_sst(
                                 cf, new_sst, klog_bm, vlog_bm, bloom, block_indexes, entry_count,
-                                klog_block_num, vlog_block_num, max_seq, end_level, partition);
+                                tombstone_count, klog_block_num, vlog_block_num, max_seq, end_level,
+                                partition);
 
                             /* we create replacement sst for remaining entries in this partition */
                             uint64_t split_id = atomic_fetch_add(&cf->next_sstable_id, 1);
@@ -13836,6 +13894,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                             /* we reset per-sst counters */
                             entry_count = 0;
+                            tombstone_count = 0;
                             klog_block_num = 0;
                             vlog_block_num = 0;
                             max_seq = 0;
@@ -13911,8 +13970,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             new_sst->max_key_size = last_key_size;
 
             tdb_partitioned_merge_finalize_sst(cf, new_sst, klog_bm, vlog_bm, bloom, block_indexes,
-                                               entry_count, klog_block_num, vlog_block_num, max_seq,
-                                               end_level, partition);
+                                               entry_count, tombstone_count, klog_block_num,
+                                               vlog_block_num, max_seq, end_level, partition);
         }
 
         tidesdb_merge_heap_free(heap);
@@ -13933,6 +13992,70 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                   cf->name, num_partitions);
 
     return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_cf_dense_tombstone_witness
+ * walks every level looking for an sstable whose tombstone density is at or above
+ * the configured trigger ratio. on a hit we record the offending sstable's level
+ * and density via out-parameters so the caller can log specific context, and we
+ * return early. sstables with TDB_TOMBSTONE_COUNT_UNKNOWN (legacy footers without
+ * SSTABLE_FLAG_TOMBSTONE_COUNT) or fewer than min_entries are skipped -- we don't
+ * escalate on guesses or on sstables too small for the ratio to be meaningful.
+ *
+ * @param cf the column family
+ * @param threshold density ratio in (0.0, 1.0]
+ * @param min_entries minimum sstable entry count for density to count
+ * @param out_level optional, set to the 1-based level number of the witness on hit
+ * @param out_density optional, set to the witness sstable's density on hit
+ * @return 1 if any sstable meets or exceeds the threshold, 0 otherwise
+ */
+static int tidesdb_cf_dense_tombstone_witness(tidesdb_column_family_t *cf, double threshold,
+                                              uint64_t min_entries, int *out_level,
+                                              double *out_density)
+{
+    if (threshold <= 0.0) return 0;
+
+    const int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    for (int lv = 0; lv < num_levels; lv++)
+    {
+        tidesdb_level_t *lvl = cf->levels[lv];
+        if (!lvl) continue;
+
+        atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
+
+        const int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **ssts = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+
+        int hit = 0;
+        double witness_density = 0.0;
+        for (int i = 0; ssts && i < num_ssts; i++)
+        {
+            tidesdb_sstable_t *sst = ssts[i];
+            if (!sst) continue;
+            if (sst->tombstone_count == TDB_TOMBSTONE_COUNT_UNKNOWN) continue;
+            if (sst->num_entries < min_entries) continue;
+
+            /* fp multiply rather than divide -- one mul per sstable, identical
+             * semantics, no zero-divide branch */
+            const double bound = (double)sst->num_entries * threshold;
+            if ((double)sst->tombstone_count >= bound)
+            {
+                hit = 1;
+                witness_density = (double)sst->tombstone_count / (double)sst->num_entries;
+                break;
+            }
+        }
+
+        atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
+        if (hit)
+        {
+            if (out_level) *out_level = lv + 1;
+            if (out_density) *out_density = witness_density;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /**
@@ -14821,13 +14944,44 @@ static void *tidesdb_flush_worker_thread(void *arg)
             trigger_reason = "size";
         }
 
+        /* tombstone density trigger -- fires when any sstable in the cf carries enough
+         * tombstones that compaction should run early to push them toward the largest
+         * level (where regular tombstones finally drop) and shrink read-amp from
+         * skipping them. only consulted when structural triggers haven't already fired. */
+        int density_witness_level = 0;
+        double density_witness_value = 0.0;
+        if (!should_compact && cf->config.tombstone_density_trigger > 0.0)
+        {
+            const uint64_t min_entries = cf->config.tombstone_density_min_entries
+                                             ? cf->config.tombstone_density_min_entries
+                                             : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
+            if (tidesdb_cf_dense_tombstone_witness(cf, cf->config.tombstone_density_trigger,
+                                                   min_entries, &density_witness_level,
+                                                   &density_witness_value))
+            {
+                should_compact = 1;
+                trigger_reason = "tombstone density";
+            }
+        }
+
         if (should_compact)
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "CF '%s' level %d (first disk level) triggering compaction (%s): "
-                          "files=%d (trigger=%d), size=%zu (capacity=%zu)",
-                          cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
-                          cf->config.l1_file_count_trigger, level1_size, level1_capacity);
+            if (density_witness_level > 0)
+            {
+                TDB_DEBUG_LOG(
+                    TDB_LOG_INFO,
+                    "CF '%s' triggering compaction (%s): witness L%d density=%.3f (threshold=%.3f)",
+                    cf->name, trigger_reason, density_witness_level, density_witness_value,
+                    cf->config.tombstone_density_trigger);
+            }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' level %d (first disk level) triggering compaction (%s): "
+                              "files=%d (trigger=%d), size=%zu (capacity=%zu)",
+                              cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
+                              cf->config.l1_file_count_trigger, level1_size, level1_capacity);
+            }
             tidesdb_compact(cf);
         }
 
@@ -21933,10 +22087,21 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
                                       " written (%d entries)",
                                       current_cf->name, sst_id, entries_in_temp);
 
-                        /* we trigger compaction if needed */
+                        /* we trigger compaction if needed -- file count or density */
                         int num_l1 = atomic_load_explicit(&current_cf->levels[0]->num_sstables,
                                                           memory_order_acquire);
-                        if (num_l1 >= current_cf->config.l1_file_count_trigger)
+                        int density_hit = 0;
+                        if (current_cf->config.tombstone_density_trigger > 0.0)
+                        {
+                            const uint64_t min_entries =
+                                current_cf->config.tombstone_density_min_entries
+                                    ? current_cf->config.tombstone_density_min_entries
+                                    : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
+                            density_hit = tidesdb_cf_dense_tombstone_witness(
+                                current_cf, current_cf->config.tombstone_density_trigger,
+                                min_entries, NULL, NULL);
+                        }
+                        if (num_l1 >= current_cf->config.l1_file_count_trigger || density_hit)
                         {
                             tidesdb_compact(current_cf);
                         }
@@ -22073,7 +22238,18 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
 
                 int num_l1 = atomic_load_explicit(&current_cf->levels[0]->num_sstables,
                                                   memory_order_acquire);
-                if (num_l1 >= current_cf->config.l1_file_count_trigger)
+                int density_hit = 0;
+                if (current_cf->config.tombstone_density_trigger > 0.0)
+                {
+                    const uint64_t min_entries =
+                        current_cf->config.tombstone_density_min_entries
+                            ? current_cf->config.tombstone_density_min_entries
+                            : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
+                    density_hit = tidesdb_cf_dense_tombstone_witness(
+                        current_cf, current_cf->config.tombstone_density_trigger, min_entries, NULL,
+                        NULL);
+                }
+                if (num_l1 >= current_cf->config.l1_file_count_trigger || density_hit)
                 {
                     tidesdb_compact(current_cf);
                 }
@@ -26738,14 +26914,16 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     (*stats)->level_sizes = malloc((*stats)->num_levels * sizeof(size_t));
     (*stats)->level_num_sstables = malloc((*stats)->num_levels * sizeof(int));
     (*stats)->level_key_counts = malloc((*stats)->num_levels * sizeof(uint64_t));
+    (*stats)->level_tombstone_counts = malloc((*stats)->num_levels * sizeof(uint64_t));
     (*stats)->config = malloc(sizeof(tidesdb_column_family_config_t));
 
     if (!(*stats)->level_sizes || !(*stats)->level_num_sstables || !(*stats)->level_key_counts ||
-        !(*stats)->config)
+        !(*stats)->level_tombstone_counts || !(*stats)->config)
     {
         free((*stats)->level_sizes);
         free((*stats)->level_num_sstables);
         free((*stats)->level_key_counts);
+        free((*stats)->level_tombstone_counts);
         free((*stats)->config);
         free(*stats);
         return TDB_ERR_MEMORY;
@@ -26765,6 +26943,11 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     uint64_t btree_height_sum = 0;
     int btree_sstable_count = 0;
 
+    /* tombstone observability aggregation */
+    uint64_t total_tombstones = 0;
+    double max_density = 0.0;
+    int max_density_level = 0;
+
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
         (*stats)->level_sizes[i] = atomic_load(&cf->levels[i]->current_size);
@@ -26773,6 +26956,7 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
 
         /* we count keys per level from sstables */
         uint64_t level_keys = 0;
+        uint64_t level_tombstones = 0;
         tidesdb_sstable_t **sstables =
             atomic_load_explicit(&cf->levels[i]->sstables, memory_order_acquire);
         for (int j = 0; j < num_sstables; j++)
@@ -26794,10 +26978,29 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
                         btree_max_height = sstables[j]->btree_height;
                     }
                 }
+
+                /* sstables with unknown tombstone counts (legacy footers) contribute
+                 * nothing to the totals or the max-density witness */
+                if (sstables[j]->tombstone_count != TDB_TOMBSTONE_COUNT_UNKNOWN)
+                {
+                    level_tombstones += sstables[j]->tombstone_count;
+                    if (sstables[j]->num_entries > 0)
+                    {
+                        const double d =
+                            (double)sstables[j]->tombstone_count / (double)sstables[j]->num_entries;
+                        if (d > max_density)
+                        {
+                            max_density = d;
+                            max_density_level = i + 1;
+                        }
+                    }
+                }
             }
         }
         (*stats)->level_key_counts[i] = level_keys;
+        (*stats)->level_tombstone_counts[i] = level_tombstones;
         total_keys += level_keys;
+        total_tombstones += level_tombstones;
     }
 
     /* we populate btree stats */
@@ -26809,6 +27012,12 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
 
     (*stats)->total_keys = total_keys;
     (*stats)->total_data_size = total_data_size;
+
+    (*stats)->total_tombstones = total_tombstones;
+    (*stats)->tombstone_ratio =
+        total_keys > 0 ? (double)total_tombstones / (double)total_keys : 0.0;
+    (*stats)->max_sst_density = max_density;
+    (*stats)->max_sst_density_level = max_density_level;
 
     /* we estimate avg key/value sizes from memtable size and sstable data */
     if (total_keys > 0)
@@ -26866,6 +27075,7 @@ void tidesdb_free_stats(tidesdb_stats_t *stats)
     free(stats->level_sizes);
     free(stats->level_num_sstables);
     free(stats->level_key_counts);
+    free(stats->level_tombstone_counts);
     free(stats->config);
     free(stats);
 }
@@ -28459,6 +28669,14 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->l0_queue_stall_threshold = (int)strtol(value, NULL, 10);
     }
+    else if (strcmp(name, "tombstone_density_trigger") == 0)
+    {
+        ctx->config->tombstone_density_trigger = strtod(value, NULL);
+    }
+    else if (strcmp(name, "tombstone_density_min_entries") == 0)
+    {
+        ctx->config->tombstone_density_min_entries = (uint64_t)strtoull(value, NULL, 10);
+    }
     else if (strcmp(name, "min_disk_space") == 0)
     {
         ctx->config->min_disk_space = (uint64_t)strtoull(value, NULL, 10);
@@ -28562,6 +28780,9 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "default_isolation_level = %d\n", config->default_isolation_level);
     fprintf(fp, "l1_file_count_trigger = %d\n", config->l1_file_count_trigger);
     fprintf(fp, "l0_queue_stall_threshold = %d\n", config->l0_queue_stall_threshold);
+    fprintf(fp, "tombstone_density_trigger = %f\n", config->tombstone_density_trigger);
+    fprintf(fp, "tombstone_density_min_entries = %" PRIu64 "\n",
+            config->tombstone_density_min_entries);
     fprintf(fp, "min_disk_space = %" PRIu64 "\n", config->min_disk_space);
     fprintf(fp, "use_btree = %d\n", config->use_btree);
     fprintf(fp, "object_lazy_compaction = %d\n", config->object_lazy_compaction);
@@ -28623,6 +28844,8 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.skip_list_probability = new_config->skip_list_probability;
     cf->config.l1_file_count_trigger = new_config->l1_file_count_trigger;
     cf->config.l0_queue_stall_threshold = new_config->l0_queue_stall_threshold;
+    cf->config.tombstone_density_trigger = new_config->tombstone_density_trigger;
+    cf->config.tombstone_density_min_entries = new_config->tombstone_density_min_entries;
     cf->config.min_disk_space = new_config->min_disk_space;
     cf->config.commit_hook_fn = new_config->commit_hook_fn;
     cf->config.commit_hook_ctx = new_config->commit_hook_ctx;

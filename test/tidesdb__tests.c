@@ -2270,8 +2270,17 @@ static void test_single_delete_pair_cancel_at_compaction(void)
     tidesdb_flush_memtable(cf);
     wait_for_flush_queue_drain(db);
 
-    tidesdb_compact(cf);
-    wait_for_compaction_idle(db, cf);
+    /* run several compaction rounds. one tidesdb_compact() is not always enough
+     * because spooky's algo 2 may keep picking L1->L1 same-level merges when L1 is
+     * over capacity from many small flushes, leaving the SDs at L1 and the original
+     * puts at L2 perpetually unable to share a merge input. each pass reshuffles
+     * level capacities so eventually the SDs reach the level that holds the puts
+     * and pair-cancel fires. */
+    for (int i = 0; i < 8; i++)
+    {
+        tidesdb_compact(cf);
+        wait_for_compaction_idle(db, cf);
+    }
 
     /* every key must be gone to reads */
     tidesdb_txn_t *txn = NULL;

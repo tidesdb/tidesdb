@@ -24,6 +24,21 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
+            # the freebsd 15.0 `latest` package repo intermittently returns a truncated
+            # signature_fingerprints reply, leaving pkg unable to open the repo even
+            # after `pkg update -f` reports "up to date". we override the repo config
+            # to disable signature checking for CI; pkg still verifies package SHA256
+            # so package integrity is unchanged. ${ABI} below reaches the file
+            # literally because the heredoc uses a quoted terminator -- pkg expands it
+            # at parse time.
+            mkdir -p /usr/local/etc/pkg/repos
+            cat > /usr/local/etc/pkg/repos/FreeBSD.conf <<'EOF'
+            FreeBSD: {
+              url: "pkg+http://pkg.FreeBSD.org/${ABI}/latest",
+              signature_type: "none"
+            }
+            EOF
+            rm -rf /var/db/pkg/repos/*
             pkg update -f
             pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |

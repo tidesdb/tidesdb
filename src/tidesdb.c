@@ -118,6 +118,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
 
 typedef struct tidesdb_flush_work_t tidesdb_flush_work_t;
 typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
+typedef struct tidesdb_unified_flush_barrier_t tidesdb_unified_flush_barrier_t;
 typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 
 /* kv pair flags */
@@ -143,16 +144,17 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
  * remembered the plain tombstone bit. */
 #define TDB_KV_TOMBSTONE_FLAG_MASK (TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE)
 
-#define TDB_LOG_FILE               "LOG"
-#define TDB_WAL_PREFIX             "wal_"
-#define TDB_WAL_EXT                ".log"
-#define TDB_UNIFIED_WAL_PREFIX     "uwal_"
-#define TDB_UNIFIED_WAL_MAGIC      0x55AAU
-#define TDB_UNIFIED_WAL_MAGIC_SIZE sizeof(uint16_t)
-#define TDB_UNIFIED_CF_PREFIX_SIZE 4
-#define TDB_REPLICA_WAL_TMP        "replica_wal_tmp.log"
-#define TDB_REPLICA_MANIFEST_TMP   "MANIFEST.replica_tmp"
-#define TDB_PREFIXED_KEY_STACK_MAX 256
+#define TDB_LOG_FILE                   "LOG"
+#define TDB_WAL_PREFIX                 "wal_"
+#define TDB_WAL_EXT                    ".log"
+#define TDB_UNIFIED_WAL_PREFIX         "uwal_"
+#define TDB_UNIFIED_WAL_MAGIC          0x55AAU
+#define TDB_UNIFIED_WAL_MAGIC_SIZE     sizeof(uint16_t)
+#define TDB_UNIFIED_CF_PREFIX_SIZE     4
+#define TDB_UNIFIED_SPLITS_INITIAL_CAP 8
+#define TDB_REPLICA_WAL_TMP            "replica_wal_tmp.log"
+#define TDB_REPLICA_MANIFEST_TMP       "MANIFEST.replica_tmp"
+#define TDB_PREFIXED_KEY_STACK_MAX     256
 
 /* stack-with-heap-fallback for prefixed keys */
 #define TDB_PREFIXED_KEY_ALLOC(name, total_size, stack_buf) \
@@ -647,12 +649,40 @@ struct tidesdb_commit_status_t
  * @param cf column family
  * @param imm immutable memtable wrapper (holds refcount)
  * @param sst_id sstable id
+ * @param unified_temp_sl per cf temp skip list for a unified split task. when
+ *                        set the worker writes temp_sl to cf as an sstable
+ *                        instead of walking imm. owned by the work item,
+ *                        freed by the worker.
+ * @param unified_barrier shared barrier across sibling per cf split tasks of
+ *                        a single unified memtable flush. last finisher closes
+ *                        the unified wal and frees the barrier.
  */
 struct tidesdb_flush_work_t
 {
     tidesdb_column_family_t *cf;
     tidesdb_immutable_memtable_t *imm;
     uint64_t sst_id;
+    skip_list_t *unified_temp_sl;
+    tidesdb_unified_flush_barrier_t *unified_barrier;
+};
+
+/**
+ * tidesdb_unified_flush_barrier_t
+ * shared completion state for a unified memtable flush split into per cf tasks.
+ * the dispatcher initialises remaining to the number of per cf tasks it enqueues.
+ * each task does its own sstable write then decrements remaining. the task that
+ * brings remaining to zero owns the unified wal cleanup and the barrier free.
+ * @param remaining per cf tasks still in flight
+ * @param overall_result first non-success error reported by any task
+ * @param umt_imm unified immutable memtable being flushed
+ * @param db database instance
+ */
+struct tidesdb_unified_flush_barrier_t
+{
+    atomic_int remaining;
+    atomic_int overall_result;
+    tidesdb_memtable_t *umt_imm;
+    tidesdb_t *db;
 };
 
 /**
@@ -1285,6 +1315,9 @@ typedef struct
 
 static void *tidesdb_flush_worker_thread(void *arg);
 static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *umt_imm);
+static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family_t *cf,
+                                            skip_list_t *temp_sl);
+static void tidesdb_unified_flush_barrier_finish(tidesdb_unified_flush_barrier_t *barrier);
 static int tidesdb_unified_memtable_rotate(tidesdb_t *db);
 static void *tidesdb_compaction_worker_thread(void *arg);
 static void *tidesdb_sync_worker_thread(void *arg);
@@ -15274,6 +15307,26 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_column_family_t *cf = work->cf;
         tidesdb_immutable_memtable_t *imm = work->imm;
 
+        /*** unified per-cf split task. write the prebuilt temp skip list to cf as
+         **  an l1 sstable, then drop our share of the barrier. last finisher closes
+         *   the unified wal and marks the unified memtable flushed. */
+        if (work->unified_barrier && work->unified_temp_sl)
+        {
+            int wr = tidesdb_unified_write_cf_sstable(db, cf, work->unified_temp_sl);
+            if (wr != TDB_SUCCESS)
+            {
+                int expected = TDB_SUCCESS;
+                atomic_compare_exchange_strong_explicit(&work->unified_barrier->overall_result,
+                                                        &expected, wr, memory_order_acq_rel,
+                                                        memory_order_relaxed);
+            }
+            skip_list_free(work->unified_temp_sl);
+            tidesdb_unified_flush_barrier_finish(work->unified_barrier);
+            free(work);
+            atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
+            continue;
+        }
+
         /* unified flush dispatch -- cf==NULL means this is a unified memtable flush */
         if (!cf && imm)
         {
@@ -19709,6 +19762,8 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     work->cf = cf;
     work->imm = immutable;
     work->sst_id = sst_id;
+    work->unified_temp_sl = NULL;
+    work->unified_barrier = NULL;
 
     tidesdb_immutable_memtable_ref(immutable);
 
@@ -22763,38 +22818,191 @@ static tidesdb_column_family_t *tidesdb_find_cf_by_unified_index(tidesdb_t *db, 
 }
 
 /**
+ * tidesdb_unified_split_t
+ * one cf group built during unified flush phase 1. ownership of temp_sl transfers
+ * to the per-cf flush task once enqueued.
+ */
+typedef struct
+{
+    tidesdb_column_family_t *cf;
+    skip_list_t *temp_sl;
+} tidesdb_unified_split_t;
+
+/**
+ * tidesdb_unified_close_wal
+ * close, optionally upload, and unlink the unified wal backing umt_imm. respects
+ * the object store replicate_wal and wal_upload_sync config.
+ */
+static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm)
+{
+    if (!umt_imm->wal) return;
+
+    char *wal_path = tdb_strdup(umt_imm->wal->file_path);
+    const uint64_t imm_gen = umt_imm->generation;
+    block_manager_close(umt_imm->wal);
+    umt_imm->wal = NULL;
+    if (!wal_path) return;
+
+    if (db->object_store && db->config.object_store_config &&
+        db->config.object_store_config->replicate_wal)
+    {
+        if (db->config.object_store_config->wal_upload_sync)
+        {
+            tdb_objstore_upload_file_sync(db, wal_path);
+            tdb_unlink(wal_path);
+            tdb_sync_directory(db->db_path);
+        }
+        else
+        {
+            /** async upload with the wal generation for fence tracking. the reaper
+             *  cleans up the local file after the upload confirms. */
+            tdb_objstore_enqueue_upload(db, wal_path, imm_gen);
+        }
+    }
+    else
+    {
+        tdb_unlink(wal_path);
+        tdb_sync_directory(db->db_path);
+    }
+    free(wal_path);
+}
+
+/**
+ * tidesdb_unified_write_cf_sstable
+ * write a temp skip list as a fresh l1 sstable for cf, commit the manifest,
+ * and trigger compaction if thresholds are met. caller retains ownership of
+ * temp_sl.
+ */
+static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family_t *cf,
+                                            skip_list_t *temp_sl)
+{
+    if (!db || !cf || !temp_sl) return TDB_ERR_INVALID_ARGS;
+
+    const uint64_t sst_id = atomic_fetch_add(&cf->next_sstable_id, 1);
+    char sst_path[MAX_FILE_PATH_LENGTH];
+    snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1", cf->directory);
+
+    tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_path, sst_id, &cf->config);
+    if (!sst)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Unified flush: CF '%s' SSTable creation failed", cf->name);
+        return TDB_ERR_IO;
+    }
+
+    int wr;
+    if (cf->config.use_btree)
+        wr = tidesdb_sstable_write_from_memtable_btree(db, sst, temp_sl);
+    else
+        wr = tidesdb_sstable_write_from_memtable(db, sst, temp_sl);
+
+    if (wr != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Unified flush: CF '%s' SSTable write failed (error %d)",
+                      cf->name, wr);
+        tidesdb_sstable_unref(db, sst);
+        return wr;
+    }
+
+    tidesdb_block_managers_t bms;
+    if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
+    {
+        if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
+        if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+    }
+    if (sst->klog_bm)
+    {
+        block_manager_close(sst->klog_bm);
+        sst->klog_bm = NULL;
+    }
+    if (sst->vlog_bm)
+    {
+        block_manager_close(sst->vlog_bm);
+        sst->vlog_bm = NULL;
+    }
+
+    tidesdb_level_add_sstable(cf->levels[0], sst);
+    tidesdb_bump_sstable_layout_version(cf);
+
+    tidesdb_manifest_add_sstable(cf->manifest, 1, sst_id, sst->num_entries,
+                                 sst->klog_size + sst->vlog_size);
+    atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+    tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+    tdb_objstore_upload_manifest(db, cf);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified flush: CF '%s' SSTable %" PRIu64 " written", cf->name,
+                  sst_id);
+
+    int num_l1 = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+    int density_hit = 0;
+    if (cf->config.tombstone_density_trigger > 0.0)
+    {
+        const uint64_t min_entries = cf->config.tombstone_density_min_entries
+                                         ? cf->config.tombstone_density_min_entries
+                                         : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
+        density_hit = tidesdb_cf_dense_tombstone_witness(cf, cf->config.tombstone_density_trigger,
+                                                         min_entries, NULL, NULL);
+    }
+    if (num_l1 >= cf->config.l1_file_count_trigger || density_hit)
+    {
+        tidesdb_compact(cf);
+    }
+
+    tidesdb_sstable_unref(db, sst);
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_unified_flush_barrier_finish
+ * decrement the per-cf task barrier. the task that brings remaining to zero owns
+ * the unified wal cleanup, the flushed flag transition, and the barrier free.
+ * earlier finishers just decrement and return.
+ */
+static void tidesdb_unified_flush_barrier_finish(tidesdb_unified_flush_barrier_t *barrier)
+{
+    if (!barrier) return;
+    if (atomic_fetch_sub_explicit(&barrier->remaining, 1, memory_order_acq_rel) != 1) return;
+
+    tidesdb_unified_close_wal(barrier->db, barrier->umt_imm);
+    atomic_store_explicit(&barrier->umt_imm->flushed, 1, memory_order_release);
+    free(barrier);
+}
+
+/**
  * tidesdb_unified_flush_immutable
- * flush a unified immutable memtable by demuxing entries into per-CF sstables
- * entries are sorted by [4-byte BE cf_index][key], so consecutive entries with the
- * same prefix belong to the same CF. for each CF group we build a temporary skip list
- * with stripped keys and flush it using existing sstable write machinery.
- * @param db database instance
- * @param umt_imm unified immutable memtable to flush
- * @return TDB_SUCCESS on success, error code on failure
+ * flush a unified immutable memtable by demuxing entries into per-cf sstables.
+ * entries are sorted by a four byte big-endian cf_index followed by the user
+ * key, so consecutive entries with the same prefix belong to the same cf.
+ * phase one walks the cursor and builds a temp skip list per cf in memory.
+ * phase two enqueues a per-cf flush task for each non-empty cf onto the shared
+ * flush queue so workers write the per-cf sstables in parallel rather than
+ * sequentially within one worker. the last task to finish closes the unified
+ * wal and marks the memtable flushed. per-cf io errors are recorded on the
+ * barrier and logged by the workers.
  */
 static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *umt_imm)
 {
     if (!db || !umt_imm || !umt_imm->skip_list) return TDB_ERR_INVALID_ARGS;
 
     skip_list_cursor_t *cursor = NULL;
-    if (skip_list_cursor_init(&cursor, umt_imm->skip_list) != 0)
-    {
-        return TDB_ERR_MEMORY;
-    }
+    if (skip_list_cursor_init(&cursor, umt_imm->skip_list) != 0) return TDB_ERR_MEMORY;
 
     if (skip_list_cursor_goto_first(cursor) != 0)
     {
         skip_list_cursor_free(cursor);
-        return TDB_SUCCESS; /* empty memtable */
+        tidesdb_unified_close_wal(db, umt_imm);
+        atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
+        return TDB_SUCCESS;
     }
 
-    int overall_result = TDB_SUCCESS;
+    tidesdb_unified_split_t *splits = NULL;
+    int split_count = 0;
+    int split_cap = 0;
+    int phase1_result = TDB_SUCCESS;
+
     uint32_t current_cf_index = UINT32_MAX;
     skip_list_t *temp_sl = NULL;
     tidesdb_column_family_t *current_cf = NULL;
-    int entries_in_temp = 0;
 
-    /* we process entries grouped by CF prefix */
     do
     {
     reprocess_current_entry:;
@@ -22806,9 +23014,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
 
         if (skip_list_cursor_get_with_seq(cursor, &raw_key, &raw_key_size, &value, &value_size,
                                           &ttl, &deleted, &seq) != 0)
-        {
             continue;
-        }
 
         if (raw_key_size < TDB_UNIFIED_CF_PREFIX_SIZE) continue;
 
@@ -22818,101 +23024,35 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
 
         if (cf_index != current_cf_index)
         {
-            if (temp_sl && current_cf && entries_in_temp > 0)
+            if (temp_sl && current_cf)
             {
-                /* we flush temp skip list to sstable for current_cf */
-                const uint64_t sst_id = atomic_fetch_add(&current_cf->next_sstable_id, 1);
-                char sst_path[MAX_FILE_PATH_LENGTH];
-                snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
-                         current_cf->directory);
-
-                tidesdb_sstable_t *sst =
-                    tidesdb_sstable_create(db, sst_path, sst_id, &current_cf->config);
-                if (sst)
+                if (split_count == split_cap)
                 {
-                    int wr;
-                    if (current_cf->config.use_btree)
-                        wr = tidesdb_sstable_write_from_memtable_btree(db, sst, temp_sl);
-                    else
-                        wr = tidesdb_sstable_write_from_memtable(db, sst, temp_sl);
-
-                    if (wr == TDB_SUCCESS)
+                    int new_cap = split_cap == 0 ? TDB_UNIFIED_SPLITS_INITIAL_CAP : split_cap * 2;
+                    tidesdb_unified_split_t *grown =
+                        realloc(splits, (size_t)new_cap * sizeof(*grown));
+                    if (!grown)
                     {
-                        /* we sync and close write handles */
-                        tidesdb_block_managers_t bms;
-                        if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
-                        {
-                            if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-                            if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
-                        }
-                        if (sst->klog_bm)
-                        {
-                            block_manager_close(sst->klog_bm);
-                            sst->klog_bm = NULL;
-                        }
-                        if (sst->vlog_bm)
-                        {
-                            block_manager_close(sst->vlog_bm);
-                            sst->vlog_bm = NULL;
-                        }
-
-                        tidesdb_level_add_sstable(current_cf->levels[0], sst);
-                        tidesdb_bump_sstable_layout_version(current_cf);
-
-                        tidesdb_manifest_add_sstable(current_cf->manifest, 1, sst_id,
-                                                     sst->num_entries,
-                                                     sst->klog_size + sst->vlog_size);
-                        atomic_store(&current_cf->manifest->sequence,
-                                     atomic_load(&current_cf->next_sstable_id));
-                        tidesdb_manifest_commit(current_cf->manifest, current_cf->manifest->path);
-                        tdb_objstore_upload_manifest(db, current_cf);
-
-                        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                                      "Unified flush: CF '%s' SSTable %" PRIu64
-                                      " written (%d entries)",
-                                      current_cf->name, sst_id, entries_in_temp);
-
-                        /* we trigger compaction if needed -- file count or density */
-                        int num_l1 = atomic_load_explicit(&current_cf->levels[0]->num_sstables,
-                                                          memory_order_acquire);
-                        int density_hit = 0;
-                        if (current_cf->config.tombstone_density_trigger > 0.0)
-                        {
-                            const uint64_t min_entries =
-                                current_cf->config.tombstone_density_min_entries
-                                    ? current_cf->config.tombstone_density_min_entries
-                                    : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
-                            density_hit = tidesdb_cf_dense_tombstone_witness(
-                                current_cf, current_cf->config.tombstone_density_trigger,
-                                min_entries, NULL, NULL);
-                        }
-                        if (num_l1 >= current_cf->config.l1_file_count_trigger || density_hit)
-                        {
-                            tidesdb_compact(current_cf);
-                        }
+                        skip_list_free(temp_sl);
+                        temp_sl = NULL;
+                        phase1_result = TDB_ERR_MEMORY;
+                        break;
                     }
-                    else
-                    {
-                        TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                      "Unified flush: CF '%s' SSTable write failed (error %d)",
-                                      current_cf->name, wr);
-                        overall_result = wr;
-                    }
-                    tidesdb_sstable_unref(db, sst);
+                    splits = grown;
+                    split_cap = new_cap;
                 }
-                else
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Unified flush: CF '%s' SSTable creation failed",
-                                  current_cf->name);
-                    overall_result = TDB_ERR_IO;
-                }
+                splits[split_count].cf = current_cf;
+                splits[split_count].temp_sl = temp_sl;
+                split_count++;
+                temp_sl = NULL;
+            }
+            else if (temp_sl)
+            {
+                /* cf was dropped between rotation and flush so the temp list has nowhere to land */
+                skip_list_free(temp_sl);
+                temp_sl = NULL;
             }
 
-            if (temp_sl) skip_list_free(temp_sl);
-            temp_sl = NULL;
-            entries_in_temp = 0;
-
-            /* we look up new CF */
             pthread_rwlock_rdlock(&db->cf_list_lock);
             current_cf = tidesdb_find_cf_by_unified_index(db, cf_index);
             pthread_rwlock_unlock(&db->cf_list_lock);
@@ -22922,12 +23062,10 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
             {
                 TDB_DEBUG_LOG(TDB_LOG_WARN,
                               "Unified flush: CF index %u not found, skipping entries", cf_index);
-                /*** we skip all entries with this CF index by peeking ahead via
-                 **  cursor_next + cursor_get. the inner loop breaks when it sees a
-                 *** different cf_index, leaving the cursor on the first entry of the
-                 **  next CF. we then use 'goto' to re-enter the outer do body at the
-                 *   top so that entry is processed (not skipped by the outer
-                 *** while cursor_next). */
+                /*** skip remaining entries with this cf_index by peeking ahead.
+                 **  the inner loop breaks on the first different cf_index, leaving
+                 *   the cursor on that entry. the goto re-enters the outer body
+                 *** to process it without advancing past it again. */
                 int found_next = 0;
                 while (skip_list_cursor_next(cursor) == 0)
                 {
@@ -22942,12 +23080,11 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
                     }
                 }
                 if (found_next) goto reprocess_current_entry;
-                break; /* cursor exhausted */
+                break;
             }
 
-            /*** we create temp skip list for this CF's entries
-             **  we use the CF's own skip list config (not unified config) because the
-             *   temp skip list uses the CF's comparator and will be flushed to the CF's sstable */
+            /*** temp skip list uses the cf own comparator and skip list config
+             **  because it will be flushed to the cf sstable, not the unified one. */
             skip_list_comparator_fn cmp_fn = NULL;
             void *cmp_ctx = NULL;
             tidesdb_resolve_comparator(db, &current_cf->config, &cmp_fn, &cmp_ctx);
@@ -22958,7 +23095,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
                     current_cf->config.skip_list_probability, cmp_fn, cmp_ctx,
                     &db->cached_current_time) != 0)
             {
-                overall_result = TDB_ERR_MEMORY;
+                phase1_result = TDB_ERR_MEMORY;
                 break;
             }
         }
@@ -22967,132 +23104,115 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
         {
             skip_list_put_with_seq(temp_sl, real_key, real_key_size, value, value_size, ttl, seq,
                                    deleted);
-            entries_in_temp++;
         }
     } while (skip_list_cursor_next(cursor) == 0);
 
-    /* we flush remaining temp skip list */
-    if (temp_sl && current_cf && entries_in_temp > 0)
+    if (temp_sl && current_cf)
     {
-        const uint64_t sst_id = atomic_fetch_add(&current_cf->next_sstable_id, 1);
-        char sst_path[MAX_FILE_PATH_LENGTH];
-        snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
-                 current_cf->directory);
-
-        tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_path, sst_id, &current_cf->config);
-        if (sst)
+        if (split_count == split_cap)
         {
-            int wr;
-            if (current_cf->config.use_btree)
-                wr = tidesdb_sstable_write_from_memtable_btree(db, sst, temp_sl);
-            else
-                wr = tidesdb_sstable_write_from_memtable(db, sst, temp_sl);
-
-            if (wr == TDB_SUCCESS)
+            int new_cap = split_cap == 0 ? TDB_UNIFIED_SPLITS_INITIAL_CAP : split_cap * 2;
+            tidesdb_unified_split_t *grown = realloc(splits, (size_t)new_cap * sizeof(*grown));
+            if (!grown)
             {
-                tidesdb_block_managers_t bms;
-                if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
-                {
-                    if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-                    if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
-                }
-                if (sst->klog_bm)
-                {
-                    block_manager_close(sst->klog_bm);
-                    sst->klog_bm = NULL;
-                }
-                if (sst->vlog_bm)
-                {
-                    block_manager_close(sst->vlog_bm);
-                    sst->vlog_bm = NULL;
-                }
-
-                tidesdb_level_add_sstable(current_cf->levels[0], sst);
-                tidesdb_bump_sstable_layout_version(current_cf);
-
-                tidesdb_manifest_add_sstable(current_cf->manifest, 1, sst_id, sst->num_entries,
-                                             sst->klog_size + sst->vlog_size);
-                atomic_store(&current_cf->manifest->sequence,
-                             atomic_load(&current_cf->next_sstable_id));
-                tidesdb_manifest_commit(current_cf->manifest, current_cf->manifest->path);
-                tdb_objstore_upload_manifest(db, current_cf);
-
-                TDB_DEBUG_LOG(TDB_LOG_INFO,
-                              "Unified flush: CF '%s' SSTable %" PRIu64 " written (%d entries)",
-                              current_cf->name, sst_id, entries_in_temp);
-
-                int num_l1 = atomic_load_explicit(&current_cf->levels[0]->num_sstables,
-                                                  memory_order_acquire);
-                int density_hit = 0;
-                if (current_cf->config.tombstone_density_trigger > 0.0)
-                {
-                    const uint64_t min_entries =
-                        current_cf->config.tombstone_density_min_entries
-                            ? current_cf->config.tombstone_density_min_entries
-                            : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
-                    density_hit = tidesdb_cf_dense_tombstone_witness(
-                        current_cf, current_cf->config.tombstone_density_trigger, min_entries, NULL,
-                        NULL);
-                }
-                if (num_l1 >= current_cf->config.l1_file_count_trigger || density_hit)
-                {
-                    tidesdb_compact(current_cf);
-                }
+                skip_list_free(temp_sl);
+                temp_sl = NULL;
+                phase1_result = TDB_ERR_MEMORY;
             }
             else
             {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "Unified flush: CF '%s' SSTable write failed (error %d)",
-                              current_cf->name, wr);
-                overall_result = wr;
+                splits = grown;
+                split_cap = new_cap;
             }
-            tidesdb_sstable_unref(db, sst);
+        }
+        if (temp_sl)
+        {
+            splits[split_count].cf = current_cf;
+            splits[split_count].temp_sl = temp_sl;
+            split_count++;
+            temp_sl = NULL;
         }
     }
+    else if (temp_sl)
+    {
+        skip_list_free(temp_sl);
+        temp_sl = NULL;
+    }
 
-    if (temp_sl) skip_list_free(temp_sl);
     skip_list_cursor_free(cursor);
 
-    /** we clean up unified WAL, we upload closed segment to object store if configured,
-     *  then delete the local file. respects replicate_wal and wal_upload_sync config. */
-    if (umt_imm->wal)
+    if (split_count == 0)
     {
-        char *wal_path = tdb_strdup(umt_imm->wal->file_path);
-        const uint64_t imm_gen = umt_imm->generation;
-        block_manager_close(umt_imm->wal);
-        umt_imm->wal = NULL;
-        if (wal_path)
+        free(splits);
+        tidesdb_unified_close_wal(db, umt_imm);
+        atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
+        return phase1_result;
+    }
+
+    tidesdb_unified_flush_barrier_t *barrier = malloc(sizeof(*barrier));
+    if (!barrier)
+    {
+        /* on barrier alloc failure write inline so we do not lose data */
+        int rc = phase1_result;
+        for (int i = 0; i < split_count; i++)
         {
-            if (db->object_store && db->config.object_store_config &&
-                db->config.object_store_config->replicate_wal)
+            int wr = tidesdb_unified_write_cf_sstable(db, splits[i].cf, splits[i].temp_sl);
+            if (wr != TDB_SUCCESS) rc = wr;
+            skip_list_free(splits[i].temp_sl);
+        }
+        free(splits);
+        tidesdb_unified_close_wal(db, umt_imm);
+        atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
+        return rc;
+    }
+
+    atomic_init(&barrier->remaining, split_count);
+    atomic_init(&barrier->overall_result, TDB_SUCCESS);
+    barrier->umt_imm = umt_imm;
+    barrier->db = db;
+
+    for (int i = 0; i < split_count; i++)
+    {
+        tidesdb_flush_work_t *work = malloc(sizeof(*work));
+        if (!work)
+        {
+            int wr = tidesdb_unified_write_cf_sstable(db, splits[i].cf, splits[i].temp_sl);
+            if (wr != TDB_SUCCESS)
             {
-                if (db->config.object_store_config->wal_upload_sync)
-                {
-                    /* sync block until upload completes, we then delete locally */
-                    tdb_objstore_upload_file_sync(db, wal_path);
-                    tdb_unlink(wal_path);
-                    tdb_sync_directory(db->db_path);
-                }
-                else
-                {
-                    /** we do an async enqueue upload with WAL gen for fence tracking.
-                     *  do not delete, the reaper cleans up after upload confirms */
-                    tdb_objstore_enqueue_upload(db, wal_path, imm_gen);
-                }
+                int expected = TDB_SUCCESS;
+                atomic_compare_exchange_strong_explicit(&barrier->overall_result, &expected, wr,
+                                                        memory_order_acq_rel, memory_order_relaxed);
             }
-            else
+            skip_list_free(splits[i].temp_sl);
+            tidesdb_unified_flush_barrier_finish(barrier);
+            continue;
+        }
+
+        work->cf = splits[i].cf;
+        work->imm = NULL;
+        work->sst_id = 0;
+        work->unified_temp_sl = splits[i].temp_sl;
+        work->unified_barrier = barrier;
+
+        atomic_fetch_add_explicit(&db->flush_pending_count, 1, memory_order_release);
+        if (queue_enqueue(db->flush_queue, work) != 0)
+        {
+            atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
+            int wr = tidesdb_unified_write_cf_sstable(db, splits[i].cf, splits[i].temp_sl);
+            if (wr != TDB_SUCCESS)
             {
-                /* no object store or replicate_wal disabled -- just delete */
-                tdb_unlink(wal_path);
-                tdb_sync_directory(db->db_path);
+                int expected = TDB_SUCCESS;
+                atomic_compare_exchange_strong_explicit(&barrier->overall_result, &expected, wr,
+                                                        memory_order_acq_rel, memory_order_relaxed);
             }
-            free(wal_path);
+            skip_list_free(splits[i].temp_sl);
+            free(work);
+            tidesdb_unified_flush_barrier_finish(barrier);
         }
     }
 
-    atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
-
-    return overall_result;
+    free(splits);
+    return phase1_result;
 }
 
 /**
@@ -23171,6 +23291,8 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
         uwork->cf = NULL; /* NULL cf signals unified flush */
         uwork->imm = old_mt;
         uwork->sst_id = new_gen;
+        uwork->unified_temp_sl = NULL;
+        uwork->unified_barrier = NULL;
         atomic_fetch_add_explicit(&db->flush_pending_count, 1, memory_order_release);
         if (queue_enqueue(db->flush_queue, uwork) != 0)
         {
@@ -26822,6 +26944,8 @@ static void tidesdb_recover_single_wal(tidesdb_column_family_t *cf, char *wal_pa
         work->cf = cf;
         work->imm = imm;
         work->sst_id = atomic_fetch_add_explicit(&cf->next_sstable_id, 1, memory_order_relaxed);
+        work->unified_temp_sl = NULL;
+        work->unified_barrier = NULL;
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "CF '%s' allocated SSTable ID %" PRIu64 " for recovered WAL flush", cf->name,
                       work->sst_id);

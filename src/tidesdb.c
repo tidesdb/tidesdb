@@ -17633,6 +17633,23 @@ int tidesdb_close(tidesdb_t *db)
             tidesdb_unified_flush_immutable(db, umt);
         }
 
+        /*** the same memtable pointer lives in unified_mt.immutables (for read scans)
+         **  and in a flush_queue work item (for the worker). dequeueing from
+         *   immutables does not remove the worker's reference, so calling
+         *** tidesdb_unified_flush_immutable here without first letting the worker
+         **  finish would race the worker into block_manager_close on the same WAL.
+         *   wait for the worker to drain before draining immutables. */
+        if (db->flush_queue)
+        {
+            while (1)
+            {
+                size_t qsize = queue_size(db->flush_queue);
+                int pending = atomic_load_explicit(&db->flush_pending_count, memory_order_acquire);
+                if (qsize == 0 && pending <= 0) break;
+                usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+            }
+        }
+
         /* we drain unified immutable queue */
         if (db->unified_mt.immutables)
         {

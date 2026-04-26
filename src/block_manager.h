@@ -50,6 +50,9 @@
 #define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
 #define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
 
+/* number of iovecs we emit per block in pwritev: header, payload, footer */
+#define BLOCK_MANAGER_IOVECS_PER_BLOCK 3
+
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
 

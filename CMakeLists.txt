@@ -16,6 +16,10 @@ project(tidesdb C)
 set(CMAKE_C_STANDARD 11)
 set(PROJECT_VERSION 9.2.0)
 
+# build everything position-independent so the static archive (BUILD_SHARED_LIBS=OFF)
+# can still link into a shared module like the mariadb plugin without recompile-with-fPIC errors
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
         "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"

@@ -24,6 +24,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
+            pkg update -f
             pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |
             echo "*=====================================*"

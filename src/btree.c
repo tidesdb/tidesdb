@@ -24,7 +24,32 @@
 #include "compress.h"
 #include "xxhash.h"
 
-#define BTREE_CACHE_KEY_SIZE 32
+/* arena alignment in bytes -- every allocation is rounded up so unaligned typed access
+ * inside an arena slot is safe on platforms that fault on misaligned uint64_t loads */
+#define BTREE_ARENA_ALIGNMENT 8
+
+/* upper bound on hex digits for a uint64 -- 16 nibbles, used as the local stack buffer
+ * by btree_u64_to_hex when building a cache key */
+#define BTREE_U64_HEX_MAX 16
+
+/* initial entry capacity of a pending leaf during btree construction; the array doubles
+ * on overflow so this only sets the smallest meaningful allocation */
+#define BTREE_PENDING_LEAF_INITIAL_CAP 64
+
+/* small malloc safety pads added on top of the precomputed est_size in the leaf and
+ * internal-node serializers, to absorb any conservative undercount without realloc */
+#define BTREE_LEAF_SERIALIZE_SAFETY_PAD     64
+#define BTREE_INTERNAL_SERIALIZE_SAFETY_PAD 32
+
+/* fixed-size empty-leaf encoding -- type byte, num_entries=0 varint, prev/next int64 */
+#define BTREE_LEAF_EMPTY_BUF_SIZE 32
+
+/* compressed-node block layout written by btree_node_serialize_with_compression and read
+ * back by btree_node_read_with_compression. format is
+ * [original_size:u32][prev_offset:i64][next_offset:i64][compressed_data] */
+#define BTREE_COMPRESSED_NODE_PREV_OFF    4
+#define BTREE_COMPRESSED_NODE_NEXT_OFF    12
+#define BTREE_COMPRESSED_NODE_HEADER_SIZE 20
 
 /**
  * varint encoding utilities
@@ -226,7 +251,7 @@ void *btree_arena_alloc(btree_arena_t *arena, size_t size)
 {
     if (!arena || size == 0) return NULL;
 
-    size = (size + 7) & ~(size_t)7;
+    size = (size + (BTREE_ARENA_ALIGNMENT - 1)) & ~(size_t)(BTREE_ARENA_ALIGNMENT - 1);
 
     /* we check if current block has space */
     if (arena->current->used + size <= arena->current->size)
@@ -510,7 +535,7 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
     if (leaf->num_entries == 0)
     {
         /* empty leaf -- minimal format */
-        uint8_t *buffer = malloc(32);
+        uint8_t *buffer = malloc(BTREE_LEAF_EMPTY_BUF_SIZE);
         if (!buffer) return -1;
         size_t off = 0;
         buffer[off++] = BTREE_NODE_LEAF;
@@ -580,7 +605,7 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
     }
     est_size += keys_total + values_total;
 
-    uint8_t *buffer = malloc(est_size + 64); /* small padding for safety */
+    uint8_t *buffer = malloc(est_size + BTREE_LEAF_SERIALIZE_SAFETY_PAD);
     if (!buffer)
     {
         free(prefix_lens);
@@ -695,7 +720,7 @@ static int btree_internal_serialize(const btree_level_entry_t *entries, const ui
     }
     est_size += keys_size;
 
-    uint8_t *buffer = malloc(est_size + 32);
+    uint8_t *buffer = malloc(est_size + BTREE_INTERNAL_SERIALIZE_SAFETY_PAD);
     if (!buffer) return -1;
 
     size_t off = 0;
@@ -1072,14 +1097,16 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
     size_t data_size = block->size;
     uint8_t *decompressed = NULL;
 
-    if (compression_algo != TDB_COMPRESS_NONE && block->size > 20)
+    if (compression_algo != TDB_COMPRESS_NONE && block->size > BTREE_COMPRESSED_NODE_HEADER_SIZE)
     {
         const uint8_t *block_data = (const uint8_t *)block->data;
         const uint32_t original_size = decode_uint32_le_compat(block_data);
-        int64_t header_prev_offset = decode_int64_le_compat(block_data + 4);
-        int64_t header_next_offset = decode_int64_le_compat(block_data + 12);
-        const uint8_t *compressed_data = block_data + 20;
-        const size_t compressed_size = block->size - 20;
+        int64_t header_prev_offset =
+            decode_int64_le_compat(block_data + BTREE_COMPRESSED_NODE_PREV_OFF);
+        int64_t header_next_offset =
+            decode_int64_le_compat(block_data + BTREE_COMPRESSED_NODE_NEXT_OFF);
+        const uint8_t *compressed_data = block_data + BTREE_COMPRESSED_NODE_HEADER_SIZE;
+        const size_t compressed_size = block->size - BTREE_COMPRESSED_NODE_HEADER_SIZE;
 
         size_t decompressed_size;
         decompressed = decompress_data(compressed_data, compressed_size, &decompressed_size,
@@ -1155,7 +1182,7 @@ static inline int btree_u64_to_hex(uint64_t val, char *buf)
         buf[0] = '0';
         return 1;
     }
-    char tmp[16];
+    char tmp[BTREE_U64_HEX_MAX];
     int len = 0;
     while (val > 0)
     {
@@ -1166,6 +1193,14 @@ static inline int btree_u64_to_hex(uint64_t val, char *buf)
     {
         buf[i] = tmp[len - 1 - i];
     }
+    return len;
+}
+
+int btree_format_cache_key_prefix(uint64_t cache_key_prefix, char *out)
+{
+    if (!out) return 0;
+    int len = btree_u64_to_hex(cache_key_prefix, out);
+    out[len++] = BTREE_CACHE_KEY_SEPARATOR;
     return len;
 }
 
@@ -1192,8 +1227,7 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     }
 
     char cache_key[BTREE_CACHE_KEY_SIZE];
-    int key_len = btree_u64_to_hex(tree->cache_key_prefix, cache_key);
-    cache_key[key_len++] = ':';
+    int key_len = btree_format_cache_key_prefix(tree->cache_key_prefix, cache_key);
     key_len += btree_u64_to_hex((uint64_t)offset, cache_key + key_len);
 
     size_t cached_size = 0;
@@ -1203,7 +1237,7 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
 
     if (cached_ptr && cached_size == sizeof(btree_node_t *))
     {
-        /* cache hit -- acquire caller ref BEFORE releasing cache entry
+        /* cache hit -- acquire caller ref before releasing cache entry
          * this prevents eviction from freeing the node while we use it */
         btree_node_t *cached_node;
         memcpy(&cached_node, cached_ptr, sizeof(btree_node_t *));
@@ -1317,7 +1351,7 @@ static btree_pending_leaf_t *btree_pending_leaf_create(void)
     btree_pending_leaf_t *leaf = calloc(1, sizeof(btree_pending_leaf_t));
     if (!leaf) return NULL;
 
-    leaf->capacity = 64;
+    leaf->capacity = BTREE_PENDING_LEAF_INITIAL_CAP;
     leaf->entries = calloc(leaf->capacity, sizeof(btree_entry_t));
     leaf->keys = calloc(leaf->capacity, sizeof(uint8_t *));
     leaf->values = calloc(leaf->capacity, sizeof(uint8_t *));

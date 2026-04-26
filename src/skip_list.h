@@ -450,11 +450,11 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
  * skip_list_get_ref
  * zero-copy get that returns a direct pointer into the version data
  * the returned pointers are only valid while the caller holds a reference
- * to the skip list (e.g. memtable refcount). caller must NOT free the value.
+ * to the skip list (e.g. memtable refcount). caller must not free the value.
  * @param list skip list
  * @param key key data
  * @param key_size size of key
- * @param value pointer to value pointer (do NOT free)
+ * @param value pointer to value pointer (do not free)
  * @param value_size pointer to value size
  * @param ttl pointer to ttl
  * @param deleted pointer to deleted flag
@@ -501,7 +501,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
  * @param list skip list
  * @param key key data
  * @param key_size size of key
- * @param value pointer to const value pointer (do NOT free)
+ * @param value pointer to const value pointer (do not free)
  * @param value_size pointer to value size
  * @param ttl pointer to ttl
  * @param deleted pointer to deleted flag
@@ -575,9 +575,9 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
  * fused next + get in a single call, avoiding redundant sentinel checks
  * and enabling better prefetching. returns zero-copy pointers.
  * @param cursor cursor
- * @param key pointer to key pointer (do NOT free)
+ * @param key pointer to key pointer (do not free)
  * @param key_size pointer to key size
- * @param value pointer to value pointer (do NOT free)
+ * @param value pointer to value pointer (do not free)
  * @param value_size pointer to value size
  * @param ttl pointer to ttl
  * @param deleted pointer to deleted flag

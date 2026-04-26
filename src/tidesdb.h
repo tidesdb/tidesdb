@@ -807,8 +807,10 @@ struct tidesdb_t
  * @param read_key_arenas array of read key arenas
  * @param read_key_arena_count number of read key arenas
  * @param read_key_arena_used bytes used in current read key arena
- * @param write_set_hash hash table for O(1) write set lookup (NULL if num_ops < 256)
- * @param read_set_hash hash table for O(1) read set lookup (NULL if read_set_count < 256)
+ * @param write_set_hash hash table for O(1) write set lookup (NULL if num_ops <
+ * TDB_TXN_WRITE_HASH_THRESHOLD)
+ * @param read_set_hash hash table for O(1) read set lookup (NULL if read_set_count <
+ * TDB_TXN_READ_HASH_THRESHOLD)
  * @param cfs array of column families involved in transaction
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
@@ -1554,6 +1556,31 @@ int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_
  * @return 0 on success, -n on failure
  */
 int tidesdb_compact(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_compact_range
+ * synchronously compacts every sstable in the column family whose [min_key, max_key]
+ * overlaps the caller supplied [start_key, end_key) range. output is merged toward the
+ * largest level affected by the input set, so any tombstones in the range that meet
+ * their dead puts are dropped during this pass. the caller blocks until the merge
+ * completes. intended for bulk reclaim after large range deletes -- emit point
+ * tombstones with tidesdb_txn_delete, then call this to physically merge them out.
+ *
+ * NULL start_key means unbounded low, NULL end_key means unbounded high. both NULL
+ * is rejected with TDB_ERR_INVALID_ARGS so callers go through tidesdb_compact for
+ * full cf compaction.
+ *
+ * @param cf column family handle
+ * @param start_key inclusive range start (NULL = unbounded low)
+ * @param start_key_size size of start_key in bytes (0 if start_key is NULL)
+ * @param end_key exclusive range end (NULL = unbounded high)
+ * @param end_key_size size of end_key in bytes (0 if end_key is NULL)
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS for bad args, TDB_ERR_LOCKED
+ *         if another compaction is already running, or other error codes from the
+ *         underlying merge
+ */
+int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                          size_t start_key_size, const uint8_t *end_key, size_t end_key_size);
 
 /**
  * tidesdb_flush_memtable

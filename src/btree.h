@@ -36,6 +36,12 @@
 #define BTREE_MAGIC   0x4254522B
 #define BTREE_VERSION 1
 
+/* btree clock-cache key layout. each key is "<cache_key_prefix><sep><offset_hex>" where
+ * cache_key_prefix is set by tidesdb_sstable_create. exposed in the header so cache
+ * invalidation paths in tidesdb.c can build matching prefixes. */
+#define BTREE_CACHE_KEY_SIZE      32
+#define BTREE_CACHE_KEY_SEPARATOR ':'
+
 /* node type flags */
 #define BTREE_NODE_LEAF     0x01
 #define BTREE_NODE_INTERNAL 0x02
@@ -483,7 +489,7 @@ void btree_free(btree_t *tree);
 /**
  * btree_set_node_cache
  * sets the node cache for faster lookups (optional)
- * the cache is NOT owned by the btree -- caller must manage its lifetime
+ * the cache is not owned by the btree -- caller must manage its lifetime
  * @param tree the B+tree
  * @param cache the clock cache to use (can be NULL to disable caching)
  */
@@ -643,5 +649,18 @@ int btree_node_read(block_manager_t *bm, int64_t offset, btree_node_t **node);
  */
 int btree_node_read_with_compression(block_manager_t *bm, int64_t offset, btree_node_t **node,
                                      int compression_algo);
+
+/**
+ * btree_format_cache_key_prefix
+ * write the producer-side cache key prefix for a btree owned by an sstable whose
+ * cache_key_prefix value is the given uint64. the bytes produced match what
+ * btree_node_read_cached prepends before the per-node offset, so callers can pass them
+ * to clock_cache_delete_by_prefix to invalidate every cache entry for one btree.
+ *
+ * @param cache_key_prefix the precomputed prefix value (see tidesdb_sstable_t)
+ * @param out output buffer; must be at least BTREE_CACHE_KEY_SIZE bytes
+ * @return number of bytes written (no trailing null)
+ */
+int btree_format_cache_key_prefix(uint64_t cache_key_prefix, char *out);
 
 #endif /* __BTREE_H__ */

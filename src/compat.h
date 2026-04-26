@@ -184,7 +184,7 @@ static inline int tdb_file_unlock(int fd)
  * fcntl() F_SETLK. https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213
  *
  * macOS/BSD -- We use fcntl() F_SETLK which has per-process semantics. Critically, fcntl() locks
- * are NOT inherited across fork(), so child processes will properly fail to acquire the lock.
+ * are not inherited across fork(), so child processes will properly fail to acquire the lock.
  * flock() was considered but locks persist across fork(), causing the child to inherit the lock
  * and then block when trying to acquire a new lock on a different fd.
  * https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html
@@ -272,7 +272,7 @@ static inline void tdb_file_lock_clear_pid(const int fd)
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
- * uses fcntl() F_SETLK on macOS/BSD (locks NOT inherited across fork)
+ * uses fcntl() F_SETLK on macOS/BSD (locks not inherited across fork)
  * uses flock() on older systems without F_OFD_SETLK
  * uses F_OFD_SETLK on linux 3.15+ for per-fd locking
  * @param fd the file descriptor to lock
@@ -2687,7 +2687,7 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
  * tdb_preallocate_extent
  * extends the logical file size and reserves on-disk blocks for the new region
  * ahead of writes, so that subsequent pwrites within the preallocated extent do
- * NOT take the kernel's "write extends file" fast path. on Linux ext4 this
+ * not take the kernel's "write extends file" fast path. on Linux ext4 this
  * avoids the per-inode i_rwsem write lock; equivalent locks exist on macOS APFS
  * (vnode write lock) and Windows NTFS (file-extension lock).
  *
@@ -3267,7 +3267,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
  * renames a directory from old_path to new_path
  * on POSIX systems, rename() works for directories
  * on Windows, rename() fails if target exists, so we use MoveFileEx
- * NOTE: This does NOT replace existing directories -- caller must ensure target doesn't exist
+ * NOTE: This does not replace existing directories -- caller must ensure target doesn't exist
  * @param old_path the current path of the directory
  * @param new_path the new path for the directory
  * @return 0 on success, -1 on failure
@@ -3278,7 +3278,7 @@ static inline int atomic_rename_dir(const char *old_path, const char *new_path)
 
 #ifdef _WIN32
     /* MoveFileEx works for directories on Windows
-     * Note -- MOVEFILE_REPLACE_EXISTING does NOT work for non-empty directories,
+     * Note -- MOVEFILE_REPLACE_EXISTING does not work for non-empty directories,
      * so we don't use it here. Caller must ensure target doesn't exist. */
     if (!MoveFileEx(old_path, new_path, MOVEFILE_WRITE_THROUGH))
     {

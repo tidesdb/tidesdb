@@ -634,6 +634,18 @@ int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_
 
 /**** maintenance operations */
 int tidesdb_compact(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_compact_range
+ * synchronously compacts every sstable whose key range overlaps [start_key, end_key).
+ * output is merged toward the largest level affected. NULL endpoints are unbounded.
+ * both NULL is rejected so callers go through tidesdb_compact for full cf compaction.
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS for bad args, TDB_ERR_LOCKED if another
+ *         compaction is running, or other error codes from the underlying merge
+ */
+int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                          size_t start_key_size, const uint8_t *end_key, size_t end_key_size);
+
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
 /**

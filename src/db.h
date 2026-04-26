@@ -308,6 +308,10 @@ typedef struct tidesdb_column_family_config_t
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
  * @param object_store pluggable object store connector (NULL = local only, default)
  * @param object_store_config object store behavior configuration (NULL = use defaults)
+ * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
+ *                               across all column families. bounds total transient memory and
+ *                               work-queue depth when many column families flush at once.
+ *                               0 falls back to TDB_DEFAULT_MAX_CONCURRENT_FLUSHES.
  */
 typedef struct tidesdb_config_t
 {
@@ -328,6 +332,7 @@ typedef struct tidesdb_config_t
     uint64_t unified_memtable_sync_interval_us;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
+    int max_concurrent_flushes;
 } tidesdb_config_t;
 
 /**

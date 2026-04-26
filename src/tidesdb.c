@@ -2242,7 +2242,8 @@ tidesdb_config_t tidesdb_default_config(void)
                               .unified_memtable_sync_mode = 0,
                               .unified_memtable_sync_interval_us = 0,
                               .object_store = NULL,
-                              .object_store_config = NULL};
+                              .object_store_config = NULL,
+                              .max_concurrent_flushes = TDB_DEFAULT_MAX_CONCURRENT_FLUSHES};
 }
 
 /**
@@ -4169,19 +4170,21 @@ static int tdb_objstore_download_if_missing(const tidesdb_t *db, const char *loc
     char key[TDB_MAX_PATH_LEN];
     tdb_path_to_object_key(db, local_path, key, sizeof(key));
 
-    /* we check if object exists in store before attempting download.
-     * during flush, new sstables are being created locally for the first time
-     * and don't exist in the object store yet -- that's not an error.
-     * exists() returns 0 (not found), 1 (found), -1 (error).
-     * on error (-1) we fall through to attempt the download anyway
-     * since the store may be reachable for get but not head. */
+    /*** we check if object exists in store before attempting download.
+     **  during flush, new sstables are being created locally for the first time
+     **  and dont exist in the object store yet, that is not an error.
+     *   exists returns 0 not found, 1 found, -1 error.
+     *** on -1 we treat it as not in remote and let block_manager_open create
+     **  the file locally. a transient head failure on a read path will resolve
+     *   on the next access. attempting download with no real remote object
+     **  burns retries and aborts a fresh sstable write, which is worse. */
     const int exists_rc = db->object_store->exists(db->object_store->ctx, key, NULL);
-    if (exists_rc == 0)
+    if (exists_rc != 1)
     {
-        return 0; /* confirmed not in object store -- let block_manager_open create it */
+        return 0;
     }
 
-    /* exists_rc == 1 (found) or -1 (error) -- we attempt download with retry */
+    /* exists_rc == 1, object is confirmed remote, we attempt download with retry */
     {
         int get_rc = -1;
         unsigned int backoff_us = TDB_DOWNLOAD_INITIAL_BACKOFF_US;
@@ -15353,7 +15356,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                           "CF '%s' is marked for deletion, skipping flush for SSTable %" PRIu64,
                           cf->name, work->sst_id);
             tidesdb_immutable_memtable_unref(imm);
-            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+            atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
             continue;
@@ -15405,7 +15408,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
             /* we release work and skip flush -- the memtable stays in memory */
             tidesdb_immutable_memtable_unref(imm);
-            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+            atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
             continue;
@@ -15423,7 +15426,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                           work->sst_id);
 
             tidesdb_immutable_memtable_unref(imm);
-            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+            atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
             continue;
@@ -15458,12 +15461,12 @@ static void *tidesdb_flush_worker_thread(void *arg)
                               cf->name);
 
                 tidesdb_immutable_memtable_unref(imm);
-                atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+                atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
                 free(work);
                 atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
             }
-            /* work re-enqueued -- do not decrement flush_pending_count or clear is_flushing,
-             * item is still pending and will be processed again */
+            /* work re-enqueued so we keep the active_flushes slot held and the
+             * flush_pending counter in place, the retry will release them */
             continue;
         }
 
@@ -15519,7 +15522,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             }
             atomic_store_explicit(&imm->flushed, 1, memory_order_release);
             tidesdb_immutable_memtable_unref(imm);
-            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+            atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
             continue;
@@ -15820,9 +15823,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
             }
         }
 
-        /* we clear is_flushing flag now that flush is complete
-         * this allows new flushes to be triggered */
-        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        /* the writer cleared is_flushing after enqueue, so the worker only
+         * releases the active_flushes slot when its work is fully done */
+        atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
         free(work);
         atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
     }
@@ -17080,6 +17083,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_init(&(*db)->txn_memory_bytes, 0);
         atomic_init(&(*db)->memory_pressure_level, TDB_MEMORY_PRESSURE_NORMAL);
         atomic_init(&(*db)->flush_pending_count, 0);
+        atomic_init(&(*db)->active_flushes, 0);
         (*db)->os_check_counter = 0;
     }
     else
@@ -19515,14 +19519,34 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         if (!atomic_compare_exchange_strong_explicit(&cf->is_flushing, &expected, 1,
                                                      memory_order_acquire, memory_order_relaxed))
         {
-            /* another flush is already running, we skip this one */
+            /* another rotate is in progress for this cf, we skip this attempt */
             return TDB_SUCCESS;
         }
+    }
+
+    /*** is_flushing now serialises only the rotate critical section. the global
+     **  active_flushes counter caps how many memtable flushes can be in flight
+     *   across all column families so a hot cf cannot starve workers nor make
+     *** transient memory grow without bound when many cfs flush at once. */
+    int slot_max = cf->db->config.max_concurrent_flushes;
+    if (slot_max <= 0) slot_max = TDB_DEFAULT_MAX_CONCURRENT_FLUSHES;
+    int prev_slots = atomic_fetch_add_explicit(&cf->db->active_flushes, 1, memory_order_acq_rel);
+    if (prev_slots >= slot_max)
+    {
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
+        if (!already_holds_lock)
+        {
+            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        }
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' deferring flush, global cap %d reached", cf->name,
+                      slot_max);
+        return TDB_SUCCESS;
     }
 
     /* we check again after acquiring is_flushing in case drop happened between checks */
     if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
     {
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         if (!already_holds_lock)
         {
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -19541,6 +19565,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     if (current_entries == 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' memtable is empty, skipping flush", cf->name);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -19551,6 +19576,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "CF '%s' memtable size %zu < threshold %zu and force=0, skipping flush",
                       cf->name, current_size, cf->config.write_buffer_size);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -19588,6 +19614,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "CF '%s' is marked for deletion, aborting flush before resource allocation",
                       cf->name);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -19599,6 +19626,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                                  cf->config.write_buffer_size * 2) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to create new memtable", cf->name);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
@@ -19617,6 +19645,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL: %s", cf->name, wal_path);
             skip_list_free(new_memtable);
+            atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
             return TDB_ERR_IO;
         }
@@ -19627,6 +19656,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                           wal_path);
             block_manager_close(new_wal);
             skip_list_free(new_memtable);
+            atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
             return TDB_ERR_IO;
         }
@@ -19642,6 +19672,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to allocate new memtable structure", cf->name);
         skip_list_free(new_memtable);
         if (new_wal) block_manager_close(new_wal);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
@@ -19662,6 +19693,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         skip_list_free(new_memtable);
         if (new_wal) block_manager_close(new_wal);
         free(new_mt);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -19677,6 +19709,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
          *  store new_mt as active before returning so the CF has a usable memtable */
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' no old memtable to flush", cf->name);
         atomic_store_explicit(&cf->active_memtable, new_mt, memory_order_release);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -19729,6 +19762,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         skip_list_free(old_memtable);
         if (old_wal) block_manager_close(old_wal);
         free(immutable);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
@@ -19755,6 +19789,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         /** immutable is already queued but flush will never happen
          *  we must clean it up to prevent memory leak */
         tidesdb_immutable_memtable_unref(immutable);
+        atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
@@ -19793,7 +19828,8 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
             tidesdb_immutable_memtable_unref(immutable); /* remove work ref */
             free(work);
             atomic_fetch_sub_explicit(&cf->db->flush_pending_count, 1, memory_order_release);
-            /* leave is_flushing set to prevent more flushes until this resolves */
+            atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
+            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
             return TDB_ERR_MEMORY;
         }
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' flush queue full, retry %d/%d for SSTable %" PRIu64,
@@ -19807,6 +19843,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                   " (queue size after: %zu)",
                   cf->name, sst_id, queue_size_after);
 
+    /* rotate critical section is done. the worker holds the active_flushes slot
+     * until the sstable is committed and releases it from the flush worker loop. */
+    if (!already_holds_lock)
+    {
+        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+    }
     return TDB_SUCCESS;
 }
 

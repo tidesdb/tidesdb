@@ -196,6 +196,7 @@ typedef enum
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
+#define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES      4
 #define TDB_DEFAULT_BLOOM_FPR                   0.01
 #define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        512
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
@@ -417,6 +418,10 @@ typedef struct tidesdb_comparator_entry_t
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
  * @param object_store object store instance (NULL = local only, default)
  * @param object_store_config object store configuration (NULL = use defaults)
+ * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
+ *                               across all column families. bounds total transient memory and
+ *                               work-queue depth when many column families flush at once.
+ *                               0 falls back to TDB_DEFAULT_MAX_CONCURRENT_FLUSHES.
  */
 typedef struct tidesdb_config_t
 {
@@ -437,6 +442,7 @@ typedef struct tidesdb_config_t
     uint64_t unified_memtable_sync_interval_us;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
+    int max_concurrent_flushes;
 } tidesdb_config_t;
 
 /**
@@ -670,6 +676,8 @@ struct tidesdb_level_t
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
+ * @param active_flushes global semaphore counter for in-flight flushes across all column
+ *                       families. capped by config.max_concurrent_flushes.
  * @param os_check_counter counter for periodic os-level memory checks
  * @param cf_list_lock rwlock for cf list modifications
  * @param deferred_free_list lock-free singly-linked list of deferred free nodes for retired arrays
@@ -731,6 +739,7 @@ struct tidesdb_t
     _Atomic(int64_t) txn_memory_bytes;
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;
+    _Atomic(int) active_flushes;
     int os_check_counter;
     pthread_rwlock_t cf_list_lock;
     _Atomic(tidesdb_deferred_free_node_t *) deferred_free_list;

@@ -27066,13 +27066,17 @@ static void test_objstore_s3_minio(void)
 /* helpers shared by the tombstone density tests below */
 static void wait_for_flush_complete(tidesdb_t *db, tidesdb_column_family_t *cf)
 {
-    /* drain the flush queue first, then poll is_flushing because the worker
-     * dequeues before it finishes writing the sstable to disk */
+    /*** is_flushing is the brief rotate gate, cleared by the writer once the
+     **  work is enqueued, so polling it returns success before the worker has
+     *   actually written the sstable. flush_pending_count is incremented
+     **  before enqueue and decremented only after the worker finishes the
+     *** sstable write and level/manifest updates, so it is the right fence
+     **  for observably complete flush. */
     wait_for_flush_queue_drain(db);
     const int max_wait = 200;
     for (int i = 0; i < max_wait; i++)
     {
-        if (!atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
+        if (atomic_load_explicit(&db->flush_pending_count, memory_order_acquire) == 0 &&
             queue_size(db->flush_queue) == 0)
         {
             usleep(20000);
@@ -27080,6 +27084,7 @@ static void wait_for_flush_complete(tidesdb_t *db, tidesdb_column_family_t *cf)
         }
         usleep(20000);
     }
+    (void)cf;
 }
 
 static void td_put(tidesdb_t *db, tidesdb_column_family_t *cf, int i)

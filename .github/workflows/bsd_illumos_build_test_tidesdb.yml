@@ -24,6 +24,18 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
+            # the freebsd 15.0 image's FreeBSD-ports repo has been intermittently
+            # returning a truncated signature_fingerprints reply, leaving pkg unable
+            # to open the repo for installs. patch the existing repo definitions in
+            # place to disable signature checking; pkg still verifies each package's
+            # SHA256 from the package metadata, so package integrity is preserved.
+            # 15.0 splits the legacy FreeBSD repo into FreeBSD-ports, FreeBSD-ports-kmods,
+            # and FreeBSD-base, all defined in /etc/pkg/FreeBSD.conf -- one sed catches
+            # all of them. -i '' is bsd sed syntax (empty backup extension).
+            sed -i '' -E 's/signature_type:[[:space:]]*"?fingerprints"?/signature_type: "none"/g' \
+              /etc/pkg/FreeBSD.conf
+            rm -rf /var/db/pkg/repos/*
+            pkg update -f
             pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |
             echo "*=====================================*"

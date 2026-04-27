@@ -583,7 +583,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
 
     /* we write header + data + footer in a single pwritev call -- zero copy from block->data */
-    struct iovec iov[3];
+    struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
     iov[0].iov_base = header;
     iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     iov[1].iov_base = block->data;
@@ -591,7 +591,8 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
+    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)offset) !=
+                    (ssize_t)total_size))
         return -1;
 
     /** if O_DSYNC is available and was used at open time, pwrite already synced
@@ -627,7 +628,7 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
     encode_uint32_le_compat(footer, size);
     encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
 
-    struct iovec iov[3];
+    struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
     iov[0].iov_base = header;
     iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     iov[1].iov_base = (void *)data;
@@ -635,7 +636,8 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
     iov[2].iov_base = footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, 3, (off_t)offset) != (ssize_t)total_size))
+    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)offset) !=
+                    (ssize_t)total_size))
         return -1;
 
     if (is_sync_full(bm) && !odsync_available())
@@ -682,7 +684,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
 
     const size_t meta_size =
         valid_count * (BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE);
-    const size_t iov_count = valid_count * 3;
+    const size_t iov_count = valid_count * BLOCK_MANAGER_IOVECS_PER_BLOCK;
     unsigned char *alloc = malloc(meta_size + iov_count * sizeof(struct iovec));
     if (!alloc) return -1;
 
@@ -722,7 +724,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         iov[iov_idx + 2].iov_base = ftr;
         iov[iov_idx + 2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
-        iov_idx += 3;
+        iov_idx += BLOCK_MANAGER_IOVECS_PER_BLOCK;
         meta_idx++;
         current_offset += (int64_t)block_total;
     }

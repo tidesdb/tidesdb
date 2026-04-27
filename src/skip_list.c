@@ -1017,7 +1017,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
 
     /* we search from top level down with prefetching
      * use relaxed loads during traversal, acquire only at level 0 for final target
-     * prefetch fires BEFORE sentinel check so cache line is warming during condition eval */
+     * prefetch fires before sentinel check so cache line is warming during condition eval */
     /* on x86 (TSO), relaxed and acquire loads compile identically.
      * we use acquire uniformly to avoid a per-iteration branch */
     for (int i = max_level; i >= 0; i--)

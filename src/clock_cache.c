@@ -30,6 +30,16 @@
 #define CLOCK_CACHE_ALIGN_UP(x, a)           (((x) + ((a)-1)) & ~((size_t)(a)-1))
 #define CLOCK_CACHE_MAX_CPUS                 1024
 
+/* upper bound on the number of distinct L3 groups detect_l3_groups will track and the
+ * sysfs path buffer used to read each cpu's shared-cache id */
+#define CLOCK_CACHE_MAX_L3_GROUPS  64
+#define CLOCK_CACHE_SYSFS_PATH_MAX 128
+
+/* clock-evict scan limit -- we visit at most occupied * MULT slots per pass with a floor
+ * of MIN, so sparsely populated partitions do not waste iterations on empty slots */
+#define CLOCK_CACHE_EVICT_SCAN_MULT 3
+#define CLOCK_CACHE_EVICT_SCAN_MIN  64
+
 /**
  * detect_l3_groups
  * detect L3 cache topology by reading sysfs on Linux
@@ -43,12 +53,12 @@ static int detect_l3_groups(int num_cpus, uint8_t *cpu_to_group)
     memset(cpu_to_group, 0, (size_t)num_cpus);
 
 #if defined(__linux__)
-    int seen_ids[64];
+    int seen_ids[CLOCK_CACHE_MAX_L3_GROUPS];
     int num_groups = 0;
 
     for (int cpu = 0; cpu < num_cpus; cpu++)
     {
-        char path[128];
+        char path[CLOCK_CACHE_SYSFS_PATH_MAX];
         snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index3/id", cpu);
         FILE *f = fopen(path, "r");
         if (!f) continue;
@@ -63,7 +73,7 @@ static int detect_l3_groups(int num_cpus, uint8_t *cpu_to_group)
         {
             if (seen_ids[g] == id) break;
         }
-        if (g == num_groups && num_groups < 64)
+        if (g == num_groups && num_groups < CLOCK_CACHE_MAX_L3_GROUPS)
         {
             seen_ids[num_groups++] = id;
         }
@@ -270,7 +280,7 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
         /* entry belongs at or before the empty slot if moving it would bring it
          * closer to (or keep it at) its ideal position.
          * with wrapping -- entry is displaced if its ideal position is in the range
-         * (empty, candidate] on the circular index, i.e., it does NOT need to pass
+         * (empty, candidate] on the circular index, i.e., it does not need to pass
          * through the empty slot to reach candidate from ideal position */
         int displaced;
         if (empty <= candidate)
@@ -488,11 +498,12 @@ static int evict_for_space(clock_cache_t *cache, clock_cache_partition_t *partit
     /* we limit scan distance based on occupied count rather than total slots.
      * when the partition is sparsely populated (e.g., 128 entries in 8192 slots),
      * scanning all slots wastes 98%+ of iterations on EMPTY slots.
-     * we scan at most occupied_count * 3 slots (gives high probability of finding
-     * a victim even with clustering) with a minimum of 64. */
+     * we scan at most occupied_count * CLOCK_CACHE_EVICT_SCAN_MULT slots (gives high
+     * probability of finding a victim even with clustering) with a minimum of
+     * CLOCK_CACHE_EVICT_SCAN_MIN. */
     const size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
-    size_t scan_limit = occupied * 3;
-    if (scan_limit < 64) scan_limit = 64;
+    size_t scan_limit = occupied * CLOCK_CACHE_EVICT_SCAN_MULT;
+    if (scan_limit < CLOCK_CACHE_EVICT_SCAN_MIN) scan_limit = CLOCK_CACHE_EVICT_SCAN_MIN;
     if (scan_limit > partition->num_slots) scan_limit = partition->num_slots;
 
     /* pass 0 clears ref_bits, pass 1 evicts entries with ref_bit=0 */

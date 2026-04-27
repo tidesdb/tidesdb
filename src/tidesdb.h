@@ -196,6 +196,7 @@ typedef enum
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
+#define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES      4
 #define TDB_DEFAULT_BLOOM_FPR                   0.01
 #define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        512
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
@@ -327,6 +328,13 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param min_disk_space minimum free disk space required (bytes)
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
+ * @param tombstone_density_trigger ratio in [0.0, 1.0] above which any single sstable's
+ *                                  tombstone density (tombstone_count / num_entries) escalates
+ *                                  compaction priority; 0.0 disables the check (default).
+ *                                  sstables with fewer than tombstone_density_min_entries are
+ *                                  ignored to prevent tiny-sstable noise.
+ * @param tombstone_density_min_entries minimum entry count for an sstable to be considered by
+ *                                      the density trigger; 0 falls back to the default
  * @param use_btree use btree for klog, faster reads depending on workload
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
@@ -362,6 +370,8 @@ typedef struct tidesdb_column_family_config_t
     uint64_t min_disk_space;
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
+    double tombstone_density_trigger;
+    uint64_t tombstone_density_min_entries;
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
@@ -408,6 +418,10 @@ typedef struct tidesdb_comparator_entry_t
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
  * @param object_store object store instance (NULL = local only, default)
  * @param object_store_config object store configuration (NULL = use defaults)
+ * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
+ *                               across all column families. bounds total transient memory and
+ *                               work-queue depth when many column families flush at once.
+ *                               0 falls back to TDB_DEFAULT_MAX_CONCURRENT_FLUSHES.
  */
 typedef struct tidesdb_config_t
 {
@@ -428,6 +442,7 @@ typedef struct tidesdb_config_t
     uint64_t unified_memtable_sync_interval_us;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
+    int max_concurrent_flushes;
 } tidesdb_config_t;
 
 /**
@@ -518,6 +533,8 @@ struct tidesdb_column_family_t
  * @param max_key maximum key in this sstable
  * @param max_key_size size of maximum key
  * @param num_entries total number of keys
+ * @param tombstone_count count of tombstone entries (TDB_KV_FLAG_TOMBSTONE) in this sstable.
+ *                       TDB_TOMBSTONE_COUNT_UNKNOWN means a legacy footer pre-dating the field.
  * @param num_klog_blocks number of blocks in klog
  * @param num_vlog_blocks number of blocks in vlog
  * @param klog_data_end_offset offset where data ends in klog (before footer)
@@ -556,6 +573,7 @@ struct tidesdb_sstable_t
     uint8_t *max_key;
     size_t max_key_size;
     uint64_t num_entries;
+    uint64_t tombstone_count;
     uint64_t num_klog_blocks;
     uint64_t num_vlog_blocks;
     uint64_t klog_data_end_offset;
@@ -658,6 +676,8 @@ struct tidesdb_level_t
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
+ * @param active_flushes global semaphore counter for in-flight flushes across all column
+ *                       families. capped by config.max_concurrent_flushes.
  * @param os_check_counter counter for periodic os-level memory checks
  * @param cf_list_lock rwlock for cf list modifications
  * @param deferred_free_list lock-free singly-linked list of deferred free nodes for retired arrays
@@ -719,6 +739,7 @@ struct tidesdb_t
     _Atomic(int64_t) txn_memory_bytes;
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;
+    _Atomic(int) active_flushes;
     int os_check_counter;
     pthread_rwlock_t cf_list_lock;
     _Atomic(tidesdb_deferred_free_node_t *) deferred_free_list;
@@ -795,8 +816,10 @@ struct tidesdb_t
  * @param read_key_arenas array of read key arenas
  * @param read_key_arena_count number of read key arenas
  * @param read_key_arena_used bytes used in current read key arena
- * @param write_set_hash hash table for O(1) write set lookup (NULL if num_ops < 256)
- * @param read_set_hash hash table for O(1) read set lookup (NULL if read_set_count < 256)
+ * @param write_set_hash hash table for O(1) write set lookup (NULL if num_ops <
+ * TDB_TXN_WRITE_HASH_THRESHOLD)
+ * @param read_set_hash hash table for O(1) read set lookup (NULL if read_set_count <
+ * TDB_TXN_READ_HASH_THRESHOLD)
  * @param cfs array of column families involved in transaction
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
@@ -908,6 +931,11 @@ struct tidesdb_iter_t
  * @param btree_total_nodes total b+tree nodes across all sstables
  * @param btree_max_height maximum tree height across all sstables
  * @param btree_avg_height average tree height across all sstables
+ * @param total_tombstones sum of tombstone_count across every sstable in the cf
+ * @param tombstone_ratio total_tombstones / total_keys (0.0 if total_keys is 0)
+ * @param level_tombstone_counts tombstone count per level (parallels level_key_counts)
+ * @param max_sst_density worst per-sstable tombstone density observed in the cf
+ * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
  */
 struct tidesdb_stats_t
 {
@@ -928,6 +956,12 @@ struct tidesdb_stats_t
     uint64_t btree_total_nodes;
     uint32_t btree_max_height;
     double btree_avg_height;
+    /* tombstone observability */
+    uint64_t total_tombstones;
+    double tombstone_ratio;
+    uint64_t *level_tombstone_counts;
+    double max_sst_density;
+    int max_sst_density_level;
 };
 
 /**
@@ -1531,6 +1565,31 @@ int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_
  * @return 0 on success, -n on failure
  */
 int tidesdb_compact(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_compact_range
+ * synchronously compacts every sstable in the column family whose [min_key, max_key]
+ * overlaps the caller supplied [start_key, end_key) range. output is merged toward the
+ * largest level affected by the input set, so any tombstones in the range that meet
+ * their dead puts are dropped during this pass. the caller blocks until the merge
+ * completes. intended for bulk reclaim after large range deletes -- emit point
+ * tombstones with tidesdb_txn_delete, then call this to physically merge them out.
+ *
+ * NULL start_key means unbounded low, NULL end_key means unbounded high. both NULL
+ * is rejected with TDB_ERR_INVALID_ARGS so callers go through tidesdb_compact for
+ * full cf compaction.
+ *
+ * @param cf column family handle
+ * @param start_key inclusive range start (NULL = unbounded low)
+ * @param start_key_size size of start_key in bytes (0 if start_key is NULL)
+ * @param end_key exclusive range end (NULL = unbounded high)
+ * @param end_key_size size of end_key in bytes (0 if end_key is NULL)
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS for bad args, TDB_ERR_LOCKED
+ *         if another compaction is already running, or other error codes from the
+ *         underlying merge
+ */
+int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                          size_t start_key_size, const uint8_t *end_key, size_t end_key_size);
 
 /**
  * tidesdb_flush_memtable

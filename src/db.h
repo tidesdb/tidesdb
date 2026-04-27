@@ -235,6 +235,13 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param min_disk_space minimum free disk space required (bytes)
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
+ * @param tombstone_density_trigger ratio in [0.0, 1.0] above which any single sstable's
+ *                                  tombstone density (tombstone_count / num_entries) escalates
+ *                                  compaction priority; 0.0 disables the check (default).
+ *                                  sstables with fewer than tombstone_density_min_entries are
+ *                                  ignored to prevent tiny-sstable noise.
+ * @param tombstone_density_min_entries minimum entry count for an sstable to be considered by
+ *                                      the density trigger; 0 falls back to the default
  * @param use_btree whether btree is used
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
@@ -269,6 +276,8 @@ typedef struct tidesdb_column_family_config_t
     uint64_t min_disk_space;
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
+    double tombstone_density_trigger;
+    uint64_t tombstone_density_min_entries;
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
@@ -299,6 +308,10 @@ typedef struct tidesdb_column_family_config_t
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
  * @param object_store pluggable object store connector (NULL = local only, default)
  * @param object_store_config object store behavior configuration (NULL = use defaults)
+ * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
+ *                               across all column families. bounds total transient memory and
+ *                               work-queue depth when many column families flush at once.
+ *                               0 falls back to TDB_DEFAULT_MAX_CONCURRENT_FLUSHES.
  */
 typedef struct tidesdb_config_t
 {
@@ -319,6 +332,7 @@ typedef struct tidesdb_config_t
     uint64_t unified_memtable_sync_interval_us;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
+    int max_concurrent_flushes;
 } tidesdb_config_t;
 
 /**
@@ -340,6 +354,11 @@ typedef struct tidesdb_config_t
  * @param btree_total_nodes total number of nodes in btree
  * @param btree_max_height maximum height of btree
  * @param btree_avg_height average height of btree
+ * @param total_tombstones sum of tombstone_count across every sstable in the cf
+ * @param tombstone_ratio total_tombstones / total_keys (0.0 if total_keys is 0)
+ * @param level_tombstone_counts tombstone count per level (parallels level_key_counts)
+ * @param max_sst_density worst per-sstable tombstone density observed in the cf
+ * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
  */
 typedef struct tidesdb_stats_t
 {
@@ -359,6 +378,11 @@ typedef struct tidesdb_stats_t
     uint64_t btree_total_nodes;
     uint32_t btree_max_height;
     double btree_avg_height;
+    uint64_t total_tombstones;
+    double tombstone_ratio;
+    uint64_t *level_tombstone_counts;
+    double max_sst_density;
+    int max_sst_density_level;
 } tidesdb_stats_t;
 
 /**
@@ -615,6 +639,18 @@ int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_
 
 /**** maintenance operations */
 int tidesdb_compact(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_compact_range
+ * synchronously compacts every sstable whose key range overlaps [start_key, end_key).
+ * output is merged toward the largest level affected. NULL endpoints are unbounded.
+ * both NULL is rejected so callers go through tidesdb_compact for full cf compaction.
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS for bad args, TDB_ERR_LOCKED if another
+ *         compaction is running, or other error codes from the underlying merge
+ */
+int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                          size_t start_key_size, const uint8_t *end_key, size_t end_key_size);
+
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
 /**

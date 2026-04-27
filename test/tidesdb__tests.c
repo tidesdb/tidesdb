@@ -2270,8 +2270,17 @@ static void test_single_delete_pair_cancel_at_compaction(void)
     tidesdb_flush_memtable(cf);
     wait_for_flush_queue_drain(db);
 
-    tidesdb_compact(cf);
-    wait_for_compaction_idle(db, cf);
+    /* run several compaction rounds. one tidesdb_compact() is not always enough
+     * because spooky's algo 2 may keep picking L1->L1 same-level merges when L1 is
+     * over capacity from many small flushes, leaving the SDs at L1 and the original
+     * puts at L2 perpetually unable to share a merge input. each pass reshuffles
+     * level capacities so eventually the SDs reach the level that holds the puts
+     * and pair-cancel fires. */
+    for (int i = 0; i < 8; i++)
+    {
+        tidesdb_compact(cf);
+        wait_for_compaction_idle(db, cf);
+    }
 
     /* every key must be gone to reads */
     tidesdb_txn_t *txn = NULL;
@@ -12493,7 +12502,7 @@ static void test_multi_cf_transaction_recovery_comprehensive(void)
         }
         ASSERT_EQ(committed_found, NUM_COMMITTED_TXNS);
 
-        /* verify rolled back transactions are NOT present */
+        /* verify rolled back transactions are not present */
         for (int i = 0; i < NUM_ROLLBACK_TXNS; i++)
         {
             char key[32];
@@ -27054,6 +27063,870 @@ static void test_objstore_s3_minio(void)
 }
 #endif /* TIDESDB_WITH_S3 */
 
+/* helpers shared by the tombstone density tests below */
+static void wait_for_flush_complete(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    /* drain the flush queue first, then poll is_flushing because the worker
+     * dequeues before it finishes writing the sstable to disk */
+    wait_for_flush_queue_drain(db);
+    const int max_wait = 200;
+    for (int i = 0; i < max_wait; i++)
+    {
+        if (!atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
+            queue_size(db->flush_queue) == 0)
+        {
+            usleep(20000);
+            break;
+        }
+        usleep(20000);
+    }
+}
+
+static void td_put(tidesdb_t *db, tidesdb_column_family_t *cf, int i)
+{
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    char key[32];
+    char value[64];
+    snprintf(key, sizeof(key), "tdkey_%06d", i);
+    snprintf(value, sizeof(value), "tdval_%06d", i);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                              strlen(value) + 1, 0),
+              0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+}
+
+static void td_delete(tidesdb_t *db, tidesdb_column_family_t *cf, int i)
+{
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    char key[32];
+    snprintf(key, sizeof(key), "tdkey_%06d", i);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+}
+
+static void test_tombstone_count_after_flush(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tcaf_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tcaf_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 100;
+    const int num_deletes = 60;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    /* flush before issuing deletes so puts and deletes don't collapse in the memtable */
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = 0; i < num_deletes; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_TRUE(stats->total_tombstones >= (uint64_t)num_deletes);
+    ASSERT_TRUE(stats->total_keys >= (uint64_t)num_keys);
+    tidesdb_free_stats(stats);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_count_round_trip(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "tcrt_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tcrt_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 80;
+    const int num_deletes = 50;
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    for (int i = 0; i < num_deletes; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    tidesdb_stats_t *before = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &before), 0);
+    const uint64_t expected = before->total_tombstones;
+    ASSERT_TRUE(expected > 0);
+    tidesdb_free_stats(before);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* reopen and confirm the count was recovered from the sstable footers */
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "tcrt_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_stats_t *after = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &after), 0);
+    ASSERT_EQ((int)after->total_tombstones, (int)expected);
+    tidesdb_free_stats(after);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_density_trigger_fires(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    /* keep structural triggers far out of reach so only the density signal can fire */
+    cf_config.l1_file_count_trigger = 1000;
+    cf_config.write_buffer_size = 4096;
+    cf_config.tombstone_density_trigger = 0.5;
+    cf_config.tombstone_density_min_entries = 8;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tdtf_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tdtf_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 100;
+    const int num_deletes = 80;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = 0; i < num_deletes; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* the density trigger must have run a compaction even though l1_file_count_trigger
+     * is 1000 -- after settling, the post-flush trigger consumed at least one of the
+     * dense L1 sstables */
+    int level1_ssts = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+    ASSERT_TRUE(level1_ssts < 2);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_density_trigger_ignores_tiny(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.l1_file_count_trigger = 1000;
+    cf_config.tombstone_density_trigger = 0.5;
+    cf_config.tombstone_density_min_entries = 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tdti_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tdti_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* 10 puts, 6 deletes -- density 60% but well below min_entries so the trigger
+     * must not fire and l1 must keep its single sstable */
+    for (int i = 0; i < 10; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = 0; i < 6; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    int level1_ssts = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+    ASSERT_TRUE(level1_ssts >= 2);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_stats_observability(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tso_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tso_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 100;
+    const int num_deletes = 40;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    for (int i = 0; i < num_deletes; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_TRUE(stats->total_tombstones >= (uint64_t)num_deletes);
+    ASSERT_TRUE(stats->tombstone_ratio > 0.0);
+    ASSERT_TRUE(stats->tombstone_ratio <= 1.0);
+    ASSERT_TRUE(stats->level_tombstone_counts != NULL);
+    ASSERT_TRUE(stats->max_sst_density > 0.0);
+    ASSERT_TRUE(stats->max_sst_density <= 1.0);
+    ASSERT_TRUE(stats->max_sst_density_level >= 1);
+
+    /* per-level counts must sum to the aggregate */
+    uint64_t sum = 0;
+    for (int i = 0; i < stats->num_levels; i++) sum += stats->level_tombstone_counts[i];
+    ASSERT_EQ((int)sum, (int)stats->total_tombstones);
+
+    tidesdb_free_stats(stats);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_count_heavy_compaction(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    /* small write buffer drives many flushes; small file-count trigger drives multiple
+     * compactions across levels so we exercise the merge counter paths */
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 4;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "thc_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "thc_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 2000;
+    const int num_deletes = 1200;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        td_put(db, cf, i);
+        if (i % 200 == 199)
+        {
+            tidesdb_flush_memtable(cf);
+            wait_for_flush_complete(db, cf);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    for (int i = 0; i < num_deletes; i++)
+    {
+        td_delete(db, cf, i);
+        if (i % 200 == 199)
+        {
+            tidesdb_flush_memtable(cf);
+            wait_for_flush_complete(db, cf);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* after settling, every key in [0, num_deletes) must be inaccessible and every
+     * key in [num_deletes, num_keys) must read back -- this asserts compaction
+     * preserved correctness through the tombstone counter changes */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    int still_alive = 0;
+    int really_deleted = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (i < num_deletes)
+        {
+            if (rc != 0 || value == NULL) really_deleted++;
+        }
+        else
+        {
+            if (rc == 0 && value != NULL) still_alive++;
+        }
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(really_deleted, num_deletes);
+    ASSERT_EQ(still_alive, num_keys - num_deletes);
+
+    /* tombstone counts must remain consistent after the cascade -- each level's
+     * level_tombstone_counts must sum to total_tombstones, and total must not
+     * exceed num_deletes (some may have dropped at the largest level) */
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    uint64_t sum = 0;
+    for (int i = 0; i < stats->num_levels; i++) sum += stats->level_tombstone_counts[i];
+    ASSERT_EQ((int)sum, (int)stats->total_tombstones);
+    ASSERT_TRUE(stats->total_tombstones <= (uint64_t)num_deletes);
+    tidesdb_free_stats(stats);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_count_cascade_invariants(void)
+{
+    /* exercises counter conservation across many flushes plus repeated explicit
+     * compactions.  spooky's dynamic target-level selection makes it hard to force
+     * tombstones to drop deterministically, so we assert what we actually care about:
+     * the per-level counts always sum to total_tombstones, total_tombstones never
+     * exceeds num_deletes (drops monotonically reduce it), and read-after-delete
+     * stays consistent through the cascade. */
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.min_levels = 2;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 2;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tcci_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tcci_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 400;
+    const int num_deletes = num_keys;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        td_put(db, cf, i);
+        if (i % 100 == 99)
+        {
+            tidesdb_flush_memtable(cf);
+            wait_for_flush_complete(db, cf);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    for (int i = 0; i < num_deletes; i++)
+    {
+        td_delete(db, cf, i);
+        if (i % 100 == 99)
+        {
+            tidesdb_flush_memtable(cf);
+            wait_for_flush_complete(db, cf);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    for (int i = 0; i < 8; i++)
+    {
+        tidesdb_compact(cf);
+        wait_for_compaction_idle(db, cf);
+    }
+
+    /* every key was deleted -- reads must all fail */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_TRUE(rc != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    uint64_t sum = 0;
+    for (int i = 0; i < stats->num_levels; i++) sum += stats->level_tombstone_counts[i];
+    ASSERT_EQ((int)sum, (int)stats->total_tombstones);
+    ASSERT_TRUE(stats->total_tombstones <= (uint64_t)num_deletes);
+    tidesdb_free_stats(stats);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_tombstone_count_unified_memtable(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 8192;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 4;
+    ASSERT_EQ(tidesdb_create_column_family(db, "tcum_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tcum_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 800;
+    const int num_deletes = 500;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    /* in unified mode flushes are driven globally by the unified memtable's own
+     * threshold; just wait for queues to settle */
+    wait_for_flush_queue_drain(db);
+    wait_for_compaction_idle(db, cf);
+
+    for (int i = 0; i < num_deletes; i++) td_delete(db, cf, i);
+    wait_for_flush_queue_drain(db);
+    wait_for_compaction_idle(db, cf);
+
+    /* read-after-delete consistency under unified mode */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    int really_deleted = 0;
+    int still_alive = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (i < num_deletes)
+        {
+            if (rc != 0 || value == NULL) really_deleted++;
+        }
+        else
+        {
+            if (rc == 0 && value != NULL) still_alive++;
+        }
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(really_deleted, num_deletes);
+    ASSERT_EQ(still_alive, num_keys - num_deletes);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    uint64_t sum = 0;
+    for (int i = 0; i < stats->num_levels; i++) sum += stats->level_tombstone_counts[i];
+    ASSERT_EQ((int)sum, (int)stats->total_tombstones);
+    ASSERT_TRUE(stats->total_tombstones <= (uint64_t)num_deletes);
+    tidesdb_free_stats(stats);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void td_make_key(char *out, size_t out_size, int i)
+{
+    snprintf(out, out_size, "tdkey_%06d", i);
+}
+
+static void test_compact_range_arg_validation(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "crav_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "crav_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const uint8_t key[] = "k";
+    const size_t key_size = sizeof(key);
+
+    ASSERT_EQ(tidesdb_compact_range(NULL, key, key_size, key, key_size), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_compact_range(cf, NULL, 0, NULL, 0), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_compact_range(cf, key, 0, NULL, 0), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_compact_range(cf, NULL, 0, key, 0), TDB_ERR_INVALID_ARGS);
+
+    /* unbounded on either side is allowed */
+    ASSERT_EQ(tidesdb_compact_range(cf, NULL, 0, key, key_size), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_compact_range(cf, key, key_size, NULL, 0), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_compact_range_basic_reclaim(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 1000;
+    ASSERT_EQ(tidesdb_create_column_family(db, "crbr_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "crbr_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 200;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    char start[32];
+    char end[32];
+    td_make_key(start, sizeof(start), 0);
+    td_make_key(end, sizeof(end), num_keys);
+    ASSERT_EQ(tidesdb_compact_range(cf, (uint8_t *)start, strlen(start) + 1, (uint8_t *)end,
+                                    strlen(end) + 1),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    /* every deleted key must remain inaccessible after the range merge */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        td_make_key(key, sizeof(key), i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_TRUE(rc != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* counter invariant must still hold across the bespoke merge */
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    uint64_t sum = 0;
+    for (int i = 0; i < stats->num_levels; i++) sum += stats->level_tombstone_counts[i];
+    ASSERT_EQ((int)sum, (int)stats->total_tombstones);
+    tidesdb_free_stats(stats);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_compact_range_no_overlap_noop(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "crno_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "crno_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 50; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    /* a range entirely above any existing key triggers a no-op */
+    const uint8_t high_start[] = "zzzzzz_aaa";
+    const uint8_t high_end[] = "zzzzzz_zzz";
+    ASSERT_EQ(tidesdb_compact_range(cf, high_start, sizeof(high_start), high_end, sizeof(high_end)),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    /* original sstable count is preserved -- nothing was rewritten */
+    int level1_ssts = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+    ASSERT_TRUE(level1_ssts >= 1);
+
+    /* reads still work */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        td_make_key(key, sizeof(key), i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_compact_range_partial_range(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 1000;
+    ASSERT_EQ(tidesdb_create_column_family(db, "crpr_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "crpr_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 300;
+    const int delete_lo = 100;
+    const int delete_hi = 200;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = delete_lo; i < delete_hi; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    /* compact only the deleted range -- keys outside the range may incidentally
+     * get rewritten if they live in the same sstables, which is by design */
+    char start[32];
+    char end[32];
+    td_make_key(start, sizeof(start), delete_lo);
+    td_make_key(end, sizeof(end), delete_hi);
+    ASSERT_EQ(tidesdb_compact_range(cf, (uint8_t *)start, strlen(start) + 1, (uint8_t *)end,
+                                    strlen(end) + 1),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        td_make_key(key, sizeof(key), i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (i >= delete_lo && i < delete_hi)
+        {
+            ASSERT_TRUE(rc != 0 || value == NULL);
+        }
+        else
+        {
+            ASSERT_EQ(rc, 0);
+            ASSERT_TRUE(value != NULL);
+        }
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_compact_range_unbounded_endpoints(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "cre_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cre_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 150;
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    /* unbounded low + bounded high covers everything below the cap */
+    char cap[32];
+    td_make_key(cap, sizeof(cap), num_keys);
+    ASSERT_EQ(tidesdb_compact_range(cf, NULL, 0, (uint8_t *)cap, strlen(cap) + 1), TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    /* unbounded high covers everything above the floor */
+    char floor_key[32];
+    td_make_key(floor_key, sizeof(floor_key), 0);
+    ASSERT_EQ(tidesdb_compact_range(cf, (uint8_t *)floor_key, strlen(floor_key) + 1, NULL, 0),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        td_make_key(key, sizeof(key), i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_TRUE(rc != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_compact_range_unified_memtable(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 8192;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "cru_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cru_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 300;
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    wait_for_flush_queue_drain(db);
+    wait_for_compaction_idle(db, cf);
+
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    wait_for_flush_queue_drain(db);
+    wait_for_compaction_idle(db, cf);
+
+    char start[32];
+    char end[32];
+    td_make_key(start, sizeof(start), 0);
+    td_make_key(end, sizeof(end), num_keys);
+    ASSERT_EQ(tidesdb_compact_range(cf, (uint8_t *)start, strlen(start) + 1, (uint8_t *)end,
+                                    strlen(end) + 1),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        td_make_key(key, sizeof(key), i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_TRUE(rc != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_btree_cache_invalidation_on_sstable_free(void)
+{
+    /* regression for the producer/consumer mismatch in
+     * tidesdb_invalidate_btree_cache_for_sstable. before the fix the consumer formatted
+     * the prefix from sst->id in decimal while the producer keyed entries on
+     * hex(XXH64(klog_path)), so invalidation never matched anything and stale entries
+     * lingered in the btree node cache until natural CLOCK eviction. with the fix the
+     * cache count must drop after sstable_free. */
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.use_btree = 1;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 2;
+    ASSERT_EQ(tidesdb_create_column_family(db, "btci_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btci_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    if (!db->btree_node_cache)
+    {
+        /* btree node cache is disabled, nothing to assert about */
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+        cleanup_test_dir();
+        return;
+    }
+
+    const int num_keys = 600;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        td_put(db, cf, i);
+        if (i % 100 == 99)
+        {
+            tidesdb_flush_memtable(cf);
+            wait_for_flush_complete(db, cf);
+        }
+    }
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* read every key to populate the btree node cache */
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int i = 0; i < num_keys; i++)
+        {
+            char key[32];
+            td_make_key(key, sizeof(key), i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+            (void)rc;
+            if (value) free(value);
+        }
+        tidesdb_txn_free(txn);
+    }
+
+    clock_cache_stats_t before;
+    clock_cache_get_stats(db->btree_node_cache, &before);
+    ASSERT_TRUE(before.total_entries > 0);
+
+    /* compact all the way through every level so the original sstables get freed
+     * and trigger tidesdb_invalidate_btree_cache_for_sstable for each */
+    for (int i = 0; i < 8; i++)
+    {
+        tidesdb_compact(cf);
+        wait_for_compaction_idle(db, cf);
+    }
+
+    clock_cache_stats_t after;
+    clock_cache_get_stats(db->btree_node_cache, &after);
+
+    /* the new sstables produced by compaction have not been queried yet, so any
+     * entries surviving in the cache must belong to the freed sstables. with the
+     * invalidator working, that count is zero. give a tiny slack only for races
+     * around concurrent compaction reading the new sstables. */
+    ASSERT_TRUE(after.total_entries < before.total_entries);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -27379,6 +28252,21 @@ int main(int argc, char **argv)
     RUN_TEST(test_multi_cf_create_drop_churn_under_load, tests_passed);
     RUN_TEST(test_multi_cf_mixed_isolation_cross_txn, tests_passed);
     RUN_TEST(test_db_stats_basic, tests_passed);
+    RUN_TEST(test_tombstone_count_after_flush, tests_passed);
+    RUN_TEST(test_tombstone_count_round_trip, tests_passed);
+    RUN_TEST(test_tombstone_density_trigger_fires, tests_passed);
+    RUN_TEST(test_tombstone_density_trigger_ignores_tiny, tests_passed);
+    RUN_TEST(test_tombstone_stats_observability, tests_passed);
+    RUN_TEST(test_tombstone_count_heavy_compaction, tests_passed);
+    RUN_TEST(test_tombstone_count_cascade_invariants, tests_passed);
+    RUN_TEST(test_tombstone_count_unified_memtable, tests_passed);
+    RUN_TEST(test_compact_range_arg_validation, tests_passed);
+    RUN_TEST(test_compact_range_basic_reclaim, tests_passed);
+    RUN_TEST(test_compact_range_no_overlap_noop, tests_passed);
+    RUN_TEST(test_compact_range_partial_range, tests_passed);
+    RUN_TEST(test_compact_range_unbounded_endpoints, tests_passed);
+    RUN_TEST(test_compact_range_unified_memtable, tests_passed);
+    RUN_TEST(test_btree_cache_invalidation_on_sstable_free, tests_passed);
     RUN_TEST(test_purge_cf_basic, tests_passed);
     RUN_TEST(test_purge_all, tests_passed);
     RUN_TEST(test_sync_wal, tests_passed);

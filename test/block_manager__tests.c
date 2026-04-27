@@ -2904,7 +2904,7 @@ void test_write_raw_hole_stops_replay(void)
 
     /*
      * cursor_next from A uses A's cached size to advance the file pointer to
-     * block B's offset.  It does NOT read B's content here, it just moves
+     * block B's offset.  It does not read B's content here, it just moves
      * the cursor position.  Therefore it returns 0 (success).
      */
     ASSERT_EQ(block_manager_cursor_next(cursor), 0);

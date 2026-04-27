@@ -25,7 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MANIFEST_TMP_EXT ".tmp."
+#define MANIFEST_TMP_EXT     ".tmp."
+#define MANIFEST_TMP_EXT_LEN (sizeof(MANIFEST_TMP_EXT) - 1)
 
 /**
  * tidesdb_manifest_add_sstable_unlocked
@@ -108,8 +109,9 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         {
             /* we check if filename matches pattern -- <base_name>MANIFEST_TMP_EXT* */
             const size_t entry_len = strlen(entry->d_name);
-            if (entry_len > base_len + 5 && strncmp(entry->d_name, base_name, base_len) == 0 &&
-                strncmp(entry->d_name + base_len, MANIFEST_TMP_EXT, 5) == 0)
+            if (entry_len > base_len + MANIFEST_TMP_EXT_LEN &&
+                strncmp(entry->d_name, base_name, base_len) == 0 &&
+                strncmp(entry->d_name + base_len, MANIFEST_TMP_EXT, MANIFEST_TMP_EXT_LEN) == 0)
             {
                 /* found orphaned temp file, we remove it */
                 char temp_full_path[MANIFEST_PATH_LEN];

@@ -1936,7 +1936,7 @@ static int verify_block_payload(const uint8_t *buf, size_t len)
 /**
  * test_realistic_block_cache_eviction
  * models a single-threaded btree scan workload:
- *   -- 5000 "blocks" (more than fit in cache) with variable sizes 200B–4KB
+ *   -- 5000 "blocks" (more than fit in cache) with variable sizes 200B-4KB
  *   -- insert all blocks, verify byte budget is respected throughout
  *   -- read back with Zipfian access (hot blocks hit cache, cold blocks miss)
  *   -- verify every successful read returns uncorrupted data

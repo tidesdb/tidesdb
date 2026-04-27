@@ -25,6 +25,9 @@
 
 #define TDB_LOCAL_CACHE_KLOG_EXT ".klog"
 #define TDB_LOCAL_CACHE_VLOG_EXT ".vlog"
+/* both partner extensions must be the same length for the swap-trick in
+ * cache_evict_partner to produce a valid path */
+#define TDB_LOCAL_CACHE_EXT_LEN (sizeof(TDB_LOCAL_CACHE_KLOG_EXT) - 1)
 
 /**
  * cache_hash
@@ -230,9 +233,9 @@ static void cache_evict_partner(tdb_local_cache_t *cache, const tdb_cache_entry_
                                 size_t *current)
 {
     size_t vlen = strlen(victim->path);
-    if (vlen < 5) return;
+    if (vlen < TDB_LOCAL_CACHE_EXT_LEN) return;
 
-    const char *ext = victim->path + vlen - 5;
+    const char *ext = victim->path + vlen - TDB_LOCAL_CACHE_EXT_LEN;
     const char *partner_ext = NULL;
 
     if (strcmp(ext, TDB_LOCAL_CACHE_KLOG_EXT) == 0)
@@ -243,8 +246,8 @@ static void cache_evict_partner(tdb_local_cache_t *cache, const tdb_cache_entry_
     if (!partner_ext) return;
 
     char partner_path[TDB_LOCAL_CACHE_MAX_PATH];
-    memcpy(partner_path, victim->path, vlen - 5);
-    memcpy(partner_path + vlen - 5, partner_ext, 5);
+    memcpy(partner_path, victim->path, vlen - TDB_LOCAL_CACHE_EXT_LEN);
+    memcpy(partner_path + vlen - TDB_LOCAL_CACHE_EXT_LEN, partner_ext, TDB_LOCAL_CACHE_EXT_LEN);
     partner_path[vlen] = '\0';
 
     uint32_t ph = cache_hash(partner_path);

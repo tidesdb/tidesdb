@@ -84,7 +84,7 @@ int tdb_local_cache_init(tdb_local_cache_t *cache, const char *cache_dir, size_t
 /**
  * tdb_local_cache_destroy
  * free all tracking entries and destroy mutex.
- * does NOT delete cached files from disk (they persist for next startup).
+ * does not delete cached files from disk (they persist for next startup).
  * @param cache cache to destroy
  */
 void tdb_local_cache_destroy(tdb_local_cache_t *cache);
@@ -110,7 +110,7 @@ void tdb_local_cache_touch(tdb_local_cache_t *cache, const char *local_path);
 
 /**
  * tdb_local_cache_remove
- * remove a file from cache tracking. does NOT delete the file from disk.
+ * remove a file from cache tracking. does not delete the file from disk.
  * @param cache      cache manager
  * @param local_path path to remove
  */

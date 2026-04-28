@@ -23105,7 +23105,7 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     }
     if (num_l1 >= cf->config.l1_file_count_trigger || density_hit)
     {
-        tidesdb_compact(cf);
+        tidesdb_compact_with_flags(cf, density_hit ? 1 : 0);
     }
 
     tidesdb_sstable_unref(db, sst);

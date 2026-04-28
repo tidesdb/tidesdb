@@ -27307,6 +27307,199 @@ static void test_tombstone_stats_observability(void)
     cleanup_test_dir();
 }
 
+/*** witness path drops tombstones at non-largest target when no older sstable
+ **  can possibly contain the key. setup keeps deeper levels empty so the helper
+ *   walks them and sees nothing. expectation is that after the density trigger
+ **  fires and the merge runs, total_tombstones converges to zero even though
+ *** the merge target is not the largest level. */
+static void test_tombstone_witness_drops_when_no_older(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 1000;
+    cf_config.tombstone_density_trigger = 0.5;
+    cf_config.tombstone_density_min_entries = 8;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "twno_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "twno_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 200;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_EQ((int)stats->total_tombstones, 0);
+    tidesdb_free_stats(stats);
+
+    /* every key must read as NOT_FOUND, the deletes are still observable */
+    for (int i = 0; i < num_keys; i += 17)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs),
+                  TDB_ERR_NOT_FOUND);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+/*** witness path preserves tombstones when an older sstable at a deeper level
+ **  may still contain the masked put. setup sinks an older put into a deep
+ *   level via repeated flush+compact, then layers a tombstone for the same key
+ **  at L1. the merge would rule the deletion safe to drop only if the helper
+ *** told it nothing older holds the key, which here it cannot. correctness
+ **  bar is that the deleted key reads as NOT_FOUND after the witness path
+ *   runs. tombstones may or may not still be present depending on which level
+ **  the merge landed in. */
+static void test_tombstone_witness_preserves_when_older_exists(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 4;
+    cf_config.tombstone_density_trigger = 0.5;
+    cf_config.tombstone_density_min_entries = 8;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+    cf_config.min_levels = 3;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "twpe_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "twpe_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 100;
+
+    /* first wave of puts, push them down the tree by triggering several
+     * structural compactions before the deletes arrive */
+    for (int wave = 0; wave < 5; wave++)
+    {
+        for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+        tidesdb_flush_memtable(cf);
+        wait_for_flush_complete(db, cf);
+        ASSERT_EQ(tidesdb_compact(cf), TDB_SUCCESS);
+        wait_for_compaction_idle(db, cf);
+    }
+
+    /* tombstones for the same keys at L1, density above the trigger */
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* correctness, every deleted key must be invisible regardless of which
+     * level the surviving tombstones (if any) ended up at */
+    for (int i = 0; i < num_keys; i += 7)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs),
+                  TDB_ERR_NOT_FOUND);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+/*** tidesdb_compact_range is operator-driven reclaim and threads
+ **  witness_triggered=1 into the targeted merge. expectation is that the
+ *   tombstones from a range delete drop within the targeted slice when no
+ **  older sstable holds the key. */
+static void test_tombstone_compact_range_drops(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tcrd_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tcrd_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 300;
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    /* delete a contiguous middle slice, then call the targeted compaction
+     * api over exactly that range */
+    const int del_lo = num_keys * 30 / 100;
+    const int del_hi = num_keys * 70 / 100;
+    for (int i = del_lo; i < del_hi; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    char start_key[32];
+    char end_key[32];
+    snprintf(start_key, sizeof(start_key), "tdkey_%06d", del_lo);
+    snprintf(end_key, sizeof(end_key), "tdkey_%06d", del_hi);
+    ASSERT_EQ(tidesdb_compact_range(cf, (uint8_t *)start_key, strlen(start_key) + 1,
+                                    (uint8_t *)end_key, strlen(end_key) + 1),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_EQ((int)stats->total_tombstones, 0);
+    tidesdb_free_stats(stats);
+
+    /* keys outside the range still readable, keys inside still hidden */
+    for (int i = 0; i < num_keys; i += 11)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        const int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs);
+        if (i >= del_lo && i < del_hi)
+        {
+            ASSERT_EQ(rc, TDB_ERR_NOT_FOUND);
+        }
+        else
+        {
+            ASSERT_EQ(rc, TDB_SUCCESS);
+            free(val);
+        }
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
 static void test_tombstone_count_heavy_compaction(void)
 {
     cleanup_test_dir();
@@ -27706,7 +27899,7 @@ static void test_compact_range_partial_range(void)
     tidesdb_flush_memtable(cf);
     wait_for_flush_complete(db, cf);
 
-    /* compact only the deleted range -- keys outside the range may incidentally
+    /* we compact only the deleted range -- keys outside the range may incidentally
      * get rewritten if they live in the same sstables, which is by design */
     char start[32];
     char end[32];
@@ -27890,7 +28083,7 @@ static void test_btree_cache_invalidation_on_sstable_free(void)
     wait_for_flush_complete(db, cf);
     wait_for_compaction_idle(db, cf);
 
-    /* read every key to populate the btree node cache */
+    /* we read every key to populate the btree node cache */
     {
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -27911,7 +28104,7 @@ static void test_btree_cache_invalidation_on_sstable_free(void)
     clock_cache_get_stats(db->btree_node_cache, &before);
     ASSERT_TRUE(before.total_entries > 0);
 
-    /* compact all the way through every level so the original sstables get freed
+    /* we compact all the way through every level so the original sstables get freed
      * and trigger tidesdb_invalidate_btree_cache_for_sstable for each */
     for (int i = 0; i < 8; i++)
     {
@@ -28262,6 +28455,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_tombstone_density_trigger_fires, tests_passed);
     RUN_TEST(test_tombstone_density_trigger_ignores_tiny, tests_passed);
     RUN_TEST(test_tombstone_stats_observability, tests_passed);
+    RUN_TEST(test_tombstone_witness_drops_when_no_older, tests_passed);
+    RUN_TEST(test_tombstone_witness_preserves_when_older_exists, tests_passed);
+    RUN_TEST(test_tombstone_compact_range_drops, tests_passed);
     RUN_TEST(test_tombstone_count_heavy_compaction, tests_passed);
     RUN_TEST(test_tombstone_count_cascade_invariants, tests_passed);
     RUN_TEST(test_tombstone_count_unified_memtable, tests_passed);

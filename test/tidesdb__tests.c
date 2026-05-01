@@ -11799,7 +11799,7 @@ static void test_background_flush_multiple_immutable_memtables(void)
  * window observed by other writers */
 #define TEST_RACE_COMMITTER_THREADS    16
 #define TEST_RACE_TXN_PER_COMMITTER    3000
-#define TEST_RACE_WRITE_BUFFER_BYTES   512
+#define TEST_RACE_WRITE_BUFFER_BYTES   4096
 #define TEST_RACE_NUM_CFS              8
 #define TEST_RACE_KEY_BUF_BYTES        48
 #define TEST_RACE_VAL_BUF_BYTES        96

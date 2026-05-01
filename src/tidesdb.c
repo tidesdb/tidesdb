@@ -16234,8 +16234,6 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
     while (atomic_load(&db->sstable_reaper_active))
     {
-        TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Reaper: loop top");
-
         time_t now = tdb_get_current_time();
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
 
@@ -16254,15 +16252,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             ts.tv_nsec -= TDB_NANOSECONDS_PER_SECOND;
         }
 
-        TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Reaper: before mutex_lock");
         pthread_mutex_lock(&db->reaper_thread_mutex);
-        TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Reaper: before timedwait");
 
         if (atomic_load(&db->sstable_reaper_active))
         {
             int wait_rc =
                 pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
-            TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Reaper: timedwait returned %d", wait_rc);
         }
         int should_exit = !atomic_load(&db->sstable_reaper_active);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
@@ -16626,10 +16621,16 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             time_t last_access;
         } sstable_candidate_t;
 
-        /* stack buffer for common case (≤N open SSTs), heap fallback for large configs */
+        /* stack buffer for common case (≤N open SSTs), heap fallback for large configs.
+         * current_open is a snapshot; concurrent flushes can add more SSTables between
+         * the snapshot and the scan below.  we add headroom to reduce the chance of
+         * hitting the cap, and enforce a bounds check when inserting candidates. */
 #define TDB_REAPER_STACK_CANDIDATES 256
         sstable_candidate_t stack_candidates[TDB_REAPER_STACK_CANDIDATES];
         sstable_candidate_t *candidates;
+        const int candidates_capacity = (current_open <= TDB_REAPER_STACK_CANDIDATES)
+                                            ? TDB_REAPER_STACK_CANDIDATES
+                                            : current_open + (current_open / 4) + 64;
         const int use_stack = (current_open <= TDB_REAPER_STACK_CANDIDATES);
         if (use_stack)
         {
@@ -16637,7 +16638,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         }
         else
         {
-            candidates = malloc(current_open * sizeof(sstable_candidate_t));
+            candidates = malloc(candidates_capacity * sizeof(sstable_candidate_t));
             if (!candidates)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Reaper: failed to allocate candidates array");
@@ -16716,7 +16717,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         }
 
                         /* now we check if we're the only extra ref (refcount should be 2) */
-                        if (atomic_load(&sst->refcount) == 2)
+                        if (atomic_load(&sst->refcount) == 2 &&
+                            candidate_count < candidates_capacity)
                         {
                             candidates[candidate_count].sst = sst;
                             candidates[candidate_count].last_access =
@@ -16725,7 +16727,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         }
                         else
                         {
-                            /* someone else is using it, we must release our ref */
+                            /* someone else is using it or buffer full, release our ref */
                             tidesdb_sstable_unref(db, sst);
                         }
                     }

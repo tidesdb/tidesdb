@@ -11607,12 +11607,17 @@ static void tidesdb_add_ssts_to_merge_heap(tidesdb_t *db, tidesdb_sstable_t **ss
                       sst->id, sst->num_klog_blocks, sst->klog_data_end_offset);
 
         tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(db, sst);
+        int source_added = 0;
         if (source)
         {
             if (source->current_kv)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "Added merge source for SSTable %" PRIu64, sst->id);
-                if (tidesdb_merge_heap_add_source(heap, source) != TDB_SUCCESS)
+                if (tidesdb_merge_heap_add_source(heap, source) == TDB_SUCCESS)
+                {
+                    source_added = 1;
+                }
+                else
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR,
                                   "Failed to add merge source for SSTable %" PRIu64 " to heap",
@@ -11634,7 +11639,14 @@ static void tidesdb_add_ssts_to_merge_heap(tidesdb_t *db, tidesdb_sstable_t **ss
                           sst->id);
         }
 
-        queue_enqueue(delete_queue, sst);
+        if (source_added)
+        {
+            queue_enqueue(delete_queue, sst);
+        }
+        else
+        {
+            tidesdb_sstable_unref(db, sst);
+        }
     }
 }
 
@@ -15933,12 +15945,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 }
             }
 
+            /** we always republish the snapshot after the dequeue-re-enqueue loop.
+             * a concurrent rotation can call tidesdb_imm_snap_publish while an item
+             * is temporarily out of the queue, orphaning it from the snapshot.
+             * republishing here ensures every re-enqueued item is visible to readers */
+            tidesdb_imm_snap_publish(cf);
+
             if (cleaned > 0)
             {
-                /** we republish lock-free snapshot -- non-blocking, rebuilds without
-                 * the removed items and swaps active index immediately */
-                tidesdb_imm_snap_publish(cf);
-
                 /** we wait for old-slot readers to drain before freeing
                  * this is the only path that needs blocking drain (items being freed) */
                 tidesdb_imm_snap_drain_previous(cf);

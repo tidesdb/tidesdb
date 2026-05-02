@@ -12002,7 +12002,9 @@ static void test_active_memtable_rotation_race(void)
 
     for (int i = 0; i < TEST_RACE_FLUSH_DRAIN_MAX_ITER; i++)
     {
-        if (queue_size(db->flush_queue) == 0) break;
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&db->flush_pending_count, memory_order_acquire) == 0)
+            break;
         usleep(TEST_RACE_FLUSH_DRAIN_INT_US);
     }
 

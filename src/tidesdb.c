@@ -15481,6 +15481,37 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* unified flush dispatch -- cf==NULL means this is a unified memtable flush */
         if (!cf && imm)
         {
+            /* wait for in-flight writers to drain before reading the memtable.
+             * writers hold a refcount while writing to the unified WAL + skip list.
+             * without this drain barrier_finish can close the WAL while a writer
+             * is still inside block_manager_write_raw on the same handle.
+             * baseline -- 1 (original) + 1 (work ref) = 2 when no external refs */
+            int drain_iterations = 0;
+            while (atomic_load_explicit(&imm->refcount, memory_order_acquire) >
+                   TDB_REFCOUNT_DRAIN_BASELINE)
+            {
+                drain_iterations++;
+                if (drain_iterations < TDB_REFCOUNT_DRAIN_SPIN_THRESHOLD)
+                {
+                    cpu_pause();
+                }
+                else if (drain_iterations < TDB_REFCOUNT_DRAIN_YIELD_THRESHOLD)
+                {
+                    cpu_yield();
+                }
+                else
+                {
+                    usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+                }
+                if ((drain_iterations & TDB_REFCOUNT_DRAIN_LOG_INTERVAL) == 0)
+                {
+                    TDB_DEBUG_LOG(
+                        TDB_LOG_WARN,
+                        "Unified flush worker waiting for memtable refcount to drain (current=%d)",
+                        atomic_load_explicit(&imm->refcount, memory_order_acquire));
+                }
+            }
+
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker processing unified memtable flush");
             int uflush_rc = tidesdb_unified_flush_immutable(db, imm);
             if (uflush_rc != TDB_SUCCESS)
@@ -15488,9 +15519,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Unified flush failed (error %d)", uflush_rc);
             }
 
-            /* we do not free imm here -- it is still in unified_mt.immutables queue
-             * and readers may be scanning it. tidesdb_unified_flush_immutable already
-             * marks it flushed and deletes the WAL. close path handles cleanup. */
+            /* release the work ref taken during rotation */
+            tidesdb_immutable_memtable_unref(imm);
 
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
@@ -16270,8 +16300,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         if (atomic_load(&db->sstable_reaper_active))
         {
-            int wait_rc =
-                pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
+            (void)pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
         }
         int should_exit = !atomic_load(&db->sstable_reaper_active);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
@@ -23495,6 +23524,11 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     /* we enqueue old to immutable queue (for read path scanning) */
     queue_enqueue(db->unified_mt.immutables, old_mt);
 
+    /* we take a work ref so the drain baseline matches per-CF flush
+     * (1 original + 1 work = TDB_REFCOUNT_DRAIN_BASELINE).  same helper as per-CF
+     * rotation uses so the memory ordering matches. */
+    tidesdb_immutable_memtable_ref(old_mt);
+
     /* we enqueue flush work item with cf=NULL to signal unified flush */
     tidesdb_flush_work_t *uwork = malloc(sizeof(tidesdb_flush_work_t));
     if (uwork)
@@ -23509,8 +23543,13 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
         {
             free(uwork);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
+            tidesdb_immutable_memtable_unref(old_mt);
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to enqueue unified flush work");
         }
+    }
+    else
+    {
+        tidesdb_immutable_memtable_unref(old_mt);
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable rotated (gen=%" PRIu64 ", WAL=%s)", new_gen,

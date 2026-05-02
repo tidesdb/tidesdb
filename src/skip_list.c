@@ -930,12 +930,9 @@ int skip_list_new_with_arena(skip_list_t **list, const int max_level, const floa
     if (rc != 0) return rc;
 
     (*list)->arena = skip_list_arena_create(arena_initial_capacity);
-    if ((*list)->arena == NULL)
-    {
-        skip_list_free(*list);
-        *list = NULL;
-        return -1;
-    }
+    /* arena is optional -- if the initial block is too large for the address
+     * space (e.g. 128 MB on a 32-bit build under ASAN) the skip list falls
+     * back to per-node malloc which is slower but correct. */
 
     return 0;
 }

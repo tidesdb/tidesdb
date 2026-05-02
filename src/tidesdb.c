@@ -322,6 +322,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_OPENING_WAIT_MAX_MS                     100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS               5
 #define TDB_FLUSH_RETRY_BACKOFF_US                  100000
+#define TDB_TXN_ACTIVE_RELOAD_MAX_ATTEMPTS          16
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS             10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
@@ -23601,8 +23602,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     /* with the unified path, we do single WAL + single skip list */
     if (txn->db->unified_mt.enabled)
     {
-        tidesdb_memtable_t *umt =
-            atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
+        tidesdb_memtable_t *umt;
+        int umt_load_attempts = 0;
+
+    reload_unified_active:
+        umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
         if (!umt || !tidesdb_memtable_try_ref(umt))
         {
             umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
@@ -23610,6 +23614,20 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 return TDB_ERR_UNKNOWN;
             }
+        }
+
+        /*** phantom-writer guard -- after we hold a ref, verify umt is still the active
+         **  unified memtable.  if a rotation completed between our load and our try_ref,
+         *   umt is now an immutable that the flush worker may already be reading.  unref
+         *** and retry so our writes always land on the current active memtable. */
+        if (atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire) != umt)
+        {
+            tidesdb_immutable_memtable_unref(umt);
+            if (++umt_load_attempts > TDB_TXN_ACTIVE_RELOAD_MAX_ATTEMPTS)
+            {
+                return TDB_ERR_UNKNOWN;
+            }
+            goto reload_unified_active;
         }
 
         /* we serialize unified WAL batch */
@@ -23777,7 +23795,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
-        tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+        tidesdb_memtable_t *mt;
+        int load_attempts = 0;
+
+    reload_active:
+        mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
         /*** we use CAS-based try_ref to safely handle the case where the loaded
          **  memtable was rotated to immutable and freed between our load and ref.
@@ -23797,6 +23819,27 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 result = TDB_ERR_UNKNOWN;
                 goto cleanup;
             }
+        }
+
+        /*** phantom-writer guard -- after we hold a ref, verify mt is still the active.
+         **  if a rotation completed between our load and our try_ref, mt is now an
+         *   immutable that the flush worker may already be reading.  unref and retry
+         *** so our writes always land on the current active memtable. */
+        if (atomic_load_explicit(&cf->active_memtable, memory_order_acquire) != mt)
+        {
+            tidesdb_immutable_memtable_unref(mt);
+            if (++load_attempts > TDB_TXN_ACTIVE_RELOAD_MAX_ATTEMPTS)
+            {
+                for (int j = 0; j < cf_idx; j++)
+                {
+                    if (cf_memtables[j])
+                        atomic_fetch_sub_explicit(&cf_memtables[j]->refcount, 1,
+                                                  memory_order_release);
+                }
+                result = TDB_ERR_UNKNOWN;
+                goto cleanup;
+            }
+            goto reload_active;
         }
         cf_memtables[cf_idx] = mt;
         cf_skiplists[cf_idx] = mt->skip_list;

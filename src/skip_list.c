@@ -929,10 +929,18 @@ int skip_list_new_with_arena(skip_list_t **list, const int max_level, const floa
                                                            comparator_ctx, cached_time);
     if (rc != 0) return rc;
 
-    (*list)->arena = skip_list_arena_create(arena_initial_capacity);
-    /* arena is optional -- if the initial block is too large for the address
-     * space (e.g. 128 MB on a 32-bit build under ASAN) the skip list falls
-     * back to per-node malloc which is slower but correct. */
+    /* cap the first block so a large write_buffer_size config does not ask for
+     * a >100 MB allocation up front.  the arena grows on demand so capping the
+     * initial block does not bound how much data the memtable can hold. */
+    size_t initial_cap = arena_initial_capacity;
+    if (initial_cap > SKIP_LIST_ARENA_MAX_INITIAL_BLOCK)
+    {
+        initial_cap = SKIP_LIST_ARENA_MAX_INITIAL_BLOCK;
+    }
+
+    (*list)->arena = skip_list_arena_create(initial_cap);
+    /* arena is optional -- on the rare path where even the capped allocation
+     * fails, skip_list_alloc/dealloc fall back to per-node malloc/free. */
 
     return 0;
 }

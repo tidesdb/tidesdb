@@ -24418,6 +24418,19 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                             atomic_fetch_sub_explicit(&imm->refcount, 1, memory_order_release);
                             continue;
                         }
+
+                        /*** cached_mt_sources was sized using uimm_size_hint; the queue
+                         **  may have grown between that load and the snapshot above so
+                         *   snap_count can exceed the reserved budget.  bail before we
+                         *** would overrun the buffer.  the unwritten immutables are
+                         **  still safe -- they will be flushed to sst and the iterator
+                         *   reads them from disk on the next refresh. */
+                        if ((*iter)->num_cached_mt_sources >= mt_capacity)
+                        {
+                            atomic_fetch_sub_explicit(&imm->refcount, 1, memory_order_release);
+                            continue;
+                        }
+
                         tidesdb_merge_source_t *src = tidesdb_merge_source_from_unified_memtable(
                             imm->skip_list, &cf->config, imm, cf->unified_cf_index);
                         /* merge_source_from_unified_memtable took its own ref */

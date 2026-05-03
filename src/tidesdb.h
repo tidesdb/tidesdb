@@ -513,7 +513,8 @@ struct tidesdb_column_family_t
      * readers acquire active slot, use items, release when done
      * writers rebuild in inactive slot, swap active, wait for old readers */
     tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
-    _Atomic(int) imm_snap_active; /* 0 or 1, index of current snapshot */
+    _Atomic(int) imm_snap_active;     /* 0 or 1, index of current snapshot */
+    _Atomic(int) imm_snap_publishing; /* CAS-admission flag serializing concurrent publishers */
 
     /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
     uint32_t unified_cf_index;

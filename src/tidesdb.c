@@ -6047,6 +6047,26 @@ static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
  */
 static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
 {
+    /*** serialize concurrent publishers via CAS admission.  per-CF flush cleanup
+     **  loop and rotation can both call this at overlapping times.  without this
+     *   guard the two callers would race on the same inactive slot's items[]
+     *** array, producing an interleaved snapshot.  publish is uncommon (one per
+     **  rotation/cleanup) so a brief spin is fine and avoids introducing a mutex.
+     *   the loser still serves a useful purpose -- by the time it runs, the
+     *   queue may have changed again, so it re-snapshots the current state. */
+    int expected = 0;
+    int admit_spins = 0;
+    while (!atomic_compare_exchange_weak_explicit(&cf->imm_snap_publishing, &expected, 1,
+                                                  memory_order_acquire, memory_order_relaxed))
+    {
+        expected = 0;
+        if (admit_spins < TDB_IMM_SNAP_ACQUIRE_SPIN_LIMIT)
+            cpu_pause();
+        else
+            cpu_yield();
+        admit_spins++;
+    }
+
     const int active = atomic_load_explicit(&cf->imm_snap_active, memory_order_acquire);
     const int next_idx = 1 - active;
     tidesdb_imm_snap_t *next = &cf->imm_snaps[next_idx];
@@ -6078,6 +6098,8 @@ static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
      ** NON-BLOCKING**** old slot readers drain on their own, no spin-wait here
      * this avoids the flush worker stalling on slow readers (sstable I/O) */
     atomic_store_explicit(&cf->imm_snap_active, next_idx, memory_order_release);
+
+    atomic_store_explicit(&cf->imm_snap_publishing, 0, memory_order_release);
 }
 
 /**
@@ -11652,6 +11674,24 @@ static void tidesdb_add_ssts_to_merge_heap(tidesdb_t *db, tidesdb_sstable_t **ss
 }
 
 /**
+ * tidesdb_release_merge_source_refs
+ * release the per-source refs that tidesdb_collect_ssts_from_snapshot added when
+ * building delete_queue, without touching the level arrays.  used on merge error
+ * paths before the new sstable has been published so source sstables stay
+ * reachable in their levels and no committed data is lost.
+ * @param db the database
+ * @param delete_queue queue of source sstables to release refs on
+ */
+static void tidesdb_release_merge_source_refs(const tidesdb_t *db, queue_t *delete_queue)
+{
+    while (!queue_is_empty(delete_queue))
+    {
+        tidesdb_sstable_t *sst = queue_dequeue(delete_queue);
+        if (sst) tidesdb_sstable_unref(db, sst);
+    }
+}
+
+/**
  * tidesdb_cleanup_merged_sstables
  * remove old sstables from levels and manifest after merge
  * @param cf the column family
@@ -11800,7 +11840,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     if (!new_sst)
     {
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_MEMORY;
@@ -11816,7 +11856,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     {
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_IO;
@@ -11830,7 +11870,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         block_manager_close(klog_bm);
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_IO;
@@ -11923,7 +11963,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         if (btree_result != TDB_SUCCESS)
         {
             tidesdb_sstable_unref(cf->db, new_sst);
-            tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+            tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
             queue_free(sstables_to_delete);
             tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
             return btree_result;
@@ -12496,7 +12536,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     if (!new_sst)
     {
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level, max_input_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         return TDB_ERR_MEMORY;
     }
@@ -12511,7 +12551,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     {
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level, max_input_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         return TDB_ERR_IO;
     }
@@ -12524,7 +12564,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         block_manager_close(klog_bm);
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level, max_input_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         return TDB_ERR_IO;
     }
@@ -12568,8 +12608,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         if (btree_result != TDB_SUCCESS)
         {
             tidesdb_sstable_unref(cf->db, new_sst);
-            tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level,
-                                            max_input_level);
+            tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
             queue_free(sstables_to_delete);
             return btree_result;
         }
@@ -18767,6 +18806,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         atomic_init(&cf->imm_snaps[s].readers, 0);
     }
     atomic_init(&cf->imm_snap_active, 0);
+    atomic_init(&cf->imm_snap_publishing, 0);
 
     /*** in unified memtable mode, writes go through the unified WAL so
      **  per-CF WAL files are not needed. skip creation to avoid wasted
@@ -24262,14 +24302,18 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     (*iter)->heap->pop_buf_cap[1] = (*iter)->heap->pop_buf[1] ? TDB_MERGE_POP_BUF_INITIAL_CAP : 0;
     (*iter)->heap->pop_buf_slot = 0;
 
-    size_t imm_count = 0;
-    tidesdb_immutable_memtable_t **imm_snapshot =
-        tidesdb_snapshot_immutable_memtables(cf, &imm_count);
-
     /*** we pin the active memtable with try_ref to prevent use-after-free
      *   if rotation+flush races between our load and merge_source_from_memtable's ref.
      **  without try_ref, the memtable could rotate to immutable, flush, and free
-     *** before the unconditional ref in merge_source_from_memtable fires. */
+     *** before the unconditional ref in merge_source_from_memtable fires.
+     *
+     ** the active memtable load must come BEFORE the immutable snapshot.
+     *  rotation order is queue_enqueue(immutables, mt) -> imm_snap_publish ->
+     *  atomic_store(active, new).  if we sample the imm snap first and then load
+     *  active, a rotation that lands in between gives us an old snap (without mt)
+     *  and a new active (without the data, since it was in mt) -- iterator misses
+     *  every entry that just rotated.  loading active first means any later snap
+     *  acquire sees a state at least as new as the one we observed for active. */
     tidesdb_memtable_t *active_mt_struct =
         atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     if (active_mt_struct && !tidesdb_memtable_try_ref(active_mt_struct))
@@ -24283,6 +24327,10 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
 
     /* we ensure consistent view */
     atomic_thread_fence(memory_order_acquire);
+
+    size_t imm_count = 0;
+    tidesdb_immutable_memtable_t **imm_snapshot =
+        tidesdb_snapshot_immutable_memtables(cf, &imm_count);
 
     if (txn->isolation_level == TDB_ISOLATION_READ_COMMITTED)
     {

@@ -1095,11 +1095,6 @@ static void *benchmark_foreach_thread(void *arg)
         cpu_pause();
     }
 
-    while (args->start_time->tv_sec == 0)
-    {
-        cpu_pause();
-    }
-
     _Atomic int visit_count = 0;
 
     for (int i = 0; i < args->iterations; i++)
@@ -1118,11 +1113,6 @@ static void *benchmark_peek_at_thread(void *arg)
     atomic_fetch_add(args->ready_count, 1);
 
     while (atomic_load(args->ready_count) < args->total_threads)
-    {
-        cpu_pause();
-    }
-
-    while (args->start_time->tv_sec == 0)
     {
         cpu_pause();
     }

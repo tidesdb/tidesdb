@@ -11,10 +11,11 @@ if(TIDESDB_WITH_MIMALLOC)
     list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
 endif()
 
-project(tidesdb C)
+project(tidesdb
+	VERSION 9.2.0
+	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 9.2.0)
 
 # build everything position-independent so the static archive (BUILD_SHARED_LIBS=OFF)
 # can still link into a shared module like the mariadb plugin without recompile-with-fPIC errors
@@ -117,6 +118,10 @@ if(TIDESDB_WITH_S3)
 endif()
 
 add_library(tidesdb ${TIDESDB_SOURCES})
+
+set_target_properties(tidesdb PROPERTIES
+	                      VERSION "${PROJECT_VERSION}"
+                              SOVERSION "${PROJECT_VERSION_MAJOR}")
 
 target_include_directories(tidesdb PRIVATE src)
 
@@ -396,13 +401,14 @@ if(TIDESDB_WITH_S3)
     message(STATUS "Building with S3-compatible object store connector")
 endif()
 
+include(GNUInstallDirs)
 install(TARGETS tidesdb
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib)
+	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-install(DIRECTORY src/ DESTINATION include/tidesdb FILES_MATCHING PATTERN "*.h")
-install(FILES external/ini.h external/xxhash.h DESTINATION include/tidesdb)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h" DESTINATION include/tidesdb)
+install(DIRECTORY src/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tidesdb" FILES_MATCHING PATTERN "*.h")
+install(FILES external/ini.h external/xxhash.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tidesdb")
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tidesdb")
 
 # we create consolidated include directory in build tree for easy consumption
 # this allows consumers to use -I<build_dir>/include and #include <tidesdb/tidesdb.h>
@@ -665,11 +671,11 @@ write_basic_package_version_file(
 configure_package_config_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TidesDBConfig.cmake.in"
         "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfig.cmake"
-        INSTALL_DESTINATION lib/cmake/tidesdb
+	INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tidesdb"
 )
 
 install(FILES
         "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfigVersion.cmake"
-        DESTINATION lib/cmake/tidesdb
+	DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tidesdb"
 )

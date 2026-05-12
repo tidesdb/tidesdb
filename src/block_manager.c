@@ -119,6 +119,26 @@ static uint8_t *bm_get_read_buf(const size_t needed)
 }
 
 /**
+ * bm_block_size_in_range
+ * sanity-check a decoded block size against current file size before
+ * passing it to an allocator. a stale/corrupt header that decodes to
+ * a multi-GB size would otherwise trigger an out-of-memory abort on
+ * 32-bit targets and a silent retry on 64-bit.
+ * @param bm the block manager
+ * @param offset start of the block (header position)
+ * @param block_size decoded size field
+ * @return 1 if header+block+footer fits within current_file_size, 0 otherwise
+ */
+static inline int bm_block_size_in_range(const block_manager_t *bm, const uint64_t offset,
+                                         const uint32_t block_size)
+{
+    const uint64_t file_size = atomic_load(&bm->current_file_size);
+    const uint64_t need =
+        offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
+    return need <= file_size;
+}
+
+/**
  * odsync_available
  * check if O_DSYNC is available on the specific platform
  * @return 1 if O_DSYNC is available, 0 otherwise
@@ -803,6 +823,7 @@ int block_manager_update_checksum(block_manager_t *bm, const int64_t block_offse
 
     const uint32_t block_size = decode_uint32_le_compat(size_buf);
     if (block_size == 0) return -1;
+    if (!bm_block_size_in_range(bm, (uint64_t)block_offset, block_size)) return -1;
 
     /* we use thread-local buffer to avoid page faults from fresh malloc pages */
     uint8_t *data = bm_get_read_buf(block_size);
@@ -1054,6 +1075,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 
     const uint32_t block_size = decode_uint32_le_compat(header_buf);
     if (BM_UNLIKELY(block_size == 0)) return NULL;
+    if (BM_UNLIKELY(!bm_block_size_in_range(bm, offset, block_size))) return NULL;
 
     const uint32_t stored_checksum =
         decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
@@ -1118,6 +1140,8 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         block_size = decode_uint32_le_compat(size_buf);
         if (block_size == 0) return NULL;
     }
+
+    if (!bm_block_size_in_range(bm, offset, block_size)) return NULL;
 
     /* if block is smaller than max_bytes, we read full block */
     if (block_size <= max_bytes)
@@ -1730,6 +1754,7 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
         decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
 
     if (BM_UNLIKELY(block_size == 0)) return -1; /* invalid block */
+    if (BM_UNLIKELY(!bm_block_size_in_range(bm, offset, block_size))) return -1;
 
     /** we pread into thread-local buffer to avoid page faults on fresh anonymous pages.
      *  we verify checksum before allocating the caller's output buffer. */

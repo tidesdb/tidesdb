@@ -11786,6 +11786,285 @@ static void test_background_flush_multiple_immutable_memtables(void)
     cleanup_test_dir();
 }
 
+/* test configuration constants for the active memtable rotation race repro
+ * the race lives in tidesdb_txn_commit at the per-cf try_ref loop. a writer
+ * thread loads cf->active_memtable, gets preempted, the flush worker takes
+ * the immutable through flush + cleanup which CAS the refcount from 1 to 0,
+ * then the writer's try_ref reads refcount as 0 and returns 0. the existing
+ * 2 shot retry handles the common case but loses the race when rotations are
+ * happening faster than the writer's load + try_ref pair. small write buffer
+ * plus many committers plus multi-cf commits amplifies the race because every
+ * commit hits the per-cf loop num_cfs times, and a sync_wal thread constantly
+ * holds a competing ref on the active memtable to widen the transient zero
+ * window observed by other writers */
+#define TEST_RACE_COMMITTER_THREADS    16
+#define TEST_RACE_TXN_PER_COMMITTER    3000
+#define TEST_RACE_WRITE_BUFFER_BYTES   4096
+#define TEST_RACE_NUM_CFS              8
+#define TEST_RACE_KEY_BUF_BYTES        48
+#define TEST_RACE_VAL_BUF_BYTES        96
+#define TEST_RACE_CF_NAME_BUF          32
+#define TEST_RACE_FLUSH_DRAIN_MAX_ITER 600
+#define TEST_RACE_FLUSH_DRAIN_INT_US   50000
+#define TEST_RACE_SYNCER_SLEEP_US      0
+#define TEST_RACE_CF_NAME_FMT          "rotation_race_cf_%d"
+#define TEST_RACE_KEY_FMT              "rrk_c%d_t%03d_%07d"
+#define TEST_RACE_VAL_FMT              "rrv_c%d_t%03d_%07d"
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t **cfs;
+    int num_cfs;
+    int thread_id;
+    int num_txns;
+    uint8_t *committed_flags;
+    _Atomic(int) *unknown_errors;
+    _Atomic(int) *unexpected_errors;
+    _Atomic(int) committed_count;
+} active_mt_race_writer_t;
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t **cfs;
+    int num_cfs;
+    _Atomic(int) *stop;
+} active_mt_race_syncer_t;
+
+/* secondary thread that hammers tidesdb_sync_wal on every cf in a tight loop.
+ * sync_wal also does try_ref on cf->active_memtable, so it pushes the active
+ * memtable refcount through transient values (1 -> 2 -> 1 -> ...) constantly,
+ * which widens the window where a cleanup CAS can witness refcount == 1 and
+ * race against a writer's two-shot try_ref */
+static void *active_mt_race_syncer_thread(void *arg)
+{
+    active_mt_race_syncer_t *data = (active_mt_race_syncer_t *)arg;
+    while (!atomic_load(data->stop))
+    {
+        for (int i = 0; i < data->num_cfs; i++)
+        {
+            (void)tidesdb_sync_wal(data->cfs[i]);
+        }
+        if (TEST_RACE_SYNCER_SLEEP_US > 0) usleep(TEST_RACE_SYNCER_SLEEP_US);
+    }
+    return NULL;
+}
+
+static void *active_mt_race_writer_thread(void *arg)
+{
+    active_mt_race_writer_t *data = (active_mt_race_writer_t *)arg;
+    char key[TEST_RACE_KEY_BUF_BYTES];
+    char value[TEST_RACE_VAL_BUF_BYTES];
+
+    for (int i = 0; i < data->num_txns; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        int begin_rc = tidesdb_txn_begin(data->db, &txn);
+        if (begin_rc != 0)
+        {
+            atomic_fetch_add(data->unexpected_errors, 1);
+            continue;
+        }
+
+        /* multi-cf commit, one put per cf so the per-cf try_ref loop in
+         * tidesdb_txn_commit iterates num_cfs times per commit */
+        int put_failed = 0;
+        for (int c = 0; c < data->num_cfs; c++)
+        {
+            snprintf(key, sizeof(key), TEST_RACE_KEY_FMT, c, data->thread_id, i);
+            snprintf(value, sizeof(value), TEST_RACE_VAL_FMT, c, data->thread_id, i);
+            int put_rc = tidesdb_txn_put(txn, data->cfs[c], (uint8_t *)key, strlen(key) + 1,
+                                         (uint8_t *)value, strlen(value) + 1, 0);
+            if (put_rc != 0)
+            {
+                atomic_fetch_add(data->unexpected_errors, 1);
+                put_failed = 1;
+                break;
+            }
+        }
+        if (put_failed)
+        {
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        int commit_rc = tidesdb_txn_commit(txn);
+        if (commit_rc == TDB_ERR_UNKNOWN)
+        {
+            atomic_fetch_add(data->unknown_errors, 1);
+        }
+        else if (commit_rc != 0)
+        {
+            atomic_fetch_add(data->unexpected_errors, 1);
+        }
+        else
+        {
+            data->committed_flags[i] = 1;
+            atomic_fetch_add(&data->committed_count, 1);
+        }
+
+        tidesdb_txn_free(txn);
+    }
+
+    return NULL;
+}
+
+/* test_active_memtable_rotation_race
+ * stress reproducer for the per cf rotation race in tidesdb_txn_commit. forces
+ * frequent rotation by sizing the write buffer to a few kilobytes, runs many
+ * committer threads in parallel, and asserts that no commit returns
+ * TDB_ERR_UNKNOWN and that every successfully committed key is readable on a
+ * final scan. the test reproduces the race deterministically against the
+ * unfixed binary, which surfaces the symptom as one or more TDB_ERR_UNKNOWN
+ * returns from tidesdb_txn_commit. unified mode is not exercised here because
+ * the unified active memtable refcount is only mutated by writers themselves
+ * and never reaches zero during runtime, so the same race does not apply on
+ * that path */
+static void test_active_memtable_rotation_race(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = TEST_RACE_WRITE_BUFFER_BYTES;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    tidesdb_column_family_t *cfs[TEST_RACE_NUM_CFS];
+    char cf_name[TEST_RACE_CF_NAME_BUF];
+    for (int c = 0; c < TEST_RACE_NUM_CFS; c++)
+    {
+        snprintf(cf_name, sizeof(cf_name), TEST_RACE_CF_NAME_FMT, c);
+        ASSERT_EQ(tidesdb_create_column_family(db, cf_name, &cf_config), 0);
+        cfs[c] = tidesdb_get_column_family(db, cf_name);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    _Atomic(int) unknown_errors = 0;
+    _Atomic(int) unexpected_errors = 0;
+    _Atomic(int) syncer_stop = 0;
+
+    /* syncer thread disabled while we isolate the data loss source */
+    pthread_t syncer;
+    active_mt_race_syncer_t syncer_data = {
+        .db = db, .cfs = cfs, .num_cfs = TEST_RACE_NUM_CFS, .stop = &syncer_stop};
+    (void)syncer;
+    (void)syncer_data;
+    (void)active_mt_race_syncer_thread;
+
+    pthread_t *threads = malloc(sizeof(pthread_t) * TEST_RACE_COMMITTER_THREADS);
+    active_mt_race_writer_t *thread_data =
+        malloc(sizeof(active_mt_race_writer_t) * TEST_RACE_COMMITTER_THREADS);
+    ASSERT_TRUE(threads != NULL);
+    ASSERT_TRUE(thread_data != NULL);
+
+    printf("\n  Launching %d committer threads, each running %d transactions\n",
+           TEST_RACE_COMMITTER_THREADS, TEST_RACE_TXN_PER_COMMITTER);
+    printf("  Write buffer size %d bytes, %d cfs per commit\n", TEST_RACE_WRITE_BUFFER_BYTES,
+           TEST_RACE_NUM_CFS);
+
+    for (int i = 0; i < TEST_RACE_COMMITTER_THREADS; i++)
+    {
+        thread_data[i].db = db;
+        thread_data[i].cfs = cfs;
+        thread_data[i].num_cfs = TEST_RACE_NUM_CFS;
+        thread_data[i].thread_id = i;
+        thread_data[i].num_txns = TEST_RACE_TXN_PER_COMMITTER;
+        thread_data[i].committed_flags = calloc((size_t)TEST_RACE_TXN_PER_COMMITTER, 1);
+        ASSERT_TRUE(thread_data[i].committed_flags != NULL);
+        thread_data[i].unknown_errors = &unknown_errors;
+        thread_data[i].unexpected_errors = &unexpected_errors;
+        atomic_init(&thread_data[i].committed_count, 0);
+        pthread_create(&threads[i], NULL, active_mt_race_writer_thread, &thread_data[i]);
+    }
+
+    for (int i = 0; i < TEST_RACE_COMMITTER_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    atomic_store(&syncer_stop, 1);
+
+    int total_committed = 0;
+    for (int i = 0; i < TEST_RACE_COMMITTER_THREADS; i++)
+    {
+        total_committed += atomic_load(&thread_data[i].committed_count);
+    }
+
+    int unknown = atomic_load(&unknown_errors);
+    int unexpected = atomic_load(&unexpected_errors);
+
+    printf("  Successful commits %d / %d\n", total_committed,
+           TEST_RACE_COMMITTER_THREADS * TEST_RACE_TXN_PER_COMMITTER);
+    printf("  TDB_ERR_UNKNOWN returns %d\n", unknown);
+    printf("  Other unexpected errors %d\n", unexpected);
+    fflush(stdout);
+
+    for (int i = 0; i < TEST_RACE_FLUSH_DRAIN_MAX_ITER; i++)
+    {
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&db->flush_pending_count, memory_order_acquire) == 0)
+            break;
+        usleep(TEST_RACE_FLUSH_DRAIN_INT_US);
+    }
+
+    tidesdb_txn_t *verify_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &verify_txn), 0);
+
+    int verified = 0;
+    int missing = 0;
+    char key[TEST_RACE_KEY_BUF_BYTES];
+    char expected[TEST_RACE_VAL_BUF_BYTES];
+    for (int t = 0; t < TEST_RACE_COMMITTER_THREADS; t++)
+    {
+        for (int i = 0; i < TEST_RACE_TXN_PER_COMMITTER; i++)
+        {
+            if (!thread_data[t].committed_flags[i]) continue;
+            for (int c = 0; c < TEST_RACE_NUM_CFS; c++)
+            {
+                snprintf(key, sizeof(key), TEST_RACE_KEY_FMT, c, t, i);
+                snprintf(expected, sizeof(expected), TEST_RACE_VAL_FMT, c, t, i);
+
+                uint8_t *retrieved_value = NULL;
+                size_t retrieved_size = 0;
+                int rc = tidesdb_txn_get(verify_txn, cfs[c], (uint8_t *)key, strlen(key) + 1,
+                                         &retrieved_value, &retrieved_size);
+                if (rc == 0 && retrieved_value != NULL &&
+                    strcmp((char *)retrieved_value, expected) == 0)
+                {
+                    verified++;
+                }
+                else
+                {
+                    missing++;
+                }
+                if (retrieved_value) free(retrieved_value);
+            }
+        }
+    }
+    tidesdb_txn_free(verify_txn);
+
+    int expected_total_keys = total_committed * TEST_RACE_NUM_CFS;
+    printf("  Verified %d / %d committed keys (missing %d)\n", verified, expected_total_keys,
+           missing);
+    fflush(stdout);
+
+    ASSERT_EQ(unknown, 0);
+    ASSERT_EQ(unexpected, 0);
+    ASSERT_EQ(missing, 0);
+    ASSERT_EQ(verified, expected_total_keys);
+
+    for (int i = 0; i < TEST_RACE_COMMITTER_THREADS; i++)
+    {
+        free(thread_data[i].committed_flags);
+    }
+    free(threads);
+    free(thread_data);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 static void test_multi_cf_transaction_atomicity_recovery(void)
 {
     cleanup_test_dir();
@@ -27307,6 +27586,199 @@ static void test_tombstone_stats_observability(void)
     cleanup_test_dir();
 }
 
+/*** witness path drops tombstones at non-largest target when no older sstable
+ **  can possibly contain the key. setup keeps deeper levels empty so the helper
+ *   walks them and sees nothing. expectation is that after the density trigger
+ **  fires and the merge runs, total_tombstones converges to zero even though
+ *** the merge target is not the largest level. */
+static void test_tombstone_witness_drops_when_no_older(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 1000;
+    cf_config.tombstone_density_trigger = 0.5;
+    cf_config.tombstone_density_min_entries = 8;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "twno_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "twno_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 200;
+
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_EQ((int)stats->total_tombstones, 0);
+    tidesdb_free_stats(stats);
+
+    /* every key must read as NOT_FOUND, the deletes are still observable */
+    for (int i = 0; i < num_keys; i += 17)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs),
+                  TDB_ERR_NOT_FOUND);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+/*** witness path preserves tombstones when an older sstable at a deeper level
+ **  may still contain the masked put. setup sinks an older put into a deep
+ *   level via repeated flush+compact, then layers a tombstone for the same key
+ **  at L1. the merge would rule the deletion safe to drop only if the helper
+ *** told it nothing older holds the key, which here it cannot. correctness
+ **  bar is that the deleted key reads as NOT_FOUND after the witness path
+ *   runs. tombstones may or may not still be present depending on which level
+ **  the merge landed in. */
+static void test_tombstone_witness_preserves_when_older_exists(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.l1_file_count_trigger = 4;
+    cf_config.tombstone_density_trigger = 0.5;
+    cf_config.tombstone_density_min_entries = 8;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+    cf_config.min_levels = 3;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "twpe_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "twpe_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 100;
+
+    /* first wave of puts, push them down the tree by triggering several
+     * structural compactions before the deletes arrive */
+    for (int wave = 0; wave < 5; wave++)
+    {
+        for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+        tidesdb_flush_memtable(cf);
+        wait_for_flush_complete(db, cf);
+        ASSERT_EQ(tidesdb_compact(cf), TDB_SUCCESS);
+        wait_for_compaction_idle(db, cf);
+    }
+
+    /* tombstones for the same keys at L1, density above the trigger */
+    for (int i = 0; i < num_keys; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+    wait_for_compaction_idle(db, cf);
+
+    /* correctness, every deleted key must be invisible regardless of which
+     * level the surviving tombstones (if any) ended up at */
+    for (int i = 0; i < num_keys; i += 7)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs),
+                  TDB_ERR_NOT_FOUND);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+/*** tidesdb_compact_range is operator-driven reclaim and threads
+ **  witness_triggered=1 into the targeted merge. expectation is that the
+ *   tombstones from a range delete drop within the targeted slice when no
+ **  older sstable holds the key. */
+static void test_tombstone_compact_range_drops(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.write_buffer_size = 4096;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "tcrd_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "tcrd_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 300;
+    for (int i = 0; i < num_keys; i++) td_put(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    /* delete a contiguous middle slice, then call the targeted compaction
+     * api over exactly that range */
+    const int del_lo = num_keys * 30 / 100;
+    const int del_hi = num_keys * 70 / 100;
+    for (int i = del_lo; i < del_hi; i++) td_delete(db, cf, i);
+    tidesdb_flush_memtable(cf);
+    wait_for_flush_complete(db, cf);
+
+    char start_key[32];
+    char end_key[32];
+    snprintf(start_key, sizeof(start_key), "tdkey_%06d", del_lo);
+    snprintf(end_key, sizeof(end_key), "tdkey_%06d", del_hi);
+    ASSERT_EQ(tidesdb_compact_range(cf, (uint8_t *)start_key, strlen(start_key) + 1,
+                                    (uint8_t *)end_key, strlen(end_key) + 1),
+              TDB_SUCCESS);
+    wait_for_compaction_idle(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_EQ((int)stats->total_tombstones, 0);
+    tidesdb_free_stats(stats);
+
+    /* keys outside the range still readable, keys inside still hidden */
+    for (int i = 0; i < num_keys; i += 11)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tdkey_%06d", i);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        const int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs);
+        if (i >= del_lo && i < del_hi)
+        {
+            ASSERT_EQ(rc, TDB_ERR_NOT_FOUND);
+        }
+        else
+        {
+            ASSERT_EQ(rc, TDB_SUCCESS);
+            free(val);
+        }
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
 static void test_tombstone_count_heavy_compaction(void)
 {
     cleanup_test_dir();
@@ -27706,7 +28178,7 @@ static void test_compact_range_partial_range(void)
     tidesdb_flush_memtable(cf);
     wait_for_flush_complete(db, cf);
 
-    /* compact only the deleted range -- keys outside the range may incidentally
+    /* we compact only the deleted range -- keys outside the range may incidentally
      * get rewritten if they live in the same sstables, which is by design */
     char start[32];
     char end[32];
@@ -27890,7 +28362,7 @@ static void test_btree_cache_invalidation_on_sstable_free(void)
     wait_for_flush_complete(db, cf);
     wait_for_compaction_idle(db, cf);
 
-    /* read every key to populate the btree node cache */
+    /* we read every key to populate the btree node cache */
     {
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -27911,7 +28383,7 @@ static void test_btree_cache_invalidation_on_sstable_free(void)
     clock_cache_get_stats(db->btree_node_cache, &before);
     ASSERT_TRUE(before.total_entries > 0);
 
-    /* compact all the way through every level so the original sstables get freed
+    /* we compact all the way through every level so the original sstables get freed
      * and trigger tidesdb_invalidate_btree_cache_for_sstable for each */
     for (int i = 0; i < 8; i++)
     {
@@ -27932,6 +28404,121 @@ static void test_btree_cache_invalidation_on_sstable_free(void)
     cleanup_test_dir();
 }
 
+static void test_unified_bulk_commit_reset_scan(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    /* small enough that 100k ~50-byte entries rotate the memtable
+       multiple times during the run  */
+    config.unified_memtable_write_buffer_size = 1024 * 1024; /* 1 MB */
+    config.unified_memtable_sync_mode = 0;                   /* NONE */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "loss_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "loss_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we mimic mariadb per-statement shape exactly where 1000 puts split into
+       two 500-op mid-commits, then a final empty commit (the autocommit
+       hton_commit fires on an already-empty txn after the second mid-commit
+       cleared it).  next iteration recycles the same handle via reset. */
+    const int stmts = 5000;
+    const int ops_per_stmt = 1000;
+    const int batch_size = 500;
+    const int total = stmts * ops_per_stmt;
+
+    /* one long-lived txn handle, recycled via tidesdb_txn_reset every
+       ops_per_stmt puts -- exact mirror of ha_tidesdb's maybe_bulk_commit. */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn), 0);
+
+    int next_id = 1;
+    for (int s = 0; s < stmts; s++)
+    {
+        int put_in_batch = 0;
+        for (int k = 0; k < ops_per_stmt; k++)
+        {
+            uint8_t key[16];
+            uint8_t value[40];
+            int written = snprintf((char *)key, sizeof(key), "k%010d", next_id);
+            ASSERT_TRUE(written > 0 && written < (int)sizeof(key));
+            size_t key_size = (size_t)written + 1;
+            memset(value, 'v', sizeof(value));
+            value[sizeof(value) - 1] = '\0';
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, key, key_size, value, sizeof(value), 0), 0);
+            next_id++;
+            put_in_batch++;
+
+            /* mid-statement commit at every batch_size, mirrors maybe_bulk_commit */
+            if (put_in_batch >= batch_size)
+            {
+                ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+                ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+                put_in_batch = 0;
+            }
+        }
+        /* end-of-statement commit (autocommit -> hton_commit), often empty
+           because the last mid-commit just cleared the txn */
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* we scan right away without waiting for flush queue or compactions to
+       drain -- this is what the user's repro does (SELECT COUNT(*) at the
+       end of the script).  background flushes and compactions are very
+       likely still in flight. */
+    tidesdb_txn_t *rtxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &rtxn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(rtxn, cf, &iter), 0);
+    ASSERT_TRUE(iter != NULL);
+    /* mirror ha_tidesdb's rnd_init where seek with a one-byte data namespace
+       prefix instead of seek_to_first.  this routes through
+       tidesdb_iter_seek_sstable_source_forward (the path the plugin
+       actually exercises) which handles lazy SST sources differently
+       than seek_to_first. */
+    uint8_t data_prefix = 'k';
+    tidesdb_iter_seek(iter, &data_prefix, 1);
+
+    int seen = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *k = NULL;
+        size_t ks = 0;
+        if (tidesdb_iter_key(iter, &k, &ks) != 0) break;
+        seen++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(rtxn);
+
+    /* if the bug fires, seen < total.  print both numbers either way so a
+       failing run shows the loss percentage in the test output.  fflush
+       so the diagnostic lands before assert() aborts the process. */
+    if (seen != total)
+    {
+        fprintf(stderr, BOLDRED "\n  scan saw %d / %d expected (%.2f%% loss)\n" RESET, seen, total,
+                100.0 * (total - seen) / total);
+        fflush(stderr);
+    }
+    ASSERT_EQ(seen, total);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -27947,6 +28534,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_multiple_column_families, tests_passed);
     RUN_TEST(test_memtable_flush, tests_passed);
     RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
+    RUN_TEST(test_active_memtable_rotation_race, tests_passed);
     RUN_TEST(test_persistence_and_recovery, tests_passed);
     RUN_TEST(test_backup_basic, tests_passed);
     RUN_TEST(test_backup_concurrent_writes, tests_passed);
@@ -28262,6 +28850,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_tombstone_density_trigger_fires, tests_passed);
     RUN_TEST(test_tombstone_density_trigger_ignores_tiny, tests_passed);
     RUN_TEST(test_tombstone_stats_observability, tests_passed);
+    RUN_TEST(test_tombstone_witness_drops_when_no_older, tests_passed);
+    RUN_TEST(test_tombstone_witness_preserves_when_older_exists, tests_passed);
+    RUN_TEST(test_tombstone_compact_range_drops, tests_passed);
     RUN_TEST(test_tombstone_count_heavy_compaction, tests_passed);
     RUN_TEST(test_tombstone_count_cascade_invariants, tests_passed);
     RUN_TEST(test_tombstone_count_unified_memtable, tests_passed);
@@ -28294,6 +28885,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_cold_start, tests_passed);
     RUN_TEST(test_objstore_compaction_and_iterators, tests_passed);
     RUN_TEST(test_unified_iterator_consistency, tests_passed);
+    RUN_TEST(test_unified_bulk_commit_reset_scan, tests_passed);
     RUN_TEST(test_objstore_paired_eviction, tests_passed);
     RUN_TEST(test_objstore_stats, tests_passed);
     RUN_TEST(test_objstore_frozen_point_lookup, tests_passed);

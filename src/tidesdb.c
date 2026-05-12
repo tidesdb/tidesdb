@@ -322,6 +322,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_OPENING_WAIT_MAX_MS                     100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS               5
 #define TDB_FLUSH_RETRY_BACKOFF_US                  100000
+#define TDB_TXN_ACTIVE_RELOAD_MAX_ATTEMPTS          16
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS             10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
@@ -691,12 +692,17 @@ struct tidesdb_unified_flush_barrier_t
  * @param cf column family
  * @param start_level starting level
  * @param target_level target level
+ * @param witness_triggered set when the compaction was scheduled by the tombstone
+ *                          density witness path, letting the merge drop tombstones
+ *                          earlier than the largest level when no older sstable
+ *                          can possibly hold the key
  */
 struct tidesdb_compaction_work_t
 {
     tidesdb_column_family_t *cf;
     int start_level;
     int target_level;
+    int witness_triggered;
 };
 
 /**
@@ -1271,12 +1277,14 @@ static void tidesdb_merge_source_free(tidesdb_merge_source_t *source);
 static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source);
 static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source);
 static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_level,
-                                         int target_level);
-static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level);
-static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level);
+                                         int target_level, int witness_triggered);
+static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level,
+                                  int witness_triggered);
+static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level,
+                                     int witness_triggered);
 static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t **inputs,
                                   int input_count, int min_input_level, int max_input_level,
-                                  int target_level);
+                                  int target_level, int witness_triggered);
 static int tdb_partitioned_merge_finalize_sst(tidesdb_column_family_t *cf, tidesdb_sstable_t *sst,
                                               block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                               bloom_filter_t *bloom,
@@ -1288,8 +1296,12 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
                                                  block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                                  bloom_filter_t *bloom, queue_t *sstables_to_delete,
-                                                 int is_largest_level);
-static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf);
+                                                 int is_largest_level, int target_level,
+                                                 int witness_triggered);
+static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int witness_triggered);
+static int tidesdb_compact_with_flags(tidesdb_column_family_t *cf, int witness_triggered);
+static int tdb_no_older_sst_has_key(tidesdb_column_family_t *cf, int target_level,
+                                    const uint8_t *key, size_t key_size);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable);
 static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capacity, size_t ratio);
@@ -6035,6 +6047,24 @@ static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
  */
 static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
 {
+    /* serialize concurrent publishers -- the per-CF flush cleanup loop and
+     * rotation can call this at overlapping times. without admission both
+     * callers would race on the same inactive slot's items[] array and
+     * produce an interleaved snapshot. publish is uncommon so a brief spin
+     * is acceptable and avoids a mutex on this hot RCU path. */
+    int expected = 0;
+    int admit_spins = 0;
+    while (!atomic_compare_exchange_weak_explicit(&cf->imm_snap_publishing, &expected, 1,
+                                                  memory_order_acquire, memory_order_relaxed))
+    {
+        expected = 0;
+        if (admit_spins < TDB_IMM_SNAP_ACQUIRE_SPIN_LIMIT)
+            cpu_pause();
+        else
+            cpu_yield();
+        admit_spins++;
+    }
+
     const int active = atomic_load_explicit(&cf->imm_snap_active, memory_order_acquire);
     const int next_idx = 1 - active;
     tidesdb_imm_snap_t *next = &cf->imm_snaps[next_idx];
@@ -6066,6 +6096,8 @@ static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
      ** NON-BLOCKING**** old slot readers drain on their own, no spin-wait here
      * this avoids the flush worker stalling on slow readers (sstable I/O) */
     atomic_store_explicit(&cf->imm_snap_active, next_idx, memory_order_release);
+
+    atomic_store_explicit(&cf->imm_snap_publishing, 0, memory_order_release);
 }
 
 /**
@@ -6726,13 +6758,18 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
  * @param bloom bloom filter (optional, may be NULL)
  * @param sstables_to_delete queue for corrupted sstables
  * @param is_largest_level whether this is the largest level
+ * @param target_level 0-indexed output level (used for tombstone witness checks)
+ * @param witness_triggered set when the merge was scheduled by the tombstone density
+ *                          witness, allowing tombstones to drop earlier than the
+ *                          largest level when no older sstable can possibly hold the key
  * @return 0 on success, error code on failure
  */
 static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
                                                  block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                                  bloom_filter_t *bloom, queue_t *sstables_to_delete,
-                                                 const int is_largest_level)
+                                                 const int is_largest_level, const int target_level,
+                                                 const int witness_triggered)
 {
     if (!cf || !sst || !heap || !klog_bm || !vlog_bm) return TDB_ERR_INVALID_ARGS;
 
@@ -6815,7 +6852,10 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
             const int tombstone_drop =
-                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level;
+                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                (is_largest_level ||
+                 (witness_triggered && tdb_no_older_sst_has_key(cf, target_level, pending->key,
+                                                                pending->entry.key_size)));
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -7726,9 +7766,48 @@ full_download_path:
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* when block index is definitive, we read exactly one block and search it.
-     * this is O(1) disk reads per point lookup instead of O(N) scan. */
-    const uint64_t max_blocks_to_scan = block_index_definitive ? 1 : sst->num_klog_blocks;
+    /* when block index is definitive, scan only the blocks whose prefix range
+     * could include the search key. with prefix truncation several consecutive
+     * blocks can share the same min/max prefix, so count them starting from the
+     * leftmost match returned by find_predecessor. without this, a longer key
+     * landing in the second prefix-matching block would be missed. */
+    uint64_t max_blocks_to_scan = sst->num_klog_blocks;
+    if (block_index_definitive && sst->block_indexes)
+    {
+        const tidesdb_block_index_t *bi = sst->block_indexes;
+        int64_t start_slot = -1;
+        for (int64_t s = 0; s < (int64_t)bi->count; s++)
+        {
+            if (bi->file_positions[s] == start_file_position)
+            {
+                start_slot = s;
+                break;
+            }
+        }
+        if (start_slot >= 0)
+        {
+            uint8_t search_pfx[TDB_BLOCK_INDEX_PREFIX_MAX];
+            const size_t cl = (key_size < bi->prefix_len) ? key_size : bi->prefix_len;
+            memcpy(search_pfx, key, cl);
+            if (cl < bi->prefix_len) memset(search_pfx + cl, 0, bi->prefix_len - cl);
+
+            uint64_t span = 1;
+            for (int64_t s = start_slot + 1; s < (int64_t)bi->count; s++)
+            {
+                const uint8_t *s_min = bi->min_key_prefixes + (s * bi->prefix_len);
+                const int cmp = bi->comparator ? bi->comparator(s_min, bi->prefix_len, search_pfx,
+                                                                bi->prefix_len, bi->comparator_ctx)
+                                               : memcmp(s_min, search_pfx, bi->prefix_len);
+                if (cmp > 0) break;
+                span++;
+            }
+            max_blocks_to_scan = span;
+        }
+        else
+        {
+            max_blocks_to_scan = 1;
+        }
+    }
 
     uint64_t blocks_scanned = 0;
 
@@ -8765,6 +8844,27 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
 static void tidesdb_bump_sstable_layout_version(tidesdb_column_family_t *cf)
 {
     atomic_fetch_add_explicit(&cf->sstable_layout_version, 1, memory_order_release);
+}
+
+/**
+ * tidesdb_iter_drain_wait
+ * block until every iterator currently registered against this CF has been freed.
+ * compaction calls this immediately before publishing a layout change (removing
+ * sstables from levels, bumping layout_version) so an in-flight iter cannot
+ * observe a half-mutated level structure or read from a deleted-but-pinned sstable
+ * whose block_manager the reaper has just closed.
+ * @param cf column family
+ */
+static void tidesdb_iter_drain_wait(tidesdb_column_family_t *cf)
+{
+    if (atomic_load_explicit(&cf->active_iter_count, memory_order_acquire) == 0) return;
+
+    pthread_mutex_lock(&cf->iter_drain_mtx);
+    while (atomic_load_explicit(&cf->active_iter_count, memory_order_acquire) > 0)
+    {
+        pthread_cond_wait(&cf->iter_drain_cv, &cf->iter_drain_mtx);
+    }
+    pthread_mutex_unlock(&cf->iter_drain_mtx);
 }
 
 /**
@@ -10760,9 +10860,11 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                     source->source.sstable.lazy.bmblock = NULL;
                                     source->source.sstable.lazy.decompressed = NULL;
                                     source->source.sstable.current_entry_idx = 0;
-                                    source->source.sstable.klog_cursor->current_block_size =
-                                        bdata_size;
-                                    source->source.sstable.klog_cursor->block_size_valid = 1;
+                                    /* do not overwrite klog_cursor->current_block_size with the
+                                     * post-strip bdata_size -- cursor_next consumes the on-disk
+                                     * size set upstream by block_manager_cursor_read. writing
+                                     * the stripped size advances the cursor too little and
+                                     * lands it mid-block on the next read */
                                     return TDB_SUCCESS;
                                 }
                             }
@@ -11558,12 +11660,17 @@ static void tidesdb_add_ssts_to_merge_heap(tidesdb_t *db, tidesdb_sstable_t **ss
                       sst->id, sst->num_klog_blocks, sst->klog_data_end_offset);
 
         tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(db, sst);
+        int source_added = 0;
         if (source)
         {
             if (source->current_kv)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "Added merge source for SSTable %" PRIu64, sst->id);
-                if (tidesdb_merge_heap_add_source(heap, source) != TDB_SUCCESS)
+                if (tidesdb_merge_heap_add_source(heap, source) == TDB_SUCCESS)
+                {
+                    source_added = 1;
+                }
+                else
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR,
                                   "Failed to add merge source for SSTable %" PRIu64 " to heap",
@@ -11585,7 +11692,35 @@ static void tidesdb_add_ssts_to_merge_heap(tidesdb_t *db, tidesdb_sstable_t **ss
                           sst->id);
         }
 
-        queue_enqueue(delete_queue, sst);
+        /* only enqueue for deletion if the source actually made it into the heap.
+         * otherwise the sst contributed nothing to the merge and removing it from
+         * the level would erase live data. */
+        if (source_added)
+        {
+            queue_enqueue(delete_queue, sst);
+        }
+        else
+        {
+            tidesdb_sstable_unref(db, sst);
+        }
+    }
+}
+
+/**
+ * tidesdb_release_merge_source_refs
+ * release the per-source refs that tidesdb_add_ssts_to_merge_heap added when
+ * building delete_queue, without touching the level arrays. used on merge
+ * error paths before the new sstable has been published so source sstables
+ * stay reachable in their levels and no committed data is lost.
+ * @param db the database
+ * @param delete_queue queue of source sstables to release refs on
+ */
+static void tidesdb_release_merge_source_refs(const tidesdb_t *db, queue_t *delete_queue)
+{
+    while (!queue_is_empty(delete_queue))
+    {
+        tidesdb_sstable_t *sst = queue_dequeue(delete_queue);
+        if (sst) tidesdb_sstable_unref(db, sst);
     }
 }
 
@@ -11608,6 +11743,11 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
         if (!sst) continue;
 
         atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
+
+        /* drain in-flight iterators before publishing the level removal -- prevents
+         * an iter from reading a cursor against an sstable whose block_manager the
+         * reaper may close once its level ref is gone */
+        tidesdb_iter_drain_wait(cf);
 
         int removed = 0;
         int removed_level = -1;
@@ -11658,7 +11798,7 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
  * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS on failure
  */
 static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_level,
-                                         int target_level)
+                                         int target_level, int witness_triggered)
 {
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
@@ -11738,7 +11878,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     if (!new_sst)
     {
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_MEMORY;
@@ -11754,7 +11894,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     {
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_IO;
@@ -11768,7 +11908,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         block_manager_close(klog_bm);
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_IO;
@@ -11852,7 +11992,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     if (cf->config.use_btree)
     {
         int btree_result = tidesdb_sstable_write_from_heap_btree(
-            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level);
+            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level,
+            target_level, witness_triggered);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         tidesdb_merge_heap_free(heap);
@@ -11860,7 +12001,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         if (btree_result != TDB_SUCCESS)
         {
             tidesdb_sstable_unref(cf->db, new_sst);
-            tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+            tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
             queue_free(sstables_to_delete);
             tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
             return btree_result;
@@ -11929,7 +12070,10 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
             const int tombstone_drop =
-                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level;
+                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                (is_largest_level ||
+                 (witness_triggered && tdb_no_older_sst_has_key(cf, target_level, pending->key,
+                                                                pending->entry.key_size)));
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -12385,7 +12529,7 @@ merge_complete:;
  */
 static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t **inputs,
                                   int input_count, int min_input_level, int max_input_level,
-                                  int target_level)
+                                  int target_level, int witness_triggered)
 {
     if (!cf || !inputs || input_count <= 0) return TDB_ERR_INVALID_ARGS;
     if (min_input_level < 0 || max_input_level < min_input_level) return TDB_ERR_INVALID_ARGS;
@@ -12430,7 +12574,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     if (!new_sst)
     {
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level, max_input_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         return TDB_ERR_MEMORY;
     }
@@ -12445,7 +12589,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     {
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level, max_input_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         return TDB_ERR_IO;
     }
@@ -12458,7 +12602,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         block_manager_close(klog_bm);
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level, max_input_level);
+        tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
         queue_free(sstables_to_delete);
         return TDB_ERR_IO;
     }
@@ -12493,7 +12637,8 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     if (cf->config.use_btree)
     {
         int btree_result = tidesdb_sstable_write_from_heap_btree(
-            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level);
+            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level,
+            target_level, witness_triggered);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         tidesdb_merge_heap_free(heap);
@@ -12501,8 +12646,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         if (btree_result != TDB_SUCCESS)
         {
             tidesdb_sstable_unref(cf->db, new_sst);
-            tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level,
-                                            max_input_level);
+            tidesdb_release_merge_source_refs(cf->db, sstables_to_delete);
             queue_free(sstables_to_delete);
             return btree_result;
         }
@@ -12945,7 +13089,8 @@ merge_complete:;
  * @param target_level target level
  * @return 0 on success, negative on failure
  */
-static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
+static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level,
+                                  int witness_triggered)
 {
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
@@ -12979,7 +13124,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Added level, now have %d levels", num_levels);
         }
 
-        return tidesdb_full_preemptive_merge(cf, 0, target_level);
+        return tidesdb_full_preemptive_merge(cf, 0, target_level, witness_triggered);
     }
 
     tidesdb_level_t *target = cf->levels[target_level];
@@ -13061,7 +13206,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     /* if no boundaries, do a simple full merge */
     if (num_boundaries == 0)
     {
-        int result = tidesdb_full_preemptive_merge(cf, 0, target_level);
+        int result = tidesdb_full_preemptive_merge(cf, 0, target_level, witness_triggered);
 
         while (!queue_is_empty(sstables_to_delete))
         {
@@ -13277,7 +13422,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             klog_block = NULL;
 
             int btree_result = tidesdb_sstable_write_from_heap_btree(
-                cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, 0);
+                cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, 0, target_level + 1,
+                witness_triggered);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -13946,7 +14092,8 @@ static int tdb_partitioned_merge_finalize_sst(
     return 0;
 }
 
-static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level)
+static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level,
+                                     int witness_triggered)
 {
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
@@ -13978,7 +14125,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
          * tidesdb_full_preemptive_merge expects 0-indexed array indices, not 1-indexed level
          * numbers */
 
-        return tidesdb_full_preemptive_merge(cf, start_idx, end_idx);
+        return tidesdb_full_preemptive_merge(cf, start_idx, end_idx, witness_triggered);
     }
 
     queue_t *sstables_to_delete = queue_new();
@@ -14191,8 +14338,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
              * partitioned merge goes to the level before largest, so not largest level */
             if (cf->config.use_btree)
             {
-                int btree_result = tidesdb_sstable_write_from_heap_btree(cf, new_sst, heap, klog_bm,
-                                                                         vlog_bm, bloom, NULL, 0);
+                int btree_result = tidesdb_sstable_write_from_heap_btree(
+                    cf, new_sst, heap, klog_bm, vlog_bm, bloom, NULL, 0, end_idx,
+                    witness_triggered);
                 block_manager_close(klog_bm);
                 block_manager_close(vlog_bm);
                 tidesdb_merge_heap_free(heap);
@@ -14646,6 +14794,85 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 }
 
 /**
+ * tdb_no_older_sst_has_key
+ * returns 1 if no sstable at any level deeper than target_level can possibly
+ * contain the given key, 0 otherwise. used by the tombstone density witness
+ * path to drop a tombstone earlier than the largest level when the read path
+ * cannot find an older version of the key elsewhere in the tree.
+ *
+ * correctness relies on the witness-triggered merge feeding levels [0, target_level]
+ * into the new sstable, so any older version masked by the tombstone now lives
+ * only at levels strictly greater than target_level. range and bloom checks are
+ * both false-positive-only, so a definitive miss is trustworthy and a positive
+ * answer conservatively keeps the tombstone.
+ *
+ * conservative on missing range bounds, on cfs that disabled bloom filters, or
+ * when target_level already names the largest level (caller's is_largest_level
+ * path handles that case directly).
+ *
+ * @param cf column family
+ * @param target_level 0-indexed target level of the in-flight merge
+ * @param key key being considered for tombstone drop
+ * @param key_size key length
+ * @return 1 if no deeper sstable can hold the key, 0 otherwise
+ */
+static int tdb_no_older_sst_has_key(tidesdb_column_family_t *cf, int target_level,
+                                    const uint8_t *key, size_t key_size)
+{
+    if (!cf || !key || key_size == 0) return 0;
+
+    skip_list_comparator_fn cmp_fn = NULL;
+    void *cmp_ctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &cmp_fn, &cmp_ctx);
+    if (!cmp_fn) cmp_fn = skip_list_comparator_memcmp;
+
+    const int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    for (int lv = target_level + 1; lv < num_levels; lv++)
+    {
+        tidesdb_level_t *lvl = cf->levels[lv];
+        if (!lvl) continue;
+
+        atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
+
+        const int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **ssts = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+
+        int may_contain = 0;
+        for (int i = 0; ssts && i < num_ssts; i++)
+        {
+            tidesdb_sstable_t *sst = ssts[i];
+            if (!sst) continue;
+
+            /* range check first because it is a single comparator call and filters
+             * out the common case where the key is well outside the sstable's
+             * covered span. on missing bounds we cannot prove a miss. */
+            if (!sst->min_key || !sst->max_key || sst->min_key_size == 0 || sst->max_key_size == 0)
+            {
+                may_contain = 1;
+                break;
+            }
+            if (cmp_fn(key, key_size, sst->min_key, sst->min_key_size, cmp_ctx) < 0) continue;
+            if (cmp_fn(key, key_size, sst->max_key, sst->max_key_size, cmp_ctx) > 0) continue;
+
+            /* range overlaps -- consult bloom for a definitive miss. if the cf
+             * disabled bloom filters the range hit is the strongest signal we
+             * have and we conservatively keep the tombstone. */
+            if (sst->bloom_filter)
+            {
+                if (!bloom_filter_contains(sst->bloom_filter, key, key_size)) continue;
+            }
+
+            may_contain = 1;
+            break;
+        }
+
+        atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
+        if (may_contain) return 0;
+    }
+    return 1;
+}
+
+/**
  * tidesdb_cf_dense_tombstone_witness
  * walks every level looking for an sstable whose tombstone density is at or above
  * the configured trigger ratio. on a hit we record the offending sstable's level
@@ -14728,7 +14955,7 @@ static int tidesdb_cf_dense_tombstone_witness(tidesdb_column_family_t *cf, doubl
  * @param cf the column family
  * @return TDB_SUCCESS on success, error code on failure
  */
-int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
+int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int witness_triggered)
 {
     /* we check if CF is marked for deletion before doing any work */
     if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
@@ -14817,17 +15044,17 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     if (target_lvl < X)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge levels 1 to %d", target_lvl);
-        result = tidesdb_full_preemptive_merge(cf, 0, target_lvl - 1); /* convert to 0-indexed */
+        result = tidesdb_full_preemptive_merge(cf, 0, target_lvl - 1, witness_triggered);
     }
     else if (target_lvl == X)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
-        result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
+        result = tidesdb_dividing_merge(cf, X - 1, witness_triggered);
     }
     else
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "Target_lvl > X, defaulting to dividing merge");
-        result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
+        result = tidesdb_dividing_merge(cf, X - 1, witness_triggered);
     }
 
     /* we reload num_levels atomically after compaction */
@@ -14897,7 +15124,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Level %d is full, triggering partitioned preemptive merge", X);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Partitioned preemptive merge levels %d to %d", X, z);
-        result = tidesdb_partitioned_merge(cf, X, z);
+        result = tidesdb_partitioned_merge(cf, X, z, witness_triggered);
 
         /* we reload num_levels after merge */
         num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
@@ -15260,6 +15487,9 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
         tidesdb_manifest_close(cf->manifest);
     }
 
+    pthread_mutex_destroy(&cf->iter_drain_mtx);
+    pthread_cond_destroy(&cf->iter_drain_cv);
+
     free(cf->name);
     free(cf->directory);
     free(cf);
@@ -15333,6 +15563,37 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* unified flush dispatch -- cf==NULL means this is a unified memtable flush */
         if (!cf && imm)
         {
+            /* wait for in-flight writers to drain before reading the memtable.
+             * writers hold a refcount while writing to the unified WAL + skip list.
+             * without this drain barrier the flush worker can close the WAL while a
+             * writer is still inside block_manager_write_raw on the same handle.
+             * baseline -- 1 (original) + 1 (work ref taken at rotation) */
+            int drain_iterations = 0;
+            while (atomic_load_explicit(&imm->refcount, memory_order_acquire) >
+                   TDB_REFCOUNT_DRAIN_BASELINE)
+            {
+                drain_iterations++;
+                if (drain_iterations < TDB_REFCOUNT_DRAIN_SPIN_THRESHOLD)
+                {
+                    cpu_pause();
+                }
+                else if (drain_iterations < TDB_REFCOUNT_DRAIN_YIELD_THRESHOLD)
+                {
+                    cpu_yield();
+                }
+                else
+                {
+                    usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+                }
+                if ((drain_iterations & TDB_REFCOUNT_DRAIN_LOG_INTERVAL) == 0)
+                {
+                    TDB_DEBUG_LOG(
+                        TDB_LOG_WARN,
+                        "Unified flush worker waiting for memtable refcount to drain (current=%d)",
+                        atomic_load_explicit(&imm->refcount, memory_order_acquire));
+                }
+            }
+
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker processing unified memtable flush");
             int uflush_rc = tidesdb_unified_flush_immutable(db, imm);
             if (uflush_rc != TDB_SUCCESS)
@@ -15340,9 +15601,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Unified flush failed (error %d)", uflush_rc);
             }
 
-            /* we do not free imm here -- it is still in unified_mt.immutables queue
-             * and readers may be scanning it. tidesdb_unified_flush_immutable already
-             * marks it flushed and deletes the WAL. close path handles cleanup. */
+            /* release the work ref taken at rotation -- the queue still holds the
+             * original ref so readers scanning unified_mt.immutables are safe; close
+             * path drops the final ref. */
+            tidesdb_immutable_memtable_unref(imm);
 
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
@@ -15653,7 +15915,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                               cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
                               cf->config.l1_file_count_trigger, level1_size, level1_capacity);
             }
-            tidesdb_compact(cf);
+            tidesdb_compact_with_flags(cf, density_witness_level > 0 ? 1 : 0);
         }
 
         /* we release our reference -- the level now owns it */
@@ -15797,12 +16059,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 }
             }
 
+            /* a concurrent rotation can call tidesdb_imm_snap_publish while an item is
+             * temporarily out of the queue here, orphaning it from the snapshot. always
+             * republish after the dequeue-re-enqueue loop so every re-enqueued item is
+             * visible to readers, regardless of whether anything was actually freed */
+            tidesdb_imm_snap_publish(cf);
+
             if (cleaned > 0)
             {
-                /** we republish lock-free snapshot -- non-blocking, rebuilds without
-                 * the removed items and swaps active index immediately */
-                tidesdb_imm_snap_publish(cf);
-
                 /** we wait for old-slot readers to drain before freeing
                  * this is the only path that needs blocking drain (items being freed) */
                 tidesdb_imm_snap_drain_previous(cf);
@@ -15908,7 +16172,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
         }
 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Compacting CF '%s'", cf->name);
-        const int result = tidesdb_trigger_compaction(cf);
+        const int result = tidesdb_trigger_compaction(cf, work->witness_triggered);
         if (result != TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' compaction failed with error %d", cf->name,
@@ -16490,18 +16754,23 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             time_t last_access;
         } sstable_candidate_t;
 
-        /* stack buffer for common case (≤N open SSTs), heap fallback for large configs */
+        /* stack buffer for common case (≤N open SSTs), heap fallback for large configs.
+         * current_open is a snapshot -- concurrent flushes can add more SSTables between
+         * the snapshot and the scan below. add headroom on the heap allocation and bound
+         * candidate inserts to capacity so we never write past the end. */
 #define TDB_REAPER_STACK_CANDIDATES 256
         sstable_candidate_t stack_candidates[TDB_REAPER_STACK_CANDIDATES];
         sstable_candidate_t *candidates;
         const int use_stack = (current_open <= TDB_REAPER_STACK_CANDIDATES);
+        const int candidates_capacity =
+            use_stack ? TDB_REAPER_STACK_CANDIDATES : current_open + (current_open / 4) + 64;
         if (use_stack)
         {
             candidates = stack_candidates;
         }
         else
         {
-            candidates = malloc(current_open * sizeof(sstable_candidate_t));
+            candidates = malloc(candidates_capacity * sizeof(sstable_candidate_t));
             if (!candidates)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Reaper: failed to allocate candidates array");
@@ -16580,7 +16849,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         }
 
                         /* now we check if we're the only extra ref (refcount should be 2) */
-                        if (atomic_load(&sst->refcount) == 2)
+                        if (atomic_load(&sst->refcount) == 2 &&
+                            candidate_count < candidates_capacity)
                         {
                             candidates[candidate_count].sst = sst;
                             candidates[candidate_count].last_access =
@@ -16589,7 +16859,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         }
                         else
                         {
-                            /* someone else is using it, we must release our ref */
+                            /* someone else is using it or candidates buffer is full,
+                             * release our ref */
                             tidesdb_sstable_unref(db, sst);
                         }
                     }
@@ -18585,6 +18856,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         atomic_init(&cf->imm_snaps[s].readers, 0);
     }
     atomic_init(&cf->imm_snap_active, 0);
+    atomic_init(&cf->imm_snap_publishing, 0);
 
     /*** in unified memtable mode, writes go through the unified WAL so
      **  per-CF WAL files are not needed. skip creation to avoid wasted
@@ -18735,6 +19007,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->is_flushing, 0);
     atomic_init(&cf->immutable_cleanup_counter, 0);
     atomic_init(&cf->pending_commits, 0);
+    atomic_init(&cf->active_iter_count, 0);
+    pthread_mutex_init(&cf->iter_drain_mtx, NULL);
+    pthread_cond_init(&cf->iter_drain_cv, NULL);
 
     char manifest_path[TDB_MAX_PATH_LEN];
     snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
@@ -19852,7 +20127,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     return TDB_SUCCESS;
 }
 
-int tidesdb_compact(tidesdb_column_family_t *cf)
+/**
+ * tidesdb_compact_with_flags
+ * internal entry point that lets the caller pass the witness_triggered flag.
+ * the public tidesdb_compact wraps this with witness_triggered=0.
+ */
+static int tidesdb_compact_with_flags(tidesdb_column_family_t *cf, int witness_triggered)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
@@ -19870,13 +20150,32 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
     }
 
     work->cf = cf;
+    work->start_level = 0;
+    work->target_level = 0;
+    work->witness_triggered = witness_triggered;
     if (queue_enqueue(cf->db->compaction_queue, work) != 0)
     {
         free(work);
         return TDB_ERR_MEMORY;
     }
 
+    /***** we wait for the worker to acknowledge the work by setting is_compacting.
+     ****  callers that immediately poll is_compacting to wait for completion would
+     ***   otherwise race the worker's queue_dequeue_wait and observe 0 before the
+     **    worker has started, producing an inconsistent mid-flush view of the level
+     *     structure. */
+    for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS; i++)
+    {
+        if (atomic_load_explicit(&cf->is_compacting, memory_order_acquire)) break;
+        usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+    }
+
     return TDB_SUCCESS;
+}
+
+int tidesdb_compact(tidesdb_column_family_t *cf)
+{
+    return tidesdb_compact_with_flags(cf, 0);
 }
 
 /**
@@ -20023,11 +20322,14 @@ int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
     }
 
     /* merge into the largest level affected so any tombstones in the range that
-     * meet their dead puts get a shot at dropping when the target is the bottom */
+     * meet their dead puts get a shot at dropping when the target is the bottom.
+     * tidesdb_compact_range is operator-driven reclaim, so we set witness_triggered
+     * to let the merge drop tombstones at the targeted output level when no older
+     * sstable can possibly hold the key instead of carrying them to the largest */
     const int target_level = max_input_level;
 
     const int merge_result = tidesdb_targeted_merge(cf, inputs, input_count, min_input_level,
-                                                    max_input_level, target_level);
+                                                    max_input_level, target_level, 1);
     free(inputs);
 
     atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
@@ -22986,7 +23288,7 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     }
     if (num_l1 >= cf->config.l1_file_count_trigger || density_hit)
     {
-        tidesdb_compact(cf);
+        tidesdb_compact_with_flags(cf, density_hit ? 1 : 0);
     }
 
     tidesdb_sstable_unref(db, sst);
@@ -23326,6 +23628,11 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     /* we enqueue old to immutable queue (for read path scanning) */
     queue_enqueue(db->unified_mt.immutables, old_mt);
 
+    /* take a work ref so the flush worker's drain baseline matches per-CF flush
+     * (1 original + 1 work = TDB_REFCOUNT_DRAIN_BASELINE). flush worker releases
+     * this ref after the drain completes. */
+    tidesdb_immutable_memtable_ref(old_mt);
+
     /* we enqueue flush work item with cf=NULL to signal unified flush */
     tidesdb_flush_work_t *uwork = malloc(sizeof(tidesdb_flush_work_t));
     if (uwork)
@@ -23340,8 +23647,13 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
         {
             free(uwork);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
+            tidesdb_immutable_memtable_unref(old_mt);
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to enqueue unified flush work");
         }
+    }
+    else
+    {
+        tidesdb_immutable_memtable_unref(old_mt);
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable rotated (gen=%" PRIu64 ", WAL=%s)", new_gen,
@@ -23393,8 +23705,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     /* with the unified path, we do single WAL + single skip list */
     if (txn->db->unified_mt.enabled)
     {
-        tidesdb_memtable_t *umt =
-            atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
+        tidesdb_memtable_t *umt;
+        int umt_load_attempts = 0;
+
+    reload_unified_active:
+        umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
         if (!umt || !tidesdb_memtable_try_ref(umt))
         {
             umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
@@ -23402,6 +23717,20 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 return TDB_ERR_UNKNOWN;
             }
+        }
+
+        /* phantom-writer guard -- after we hold a ref, verify umt is still the
+         * active unified memtable. if rotation completed between our load and
+         * try_ref, umt is now an immutable that the flush worker may already be
+         * reading. unref and retry so our writes land on the current active. */
+        if (atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire) != umt)
+        {
+            tidesdb_immutable_memtable_unref(umt);
+            if (++umt_load_attempts > TDB_TXN_ACTIVE_RELOAD_MAX_ATTEMPTS)
+            {
+                return TDB_ERR_UNKNOWN;
+            }
+            goto reload_unified_active;
         }
 
         /* we serialize unified WAL batch */
@@ -23569,7 +23898,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
-        tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+        tidesdb_memtable_t *mt;
+        int load_attempts = 0;
+
+    reload_active:
+        mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
         /*** we use CAS-based try_ref to safely handle the case where the loaded
          **  memtable was rotated to immutable and freed between our load and ref.
@@ -23589,6 +23922,27 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 result = TDB_ERR_UNKNOWN;
                 goto cleanup;
             }
+        }
+
+        /* phantom-writer guard -- after we hold a ref, verify mt is still the
+         * active memtable. if rotation completed between our load and try_ref,
+         * mt is now an immutable that the flush worker may already be reading.
+         * unref and retry so our writes land on the current active memtable. */
+        if (atomic_load_explicit(&cf->active_memtable, memory_order_acquire) != mt)
+        {
+            tidesdb_immutable_memtable_unref(mt);
+            if (++load_attempts > TDB_TXN_ACTIVE_RELOAD_MAX_ATTEMPTS)
+            {
+                for (int j = 0; j < cf_idx; j++)
+                {
+                    if (cf_memtables[j])
+                        atomic_fetch_sub_explicit(&cf_memtables[j]->refcount, 1,
+                                                  memory_order_release);
+                }
+                result = TDB_ERR_UNKNOWN;
+                goto cleanup;
+            }
+            goto reload_active;
         }
         cf_memtables[cf_idx] = mt;
         cf_skiplists[cf_idx] = mt->skip_list;
@@ -24406,6 +24760,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         free(ssts_array);
     }
 
+    atomic_fetch_add_explicit(&cf->active_iter_count, 1, memory_order_acq_rel);
     return TDB_SUCCESS;
 }
 
@@ -25347,7 +25702,10 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
         compact_block_index_find_predecessor(sst->block_indexes, key, key_size, &block_position);
     }
 
-    if (block_position > 0)
+    /* a stale or miscomputed block_position past the data tail would land the
+     * cursor in index/bloom/metadata bytes that decode as garbage block sizes */
+    if (block_position > 0 &&
+        (sst->klog_data_end_offset == 0 || block_position < sst->klog_data_end_offset))
     {
         block_manager_cursor_goto(cursor, block_position);
     }
@@ -25787,7 +26145,8 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         compact_block_index_find_predecessor(sst->block_indexes, key, key_size, &block_position);
     }
 
-    if (block_position > 0)
+    if (block_position > 0 &&
+        (sst->klog_data_end_offset == 0 || block_position < sst->klog_data_end_offset))
     {
         block_manager_cursor_goto(cursor, block_position);
     }
@@ -26002,12 +26361,32 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
     iter->valid = 0;
     iter->direction = 1;
 
-    /****** we only rebuild SST cache on initial build (num_cached_sources == 0).
-     *****  the iterator holds refs to all sstables it needs and has snapshot semantics
-     ****   via its transaction -- new sstables from later flushes contain data already
-     ***    visible through memtable sources, and compaction cannot delete ref'd sstables.
+    /***** READ_COMMITTED's documented contract refreshes the snapshot on each
+     ****  read operation; READ_UNCOMMITTED has no snapshot at all. for the
+     ***   higher levels (repeatable_read/snapshot/serializable) the seq is
+     **    fixed at txn begin and must not move.
      */
-    if (iter->num_cached_sources == 0)
+    const tidesdb_isolation_level_t iso = iter->txn->isolation_level;
+    if (iso == TDB_ISOLATION_READ_COMMITTED)
+    {
+        const uint64_t cur = atomic_load_explicit(&iter->cf->db->global_seq, memory_order_acquire);
+        iter->cf_snapshot = (cur > 0) ? cur - 1 : 0;
+    }
+
+    /****** for read_uncommitted/read_committed the iter must observe layout
+     *****  changes published by compaction (otherwise a "should-see-latest"
+     ****   read can miss data merged into a new sstable). higher isolation
+     ***    levels keep the original snapshot of sstables -- compaction
+     **     cannot free a ref'd sstable, and the compaction publish step
+     *      drains active iters before swapping the level array.
+     */
+    const int layout_changed =
+        iter->cached_layout_version !=
+        atomic_load_explicit(&iter->cf->sstable_layout_version, memory_order_acquire);
+    const int needs_rebuild =
+        iter->num_cached_sources == 0 || (iso <= TDB_ISOLATION_READ_COMMITTED && layout_changed);
+
+    if (needs_rebuild)
     {
         const int result = tidesdb_iter_rebuild_sst_cache(iter);
         if (result != TDB_SUCCESS) return result;
@@ -26830,6 +27209,8 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
 {
     if (!iter) return;
 
+    tidesdb_column_family_t *cf = iter->cf;
+
     tidesdb_kv_pair_free(iter->current);
     tidesdb_merge_heap_free(iter->heap);
 
@@ -26853,6 +27234,17 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
 
     free(iter->temp_sources);
     free(iter);
+
+    if (cf)
+    {
+        const int prev = atomic_fetch_sub_explicit(&cf->active_iter_count, 1, memory_order_acq_rel);
+        if (prev == 1)
+        {
+            pthread_mutex_lock(&cf->iter_drain_mtx);
+            pthread_cond_broadcast(&cf->iter_drain_cv);
+            pthread_mutex_unlock(&cf->iter_drain_mtx);
+        }
+    }
 }
 
 /**
@@ -28200,7 +28592,7 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf)
     if (atomic_compare_exchange_strong_explicit(&cf->is_compacting, &expected, 1,
                                                 memory_order_acquire, memory_order_relaxed))
     {
-        tidesdb_trigger_compaction(cf);
+        tidesdb_trigger_compaction(cf, 0);
         atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
     }
 

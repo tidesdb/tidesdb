@@ -488,6 +488,9 @@ struct tidesdb_memtable_t
  * @param imm_snaps double-buffered lock-free immutable memtable snapshot slots
  * @param imm_snap_active index (0 or 1) of the currently active snapshot slot
  * @param unified_cf_index unified memtable column family index (4-byte big-endian prefix)
+ * @param active_iter_count number of live iterators on this CF (drained by compaction publish)
+ * @param iter_drain_mtx mutex guarding iter_drain_cv
+ * @param iter_drain_cv signaled when active_iter_count drops to 0
  */
 struct tidesdb_column_family_t
 {
@@ -513,10 +516,17 @@ struct tidesdb_column_family_t
      * readers acquire active slot, use items, release when done
      * writers rebuild in inactive slot, swap active, wait for old readers */
     tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
-    _Atomic(int) imm_snap_active; /* 0 or 1, index of current snapshot */
+    _Atomic(int) imm_snap_active;     /* 0 or 1, index of current snapshot */
+    _Atomic(int) imm_snap_publishing; /* CAS-admission flag serializing concurrent publishers */
 
     /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
     uint32_t unified_cf_index;
+
+    /* iterator drain barrier -- compaction's publish step waits here so removed
+     * sstables and bumped layout_version cannot invalidate an in-flight iter */
+    _Atomic(int) active_iter_count;
+    pthread_mutex_t iter_drain_mtx;
+    pthread_cond_t iter_drain_cv;
 };
 
 /**

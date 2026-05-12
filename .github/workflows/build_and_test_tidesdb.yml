@@ -244,25 +244,35 @@ jobs:
           git pull
           .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
 
-      - name: Install and setup MinGW
+      - name: Install and setup MinGW (x86)
+        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          install: mingw-w64-i686-toolchain
+          path-type: inherit
+          update: false
+          cache: true
+
+      - name: Install and setup MinGW (x64)
+        if: matrix.compiler == 'mingw' && matrix.arch == 'x64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-toolchain
+          path-type: inherit
+          update: false
+          cache: true
+
+      - name: Verify MinGW toolchain
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
-          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
-          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          if ("${{ matrix.arch }}" -eq "x86") {
-              choco install mingw --version=8.1.0 --forcex86 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
-          } else {
-              choco install mingw --version=8.1.0 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-          }
-          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          # Also persist the PATH cleanup for subsequent steps
-          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $env:PATH = "$mingwPath;$cleanPath"
+          $gccPath = (Get-Command gcc -ErrorAction SilentlyContinue).Source
+          if (-not $gccPath) { throw "gcc not found on PATH after MSYS2 setup" }
+          Write-Host "Using gcc at: $gccPath"
           gcc --version
+          if ($LASTEXITCODE -ne 0) { throw "gcc --version failed" }
 
       - name: Configure CMake (Linux/macOS x64)
         if: runner.os != 'Windows' && matrix.arch == 'x64'

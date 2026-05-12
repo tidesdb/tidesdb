@@ -929,13 +929,17 @@ int skip_list_new_with_arena(skip_list_t **list, const int max_level, const floa
                                                            comparator_ctx, cached_time);
     if (rc != 0) return rc;
 
-    (*list)->arena = skip_list_arena_create(arena_initial_capacity);
-    if ((*list)->arena == NULL)
+    /* cap the first block so a large write_buffer_size config does not ask for
+     * an oversized allocation up front. the arena grows on demand. */
+    size_t initial_cap = arena_initial_capacity;
+    if (initial_cap > SKIP_LIST_ARENA_MAX_INITIAL_BLOCK)
     {
-        skip_list_free(*list);
-        *list = NULL;
-        return -1;
+        initial_cap = SKIP_LIST_ARENA_MAX_INITIAL_BLOCK;
     }
+
+    /* arena is optional -- if even the capped allocation fails,
+     * skip_list_alloc/dealloc fall back to per-node malloc/free */
+    (*list)->arena = skip_list_arena_create(initial_cap);
 
     return 0;
 }

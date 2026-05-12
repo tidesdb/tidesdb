@@ -45,6 +45,12 @@ typedef struct skip_list_arena_t skip_list_arena_t;
 /* default size for thread-local blocks (smaller than shared block to save memory) */
 #define SKIP_LIST_ARENA_TL_BLOCK_SIZE (64 * 1024)
 
+/* cap the initial arena block so a large write_buffer_size config cannot ask
+ * for a multi-MB allocation that exhausts the address space on 32-bit builds.
+ * the arena grows on demand (TL_BLOCK_SIZE per new block) so capping here does
+ * not bound total memtable size. */
+#define SKIP_LIST_ARENA_MAX_INITIAL_BLOCK (4 * 1024 * 1024)
+
 /**
  * skip_list_arena_block_t
  * a single contiguous memory block in the arena's linked list

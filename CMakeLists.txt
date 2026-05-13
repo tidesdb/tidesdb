@@ -127,15 +127,18 @@ target_include_directories(tidesdb PRIVATE src)
 
 # find compression libraries.
 # MSVC builds rely on vcpkg, which ships full CMake config packages.
-# MinGW (MSYS2) packages ship pkg-config (.pc) files but not always CMake
-# configs (e.g. lz4 has no lz4Config.cmake under MSYS2), so use PkgConfig
-# there. winpthreads is bundled with the MinGW toolchain — link -lpthread.
+# MinGW (MSYS2): zstd and lz4 ship only pkg-config (.pc) files, no CMake
+# configs, so use PkgConfig for them. snappy is the opposite: upstream
+# snappy installs SnappyConfig.cmake but no .pc (so the x86 from-source
+# build in CI cannot use pkg-config), while MSYS2's prebuilt snappy ships
+# both. CONFIG mode works for snappy across all three setups.
+# winpthreads is bundled with the MinGW toolchain so we link plain pthread.
 if(WIN32)
     if(MINGW)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
         pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
-        pkg_check_modules(SNAPPY REQUIRED IMPORTED_TARGET snappy)
+        find_package(Snappy CONFIG REQUIRED)
     else()
         find_package(zstd CONFIG REQUIRED)
         find_package(Snappy CONFIG REQUIRED)
@@ -245,7 +248,7 @@ elseif(WIN32)
         target_link_libraries(tidesdb PUBLIC
                 PkgConfig::ZSTD
                 PkgConfig::LZ4
-                PkgConfig::SNAPPY
+                Snappy::snappy
                 pthread
         )
     else()

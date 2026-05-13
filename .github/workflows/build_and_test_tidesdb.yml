@@ -250,6 +250,10 @@ jobs:
         with:
           msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
           update: false
+          # propagate /mingw{32,64}/bin onto the runner's Windows PATH so
+          # subsequent bash/pwsh steps (notably `ctest`) can locate the
+          # compression DLLs at runtime; without this we hit STATUS_DLL_NOT_FOUND.
+          path-type: inherit
           # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
           # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
           # source in the next step. zstd/lz4 are still packaged for i686.
@@ -612,6 +616,10 @@ jobs:
         with:
           msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
           update: false
+          # propagate /mingw{32,64}/bin onto the runner's Windows PATH so
+          # subsequent bash/pwsh steps (notably `ctest`) can locate the
+          # compression DLLs at runtime; without this we hit STATUS_DLL_NOT_FOUND.
+          path-type: inherit
           # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
           # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
           # source in the next step. zstd/lz4 are still packaged for i686.
@@ -1108,6 +1116,10 @@ jobs:
         with:
           msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
           update: false
+          # propagate /mingw{32,64}/bin onto the runner's Windows PATH so
+          # subsequent bash/pwsh steps (notably `ctest`) can locate the
+          # compression DLLs at runtime; without this we hit STATUS_DLL_NOT_FOUND.
+          path-type: inherit
           # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
           # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
           # source in the next step. zstd/lz4 are still packaged for i686.

@@ -405,29 +405,6 @@ jobs:
         if: matrix.compiler != 'mingw'
         run: cmake --build build --config Release
 
-      # Diagnostic: dumps PATH and the actual DLL deps of compress_tests.exe
-      # so we can see which DLL is being resolved if a test fails at load.
-      # Safe to remove once MinGW CI has been green for a release cycle.
-      - name: Diagnose MinGW runtime DLL resolution
-        if: matrix.compiler == 'mingw'
-        shell: msys2 {0}
-        run: |
-          echo "=== MSYSTEM and MINGW_PREFIX ==="
-          echo "MSYSTEM=$MSYSTEM  MINGW_PREFIX=$MINGW_PREFIX"
-          echo "=== PATH ==="
-          echo "$PATH" | tr ':' '\n'
-          echo "=== which ctest / gcc ==="
-          which ctest gcc || true
-          echo "=== build/ contents (exes + dlls) ==="
-          ls -la build/*.exe build/*.dll 2>/dev/null | head -40
-          echo "=== Imported DLLs of compress_tests.exe ==="
-          objdump -p build/compress_tests.exe 2>/dev/null | grep -i 'DLL Name' || true
-          echo "=== libsnappy.dll location (file + arch) ==="
-          for d in "$MINGW_PREFIX/bin" /c/Strawberry/c/bin /mingw32/bin /mingw64/bin; do
-            [ -e "$d/libsnappy.dll" ] && file "$d/libsnappy.dll" || true
-            [ -e "$d/libstdc++-6.dll" ] && file "$d/libstdc++-6.dll" || true
-          done
-
       - name: Run tests
         shell: bash
         run: |

@@ -125,12 +125,26 @@ set_target_properties(tidesdb PROPERTIES
 
 target_include_directories(tidesdb PRIVATE src)
 
-# find compression libraries (use CONFIG mode on Windows with vcpkg)
+# find compression libraries.
+# MSVC builds rely on vcpkg, which ships full CMake config packages.
+# MinGW (MSYS2): zstd and lz4 ship only pkg-config (.pc) files, no CMake
+# configs, so use PkgConfig for them. snappy is the opposite: upstream
+# snappy installs SnappyConfig.cmake but no .pc (so the x86 from-source
+# build in CI cannot use pkg-config), while MSYS2's prebuilt snappy ships
+# both. CONFIG mode works for snappy across all three setups.
+# winpthreads is bundled with the MinGW toolchain so we link plain pthread.
 if(WIN32)
-    find_package(zstd CONFIG REQUIRED)
-    find_package(Snappy CONFIG REQUIRED)
-    find_package(lz4 CONFIG REQUIRED)
-    find_package(PThreads4W REQUIRED)
+    if(MINGW)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+        pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+        find_package(Snappy CONFIG REQUIRED)
+    else()
+        find_package(zstd CONFIG REQUIRED)
+        find_package(Snappy CONFIG REQUIRED)
+        find_package(lz4 CONFIG REQUIRED)
+        find_package(PThreads4W REQUIRED)
+    endif()
 endif()
 
 # mimalloc support (optional, OFF by default)
@@ -230,12 +244,21 @@ if(APPLE)
 
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
-    target_link_libraries(tidesdb PUBLIC
-            $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
-            Snappy::snappy
-            lz4::lz4
-            PThreads4W::PThreads4W
-    )
+    if(MINGW)
+        target_link_libraries(tidesdb PUBLIC
+                PkgConfig::ZSTD
+                PkgConfig::LZ4
+                Snappy::snappy
+                pthread
+        )
+    else()
+        target_link_libraries(tidesdb PUBLIC
+                $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
+                Snappy::snappy
+                lz4::lz4
+                PThreads4W::PThreads4W
+        )
+    endif()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
@@ -633,30 +656,60 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)
-        # determine vcpkg triplet based on target architecture
-        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-            set(VCPKG_TARGET_TRIPLET "x64-windows")
+        set(TIDESDB_TEST_TARGETS
+                block_manager_tests skip_list_tests compress_tests bloom_filter_tests
+                manifest_tests queue_tests tidesdb_tests tidesdb_bench)
+
+        if(MINGW)
+            # On MinGW (MSYS2), the test exes link against shared snappy/zstd/lz4
+            # plus the MinGW C/C++ runtimes. Copy the DLLs next to each exe so
+            # Windows loads them from the exe directory and we do not depend on
+            # PATH order (the runner has multiple gcc toolchains on PATH).
+            set(MINGW_RUNTIME_BIN "$ENV{MINGW_PREFIX}/bin")
+            file(GLOB MINGW_RUNTIME_DLLS
+                    "${MINGW_RUNTIME_BIN}/libsnappy*.dll"
+                    "${MINGW_RUNTIME_BIN}/libzstd*.dll"
+                    "${MINGW_RUNTIME_BIN}/liblz4*.dll"
+                    "${MINGW_RUNTIME_BIN}/libstdc++*.dll"
+                    "${MINGW_RUNTIME_BIN}/libgcc_s*.dll"
+                    "${MINGW_RUNTIME_BIN}/libwinpthread*.dll"
+            )
+            if(MINGW_RUNTIME_DLLS)
+                foreach(test_target ${TIDESDB_TEST_TARGETS})
+                    add_custom_command(TARGET ${test_target} POST_BUILD
+                            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            ${MINGW_RUNTIME_DLLS}
+                            $<TARGET_FILE_DIR:${test_target}>
+                            COMMENT "Copying MinGW runtime DLLs to ${test_target} directory"
+                    )
+                endforeach()
+            endif()
         else()
-            set(VCPKG_TARGET_TRIPLET "x86-windows")
-        endif()
+            # determine vcpkg triplet based on target architecture
+            if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+                set(VCPKG_TARGET_TRIPLET "x64-windows")
+            else()
+                set(VCPKG_TARGET_TRIPLET "x86-windows")
+            endif()
 
-        # get DLLs from the correct vcpkg directory
-        file(GLOB VCPKG_DLLS
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll"
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
-        )
+            # get DLLs from the correct vcpkg directory
+            file(GLOB VCPKG_DLLS
+                    "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll"
+                    "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
+            )
 
-        # only proceed if we found DLLs
-        if(VCPKG_DLLS)
-            # copy DLLs to build directory after building tests
-            foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests queue_tests tidesdb_tests tidesdb_bench)
-                add_custom_command(TARGET ${test_target} POST_BUILD
-                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        ${VCPKG_DLLS}
-                        $<TARGET_FILE_DIR:${test_target}>
-                        COMMENT "Copying DLLs to ${test_target} directory"
-                )
-            endforeach()
+            # only proceed if we found DLLs
+            if(VCPKG_DLLS)
+                # copy DLLs to build directory after building tests
+                foreach(test_target ${TIDESDB_TEST_TARGETS})
+                    add_custom_command(TARGET ${test_target} POST_BUILD
+                            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            ${VCPKG_DLLS}
+                            $<TARGET_FILE_DIR:${test_target}>
+                            COMMENT "Copying DLLs to ${test_target} directory"
+                    )
+                endforeach()
+            endif()
         endif()
     endif()
 endif()

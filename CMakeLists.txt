@@ -130,7 +130,11 @@ if(WIN32)
     find_package(zstd CONFIG REQUIRED)
     find_package(Snappy CONFIG REQUIRED)
     find_package(lz4 CONFIG REQUIRED)
-    find_package(PThreads4W REQUIRED)
+    # PThreads4W is a vcpkg-only package; MinGW (MSYS2) bundles winpthreads
+    # in the toolchain, so we link plain `pthread` for MinGW below.
+    if(NOT MINGW)
+        find_package(PThreads4W REQUIRED)
+    endif()
 endif()
 
 # mimalloc support (optional, OFF by default)
@@ -234,8 +238,12 @@ elseif(WIN32)
             $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
             Snappy::snappy
             lz4::lz4
-            PThreads4W::PThreads4W
     )
+    if(MINGW)
+        target_link_libraries(tidesdb PUBLIC pthread)
+    else()
+        target_link_libraries(tidesdb PUBLIC PThreads4W::PThreads4W)
+    endif()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)

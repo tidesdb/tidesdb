@@ -210,16 +210,16 @@ jobs:
         shell: bash
         run: brew install zstd lz4 snappy
 
-      - name: Setup vcpkg binary cache (Windows)
-        if: runner.os == 'Windows'
+      - name: Setup vcpkg binary cache (Windows MSVC)
+        if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         shell: pwsh
         run: |
           $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
           echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Cache vcpkg packages (Windows)
-        if: runner.os == 'Windows'
+      - name: Cache vcpkg packages (Windows MSVC)
+        if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         uses: actions/cache@v4
         with:
           path: vcpkg_cache
@@ -244,25 +244,13 @@ jobs:
           git pull
           .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
 
-      - name: Install and setup MinGW
+      - name: Setup MSYS2 (MinGW)
         if: matrix.compiler == 'mingw'
-        shell: pwsh
-        run: |
-          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
-          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          if ("${{ matrix.arch }}" -eq "x86") {
-              choco install mingw --version=8.1.0 --forcex86 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
-          } else {
-              choco install mingw --version=8.1.0 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-          }
-          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          # Also persist the PATH cleanup for subsequent steps
-          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $env:PATH = "$mingwPath;$cleanPath"
-          gcc --version
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
+          update: false
+          install: ${{ matrix.arch == 'x86' && 'mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4 mingw-w64-i686-snappy' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
 
       - name: Configure CMake (Linux/macOS x64)
         if: runner.os != 'Windows' && matrix.arch == 'x64'
@@ -359,52 +347,36 @@ jobs:
             -DTIDESDB_BUILD_TESTS=ON \
             -DTIDESDB_WITH_SANITIZER=ON
 
+      # NOTE: TIDESDB_WITH_SANITIZER on Windows only adds extra warning flags;
+      # neither MSVC nor MinGW gates real ASan/UBSan on it (see CMakeLists.txt:66-103).
+      # Keep it OFF on Windows to avoid the noise.
       - name: Configure CMake (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
         run: |
-          cmake -S . -B build -A x64 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A x64 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Windows MSVC x86)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
         shell: pwsh
         run: |
-          cmake -S . -B build -A Win32 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A Win32 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Windows MinGW)
         if: matrix.compiler == 'mingw'
-        shell: pwsh
+        shell: msys2 {0}
         run: |
-          if ("${{ matrix.arch }}" -eq "x86") {
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
+          cmake -S . -B build -G "MinGW Makefiles" \
+            -DTIDESDB_BUILD_TESTS=ON \
+            -DTIDESDB_WITH_SANITIZER=OFF
 
-              cd $env:GITHUB_WORKSPACE
-
-              Write-Host "Configuring for 32-bit MinGW build..."
-              cmake -S . -B build -G "MinGW Makefiles" `
-                -DCMAKE_C_FLAGS="-m32" `
-                -DCMAKE_SYSTEM_PROCESSOR=x86 `
-                -DTIDESDB_BUILD_TESTS=ON `
-                -DTIDESDB_WITH_SANITIZER=ON `
-                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-                -DVCPKG_TARGET_TRIPLET=x86-windows
-          } else {
-
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-
-              cd $env:GITHUB_WORKSPACE
-
-              Write-Host "Configuring for 64-bit MinGW build..."
-              cmake -S . -B build -G "MinGW Makefiles" `
-                -DTIDESDB_BUILD_TESTS=ON `
-                -DTIDESDB_WITH_SANITIZER=ON `
-                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-                -DVCPKG_TARGET_TRIPLET=x64-windows
-          }
+      - name: Build (MinGW)
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
+        run: cmake --build build --config Release
 
       - name: Build
+        if: matrix.compiler != 'mingw'
         run: cmake --build build --config Release
 
       - name: Run tests
@@ -582,16 +554,16 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install zstd lz4 snappy
       
-      - name: Setup vcpkg binary cache (Windows)
-        if: runner.os == 'Windows'
+      - name: Setup vcpkg binary cache (Windows MSVC)
+        if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         shell: pwsh
         run: |
           $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
           echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Cache vcpkg packages (Windows)
-        if: runner.os == 'Windows'
+      - name: Cache vcpkg packages (Windows MSVC)
+        if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         uses: actions/cache@v4
         with:
           path: vcpkg_cache
@@ -599,58 +571,45 @@ jobs:
           restore-keys: |
             vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-
             vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
-      
+
       - name: Install dependencies (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-      
+
       - name: Install dependencies (Windows MSVC x86)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
         shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
-      
-      - name: Install dependencies (Windows MinGW)
+
+      - name: Setup MSYS2 (MinGW)
         if: matrix.compiler == 'mingw'
-        shell: pwsh
-        run: |
-          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
-          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          if ("${{ matrix.arch }}" -eq "x86") {
-              choco install mingw --version=8.1.0 --forcex86 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
-          } else {
-              choco install mingw --version=8.1.0 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-          }
-          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
+          update: false
+          install: ${{ matrix.arch == 'x86' && 'mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4 mingw-w64-i686-snappy' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
       
+      - name: Build TidesDB (Windows MinGW)
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G "MinGW Makefiles" -DTIDESDB_WITH_SANITIZER=OFF
+          cmake --build build --config Release
+
       - name: Build TidesDB
+        if: matrix.compiler != 'mingw'
         shell: bash
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
-            if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              if [ "${{ matrix.arch }}" == "x86" ]; then
-                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_FLAGS="-m32" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x86-windows
-              else
-                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
-              fi
+            if [ "${{ matrix.arch }}" == "x86" ]; then
+              cmake -S . -B build -A Win32 -DTIDESDB_WITH_SANITIZER=OFF -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
             else
-              if [ "${{ matrix.arch }}" == "x86" ]; then
-                cmake -S . -B build -A Win32 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-              else
-                cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-              fi
+              cmake -S . -B build -A x64 -DTIDESDB_WITH_SANITIZER=OFF -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
             fi
           elif [ "$RUNNER_OS" == "Linux" ]; then
             export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
@@ -664,7 +623,7 @@ jobs:
             cmake -S . -B build
           fi
           cmake --build build --config Release
-      
+
       - name: Verify database
         shell: bash
         run: |
@@ -1070,16 +1029,16 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install zstd lz4 snappy
       
-      - name: Setup vcpkg binary cache (Windows)
-        if: runner.os == 'Windows'
+      - name: Setup vcpkg binary cache (Windows MSVC)
+        if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         shell: pwsh
         run: |
           $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
           echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Cache vcpkg packages (Windows)
-        if: runner.os == 'Windows'
+      - name: Cache vcpkg packages (Windows MSVC)
+        if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         uses: actions/cache@v4
         with:
           path: vcpkg_cache
@@ -1088,58 +1047,45 @@ jobs:
             vcpkg-verify-lsmb-${{ matrix.compiler }}-${{ matrix.arch }}-
             vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-
             vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
-      
+
       - name: Install dependencies (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-      
+
       - name: Install dependencies (Windows MSVC x86)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
         shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
-      
-      - name: Install dependencies (Windows MinGW)
+
+      - name: Setup MSYS2 (MinGW)
         if: matrix.compiler == 'mingw'
-        shell: pwsh
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
+          update: false
+          install: ${{ matrix.arch == 'x86' && 'mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4 mingw-w64-i686-snappy' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+
+      - name: Build TidesDB (Windows MinGW)
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
         run: |
-          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
-          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          if ("${{ matrix.arch }}" -eq "x86") {
-              choco install mingw --version=8.1.0 --forcex86 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
-          } else {
-              choco install mingw --version=8.1.0 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-          }
-          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
-          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      
+          cmake -S . -B build -G "MinGW Makefiles" -DTIDESDB_WITH_SANITIZER=OFF
+          cmake --build build --config Release
+
       - name: Build TidesDB
+        if: matrix.compiler != 'mingw'
         shell: bash
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
-            if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              if [ "${{ matrix.arch }}" == "x86" ]; then
-                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_FLAGS="-m32" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x86-windows
-              else
-                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
-              fi
+            if [ "${{ matrix.arch }}" == "x86" ]; then
+              cmake -S . -B build -A Win32 -DTIDESDB_WITH_SANITIZER=OFF -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
             else
-              if [ "${{ matrix.arch }}" == "x86" ]; then
-                cmake -S . -B build -A Win32 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-              else
-                cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-              fi
+              cmake -S . -B build -A x64 -DTIDESDB_WITH_SANITIZER=OFF -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
             fi
           elif [ "$RUNNER_OS" == "Linux" ]; then
             export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
@@ -1153,7 +1099,7 @@ jobs:
             cmake -S . -B build
           fi
           cmake --build build --config Release
-      
+
       - name: Verify database
         shell: bash
         run: |

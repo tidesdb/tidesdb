@@ -250,7 +250,27 @@ jobs:
         with:
           msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
           update: false
-          install: ${{ matrix.arch == 'x86' && 'mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4 mingw-w64-i686-snappy' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+          # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
+          # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
+          # source in the next step. zstd/lz4 are still packaged for i686.
+          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+
+      - name: Build snappy from source (MinGW x86)
+        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+        shell: msys2 {0}
+        run: |
+          # MSYS2 dropped mingw-w64-i686-snappy when it deprecated MINGW32
+          # (Oct 2024). Build snappy 1.2.2 from source and install into
+          # /mingw32 so pkg-config picks up snappy.pc during cmake configure.
+          git clone --depth 1 --branch 1.2.2 https://github.com/google/snappy.git /tmp/snappy
+          cd /tmp/snappy
+          cmake -S . -B build -G "MinGW Makefiles" \
+            -DCMAKE_INSTALL_PREFIX=/mingw32 \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build build --config Release
+          cmake --install build
 
       - name: Configure CMake (Linux/macOS x64)
         if: runner.os != 'Windows' && matrix.arch == 'x64'
@@ -592,7 +612,27 @@ jobs:
         with:
           msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
           update: false
-          install: ${{ matrix.arch == 'x86' && 'mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4 mingw-w64-i686-snappy' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+          # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
+          # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
+          # source in the next step. zstd/lz4 are still packaged for i686.
+          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+
+      - name: Build snappy from source (MinGW x86)
+        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+        shell: msys2 {0}
+        run: |
+          # MSYS2 dropped mingw-w64-i686-snappy when it deprecated MINGW32
+          # (Oct 2024). Build snappy 1.2.2 from source and install into
+          # /mingw32 so pkg-config picks up snappy.pc during cmake configure.
+          git clone --depth 1 --branch 1.2.2 https://github.com/google/snappy.git /tmp/snappy
+          cd /tmp/snappy
+          cmake -S . -B build -G "MinGW Makefiles" \
+            -DCMAKE_INSTALL_PREFIX=/mingw32 \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build build --config Release
+          cmake --install build
       
       - name: Build TidesDB (Windows MinGW)
         if: matrix.compiler == 'mingw'
@@ -1068,7 +1108,27 @@ jobs:
         with:
           msystem: ${{ matrix.arch == 'x86' && 'MINGW32' || 'MINGW64' }}
           update: false
-          install: ${{ matrix.arch == 'x86' && 'mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4 mingw-w64-i686-snappy' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+          # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
+          # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
+          # source in the next step. zstd/lz4 are still packaged for i686.
+          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+
+      - name: Build snappy from source (MinGW x86)
+        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+        shell: msys2 {0}
+        run: |
+          # MSYS2 dropped mingw-w64-i686-snappy when it deprecated MINGW32
+          # (Oct 2024). Build snappy 1.2.2 from source and install into
+          # /mingw32 so pkg-config picks up snappy.pc during cmake configure.
+          git clone --depth 1 --branch 1.2.2 https://github.com/google/snappy.git /tmp/snappy
+          cd /tmp/snappy
+          cmake -S . -B build -G "MinGW Makefiles" \
+            -DCMAKE_INSTALL_PREFIX=/mingw32 \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build build --config Release
+          cmake --install build
 
       - name: Build TidesDB (Windows MinGW)
         if: matrix.compiler == 'mingw'

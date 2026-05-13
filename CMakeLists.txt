@@ -125,14 +125,21 @@ set_target_properties(tidesdb PROPERTIES
 
 target_include_directories(tidesdb PRIVATE src)
 
-# find compression libraries (use CONFIG mode on Windows with vcpkg)
+# find compression libraries.
+# MSVC builds rely on vcpkg, which ships full CMake config packages.
+# MinGW (MSYS2) packages ship pkg-config (.pc) files but not always CMake
+# configs (e.g. lz4 has no lz4Config.cmake under MSYS2), so use PkgConfig
+# there. winpthreads is bundled with the MinGW toolchain — link -lpthread.
 if(WIN32)
-    find_package(zstd CONFIG REQUIRED)
-    find_package(Snappy CONFIG REQUIRED)
-    find_package(lz4 CONFIG REQUIRED)
-    # PThreads4W is a vcpkg-only package; MinGW (MSYS2) bundles winpthreads
-    # in the toolchain, so we link plain `pthread` for MinGW below.
-    if(NOT MINGW)
+    if(MINGW)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+        pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+        pkg_check_modules(SNAPPY REQUIRED IMPORTED_TARGET snappy)
+    else()
+        find_package(zstd CONFIG REQUIRED)
+        find_package(Snappy CONFIG REQUIRED)
+        find_package(lz4 CONFIG REQUIRED)
         find_package(PThreads4W REQUIRED)
     endif()
 endif()
@@ -234,15 +241,20 @@ if(APPLE)
 
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
-    target_link_libraries(tidesdb PUBLIC
-            $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
-            Snappy::snappy
-            lz4::lz4
-    )
     if(MINGW)
-        target_link_libraries(tidesdb PUBLIC pthread)
+        target_link_libraries(tidesdb PUBLIC
+                PkgConfig::ZSTD
+                PkgConfig::LZ4
+                PkgConfig::SNAPPY
+                pthread
+        )
     else()
-        target_link_libraries(tidesdb PUBLIC PThreads4W::PThreads4W)
+        target_link_libraries(tidesdb PUBLIC
+                $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
+                Snappy::snappy
+                lz4::lz4
+                PThreads4W::PThreads4W
+        )
     endif()
 
     if(TIDESDB_WITH_MIMALLOC)

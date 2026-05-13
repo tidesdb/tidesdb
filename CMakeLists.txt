@@ -656,30 +656,60 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)
-        # determine vcpkg triplet based on target architecture
-        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-            set(VCPKG_TARGET_TRIPLET "x64-windows")
+        set(TIDESDB_TEST_TARGETS
+                block_manager_tests skip_list_tests compress_tests bloom_filter_tests
+                manifest_tests queue_tests tidesdb_tests tidesdb_bench)
+
+        if(MINGW)
+            # On MinGW (MSYS2), the test exes link against shared snappy/zstd/lz4
+            # plus the MinGW C/C++ runtimes. Copy the DLLs next to each exe so
+            # Windows loads them from the exe directory and we do not depend on
+            # PATH order (the runner has multiple gcc toolchains on PATH).
+            set(MINGW_RUNTIME_BIN "$ENV{MINGW_PREFIX}/bin")
+            file(GLOB MINGW_RUNTIME_DLLS
+                    "${MINGW_RUNTIME_BIN}/libsnappy*.dll"
+                    "${MINGW_RUNTIME_BIN}/libzstd*.dll"
+                    "${MINGW_RUNTIME_BIN}/liblz4*.dll"
+                    "${MINGW_RUNTIME_BIN}/libstdc++*.dll"
+                    "${MINGW_RUNTIME_BIN}/libgcc_s*.dll"
+                    "${MINGW_RUNTIME_BIN}/libwinpthread*.dll"
+            )
+            if(MINGW_RUNTIME_DLLS)
+                foreach(test_target ${TIDESDB_TEST_TARGETS})
+                    add_custom_command(TARGET ${test_target} POST_BUILD
+                            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            ${MINGW_RUNTIME_DLLS}
+                            $<TARGET_FILE_DIR:${test_target}>
+                            COMMENT "Copying MinGW runtime DLLs to ${test_target} directory"
+                    )
+                endforeach()
+            endif()
         else()
-            set(VCPKG_TARGET_TRIPLET "x86-windows")
-        endif()
+            # determine vcpkg triplet based on target architecture
+            if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+                set(VCPKG_TARGET_TRIPLET "x64-windows")
+            else()
+                set(VCPKG_TARGET_TRIPLET "x86-windows")
+            endif()
 
-        # get DLLs from the correct vcpkg directory
-        file(GLOB VCPKG_DLLS
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll"
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
-        )
+            # get DLLs from the correct vcpkg directory
+            file(GLOB VCPKG_DLLS
+                    "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll"
+                    "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
+            )
 
-        # only proceed if we found DLLs
-        if(VCPKG_DLLS)
-            # copy DLLs to build directory after building tests
-            foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests queue_tests tidesdb_tests tidesdb_bench)
-                add_custom_command(TARGET ${test_target} POST_BUILD
-                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        ${VCPKG_DLLS}
-                        $<TARGET_FILE_DIR:${test_target}>
-                        COMMENT "Copying DLLs to ${test_target} directory"
-                )
-            endforeach()
+            # only proceed if we found DLLs
+            if(VCPKG_DLLS)
+                # copy DLLs to build directory after building tests
+                foreach(test_target ${TIDESDB_TEST_TARGETS})
+                    add_custom_command(TARGET ${test_target} POST_BUILD
+                            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            ${VCPKG_DLLS}
+                            $<TARGET_FILE_DIR:${test_target}>
+                            COMMENT "Copying DLLs to ${test_target} directory"
+                    )
+                endforeach()
+            endif()
         endif()
     endif()
 endif()

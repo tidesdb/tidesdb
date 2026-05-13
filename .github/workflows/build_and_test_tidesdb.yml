@@ -254,22 +254,24 @@ jobs:
           # subsequent bash/pwsh steps (notably `ctest`) can locate the
           # compression DLLs at runtime; without this we hit STATUS_DLL_NOT_FOUND.
           path-type: inherit
-          # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
-          # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
-          # source in the next step. zstd/lz4 are still packaged for i686.
-          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+          # snappy is built from source for both arches in the next step (see
+          # there for why), so MSYS2's prebuilt snappy package is not installed.
+          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'git mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4' }}
 
-      - name: Build snappy from source (MinGW x86)
-        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+      - name: Build snappy from source (MinGW)
+        if: matrix.compiler == 'mingw'
         shell: msys2 {0}
         run: |
-          # MSYS2 dropped mingw-w64-i686-snappy when it deprecated MINGW32
-          # (Oct 2024). Build snappy 1.2.2 from source and install into
-          # /mingw32 so pkg-config picks up snappy.pc during cmake configure.
+          # Build snappy 1.2.2 from source for both arches so the two legs use
+          # an identical snappy: shared libsnappy.dll plus SnappyConfig.cmake
+          # pointing at the shared variant. MSYS2 dropped mingw-w64-i686-snappy
+          # in Oct 2024 (no x86 package at all), and its prebuilt x64 package
+          # ships only the static C++ archive which fails to link from our
+          # C-only test exes. Building ourselves keeps both legs consistent.
           git clone --depth 1 --branch 1.2.2 https://github.com/google/snappy.git /tmp/snappy
           cd /tmp/snappy
           cmake -S . -B build -G "MinGW Makefiles" \
-            -DCMAKE_INSTALL_PREFIX=/mingw32 \
+            -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX" \
             -DSNAPPY_BUILD_TESTS=OFF \
             -DSNAPPY_BUILD_BENCHMARKS=OFF \
             -DBUILD_SHARED_LIBS=ON
@@ -402,6 +404,29 @@ jobs:
       - name: Build
         if: matrix.compiler != 'mingw'
         run: cmake --build build --config Release
+
+      # Diagnostic: dumps PATH and the actual DLL deps of compress_tests.exe
+      # so we can see which DLL is being resolved if a test fails at load.
+      # Safe to remove once MinGW CI has been green for a release cycle.
+      - name: Diagnose MinGW runtime DLL resolution
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
+        run: |
+          echo "=== MSYSTEM and MINGW_PREFIX ==="
+          echo "MSYSTEM=$MSYSTEM  MINGW_PREFIX=$MINGW_PREFIX"
+          echo "=== PATH ==="
+          echo "$PATH" | tr ':' '\n'
+          echo "=== which ctest / gcc ==="
+          which ctest gcc || true
+          echo "=== build/ contents (exes + dlls) ==="
+          ls -la build/*.exe build/*.dll 2>/dev/null | head -40
+          echo "=== Imported DLLs of compress_tests.exe ==="
+          objdump -p build/compress_tests.exe 2>/dev/null | grep -i 'DLL Name' || true
+          echo "=== libsnappy.dll location (file + arch) ==="
+          for d in "$MINGW_PREFIX/bin" /c/Strawberry/c/bin /mingw32/bin /mingw64/bin; do
+            [ -e "$d/libsnappy.dll" ] && file "$d/libsnappy.dll" || true
+            [ -e "$d/libstdc++-6.dll" ] && file "$d/libstdc++-6.dll" || true
+          done
 
       - name: Run tests
         shell: bash
@@ -620,22 +645,24 @@ jobs:
           # subsequent bash/pwsh steps (notably `ctest`) can locate the
           # compression DLLs at runtime; without this we hit STATUS_DLL_NOT_FOUND.
           path-type: inherit
-          # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
-          # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
-          # source in the next step. zstd/lz4 are still packaged for i686.
-          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+          # snappy is built from source for both arches in the next step (see
+          # there for why), so MSYS2's prebuilt snappy package is not installed.
+          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'git mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4' }}
 
-      - name: Build snappy from source (MinGW x86)
-        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+      - name: Build snappy from source (MinGW)
+        if: matrix.compiler == 'mingw'
         shell: msys2 {0}
         run: |
-          # MSYS2 dropped mingw-w64-i686-snappy when it deprecated MINGW32
-          # (Oct 2024). Build snappy 1.2.2 from source and install into
-          # /mingw32 so pkg-config picks up snappy.pc during cmake configure.
+          # Build snappy 1.2.2 from source for both arches so the two legs use
+          # an identical snappy: shared libsnappy.dll plus SnappyConfig.cmake
+          # pointing at the shared variant. MSYS2 dropped mingw-w64-i686-snappy
+          # in Oct 2024 (no x86 package at all), and its prebuilt x64 package
+          # ships only the static C++ archive which fails to link from our
+          # C-only test exes. Building ourselves keeps both legs consistent.
           git clone --depth 1 --branch 1.2.2 https://github.com/google/snappy.git /tmp/snappy
           cd /tmp/snappy
           cmake -S . -B build -G "MinGW Makefiles" \
-            -DCMAKE_INSTALL_PREFIX=/mingw32 \
+            -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX" \
             -DSNAPPY_BUILD_TESTS=OFF \
             -DSNAPPY_BUILD_BENCHMARKS=OFF \
             -DBUILD_SHARED_LIBS=ON
@@ -1120,22 +1147,24 @@ jobs:
           # subsequent bash/pwsh steps (notably `ctest`) can locate the
           # compression DLLs at runtime; without this we hit STATUS_DLL_NOT_FOUND.
           path-type: inherit
-          # NOTE: mingw-w64-i686-snappy was dropped when MSYS2 deprecated the
-          # MINGW32 environment (Oct 2024). The x86 leg builds snappy from
-          # source in the next step. zstd/lz4 are still packaged for i686.
-          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4 mingw-w64-x86_64-snappy' }}
+          # snappy is built from source for both arches in the next step (see
+          # there for why), so MSYS2's prebuilt snappy package is not installed.
+          install: ${{ matrix.arch == 'x86' && 'git mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-make mingw-w64-i686-pkgconf mingw-w64-i686-zstd mingw-w64-i686-lz4' || 'git mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zstd mingw-w64-x86_64-lz4' }}
 
-      - name: Build snappy from source (MinGW x86)
-        if: matrix.compiler == 'mingw' && matrix.arch == 'x86'
+      - name: Build snappy from source (MinGW)
+        if: matrix.compiler == 'mingw'
         shell: msys2 {0}
         run: |
-          # MSYS2 dropped mingw-w64-i686-snappy when it deprecated MINGW32
-          # (Oct 2024). Build snappy 1.2.2 from source and install into
-          # /mingw32 so pkg-config picks up snappy.pc during cmake configure.
+          # Build snappy 1.2.2 from source for both arches so the two legs use
+          # an identical snappy: shared libsnappy.dll plus SnappyConfig.cmake
+          # pointing at the shared variant. MSYS2 dropped mingw-w64-i686-snappy
+          # in Oct 2024 (no x86 package at all), and its prebuilt x64 package
+          # ships only the static C++ archive which fails to link from our
+          # C-only test exes. Building ourselves keeps both legs consistent.
           git clone --depth 1 --branch 1.2.2 https://github.com/google/snappy.git /tmp/snappy
           cd /tmp/snappy
           cmake -S . -B build -G "MinGW Makefiles" \
-            -DCMAKE_INSTALL_PREFIX=/mingw32 \
+            -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX" \
             -DSNAPPY_BUILD_TESTS=OFF \
             -DSNAPPY_BUILD_BENCHMARKS=OFF \
             -DBUILD_SHARED_LIBS=ON

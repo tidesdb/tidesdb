@@ -1221,6 +1221,9 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
                                                 uint64_t *file_position);
 static int compact_block_index_find_slot(const tidesdb_block_index_t *index, const uint8_t *key,
                                          size_t key_len, int64_t *slot);
+static uint32_t compact_block_index_run_length(const tidesdb_block_index_t *index,
+                                               const uint8_t *key, size_t key_len,
+                                               int64_t start_slot);
 static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *min_key,
                                    size_t min_key_len, const uint8_t *max_key, size_t max_key_len,
                                    uint64_t file_position);
@@ -7578,25 +7581,36 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
      * + deserialize + cache_put). */
     uint64_t start_file_position = 0;
     int block_index_definitive = 0;
+    uint64_t block_index_run_len = 0;
     if (sst->block_indexes && sst->block_indexes->count > 0)
     {
-        const int index_result = compact_block_index_find_predecessor(
-            sst->block_indexes, key, key_size, &start_file_position);
-        if (index_result == 0)
+        int64_t start_slot = 0;
+        if (compact_block_index_find_slot(sst->block_indexes, key, key_size, &start_slot) == 0)
         {
+            start_file_position = sst->block_indexes->file_positions[start_slot];
+            /* the prefix index is lossy -- keys sharing a prefix longer than
+             * prefix_len span multiple blocks with identical min/max prefixes.
+             * the run length is how many consecutive blocks the lookup must
+             * scan to be definitive, not just the first */
+            block_index_run_len =
+                compact_block_index_run_length(sst->block_indexes, key, key_size, start_slot);
             /* block index covers all blocks when count matches num_klog_blocks
              * (index_sample_ratio == 1). in this case the lookup is definitive:
-             * if the key isn't in the pointed block, it's not in the sstable. */
+             * scanning the prefix-colliding run is enough -- if the key isn't in
+             * any block of the run, it's not in the sstable. */
             block_index_definitive =
                 (sst->block_indexes->count >= sst->num_klog_blocks && start_file_position > 0);
         }
     }
 
     /* when the file is frozen (not local) and the block index gives us a definitive
-     * position, use range_get to fetch just that one block from the object store
-     * instead of downloading the entire sstable file. this turns a multi-second
-     * full-file download into a single ~50ms HTTP range request for 64KB. */
-    if (db->object_store && block_index_definitive && start_file_position > 0 && !sst->klog_bm)
+     * single-block position, use range_get to fetch just that one block from the
+     * object store instead of downloading the entire sstable file. this turns a
+     * multi-second full-file download into a single ~50ms HTTP range request for
+     * 64KB. only valid when the prefix-colliding run is a single block -- a longer
+     * run needs the full-download scan path below to cover every candidate block. */
+    if (db->object_store && block_index_definitive && start_file_position > 0 &&
+        block_index_run_len <= 1 && !sst->klog_bm)
     {
         struct stat local_st;
         if (stat(sst->klog_path, &local_st) != 0)
@@ -7761,9 +7775,12 @@ full_download_path:
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* when block index is definitive, we read exactly one block and search it.
-     * this is O(1) disk reads per point lookup instead of O(N) scan. */
-    const uint64_t max_blocks_to_scan = block_index_definitive ? 1 : sst->num_klog_blocks;
+    /* when block index is definitive we scan the prefix-colliding run -- one
+     * block for unique prefixes, a short contiguous run when keys share a prefix
+     * longer than prefix_len. still O(1) disk reads in the common case instead
+     * of the O(N) full scan. */
+    const uint64_t max_blocks_to_scan =
+        block_index_definitive ? block_index_run_len : sst->num_klog_blocks;
 
     uint64_t blocks_scanned = 0;
 
@@ -30343,129 +30360,17 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
 }
 
 /**
- * compact_block_index_find_predecessor
- * finds the block that should contain the given key using binary search
- *
- * algorithm:
- * 1. early exit if key < first blocks min_key (return first block)
- * 2. binary search for rightmost block where min_key <= search_key <= max_key
- * 3. if no exact range match, fallback to last block where min_key <= search_key
- *
- * this ensures we always start searching from the correct block, avoiding
- * false negatives when keys fall between indexed blocks or at block boundaries.
- *
- * @param index the block index to search
- * @param key the search key
- * @param key_len length of the search key
- * @param file_position output parameter for the found block file position
- * @return 0 on success, -1 if no suitable block found
- */
-static int compact_block_index_find_predecessor(const tidesdb_block_index_t *index,
-                                                const uint8_t *key, const size_t key_len,
-                                                uint64_t *file_position)
-{
-    if (!index || !key || index->count == 0) return -1;
-
-    uint8_t search_prefix[TDB_BLOCK_INDEX_PREFIX_MAX];
-    const size_t copy_len = (key_len < index->prefix_len) ? key_len : index->prefix_len;
-    memcpy(search_prefix, key, copy_len);
-    if (copy_len < index->prefix_len)
-    {
-        memset(search_prefix + copy_len, 0, index->prefix_len - copy_len);
-    }
-
-    /* we check if key is before first block */
-    const uint8_t *first_min = index->min_key_prefixes;
-    int cmp_first;
-    if (index->comparator)
-    {
-        cmp_first = index->comparator(search_prefix, index->prefix_len, first_min,
-                                      index->prefix_len, index->comparator_ctx);
-    }
-    else
-    {
-        cmp_first = memcmp(search_prefix, first_min, index->prefix_len);
-    }
-
-    if (cmp_first < 0)
-    {
-        *file_position = index->file_positions[0];
-        return 0;
-    }
-
-    /* we utilize binary search to find the rightmost block where min_key <= search_key <= max_key
-     * or the last block where min_key <= search_key if no exact range match */
-    int64_t left = 0;
-    int64_t right = index->count - 1;
-    int64_t exact_match = -1;
-    int64_t fallback = -1;
-
-    while (left <= right)
-    {
-        const int64_t mid = left + (right - left) / 2;
-        const uint8_t *mid_min_prefix = index->min_key_prefixes + (mid * index->prefix_len);
-        const uint8_t *mid_max_prefix = index->max_key_prefixes + (mid * index->prefix_len);
-
-        /* we compare search key with blocks min and max keys */
-        int cmp_min, cmp_max;
-        if (index->comparator)
-        {
-            cmp_min = index->comparator(mid_min_prefix, index->prefix_len, search_prefix,
-                                        index->prefix_len, index->comparator_ctx);
-            cmp_max = index->comparator(search_prefix, index->prefix_len, mid_max_prefix,
-                                        index->prefix_len, index->comparator_ctx);
-        }
-        else
-        {
-            cmp_min = memcmp(mid_min_prefix, search_prefix, index->prefix_len);
-            cmp_max = memcmp(search_prefix, mid_max_prefix, index->prefix_len);
-        }
-
-        if (cmp_min <= 0)
-        {
-            /* min_key <= search_key, keep it as fallback candidate */
-            fallback = mid;
-
-            if (cmp_max <= 0)
-            {
-                /* key lies inside this block; we must remember and search right for the rightmost
-                 * match */
-                exact_match = mid;
-                left = mid + 1;
-            }
-            else
-            {
-                /* search_key > max_key -- we need to search right for a tighter block */
-                left = mid + 1;
-            }
-        }
-        else
-        {
-            /* search_key < min_key -- we need to search left */
-            right = mid - 1;
-        }
-    }
-
-    if (exact_match >= 0)
-    {
-        *file_position = index->file_positions[exact_match];
-        return 0;
-    }
-
-    if (fallback >= 0)
-    {
-        *file_position = index->file_positions[fallback];
-        return 0;
-    }
-
-    return -1; /* no predecessor found */
-}
-
-/**
  * compact_block_index_find_slot
- * finds the index slot that should contain the given key using binary search
- * same algorithm as compact_block_index_find_predecessor but returns the slot
- * number instead of a file position
+ * finds the leftmost block that could contain the given key using binary search
+ *
+ * the block index is lossy -- it stores only the first prefix_len bytes of each
+ * block's min/max key. when several keys share a prefix longer than prefix_len
+ * they can span multiple klog blocks that all have identical min/max prefixes.
+ * returning the rightmost prefix match would overshoot the block that actually
+ * holds the key, so this finds the leftmost block whose max prefix is >= the
+ * search prefix -- the first block that could hold the key or a key after it.
+ * callers needing a definitive answer scan the prefix-colliding run forward
+ * from here via compact_block_index_run_length.
  *
  * @param index the block index to search
  * @param key the search key
@@ -30486,83 +30391,121 @@ static int compact_block_index_find_slot(const tidesdb_block_index_t *index, con
         memset(search_prefix + copy_len, 0, index->prefix_len - copy_len);
     }
 
-    /* we check if key is before first block */
-    const uint8_t *first_min = index->min_key_prefixes;
-    int cmp_first;
-    if (index->comparator)
-    {
-        cmp_first = index->comparator(search_prefix, index->prefix_len, first_min,
-                                      index->prefix_len, index->comparator_ctx);
-    }
-    else
-    {
-        cmp_first = memcmp(search_prefix, first_min, index->prefix_len);
-    }
-
-    if (cmp_first < 0)
-    {
-        *slot = 0;
-        return 0;
-    }
-
     int64_t left = 0;
-    int64_t right = index->count - 1;
-    int64_t exact_match = -1;
-    int64_t fallback = -1;
+    int64_t right = (int64_t)index->count - 1;
+    int64_t candidate = -1;
 
     while (left <= right)
     {
         const int64_t mid = left + (right - left) / 2;
-        const uint8_t *mid_min_prefix = index->min_key_prefixes + (mid * index->prefix_len);
         const uint8_t *mid_max_prefix = index->max_key_prefixes + (mid * index->prefix_len);
 
-        int cmp_min, cmp_max;
+        int cmp_max;
         if (index->comparator)
         {
-            cmp_min = index->comparator(mid_min_prefix, index->prefix_len, search_prefix,
-                                        index->prefix_len, index->comparator_ctx);
             cmp_max = index->comparator(search_prefix, index->prefix_len, mid_max_prefix,
                                         index->prefix_len, index->comparator_ctx);
         }
         else
         {
-            cmp_min = memcmp(mid_min_prefix, search_prefix, index->prefix_len);
             cmp_max = memcmp(search_prefix, mid_max_prefix, index->prefix_len);
         }
 
-        if (cmp_min <= 0)
+        if (cmp_max <= 0)
         {
-            fallback = mid;
-
-            if (cmp_max <= 0)
-            {
-                exact_match = mid;
-                left = mid + 1;
-            }
-            else
-            {
-                left = mid + 1;
-            }
+            /* search_prefix <= max_prefix[mid] -- mid could hold the key; keep it
+             * and look left for an earlier block that also could */
+            candidate = mid;
+            right = mid - 1;
         }
         else
         {
-            right = mid - 1;
+            /* search_prefix > max_prefix[mid] -- the key sorts past this block */
+            left = mid + 1;
         }
     }
 
-    if (exact_match >= 0)
+    /* if no block has max_prefix >= search_prefix the key sorts past every
+     * indexed block; fall back to the last block so iterators position at the
+     * end and point lookups scan it and find nothing */
+    *slot = (candidate >= 0) ? candidate : (int64_t)index->count - 1;
+    return 0;
+}
+
+/**
+ * compact_block_index_find_predecessor
+ * thin wrapper over compact_block_index_find_slot that returns the file
+ * position of the leftmost block that could contain the key
+ *
+ * @param index the block index to search
+ * @param key the search key
+ * @param key_len length of the search key
+ * @param file_position output parameter for the found block file position
+ * @return 0 on success, -1 if no suitable block found
+ */
+static int compact_block_index_find_predecessor(const tidesdb_block_index_t *index,
+                                                const uint8_t *key, const size_t key_len,
+                                                uint64_t *file_position)
+{
+    int64_t slot = 0;
+    if (compact_block_index_find_slot(index, key, key_len, &slot) != 0) return -1;
+    *file_position = index->file_positions[slot];
+    return 0;
+}
+
+/**
+ * compact_block_index_run_length
+ * counts the prefix-colliding run starting at start_slot -- the number of
+ * consecutive blocks whose min prefix is <= the search prefix. because the
+ * prefix index is lossy a definitive point lookup must scan every block in
+ * this run, not just the first, since the index cannot tell which one holds
+ * the key. returns at least 1 so the caller always scans the starting block.
+ *
+ * @param index the block index to search
+ * @param key the search key
+ * @param key_len length of the search key
+ * @param start_slot leftmost candidate slot from compact_block_index_find_slot
+ * @return number of consecutive candidate blocks, 0 if start_slot is invalid
+ */
+static uint32_t compact_block_index_run_length(const tidesdb_block_index_t *index,
+                                               const uint8_t *key, const size_t key_len,
+                                               const int64_t start_slot)
+{
+    if (!index || !key || start_slot < 0 || (uint32_t)start_slot >= index->count) return 0;
+
+    uint8_t search_prefix[TDB_BLOCK_INDEX_PREFIX_MAX];
+    const size_t copy_len = (key_len < index->prefix_len) ? key_len : index->prefix_len;
+    memcpy(search_prefix, key, copy_len);
+    if (copy_len < index->prefix_len)
     {
-        *slot = exact_match;
-        return 0;
+        memset(search_prefix + copy_len, 0, index->prefix_len - copy_len);
     }
 
-    if (fallback >= 0)
+    uint32_t run = 0;
+    for (uint32_t s = (uint32_t)start_slot; s < index->count; s++)
     {
-        *slot = fallback;
-        return 0;
+        const uint8_t *min_prefix = index->min_key_prefixes + (s * index->prefix_len);
+        int cmp_min;
+        if (index->comparator)
+        {
+            cmp_min = index->comparator(min_prefix, index->prefix_len, search_prefix,
+                                        index->prefix_len, index->comparator_ctx);
+        }
+        else
+        {
+            cmp_min = memcmp(min_prefix, search_prefix, index->prefix_len);
+        }
+
+        /* min_prefix > search_prefix -- the key sorts before this block, so it
+         * cannot be in this block or any later one; the run ends here */
+        if (cmp_min > 0) break;
+        run++;
     }
 
-    return -1;
+    /* a gap (start_slot's min prefix already past the search prefix) still scans
+     * one block so the in-block search can report not found consistently */
+    if (run == 0) run = 1;
+    return run;
 }
 
 /**

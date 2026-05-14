@@ -217,6 +217,9 @@ typedef struct skip_list_t
  * @param current current node position
  * @param cached_header cached header sentinel for fast boundary checks
  * @param cached_tail cached tail sentinel for fast boundary checks
+ * @param current_version current version on the current node; NULL means use head.
+ *                        advanced by skip_list_cursor_advance_in_node and reset on
+ *                        every cursor seek/next/prev
  */
 typedef struct
 {
@@ -224,6 +227,7 @@ typedef struct
     skip_list_node_t *current;
     skip_list_node_t *cached_header;
     skip_list_node_t *cached_tail;
+    skip_list_version_t *current_version;
 } skip_list_cursor_t;
 
 /**
@@ -602,6 +606,17 @@ int skip_list_cursor_next_get(skip_list_cursor_t *cursor, uint8_t **key, size_t 
 int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
                                   uint8_t **value, size_t *value_size, int64_t *ttl,
                                   uint8_t *deleted, uint64_t *seq);
+
+/**
+ * skip_list_cursor_advance_in_node
+ * advance the cursor to the next-older version on the current node without moving
+ * to the next key. used by mvcc readers and flushers that need every version still
+ * visible to an active snapshot, not just the latest. resets to head on the next
+ * cursor seek/next/prev.
+ * @param cursor cursor
+ * @return 0 on success, -1 when the version chain on the current node is exhausted
+ */
+int skip_list_cursor_advance_in_node(skip_list_cursor_t *cursor);
 
 /**
  * skip_list_cursor_free

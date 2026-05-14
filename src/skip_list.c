@@ -1433,6 +1433,7 @@ int skip_list_cursor_init(skip_list_cursor_t **cursor, skip_list_t *list)
     (*cursor)->cached_tail = atomic_load_explicit(&list->tail, memory_order_acquire);
     (*cursor)->current =
         atomic_load_explicit(&(*cursor)->cached_header->forward[0], memory_order_acquire);
+    (*cursor)->current_version = NULL;
     return 0;
 }
 
@@ -1454,6 +1455,7 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor)
     if (cursor->current == cursor->cached_tail) return -1;
 
     cursor->current = atomic_load_explicit(&cursor->current->forward[0], memory_order_acquire);
+    cursor->current_version = NULL;
     if (cursor->current == NULL || cursor->current == cursor->cached_tail) return -1;
 
     /* we prefetch next node, its key, and its version to hide memory latency */
@@ -1477,6 +1479,7 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor)
 
     cursor->current = atomic_load_explicit(
         &BACKWARD_PTR(cursor->current, 0, cursor->current->level), memory_order_acquire);
+    cursor->current_version = NULL;
     if (cursor->current == NULL || cursor->current == cursor->cached_header) return -1;
 
     /* we prefetch backward neighbor and version for the current node */
@@ -1492,6 +1495,27 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor)
     return 0;
 }
 
+int skip_list_cursor_advance_in_node(skip_list_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->current == NULL) return -1;
+    if (cursor->current == cursor->cached_header || cursor->current == cursor->cached_tail)
+        return -1;
+
+    /* if no version was selected yet, the next-older sits behind the head; otherwise
+     * walk the chain pointer from the version we are currently parked on */
+    skip_list_version_t *cur =
+        cursor->current_version
+            ? cursor->current_version
+            : atomic_load_explicit(&cursor->current->versions, memory_order_acquire);
+    if (cur == NULL) return -1;
+
+    skip_list_version_t *next_older = atomic_load_explicit(&cur->next, memory_order_acquire);
+    if (next_older == NULL) return -1;
+
+    cursor->current_version = next_older;
+    return 0;
+}
+
 int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
                          uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted)
 {
@@ -1503,7 +1527,9 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
     *key_size = cursor->current->key_size;
 
     skip_list_version_t *version =
-        atomic_load_explicit(&cursor->current->versions, memory_order_acquire);
+        cursor->current_version
+            ? cursor->current_version
+            : atomic_load_explicit(&cursor->current->versions, memory_order_acquire);
     if (version == NULL) return -1;
 
     if (ttl != NULL) *ttl = version->ttl;
@@ -1535,7 +1561,9 @@ int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, siz
     *key_size = cursor->current->key_size;
 
     skip_list_version_t *version =
-        atomic_load_explicit(&cursor->current->versions, memory_order_acquire);
+        cursor->current_version
+            ? cursor->current_version
+            : atomic_load_explicit(&cursor->current->versions, memory_order_acquire);
     if (version == NULL) return -1;
 
     if (ttl != NULL) *ttl = version->ttl;
@@ -1573,6 +1601,7 @@ int skip_list_cursor_next_get(skip_list_cursor_t *cursor, uint8_t **key, size_t 
 
     /* we advance to next node */
     cursor->current = atomic_load_explicit(&cursor->current->forward[0], memory_order_acquire);
+    cursor->current_version = NULL;
     if (cursor->current == NULL || cursor->current == cursor->cached_tail) return -1;
 
     /* we prefetch next node for the next call to this function */
@@ -1652,6 +1681,7 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor)
     if (last == NULL || NODE_IS_SENTINEL(last)) return -1;
 
     cursor->current = last;
+    cursor->current_version = NULL;
     return 0;
 }
 
@@ -1662,6 +1692,7 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
         atomic_load_explicit(&cursor->cached_header->forward[0], memory_order_acquire);
     if (first == NULL || NODE_IS_SENTINEL(first)) return -1;
     cursor->current = first;
+    cursor->current_version = NULL;
     return 0;
 }
 
@@ -1714,6 +1745,7 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
     /* we position cursor at the node before target
      * caller must call skip_list_cursor_next() to access first key >= target */
     cursor->current = current;
+    cursor->current_version = NULL;
     return 0;
 }
 
@@ -1757,10 +1789,12 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
     {
         /* no key <= target exists, cursor is invalid */
         cursor->current = current;
+        cursor->current_version = NULL;
         return 0;
     }
 
     cursor->current = current;
+    cursor->current_version = NULL;
     return 0;
 }
 

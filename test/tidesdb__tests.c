@@ -25488,6 +25488,156 @@ static void test_perf_cached_iter_seek(void)
     cleanup_test_dir();
 }
 
+static void test_block_index_shared_prefix(void)
+{
+    /* keys that share a prefix longer than block_index_prefix_len span multiple
+     * klog blocks whose min/max prefixes are all identical. the block index
+     * search must land on the leftmost such block and the lookup must scan the
+     * whole prefix-colliding run -- otherwise point lookups and seeks for keys
+     * in any but the overshot block return a false NOT_FOUND. */
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    /* default cf config -- block_index_prefix_len 16, index_sample_ratio 1,
+     * block indexes enabled. small write buffer + padded values force the
+     * shared-prefix keys across many blocks. */
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 16 * 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    ASSERT_EQ(tidesdb_create_column_family(db, "bidx_prefix_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_prefix_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* 24 byte prefix -- longer than the 16 byte block_index_prefix_len */
+    static const char SHARED[] = "shared_prefix_blockidx__";
+    const int SHARED_KEYS = 3000;
+    const int UNIQUE_KEYS = 500;
+
+    char value[160];
+    memset(value, 'V', sizeof(value));
+    value[sizeof(value) - 1] = '\0';
+
+    for (int i = 0; i < SHARED_KEYS; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "%s%08d", SHARED, i);
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  sizeof(value), 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+    for (int i = 0; i < UNIQUE_KEYS; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "u%08d_uniqueprefix", i);
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  sizeof(value), 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+    int flush_settled = 0;
+    for (int w = 0; w < 1000; w++)
+    {
+        if (!tidesdb_is_flushing(cf))
+        {
+            flush_settled = 1;
+            break;
+        }
+        usleep(20000);
+    }
+    ASSERT_TRUE(flush_settled);
+    for (int w = 0; w < 1000; w++)
+    {
+        if (!tidesdb_is_compacting(cf)) break;
+        usleep(20000);
+    }
+
+    /* point lookups -- every shared-prefix key must be found */
+    int shared_found = 0;
+    for (int i = 0; i < SHARED_KEYS; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "%s%08d", SHARED, i);
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        uint8_t *val = NULL;
+        size_t vlen = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vlen) == 0 && val)
+        {
+            shared_found++;
+        }
+        free(val);
+        tidesdb_txn_rollback(txn);
+        tidesdb_txn_free(txn);
+    }
+    printf("  point lookups: %d / %d shared-prefix keys found\n", shared_found, SHARED_KEYS);
+    ASSERT_EQ(shared_found, SHARED_KEYS);
+
+    /* seeks -- iter_seek to each shared-prefix key must land on it exactly */
+    int shared_seeked = 0;
+    for (int i = 0; i < SHARED_KEYS; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "%s%08d", SHARED, i);
+        const size_t klen = strlen(key) + 1;
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+        if (tidesdb_iter_seek(iter, (uint8_t *)key, klen) == 0 && tidesdb_iter_valid(iter))
+        {
+            uint8_t *ik = NULL;
+            size_t ik_size = 0;
+            if (tidesdb_iter_key(iter, &ik, &ik_size) == 0 && ik_size == klen &&
+                memcmp(ik, key, klen) == 0)
+            {
+                shared_seeked++;
+            }
+        }
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+    }
+    printf("  seeks: %d / %d shared-prefix keys landed exactly\n", shared_seeked, SHARED_KEYS);
+    ASSERT_EQ(shared_seeked, SHARED_KEYS);
+
+    /* full forward scan must still see every committed key once */
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+        ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+        int scanned = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            scanned++;
+            tidesdb_iter_next(iter);
+        }
+        printf("  full scan: %d keys (expected %d)\n", scanned, SHARED_KEYS + UNIQUE_KEYS);
+        ASSERT_EQ(scanned, SHARED_KEYS + UNIQUE_KEYS);
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_objstore_fs_roundtrip(void)
 {
     cleanup_test_dir();
@@ -28309,6 +28459,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_iter_unflushed, tests_passed);
     RUN_TEST(test_unified_snapshot_commit, tests_passed);
     RUN_TEST(test_perf_cached_iter_seek, tests_passed);
+    RUN_TEST(test_block_index_shared_prefix, tests_passed);
     RUN_TEST(test_objstore_fs_roundtrip, tests_passed);
     RUN_TEST(test_objstore_cold_start, tests_passed);
     RUN_TEST(test_objstore_compaction_and_iterators, tests_passed);

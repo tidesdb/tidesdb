@@ -360,6 +360,10 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_REFCOUNT_DRAIN_SLEEP_US        10     /* sleep interval after yield threshold */
 #define TDB_REFCOUNT_DRAIN_LOG_INTERVAL    0xFFFF /* log warning every ~64K iterations */
 #define TDB_REFCOUNT_DRAIN_BASELINE        2      /* baseline refcount -- 1 original + 1 work ref */
+#define TDB_UNIFIED_REFCOUNT_DRAIN_BASELINE \
+    1 /* unified flush path adds no work ref -- baseline is original only */
+#define TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS \
+    16 /* bound on load+try_ref+revalidate retries when active is rotating */
 
 /* default L0/L1 management configuration */
 #define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
@@ -19453,13 +19457,22 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     /* in unified memtable mode the cf->active_memtable is a per-cf wrapper but
      * the real active memtable lives on db->unified_mt.  we rotate the unified
      * memtable so the current contents enqueue for flush, and then fall through
-     * to the per-cf flush path to cover any stragglers or immutable wrappers. */
+     * to the per-cf flush path to cover any stragglers or immutable wrappers.
+     * the rotate function requires unified_mt.is_flushing admission to prevent
+     * concurrent rotators from enqueueing the same memtable twice. if CAS fails
+     * another rotator is in progress and will cover this flush */
     if (cf->db && cf->db->config.unified_memtable)
     {
-        const int rot_rc = tidesdb_unified_memtable_rotate(cf->db);
-        if (rot_rc != TDB_SUCCESS && rot_rc != TDB_ERR_LOCKED)
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&cf->db->unified_mt.is_flushing, &expected, 1,
+                                                    memory_order_acquire, memory_order_relaxed))
         {
-            return rot_rc;
+            const int rot_rc = tidesdb_unified_memtable_rotate(cf->db);
+            atomic_store_explicit(&cf->db->unified_mt.is_flushing, 0, memory_order_release);
+            if (rot_rc != TDB_SUCCESS && rot_rc != TDB_ERR_LOCKED)
+            {
+                return rot_rc;
+            }
         }
     }
 
@@ -23025,6 +23038,37 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
 {
     if (!db || !umt_imm || !umt_imm->skip_list) return TDB_ERR_INVALID_ARGS;
 
+    /* we wait for all in-flight writers to finish before reading from memtable
+     * writers hold refcount while writing to WAL and skip_list
+     * we must wait for them to complete before closing the WAL
+     * refcount accounting -- 1 (original) = 1 baseline (no work ref in unified path) */
+    int drain_iterations = 0;
+    while (atomic_load_explicit(&umt_imm->refcount, memory_order_acquire) >
+           TDB_UNIFIED_REFCOUNT_DRAIN_BASELINE)
+    {
+        drain_iterations++;
+        if (drain_iterations < TDB_REFCOUNT_DRAIN_SPIN_THRESHOLD)
+        {
+            cpu_pause();
+        }
+        else if (drain_iterations < TDB_REFCOUNT_DRAIN_YIELD_THRESHOLD)
+        {
+            cpu_yield();
+        }
+        else
+        {
+            usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+        }
+        if ((drain_iterations & TDB_REFCOUNT_DRAIN_LOG_INTERVAL) == 0)
+        {
+            TDB_DEBUG_LOG(
+                TDB_LOG_WARN,
+                "Unified flush worker waiting for memtable refcount to drain (current=%d)",
+                atomic_load_explicit(&umt_imm->refcount, memory_order_acquire));
+        }
+    }
+    atomic_thread_fence(memory_order_acquire);
+
     skip_list_cursor_t *cursor = NULL;
     if (skip_list_cursor_init(&cursor, umt_imm->skip_list) != 0) return TDB_ERR_MEMORY;
 
@@ -23393,15 +23437,24 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     /* with the unified path, we do single WAL + single skip list */
     if (txn->db->unified_mt.enabled)
     {
-        tidesdb_memtable_t *umt =
-            atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-        if (!umt || !tidesdb_memtable_try_ref(umt))
+        /* we load + try_ref + revalidate active so a rotation that fires between our load
+         * and try_ref cannot leave us holding a retired memtable. without the revalidate
+         * the flush worker can race ahead and close umt->wal under our feet */
+        tidesdb_memtable_t *umt = NULL;
+        int umt_attempts = 0;
+        for (;;)
         {
             umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-            if (!umt || !tidesdb_memtable_try_ref(umt))
+            if (!umt) return TDB_ERR_UNKNOWN;
+            if (!tidesdb_memtable_try_ref(umt))
             {
-                return TDB_ERR_UNKNOWN;
+                if (++umt_attempts >= TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
+                continue;
             }
+            if (umt == atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire))
+                break;
+            atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
+            if (++umt_attempts >= TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
         }
 
         /* we serialize unified WAL batch */

@@ -297,6 +297,20 @@ typedef struct
     _Atomic(int32_t) readers;
 } tidesdb_imm_snap_t;
 
+/* one column family's persisted unified memtable index
+ * mirrors a line of the UNIMAP file. the index prefixes every key the cf
+ * writes into the shared unified skip_list and wal, so it must stay stable
+ * across reopen -- it is keyed on the cf name, the only cf identity that
+ * survives a crash
+ * @param name column family name
+ * @param index the unified_cf_index permanently assigned to that name
+ */
+typedef struct
+{
+    char name[TDB_MAX_CF_NAME_LEN];
+    uint32_t index;
+} tidesdb_unified_cf_index_entry_t;
+
 typedef struct tidesdb_txn_t tidesdb_txn_t;
 typedef struct tidesdb_iter_t tidesdb_iter_t;
 typedef struct tidesdb_stats_t tidesdb_stats_t;
@@ -762,6 +776,10 @@ struct tidesdb_t
         size_t write_buffer_size;
         _Atomic(uint32_t) next_cf_index;
         _Atomic(uint64_t) wal_generation;
+        tidesdb_unified_cf_index_entry_t *cf_index_map; /* name -> index, mirrors UNIMAP file */
+        int cf_index_map_count;
+        int cf_index_map_capacity;
+        pthread_mutex_t cf_index_map_lock;
     } unified_mt;
 
     /* object store mode runtime state */

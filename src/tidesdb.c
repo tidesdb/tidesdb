@@ -144,17 +144,21 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
  * remembered the plain tombstone bit. */
 #define TDB_KV_TOMBSTONE_FLAG_MASK (TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE)
 
-#define TDB_LOG_FILE                   "LOG"
-#define TDB_WAL_PREFIX                 "wal_"
-#define TDB_WAL_EXT                    ".log"
-#define TDB_UNIFIED_WAL_PREFIX         "uwal_"
-#define TDB_UNIFIED_WAL_MAGIC          0x55AAU
-#define TDB_UNIFIED_WAL_MAGIC_SIZE     sizeof(uint16_t)
-#define TDB_UNIFIED_CF_PREFIX_SIZE     4
-#define TDB_UNIFIED_SPLITS_INITIAL_CAP 8
-#define TDB_REPLICA_WAL_TMP            "replica_wal_tmp.log"
-#define TDB_REPLICA_MANIFEST_TMP       "MANIFEST.replica_tmp"
-#define TDB_PREFIXED_KEY_STACK_MAX     256
+#define TDB_LOG_FILE                         "LOG"
+#define TDB_WAL_PREFIX                       "wal_"
+#define TDB_WAL_EXT                          ".log"
+#define TDB_UNIFIED_WAL_PREFIX               "uwal_"
+#define TDB_UNIFIED_WAL_MAGIC                0x55AAU
+#define TDB_UNIFIED_WAL_MAGIC_SIZE           sizeof(uint16_t)
+#define TDB_UNIFIED_CF_PREFIX_SIZE           4
+#define TDB_UNIFIED_SPLITS_INITIAL_CAP       8
+#define TDB_UNIFIED_CF_INDEX_MAP_FILE        "UNIMAP"
+#define TDB_UNIFIED_CF_INDEX_MAP_TMP         "UNIMAP.tmp"
+#define TDB_UNIFIED_CF_INDEX_MAP_INITIAL_CAP 8
+#define TDB_UNIFIED_CF_INDEX_MAP_LINE_MAX    (TDB_MAX_CF_NAME_LEN + 32)
+#define TDB_REPLICA_WAL_TMP                  "replica_wal_tmp.log"
+#define TDB_REPLICA_MANIFEST_TMP             "MANIFEST.replica_tmp"
+#define TDB_PREFIXED_KEY_STACK_MAX           256
 
 /* stack-with-heap-fallback for prefixed keys */
 #define TDB_PREFIXED_KEY_ALLOC(name, total_size, stack_buf) \
@@ -695,12 +699,26 @@ struct tidesdb_unified_flush_barrier_t
  * @param cf column family
  * @param start_level starting level
  * @param target_level target level
+ * @param steer_to_bottom when set, the worker runs a targeted merge of
+ *                        [steer_min_key, steer_max_key] into the largest level
+ *                        instead of the geometry-driven spooky compaction --
+ *                        used to push a tombstone-dense sstable down to where
+ *                        regular tombstones can finally drop
+ * @param steer_min_key malloc'd copy of the dense sstable's min key (worker frees)
+ * @param steer_min_key_size size of steer_min_key
+ * @param steer_max_key malloc'd copy of the dense sstable's max key (worker frees)
+ * @param steer_max_key_size size of steer_max_key
  */
 struct tidesdb_compaction_work_t
 {
     tidesdb_column_family_t *cf;
     int start_level;
     int target_level;
+    int steer_to_bottom;
+    uint8_t *steer_min_key;
+    size_t steer_min_key_size;
+    uint8_t *steer_max_key;
+    size_t steer_max_key_size;
 };
 
 /**
@@ -1082,6 +1100,32 @@ static int tdb_parse_wal_id(const char *filename, uint64_t *id)
 }
 
 /**
+ * tdb_parse_unified_wal_gen
+ * parse unified WAL generation from filename like "uwal_12345.log"
+ * @param filename the filename to parse
+ * @param gen output WAL generation
+ * @return 1 on success, 0 on failure
+ */
+static int tdb_parse_unified_wal_gen(const char *filename, uint64_t *gen)
+{
+    if (!filename || !gen) return 0;
+
+    const size_t prefix_len = strlen(TDB_UNIFIED_WAL_PREFIX);
+    if (strncmp(filename, TDB_UNIFIED_WAL_PREFIX, prefix_len) != 0) return 0;
+
+    const char *p = filename + prefix_len;
+    char *endptr;
+
+    const unsigned long long val = strtoull(p, &endptr, 10);
+    if (endptr == p) return 0;
+
+    if (strcmp(endptr, TDB_WAL_EXT) != 0) return 0;
+
+    *gen = (uint64_t)val;
+    return 1;
+}
+
+/**
  * tdb_parse_level_num
  * parse level number from filename like "L5_..."
  * @param filename the filename to parse
@@ -1285,6 +1329,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t **inputs,
                                   int input_count, int min_input_level, int max_input_level,
                                   int target_level);
+static int tidesdb_compact_range_internal(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                                          size_t start_key_size, const uint8_t *end_key,
+                                          size_t end_key_size, int target_level_override);
+static int tidesdb_compact_steer_to_bottom(tidesdb_column_family_t *cf, uint8_t *min_key,
+                                           size_t min_key_size, uint8_t *max_key,
+                                           size_t max_key_size);
 static int tdb_partitioned_merge_finalize_sst(tidesdb_column_family_t *cf, tidesdb_sstable_t *sst,
                                               block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                               bloom_filter_t *bloom,
@@ -1300,6 +1350,8 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable);
+static int tidesdb_wal_replay_into(tidesdb_column_family_t *cf, block_manager_t *wal,
+                                   skip_list_t *target);
 static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capacity, size_t ratio);
 
 static int tidesdb_add_level(tidesdb_column_family_t *cf);
@@ -1308,6 +1360,14 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf);
 static int tidesdb_recover_database(tidesdb_t *db);
 static int tidesdb_recover_column_family(tidesdb_column_family_t *cf);
 static void tidesdb_column_family_free(tidesdb_column_family_t *cf);
+static int tidesdb_unimap_load(tidesdb_t *db);
+static int tidesdb_unimap_persist(tidesdb_t *db);
+static void tidesdb_unimap_objstore_pull(tidesdb_t *db, int overwrite);
+static void tidesdb_unimap_resolve(tidesdb_t *db, const char *name, uint32_t *out_index,
+                                   int *out_is_new);
+static void tidesdb_unimap_remove(tidesdb_t *db, const char *name);
+static void tidesdb_unimap_rename(tidesdb_t *db, const char *old_name, const char *new_name);
+static void tidesdb_unimap_free(tidesdb_t *db);
 
 /**
  * tidesdb_worker_thread_arg_t
@@ -5149,6 +5209,15 @@ static void tdb_replica_discover_new_cfs(tidesdb_t *db)
             "Replica sync: object store list failed after %d attempts, skipping discovery",
             TDB_LIST_MAX_RETRIES);
         return;
+    }
+
+    /* the primary uploads UNIMAP whenever it adds a cf, so we re-sync it before
+     * creating any newly discovered cf -- otherwise the replica would assign
+     * its own index and diverge from the primary's unified wal */
+    if (db->unified_mt.enabled)
+    {
+        tidesdb_unimap_objstore_pull(db, 1);
+        tidesdb_unimap_load(db);
     }
 
     for (int i = 0; i < discovery.count; i++)
@@ -14737,21 +14806,32 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
  * tidesdb_cf_dense_tombstone_witness
  * walks every level looking for an sstable whose tombstone density is at or above
  * the configured trigger ratio. on a hit we record the offending sstable's level
- * and density via out-parameters so the caller can log specific context, and we
- * return early. sstables with TDB_TOMBSTONE_COUNT_UNKNOWN (legacy footers without
- * SSTABLE_FLAG_TOMBSTONE_COUNT) or fewer than min_entries are skipped -- we don't
- * escalate on guesses or on sstables too small for the ratio to be meaningful.
+ * and density via out-parameters so the caller can log specific context, and --
+ * when out_min_key/out_max_key are supplied -- a malloc'd copy of the witness
+ * sstable's key range so the caller can steer a targeted merge at it. we return
+ * early on the first hit. sstables with TDB_TOMBSTONE_COUNT_UNKNOWN (legacy
+ * footers without SSTABLE_FLAG_TOMBSTONE_COUNT) or fewer than min_entries are
+ * skipped -- we don't escalate on guesses or on sstables too small for the
+ * ratio to be meaningful.
  *
  * @param cf the column family
  * @param threshold density ratio in (0.0, 1.0]
  * @param min_entries minimum sstable entry count for density to count
  * @param out_level optional, set to the 1-based level number of the witness on hit
  * @param out_density optional, set to the witness sstable's density on hit
+ * @param out_min_key optional, set to a malloc'd copy of the witness min key on hit
+ *                    (caller frees); paired with out_min_key_size
+ * @param out_min_key_size optional, set to the witness min key size on hit
+ * @param out_max_key optional, set to a malloc'd copy of the witness max key on hit
+ *                    (caller frees); paired with out_max_key_size
+ * @param out_max_key_size optional, set to the witness max key size on hit
  * @return 1 if any sstable meets or exceeds the threshold, 0 otherwise
  */
 static int tidesdb_cf_dense_tombstone_witness(tidesdb_column_family_t *cf, double threshold,
                                               uint64_t min_entries, int *out_level,
-                                              double *out_density)
+                                              double *out_density, uint8_t **out_min_key,
+                                              size_t *out_min_key_size, uint8_t **out_max_key,
+                                              size_t *out_max_key_size)
 {
     if (threshold <= 0.0) return 0;
 
@@ -14768,6 +14848,8 @@ static int tidesdb_cf_dense_tombstone_witness(tidesdb_column_family_t *cf, doubl
 
         int hit = 0;
         double witness_density = 0.0;
+        uint8_t *witness_min = NULL, *witness_max = NULL;
+        size_t witness_min_size = 0, witness_max_size = 0;
         for (int i = 0; ssts && i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = ssts[i];
@@ -14782,6 +14864,26 @@ static int tidesdb_cf_dense_tombstone_witness(tidesdb_column_family_t *cf, doubl
             {
                 hit = 1;
                 witness_density = (double)sst->tombstone_count / (double)sst->num_entries;
+                /* copy the key range while we still hold array_readers on the
+                 * level so the sstable cannot be retired from under us */
+                if (out_min_key && sst->min_key && sst->min_key_size > 0)
+                {
+                    witness_min = malloc(sst->min_key_size);
+                    if (witness_min)
+                    {
+                        memcpy(witness_min, sst->min_key, sst->min_key_size);
+                        witness_min_size = sst->min_key_size;
+                    }
+                }
+                if (out_max_key && sst->max_key && sst->max_key_size > 0)
+                {
+                    witness_max = malloc(sst->max_key_size);
+                    if (witness_max)
+                    {
+                        memcpy(witness_max, sst->max_key, sst->max_key_size);
+                        witness_max_size = sst->max_key_size;
+                    }
+                }
                 break;
             }
         }
@@ -14791,6 +14893,10 @@ static int tidesdb_cf_dense_tombstone_witness(tidesdb_column_family_t *cf, doubl
         {
             if (out_level) *out_level = lv + 1;
             if (out_density) *out_density = witness_density;
+            if (out_min_key) *out_min_key = witness_min;
+            if (out_min_key_size) *out_min_key_size = witness_min_size;
+            if (out_max_key) *out_max_key = witness_max;
+            if (out_max_key_size) *out_max_key_size = witness_max_size;
             return 1;
         }
     }
@@ -15118,14 +15224,39 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
         return TDB_ERR_MEMORY;
     }
 
-    /* we read all entries from WAL */
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, wal) != 0)
+    /* replay every entry from the wal into the freshly allocated memtable */
+    const int replay_rc = tidesdb_wal_replay_into(cf, wal, *memtable);
+    if (replay_rc != TDB_SUCCESS)
     {
         skip_list_free(*memtable);
+        *memtable = NULL;
         block_manager_close(wal);
-        return TDB_ERR_IO;
+        return replay_rc;
     }
+
+    /* we evict WAL data from page cache after recovery, data is now in memtable
+     * this frees cache space for more useful data during normal operation */
+    evict_file_region(wal->fd, 0, 0);
+    block_manager_close(wal);
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_wal_replay_into
+ * replays every entry from an already-open, already-validated wal block manager
+ * into target. shared by tidesdb_wal_recover (fresh skip list for an immutable
+ * wal) and by the adopt-active-wal recovery path (replay in place into the live
+ * active memtable skip list). the caller owns the wal block manager lifecycle.
+ * @param cf the column family (for logging)
+ * @param wal an open, validated wal block manager
+ * @param target the skip list to replay entries into
+ * @return TDB_SUCCESS on success, error code on failure
+ */
+static int tidesdb_wal_replay_into(tidesdb_column_family_t *cf, block_manager_t *wal,
+                                   skip_list_t *target)
+{
+    block_manager_cursor_t *cursor;
+    if (block_manager_cursor_init(&cursor, wal) != 0) return TDB_ERR_IO;
 
     int block_count = 0;
     int entry_count = 0;
@@ -15260,12 +15391,12 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                     uint8_t sl_flags = SKIP_LIST_FLAG_DELETED;
                     if (entry.flags & TDB_KV_FLAG_SINGLE_DELETE)
                         sl_flags |= SKIP_LIST_FLAG_SINGLE_DELETE;
-                    skip_list_put_with_seq(*memtable, key, entry.key_size, NULL, 0, 0, entry.seq,
+                    skip_list_put_with_seq(target, key, entry.key_size, NULL, 0, 0, entry.seq,
                                            sl_flags);
                 }
                 else
                 {
-                    skip_list_put_with_seq(*memtable, key, entry.key_size, value, entry.value_size,
+                    skip_list_put_with_seq(target, key, entry.key_size, value, entry.value_size,
                                            entry.ttl, entry.seq, 0);
                 }
             }
@@ -15277,17 +15408,10 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO,
-                  "CF '%s' WAL recovery completed: %d blocks, %d entries, memtable has %d entries",
-                  cf->name, block_count, entry_count, skip_list_count_entries(*memtable));
+                  "CF '%s' WAL replay completed: %d blocks, %d entries, target has %d entries",
+                  cf->name, block_count, entry_count, skip_list_count_entries(target));
 
     block_manager_cursor_free(cursor);
-
-    /* we evict WAL data from page cache after recovery, data is now in memtable
-     * this frees cache space for more useful data during normal operation */
-    evict_file_region(wal->fd, 0, 0);
-
-    block_manager_close(wal);
-
     return TDB_SUCCESS;
 }
 
@@ -15706,19 +15830,28 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /*** tombstone density trigger fires when any sstable in the cf carries enough
          **  tombstones that compaction should run early to push them toward the largest
          *   level (where regular tombstones finally drop) and shrink read-amp from
-         *   skipping them. only consulted when structural triggers haven't already fired. */
+         *   skipping them. consulted even when a structural trigger already fired --
+         *   delete-heavy workloads keep the structural triggers permanently hot, so
+         *   gating the witness behind them means it would never get a turn. on a hit
+         *   we capture the witness sstable's key range so the response can steer a
+         *   targeted merge at it rather than running geometry-only spooky. */
         int density_witness_level = 0;
         double density_witness_value = 0.0;
-        if (!should_compact && cf->config.tombstone_density_trigger > 0.0)
+        int density_triggered = 0;
+        uint8_t *density_min_key = NULL, *density_max_key = NULL;
+        size_t density_min_key_size = 0, density_max_key_size = 0;
+        if (cf->config.tombstone_density_trigger > 0.0)
         {
             const uint64_t min_entries = cf->config.tombstone_density_min_entries
                                              ? cf->config.tombstone_density_min_entries
                                              : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
-            if (tidesdb_cf_dense_tombstone_witness(cf, cf->config.tombstone_density_trigger,
-                                                   min_entries, &density_witness_level,
-                                                   &density_witness_value))
+            if (tidesdb_cf_dense_tombstone_witness(
+                    cf, cf->config.tombstone_density_trigger, min_entries, &density_witness_level,
+                    &density_witness_value, &density_min_key, &density_min_key_size,
+                    &density_max_key, &density_max_key_size))
             {
                 should_compact = 1;
+                density_triggered = 1;
                 trigger_reason = "tombstone density";
             }
         }
@@ -15741,8 +15874,32 @@ static void *tidesdb_flush_worker_thread(void *arg)
                               cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
                               cf->config.l1_file_count_trigger, level1_size, level1_capacity);
             }
-            tidesdb_compact(cf);
+
+            /* if the density witness fired and the dense sstable is above the
+             * largest level, steer a targeted merge of its key range down to the
+             * bottom so the regular tombstones reach where they can drop.
+             * otherwise (structural trigger, or already at the bottom level) run
+             * the geometry-driven compaction. */
+            const int num_levels =
+                atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+            if (density_triggered && density_witness_level > 0 &&
+                density_witness_level < num_levels && density_min_key && density_max_key)
+            {
+                /* ownership of the key copies passes to the steer helper */
+                tidesdb_compact_steer_to_bottom(cf, density_min_key, density_min_key_size,
+                                                density_max_key, density_max_key_size);
+                density_min_key = NULL;
+                density_max_key = NULL;
+            }
+            else
+            {
+                tidesdb_compact(cf);
+            }
         }
+
+        /* free the witness key copies if the steer path did not take ownership */
+        free(density_min_key);
+        free(density_max_key);
 
         /* we release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
@@ -15991,6 +16148,30 @@ static void *tidesdb_compaction_worker_thread(void *arg)
                 cf->name, cf->config.min_disk_space);
             /* we clear is_compacting flag so compaction can be retried later */
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
+            free(work);
+            continue;
+        }
+
+        if (work->steer_to_bottom)
+        {
+            /* tombstone-steered compaction -- targeted-merge the dense sstable's
+             * key range into the largest level so its regular tombstones reach
+             * where they can drop, instead of the geometry-driven spooky path */
+            const int num_levels =
+                atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' tombstone-steered compaction to largest level %d",
+                          cf->name, num_levels);
+            const int result = tidesdb_compact_range_internal(
+                cf, work->steer_min_key, work->steer_min_key_size, work->steer_max_key,
+                work->steer_max_key_size, num_levels - 1);
+            if (result != TDB_SUCCESS && result != TDB_ERR_LOCKED)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "CF '%s' tombstone-steered compaction failed with error %d", cf->name,
+                              result);
+            }
+            free(work->steer_min_key);
+            free(work->steer_max_key);
             free(work);
             continue;
         }
@@ -17348,14 +17529,52 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             return TDB_ERR_MEMORY;
         }
 
+        /*** the active unified memtable's wal is the highest-generation
+         **  uwal_*.log in db_path -- rotation always allocates a strictly higher
+         *   generation, so on a crash-reopen the highest existing file is the
+         **  wal that was active. we adopt it -- open without truncating,
+         *** validate to trim any preallocation tail -- so recovery can replay it
+         **  in place. lower-generation uwals are recovered separately. a fresh
+         *   db has no uwal files, so we fall back to creating uwal_0.log. */
+        uint64_t active_uwal_gen = 0;
+        int have_existing_uwal = 0;
+        DIR *uwal_scan = opendir((*db)->db_path);
+        if (uwal_scan)
+        {
+            struct dirent *ue;
+            while ((ue = readdir(uwal_scan)) != NULL)
+            {
+                uint64_t ugen = 0;
+                if (tdb_parse_unified_wal_gen(ue->d_name, &ugen))
+                {
+                    if (!have_existing_uwal || ugen > active_uwal_gen)
+                    {
+                        active_uwal_gen = ugen;
+                        have_existing_uwal = 1;
+                    }
+                }
+            }
+            closedir(uwal_scan);
+        }
+
         char uwal_path[TDB_MAX_PATH_LEN];
         snprintf(uwal_path, sizeof(uwal_path),
                  "%s" PATH_SEPARATOR TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, (*db)->db_path,
-                 TDB_U64_CAST(0));
+                 TDB_U64_CAST(active_uwal_gen));
 
         block_manager_t *uwal = NULL;
-        if (block_manager_open(&uwal, uwal_path, umt_sync_mode) != 0 ||
-            block_manager_truncate(uwal) != 0)
+        int uwal_open_failed = (block_manager_open(&uwal, uwal_path, umt_sync_mode) != 0);
+        if (!uwal_open_failed)
+        {
+            /* adopt an existing uwal -- validate (permissive) to trim the
+             * preallocation tail; a fresh db's uwal_0.log gets truncated empty */
+            if (have_existing_uwal)
+                uwal_open_failed = (block_manager_validate_last_block(
+                                        uwal, BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION) != 0);
+            else
+                uwal_open_failed = (block_manager_truncate(uwal) != 0);
+        }
+        if (uwal_open_failed)
         {
             if (uwal) block_manager_close(uwal);
             skip_list_free(umt_sl);
@@ -17404,10 +17623,31 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         umt->skip_list = umt_sl;
         umt->wal = uwal;
         umt->id = 0;
-        umt->generation = 0;
+        /* generation matches the adopted uwal file; wal_generation tracks it so
+         * the next rotation allocates uwal_<active+1> and never collides */
+        umt->generation = active_uwal_gen;
         atomic_init(&umt->refcount, 1);
         atomic_init(&umt->flushed, 0);
         atomic_init(&(*db)->unified_mt.active, umt);
+        atomic_store_explicit(&(*db)->unified_mt.wal_generation, active_uwal_gen,
+                              memory_order_relaxed);
+
+        /* the unified cf index map keeps each cf's key prefix stable across
+         * reopen. without it a crash-reopen reassigns indexes by directory
+         * scan order and unified wal recovery replays under the wrong cf. */
+        (*db)->unified_mt.cf_index_map = NULL;
+        (*db)->unified_mt.cf_index_map_count = 0;
+        (*db)->unified_mt.cf_index_map_capacity = 0;
+        pthread_mutex_init(&(*db)->unified_mt.cf_index_map_lock, NULL);
+        /* a cold-started node (no local UNIMAP) pulls the map from the object
+         * store so its cf indexes match the primary that wrote the uploaded
+         * unified wal; a node with a local map keeps its own */
+        tidesdb_unimap_objstore_pull(*db, 0);
+        if (tidesdb_unimap_load(*db) != TDB_SUCCESS)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Failed to load UNIMAP, unified cf indexes may be reassigned");
+        }
 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable initialized (write_buffer=%zu bytes, WAL=%s)",
                       (*db)->unified_mt.write_buffer_size, uwal_path);
@@ -17430,6 +17670,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                 free(umt);
             }
             queue_free((*db)->unified_mt.immutables);
+            tidesdb_unimap_free(*db);
         }
         free((*db)->active_txns);
         pthread_rwlock_destroy(&(*db)->active_txns_lock);
@@ -18223,6 +18464,8 @@ int tidesdb_close(tidesdb_t *db)
             queue_free(db->unified_mt.immutables);
         }
 
+        tidesdb_unimap_free(db);
+
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified memtable state cleaned up");
     }
 
@@ -18451,6 +18694,313 @@ static void txn_entry_evict(void *data, void *ctx)
     if (data) free(data);
 }
 
+/**
+ * tidesdb_unimap_persist
+ * atomically rewrites the UNIMAP file from the in-memory cf index map.
+ * the caller must hold unified_mt.cf_index_map_lock.
+ * @param db database handle
+ * @return error code
+ */
+static int tidesdb_unimap_persist(tidesdb_t *db)
+{
+    char tmp_path[TDB_MAX_PATH_LEN];
+    char final_path[TDB_MAX_PATH_LEN];
+    snprintf(tmp_path, sizeof(tmp_path), "%s" PATH_SEPARATOR TDB_UNIFIED_CF_INDEX_MAP_TMP,
+             db->db_path);
+    snprintf(final_path, sizeof(final_path), "%s" PATH_SEPARATOR TDB_UNIFIED_CF_INDEX_MAP_FILE,
+             db->db_path);
+
+    FILE *fp = fopen(tmp_path, "w");
+    if (!fp)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to open %s for write", tmp_path);
+        return TDB_ERR_IO;
+    }
+
+    for (int i = 0; i < db->unified_mt.cf_index_map_count; i++)
+    {
+        fprintf(fp, "%u %s\n", db->unified_mt.cf_index_map[i].index,
+                db->unified_mt.cf_index_map[i].name);
+    }
+
+    if (fflush(fp) != 0 || tdb_fsync(fileno(fp)) != 0)
+    {
+        fclose(fp);
+        tdb_unlink(tmp_path);
+        return TDB_ERR_IO;
+    }
+    fclose(fp);
+
+    /* atomic_rename_file replaces the target and syncs the parent directory */
+    if (atomic_rename_file(tmp_path, final_path) != 0)
+    {
+        tdb_unlink(tmp_path);
+        return TDB_ERR_IO;
+    }
+
+    /* in object store mode the map must reach the store like config.ini and
+     * MANIFEST so replicas reconstruct cf indexes the same way the primary did */
+    if (db->object_store)
+    {
+        tdb_objstore_upload_file_sync(db, final_path);
+    }
+
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_unimap_objstore_pull
+ * downloads the UNIMAP file from the object store to db_path. when overwrite
+ * is 0 the download is skipped if a local UNIMAP already exists, so a
+ * primary's authoritative local map is never clobbered; replicas pass 1 to
+ * always track the primary. best effort -- a missing remote object is not an
+ * error, the node may be the first to write it.
+ * @param db database handle
+ * @param overwrite 1 to always download, 0 to skip when a local copy exists
+ */
+static void tidesdb_unimap_objstore_pull(tidesdb_t *db, int overwrite)
+{
+    if (!db->object_store) return;
+
+    char local_path[TDB_MAX_PATH_LEN];
+    snprintf(local_path, sizeof(local_path), "%s" PATH_SEPARATOR TDB_UNIFIED_CF_INDEX_MAP_FILE,
+             db->db_path);
+
+    if (!overwrite)
+    {
+        struct STAT_STRUCT st;
+        if (STAT_FUNC(local_path, &st) == 0) return; /* local copy is authoritative */
+    }
+
+    if (db->object_store->get(db->object_store->ctx, TDB_UNIFIED_CF_INDEX_MAP_FILE, local_path) !=
+        0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "No UNIMAP in object store yet (or download failed)");
+    }
+}
+
+/**
+ * tidesdb_unimap_load
+ * (re)reads the UNIMAP file into the in-memory cf index map and advances
+ * next_cf_index past every persisted index. the map is cleared first so the
+ * call is idempotent and usable as a replica re-sync reload. a missing file
+ * is a fresh database and not an error. takes cf_index_map_lock.
+ * @param db database handle
+ * @return error code
+ */
+static int tidesdb_unimap_load(tidesdb_t *db)
+{
+    char path[TDB_MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s" PATH_SEPARATOR TDB_UNIFIED_CF_INDEX_MAP_FILE, db->db_path);
+
+    pthread_mutex_lock(&db->unified_mt.cf_index_map_lock);
+
+    /* a reload (replica re-sync) starts from a clean map */
+    free(db->unified_mt.cf_index_map);
+    db->unified_mt.cf_index_map = NULL;
+    db->unified_mt.cf_index_map_count = 0;
+    db->unified_mt.cf_index_map_capacity = 0;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+    {
+        pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+        return TDB_SUCCESS; /* fresh database, no map yet */
+    }
+
+    uint32_t max_index = 0;
+    int have_entry = 0;
+    char line[TDB_UNIFIED_CF_INDEX_MAP_LINE_MAX];
+    while (fgets(line, sizeof(line), fp))
+    {
+        /* each line is "<index> <name>" with the name running to end of line */
+        char *sep = strchr(line, ' ');
+        if (!sep) continue;
+        *sep = '\0';
+        char *name = sep + 1;
+        size_t name_len = strlen(name);
+        while (name_len > 0 && (name[name_len - 1] == '\n' || name[name_len - 1] == '\r'))
+        {
+            name[--name_len] = '\0';
+        }
+        if (name_len == 0 || name_len >= TDB_MAX_CF_NAME_LEN) continue;
+
+        uint32_t index = (uint32_t)strtoul(line, NULL, 10);
+
+        if (db->unified_mt.cf_index_map_count >= db->unified_mt.cf_index_map_capacity)
+        {
+            int new_cap = db->unified_mt.cf_index_map_capacity == 0
+                              ? TDB_UNIFIED_CF_INDEX_MAP_INITIAL_CAP
+                              : db->unified_mt.cf_index_map_capacity * 2;
+            tidesdb_unified_cf_index_entry_t *grown = realloc(
+                db->unified_mt.cf_index_map, new_cap * sizeof(tidesdb_unified_cf_index_entry_t));
+            if (!grown)
+            {
+                free(db->unified_mt.cf_index_map);
+                db->unified_mt.cf_index_map = NULL;
+                db->unified_mt.cf_index_map_count = 0;
+                db->unified_mt.cf_index_map_capacity = 0;
+                fclose(fp);
+                pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+                return TDB_ERR_MEMORY;
+            }
+            db->unified_mt.cf_index_map = grown;
+            db->unified_mt.cf_index_map_capacity = new_cap;
+        }
+
+        tidesdb_unified_cf_index_entry_t *e =
+            &db->unified_mt.cf_index_map[db->unified_mt.cf_index_map_count++];
+        snprintf(e->name, sizeof(e->name), "%s", name);
+        e->index = index;
+
+        if (!have_entry || index > max_index)
+        {
+            max_index = index;
+            have_entry = 1;
+        }
+    }
+    fclose(fp);
+
+    if (have_entry)
+    {
+        atomic_store_explicit(&db->unified_mt.next_cf_index, max_index + 1, memory_order_relaxed);
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Loaded UNIMAP with %d column family index entries",
+                  db->unified_mt.cf_index_map_count);
+    pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_unimap_resolve
+ * returns the unified_cf_index for a column family name. an existing name
+ * keeps the index it was first assigned; a new name is assigned the next
+ * index and appended to the in-memory map. the caller persists the map with
+ * tidesdb_unimap_persist when out_is_new is set. takes cf_index_map_lock.
+ * @param db database handle
+ * @param name column family name
+ * @param out_index receives the resolved index
+ * @param out_is_new receives 1 if a new index was assigned, 0 otherwise
+ */
+static void tidesdb_unimap_resolve(tidesdb_t *db, const char *name, uint32_t *out_index,
+                                   int *out_is_new)
+{
+    *out_is_new = 0;
+
+    pthread_mutex_lock(&db->unified_mt.cf_index_map_lock);
+
+    for (int i = 0; i < db->unified_mt.cf_index_map_count; i++)
+    {
+        if (strcmp(db->unified_mt.cf_index_map[i].name, name) == 0)
+        {
+            *out_index = db->unified_mt.cf_index_map[i].index;
+            pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+            return;
+        }
+    }
+
+    uint32_t assigned =
+        atomic_fetch_add_explicit(&db->unified_mt.next_cf_index, 1, memory_order_relaxed);
+    *out_index = assigned;
+
+    if (db->unified_mt.cf_index_map_count >= db->unified_mt.cf_index_map_capacity)
+    {
+        int new_cap = db->unified_mt.cf_index_map_capacity == 0
+                          ? TDB_UNIFIED_CF_INDEX_MAP_INITIAL_CAP
+                          : db->unified_mt.cf_index_map_capacity * 2;
+        tidesdb_unified_cf_index_entry_t *grown = realloc(
+            db->unified_mt.cf_index_map, new_cap * sizeof(tidesdb_unified_cf_index_entry_t));
+        if (!grown)
+        {
+            /* the cf still works this session with the assigned index, but the
+             * map cannot be grown to record it, so it will not be persisted */
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to grow UNIMAP for CF '%s'", name);
+            pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+            return;
+        }
+        db->unified_mt.cf_index_map = grown;
+        db->unified_mt.cf_index_map_capacity = new_cap;
+    }
+
+    tidesdb_unified_cf_index_entry_t *e =
+        &db->unified_mt.cf_index_map[db->unified_mt.cf_index_map_count++];
+    snprintf(e->name, sizeof(e->name), "%s", name);
+    e->index = assigned;
+    *out_is_new = 1;
+
+    pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+}
+
+/**
+ * tidesdb_unimap_remove
+ * drops a column family name from the in-memory map and rewrites UNIMAP.
+ * next_cf_index is left untouched so a dropped index is never reused.
+ * @param db database handle
+ * @param name column family name
+ */
+static void tidesdb_unimap_remove(tidesdb_t *db, const char *name)
+{
+    pthread_mutex_lock(&db->unified_mt.cf_index_map_lock);
+
+    for (int i = 0; i < db->unified_mt.cf_index_map_count; i++)
+    {
+        if (strcmp(db->unified_mt.cf_index_map[i].name, name) == 0)
+        {
+            for (int j = i; j < db->unified_mt.cf_index_map_count - 1; j++)
+            {
+                db->unified_mt.cf_index_map[j] = db->unified_mt.cf_index_map[j + 1];
+            }
+            db->unified_mt.cf_index_map_count--;
+            tidesdb_unimap_persist(db);
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+}
+
+/**
+ * tidesdb_unimap_rename
+ * updates a column family name in the in-memory map, keeping its index, and
+ * rewrites UNIMAP.
+ * @param db database handle
+ * @param old_name current column family name
+ * @param new_name new column family name
+ */
+static void tidesdb_unimap_rename(tidesdb_t *db, const char *old_name, const char *new_name)
+{
+    pthread_mutex_lock(&db->unified_mt.cf_index_map_lock);
+
+    for (int i = 0; i < db->unified_mt.cf_index_map_count; i++)
+    {
+        if (strcmp(db->unified_mt.cf_index_map[i].name, old_name) == 0)
+        {
+            snprintf(db->unified_mt.cf_index_map[i].name,
+                     sizeof(db->unified_mt.cf_index_map[i].name), "%s", new_name);
+            tidesdb_unimap_persist(db);
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+}
+
+/**
+ * tidesdb_unimap_free
+ * releases the in-memory cf index map and its lock, called from
+ * tidesdb_close for unified mode databases.
+ * @param db database handle
+ */
+static void tidesdb_unimap_free(tidesdb_t *db)
+{
+    free(db->unified_mt.cf_index_map);
+    db->unified_mt.cf_index_map = NULL;
+    db->unified_mt.cf_index_map_count = 0;
+    db->unified_mt.cf_index_map_capacity = 0;
+    pthread_mutex_destroy(&db->unified_mt.cf_index_map_lock);
+}
+
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
@@ -18547,11 +19097,15 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     snprintf(cf->config.name, sizeof(cf->config.name), "%s", name);
     cf->db = db;
 
-    /* in unified memtable mode we assign monotonic CF index for key prefixing */
+    /* in unified memtable mode the cf needs a stable index that prefixes its
+     * keys in the shared skip_list and wal. tidesdb_unimap_resolve hands back
+     * the index this name was first assigned (persisted in UNIMAP) or assigns
+     * a fresh one. a freshly assigned index is persisted after the cf is
+     * registered, below. */
+    int unimap_is_new = 0;
     if (db->unified_mt.enabled)
     {
-        cf->unified_cf_index =
-            atomic_fetch_add_explicit(&db->unified_mt.next_cf_index, 1, memory_order_relaxed);
+        tidesdb_unimap_resolve(db, name, &cf->unified_cf_index, &unimap_is_new);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' assigned unified_cf_index=%u", name,
                       cf->unified_cf_index);
     }
@@ -18678,12 +19232,40 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
      **  per-CF WAL files are not needed. skip creation to avoid wasted
      *   I/O, file descriptors, and confusing artifacts on disk. */
     block_manager_t *new_wal = NULL;
+    uint64_t active_wal_id = 0;
     if (!db->unified_mt.enabled)
     {
+        /*** the active memtable's wal is the highest-id wal_*.log in the cf
+         **  directory--rotation always allocates a strictly higher id, so on a
+         *   crash-reopen the highest existing file is the wal that was active.
+         **  we adopt it -- open without truncating, validate to trim any
+         *** preallocation tail -- so recovery can replay it in place. lower-id
+         **  wals are immutables recovery handles separately. a fresh cf has no
+         *   wal files, so we fall back to creating wal_0.log. */
+        int have_existing_wal = 0;
+        DIR *wal_scan = opendir(cf->directory);
+        if (wal_scan)
+        {
+            struct dirent *we;
+            while ((we = readdir(wal_scan)) != NULL)
+            {
+                uint64_t wid = 0;
+                if (tdb_parse_wal_id(we->d_name, &wid))
+                {
+                    if (!have_existing_wal || wid > active_wal_id)
+                    {
+                        active_wal_id = wid;
+                        have_existing_wal = 1;
+                    }
+                }
+            }
+            closedir(wal_scan);
+        }
+
         char wal_path[TDB_MAX_PATH_LEN];
         snprintf(wal_path, sizeof(wal_path),
                  "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, cf->directory,
-                 TDB_U64_CAST(0));
+                 TDB_U64_CAST(active_wal_id));
 
         if (block_manager_open(&new_wal, wal_path, config->sync_mode) != 0)
         {
@@ -18695,8 +19277,27 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             return TDB_ERR_IO;
         }
 
-        if (block_manager_truncate(new_wal) != 0)
+        if (have_existing_wal)
         {
+            /* adopt an existing wal -- validate (permissive) to trim the
+             * preallocation tail so the block manager's logical size is the
+             * real data extent and appends land in the right place. recovery
+             * replays this file's entries into this memtable's skip list. */
+            if (block_manager_validate_last_block(new_wal,
+                                                  BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION) != 0)
+            {
+                block_manager_close(new_wal);
+                queue_free(cf->immutable_memtables);
+                skip_list_free(new_memtable);
+                free(cf->directory);
+                free(cf->name);
+                free(cf);
+                return TDB_ERR_IO;
+            }
+        }
+        else if (block_manager_truncate(new_wal) != 0)
+        {
+            /* fresh cf -- start wal_0.log empty */
             block_manager_close(new_wal);
             queue_free(cf->immutable_memtables);
             skip_list_free(new_memtable);
@@ -18720,7 +19321,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
     initial_mt->skip_list = new_memtable;
     initial_mt->wal = new_wal; /* NULL in unified mode */
-    initial_mt->id = 0;
+    /* mt->id matches the backing wal's file id -- the highest existing wal_*.log
+     * on a crash-reopen, or 0 for the fresh wal_0.log of a brand-new cf */
+    initial_mt->id = active_wal_id;
     initial_mt->generation = 0;
     atomic_init(&initial_mt->refcount, 1);
     atomic_init(&initial_mt->flushed, 0);
@@ -18906,6 +19509,14 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     db->num_column_families++;
     pthread_rwlock_unlock(&db->cf_list_lock);
 
+    /* persist a freshly assigned unified index now that the cf is registered */
+    if (unimap_is_new)
+    {
+        pthread_mutex_lock(&db->unified_mt.cf_index_map_lock);
+        tidesdb_unimap_persist(db);
+        pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
+    }
+
     /* we save configuration to disk for recovery */
     char config_path[MAX_FILE_PATH_LENGTH];
     snprintf(config_path, sizeof(config_path),
@@ -19050,6 +19661,14 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
         snprintf(prefix, sizeof(prefix), "%s/", cf_to_drop->name);
         db->object_store->list(db->object_store->ctx, prefix, tdb_objstore_delete_listed_cb,
                                db->object_store);
+    }
+
+    /* we drop the cf from the unified index map before removing its directory
+     * so a crash between the two leaves the map describing more than exists,
+     * never less -- a stale entry is harmless, a missing one is not */
+    if (db->unified_mt.enabled)
+    {
+        tidesdb_unimap_remove(db, cf_to_drop->name);
     }
 
     const int result = remove_directory(cf_to_drop->directory);
@@ -19402,6 +20021,12 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
 
     /* we clear the deletion mark now that rename is complete */
     atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
+
+    /* the unified index map is keyed on cf name, so the rename must follow */
+    if (db->unified_mt.enabled)
+    {
+        tidesdb_unimap_rename(db, old_name, new_name);
+    }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Successfully renamed column family: %s -> %s", old_name, new_name);
 
@@ -19959,8 +20584,9 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         return TDB_SUCCESS;
     }
 
-    /* we enqueue compaction work */
-    tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
+    /* we enqueue compaction work -- calloc so the steer fields default to zero
+     * (a plain geometry-driven compaction, no tombstone steering) */
+    tidesdb_compaction_work_t *work = calloc(1, sizeof(tidesdb_compaction_work_t));
     if (!work)
     {
         return TDB_ERR_MEMORY;
@@ -19969,6 +20595,66 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
     work->cf = cf;
     if (queue_enqueue(cf->db->compaction_queue, work) != 0)
     {
+        free(work);
+        return TDB_ERR_MEMORY;
+    }
+
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_compact_steer_to_bottom
+ * enqueues a tombstone-steered compaction -- the worker will targeted-merge the
+ * [min_key, max_key] range down to the largest level so a tombstone-dense
+ * sstable's regular tombstones reach where they can finally drop. takes
+ * ownership of the malloc'd min_key/max_key copies (worker frees them, or this
+ * frees them on an enqueue failure). a no-op if either key copy is missing or
+ * a compaction is already running.
+ * @param cf the column family
+ * @param min_key malloc'd copy of the dense sstable's min key
+ * @param min_key_size size of min_key
+ * @param max_key malloc'd copy of the dense sstable's max key
+ * @param max_key_size size of max_key
+ * @return TDB_SUCCESS (enqueued or skipped), TDB_ERR_MEMORY on alloc failure
+ */
+static int tidesdb_compact_steer_to_bottom(tidesdb_column_family_t *cf, uint8_t *min_key,
+                                           size_t min_key_size, uint8_t *max_key,
+                                           size_t max_key_size)
+{
+    if (!cf || !min_key || !max_key || min_key_size == 0 || max_key_size == 0)
+    {
+        free(min_key);
+        free(max_key);
+        return TDB_SUCCESS;
+    }
+
+    if (atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
+    {
+        /* compaction already running -- skip, the keys are no longer needed */
+        free(min_key);
+        free(max_key);
+        return TDB_SUCCESS;
+    }
+
+    tidesdb_compaction_work_t *work = calloc(1, sizeof(tidesdb_compaction_work_t));
+    if (!work)
+    {
+        free(min_key);
+        free(max_key);
+        return TDB_ERR_MEMORY;
+    }
+
+    work->cf = cf;
+    work->steer_to_bottom = 1;
+    work->steer_min_key = min_key;
+    work->steer_min_key_size = min_key_size;
+    work->steer_max_key = max_key;
+    work->steer_max_key_size = max_key_size;
+
+    if (queue_enqueue(cf->db->compaction_queue, work) != 0)
+    {
+        free(work->steer_min_key);
+        free(work->steer_max_key);
         free(work);
         return TDB_ERR_MEMORY;
     }
@@ -20005,8 +20691,25 @@ static int tdb_range_overlap_check(skip_list_comparator_fn cmp_fn, void *cmp_ctx
     return 1;
 }
 
-int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
-                          size_t start_key_size, const uint8_t *end_key, size_t end_key_size)
+/**
+ * tidesdb_compact_range_internal
+ * collects every sstable whose key range overlaps [start_key, end_key) and
+ * targeted-merges them. target_level_override >= 0 forces that target level --
+ * used to steer a tombstone-dense range down to the largest level, the one
+ * place regular (non single-delete) tombstones can finally drop. a negative
+ * override keeps the default of merging into max_input_level.
+ *
+ * @param cf the column family
+ * @param start_key range start (NULL = unbounded)
+ * @param start_key_size size of start_key
+ * @param end_key range end, exclusive (NULL = unbounded)
+ * @param end_key_size size of end_key
+ * @param target_level_override forced 0-based target level, or < 0 for default
+ * @return TDB_SUCCESS or error code
+ */
+static int tidesdb_compact_range_internal(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                                          size_t start_key_size, const uint8_t *end_key,
+                                          size_t end_key_size, int target_level_override)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
     if (!start_key && !end_key) return TDB_ERR_INVALID_ARGS;
@@ -20114,14 +20817,21 @@ int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
     {
         free(inputs);
         atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "compact_range: CF '%s' no sstables overlap requested range",
-                      cf->name);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' no sstables overlap requested range", cf->name);
         return TDB_SUCCESS;
     }
 
     /* merge into the largest level affected so any tombstones in the range that
-     * meet their dead puts get a shot at dropping when the target is the bottom */
-    const int target_level = max_input_level;
+     * meet their dead puts get a shot at dropping when the target is the bottom.
+     * a caller can override this to force the largest level of the whole cf --
+     * regular tombstones only drop there, so steering a dense range down is the
+     * difference between the tombstones dying and lingering forever. */
+    int target_level = max_input_level;
+    if (target_level_override >= 0 && target_level_override < num_levels)
+    {
+        target_level = target_level_override;
+        if (target_level < min_input_level) target_level = min_input_level;
+    }
 
     const int merge_result = tidesdb_targeted_merge(cf, inputs, input_count, min_input_level,
                                                     max_input_level, target_level);
@@ -20129,6 +20839,13 @@ int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
 
     atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
     return merge_result;
+}
+
+int tidesdb_compact_range(tidesdb_column_family_t *cf, const uint8_t *start_key,
+                          size_t start_key_size, const uint8_t *end_key, size_t end_key_size)
+{
+    /* public api keeps the default behavior -- merge into max_input_level */
+    return tidesdb_compact_range_internal(cf, start_key, start_key_size, end_key, end_key_size, -1);
 }
 
 /**
@@ -23111,18 +23828,39 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
 
     int num_l1 = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
     int density_hit = 0;
+    int density_witness_level = 0;
+    uint8_t *density_min_key = NULL, *density_max_key = NULL;
+    size_t density_min_key_size = 0, density_max_key_size = 0;
     if (cf->config.tombstone_density_trigger > 0.0)
     {
         const uint64_t min_entries = cf->config.tombstone_density_min_entries
                                          ? cf->config.tombstone_density_min_entries
                                          : TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES;
-        density_hit = tidesdb_cf_dense_tombstone_witness(cf, cf->config.tombstone_density_trigger,
-                                                         min_entries, NULL, NULL);
+        density_hit = tidesdb_cf_dense_tombstone_witness(
+            cf, cf->config.tombstone_density_trigger, min_entries, &density_witness_level, NULL,
+            &density_min_key, &density_min_key_size, &density_max_key, &density_max_key_size);
     }
-    if (num_l1 >= cf->config.l1_file_count_trigger || density_hit)
+
+    const int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    if (density_hit && density_witness_level > 0 && density_witness_level < num_levels &&
+        density_min_key && density_max_key)
+    {
+        /* steer the dense sstable's range down to the largest level so its
+         * regular tombstones reach where they can drop; ownership of the key
+         * copies passes to the steer helper */
+        tidesdb_compact_steer_to_bottom(cf, density_min_key, density_min_key_size, density_max_key,
+                                        density_max_key_size);
+        density_min_key = NULL;
+        density_max_key = NULL;
+    }
+    else if (num_l1 >= cf->config.l1_file_count_trigger || density_hit)
     {
         tidesdb_compact(cf);
     }
+
+    /* free the witness key copies if the steer path did not take ownership */
+    free(density_min_key);
+    free(density_max_key);
 
     tidesdb_sstable_unref(db, sst);
     return TDB_SUCCESS;
@@ -27312,12 +28050,55 @@ static int tidesdb_recover_wals(tidesdb_column_family_t *cf)
 
     tidesdb_sort_wal_files(wal_files);
 
+    /* create_column_family adopted the highest-id wal as the active memtable's
+     * wal (already open + validated). recovery replays that one in place into
+     * the live active skip list and leaves the file alone; the lower-id wals
+     * are immutables, recovered and flushed the usual way. */
+    tidesdb_memtable_t *active_mt =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    const uint64_t active_wal_id = active_mt ? active_mt->id : 0;
+
     while (!queue_is_empty(wal_files))
     {
         char *wal_path = queue_dequeue(wal_files);
-        if (wal_path)
+        if (!wal_path) continue;
+
+        const char *wal_name = strrchr(wal_path, PATH_SEPARATOR[0]);
+        wal_name = wal_name ? wal_name + 1 : wal_path;
+        uint64_t wid = 0;
+        const int parsed = tdb_parse_wal_id(wal_name, &wid);
+
+        if (parsed && active_mt && active_mt->wal && wid == active_wal_id)
+        {
+            /* the active memtable's own wal -- replay in place, keep the file */
+            const int rc = tidesdb_wal_replay_into(cf, active_mt->wal, active_mt->skip_list);
+            if (rc != TDB_SUCCESS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to replay active WAL %s (error %d)",
+                              cf->name, wal_path, rc);
+            }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' replayed active WAL %s into active memtable (%d entries)",
+                              cf->name, wal_path, skip_list_count_entries(active_mt->skip_list));
+            }
+            free(wal_path);
+        }
+        else
         {
             tidesdb_recover_single_wal(cf, wal_path);
+        }
+    }
+
+    /* keep the shared sstable/wal id space monotonic past the active wal so a
+     * later rotation cannot allocate wal_<active_wal_id> and truncate the live
+     * active wal (rotation derives the new wal id from next_sstable_id) */
+    {
+        uint64_t cur = atomic_load_explicit(&cf->next_sstable_id, memory_order_relaxed);
+        if (cur < active_wal_id + 1)
+        {
+            atomic_store_explicit(&cf->next_sstable_id, active_wal_id + 1, memory_order_relaxed);
         }
     }
 
@@ -27669,6 +28450,40 @@ static uint64_t tidesdb_scan_max_sequence(tidesdb_column_family_t *cf)
         free(imm_snap);
     }
 
+    /* we scan the active memtable -- crash recovery replays the adopted active
+     * wal in place into it, so its entries' seqs would otherwise be invisible to
+     * the max-seq scan (they never pass through an sstable or immutable) */
+    tidesdb_memtable_t *active_mt =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    if (active_mt && active_mt->skip_list)
+    {
+        skip_list_cursor_t *cursor;
+        if (skip_list_cursor_init(&cursor, active_mt->skip_list) == 0)
+        {
+            if (skip_list_cursor_goto_first(cursor) == 0)
+            {
+                do
+                {
+                    uint8_t *key, *value;
+                    size_t key_size, value_size;
+                    int64_t ttl;
+                    uint8_t deleted;
+                    uint64_t seq;
+
+                    if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size,
+                                                      &ttl, &deleted, &seq) == 0)
+                    {
+                        if (seq > global_max_seq)
+                        {
+                            global_max_seq = seq;
+                        }
+                    }
+                } while (skip_list_cursor_next(cursor) == 0);
+            }
+            skip_list_cursor_free(cursor);
+        }
+    }
+
     return global_max_seq;
 }
 
@@ -27738,11 +28553,150 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 }
 
 /**
+ * tidesdb_unified_wal_replay_into
+ * replays one already-open, already-validated unified WAL into target. unified
+ * WAL entry format -- [cf_index BE32][flags][varint key_size][varint value_size]
+ * [varint seq][ttl(8)?][key][value] -- replayed as prefixed keys [cf_index][key]
+ * into the shared skip list. updates *max_seq and *total_entries; advances
+ * unified_mt.next_cf_index past any cf_index seen. the caller owns the wal
+ * block manager lifecycle.
+ * @param db database instance
+ * @param wal an open, validated unified WAL block manager
+ * @param target the unified skip list to replay into
+ * @param max_seq updated with the highest seq seen
+ * @param total_entries incremented per replayed entry
+ * @return TDB_SUCCESS on success, error code on failure
+ */
+static int tidesdb_unified_wal_replay_into(tidesdb_t *db, block_manager_t *wal, skip_list_t *target,
+                                           uint64_t *max_seq, int *total_entries)
+{
+    block_manager_cursor_t *cursor = NULL;
+    if (block_manager_cursor_init(&cursor, wal) != 0) return TDB_ERR_IO;
+
+    if (block_manager_cursor_goto_first(cursor) == 0)
+    {
+        do
+        {
+            block_manager_block_t *block = block_manager_cursor_read(cursor);
+            if (!block) break;
+
+            const uint8_t *ptr = block->data;
+            size_t remaining = block->size;
+
+            /* we check and skip the unified magic prefix */
+            if (remaining >= TDB_UNIFIED_WAL_MAGIC_SIZE)
+            {
+                uint16_t magic = ((uint16_t)ptr[0] << 8) | ptr[1];
+                if (magic == TDB_UNIFIED_WAL_MAGIC)
+                {
+                    ptr += TDB_UNIFIED_WAL_MAGIC_SIZE;
+                    remaining -= TDB_UNIFIED_WAL_MAGIC_SIZE;
+                }
+            }
+
+            uint32_t max_cf_index_seen = 0;
+            while (remaining > TDB_UNIFIED_CF_PREFIX_SIZE)
+            {
+                /* we read cf_index */
+                const uint32_t cf_index = tdb_decode_be32(ptr);
+                if (cf_index > max_cf_index_seen) max_cf_index_seen = cf_index;
+                ptr += TDB_UNIFIED_CF_PREFIX_SIZE;
+                remaining -= TDB_UNIFIED_CF_PREFIX_SIZE;
+
+                if (remaining < 1) break;
+                const uint8_t flags = *ptr++;
+                remaining--;
+
+                uint64_t key_size_u64;
+                int br = decode_varint(ptr, &key_size_u64, (int)remaining);
+                if (br < 0 || key_size_u64 > UINT32_MAX) break;
+                ptr += br;
+                remaining -= br;
+
+                uint64_t value_size_u64;
+                br = decode_varint(ptr, &value_size_u64, (int)remaining);
+                if (br < 0 || value_size_u64 > UINT32_MAX) break;
+                ptr += br;
+                remaining -= br;
+
+                uint64_t seq_value;
+                br = decode_varint(ptr, &seq_value, (int)remaining);
+                if (br < 0) break;
+                ptr += br;
+                remaining -= br;
+
+                int64_t ttl = 0;
+                if (flags & TDB_KV_FLAG_HAS_TTL)
+                {
+                    if (remaining < sizeof(int64_t)) break;
+                    ttl = decode_int64_le_compat(ptr);
+                    ptr += sizeof(int64_t);
+                    remaining -= sizeof(int64_t);
+                }
+
+                if (remaining < key_size_u64) break;
+                const uint8_t *key = ptr;
+                ptr += key_size_u64;
+                remaining -= key_size_u64;
+
+                const uint8_t *value = NULL;
+                if (value_size_u64 > 0)
+                {
+                    if (remaining < value_size_u64) break;
+                    value = ptr;
+                    ptr += value_size_u64;
+                    remaining -= value_size_u64;
+                }
+
+                /* we build prefixed key and insert into unified memtable */
+                const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
+                TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack4);
+                if (!prefixed) break;
+                tdb_encode_be32(cf_index, prefixed);
+                memcpy(prefixed + TDB_UNIFIED_CF_PREFIX_SIZE, key, key_size_u64);
+                const size_t pk_size = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
+
+                const int is_delete = (flags & TDB_KV_FLAG_TOMBSTONE) ? 1 : 0;
+                skip_list_put_with_seq(
+                    target, prefixed, pk_size, is_delete ? NULL : (uint8_t *)value,
+                    is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, is_delete);
+                TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack4);
+
+                if (seq_value > *max_seq) *max_seq = seq_value;
+                (*total_entries)++;
+            }
+
+            /* we must ensure next_cf_index is past any cf_index seen in the WAL */
+            if (max_cf_index_seen > 0)
+            {
+                uint32_t needed = max_cf_index_seen + 1;
+                uint32_t current =
+                    atomic_load_explicit(&db->unified_mt.next_cf_index, memory_order_relaxed);
+                while (needed > current)
+                {
+                    if (atomic_compare_exchange_weak_explicit(
+                            &db->unified_mt.next_cf_index, &current, needed, memory_order_relaxed,
+                            memory_order_relaxed))
+                        break;
+                }
+            }
+
+            block_manager_block_release(block);
+        } while (block_manager_cursor_next(cursor) == 0);
+    }
+
+    block_manager_cursor_free(cursor);
+    return TDB_SUCCESS;
+}
+
+/**
  * tidesdb_unified_wal_recover
- * recover unified WAL files from db_path into the unified active memtable
- * unified WAL format -- 2-byte magic + per-entry( cf_index(4 BE) + flags(1) )
- *   + varint(key_size) + varint(value_size) + varint(seq) + [ttl(8)] + key + value
- * entries are replayed into the unified skip list with prefixed keys [cf_index][key]
+ * recover unified WAL files from db_path into the unified active memtable.
+ * the highest-generation uwal_*.log is the active memtable's wal (adopted +
+ * validated at open) -- its entries are replayed in place from the live block
+ * manager and the file is kept. lower-generation uwal files are replayed and
+ * then deleted. unified WAL entry format is documented on
+ * tidesdb_unified_wal_replay_into.
  * @param db database instance
  * @return TDB_SUCCESS on success, error code on failure
  */
@@ -27763,22 +28717,15 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
         return TDB_ERR_MEMORY;
     }
 
-    /** we build the active WAL filename so we can skip it during recovery
-     *  the active WAL was already truncated at open and must not be deleted */
-    char active_wal_name[TDB_MAX_PATH_LEN];
-    snprintf(
-        active_wal_name, sizeof(active_wal_name), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
-        TDB_U64_CAST(atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed)));
-
+    /* we collect every uwal_*.log -- the highest generation is the active
+     * memtable's wal (adopted + validated at open), replayed in place; the
+     * lower generations are replayed then deleted */
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL)
     {
         if (strstr(entry->d_name, TDB_UNIFIED_WAL_PREFIX) == entry->d_name &&
             strstr(entry->d_name, TDB_WAL_EXT) != NULL)
         {
-            /* we skip the active WAL, it was just truncated and is in use */
-            if (strcmp(entry->d_name, active_wal_name) == 0) continue;
-
             const size_t path_len = strlen(db->db_path) + strlen(entry->d_name) + 2;
             char *wal_path = malloc(path_len);
             if (wal_path)
@@ -27801,153 +28748,64 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
     int total_entries = 0;
     uint64_t max_seq = 0;
 
+    /* the active memtable adopted the highest-generation uwal at open (already
+     * open + validated). replay that one in place from the live block manager
+     * and keep the file; replay + delete the lower generations. */
+    const uint64_t active_gen =
+        atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
+
     while (!queue_is_empty(wal_files))
     {
         char *wal_path = queue_dequeue(wal_files);
         if (!wal_path) continue;
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering unified WAL: %s", wal_path);
+        const char *wal_name = strrchr(wal_path, PATH_SEPARATOR[0]);
+        wal_name = wal_name ? wal_name + 1 : wal_path;
+        uint64_t gen = 0;
+        const int parsed = tdb_parse_unified_wal_gen(wal_name, &gen);
+
+        if (parsed && umt->wal && gen == active_gen)
+        {
+            /* the active unified WAL -- replay in place from the live block
+             * manager, keep the file (it backs the active memtable) */
+            const int rc = tidesdb_unified_wal_replay_into(db, umt->wal, umt->skip_list, &max_seq,
+                                                           &total_entries);
+            if (rc != TDB_SUCCESS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to replay active unified WAL '%s'", wal_path);
+            }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Replayed active unified WAL in place '%s'", wal_path);
+            }
+            free(wal_path);
+            continue;
+        }
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering unified WAL '%s'", wal_path);
 
         block_manager_t *wal = NULL;
         if (block_manager_open(&wal, wal_path, TDB_SYNC_FULL) != 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to open unified WAL: %s", wal_path);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to open unified WAL file '%s'", wal_path);
             free(wal_path);
             continue;
         }
 
         if (block_manager_validate_last_block(wal, BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION) != 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN, "Unified WAL validation failed: %s", wal_path);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Unified WAL validation failed for '%s'", wal_path);
             block_manager_close(wal);
             free(wal_path);
             continue;
         }
 
-        block_manager_cursor_t *cursor = NULL;
-        if (block_manager_cursor_init(&cursor, wal) != 0)
-        {
-            block_manager_close(wal);
-            free(wal_path);
-            continue;
-        }
+        tidesdb_unified_wal_replay_into(db, wal, umt->skip_list, &max_seq, &total_entries);
 
-        if (block_manager_cursor_goto_first(cursor) == 0)
-        {
-            do
-            {
-                block_manager_block_t *block = block_manager_cursor_read(cursor);
-                if (!block) break;
-
-                const uint8_t *ptr = block->data;
-                size_t remaining = block->size;
-
-                /* we check and skip the unified magic prefix */
-                if (remaining >= TDB_UNIFIED_WAL_MAGIC_SIZE)
-                {
-                    uint16_t magic = ((uint16_t)ptr[0] << 8) | ptr[1];
-                    if (magic == TDB_UNIFIED_WAL_MAGIC)
-                    {
-                        ptr += TDB_UNIFIED_WAL_MAGIC_SIZE;
-                        remaining -= TDB_UNIFIED_WAL_MAGIC_SIZE;
-                    }
-                }
-
-                uint32_t max_cf_index_seen = 0;
-                while (remaining > TDB_UNIFIED_CF_PREFIX_SIZE)
-                {
-                    /* we read cf_index */
-                    const uint32_t cf_index = tdb_decode_be32(ptr);
-                    if (cf_index > max_cf_index_seen) max_cf_index_seen = cf_index;
-                    ptr += TDB_UNIFIED_CF_PREFIX_SIZE;
-                    remaining -= TDB_UNIFIED_CF_PREFIX_SIZE;
-
-                    if (remaining < 1) break;
-                    const uint8_t flags = *ptr++;
-                    remaining--;
-
-                    uint64_t key_size_u64;
-                    int br = decode_varint(ptr, &key_size_u64, (int)remaining);
-                    if (br < 0 || key_size_u64 > UINT32_MAX) break;
-                    ptr += br;
-                    remaining -= br;
-
-                    uint64_t value_size_u64;
-                    br = decode_varint(ptr, &value_size_u64, (int)remaining);
-                    if (br < 0 || value_size_u64 > UINT32_MAX) break;
-                    ptr += br;
-                    remaining -= br;
-
-                    uint64_t seq_value;
-                    br = decode_varint(ptr, &seq_value, (int)remaining);
-                    if (br < 0) break;
-                    ptr += br;
-                    remaining -= br;
-
-                    int64_t ttl = 0;
-                    if (flags & TDB_KV_FLAG_HAS_TTL)
-                    {
-                        if (remaining < sizeof(int64_t)) break;
-                        ttl = decode_int64_le_compat(ptr);
-                        ptr += sizeof(int64_t);
-                        remaining -= sizeof(int64_t);
-                    }
-
-                    if (remaining < key_size_u64) break;
-                    const uint8_t *key = ptr;
-                    ptr += key_size_u64;
-                    remaining -= key_size_u64;
-
-                    const uint8_t *value = NULL;
-                    if (value_size_u64 > 0)
-                    {
-                        if (remaining < value_size_u64) break;
-                        value = ptr;
-                        ptr += value_size_u64;
-                        remaining -= value_size_u64;
-                    }
-
-                    /* we build prefixed key and insert into unified memtable */
-                    const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
-                    TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack4);
-                    if (!prefixed) break;
-                    tdb_encode_be32(cf_index, prefixed);
-                    memcpy(prefixed + TDB_UNIFIED_CF_PREFIX_SIZE, key, key_size_u64);
-                    const size_t pk_size = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
-
-                    const int is_delete = (flags & TDB_KV_FLAG_TOMBSTONE) ? 1 : 0;
-                    skip_list_put_with_seq(
-                        umt->skip_list, prefixed, pk_size, is_delete ? NULL : (uint8_t *)value,
-                        is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, is_delete);
-                    TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack4);
-
-                    if (seq_value > max_seq) max_seq = seq_value;
-                    total_entries++;
-                }
-
-                /* we must ensure next_cf_index is past any cf_index seen in the WAL */
-                if (max_cf_index_seen > 0)
-                {
-                    uint32_t needed = max_cf_index_seen + 1;
-                    uint32_t current =
-                        atomic_load_explicit(&db->unified_mt.next_cf_index, memory_order_relaxed);
-                    while (needed > current)
-                    {
-                        if (atomic_compare_exchange_weak_explicit(
-                                &db->unified_mt.next_cf_index, &current, needed,
-                                memory_order_relaxed, memory_order_relaxed))
-                            break;
-                    }
-                }
-
-                block_manager_block_release(block);
-            } while (block_manager_cursor_next(cursor) == 0);
-        }
-
-        block_manager_cursor_free(cursor);
         block_manager_close(wal);
 
-        /* we delete recovered WAL file */
+        /* we delete the recovered lower-generation WAL -- its entries are now in
+         * the active unified memtable */
         tdb_unlink(wal_path);
         free(wal_path);
     }
@@ -27964,7 +28822,7 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
         }
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified WAL recovery completed: %d entries, max_seq=%" PRIu64,
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified WAL recovery completed '%d' entries, max_seq=%" PRIu64,
                   total_entries, max_seq);
 
     return TDB_SUCCESS;
@@ -27980,7 +28838,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting database recovery from: %s", db->db_path);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting database recovery from '%s'", db->db_path);
 
     /*** if local directory is empty or missing but
      **  object store has data, discover CFs from remote and download their
@@ -28012,7 +28870,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
         struct STAT_STRUCT st;
         if (STAT_FUNC(full_path, &st) == 0 && S_ISDIR(st.st_mode))
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "Found CF directory: %s", entry->d_name);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Found CF directory '%s'", entry->d_name);
             tidesdb_column_family_t *cf = tidesdb_get_column_family_internal(db, entry->d_name);
 
             if (!cf)
@@ -28068,25 +28926,25 @@ static int tidesdb_recover_database(tidesdb_t *db)
                 {
                     /* CF already exists in memory, we try to get it again */
                     cf = tidesdb_get_column_family_internal(db, entry->d_name);
-                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF already exists during recovery: %s",
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF already exists during recovery '%s'",
                                   entry->d_name);
                 }
                 else
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
-                                  "Failed to create CF during recovery: %s (error code: %d)",
+                                  "Failed to create CF during recovery '%s' (error code: %d)",
                                   entry->d_name, create_result);
                 }
             }
 
             if (cf)
             {
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering CF: %s", entry->d_name);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering CF '%s'", entry->d_name);
                 tidesdb_recover_column_family(cf);
             }
             else
             {
-                TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to get/create CF: %s", entry->d_name);
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to get/create CF '%s'", entry->d_name);
             }
         }
     }
@@ -28403,8 +29261,7 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf)
                 atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
             if (umt && umt->skip_list && skip_list_count_entries(umt->skip_list) > 0)
             {
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "purge_cf: rotating unified memtable for CF '%s'",
-                              cf->name);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Rotating unified memtable for CF '%s'", cf->name);
                 tidesdb_unified_memtable_rotate(db);
             }
             atomic_store_explicit(&db->unified_mt.is_flushing, 0, memory_order_release);
@@ -28431,8 +29288,7 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf)
     const int result = tidesdb_flush_memtable_internal(cf, 0, 1);
     if (result != TDB_SUCCESS && result != TDB_ERR_MEMORY)
     {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "purge_cf: flush failed for CF '%s' (err=%d)", cf->name,
-                      result);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Flush failed for CF '%s' (err=%d)", cf->name, result);
         return result;
     }
 
@@ -28466,7 +29322,7 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf)
         usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "purge_cf: CF '%s' purge complete", cf->name);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' purge complete", cf->name);
     return TDB_SUCCESS;
 }
 
@@ -28476,7 +29332,7 @@ int tidesdb_purge(tidesdb_t *db)
 
     int first_err = TDB_SUCCESS;
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "purge: starting full database purge");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting full database purge");
 
     /** we flush unified active memtable before per-CF purge so that the resulting
      *  ssts are included in the per-CF compaction pass that follows */
@@ -28490,7 +29346,7 @@ int tidesdb_purge(tidesdb_t *db)
                 atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
             if (umt && umt->skip_list && skip_list_count_entries(umt->skip_list) > 0)
             {
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "purge: rotating unified memtable");
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Rotating unified memtable");
                 tidesdb_unified_memtable_rotate(db);
             }
             atomic_store_explicit(&db->unified_mt.is_flushing, 0, memory_order_release);
@@ -28535,7 +29391,7 @@ int tidesdb_purge(tidesdb_t *db)
         usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "purge: full database purge complete");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Full database purge complete");
     return first_err;
 }
 
@@ -29055,7 +29911,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
         if (mkdir(dir, TDB_DIR_PERMISSIONS) != 0) return TDB_ERR_IO;
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting backup to directory: %s", dir);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting backup to directory '%s'", dir);
 
     int result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_IMMUTABLE);
     if (result != TDB_SUCCESS) return result;
@@ -29175,7 +30031,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
     result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_FINAL);
     if (result != TDB_SUCCESS) return result;
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully: %s", dir);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully in '%s'", dir);
     return TDB_SUCCESS;
 }
 
@@ -29265,7 +30121,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         if (mkdir(checkpoint_dir, TDB_DIR_PERMISSIONS) != 0) return TDB_ERR_IO;
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting checkpoint to directory: %s", checkpoint_dir);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting checkpoint to directory '%s'", checkpoint_dir);
 
     int result = TDB_SUCCESS;
 
@@ -29287,7 +30143,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         if (!cf) continue;
         if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire)) continue;
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint: processing CF '%s'", cf->name);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint processing CF '%s'", cf->name);
 
         /*** we force flush memtable so all data is in sstables.
          **  we retry in a loop because tidesdb_flush_memtable_internal uses a CAS on
@@ -29312,7 +30168,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
             result = tidesdb_flush_memtable_internal(cf, 0, 1);
             if (result != TDB_SUCCESS && result != TDB_ERR_MEMORY)
             {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: flush failed for CF '%s' (err=%d)",
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint flush failed for CF '%s' (err=%d)",
                               cf->name, result);
                 return result;
             }
@@ -29356,7 +30212,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                  checkpoint_dir, cf->name);
         if (mkdir(cf_checkpoint_dir, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
         {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to create CF dir %s",
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint failed to create CF dir %s",
                           cf_checkpoint_dir);
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             return TDB_ERR_IO;
@@ -29394,7 +30250,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                 result = tidesdb_checkpoint_ensure_parent_dir(dst_klog);
                 if (result != TDB_SUCCESS)
                 {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to create parent dir for %s",
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint failed to create parent dir for %s",
                                   dst_klog);
                     break;
                 }
@@ -29403,7 +30259,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                 result = tidesdb_checkpoint_link_or_copy(sst->klog_path, dst_klog);
                 if (result != TDB_SUCCESS)
                 {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to link/copy klog %s",
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint failed to link/copy klog %s",
                                   sst->klog_path);
                     break;
                 }
@@ -29412,12 +30268,12 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                 result = tidesdb_checkpoint_link_or_copy(sst->vlog_path, dst_vlog);
                 if (result != TDB_SUCCESS)
                 {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to link/copy vlog %s",
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint failed to link/copy vlog %s",
                                   sst->vlog_path);
                     break;
                 }
 
-                TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Checkpoint: linked SSTable %" PRIu64 " on L%d",
+                TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Checkpoint linked SSTable %" PRIu64 " on L%d",
                               sst->id, level + 1);
             }
         }
@@ -29448,7 +30304,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
             }
             if (result != TDB_SUCCESS)
             {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to copy manifest for CF '%s'",
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint failed to copy manifest for CF '%s'",
                               cf->name);
             }
         }
@@ -29483,7 +30339,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
             }
             if (result != TDB_SUCCESS)
             {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to copy config for CF '%s'",
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint failed to copy config for CF '%s'",
                               cf->name);
             }
         }
@@ -29491,7 +30347,7 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         /* we resume compactions */
         atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint: CF '%s' done (levels=%d, result=%d)", cf->name,
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint for CF '%s' done (levels=%d, result=%d)", cf->name,
                       num_levels, result);
 
         if (result != TDB_SUCCESS) return result;

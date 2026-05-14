@@ -2617,6 +2617,69 @@ void test_skip_list_cursor_next_get()
     skip_list_free(list);
 }
 
+void test_skip_list_cursor_advance_in_node()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    /* kA carries three versions, kB carries one. the chain is descending by seq */
+    uint8_t ka[] = "kA";
+    uint8_t kb[] = "kB";
+    ASSERT_EQ(skip_list_put_with_seq(list, ka, sizeof(ka), (uint8_t *)"v1", 3, -1, 1, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, ka, sizeof(ka), (uint8_t *)"v5", 3, -1, 5, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, ka, sizeof(ka), (uint8_t *)"v9", 3, -1, 9, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, kb, sizeof(kb), (uint8_t *)"v3", 3, -1, 3, 0), 0);
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+    ASSERT_EQ(skip_list_cursor_goto_first(cursor), 0);
+
+    uint8_t *key, *value;
+    size_t key_size, value_size;
+    int64_t ttl;
+    uint8_t deleted;
+    uint64_t seq;
+
+    /* head of kA is the newest version */
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                            &deleted, &seq),
+              0);
+    ASSERT_TRUE(memcmp(key, ka, sizeof(ka)) == 0);
+    ASSERT_EQ(seq, 9);
+
+    /* advance through the chain -- seq 9 -> 5 -> 1 */
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                            &deleted, &seq),
+              0);
+    ASSERT_TRUE(memcmp(key, ka, sizeof(ka)) == 0);
+    ASSERT_EQ(seq, 5);
+
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                            &deleted, &seq),
+              0);
+    ASSERT_TRUE(memcmp(key, ka, sizeof(ka)) == 0);
+    ASSERT_EQ(seq, 1);
+
+    /* chain exhausted */
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), -1);
+
+    /* moving to the next key resets the version pointer back to the head */
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                            &deleted, &seq),
+              0);
+    ASSERT_TRUE(memcmp(key, kb, sizeof(kb)) == 0);
+    ASSERT_EQ(seq, 3);
+
+    /* single-version node has no chain to walk */
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), -1);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
 void benchmark_skip_list_read_path()
 {
     printf(BOLDWHITE "\n----------------- Read Path Benchmark -----------------\n" RESET);
@@ -2943,6 +3006,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_arena_zero_capacity, tests_passed);
     RUN_TEST(test_skip_list_get_ref, tests_passed);
     RUN_TEST(test_skip_list_cursor_next_get, tests_passed);
+    RUN_TEST(test_skip_list_cursor_advance_in_node, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);

@@ -607,7 +607,7 @@ void *writer_thread(void *arg)
     for (int i = 0; i < BLOCKS_PER_WRITER; i++)
     {
         uint64_t size = 20;
-        char data[20];
+        char data[20] = {0};
         snprintf(data, 20, "writer%d-block%d", thread_id, i);
 
         block_manager_block_t *block = block_manager_block_create(size, data);
@@ -1081,7 +1081,7 @@ void benchmark_block_manager_write_raw(void)
     ASSERT_TRUE(data != NULL);
     for (int i = 0; i < bench_blocks; i++)
     {
-        data[i] = malloc(bench_size);
+        data[i] = calloc(1, bench_size);
         ASSERT_TRUE(data[i] != NULL);
         for (int j = 0; j < bench_size - 20; j++)
         {
@@ -1174,7 +1174,7 @@ void benchmark_block_manager()
 
     for (int i = 0; i < NUM_BLOCKS; i++)
     {
-        block_data[i] = malloc(BLOCK_SIZE);
+        block_data[i] = calloc(1, BLOCK_SIZE);
         ASSERT_TRUE(block_data[i] != NULL);
 
         /* we fill with random data + sequential identifier */

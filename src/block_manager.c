@@ -27,6 +27,10 @@
 /* thread-local reusable pread buffer to avoid page faults on every block read. */
 #define BM_READ_BUF_INITIAL_SIZE (128 * 1024)
 
+/* DIAGNOSTIC -- a real block never approaches this. a larger size read from a
+ * block header means the bytes at that offset are not a real header. */
+#define BM_DIAG_MAX_SANE_BLOCK_SIZE (256u * 1024u * 1024u)
+
 static pthread_key_t bm_tls_key;
 static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
 
@@ -1054,6 +1058,24 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 
     const uint32_t block_size = decode_uint32_le_compat(header_buf);
     if (BM_UNLIKELY(block_size == 0)) return NULL;
+
+    /* an absurd size means the bytes at this offset are not a real block
+     * header. we log the full context (the offset against the file extents and
+     * the raw header bytes) and fail the read gracefully instead of trying to
+     * allocate gigabytes of trash. */
+    if (BM_UNLIKELY(block_size > BM_DIAG_MAX_SANE_BLOCK_SIZE))
+    {
+        fprintf(stderr,
+                "BMDIAG absurd block_size=%u (0x%08x) at offset=%llu file='%s' fd=%d "
+                "file_size=%llu prealloc=%llu header=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                block_size, block_size, (unsigned long long)offset, bm->file_path, fd,
+                (unsigned long long)atomic_load(&bm->current_file_size),
+                (unsigned long long)atomic_load(&bm->preallocated_size), header_buf[0],
+                header_buf[1], header_buf[2], header_buf[3], header_buf[4], header_buf[5],
+                header_buf[6], header_buf[7]);
+        fflush(stderr);
+        return NULL;
+    }
 
     const uint32_t stored_checksum =
         decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);

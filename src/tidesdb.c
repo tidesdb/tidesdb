@@ -17509,7 +17509,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     if (effective_block_cache_size > 0)
     {
-        cache_config_t cache_config;
+        cache_config_t cache_config = {0};
         clock_cache_compute_config(effective_block_cache_size, &cache_config);
         cache_config.evict_callback = tidesdb_cache_evict_block; /* ref-counted block cleanup */
 

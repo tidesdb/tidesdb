@@ -984,6 +984,11 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
      * payload is aligned to CLOCK_CACHE_PAYLOAD_ALIGN for safe typed access
      * this halves malloc calls and improves data locality */
     const size_t aligned_key_len = CLOCK_CACHE_ALIGN_UP(key_len, CLOCK_CACHE_PAYLOAD_ALIGN);
+    if (aligned_key_len < key_len || aligned_key_len > SIZE_MAX - payload_len)
+    {
+        atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
+        return -1;
+    }
     char *new_buf = (char *)malloc(aligned_key_len + payload_len);
     if (!new_buf)
     {
@@ -1056,6 +1061,11 @@ int clock_cache_put_new(clock_cache_t *cache, const char *key, size_t key_len, c
     }
 
     const size_t aligned_key_len = CLOCK_CACHE_ALIGN_UP(key_len, CLOCK_CACHE_PAYLOAD_ALIGN);
+    if (aligned_key_len < key_len || aligned_key_len > SIZE_MAX - payload_len)
+    {
+        atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
+        return -1;
+    }
     char *new_buf = (char *)malloc(aligned_key_len + payload_len);
     if (!new_buf)
     {

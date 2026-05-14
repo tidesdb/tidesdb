@@ -1285,7 +1285,8 @@ static uint64_t tidesdb_min_active_snapshot_seq(tidesdb_t *db);
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
                                                skip_list_t *memtable);
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
-                               size_t key_size, tidesdb_kv_pair_t **kv, int skip_bloom);
+                               size_t key_size, uint64_t seq_ceiling, tidesdb_kv_pair_t **kv,
+                               int skip_bloom);
 static int tidesdb_sstable_get_seq(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                    size_t key_size, uint64_t *out_seq);
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst);
@@ -2889,6 +2890,10 @@ static int tidesdb_build_indexed_block_data(const uint8_t *data, const size_t da
  * @param data_size size of data
  * @param search_key the key to find
  * @param search_key_size size of search key
+ * @param seq_ceiling highest sequence number to consider (UINT64_MAX = newest).
+ *                    a key may appear several times in one block when a flush
+ *                    or compaction retains a version chain; the run is scanned
+ *                    and the highest seq at or below the ceiling is returned
  * @param comparator_fn comparator function
  * @param comparator_ctx comparator context
  * @param out_entry output  -- entry metadata (flags, key_size, value_size, seq, ttl, vlog_offset)
@@ -2898,6 +2903,7 @@ static int tidesdb_build_indexed_block_data(const uint8_t *data, const size_t da
  */
 static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_size,
                                          const uint8_t *search_key, const size_t search_key_size,
+                                         const uint64_t seq_ceiling,
                                          skip_list_comparator_fn comparator_fn,
                                          void *comparator_ctx, tidesdb_klog_entry_t *out_entry,
                                          const uint8_t **out_key, const uint8_t **out_value)
@@ -2938,6 +2944,54 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
         }
 
         if (found < 0) return -1;
+
+        /* a key may have several versions in this block when a flush or
+         * compaction retained a version chain. they sit in a contiguous run --
+         * scan it and keep the highest seq at or below seq_ceiling, the version
+         * visible at the caller's snapshot. the abs_seq is precomputed in each
+         * index entry, so the scan needs no entry decoding. */
+        {
+            int32_t run_lo = found;
+            int32_t run_hi = found;
+            while (run_lo > 0)
+            {
+                const uint8_t *pe = idx_base + (run_lo - 1) * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                const uint32_t pk_off = decode_uint32_le_compat(pe + TDB_BLOCK_IDX_KEY_OFF);
+                const uint32_t pk_sz = decode_uint32_le_compat(pe + TDB_BLOCK_IDX_KEY_SIZE);
+                if (comparator_fn(search_key, search_key_size, block_data + pk_off, pk_sz,
+                                  comparator_ctx) != 0)
+                    break;
+                run_lo--;
+            }
+            while (run_hi + 1 < (int32_t)idx_count)
+            {
+                const uint8_t *ne = idx_base + (run_hi + 1) * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                const uint32_t nk_off = decode_uint32_le_compat(ne + TDB_BLOCK_IDX_KEY_OFF);
+                const uint32_t nk_sz = decode_uint32_le_compat(ne + TDB_BLOCK_IDX_KEY_SIZE);
+                if (comparator_fn(search_key, search_key_size, block_data + nk_off, nk_sz,
+                                  comparator_ctx) != 0)
+                    break;
+                run_hi++;
+            }
+
+            int32_t best = -1;
+            uint64_t best_seq = 0;
+            for (int32_t i = run_lo; i <= run_hi; i++)
+            {
+                const uint8_t *re = idx_base + i * TDB_BLOCK_INDEX_ENTRY_STRIDE;
+                const uint32_t s_lo = decode_uint32_le_compat(re + TDB_BLOCK_IDX_SEQ_LO);
+                const uint32_t s_hi = decode_uint32_le_compat(re + TDB_BLOCK_IDX_SEQ_HI);
+                const uint64_t e_seq = ((uint64_t)s_hi << TDB_U64_HI_LO_SHIFT) | s_lo;
+                if (e_seq > seq_ceiling) continue;
+                if (best < 0 || e_seq > best_seq)
+                {
+                    best = i;
+                    best_seq = e_seq;
+                }
+            }
+            if (best < 0) return -1;
+            found = best;
+        }
 
         /* we extract matched entry metadata */
         const uint8_t *fie = idx_base + found * TDB_BLOCK_INDEX_ENTRY_STRIDE;
@@ -3135,6 +3189,55 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
         if (index != stack_index) free(index);
         if (num_entries > TDB_KLOG_BLOCK_STACK_ENTRIES) free(entry_offsets);
         return -1;
+    }
+
+    /* a key may have several versions in this block when a flush or compaction
+     * retained a version chain. they sit in a contiguous run -- scan it and
+     * keep the highest seq at or below seq_ceiling. delta-seq entries chain
+     * from the nearest preceding absolute, so we sum abs_seq forward from
+     * entry 0 in one pass and consider the members inside the run. */
+    {
+        int32_t run_lo = found;
+        int32_t run_hi = found;
+        while (run_lo > 0 &&
+               comparator_fn(search_key, search_key_size, data + index[run_lo - 1].key_offset,
+                             index[run_lo - 1].key_size, comparator_ctx) == 0)
+            run_lo--;
+        while (run_hi + 1 < (int32_t)valid_entries &&
+               comparator_fn(search_key, search_key_size, data + index[run_hi + 1].key_offset,
+                             index[run_hi + 1].key_size, comparator_ctx) == 0)
+            run_hi++;
+
+        int32_t best = -1;
+        uint64_t best_seq = 0;
+        uint64_t abs_seq = 0;
+        for (int32_t j = 0; j <= run_hi; j++)
+        {
+            const uint8_t *sptr = data + entry_offsets[j];
+            const uint8_t sf = *sptr++;
+            uint64_t dummy, sv;
+            sptr += decode_varint(sptr, &dummy, TDB_VARINT_MAX_BYTES); /* key_size */
+            sptr += decode_varint(sptr, &dummy, TDB_VARINT_MAX_BYTES); /* value_size */
+            sptr += decode_varint(sptr, &sv, TDB_VARINT_MAX_BYTES);    /* seq */
+            if (sf & TDB_KV_FLAG_DELTA_SEQ)
+                abs_seq += sv;
+            else
+                abs_seq = sv;
+
+            if (j >= run_lo && abs_seq <= seq_ceiling && (best < 0 || abs_seq > best_seq))
+            {
+                best = j;
+                best_seq = abs_seq;
+            }
+        }
+
+        if (best < 0)
+        {
+            if (index != stack_index) free(index);
+            if (num_entries > TDB_KLOG_BLOCK_STACK_ENTRIES) free(entry_offsets);
+            return -1;
+        }
+        found = best;
     }
 
     /* we re-parse the single matched entry to extract full metadata */
@@ -7409,10 +7512,12 @@ cleanup:
  * @param sst the sstable
  * @param key the key
  * @param key_size the size of the key
+ * @param seq_ceiling highest sequence number to consider (UINT64_MAX = newest)
  * @param kv the key-value pair
  */
 static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
-                                     const size_t key_size, tidesdb_kv_pair_t **kv)
+                                     const size_t key_size, const uint64_t seq_ceiling,
+                                     tidesdb_kv_pair_t **kv)
 {
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
@@ -7479,8 +7584,8 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
     int64_t ttl = 0;
     uint8_t deleted = 0;
 
-    const int result =
-        btree_get(&tree, key, key_size, &value, &value_size, &vlog_offset, &seq, &ttl, &deleted);
+    const int result = btree_get_at_seq(&tree, key, key_size, seq_ceiling, &value, &value_size,
+                                        &vlog_offset, &seq, &ttl, &deleted);
     if (result != 0)
     {
         return TDB_ERR_NOT_FOUND;
@@ -7573,11 +7678,13 @@ static _Thread_local uint64_t tdb_sst_get_seq_out;
  * @param sst the sstable
  * @param key the key
  * @param key_size the size of the key
+ * @param seq_ceiling highest sequence number to consider (UINT64_MAX = newest)
  * @param kv the key-value pair (NULL for seq-only mode)
  * @param skip_bloom if nonzero, skip bloom filter check
  */
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
-                               const size_t key_size, tidesdb_kv_pair_t **kv, const int skip_bloom)
+                               const size_t key_size, const uint64_t seq_ceiling,
+                               tidesdb_kv_pair_t **kv, const int skip_bloom)
 {
     /* we branch based on sstable type.
      * btree path does not support seq-only mode (kv=NULL), so fall back
@@ -7587,7 +7694,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         if (!kv)
         {
             tidesdb_kv_pair_t *tmp_kv = NULL;
-            const int rc = tidesdb_sstable_get_btree(db, sst, key, key_size, &tmp_kv);
+            const int rc = tidesdb_sstable_get_btree(db, sst, key, key_size, seq_ceiling, &tmp_kv);
             if (rc == TDB_SUCCESS && tmp_kv)
             {
                 tdb_sst_get_seq_out = tmp_kv->entry.seq;
@@ -7595,7 +7702,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             }
             return rc;
         }
-        return tidesdb_sstable_get_btree(db, sst, key, key_size, kv);
+        return tidesdb_sstable_get_btree(db, sst, key, key_size, seq_ceiling, kv);
     }
 
     if (!sst->min_key || !sst->max_key)
@@ -7727,8 +7834,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             const uint8_t *found_value = NULL;
 
             const int search_rc = tidesdb_klog_block_search_raw(
-                search_data, search_data_size, key, key_size, comparator_fn, comparator_ctx,
-                &found_entry, &found_key, &found_value);
+                search_data, search_data_size, key, key_size, seq_ceiling, comparator_fn,
+                comparator_ctx, &found_entry, &found_key, &found_value);
 
             if (search_rc != 0)
             {
@@ -7926,9 +8033,9 @@ full_download_path:
         const uint8_t *found_key = NULL;
         const uint8_t *found_value = NULL;
 
-        const int search_rc = tidesdb_klog_block_search_raw(search_data, search_data_size, key,
-                                                            key_size, comparator_fn, comparator_ctx,
-                                                            &found_entry, &found_key, &found_value);
+        const int search_rc = tidesdb_klog_block_search_raw(
+            search_data, search_data_size, key, key_size, seq_ceiling, comparator_fn,
+            comparator_ctx, &found_entry, &found_key, &found_value);
 
         if (search_rc == 0)
         {
@@ -8050,8 +8157,10 @@ static int tidesdb_sstable_get_seq(tidesdb_t *db, tidesdb_sstable_t *sst, const 
 {
     /* we call tidesdb_sstable_get with kv=NULL to trigger seq-only mode.
      * this skips kv_pair_create, value memcpy, and vlog reads.
-     * the seq is returned via the file-scope thread-local tdb_sst_get_seq_out. */
-    const int result = tidesdb_sstable_get(db, sst, key, key_size, NULL, 0);
+     * the seq is returned via the file-scope thread-local tdb_sst_get_seq_out.
+     * seq-only mode feeds conflict detection, which needs the true newest
+     * version, so the ceiling is unbounded. */
+    const int result = tidesdb_sstable_get(db, sst, key, key_size, UINT64_MAX, NULL, 0);
     if (result == TDB_SUCCESS)
     {
         *out_seq = tdb_sst_get_seq_out;
@@ -22142,8 +22251,8 @@ unified_sst_search:;
             }
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
-            int get_result = tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv,
-                                                 boundary_search_idx >= 0);
+            int get_result = tidesdb_sstable_get(cf->db, sst, key, key_size, snapshot_seq,
+                                                 &candidate_kv, boundary_search_idx >= 0);
 
             if (get_result == TDB_SUCCESS && candidate_kv)
             {

@@ -741,6 +741,88 @@ void test_btree_duplicate_keys()
     (void)remove(TEST_BTREE_FILE);
 }
 
+/* a key present multiple times in one btree -- a tombstone at a higher seq and
+ * an older live value at a lower seq, the shape a flush or compaction produces
+ * when it retains a version chain -- must resolve to the NEWEST version on
+ * lookup. before the fix btree_get did a plain exact-match binary search and
+ * returned a non-deterministic match among the duplicates; the trailing key
+ * here makes the search midpoint land on the older live entry, resurrecting a
+ * deleted key. */
+void test_btree_multi_version_resolution()
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    /* key "k" twice -- tombstone at seq 100, older live value at seq 50 -- then
+     * a trailing key "m" so the leaf has 3 entries and btree_get's binary
+     * search midpoint (index 1) lands on the stale live "k" */
+    uint8_t k[] = "k";
+    uint8_t m[] = "m";
+    uint8_t live[] = "live_value";
+    uint8_t mval[] = "m_value";
+    ASSERT_TRUE(btree_builder_add(builder, k, sizeof(k), NULL, 0, 0, 100, 0,
+                                  BTREE_ENTRY_FLAG_TOMBSTONE) == 0);
+    ASSERT_TRUE(btree_builder_add(builder, k, sizeof(k), live, sizeof(live), 0, 50, 0, 0) == 0);
+    ASSERT_TRUE(btree_builder_add(builder, m, sizeof(m), mval, sizeof(mval), 0, 1, 0, 0) == 0);
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    /* lookup of "k" must resolve to the newest version -- the tombstone at
+     * seq 100 -- not the older live value at seq 50 */
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_offset = 0;
+    uint64_t seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(
+        btree_get(tree, k, sizeof(k), &value, &value_size, &vlog_offset, &seq, &ttl, &deleted), 0);
+    ASSERT_EQ(seq, 100);
+    ASSERT_TRUE(deleted & BTREE_ENTRY_FLAG_TOMBSTONE);
+    free(value);
+    value = NULL;
+
+    /* a snapshot-bounded lookup resolves to the newest version at or below the
+     * ceiling -- a reader between the two writes still sees the live value */
+    ASSERT_EQ(btree_get_at_seq(tree, k, sizeof(k), 200, &value, &value_size, &vlog_offset, &seq,
+                               &ttl, &deleted),
+              0);
+    ASSERT_EQ(seq, 100);
+    ASSERT_TRUE(deleted & BTREE_ENTRY_FLAG_TOMBSTONE);
+    free(value);
+    value = NULL;
+
+    ASSERT_EQ(btree_get_at_seq(tree, k, sizeof(k), 75, &value, &value_size, &vlog_offset, &seq,
+                               &ttl, &deleted),
+              0);
+    ASSERT_EQ(seq, 50);
+    ASSERT_FALSE(deleted & BTREE_ENTRY_FLAG_TOMBSTONE);
+    ASSERT_TRUE(value != NULL && value_size == sizeof(live) &&
+                memcmp(value, live, value_size) == 0);
+    free(value);
+    value = NULL;
+
+    /* below every version of the key -- not visible at that snapshot */
+    ASSERT_EQ(btree_get_at_seq(tree, k, sizeof(k), 30, &value, &value_size, &vlog_offset, &seq,
+                               &ttl, &deleted),
+              -1);
+
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
 void test_btree_large_keys_values()
 {
     block_manager_t *bm = NULL;
@@ -2446,6 +2528,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_empty_tree, tests_passed);
     RUN_TEST(test_btree_single_entry, tests_passed);
     RUN_TEST(test_btree_duplicate_keys, tests_passed);
+    RUN_TEST(test_btree_multi_version_resolution, tests_passed);
     RUN_TEST(test_btree_large_keys_values, tests_passed);
     RUN_TEST(test_btree_seek_edge_cases, tests_passed);
     RUN_TEST(test_btree_compression_single_leaf, tests_passed);

@@ -1632,10 +1632,17 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
     if (ttl != 0) flags |= BTREE_ENTRY_FLAG_HAS_TTL;
     if (vlog_offset > 0) flags |= BTREE_ENTRY_FLAG_VLOG_REF;
 
+    /* we flush the full leaf before adding -- but never across a run of entries
+     * that share a key. a key's versions must all stay within one leaf so
+     * internal-node routing lands on the single leaf holding them and btree_get
+     * can resolve the whole run. */
     if (builder->current_leaf->current_size >= builder->config.target_node_size &&
         builder->current_leaf->num_entries >= BTREE_MIN_ENTRIES_PER_LEAF)
     {
-        if (btree_builder_flush_leaf(builder) != 0)
+        const btree_pending_leaf_t *cur = builder->current_leaf;
+        const int same_key_as_last = cur->last_key != NULL && cur->last_key_size == key_size &&
+                                     memcmp(cur->last_key, key, key_size) == 0;
+        if (!same_key_as_last && btree_builder_flush_leaf(builder) != 0)
         {
             return -1;
         }
@@ -2129,9 +2136,9 @@ int btree_open(btree_t **tree, block_manager_t *bm, const btree_config_t *config
     return 0;
 }
 
-int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t **value,
-              size_t *value_size, uint64_t *vlog_offset, uint64_t *seq, int64_t *ttl,
-              uint8_t *deleted)
+int btree_get_at_seq(btree_t *tree, const uint8_t *key, const size_t key_size,
+                     const uint64_t seq_ceiling, uint8_t **value, size_t *value_size,
+                     uint64_t *vlog_offset, uint64_t *seq, int64_t *ttl, uint8_t *deleted)
 {
     if (!tree || !key || key_size == 0) return -1;
 
@@ -2149,7 +2156,9 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
     {
         /* we utilize binary search for child index in internal node
          * find the largest i where key >= keys[i], then child_idx = i + 1
-         * if key < keys[0], child_idx = 0 */
+         * if key < keys[0], child_idx = 0. separator keys are strictly
+         * increasing -- the builder never splits a key's run across leaves --
+         * so a key's whole run lives in the one child this routes to. */
         uint32_t child_idx = 0;
         if (node->num_entries > 0)
         {
@@ -2182,27 +2191,42 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
         }
     }
 
-    int32_t left = 0;
-    int32_t right = (int32_t)node->num_entries - 1;
-    int32_t found_idx = -1;
-
-    while (left <= right)
+    /* lower_bound -- leftmost index whose key is >= the search key */
+    int32_t lo = 0;
+    int32_t hi = (int32_t)node->num_entries;
+    while (lo < hi)
     {
-        const int32_t mid = left + (right - left) / 2;
+        const int32_t mid = lo + (hi - lo) / 2;
         const int cmp = btree_compare_keys_inline(&tree->config, key, key_size, node->keys[mid],
                                                   node->key_sizes[mid]);
-        if (cmp == 0)
+        if (cmp <= 0)
         {
-            found_idx = mid;
-            break;
-        }
-        if (cmp < 0)
-        {
-            right = mid - 1;
+            hi = mid;
         }
         else
         {
-            left = mid + 1;
+            lo = mid + 1;
+        }
+    }
+
+    /* scan the run of entries that share the search key, keeping the highest
+     * seq that does not exceed seq_ceiling. a key may have several versions --
+     * a flush or compaction retains a version chain -- and they all live in
+     * this one leaf, so the resolved version is the one visible at the
+     * caller's snapshot. */
+    int32_t found_idx = -1;
+    for (int32_t i = lo; i < (int32_t)node->num_entries; i++)
+    {
+        if (btree_compare_keys_inline(&tree->config, key, key_size, node->keys[i],
+                                      node->key_sizes[i]) != 0)
+        {
+            break;
+        }
+        const uint64_t entry_seq = node->entries[i].seq;
+        if (entry_seq > seq_ceiling) continue;
+        if (found_idx < 0 || entry_seq > node->entries[found_idx].seq)
+        {
+            found_idx = i;
         }
     }
 
@@ -2244,6 +2268,14 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
 
     btree_node_done(node, using_cache);
     return 0;
+}
+
+int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t **value,
+              size_t *value_size, uint64_t *vlog_offset, uint64_t *seq, int64_t *ttl,
+              uint8_t *deleted)
+{
+    return btree_get_at_seq(tree, key, key_size, UINT64_MAX, value, value_size, vlog_offset, seq,
+                            ttl, deleted);
 }
 
 uint64_t btree_get_entry_count(const btree_t *tree)

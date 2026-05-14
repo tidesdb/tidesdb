@@ -25380,19 +25380,38 @@ static void test_perf_cached_iter_seek(void)
         tidesdb_txn_free(txn);
     }
 
+    /* tidesdb_is_flushing covers flush_pending_count, which only drops to zero
+     * after the worker installs the sstable into the level -- the raw is_flushing
+     * flag clears at the end of the rotation, well before the sstable lands.
+     * the wait is bounded so a genuinely stuck flush fails loudly here rather than
+     * surfacing later as a confusing total_ssts assertion */
     tidesdb_flush_memtable(cf);
-    for (int w = 0; w < 200; w++)
+    int flush_settled = 0;
+    for (int w = 0; w < 1000; w++)
     {
-        if (!atomic_load(&cf->is_flushing) && queue_size(db->flush_queue) == 0) break;
+        if (!tidesdb_is_flushing(cf))
+        {
+            flush_settled = 1;
+            break;
+        }
         usleep(20000);
     }
+    ASSERT_TRUE(flush_settled);
 
+    /* tidesdb_is_compacting covers the compaction queue too, so we don't observe
+     * is_compacting before a worker has picked the task up */
     tidesdb_compact(cf);
-    for (int w = 0; w < 200; w++)
+    int compaction_settled = 0;
+    for (int w = 0; w < 1000; w++)
     {
-        if (!atomic_load(&cf->is_compacting)) break;
+        if (!tidesdb_is_compacting(cf))
+        {
+            compaction_settled = 1;
+            break;
+        }
         usleep(20000);
     }
+    ASSERT_TRUE(compaction_settled);
 
     int total_ssts = 0;
     int num_levels = atomic_load(&cf->num_active_levels);

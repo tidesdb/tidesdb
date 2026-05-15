@@ -11014,9 +11014,10 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                     source->source.sstable.lazy.bmblock = NULL;
                                     source->source.sstable.lazy.decompressed = NULL;
                                     source->source.sstable.current_entry_idx = 0;
-                                    source->source.sstable.klog_cursor->current_block_size =
-                                        bdata_size;
-                                    source->source.sstable.klog_cursor->block_size_valid = 1;
+                                    /* bdata_size is the decompressed size, not
+                                     * the on-disk size cursor_next needs. invalidate
+                                     * so cursor_next re-reads the size header. */
+                                    source->source.sstable.klog_cursor->block_size_valid = 0;
                                     return TDB_SUCCESS;
                                 }
                             }
@@ -26354,9 +26355,10 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
 
                 source->source.sstable.lazy.entry_idx = found;
                 source->source.sstable.current_entry_idx = found;
-                /* cache block size so cursor_next skips pread */
-                cursor->current_block_size = source->source.sstable.lazy.block_data_size;
-                cursor->block_size_valid = 1;
+                /* lazy.block_data_size is the decompressed size, not the on-disk
+                 * size cursor_next needs to advance current_pos. invalidate so
+                 * cursor_next re-reads the size header from disk. */
+                cursor->block_size_valid = 0;
                 return;
             }
         }
@@ -26703,15 +26705,33 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
             source->source.sstable.lazy.bmblock = bmblock;
             source->source.sstable.lazy.decompressed = decompressed;
             source->source.sstable.current_entry_idx = found_idx;
-            cursor->current_block_size = block_data_size;
-            cursor->block_size_valid = 1;
+            /* cursor->current_block_size must hold the on-disk (compressed) size
+             * because cursor_next advances cursor->current_pos by header + size +
+             * footer. when we read via cursor_read we have bmblock with the
+             * on-disk size; otherwise (cache hit) we leave block_size_valid clear
+             * so cursor_next re-reads the header from disk. */
+            if (bmblock)
+            {
+                cursor->current_block_size = bmblock->size;
+                cursor->block_size_valid = 1;
+            }
+            else
+            {
+                cursor->block_size_valid = 0;
+            }
             return;
         }
 
-        /** target is past this block -- we set cached block size so
-         *  cursor_next can advance without a pread syscall */
-        cursor->current_block_size = block_data_size;
-        cursor->block_size_valid = 1;
+        /* target is past this block -- same on-disk-size invariant as above */
+        if (bmblock)
+        {
+            cursor->current_block_size = bmblock->size;
+            cursor->block_size_valid = 1;
+        }
+        else
+        {
+            cursor->block_size_valid = 0;
+        }
 
         if (pin) clock_cache_release(pin);
         if (decompressed) free(decompressed);

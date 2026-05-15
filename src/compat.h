@@ -597,9 +597,41 @@ static inline int tdb_ctz64_portable(uint64_t x)
 #include <process.h>
 #define TDB_GETPID() _getpid()
 #else
+#include <sys/wait.h>
 #include <unistd.h>
 #define TDB_GETPID() getpid()
 #endif
+
+/**
+ * tdb_spawn_wait
+ * spawn a child process running cmd with the given argument vector and block
+ * until it exits. argv is NULL terminated and argv[0] is the program name.
+ * cmd is resolved like execvp, a PATH search when it contains no separator,
+ * and _spawnvp applies the same resolution on Windows.
+ * @param cmd executable to run
+ * @param argv NULL-terminated argument vector, argv[0] is the program name
+ * @return the child exit code on a normal exit, -1 on spawn failure or an
+ *         abnormal exit
+ */
+static inline int tdb_spawn_wait(const char *cmd, char *const argv[])
+{
+#ifdef _WIN32
+    intptr_t rc = _spawnvp(_P_WAIT, cmd, (const char *const *)argv);
+    return (rc < 0) ? -1 : (int)rc;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0)
+    {
+        execvp(cmd, argv);
+        _exit(127); /* execvp only returns on failure */
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+#endif
+}
 
 #ifdef _WIN32
 #include <direct.h>

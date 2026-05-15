@@ -421,8 +421,31 @@ int btree_open(btree_t **tree, block_manager_t *bm, const btree_config_t *config
                int64_t root_offset, int64_t first_leaf_offset, int64_t last_leaf_offset);
 
 /**
+ * btree_get_at_seq
+ * retrieves the version of a key visible at a sequence ceiling. a key may have
+ * several versions in one tree (a flush or compaction retains a version chain);
+ * this returns the one with the highest seq that does not exceed seq_ceiling,
+ * or -1 if the key has no version at or below it.
+ * @param tree the B+tree
+ * @param key key data
+ * @param key_size size of key
+ * @param seq_ceiling highest sequence number to consider (UINT64_MAX = newest)
+ * @param value output pointer to value (caller must free)
+ * @param value_size output value size
+ * @param vlog_offset output vlog offset (0 if inline)
+ * @param seq output sequence number
+ * @param ttl output time-to-live
+ * @param deleted output tombstone flag
+ * @return 0 on success, -1 on not found or error
+ */
+int btree_get_at_seq(btree_t *tree, const uint8_t *key, size_t key_size, uint64_t seq_ceiling,
+                     uint8_t **value, size_t *value_size, uint64_t *vlog_offset, uint64_t *seq,
+                     int64_t *ttl, uint8_t *deleted);
+
+/**
  * btree_get
- * retrieves a value by key
+ * retrieves the newest version of a key (equivalent to btree_get_at_seq with
+ * seq_ceiling = UINT64_MAX)
  * @param tree the B+tree
  * @param key key data
  * @param key_size size of key

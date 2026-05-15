@@ -28101,8 +28101,169 @@ static void test_btree_cache_invalidation_on_sstable_free(void)
     cleanup_test_dir();
 }
 
+/* crash recovery -- a child process writes fsynced committed data and then
+ * _exit()s without tidesdb_close, mimicking a hard crash with no clean
+ * shutdown. the parent reopens the database and every committed key must come
+ * back. this is the path the rest of the suite never exercises because every
+ * other recovery test closes cleanly first, which is how the wal clobber and
+ * unified index reassignment bugs stayed hidden. multiplatform -- tdb_spawn_wait
+ * re-execs this binary as its own crash child on both posix and windows. */
+#define CRASH_RECOVERY_DB_PATH      "./test_tidesdb_crash"
+#define CRASH_RECOVERY_CHILD_ARG    "__crash_recovery_child"
+#define CRASH_RECOVERY_KEY_COUNT    300
+#define CRASH_RECOVERY_WRITE_BUFFER 4096
+#define CRASH_RECOVERY_MAX_CFS      4
+
+/* argv[0] of this process, used to re-exec the binary as the crash child */
+static const char *g_test_argv0 = NULL;
+
+static void crash_recovery_cf_name(char *buf, size_t cap, int idx)
+{
+    snprintf(buf, cap, "crash_cf_%d", idx);
+}
+
+/* runs in the child process -- open, write CRASH_RECOVERY_KEY_COUNT fsynced
+ * committed keys round-robin across num_cfs column families with a small write
+ * buffer so the wal rotates several times, then _exit without closing. never
+ * returns. exit code 0 means every commit reported success. */
+static void crash_recovery_child_workload(int unified, int num_cfs)
+{
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = (char *)CRASH_RECOVERY_DB_PATH;
+    config.log_level = TDB_LOG_ERROR;
+    config.unified_memtable = unified;
+    config.unified_memtable_write_buffer_size = CRASH_RECOVERY_WRITE_BUFFER;
+    config.unified_memtable_sync_mode = TDB_SYNC_FULL;
+
+    tidesdb_t *db = NULL;
+    if (tidesdb_open(&config, &db) != 0) _exit(2);
+
+    tidesdb_column_family_t *cfs[CRASH_RECOVERY_MAX_CFS];
+    for (int c = 0; c < num_cfs; c++)
+    {
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = CRASH_RECOVERY_WRITE_BUFFER;
+        cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+        cf_config.sync_mode = TDB_SYNC_FULL;
+        char name[32];
+        crash_recovery_cf_name(name, sizeof(name), c);
+        if (tidesdb_create_column_family(db, name, &cf_config) != 0) _exit(3);
+        cfs[c] = tidesdb_get_column_family(db, name);
+        if (!cfs[c]) _exit(4);
+    }
+
+    for (int i = 0; i < CRASH_RECOVERY_KEY_COUNT; i++)
+    {
+        char key[32];
+        int klen = snprintf(key, sizeof(key), "k%08d", i);
+        tidesdb_column_family_t *cf = cfs[i % num_cfs];
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(db, &txn) != 0) _exit(5);
+        if (tidesdb_txn_put(txn, cf, (uint8_t *)key, (size_t)klen, (uint8_t *)key, (size_t)klen,
+                            0) != 0)
+            _exit(6);
+        if (tidesdb_txn_commit(txn) != 0) _exit(7);
+        tidesdb_txn_free(txn);
+    }
+
+    /* every commit returned success so every key is fsynced in a wal. exit
+     * abruptly with no tidesdb_close and no final flush -- this is the crash. */
+    _exit(0);
+}
+
+/* spawns the crash child for the given mode and blocks until it exits, then
+ * returns the child exit code. */
+static int crash_recovery_spawn_child(int unified, int num_cfs)
+{
+    char unified_arg[8];
+    char num_cfs_arg[8];
+    snprintf(unified_arg, sizeof(unified_arg), "%d", unified);
+    snprintf(num_cfs_arg, sizeof(num_cfs_arg), "%d", num_cfs);
+
+    char *child_argv[] = {(char *)g_test_argv0, (char *)CRASH_RECOVERY_CHILD_ARG, unified_arg,
+                          num_cfs_arg, NULL};
+    return tdb_spawn_wait(g_test_argv0, child_argv);
+}
+
+/* reopens the database after the crash child and asserts every committed key
+ * is recoverable in its column family, then closes cleanly. */
+static void crash_recovery_verify(int unified, int num_cfs)
+{
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = (char *)CRASH_RECOVERY_DB_PATH;
+    config.log_level = TDB_LOG_ERROR;
+    config.unified_memtable = unified;
+    config.unified_memtable_write_buffer_size = CRASH_RECOVERY_WRITE_BUFFER;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_t *cfs[CRASH_RECOVERY_MAX_CFS];
+    for (int c = 0; c < num_cfs; c++)
+    {
+        char name[32];
+        crash_recovery_cf_name(name, sizeof(name), c);
+        cfs[c] = tidesdb_get_column_family(db, name);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    for (int i = 0; i < CRASH_RECOVERY_KEY_COUNT; i++)
+    {
+        char key[32];
+        int klen = snprintf(key, sizeof(key), "k%08d", i);
+        tidesdb_column_family_t *cf = cfs[i % num_cfs];
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn), 0);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, (size_t)klen, &value, &value_size), 0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_EQ(value_size, (size_t)klen);
+        ASSERT_EQ(memcmp(value, key, (size_t)klen), 0);
+
+        free(value);
+        tidesdb_txn_rollback(txn);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+}
+
+/* per-cf and unified memtable modes, each with one and several column
+ * families. for every scenario a child writes fsynced data and crashes, then
+ * the parent reopens and verifies nothing committed was lost. */
+static void test_crash_recovery_no_clean_close(void)
+{
+    static const struct
+    {
+        int unified;
+        int num_cfs;
+    } scenarios[] = {{0, 1}, {0, CRASH_RECOVERY_MAX_CFS}, {1, 1}, {1, CRASH_RECOVERY_MAX_CFS}};
+
+    for (size_t s = 0; s < sizeof(scenarios) / sizeof(scenarios[0]); s++)
+    {
+        (void)remove_directory(CRASH_RECOVERY_DB_PATH);
+
+        ASSERT_EQ(crash_recovery_spawn_child(scenarios[s].unified, scenarios[s].num_cfs), 0);
+        crash_recovery_verify(scenarios[s].unified, scenarios[s].num_cfs);
+    }
+
+    (void)remove_directory(CRASH_RECOVERY_DB_PATH);
+}
+
 int main(int argc, char **argv)
 {
+    g_test_argv0 = argv[0];
+
+    /* the crash recovery test re-execs this binary as its own crash child */
+    if (argc >= 4 && strcmp(argv[1], CRASH_RECOVERY_CHILD_ARG) == 0)
+    {
+        crash_recovery_child_workload(atoi(argv[2]), atoi(argv[3]));
+        return 1; /* workload _exit()s, this is unreachable */
+    }
+
     INIT_TEST_FILTER(argc, argv);
     cleanup_test_dir();
     RUN_TEST(test_custom_allocator, tests_passed);
@@ -28128,6 +28289,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
     RUN_TEST(test_multi_cf_transaction_atomicity_recovery, tests_passed);
     RUN_TEST(test_multi_cf_transaction_recovery_comprehensive, tests_passed);
+    RUN_TEST(test_crash_recovery_no_clean_close, tests_passed);
     RUN_TEST(test_iterator_basic, tests_passed);
     RUN_TEST(test_stats, tests_passed);
     RUN_TEST(test_stats_comprehensive, tests_passed);

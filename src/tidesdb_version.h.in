@@ -3,4 +3,9 @@
 
 #define TIDESDB_VERSION "@PROJECT_VERSION@"
 
+/* defined when libtidesdb was built with -DTIDESDB_WITH_S3=ON.
+ * consumers can use #ifdef TIDESDB_HAS_S3 to compile-time detect S3 support
+ * without having to re-pass the build flag. */
+#cmakedefine TIDESDB_HAS_S3
+
 #endif

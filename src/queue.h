@@ -172,6 +172,21 @@ void *queue_peek_at(queue_t *queue, size_t index);
 size_t queue_snapshot(queue_t *queue, void **out, size_t max_items);
 
 /**
+ * queue_remove_if
+ * remove every item where predicate(data, context) returns non-zero. acquires the same
+ * wrlock + head_lock + tail_lock combination as queue_clear so dequeuers and enqueuers
+ * are blocked for the duration. on_remove is invoked for each removed item before its
+ * node is recycled, giving the caller a hook to decrement counters or free the data.
+ * @param queue the queue
+ * @param predicate returns non-zero for items to remove
+ * @param context user-provided context passed to predicate and on_remove
+ * @param on_remove optional callback invoked per removed item (NULL to skip)
+ * @return number of items removed
+ */
+size_t queue_remove_if(queue_t *queue, int (*predicate)(void *data, void *context), void *context,
+                       void (*on_remove)(void *data, void *context));
+
+/**
  * queue_shutdown
  * signal shutdown to all waiting threads without freeing the queue
  * threads blocked in queue_dequeue_wait will return NULL

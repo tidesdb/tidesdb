@@ -430,6 +430,52 @@ int queue_clear(queue_t *queue)
     return 0;
 }
 
+size_t queue_remove_if(queue_t *queue, int (*predicate)(void *data, void *context), void *context,
+                       void (*on_remove)(void *data, void *context))
+{
+    if (QUEUE_UNLIKELY(queue == NULL || predicate == NULL)) return 0;
+
+    pthread_rwlock_wrlock(&queue->read_lock);
+    pthread_mutex_lock(&queue->head_lock);
+    pthread_mutex_lock(&queue->tail_lock);
+
+    size_t removed = 0;
+    queue_node_t *prev = queue->head; /* dummy sentinel */
+    queue_node_t *cur = queue->head->next;
+    while (cur != NULL)
+    {
+        if (predicate(cur->data, context))
+        {
+            queue_node_t *victim = cur;
+            prev->next = cur->next;
+            if (queue->tail == cur) queue->tail = prev;
+            cur = cur->next;
+
+            if (on_remove) on_remove(victim->data, context);
+            queue_free_node(queue, victim);
+            removed++;
+        }
+        else
+        {
+            prev = cur;
+            cur = cur->next;
+        }
+    }
+
+    if (removed > 0)
+    {
+        const size_t prior = atomic_load_explicit(&queue->size, memory_order_relaxed);
+        const size_t next_size = (prior > removed) ? (prior - removed) : 0;
+        atomic_store_explicit(&queue->size, next_size, memory_order_relaxed);
+    }
+
+    pthread_mutex_unlock(&queue->tail_lock);
+    pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
+
+    return removed;
+}
+
 int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *context)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return -1;

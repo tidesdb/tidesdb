@@ -733,6 +733,26 @@ int tidesdb_sync_wal(tidesdb_column_family_t *cf);
 tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir);
 
 /**
+ * tidesdb_objstore_s3_create
+ * create an S3-compatible object store connector (AWS S3, MinIO, etc.).
+ * the library must have been built with TIDESDB_WITH_S3=ON; otherwise the
+ * symbol is unresolved at link time.
+ * @param endpoint       S3 endpoint (e.g. "s3.amazonaws.com" or "minio.local:9000")
+ * @param bucket         bucket name
+ * @param prefix         key prefix (e.g. "production/db1/"), may be NULL
+ * @param access_key     AWS access key ID
+ * @param secret_key     AWS secret access key
+ * @param region         AWS region (e.g. "us-east-1"), NULL for MinIO
+ * @param use_ssl        1 for HTTPS, 0 for HTTP
+ * @param use_path_style 1 for path-style URLs (MinIO), 0 for virtual-hosted (AWS)
+ * @return connector handle, or NULL on error
+ */
+tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char *bucket,
+                                               const char *prefix, const char *access_key,
+                                               const char *secret_key, const char *region,
+                                               int use_ssl, int use_path_style);
+
+/**
  * tidesdb_promote_to_primary
  * switch a read-only replica to primary mode
  * @param db database handle in replica mode

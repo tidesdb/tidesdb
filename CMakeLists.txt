@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.2.2
+	VERSION 9.2.3
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -21,16 +21,21 @@ set(CMAKE_C_STANDARD 11)
 # can still link into a shared module like the mariadb plugin without recompile-with-fPIC errors
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
-        "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"
-)
-
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
 option(TIDESDB_WITH_S3 "build S3-compatible object store connector (requires libcurl + openssl)" OFF)
+
+# mirror TIDESDB_WITH_S3 into TIDESDB_HAS_S3 so configure_file emits the consumer-visible define
+if(TIDESDB_WITH_S3)
+    set(TIDESDB_HAS_S3 ON)
+endif()
+
+configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"
+)
 # BUILD_SHARED_LIBS controls static vs shared library
 # Default to STATIC on Windows (avoids DLL export/import complexity), SHARED elsewhere
 # Windows users can override with -DBUILD_SHARED_LIBS=ON if needed, but may require

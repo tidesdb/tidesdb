@@ -1415,6 +1415,55 @@ static inline int tidesdb_cf_abort_requested(const tidesdb_column_family_t *cf)
 }
 
 /**
+ * tdb_cf_effective_l1_trigger
+ * file-count threshold for L1 compaction. object-store mode with lazy compaction wants
+ * to absorb more L1 files before triggering to amortise remote I/O, so the threshold
+ * doubles in that case. callers must use this everywhere they previously compared
+ * against l1_file_count_trigger directly, otherwise backpressure and compaction logic
+ * drift out of agreement (e.g. backpressure would throttle the writer before the lazy
+ * compaction even queues).
+ * @param cf column family
+ * @return effective L1 file-count trigger
+ */
+static inline int tdb_cf_effective_l1_trigger(const tidesdb_column_family_t *cf)
+{
+    int trigger = cf->config.l1_file_count_trigger;
+    if (cf->db && cf->db->object_store && cf->config.object_lazy_compaction) trigger *= 2;
+    return trigger;
+}
+
+/**
+ * tdb_cf_effective_stall
+ * L0 stall threshold scaled for multi-CF deployments. the configured value assumes
+ * single-CF usage; with N CFs sharing the global memory budget the per-CF cap is
+ * memory_limit / (N * write_buffer_size), clamped to a minimum of 2. callers use
+ * this in the apply_backpressure ladder and the adaptive-flush threshold so both
+ * sites see the same scaled value.
+ * @param cf column family
+ * @return effective stall threshold (≥ 2)
+ */
+static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
+{
+    size_t stall = (size_t)cf->config.l0_queue_stall_threshold;
+    if (cf->db)
+    {
+        const int num_cfs = cf->db->num_column_families;
+        if (num_cfs > 1)
+        {
+            const size_t mem_limit =
+                atomic_load_explicit(&cf->db->resolved_memory_limit, memory_order_relaxed);
+            const size_t arena_size = cf->config.write_buffer_size;
+            if (mem_limit > 0 && arena_size > 0)
+            {
+                const size_t per_cf_budget = mem_limit / ((size_t)num_cfs * arena_size);
+                if (per_cf_budget < stall) stall = per_cf_budget < 2 ? 2 : per_cf_budget;
+            }
+        }
+    }
+    return stall;
+}
+
+/**
  * tdb_unified_dispatch_skip_segment
  * advance cursor past every remaining entry whose 4-byte cf_index prefix matches cf_index.
  * used by the unified flush dispatcher when the resolved CF is gone (transition lookup
@@ -12606,6 +12655,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         {
             /* we assign the built index to the sstable */
             new_sst->block_indexes = block_indexes;
+            block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
 
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Block index built with %u samples",
                           new_sst->block_indexes->count);
@@ -12656,6 +12706,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Bloom filter serialization failed");
             }
             new_sst->bloom_filter = bloom;
+            bloom = NULL; /* ownership transferred; local must not double-free on abort */
         }
         else
         {
@@ -13278,6 +13329,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         if (block_indexes)
         {
             new_sst->block_indexes = block_indexes;
+            block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
             size_t index_size;
             uint8_t *index_data =
                 compact_block_index_serialize(new_sst->block_indexes, &index_size);
@@ -13319,6 +13371,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
                 free(bloom_data);
             }
             new_sst->bloom_filter = bloom;
+            bloom = NULL; /* ownership transferred; local must not double-free on abort */
         }
         else
         {
@@ -14109,6 +14162,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             if (block_indexes)
             {
                 new_sst->block_indexes = block_indexes;
+                block_indexes =
+                    NULL; /* ownership transferred; local must not double-free on abort */
 
                 size_t index_size;
                 uint8_t *index_data =
@@ -14157,6 +14212,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     }
                     free(bloom_data);
                 }
+                bloom = NULL; /* ownership transferred; local must not double-free on abort */
             }
             else
             {
@@ -16281,13 +16337,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         int should_compact = 0;
         const char *trigger_reason = NULL;
 
-        /* in object store mode with lazy compaction, double the file count
-         * trigger to reduce compaction frequency and thus remote I/O */
-        int effective_file_trigger = cf->config.l1_file_count_trigger;
-        if (db->object_store && cf->config.object_lazy_compaction)
-        {
-            effective_file_trigger *= 2;
-        }
+        const int effective_file_trigger = tdb_cf_effective_l1_trigger(cf);
 
         /* file count trigger at level 1 */
         if (num_l1_sstables >= effective_file_trigger)
@@ -21372,31 +21422,8 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
     /* we check L1 file count */
     int l1_file_count = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
 
-    /**** we compute an effective L0 stall threshold that scales down for multi-CF deployments.
-     ***  the configured threshold (default 20) assumes single-CF usage. with N CFs sharing
-     **   the memory budget, each CF should stall earlier to prevent the aggregate memory
-     **   from reaching the global limit before any per-CF stall engages.
-     ***  effective_stall = min(configured, memory_limit / (num_cfs * arena_size))
-     **** clamped to a minimum of 2 to avoid degenerate behavior */
-    size_t effective_stall = (size_t)cf->config.l0_queue_stall_threshold;
-    if (cf->db)
-    {
-        const int num_cfs = cf->db->num_column_families;
-        if (num_cfs > 1)
-        {
-            const size_t mem_limit =
-                atomic_load_explicit(&cf->db->resolved_memory_limit, memory_order_relaxed);
-            const size_t arena_size = cf->config.write_buffer_size;
-            if (mem_limit > 0 && arena_size > 0)
-            {
-                size_t per_cf_budget = mem_limit / ((size_t)num_cfs * arena_size);
-                if (per_cf_budget < effective_stall)
-                {
-                    effective_stall = per_cf_budget < 2 ? 2 : per_cf_budget;
-                }
-            }
-        }
-    }
+    const size_t effective_stall = tdb_cf_effective_stall(cf);
+    const int effective_l1_trigger = tdb_cf_effective_l1_trigger(cf);
 
     /** l0 queue exceeds threshold -- force blocking flush of all immutables
      *  this prevents unbounded memory growth when flush worker falls behind */
@@ -21436,11 +21463,10 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
      *  we apply graduated delays based on queue depth and L1 file count */
     else if (l0_queue_depth >=
                  (size_t)((double)effective_stall * TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO) ||
-             l1_file_count >=
-                 (cf->config.l1_file_count_trigger * TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER))
+             l1_file_count >= (effective_l1_trigger * TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER))
     {
         /** high pressure -- TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO of stall threshold or
-         *  TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER x L1 trigger */
+         *  TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER x effective L1 trigger */
         usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' high backpressure: L0=%zu L1=%d - %dus delay",
                       cf->name, l0_queue_depth, l1_file_count, TDB_BACKPRESSURE_HIGH_DELAY_US);
@@ -21448,11 +21474,10 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
     }
     else if (l0_queue_depth >=
                  (size_t)((double)effective_stall * TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO) ||
-             l1_file_count >=
-                 (cf->config.l1_file_count_trigger * TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER))
+             l1_file_count >= (effective_l1_trigger * TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER))
     {
         /** moderate pressure -- TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO of stall threshold or
-         *  TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER x L1 trigger */
+         *  TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER x effective L1 trigger */
         usleep(TDB_BACKPRESSURE_MODERATE_DELAY_US);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' moderate backpressure: L0=%zu L1=%d - %dus delay",
                       cf->name, l0_queue_depth, l1_file_count, TDB_BACKPRESSURE_MODERATE_DELAY_US);
@@ -24383,7 +24408,7 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
         density_min_key = NULL;
         density_max_key = NULL;
     }
-    else if (num_l1 >= cf->config.l1_file_count_trigger || density_hit)
+    else if (num_l1 >= tdb_cf_effective_l1_trigger(cf) || density_hit)
     {
         tidesdb_compact(cf);
     }
@@ -25135,14 +25160,18 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
          *****  idle (queue empty)              50% headroom for max batching
          ****   moderate (1-2 pending)          25% headroom (proven baseline)
          ***    high (>=50% stall threshold)    0% headroom, flush immediately
-         **     global elevated+                0% headroom, flush at exact write_buffer_size */
+         **     global elevated+                0% headroom, flush at exact write_buffer_size
+         *      half_stall uses the multi-CF scaled effective stall so the tier boundary
+         *      matches the threshold apply_backpressure enforces */
         const size_t l0_depth = queue_size(cf->immutable_memtables);
-        const size_t half_stall = (size_t)cf->config.l0_queue_stall_threshold / 2;
+        const size_t effective_stall = tdb_cf_effective_stall(cf);
+        const size_t half_stall = effective_stall / 2;
         const int global_pressure =
             cf->db ? atomic_load_explicit(&cf->db->memory_pressure_level, memory_order_relaxed)
                    : TDB_MEMORY_PRESSURE_NORMAL;
         size_t flush_threshold;
-        if (global_pressure >= TDB_MEMORY_PRESSURE_ELEVATED || l0_depth >= half_stall)
+        if (global_pressure >= TDB_MEMORY_PRESSURE_ELEVATED ||
+            (half_stall > 0 && l0_depth >= half_stall))
         {
             flush_threshold = cf->config.write_buffer_size;
         }

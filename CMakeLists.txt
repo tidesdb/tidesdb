@@ -72,7 +72,7 @@ if(TIDESDB_WITH_SANITIZER)
     if(MSVC)
         # debug flags for MSVC
         # MSVC ASAN can be unstable, so we only enable warnings for CI
-        # suppress noisy warnings: 4311 (pointer truncation), 4244 (conversion), 4047 (pointer indirection)
+        # suppress noisy warnings 4311 (pointer truncation), 4244 (conversion), 4047 (pointer indirection)
         # 4127 (constant expression in conditional), 4305 (type truncation),
         # 4702 (unreachable code -- triggered inside uthash macro expansions in the bench)
         add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305 /wd4702)
@@ -111,7 +111,7 @@ endif()
 include_directories(external) # for external libraries linking internally
 
 # create library (respects BUILD_SHARED_LIBS option)
-# note: on Windows, STATIC is recommended to avoid DLL export/import complexity
+# note on Windows, STATIC is recommended to avoid DLL export/import complexity
 # users can override with -DBUILD_SHARED_LIBS=ON/OFF
 set(TIDESDB_SOURCES
     src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c
@@ -132,8 +132,8 @@ target_include_directories(tidesdb PRIVATE src)
 
 # find compression libraries.
 # MSVC builds rely on vcpkg, which ships full CMake config packages.
-# MinGW (MSYS2): zstd and lz4 ship only pkg-config (.pc) files, no CMake
-# configs, so use PkgConfig for them. snappy is the opposite: upstream
+# MinGW (MSYS2) zstd and lz4 ship only pkg-config (.pc) files, no CMake
+# configs, so use PkgConfig for them. snappy is the opposite, upstream
 # snappy installs SnappyConfig.cmake but no .pc (so the x86 from-source
 # build in CI cannot use pkg-config), while MSYS2's prebuilt snappy ships
 # both. CONFIG mode works for snappy across all three setups.
@@ -373,7 +373,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
-    # Note: snappy is not available in OmniOS repos, using only lz4 and zstd
+    # Note that snappy is not available in OmniOS repos, using only lz4 and zstd
     target_include_directories(tidesdb PUBLIC /opt/ooce/include /usr/include)
     target_link_directories(tidesdb PUBLIC /opt/ooce/lib/amd64 /usr/lib/amd64)
     target_link_libraries(tidesdb PUBLIC
@@ -393,12 +393,40 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     endif()
 else()
     # for linux and other unix systems
-    # we use -l flags to avoid collision with CMake MODULE targets that some distros
-    # (e.g. Oracle Linux 8, RHEL 8) ship in their zstd-devel CMake configs
+    # prefer a CMake target if a parent project (FetchContent / add_subdirectory)
+    # has already created one for the compression lib; otherwise fall back to a
+    # bare -l<name> linker flag. the -l fallback exists because some distros
+    # (e.g. Oracle Linux 8, RHEL 8) ship zstd-devel CMake configs that define
+    # zstd::libzstd as a MODULE target and break find_package(zstd CONFIG) for
+    # plain linking. the if(TARGET ...) probe is safe as it only matches when the
+    # parent build has already produced the target, so stand-alone builds on
+    # those distros still take the -l path exactly like before.
+    function(_tidesdb_link_compression libname)
+        set(candidates "")
+        if(libname STREQUAL "zstd")
+            list(APPEND candidates
+                    zstd::libzstd_shared zstd::libzstd_static zstd::libzstd
+                    libzstd_shared libzstd_static libzstd zstd)
+        elseif(libname STREQUAL "snappy")
+            list(APPEND candidates Snappy::snappy snappy)
+        elseif(libname STREQUAL "lz4")
+            list(APPEND candidates lz4::lz4 LZ4::lz4 lz4)
+        endif()
+        foreach(tgt IN LISTS candidates)
+            if(TARGET ${tgt})
+                target_link_libraries(tidesdb PUBLIC ${tgt})
+                message(STATUS "tidesdb: linking ${libname} via existing target ${tgt}")
+                return()
+            endif()
+        endforeach()
+        target_link_libraries(tidesdb PUBLIC -l${libname})
+    endfunction()
+
+    _tidesdb_link_compression(zstd)
+    _tidesdb_link_compression(snappy)
+    _tidesdb_link_compression(lz4)
+
     target_link_libraries(tidesdb PUBLIC
-            -lzstd
-            -lsnappy
-            -llz4
             pthread
             m           # math library
             stdc++      # C++ standard library (required by Snappy)

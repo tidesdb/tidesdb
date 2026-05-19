@@ -26356,6 +26356,96 @@ static void test_objstore_frozen_point_lookup(void)
     cleanup_test_dir();
 }
 
+/* counts list() callback invocations */
+typedef struct
+{
+    int count;
+} list_count_ctx_t;
+
+static void list_count_cb(const char *key, size_t size, void *cb_ctx)
+{
+    (void)key;
+    (void)size;
+    ((list_count_ctx_t *)cb_ctx)->count++;
+}
+
+static void test_objstore_list_prefix(void)
+{
+    cleanup_test_dir();
+    const char *objstore_dir = "./test_list_prefix_store";
+    remove_directory(objstore_dir);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(store != NULL);
+
+    tidesdb_objstore_config_t os_cfg = tidesdb_objstore_default_config();
+    os_cfg.wal_sync_on_commit = 1; /* sync-upload the unified WAL on every commit */
+    os_cfg.replicate_wal = 1;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.object_store = store;
+    config.object_store_config = &os_cfg;
+    /* deliberately large write buffer so the 3 small writes below stay in the
+     * active memtable (no rotation, no sstable upload, the unified WAL is the
+     * only object at the store root besides UNIMAP) */
+    config.unified_memtable_write_buffer_size = 64ULL * 1024 * 1024;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db->unified_mt.enabled);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "list_prefix_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "list_prefix_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 3; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], value[64];
+        snprintf(key, sizeof(key), "lpkey_%04d", i);
+        snprintf(value, sizeof(value), "lpval_%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* still pre-rotation -- the WAL is the only root-level object we expect */
+    ASSERT_EQ(queue_size(db->flush_queue), 0);
+    ASSERT_FALSE(atomic_load(&db->unified_mt.is_flushing));
+
+    /* probe with a second connector handle, mirroring how a replica process
+     * would see the shared store */
+    tidesdb_objstore_t *probe = tidesdb_objstore_fs_create(objstore_dir);
+    ASSERT_TRUE(probe != NULL);
+
+    size_t wal_obj_size = 0;
+    int wal_present = probe->exists(probe->ctx, "uwal_0.log", &wal_obj_size);
+    printf("  list_prefix: uwal_0.log present=%d size=%zu bytes\n", wal_present, wal_obj_size);
+    fflush(stdout);
+    ASSERT_EQ(wal_present, 1); /* fs_exists returns 1 when present, 0 when missing */
+    ASSERT_TRUE(wal_obj_size > 0);
+
+    list_count_ctx_t lctx = {0};
+    int listed = probe->list(probe->ctx, "uwal_", list_count_cb, &lctx);
+    printf("  list_prefix: list(\"uwal_\") returned %d entries (cb_count=%d)\n", listed,
+           lctx.count);
+    fflush(stdout);
+    ASSERT_TRUE(lctx.count >= 1);
+    ASSERT_TRUE(listed >= 1);
+
+    probe->destroy(probe->ctx);
+    free(probe);
+
+    tidesdb_close(db);
+    remove_directory(objstore_dir);
+    cleanup_test_dir();
+}
+
 static void test_objstore_wal_sync_on_commit(void)
 {
     cleanup_test_dir();
@@ -28629,6 +28719,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_paired_eviction, tests_passed);
     RUN_TEST(test_objstore_stats, tests_passed);
     RUN_TEST(test_objstore_frozen_point_lookup, tests_passed);
+    RUN_TEST(test_objstore_list_prefix, tests_passed);
     RUN_TEST(test_objstore_wal_sync_on_commit, tests_passed);
     RUN_TEST(test_btree_multi_cf_vlog_isolation, tests_passed);
     RUN_TEST(test_replica_mode, tests_passed);

@@ -5138,8 +5138,11 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
                     remaining -= value_size_u64;
                 }
 
-                /* we skip entries already replayed (idempotent) */
-                if (seq_value <= max_seq) continue;
+                /* skip entries strictly below max_seq; equal-seq entries are
+                 * sibling puts from the same txn (one commit_seq, many keys)
+                 * and must all be applied. skip_list_put_with_seq rejects
+                 * duplicate (key, seq) pairs, so re-replay is harmless. */
+                if (seq_value < max_seq) continue;
 
                 const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
                 TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack_r);
@@ -5248,7 +5251,10 @@ static void tdb_replica_replay_wal(tidesdb_t *db)
     char wal_local[TDB_MAX_PATH_LEN];
     snprintf(wal_local, sizeof(wal_local), "%s" PATH_SEPARATOR TDB_REPLICA_WAL_TMP, db->db_path);
 
-    uint64_t max_seq = atomic_load_explicit(&db->global_seq, memory_order_acquire);
+    /* global_seq is the next seq to assign; max_seq here means the highest
+     * seq already applied, so derive it by subtracting one (clamped at 0) */
+    uint64_t cur_global = atomic_load_explicit(&db->global_seq, memory_order_acquire);
+    uint64_t max_seq = cur_global > 0 ? cur_global - 1 : 0;
     int total_replayed = 0;
 
     for (int wi = 0; wi < discovery.count; wi++)
@@ -17583,6 +17589,23 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     memcpy(&(*db)->config, config, sizeof(tidesdb_config_t));
 
+    /* object_store_config is a caller-owned pointer the user typically passes
+     * from a stack variable -- deep-copy it so the db keeps a stable view
+     * even after the caller's frame is gone */
+    if (config->object_store_config)
+    {
+        tidesdb_objstore_config_t *owned = malloc(sizeof(tidesdb_objstore_config_t));
+        if (!owned)
+        {
+            free((*db)->db_path);
+            free(*db);
+            *db = NULL;
+            return TDB_ERR_MEMORY;
+        }
+        memcpy(owned, config->object_store_config, sizeof(tidesdb_objstore_config_t));
+        (*db)->config.object_store_config = owned;
+    }
+
     /* object store mode requires unified memtable!! */
     if ((*db)->config.object_store != NULL && !(*db)->config.unified_memtable)
     {
@@ -19072,6 +19095,12 @@ int tidesdb_close(tidesdb_t *db)
     }
 
     free(db->db_path);
+    /* free the owned copy of object_store_config created in tidesdb_open */
+    if (db->config.object_store_config)
+    {
+        free((tidesdb_objstore_config_t *)db->config.object_store_config);
+        db->config.object_store_config = NULL;
+    }
 
     if (db->clock_cache)
     {
@@ -20067,6 +20096,13 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     if (db->object_store && save_result == TDB_SUCCESS)
     {
         tdb_objstore_upload_file_sync(db, config_path);
+
+        /* commit + upload the empty MANIFEST so replicas can discover this CF
+         * before its first flush -- discovery keys off <cf>/MANIFEST */
+        if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path) == 0)
+        {
+            tdb_objstore_upload_file_sync(db, cf->manifest->path);
+        }
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);

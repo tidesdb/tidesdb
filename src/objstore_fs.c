@@ -265,23 +265,28 @@ static int fs_exists(void *ctx, const char *key, size_t *size_out)
 }
 
 /**
- * fs_list_recurse
- * recursively walk a directory and invoke the callback for each regular file
- * @param dir_path directory to walk
- * @param root_dir root directory for computing relative keys
- * @param root_len length of root_dir string
- * @param cb callback invoked for each file (key, size, cb_ctx)
+ * fs_list_walk
+ * recursively walk abs_dir and invoke cb for each regular file whose
+ * relative key starts with prefix. subdirectories whose relative path
+ * already diverges from prefix are not descended into.
+ * @param abs_dir absolute filesystem path of the directory to walk
+ * @param rel_dir relative key path of abs_dir within the store ("" at root)
+ * @param rel_dir_len cached strlen(rel_dir)
+ * @param prefix target key prefix
+ * @param prefix_len cached strlen(prefix)
+ * @param cb callback invoked for each matching file (key, size, cb_ctx)
  * @param cb_ctx opaque context passed to callback
- * @param count running count of objects listed
- * @return updated count of objects listed
+ * @param count running count of objects emitted
+ * @return updated count
  */
-static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t root_len,
-                           void (*cb)(const char *key, size_t size, void *cb_ctx), void *cb_ctx,
-                           int count)
+static int fs_list_walk(const char *abs_dir, const char *rel_dir, size_t rel_dir_len,
+                        const char *prefix, size_t prefix_len,
+                        void (*cb)(const char *key, size_t size, void *cb_ctx), void *cb_ctx,
+                        int count)
 {
 #ifdef _WIN32
-    char pattern[TDB_FS_MAX_PATH];
-    snprintf(pattern, sizeof(pattern), "%s\\*", dir_path);
+    char pattern[TDB_FS_MAX_PATH * 2];
+    snprintf(pattern, sizeof(pattern), "%s\\*", abs_dir);
 
     struct _finddata_t fd;
     intptr_t handle = _findfirst(pattern, &fd);
@@ -289,62 +294,103 @@ static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t ro
 
     do
     {
-        if (fd.name[0] == '.') continue;
+        if (fd.name[0] == '.' && (fd.name[1] == '\0' || (fd.name[1] == '.' && fd.name[2] == '\0')))
+            continue;
 
-        char full[TDB_FS_MAX_PATH * 2];
-        snprintf(full, sizeof(full), "%s\\%s", dir_path, fd.name);
+        char child_rel[TDB_FS_MAX_PATH];
+        int n = (rel_dir_len == 0)
+                    ? snprintf(child_rel, sizeof(child_rel), "%s", fd.name)
+                    : snprintf(child_rel, sizeof(child_rel), "%s/%s", rel_dir, fd.name);
+        if (n < 0 || (size_t)n >= sizeof(child_rel)) continue;
+        size_t child_rel_len = (size_t)n;
 
         if (fd.attrib & _A_SUBDIR)
         {
-            count = fs_list_recurse(full, root_dir, root_len, cb, cb_ctx, count);
-        }
-        else
-        {
-            const char *relative = full + root_len;
-            if (*relative == '/' || *relative == '\\') relative++;
+            size_t cmp = child_rel_len < prefix_len ? child_rel_len : prefix_len;
+            if (cmp && strncmp(child_rel, prefix, cmp) != 0) continue;
 
-            /** the must normalize backslashes to forward slashes so object keys are
-             *  platform-independent (e.g. "cf_name/MANIFEST" not "cf_name\MANIFEST") */
-            char normalized[TDB_FS_MAX_PATH];
-            strncpy(normalized, relative, sizeof(normalized) - 1);
-            normalized[sizeof(normalized) - 1] = '\0';
-            for (char *p = normalized; *p; p++)
-            {
-                if (*p == '\\') *p = '/';
-            }
-
-            cb(normalized, (size_t)fd.size, cb_ctx);
-            count++;
+            char child_abs[TDB_FS_MAX_PATH * 2];
+            snprintf(child_abs, sizeof(child_abs), "%s\\%s", abs_dir, fd.name);
+            count = fs_list_walk(child_abs, child_rel, child_rel_len, prefix, prefix_len, cb,
+                                 cb_ctx, count);
+            continue;
         }
+
+        if (prefix_len != 0 &&
+            (child_rel_len < prefix_len || strncmp(child_rel, prefix, prefix_len) != 0))
+            continue;
+
+        cb(child_rel, (size_t)fd.size, cb_ctx);
+        count++;
     } while (_findnext(handle, &fd) == 0);
 
     _findclose(handle);
 #else
-    DIR *d = opendir(dir_path);
+    DIR *d = opendir(abs_dir);
     if (!d) return count;
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL)
     {
-        if (ent->d_name[0] == '.') continue;
+        if (ent->d_name[0] == '.' &&
+            (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+            continue;
 
-        char full[TDB_FS_MAX_PATH * 2];
-        snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+        char child_rel[TDB_FS_MAX_PATH];
+        int n = (rel_dir_len == 0)
+                    ? snprintf(child_rel, sizeof(child_rel), "%s", ent->d_name)
+                    : snprintf(child_rel, sizeof(child_rel), "%s/%s", rel_dir, ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child_rel)) continue;
+        size_t child_rel_len = (size_t)n;
 
-        struct stat st;
-        if (stat(full, &st) != 0) continue;
-
-        if (S_ISDIR(st.st_mode))
-        {
-            count = fs_list_recurse(full, root_dir, root_len, cb, cb_ctx, count);
-        }
+        /* prefer dirent::d_type; fall back to stat() only when the FS reports DT_UNKNOWN */
+        int is_dir = 0, is_reg = 0;
+#ifdef DT_DIR
+        if (ent->d_type == DT_DIR)
+            is_dir = 1;
+        else if (ent->d_type == DT_REG)
+            is_reg = 1;
+        else if (ent->d_type != DT_UNKNOWN)
+            continue;
         else
+#endif
         {
-            const char *relative = full + root_len;
-            if (*relative == '/') relative++;
-            cb(relative, (size_t)st.st_size, cb_ctx);
-            count++;
+            char child_abs[TDB_FS_MAX_PATH * 2];
+            snprintf(child_abs, sizeof(child_abs), "%s/%s", abs_dir, ent->d_name);
+            struct stat st;
+            if (stat(child_abs, &st) != 0) continue;
+            if (S_ISDIR(st.st_mode))
+                is_dir = 1;
+            else if (S_ISREG(st.st_mode))
+                is_reg = 1;
+            else
+                continue;
         }
+
+        if (is_dir)
+        {
+            size_t cmp = child_rel_len < prefix_len ? child_rel_len : prefix_len;
+            if (cmp && strncmp(child_rel, prefix, cmp) != 0) continue;
+
+            char child_abs[TDB_FS_MAX_PATH * 2];
+            snprintf(child_abs, sizeof(child_abs), "%s/%s", abs_dir, ent->d_name);
+            count = fs_list_walk(child_abs, child_rel, child_rel_len, prefix, prefix_len, cb,
+                                 cb_ctx, count);
+            continue;
+        }
+
+        if (!is_reg) continue;
+
+        if (prefix_len != 0 &&
+            (child_rel_len < prefix_len || strncmp(child_rel, prefix, prefix_len) != 0))
+            continue;
+
+        char child_abs[TDB_FS_MAX_PATH * 2];
+        snprintf(child_abs, sizeof(child_abs), "%s/%s", abs_dir, ent->d_name);
+        struct stat st;
+        if (stat(child_abs, &st) != 0) continue;
+        cb(child_rel, (size_t)st.st_size, cb_ctx);
+        count++;
     }
 
     closedir(d);
@@ -354,9 +400,11 @@ static int fs_list_recurse(const char *dir_path, const char *root_dir, size_t ro
 
 /**
  * fs_list
- * enumerate all objects under a key prefix
+ * enumerate all objects whose key starts with prefix. matches S3
+ * ListObjectsV2(prefix=...) semantics: the prefix is matched byte-wise
+ * against the key and need not align to a directory boundary.
  * @param ctx opaque connector context
- * @param prefix key prefix to list (e.g. "cf_name/")
+ * @param prefix key prefix to list (e.g. "cf_name/" or "uwal_")
  * @param cb callback invoked for each object (key, size, cb_ctx)
  * @param cb_ctx opaque context passed to callback
  * @return number of objects listed, -1 on error
@@ -365,17 +413,34 @@ static int fs_list(void *ctx, const char *prefix,
                    void (*cb)(const char *key, size_t size, void *cb_ctx), void *cb_ctx)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
-    char dir_path[TDB_FS_MAX_PATH + TDB_FS_MAX_PATH];
 
-    snprintf(dir_path, sizeof(dir_path), "%s/%s", fs->root_dir, prefix);
-
-    size_t len = strlen(dir_path);
-    while (len > 0 && (dir_path[len - 1] == '/' || dir_path[len - 1] == '\\'))
+    /* descend straight to the deepest directory component embedded in prefix
+     * so we don't walk ancestors that cannot contain a matching key */
+    const char *last_sep = strrchr(prefix, '/');
+#ifdef _WIN32
     {
-        dir_path[--len] = '\0';
+        const char *bs = strrchr(prefix, '\\');
+        if (bs && (!last_sep || bs > last_sep)) last_sep = bs;
+    }
+#endif
+
+    char start_abs[TDB_FS_MAX_PATH * 2];
+    char start_rel[TDB_FS_MAX_PATH];
+    size_t start_rel_len = 0;
+    if (last_sep && last_sep != prefix)
+    {
+        size_t dir_len = (size_t)(last_sep - prefix);
+        snprintf(start_abs, sizeof(start_abs), "%s/%.*s", fs->root_dir, (int)dir_len, prefix);
+        snprintf(start_rel, sizeof(start_rel), "%.*s", (int)dir_len, prefix);
+        start_rel_len = dir_len;
+    }
+    else
+    {
+        snprintf(start_abs, sizeof(start_abs), "%s", fs->root_dir);
+        start_rel[0] = '\0';
     }
 
-    return fs_list_recurse(dir_path, fs->root_dir, strlen(fs->root_dir), cb, cb_ctx, 0);
+    return fs_list_walk(start_abs, start_rel, start_rel_len, prefix, strlen(prefix), cb, cb_ctx, 0);
 }
 
 /**

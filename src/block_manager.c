@@ -1265,22 +1265,19 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
     return 0;
 }
 
-int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
+int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, const uint64_t end_offset)
 {
     if (!cursor) return -1;
 
-    /* O(1) seek to end and work backwards using footer */
-    const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
-
     /* empty file or only header */
-    if (file_size <= BLOCK_MANAGER_HEADER_SIZE)
+    if (end_offset <= BLOCK_MANAGER_HEADER_SIZE)
     {
         return -1;
     }
 
     /* we read footer of last block to get its size */
     unsigned char footer_buf[BLOCK_MANAGER_FOOTER_SIZE];
-    const off_t footer_offset = (off_t)(file_size - BLOCK_MANAGER_FOOTER_SIZE);
+    const off_t footer_offset = (off_t)(end_offset - BLOCK_MANAGER_FOOTER_SIZE);
     const ssize_t n = pread(cursor->bm->fd, footer_buf, BLOCK_MANAGER_FOOTER_SIZE, footer_offset);
 
     if (n != BLOCK_MANAGER_FOOTER_SIZE)
@@ -1301,17 +1298,26 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
     /* we calculate start position of last block */
     const uint64_t total_block_size =
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size + BLOCK_MANAGER_FOOTER_SIZE;
-    if (file_size < total_block_size)
+    if (end_offset < total_block_size)
     {
         return -1;
     }
 
-    cursor->current_pos = file_size - total_block_size;
+    cursor->current_pos = end_offset - total_block_size;
     cursor->current_block_size = block_size;
     cursor->block_size_valid = 1; /* we know the size from footer */
     cursor->block_index = -1;     /* unknown index */
 
     return 0;
+}
+
+int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return -1;
+
+    /* O(1) seek to end and work backwards using footer */
+    const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
+    return block_manager_cursor_goto_last_before(cursor, file_size);
 }
 
 int block_manager_truncate(block_manager_t *bm)

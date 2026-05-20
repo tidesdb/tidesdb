@@ -15997,6 +15997,29 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
 }
 
 /**
+ * tidesdb_unified_immutable_is_flushed
+ * queue_remove_if predicate -- selects unified immutables whose flush to per-CF
+ * sstables has completed and are therefore safe to evict from the read path
+ */
+static int tidesdb_unified_immutable_is_flushed(void *data, void *context)
+{
+    (void)context;
+    tidesdb_memtable_t *imm = (tidesdb_memtable_t *)data;
+    return imm && atomic_load_explicit(&imm->flushed, memory_order_acquire);
+}
+
+/**
+ * tidesdb_unified_immutable_drop_queue_ref
+ * queue_remove_if callback -- drops the reference the immutable queue held.
+ * the structure and its skip list are freed once the last reader also unrefs
+ */
+static void tidesdb_unified_immutable_drop_queue_ref(void *data, void *context)
+{
+    (void)context;
+    tidesdb_immutable_memtable_unref((tidesdb_immutable_memtable_t *)data);
+}
+
+/**
  * tidesdb_flush_worker_thread
  * worker thread that processes flush work items from the queue
  */
@@ -16084,9 +16107,15 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Unified flush failed (error %d)", uflush_rc);
             }
 
-            /* we do not free imm here -- it is still in unified_mt.immutables queue
-             * and readers may be scanning it. tidesdb_unified_flush_immutable already
-             * marks it flushed and deletes the WAL. close path handles cleanup. */
+            /* we evict every flushed immutable from the read path -- their data
+             * now lives in per-CF sstables. queue_remove_if takes the queue write
+             * lock so it cannot race a snapshot reader; it drops the queue's ref
+             * per item and the last concurrent reader frees the structure */
+            if (db->unified_mt.immutables)
+            {
+                queue_remove_if(db->unified_mt.immutables, tidesdb_unified_immutable_is_flushed,
+                                NULL, tidesdb_unified_immutable_drop_queue_ref);
+            }
 
             free(work);
             atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
@@ -17059,10 +17088,21 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     total_mem_bytes += (int64_t)skip_list_get_size(umt->skip_list);
                 }
 
+                /* we sum each immutable's actual skip list size. a flushed
+                 * immutable still holds its skip list resident, but most are far
+                 * below write_buffer_size -- charging every entry the full buffer
+                 * capacity over-reports total memory by an order of magnitude */
                 if (db->unified_mt.immutables)
                 {
-                    size_t uimm_count = queue_size(db->unified_mt.immutables);
-                    total_mem_bytes += (int64_t)(uimm_count * db->unified_mt.write_buffer_size);
+                    queue_t *uimm_q = db->unified_mt.immutables;
+                    pthread_rwlock_rdlock(&uimm_q->read_lock);
+                    for (queue_node_t *n = uimm_q->head->next; n != NULL; n = n->next)
+                    {
+                        tidesdb_memtable_t *uimm = (tidesdb_memtable_t *)n->data;
+                        if (uimm && uimm->skip_list)
+                            total_mem_bytes += (int64_t)skip_list_get_size(uimm->skip_list);
+                    }
+                    pthread_rwlock_unlock(&uimm_q->read_lock);
                 }
             }
 
@@ -18600,17 +18640,9 @@ int tidesdb_close(tidesdb_t *db)
                     TDB_DEBUG_LOG(TDB_LOG_INFO, "Flushing unified immutable memtable before close");
                     tidesdb_unified_flush_immutable(db, uimm);
                 }
-                if (uimm->skip_list)
-                {
-                    skip_list_free(uimm->skip_list);
-                    uimm->skip_list = NULL;
-                }
-                if (uimm->wal)
-                {
-                    block_manager_close(uimm->wal);
-                    uimm->wal = NULL;
-                }
-                free(uimm);
+                /* drop the queue's ref -- unref frees the skip list, wal and
+                 * struct (all readers have stopped by the time close drains) */
+                tidesdb_immutable_memtable_unref(uimm);
             }
         }
     }
@@ -19007,12 +19039,7 @@ int tidesdb_close(tidesdb_t *db)
             {
                 tidesdb_immutable_memtable_t *imm =
                     (tidesdb_immutable_memtable_t *)queue_dequeue(db->unified_mt.immutables);
-                if (imm)
-                {
-                    if (imm->skip_list) skip_list_free(imm->skip_list);
-                    if (imm->wal) block_manager_close(imm->wal);
-                    free(imm);
-                }
+                if (imm) tidesdb_immutable_memtable_unref(imm);
             }
             queue_free(db->unified_mt.immutables);
         }
@@ -22345,16 +22372,15 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         }
 
         /**** we search unified immutable memtables (newest first).
-         ***  we snapshot pointers under a single rwlock acquisition to avoid
-         **   per-element locking overhead.
-         *    we read queue size via inline atomic load to avoid cross-TU function call. */
+         ***  we snapshot pointers under a single rwlock acquisition and pin each
+         **   immutable with a refcount so a concurrent flush-worker eviction
+         *    cannot free one out from under the scan. */
         queue_t *uimm_q = txn->db->unified_mt.immutables;
         if (uimm_q)
         {
             const size_t uimm_count = atomic_load_explicit(&uimm_q->size, memory_order_relaxed);
             if (uimm_count > 0)
             {
-                /* we snapshot immutable pointers under one lock */
                 tidesdb_memtable_t *uimm_stack[TDB_STACK_IMM_SNAPSHOT];
                 tidesdb_memtable_t **uimm_ptrs = uimm_stack;
                 if (uimm_count > TDB_STACK_IMM_SNAPSHOT)
@@ -22363,6 +22389,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     if (!uimm_ptrs) uimm_ptrs = uimm_stack;
                 }
 
+                /* we pin each immutable under the queue read lock -- queue_remove_if
+                 * holds the matching write lock, so every entry we see is still
+                 * live and try_ref keeps it alive past the unlock */
                 size_t snap_count = 0;
                 pthread_rwlock_rdlock(&uimm_q->read_lock);
                 {
@@ -22370,14 +22399,15 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t max = (uimm_ptrs == uimm_stack) ? TDB_STACK_IMM_SNAPSHOT : uimm_count;
                     for (size_t i = 0; i < max && cur != NULL; i++, cur = cur->next)
                     {
-                        uimm_ptrs[i] = (tidesdb_memtable_t *)cur->data;
-                        snap_count++;
+                        tidesdb_memtable_t *imm_mt = (tidesdb_memtable_t *)cur->data;
+                        uimm_ptrs[snap_count++] = tidesdb_memtable_try_ref(imm_mt) ? imm_mt : NULL;
                     }
                 }
                 pthread_rwlock_unlock(&uimm_q->read_lock);
 
-                /* we search snapshot lock-free (newest first) */
-                for (size_t qi = snap_count; qi > 0; qi--)
+                /* we search the pinned snapshot (newest first) */
+                int found = 0;
+                for (size_t qi = snap_count; qi > 0 && !found; qi--)
                 {
                     tidesdb_memtable_t *imm_mt = uimm_ptrs[qi - 1];
                     if (!imm_mt || !imm_mt->skip_list) continue;
@@ -22387,37 +22417,43 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         imm_mt->skip_list, prefixed_key, pk_size, &temp_val, &temp_val_size, &ttl_u,
                         &deleted_u, &found_seq_u, snapshot_seq, visibility_check,
                         visibility_check ? txn->db->commit_status : NULL);
-                    if (mr == 0)
+                    if (mr != 0) continue;
+
+                    found = 1;
+                    if (deleted_u)
                     {
-                        if (deleted_u)
+                        unified_rc = TDB_ERR_NOT_FOUND;
+                    }
+                    else if (ttl_u <= 0 || ttl_u > now_u)
+                    {
+                        *value = malloc(temp_val_size);
+                        if (!*value)
                         {
-                            unified_rc = TDB_ERR_NOT_FOUND;
-                            if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
-                            goto unified_memtable_done;
+                            unified_rc = TDB_ERR_MEMORY;
                         }
-                        if (ttl_u <= 0 || ttl_u > now_u)
+                        else
                         {
-                            *value = malloc(temp_val_size);
-                            if (!*value)
-                            {
-                                unified_rc = TDB_ERR_MEMORY;
-                                if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
-                                goto unified_memtable_done;
-                            }
                             memcpy(*value, temp_val, temp_val_size);
                             *value_size = temp_val_size;
                             PROFILE_INC(txn->db, immutable_hits);
                             tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
                             unified_rc = TDB_SUCCESS;
-                            if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
-                            goto unified_memtable_done;
                         }
+                    }
+                    else
+                    {
                         unified_rc = TDB_ERR_NOT_FOUND;
-                        if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
-                        goto unified_memtable_done;
                     }
                 }
+
+                /* we release every pin, then the snapshot array */
+                for (size_t i = 0; i < snap_count; i++)
+                {
+                    if (uimm_ptrs[i]) tidesdb_immutable_memtable_unref(uimm_ptrs[i]);
+                }
                 if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
+
+                if (found) goto unified_memtable_done;
             }
         }
 
@@ -25607,7 +25643,11 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             queue_node_t *cur = uimm_q->head->next;
             for (; cur != NULL && unified_imm_snap_count < cap; cur = cur->next)
             {
-                unified_imm_snap[unified_imm_snap_count++] = (tidesdb_memtable_t *)cur->data;
+                /* we pin each immutable so a concurrent flush-worker eviction
+                 * cannot free it before the merge source takes its own ref */
+                tidesdb_memtable_t *uimm = (tidesdb_memtable_t *)cur->data;
+                unified_imm_snap[unified_imm_snap_count++] =
+                    tidesdb_memtable_try_ref(uimm) ? uimm : NULL;
             }
         }
         pthread_rwlock_unlock(&uimm_q->read_lock);
@@ -25687,11 +25727,17 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             for (size_t qi = 0; qi < unified_imm_snap_count; qi++)
             {
                 tidesdb_memtable_t *uimm = unified_imm_snap[qi];
-                if (!uimm || !uimm->skip_list) continue;
-                if (atomic_load_explicit(&uimm->flushed, memory_order_acquire)) continue;
+                if (!uimm) continue;
+                if (!uimm->skip_list || atomic_load_explicit(&uimm->flushed, memory_order_acquire))
+                {
+                    tidesdb_immutable_memtable_unref(uimm);
+                    continue;
+                }
 
                 tidesdb_merge_source_t *uimm_source = tidesdb_merge_source_from_unified_memtable(
                     uimm->skip_list, &cf->config, uimm, cf->unified_cf_index);
+                /* the merge source took its own ref on uimm; release our pin */
+                tidesdb_immutable_memtable_unref(uimm);
                 if (!uimm_source) continue;
                 uimm_source->is_cached = 1;
                 ((tidesdb_merge_source_t **)(*iter)
@@ -25788,6 +25834,12 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             free(imm_snapshot);
         }
 
+        /* the cache-alloc fallback consumes no unified immutables -- release the
+         * pins taken during the snapshot */
+        for (size_t qi = 0; qi < unified_imm_snap_count; qi++)
+        {
+            if (unified_imm_snap[qi]) tidesdb_immutable_memtable_unref(unified_imm_snap[qi]);
+        }
         if (unified_imm_snap != unified_imm_stack) free(unified_imm_snap);
     }
 
@@ -28104,7 +28156,18 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
 
             if (num_blocks > 0)
             {
-                if (block_manager_cursor_goto_first(cursor) == 0)
+                /* footer-based O(1) seek to the last data block instead of
+                 * walking every block forward -- the linear walk made
+                 * seek_to_last cost scale with sstable size. the klog file
+                 * appends bloom/index/metadata blocks after the data region, so
+                 * we anchor at klog_data_end_offset rather than the file end.
+                 * legacy sstables without that offset fall back to the walk */
+                const uint64_t data_end = source->source.sstable.sst->klog_data_end_offset;
+                if (data_end > 0)
+                {
+                    block_manager_cursor_goto_last_before(cursor, data_end);
+                }
+                else if (block_manager_cursor_goto_first(cursor) == 0)
                 {
                     for (uint64_t b = 1; b < num_blocks; b++)
                     {

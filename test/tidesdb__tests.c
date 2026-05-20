@@ -23816,6 +23816,83 @@ void test_db_stats_basic(void)
     cleanup_test_dir();
 }
 
+static void test_db_stats_unified_immutable_bytes_accurate(void)
+{
+    cleanup_test_dir();
+
+    /* a generous unified write buffer so manual flushes drive rotation, not
+     * size pressure -- the rotated immutables stay tiny */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 1024 * 1024;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_bytes", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ucf_bytes");
+    ASSERT_TRUE(cf != NULL);
+
+    /* each round writes a few small entries then flushes -- every flush rotates
+     * a near-empty unified memtable into the immutable queue */
+    for (int round = 0; round < 4; round++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int i = 0; i < 8; i++)
+        {
+            char key[32], val[32];
+            snprintf(key, sizeof(key), "r%d_k%02d", round, i);
+            snprintf(val, sizeof(val), "v%d_%02d", round, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+        }
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+        ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    }
+
+    /* leave a few entries in the active memtable so total bytes are non-zero */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 8; i++)
+    {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "live_k%02d", i);
+        snprintf(val, sizeof(val), "live_v%02d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* the reaper recomputes cached memory roughly every 100ms */
+    usleep(400000);
+
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+    printf("  total_memtable_bytes=%" PRIu64 " unified_immutable_count=%d\n",
+           stats.total_memtable_bytes, stats.unified_immutable_count);
+
+    /* total_memtable_bytes must reflect the immutables' actual skip list size,
+     * not write_buffer_size charged per immutable -- so it stays well below the
+     * raw queue-capacity figure the old accounting reported */
+    ASSERT_TRUE(stats.total_memtable_bytes > 0);
+    if (stats.unified_immutable_count > 0)
+    {
+        const int64_t capacity_bound =
+            (int64_t)stats.unified_immutable_count * config.unified_memtable_write_buffer_size;
+        ASSERT_TRUE(stats.total_memtable_bytes < capacity_bound);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 void test_purge_cf_basic(void)
 {
     cleanup_test_dir();
@@ -28678,6 +28755,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_multi_cf_create_drop_churn_under_load, tests_passed);
     RUN_TEST(test_multi_cf_mixed_isolation_cross_txn, tests_passed);
     RUN_TEST(test_db_stats_basic, tests_passed);
+    RUN_TEST(test_db_stats_unified_immutable_bytes_accurate, tests_passed);
     RUN_TEST(test_tombstone_count_after_flush, tests_passed);
     RUN_TEST(test_tombstone_count_round_trip, tests_passed);
     RUN_TEST(test_tombstone_density_trigger_fires, tests_passed);

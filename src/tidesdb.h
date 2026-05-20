@@ -728,7 +728,7 @@ struct tidesdb_level_t
  * @param total_uploads lifetime count of objects uploaded to object store
  * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
  * @param replica_mode 1 if running as read-only replica, 0 if primary
- * @param replica_sync_counter reaper cycle counter for MANIFEST poll throttling
+ * @param replica_sync_thread_active 1 while the dedicated replica sync thread runs
  */
 struct tidesdb_t
 {
@@ -816,12 +816,11 @@ struct tidesdb_t
     _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
     _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
     uint64_t last_wal_sync_size;             /* WAL file size at last object store sync */
-    uint64_t last_wal_cleanup_gen;           /* highest WAL gen cleaned up by reaper */
 
     /* replica mode runtime state */
-    _Atomic(int) replica_mode;             /* 1 = read-only replica, 0 = primary */
-    _Atomic(int) replica_sync_counter;     /* reaper cycle counter for MANIFEST poll */
-    _Atomic(int) replica_sync_in_progress; /* 1 while reaper is running sync cycle */
+    _Atomic(int) replica_mode;               /* 1 = read-only replica, 0 = primary */
+    pthread_t replica_sync_thread;           /* dedicated replica MANIFEST/WAL sync thread */
+    _Atomic(int) replica_sync_thread_active; /* 1 while the replica sync thread runs */
 };
 
 /**

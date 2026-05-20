@@ -339,6 +339,14 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_REAPER_DEFERRED_FLUSH_BATCH 64
 #define TDB_SSTABLE_REAPER_EVICT_RATIO  0.25
 
+/* replica sync thread configuration */
+#define TDB_REPLICA_SYNC_DEFAULT_INTERVAL_US 5000000
+#define TDB_REPLICA_SYNC_SLEEP_SLICE_US      100000
+
+/* default interval for unified WAL fsync escalation when the unified memtable
+ * is in TDB_SYNC_INTERVAL mode and unified_memtable_sync_interval_us is 0 */
+#define TDB_UNIFIED_WAL_SYNC_DEFAULT_INTERVAL_US 1000000
+
 #define TDB_WAL_STACK_BUFFER_SIZE 512
 
 /* deferred free configuration for retired sstable arrays
@@ -1403,6 +1411,7 @@ static void *tidesdb_compaction_worker_thread(void *arg);
 static void tidesdb_ensure_btree_node_cache(tidesdb_t *db);
 static void *tidesdb_sync_worker_thread(void *arg);
 static void *tidesdb_sstable_reaper_thread(void *arg);
+static void *tidesdb_replica_sync_thread(void *arg);
 static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, size_t key_size,
                                                  const uint8_t *value, size_t value_size,
                                                  time_t ttl, uint64_t seq, uint8_t tombstone_flags);
@@ -4356,6 +4365,14 @@ static void *tdb_upload_worker_thread(void *arg)
                                 memory_order_release, memory_order_relaxed))
                             break;
                     }
+
+                    /* the rotated WAL is now confirmed present on the object
+                     * store (the exists + size verify above proved it), so the
+                     * upload worker deletes the local copy here. this replaces
+                     * the reaper's old synchronous per-generation exists() sweep.
+                     * recovery can replay the WAL from the object store if the
+                     * node restarts before the immutable has flushed. */
+                    tdb_unlink(job->local_path);
                 }
             }
             else
@@ -17143,7 +17160,8 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
 /**
  * tidesdb_sync_worker_thread
- * background thread that periodically syncs WAL files for CFs with TDB_SYNC_INTERVAL mode
+ * background thread that periodically escalates fsync on WAL files in
+ * TDB_SYNC_INTERVAL mode, both per column family WALs and the unified WAL
  */
 static void *tidesdb_sync_worker_thread(void *arg)
 {
@@ -17179,6 +17197,16 @@ static void *tidesdb_sync_worker_thread(void *arg)
             }
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
+
+        /* the unified WAL participates in interval syncing too. its foreground
+         * writes are not fsynced in TDB_SYNC_INTERVAL mode, so this thread is
+         * the only thing that durably persists it. */
+        if (db->unified_mt.enabled && db->config.unified_memtable_sync_mode == TDB_SYNC_INTERVAL)
+        {
+            uint64_t uwal_interval = db->config.unified_memtable_sync_interval_us;
+            if (uwal_interval == 0) uwal_interval = TDB_UNIFIED_WAL_SYNC_DEFAULT_INTERVAL_US;
+            if (uwal_interval < min_interval) min_interval = uwal_interval;
+        }
 
         uint64_t sleep_us;
         if (min_interval == UINT64_MAX)
@@ -17247,6 +17275,18 @@ static void *tidesdb_sync_worker_thread(void *arg)
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
 
+        /* escalate fsync on the unified WAL when it is in interval sync mode --
+         * cf->active_memtable->wal is NULL in unified mode so the per-CF loop
+         * above never reaches it. */
+        if (db->unified_mt.enabled && db->config.unified_memtable_sync_mode == TDB_SYNC_INTERVAL)
+        {
+            tidesdb_memtable_t *umt = atomic_load(&db->unified_mt.active);
+            if (umt && umt->wal)
+            {
+                block_manager_escalate_fsync(umt->wal);
+            }
+        }
+
         /* we check shutdown flag after sync operations to exit promptly */
         if (!atomic_load(&db->sync_thread_active))
         {
@@ -17255,6 +17295,56 @@ static void *tidesdb_sync_worker_thread(void *arg)
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
+    return NULL;
+}
+
+/**
+ * tidesdb_replica_sync_thread
+ * dedicated replica-mode thread that polls the object store for new MANIFESTs
+ * and replays remote WALs. this work was previously done inline on the reaper
+ * thread, where a slow object store stalled every other reaper duty (deferred
+ * flush retry, memory pressure tracking, sstable eviction). a replica downloads
+ * and replays rather than uploads, so this thread is funded by reassigning one
+ * slot of the configured upload-thread budget -- the object store thread count
+ * is unchanged.
+ * @param arg pointer to the database
+ * @return NULL
+ */
+static void *tidesdb_replica_sync_thread(void *arg)
+{
+    tidesdb_t *db = (tidesdb_t *)arg;
+
+    uint64_t sync_interval_us = db->config.object_store_config
+                                    ? db->config.object_store_config->replica_sync_interval_us
+                                    : TDB_REPLICA_SYNC_DEFAULT_INTERVAL_US;
+    if (sync_interval_us == 0) sync_interval_us = TDB_REPLICA_SYNC_DEFAULT_INTERVAL_US;
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync thread created (interval=%" PRIu64 "us)",
+                  sync_interval_us);
+
+    while (atomic_load_explicit(&db->replica_sync_thread_active, memory_order_acquire))
+    {
+        /* sleep the configured interval in small slices so shutdown stays prompt */
+        uint64_t slept = 0;
+        while (slept < sync_interval_us &&
+               atomic_load_explicit(&db->replica_sync_thread_active, memory_order_acquire))
+        {
+            uint64_t slice = sync_interval_us - slept;
+            if (slice > TDB_REPLICA_SYNC_SLEEP_SLICE_US) slice = TDB_REPLICA_SYNC_SLEEP_SLICE_US;
+            usleep((useconds_t)slice);
+            slept += slice;
+        }
+        if (!atomic_load_explicit(&db->replica_sync_thread_active, memory_order_acquire)) break;
+        if (!db->object_store) continue;
+
+        tdb_replica_sync_manifests(db);
+        if (db->config.object_store_config && db->config.object_store_config->replica_replay_wal)
+        {
+            tdb_objstore_replay_remote_wals(db);
+        }
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync thread stopped");
     return NULL;
 }
 
@@ -17373,7 +17463,17 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
             pthread_rwlock_unlock(&db->cf_list_lock);
             for (int i = 0; i < deferred_count; i++)
+            {
+                /* skip a CF whose immutable queue is already at the hard cap --
+                 * flush_memtable_internal would usleep-block the reaper up to 5s
+                 * (TDB_IMMUTABLE_HARD_CAP_MAX_WAIT) waiting for it to drain,
+                 * stalling every other reaper duty. the CF stays flush_deferred,
+                 * so a later reaper cycle retries it once flushes have drained
+                 * the queue -- the retry polls instead of blocking. */
+                if (queue_size(deferred_cfs[i]->immutable_memtables) >= TDB_IMMUTABLE_HARD_CAP)
+                    continue;
                 tidesdb_flush_memtable_internal(deferred_cfs[i], 0, 1);
+            }
         }
 
         /*** global memory pressure computations
@@ -17418,7 +17518,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                  * each immutable's data is bounded by write_buffer_size (flush threshold).
                  * while arena allocates write_buffer_size * 2, the unused arena capacity
                  * is not meaningful for pressure accounting.
-                 * skipped in unified mode: per-CF immutable queues there hold only
+                 * skipped in unified mode, per-CF immutable queues there hold only
                  * empty rotated memtables (all data is in the unified memtable, summed
                  * separately below), so charging each write_buffer_size is phantom
                  * memory that inflates the pressure ratio and triggers spurious
@@ -17563,7 +17663,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     /* unified mode -- every write lands in the single shared
                      * unified memtable, so shedding memory means rotating THAT,
                      * once. the per-CF force-flushes below would only rotate
-                     * empty per-CF memtables: they shed nothing and leave stuck
+                     * empty per-CF memtables, they shed nothing and leave stuck
                      * empty immutables behind. CAS admission mirrors the rotate
                      * call in tidesdb_flush_memtable. */
                     int expected = 0;
@@ -17659,7 +17759,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                          * inline -- a synchronous multi-MB S3 PUT here blocks the
                          * reaper thread, stalling deferred-flush retry, memory
                          * pressure tracking and sstable eviction. generation 0
-                         * means a plain snapshot upload: the worker must not
+                         * means a plain snapshot upload -- the worker must not
                          * fence or delete the still-active WAL. */
                         tdb_objstore_enqueue_upload(db, umt->wal->file_path, 0);
                         TDB_DEBUG_LOG(TDB_LOG_INFO,
@@ -17667,81 +17767,6 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         db->last_wal_sync_size = wal_size;
                     }
                 }
-            }
-        }
-
-        /* we clean up old WAL files that have been confirmed uploaded (async path).
-         * iterate from last_wal_cleanup_gen+1 up to last_uploaded_gen, deleting
-         * local WAL files that are no longer needed. skip the current active gen. */
-        if (db->object_store && db->unified_mt.enabled && db->config.object_store_config &&
-            db->config.object_store_config->replicate_wal &&
-            !db->config.object_store_config->wal_upload_sync)
-        {
-            uint64_t uploaded_gen =
-                atomic_load_explicit(&db->last_uploaded_gen, memory_order_acquire);
-            uint64_t current_gen =
-                atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
-
-            uint64_t cleanup_through = db->last_wal_cleanup_gen;
-            for (uint64_t g = db->last_wal_cleanup_gen + 1; g <= uploaded_gen && g < current_gen;
-                 g++)
-            {
-                char old_wal[TDB_MAX_PATH_LEN];
-                snprintf(old_wal, sizeof(old_wal),
-                         "%s" PATH_SEPARATOR TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
-                         db->db_path, TDB_U64_CAST(g));
-
-                /*** last_uploaded_gen is a high-water mark advanced per job, so a
-                 **  generation at or below it may still be mid-upload on another
-                 *   upload worker. we delete the local WAL only once its remote
-                 **  copy is confirmed present, and we stop the cleanup cursor at
-                 *** the first unconfirmed generation so a later reaper cycle
-                 **  retries it. unlinking a WAL out from under an in-flight upload
-                 *   would fail that upload permanently and leave a remote gap. */
-                char wal_key[TDB_MAX_PATH_LEN];
-                tdb_path_to_object_key(db, old_wal, wal_key, sizeof(wal_key));
-                if (db->object_store->exists(db->object_store->ctx, wal_key, NULL) != 1) break;
-
-                tdb_unlink(old_wal); /* no-op if file already gone */
-                cleanup_through = g;
-            }
-            db->last_wal_cleanup_gen = cleanup_through;
-        }
-
-        /* replica MANIFEST sync and WAL replay. throttled by replica_sync_interval_us
-         * converted to reaper cycle count (each cycle is TDB_SSTABLE_REAPER_SLEEP_US). */
-        {
-            int rm = atomic_load_explicit(&db->replica_mode, memory_order_relaxed);
-            int os = db->object_store ? 1 : 0;
-            TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Reaper: replica_mode=%d object_store=%d", rm, os);
-        }
-        if (atomic_load_explicit(&db->replica_mode, memory_order_relaxed) && db->object_store)
-        {
-            uint64_t sync_interval_us =
-                db->config.object_store_config
-                    ? db->config.object_store_config->replica_sync_interval_us
-                    : 5000000;
-            int cycles_per_sync = (int)(sync_interval_us / TDB_SSTABLE_REAPER_SLEEP_US);
-            if (cycles_per_sync < 1) cycles_per_sync = 1;
-
-            int counter = atomic_fetch_add(&db->replica_sync_counter, 1) + 1;
-            TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Reaper: sync counter=%d/%d", counter, cycles_per_sync);
-
-            if (counter >= cycles_per_sync)
-            {
-                atomic_store(&db->replica_sync_counter, 0);
-                atomic_store_explicit(&db->replica_sync_in_progress, 1, memory_order_release);
-
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "Reaper: running replica sync now");
-                tdb_replica_sync_manifests(db);
-
-                if (db->config.object_store_config &&
-                    db->config.object_store_config->replica_replay_wal)
-                {
-                    tdb_objstore_replay_remote_wals(db);
-                }
-
-                atomic_store_explicit(&db->replica_sync_in_progress, 0, memory_order_release);
             }
         }
 
@@ -18132,8 +18157,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         &(*db)->replica_mode,
         ((*db)->config.object_store_config && (*db)->config.object_store_config->replica_mode) ? 1
                                                                                                : 0);
-    atomic_init(&(*db)->replica_sync_counter, 0);
-    atomic_init(&(*db)->replica_sync_in_progress, 0);
+    atomic_init(&(*db)->replica_sync_thread_active, 0);
 
     _tidesdb_log_level = config->log_level;
 
@@ -18937,6 +18961,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
     pthread_rwlock_unlock(&(*db)->cf_list_lock);
 
+    /* the unified WAL in interval sync mode also needs the sync worker */
+    if ((*db)->unified_mt.enabled && (*db)->config.unified_memtable_sync_mode == TDB_SYNC_INTERVAL)
+    {
+        needs_sync_thread = 1;
+    }
+
     pthread_mutex_init(&(*db)->sync_thread_mutex, NULL);
 #if defined(__linux__)
     {
@@ -19033,18 +19063,26 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             tdb_local_cache_init((*db)->local_cache, cache_dir, cache_max);
         }
 
-        /* we initialize async upload pipeline */
+        /* we initialize async upload pipeline.
+         * in replica mode one slot of the configured upload budget funds the
+         * dedicated replica sync thread instead of an upload worker. a replica
+         * downloads and replays rather than uploads, so its upload pool is
+         * otherwise near-idle and the object store thread count is unchanged.
+         * the budget is floored so an applicable (replica) config always keeps
+         * at least two object store threads, one upload worker and one sync. */
         int num_upload_threads = (*db)->config.object_store_config
                                      ? (*db)->config.object_store_config->max_concurrent_uploads
                                      : 4;
         if (num_upload_threads <= 0) num_upload_threads = 4;
+
+        const int replica = atomic_load_explicit(&(*db)->replica_mode, memory_order_acquire);
+        if (replica && num_upload_threads > 1) num_upload_threads -= 1;
 
         (*db)->upload_queue = queue_new();
         atomic_init(&(*db)->last_uploaded_gen, 0);
         atomic_init(&(*db)->total_uploads, 0);
         atomic_init(&(*db)->total_upload_failures, 0);
         (*db)->last_wal_sync_size = 0;
-        (*db)->last_wal_cleanup_gen = 0;
 
         if ((*db)->upload_queue)
         {
@@ -19059,11 +19097,24 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             }
         }
 
+        /* replica mode -- spawn the dedicated MANIFEST/WAL sync thread that
+         * replaces the reaper's old inline (blocking) replica sync. */
+        if (replica)
+        {
+            atomic_store(&(*db)->replica_sync_thread_active, 1);
+            if (pthread_create(&(*db)->replica_sync_thread, NULL, tidesdb_replica_sync_thread,
+                               *db) != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create replica sync thread");
+                atomic_store(&(*db)->replica_sync_thread_active, 0);
+            }
+        }
+
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Object store mode enabled (connector=%s, cache_dir=%s, "
-                      "upload_threads=%d)",
+                      "upload_threads=%d, replica=%d)",
                       tidesdb_objstore_backend_name((*db)->object_store->backend), cache_dir,
-                      num_upload_threads);
+                      num_upload_threads, replica);
     }
 
     atomic_store(&(*db)->is_open, 1);
@@ -19431,6 +19482,14 @@ int tidesdb_close(tidesdb_t *db)
         pthread_cond_destroy(&db->reaper_thread_cond);
     }
 
+    /* stop the replica sync thread (replica mode only). the exchange claims the
+     * shutdown so tidesdb_promote_to_primary and close never double-join it. */
+    if (atomic_exchange_explicit(&db->replica_sync_thread_active, 0, memory_order_acq_rel) == 1)
+    {
+        pthread_join(db->replica_sync_thread, NULL);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync thread stopped");
+    }
+
     /* we drain any remaining deferred frees after reaper thread has stopped */
     tidesdb_deferred_free_drain(db);
 
@@ -19694,15 +19753,15 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Promoting replica to primary mode");
 
-    /* we wait for any in-progress reaper sync cycle to complete before promotion.
-     * the reaper holds cf_list_lock as rdlock during sync -- if we flip
-     * replica_mode while the sync is mid-flight, query threads that need
-     * cf_list_lock as wrlock will block until the sync finishes, causing
-     * apparent hangs on the first query after promotion. */
-    for (int i = 0; i < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS; i++)
+    /* stop the dedicated replica sync thread before flipping replica_mode.
+     * joining it drains any in-flight MANIFEST sync / WAL replay -- flipping
+     * replica_mode mid-sync would let a query thread waiting on cf_list_lock as
+     * wrlock block behind the sync's rdlock, an apparent hang on the first
+     * query after promotion. the exchange claims the shutdown so a later close
+     * does not double-join the thread. */
+    if (atomic_exchange_explicit(&db->replica_sync_thread_active, 0, memory_order_acq_rel) == 1)
     {
-        if (!atomic_load_explicit(&db->replica_sync_in_progress, memory_order_acquire)) break;
-        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        pthread_join(db->replica_sync_thread, NULL);
     }
 
     /* final MANIFEST sync and WAL replay to catch last writes from old primary */
@@ -23123,7 +23182,7 @@ unified_sst_search:;
         }
 
         /* L1+ point reads scan every sstable in the level (bloom-filtered).
-         * a binary-search "pick one sstable" fast path is unsafe here: it relied
+         * a binary-search "pick one sstable" fast path is unsafe here, it relied
          * on level->file_boundaries, which is a compaction scratch field holding
          * the NEXT level's min-keys (see tidesdb_level_update_boundaries), not
          * this level's own boundaries -- and during a compaction add-then-remove

@@ -17417,9 +17417,17 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 /* immutable queue -- conservative estimate using write_buffer_size.
                  * each immutable's data is bounded by write_buffer_size (flush threshold).
                  * while arena allocates write_buffer_size * 2, the unused arena capacity
-                 * is not meaningful for pressure accounting */
-                size_t imm_count = queue_size(cf->immutable_memtables);
-                total_mem_bytes += (int64_t)(imm_count * cf->config.write_buffer_size);
+                 * is not meaningful for pressure accounting.
+                 * skipped in unified mode: per-CF immutable queues there hold only
+                 * empty rotated memtables (all data is in the unified memtable, summed
+                 * separately below), so charging each write_buffer_size is phantom
+                 * memory that inflates the pressure ratio and triggers spurious
+                 * force-flushes. */
+                if (!db->unified_mt.enabled)
+                {
+                    size_t imm_count = queue_size(cf->immutable_memtables);
+                    total_mem_bytes += (int64_t)(imm_count * cf->config.write_buffer_size);
+                }
 
                 /* count sstables per cf for the compaction victim heuristic. bloom
                  * filter and block index memory is not summed here -- it is tracked
@@ -17550,7 +17558,29 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
              * joining worker threads; enqueueing new work would race with shutdown */
             if (level >= TDB_MEMORY_PRESSURE_HIGH && atomic_load(&db->is_open))
             {
-                if (level >= TDB_MEMORY_PRESSURE_CRITICAL)
+                if (db->unified_mt.enabled)
+                {
+                    /* unified mode -- every write lands in the single shared
+                     * unified memtable, so shedding memory means rotating THAT,
+                     * once. the per-CF force-flushes below would only rotate
+                     * empty per-CF memtables: they shed nothing and leave stuck
+                     * empty immutables behind. CAS admission mirrors the rotate
+                     * call in tidesdb_flush_memtable. */
+                    int expected = 0;
+                    if (atomic_compare_exchange_strong_explicit(&db->unified_mt.is_flushing,
+                                                                &expected, 1, memory_order_acquire,
+                                                                memory_order_relaxed))
+                    {
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "Memory pressure %s: rotating unified memtable "
+                                      "(global %" PRId64 "/%zu bytes, %.1f%%)",
+                                      level >= TDB_MEMORY_PRESSURE_CRITICAL ? "CRITICAL" : "HIGH",
+                                      total_mem_bytes, mem_limit, ratio * 100.0);
+                        tidesdb_unified_memtable_rotate(db);
+                        atomic_store_explicit(&db->unified_mt.is_flushing, 0, memory_order_release);
+                    }
+                }
+                else if (level >= TDB_MEMORY_PRESSURE_CRITICAL)
                 {
                     /* nuclear flush -- at critical pressure we flush every non-flushing CF
                      * to shed memory as fast as possible across all column families */
@@ -17625,7 +17655,15 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         atomic_load_explicit(&umt->wal->current_file_size, memory_order_relaxed);
                     if (wal_size >= db->last_wal_sync_size + threshold)
                     {
-                        tdb_objstore_upload_file_sync(db, umt->wal->file_path);
+                        /* enqueue on the upload worker pool instead of uploading
+                         * inline -- a synchronous multi-MB S3 PUT here blocks the
+                         * reaper thread, stalling deferred-flush retry, memory
+                         * pressure tracking and sstable eviction. generation 0
+                         * means a plain snapshot upload: the worker must not
+                         * fence or delete the still-active WAL. */
+                        tdb_objstore_enqueue_upload(db, umt->wal->file_path, 0);
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "Reaper: unified WAL sync enqueued for async upload");
                         db->last_wal_sync_size = wal_size;
                     }
                 }

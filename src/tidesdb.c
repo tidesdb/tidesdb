@@ -15454,16 +15454,14 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
      * this prevents data loss where keys in memtable are not included in compaction */
     tidesdb_flush_memtable_internal(cf, 0, 1);
 
-    /* wait for flush to complete by checking the flush queue
-     * this ensures the flushed sst is available before compaction starts */
+    /* wait for the forced flush to fully complete before compaction reads the
+     * levels. flush_pending_count is decremented only after the worker finishes
+     * writing the sstable, whereas the flush queue empties as soon as a work
+     * item is dequeued -- and it is db-global, so it also reflects unrelated
+     * CFs' flushes */
     for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS; i++)
     {
-        if (queue_size(cf->db->flush_queue) == 0)
-        {
-            /* queue empty, give flush workers a moment to finish */
-            usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
-            break;
-        }
+        if (!tidesdb_is_flushing(cf)) break;
         if (tidesdb_cf_abort_requested(cf)) break;
         usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
     }

@@ -190,10 +190,14 @@ typedef enum
 } tidesdb_sync_mode_t;
 
 /* default configuration values */
-#define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024)
-#define TDB_DEFAULT_LEVEL_SIZE_RATIO            10
-#define TDB_DEFAULT_MIN_LEVELS                  5
-#define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2
+#define TDB_DEFAULT_WRITE_BUFFER_SIZE (64 * 1024 * 1024)
+#define TDB_DEFAULT_LEVEL_SIZE_RATIO  10
+/* cf trees grows organically -- L = log_T(N/B). starts with one disk
+ * level and let add_level deepen it, rather than pre-allocating empty levels */
+#define TDB_DEFAULT_MIN_LEVELS 1
+/* spooky generalized Spooky sets the dividing level X to L-2; with
+ * X = num_active_levels - 1 - offset that means offset = 1 */
+#define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       1
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
 #define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES      4

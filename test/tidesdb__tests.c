@@ -1106,15 +1106,17 @@ static void test_checkpoint_data_integrity_after_compaction(void)
         }
     }
 
-    /* we queue compaction and wait */
+    /* we queue compaction and wait. compaction_pending_count has no TOCTOU gap
+     * (incremented before enqueue, decremented after the worker finishes),
+     * unlike is_compacting which the worker sets only once it has dequeued. */
     tidesdb_compact(cf);
-    for (int i = 0, stable = 0; i < 300 && stable < 3; i++)
+    for (int i = 0, stable = 0; i < 600 && stable < 3; i++)
     {
         usleep(50000);
+        int pending = atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
         int is_flushing = atomic_load_explicit(&cf->is_flushing, memory_order_acquire);
-        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
-            !is_compacting && !is_flushing)
+        if (queue_size(db->flush_queue) == 0 && pending == 0 && !is_compacting && !is_flushing)
         {
             stable++;
         }
@@ -2182,12 +2184,18 @@ static void wait_for_flush_queue_drain(tidesdb_t *db)
  * compaction to finish so we can assert on post-compaction state. */
 static void wait_for_compaction_idle(tidesdb_t *db, tidesdb_column_family_t *cf)
 {
-    const int max_wait = 200;
+    (void)db;
+    const int max_wait = 400;
     for (int i = 0; i < max_wait; i++)
     {
         usleep(50000);
-        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        /* compaction_pending_count is incremented before the work item is
+         * enqueued and decremented only after the worker fully finishes, so it
+         * has no TOCTOU gap -- unlike is_compacting, which the worker sets only
+         * after it has already dequeued the item (the queue can be empty while
+         * is_compacting is still 0). */
+        if (atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
+            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
         {
             usleep(100000);
             break;
@@ -2270,12 +2278,10 @@ static void test_single_delete_pair_cancel_at_compaction(void)
     tidesdb_flush_memtable(cf);
     wait_for_flush_queue_drain(db);
 
-    /* run several compaction rounds. one tidesdb_compact() is not always enough
-     * because spooky's algo 2 may keep picking L1->L1 same-level merges when L1 is
-     * over capacity from many small flushes, leaving the SDs at L1 and the original
-     * puts at L2 perpetually unable to share a merge input. each pass reshuffles
-     * level capacities so eventually the SDs reach the level that holds the puts
-     * and pair-cancel fires. */
+    /* tidesdb_compact() runs a full compaction -- it merges every level into the
+     * largest, so the single-deletes and their puts always share a merge input
+     * and pair-cancel regardless of how the flushes were distributed across
+     * levels. one call suffices; the loop just exercises repeated compactions. */
     for (int i = 0; i < 8; i++)
     {
         tidesdb_compact(cf);
@@ -2297,10 +2303,10 @@ static void test_single_delete_pair_cancel_at_compaction(void)
     }
     tidesdb_txn_free(txn);
 
-    /* pair-cancel must have reaped both sides -- total_keys is at most the
-     * count of entries that never got paired (possible if some deletes and
-     * puts ended up in different compactions), but never the full 2*num_keys
-     * that regular tidesdb_txn_delete would preserve at a non-largest level. */
+    /* pair-cancel must have reaped both sides -- a full compaction merges the
+     * single-deletes with their puts at the largest level, so total_keys drops
+     * well below the 2*num_keys that regular tidesdb_txn_delete would preserve
+     * at a non-largest level. */
     tidesdb_stats_t *stats = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
     ASSERT_TRUE(stats != NULL);
@@ -2548,25 +2554,20 @@ static void run_put_then_delete_workload(tidesdb_t *db, tidesdb_column_family_t 
     }
 }
 
-/* single-delete vs regular delete head-to-head discrimination.
+/* a full compaction reaps every entry regardless of delete subtype.
  *
  * both column families run the exact same put-then-delete workload across
  * many sstables.  the only difference is whether the delete sweep uses
- * tidesdb_txn_delete (baseline) or tidesdb_txn_single_delete.  after the
- * same compaction invocation on each:
+ * tidesdb_txn_delete (baseline) or tidesdb_txn_single_delete.  tidesdb_compact
+ * runs a full compaction -- it merges every level into the largest, where a
+ * regular tombstone and a single-delete pair are reaped alike.  so after
+ * compaction:
  *
- *   -- iterator counts on both cfs must be zero (read parity -- a tombstone
- *     masks its put regardless of subtype)
- *   -- stats->total_keys on the single-delete cf must be strictly less than
- *     on the baseline cf (pair-cancel proof -- the single-delete path
- *     reaped puts and their tombstones together, the baseline path had to
- *     carry the tombstones forward because the merge target is not the
- *     largest level)
- *
- * small write_buffer_size + periodic flushes guarantee many sstables at
- * the source level so the compaction's merge input contains both the put
- * sstables and the delete sstables for every key. */
-static void test_single_delete_vs_regular_delete_discriminates(void)
+ *   -- iterator counts on both cfs must be zero (a tombstone masks its put
+ *     regardless of subtype)
+ *   -- stats->total_keys on both cfs must be zero (the full compaction
+ *     reclaimed every put and tombstone) */
+static void test_full_compaction_reaps_both_delete_types(void)
 {
     cleanup_test_dir();
     tidesdb_t *db = create_test_db();
@@ -2632,10 +2633,9 @@ static void test_single_delete_vs_regular_delete_discriminates(void)
     }
     tidesdb_txn_free(rtxn);
 
-    /* pair-cancel discrimination -- the single-delete cf must hold strictly
-     * fewer on-disk entries than the baseline cf.  baseline carries every
-     * tombstone forward because the compaction target is not the largest
-     * level; single-delete reaps both sides of each pair. */
+    /* a full compaction merges into the largest level, where regular
+     * tombstones and single-delete pairs alike are reaped -- both cfs must
+     * hold zero on-disk entries afterwards. */
     tidesdb_stats_t *stats_baseline = NULL;
     tidesdb_stats_t *stats_sd = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf_baseline, &stats_baseline), 0);
@@ -2643,7 +2643,8 @@ static void test_single_delete_vs_regular_delete_discriminates(void)
     ASSERT_TRUE(stats_baseline != NULL);
     ASSERT_TRUE(stats_sd != NULL);
 
-    ASSERT_TRUE(stats_sd->total_keys < stats_baseline->total_keys);
+    ASSERT_EQ(stats_baseline->total_keys, 0);
+    ASSERT_EQ(stats_sd->total_keys, 0);
 
     tidesdb_free_stats(stats_baseline);
     tidesdb_free_stats(stats_sd);
@@ -13456,17 +13457,7 @@ static void test_ttl_expiration_during_compaction(void)
     tidesdb_compact(cf);
 
     /* wait for compaction to complete */
-    for (int i = 0; i < 100; i++)
-    {
-        usleep(50000);
-        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
-            !is_compacting)
-        {
-            usleep(100000);
-            break;
-        }
-    }
+    wait_for_compaction_idle(db, cf);
 
     /* verify only non-expired keys remain */
     tidesdb_txn_t *txn = NULL;
@@ -28518,7 +28509,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_single_delete_pair_cancel_at_compaction, tests_passed);
     RUN_TEST(test_single_delete_many_sources_iterate_empty, tests_passed);
     RUN_TEST(test_single_delete_iterate_no_visible_entries, tests_passed);
-    RUN_TEST(test_single_delete_vs_regular_delete_discriminates, tests_passed);
+    RUN_TEST(test_full_compaction_reaps_both_delete_types, tests_passed);
     RUN_TEST(test_concurrent_writes, tests_passed);
     RUN_TEST(test_empty_value, tests_passed);
     RUN_TEST(test_delete_nonexistent_key, tests_passed);

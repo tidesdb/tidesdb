@@ -366,7 +366,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_REFCOUNT_DRAIN_SLEEP_US        10     /* sleep interval after yield threshold */
 #define TDB_REFCOUNT_DRAIN_LOG_INTERVAL    0xFFFF /* log warning every ~64K iterations */
 #define TDB_REFCOUNT_DRAIN_BASELINE        2      /* baseline refcount -- 1 original + 1 work ref */
-#define TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS \
+#define TDB_ACTIVE_REF_MAX_ATTEMPTS \
     16 /* bound on load+try_ref+revalidate retries when active is rotating */
 
 /* default L0/L1 management configuration */
@@ -16518,14 +16518,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
         skip_list_t *memtable = imm->skip_list;
         block_manager_t *wal = imm->wal;
 
-        /* we wait for all in-flight writers to finish before reading from memtable
-         * writers hold refcount while writing to WAL and skip_list
-         * we must wait for them to complete to ensure we capture all entries
-         * refcount accounting -- 1 (original) + 1 (work ref) = 2 when no external refs
+        /* we wait for all in-flight commit-path writers to finish before reading
+         * the memtable. writers bump imm->writers while they mutate the WAL and
+         * skip list, so once this drains to zero every committed entry is visible.
+         * we drain writers and not refcount -- concurrent readers and iterators
+         * pin the immutable through refcount, and waiting on refcount would let
+         * sustained read load stall the flush indefinitely. readers only read the
+         * skip list, which is safe to do alongside the flush.
          * this wait happens in the background flush thread, not the hot path */
         int drain_iterations = 0;
-        while (atomic_load_explicit(&imm->refcount, memory_order_acquire) >
-               TDB_REFCOUNT_DRAIN_BASELINE)
+        while (atomic_load_explicit(&imm->writers, memory_order_acquire) > 0)
         {
             drain_iterations++;
             if (drain_iterations < TDB_REFCOUNT_DRAIN_SPIN_THRESHOLD)
@@ -16544,8 +16546,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
             {
                 TDB_DEBUG_LOG(
                     TDB_LOG_WARN,
-                    "CF '%s' flush worker waiting for memtable refcount to drain (current=%d)",
-                    cf->name, atomic_load_explicit(&imm->refcount, memory_order_acquire));
+                    "CF '%s' flush worker waiting for in-flight writers to drain (current=%d)",
+                    cf->name, atomic_load_explicit(&imm->writers, memory_order_acquire));
             }
         }
         atomic_thread_fence(memory_order_acquire);
@@ -23050,12 +23052,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 unified_sst_search:;
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    /* we resolve comparator once for binary search on file_boundaries at L1+ */
-    skip_list_comparator_fn level_cmp_fn = NULL;
-    void *level_cmp_ctx = NULL;
-    tidesdb_resolve_comparator(txn->db, &cf->config, &level_cmp_fn, &level_cmp_ctx);
-    if (!level_cmp_fn) level_cmp_fn = skip_list_comparator_memcmp;
-
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
         int retry_backoff = TDB_SST_RETRY_INITIAL_SPINS;
@@ -23088,50 +23084,13 @@ unified_sst_search:;
             num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         }
 
-        /* for L1+ with valid file_boundaries, binary search to find the one sstable
-         * whose key range contains our search key. this reduces per-level cost from
-         * O(num_ssts) with bloom+range checks to O(log(num_ssts)) comparisons.
-         * file_boundaries[i] = min_key of sstables[i], updated after compaction.
-         * falls back to linear scan for L0 (overlapping ranges) or stale boundaries. */
-        int boundary_search_idx = -1;
-        if (level_num > 0 && num_ssts > 1)
-        {
-            const int nb = atomic_load_explicit(&level->num_boundaries, memory_order_acquire);
-            uint8_t **fb = atomic_load_explicit(&level->file_boundaries, memory_order_acquire);
-            size_t *bs = atomic_load_explicit(&level->boundary_sizes, memory_order_acquire);
-
-            if (fb && bs && nb == num_ssts)
-            {
-                /*** we find rightmost sstable where min_key <= search_key.
-                 **  since L1+ sstables are non-overlapping and sorted by min_key,
-                 *   this is the only sstable that could contain the key. */
-                int lo = 0, hi = nb - 1;
-                while (lo <= hi)
-                {
-                    const int mid = lo + (hi - lo) / 2;
-                    if (fb[mid] && bs[mid] > 0)
-                    {
-                        const int cmp =
-                            level_cmp_fn(key, key_size, fb[mid], bs[mid], level_cmp_ctx);
-                        if (cmp >= 0)
-                        {
-                            boundary_search_idx = mid;
-                            lo = mid + 1;
-                        }
-                        else
-                        {
-                            hi = mid - 1;
-                        }
-                    }
-                    else
-                    {
-                        /* null boundary -- boundaries are stale, fall back to linear */
-                        boundary_search_idx = -1;
-                        break;
-                    }
-                }
-            }
-        }
+        /* L1+ point reads scan every sstable in the level (bloom-filtered).
+         * a binary-search "pick one sstable" fast path is unsafe here: it relied
+         * on level->file_boundaries, which is a compaction scratch field holding
+         * the NEXT level's min-keys (see tidesdb_level_update_boundaries), not
+         * this level's own boundaries -- and during a compaction add-then-remove
+         * window a level transiently holds overlapping sstables, so more than one
+         * can cover the key. only a full scan keeping the highest seq is correct. */
 
         uint64_t best_seq = 0;
         uint8_t *best_value = NULL;
@@ -23139,9 +23098,8 @@ unified_sst_search:;
         int best_is_dead = 0;
         int best_found = 0;
 
-        /* we determine scan range, single sstable for boundary hit, full scan otherwise */
-        const int scan_start = (boundary_search_idx >= 0) ? boundary_search_idx : num_ssts - 1;
-        const int scan_end = (boundary_search_idx >= 0) ? boundary_search_idx : 0;
+        const int scan_start = num_ssts - 1;
+        const int scan_end = 0;
 
         for (int j = scan_start; j >= scan_end; j--)
         {
@@ -23218,8 +23176,8 @@ unified_sst_search:;
             }
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
-            int get_result = tidesdb_sstable_get(cf->db, sst, key, key_size, snapshot_seq,
-                                                 &candidate_kv, boundary_search_idx >= 0);
+            int get_result =
+                tidesdb_sstable_get(cf->db, sst, key, key_size, snapshot_seq, &candidate_kv, 0);
 
             if (get_result == TDB_SUCCESS && candidate_kv)
             {
@@ -25454,7 +25412,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             if (!umt) return TDB_ERR_UNKNOWN;
             if (!tidesdb_memtable_try_ref(umt))
             {
-                if (++umt_attempts >= TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
+                if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
                 continue;
             }
             /* mark this writer in-flight before the revalidate, mirroring the
@@ -25467,7 +25425,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 break;
             atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
             atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
-            if (++umt_attempts >= TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
+            if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
         }
 
         /* we serialize unified WAL batch */
@@ -25620,9 +25578,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     }
 
     /* apply backpressure before acquiring any memtable reference. a writer that
-     * stalls in apply_backpressure must not hold mt->refcount -- the flush
-     * worker drains an immutable's refcount before flushing it, so a stalled
-     * writer holding a rotated memtable's ref would block the flush, the flush
+     * stalls in apply_backpressure must not hold a memtable writers/refcount --
+     * the flush worker drains an immutable's writers before flushing it, so a
+     * stalled writer holding a rotated memtable would block the flush, the flush
      * would never drain the immutable queue, and the stall would never clear */
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
@@ -25647,23 +25605,33 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
-        tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
-        /*** we use CAS-based try_ref to safely handle the case where the loaded
-         **  memtable was rotated to immutable and freed between our load and ref.
-         *   if try_ref fails, reload -- the new active memtable will be current */
-        if (!tidesdb_memtable_try_ref(mt))
+        /*** we load + try_ref + writers-bump + revalidate the active memtable.
+         **  try_ref (CAS) refuses a memtable already claimed for cleanup. the
+         *   writers bump marks this commit in-flight before the revalidate so the
+         *   flush worker, which drains writers, cannot miss a writer that has
+         *   committed to mutating this memtable. the seq_cst fence pairs with the
+         *   one in tidesdb_flush_memtable_internal after it publishes the new
+         *   active, so a memtable rotated under us is abandoned -- we retry on the
+         *   new active rather than mutating a skip list the flush worker has
+         *   already started reading. */
+        tidesdb_memtable_t *mt = NULL;
+        int acquire_attempts = 0;
+        for (;;)
         {
             mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-            if (!mt || !tidesdb_memtable_try_ref(mt))
+            if (mt && tidesdb_memtable_try_ref(mt))
             {
-                /* memtable rotation is racing; we release previously acquired refs and retry */
-                for (int j = 0; j < cf_idx; j++)
-                {
-                    if (cf_memtables[j])
-                        atomic_fetch_sub_explicit(&cf_memtables[j]->refcount, 1,
-                                                  memory_order_release);
-                }
+                atomic_fetch_add_explicit(&mt->writers, 1, memory_order_acq_rel);
+                atomic_thread_fence(memory_order_seq_cst);
+                if (mt == atomic_load_explicit(&cf->active_memtable, memory_order_acquire)) break;
+                atomic_fetch_sub_explicit(&mt->writers, 1, memory_order_release);
+                atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
+            }
+            if (++acquire_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS)
+            {
+                /* active is rotating faster than we can latch it -- fail the
+                 * commit; cleanup releases the memtables latched for earlier CFs */
                 result = TDB_ERR_UNKNOWN;
                 goto cleanup;
             }
@@ -25758,6 +25726,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
         const int needs_flush = (memtable_size >= flush_threshold);
 
+        atomic_fetch_sub_explicit(&mt->writers, 1, memory_order_release);
         atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
         cf_memtables[cf_idx] = NULL; /* mark as released */
 
@@ -25863,6 +25832,7 @@ cleanup:
     {
         if (cf_memtables[i])
         {
+            atomic_fetch_sub_explicit(&cf_memtables[i]->writers, 1, memory_order_release);
             atomic_fetch_sub_explicit(&cf_memtables[i]->refcount, 1, memory_order_release);
         }
     }

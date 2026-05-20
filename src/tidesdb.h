@@ -471,6 +471,7 @@ typedef struct tidesdb_config_t
  * @param id unique identifier for this memtable
  * @param generation generation counter for memtable rotation
  * @param refcount reference count for safe concurrent access
+ * @param writers count of commit-path writers actively mutating the WAL and skip list
  * @param flushed flag indicating if memtable has been flushed to disk
  */
 struct tidesdb_memtable_t
@@ -480,6 +481,7 @@ struct tidesdb_memtable_t
     uint64_t id;
     uint64_t generation;
     _Atomic(int) refcount;
+    _Atomic(int) writers;
     _Atomic(int) flushed;
 };
 

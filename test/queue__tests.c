@@ -844,7 +844,6 @@ void test_queue_remove_if_callback_invoked(void)
     queue_enqueue(queue, &c);
     queue_enqueue(queue, &d);
 
-    int callback_count = 0;
     const size_t removed = queue_remove_if(queue, remove_if_match_even, NULL, remove_if_count);
     /* callback runs per removed item; verify count matches return value */
     (void)removed;

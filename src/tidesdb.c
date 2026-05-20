@@ -364,8 +364,6 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_REFCOUNT_DRAIN_SLEEP_US        10     /* sleep interval after yield threshold */
 #define TDB_REFCOUNT_DRAIN_LOG_INTERVAL    0xFFFF /* log warning every ~64K iterations */
 #define TDB_REFCOUNT_DRAIN_BASELINE        2      /* baseline refcount -- 1 original + 1 work ref */
-#define TDB_UNIFIED_REFCOUNT_DRAIN_BASELINE \
-    1 /* unified flush path adds no work ref -- baseline is original only */
 #define TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS \
     16 /* bound on load+try_ref+revalidate retries when active is rotating */
 
@@ -18607,6 +18605,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
          * the next rotation allocates uwal_<active+1> and never collides */
         umt->generation = active_uwal_gen;
         atomic_init(&umt->refcount, 1);
+        atomic_init(&umt->writers, 0);
         atomic_init(&umt->flushed, 0);
         atomic_init(&(*db)->unified_mt.active, umt);
         atomic_store_explicit(&(*db)->unified_mt.wal_generation, active_uwal_gen,
@@ -20311,6 +20310,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     initial_mt->id = active_wal_id;
     initial_mt->generation = 0;
     atomic_init(&initial_mt->refcount, 1);
+    atomic_init(&initial_mt->writers, 0);
     atomic_init(&initial_mt->flushed, 0);
     atomic_init(&cf->active_memtable, initial_mt);
 
@@ -21422,6 +21422,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     new_mt->id = sst_id + 1;
     new_mt->generation = old_mt ? old_mt->generation + 1 : 1;
     atomic_init(&new_mt->refcount, 1);
+    atomic_init(&new_mt->writers, 0);
     atomic_init(&new_mt->flushed, 0);
 
     /** we check marked_for_deletion again after allocating resources
@@ -24947,13 +24948,16 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
 {
     if (!db || !umt_imm || !umt_imm->skip_list) return TDB_ERR_INVALID_ARGS;
 
-    /* we wait for all in-flight writers to finish before reading from memtable
-     * writers hold refcount while writing to WAL and skip_list
-     * we must wait for them to complete before closing the WAL
-     * refcount accounting -- 1 (original) = 1 baseline (no work ref in unified path) */
+    /* we wait for all in-flight writers to finish before reading from memtable.
+     * writers bump umt_imm->writers while they mutate the WAL and skip list, so
+     * once this drains to zero no thread is touching either and closing the WAL
+     * at the end of the flush is safe. we deliberately drain writers and not
+     * refcount -- concurrent readers and iterators pin the immutable through
+     * refcount, and waiting on refcount would let sustained read load stall the
+     * flush forever while the immutable queue grows unbounded. readers only read
+     * the skip list, which is safe to do alongside the flush. */
     int drain_iterations = 0;
-    while (atomic_load_explicit(&umt_imm->refcount, memory_order_acquire) >
-           TDB_UNIFIED_REFCOUNT_DRAIN_BASELINE)
+    while (atomic_load_explicit(&umt_imm->writers, memory_order_acquire) > 0)
     {
         drain_iterations++;
         if (drain_iterations < TDB_REFCOUNT_DRAIN_SPIN_THRESHOLD)
@@ -24972,8 +24976,8 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
         {
             TDB_DEBUG_LOG(
                 TDB_LOG_WARN,
-                "Unified flush worker waiting for memtable refcount to drain (current=%d)",
-                atomic_load_explicit(&umt_imm->refcount, memory_order_acquire));
+                "Unified flush worker waiting for in-flight writers to drain (current=%d)",
+                atomic_load_explicit(&umt_imm->writers, memory_order_acquire));
         }
     }
     atomic_thread_fence(memory_order_acquire);
@@ -25302,6 +25306,7 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     new_mt->id = 0;
     new_mt->generation = new_gen;
     atomic_init(&new_mt->refcount, 1);
+    atomic_init(&new_mt->writers, 0);
     atomic_init(&new_mt->flushed, 0);
 
     /* we swap active, now old becomes immutable */
@@ -25377,6 +25382,17 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     /* with the unified path, we do single WAL + single skip list */
     if (txn->db->unified_mt.enabled)
     {
+        /* apply backpressure before acquiring the unified memtable reference. a
+         * writer that stalls in apply_backpressure must not be holding
+         * umt->refcount -- tidesdb_unified_flush_immutable drains that refcount
+         * before flushing, so a stalled writer would block the flush, the flush
+         * would never drain the immutable queue, and the stall would never end */
+        for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
+        {
+            result = tidesdb_apply_backpressure(txn->cfs[cf_idx]);
+            if (result != TDB_SUCCESS) return result;
+        }
+
         /* we load + try_ref + revalidate active so a rotation that fires between our load
          * and try_ref cannot leave us holding a retired memtable. without the revalidate
          * the flush worker can race ahead and close umt->wal under our feet */
@@ -25391,8 +25407,15 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 if (++umt_attempts >= TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
                 continue;
             }
+            /* mark this writer in-flight before the revalidate, mirroring the
+             * try_ref order, so a flush worker that drains writers cannot miss a
+             * writer that has already committed to mutating this memtable. the
+             * flush worker drains writers rather than refcount so readers cannot
+             * stall it -- see tidesdb_unified_flush_immutable */
+            atomic_fetch_add_explicit(&umt->writers, 1, memory_order_acq_rel);
             if (umt == atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire))
                 break;
+            atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
             atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
             if (++umt_attempts >= TDB_UNIFIED_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
         }
@@ -25404,6 +25427,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                                                                 sizeof(uwal_stack_buf));
         if (!uwal_batch && uwal_size > 0)
         {
+            atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
             atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
             return TDB_ERR_MEMORY;
         }
@@ -25416,6 +25440,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             if (wal_result < 0)
             {
                 if (uwal_batch != uwal_stack_buf) free(uwal_batch);
+                atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
                 atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
                 return TDB_ERR_IO;
             }
@@ -25430,27 +25455,18 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             tdb_objstore_upload_file_sync(txn->db, umt->wal->file_path);
         }
 
-        /* we apply backpressure once for unified path */
-        for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
-        {
-            result = tidesdb_apply_backpressure(txn->cfs[cf_idx]);
-            if (result != TDB_SUCCESS)
-            {
-                atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
-                return result;
-            }
-        }
-
         /* we apply ops to unified skip list with prefixed keys */
         result = tidesdb_txn_apply_ops_to_unified_memtable(txn, umt->skip_list);
         if (result != TDB_SUCCESS)
         {
+            atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
             atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
             return result;
         }
 
         /* we check if unified memtable needs rotation */
         const size_t umt_size = (size_t)skip_list_get_size(umt->skip_list);
+        atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
         atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
 
         if (umt_size >= txn->db->unified_mt.write_buffer_size)
@@ -25553,6 +25569,25 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
     }
 
+    /* apply backpressure before acquiring any memtable reference. a writer that
+     * stalls in apply_backpressure must not hold mt->refcount -- the flush
+     * worker drains an immutable's refcount before flushing it, so a stalled
+     * writer holding a rotated memtable's ref would block the flush, the flush
+     * would never drain the immutable queue, and the stall would never clear */
+    for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
+    {
+        result = tidesdb_apply_backpressure(txn->cfs[cf_idx]);
+        if (result != TDB_SUCCESS)
+        {
+            if (!use_stack_cf)
+            {
+                free(cf_memtables);
+                free(cf_skiplists);
+            }
+            return result;
+        }
+    }
+
     /****** we use a single loop for WAL write + memtable apply to close the race window
      *****  where another thread could flush the memtable between WAL write and op apply.
      ****   previously two separate loops meant ops for CF[1] could be applied to an
@@ -25623,12 +25658,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
          **     serialize the skip list without our entries. */
         if (mt)
         {
-            result = tidesdb_apply_backpressure(cf);
-            if (result != TDB_SUCCESS)
-            {
-                goto cleanup_error_result;
-            }
-
             result = tidesdb_txn_apply_ops_to_memtable(txn, cf, cf_skiplists[cf_idx]);
             if (result != TDB_SUCCESS)
             {
@@ -29065,6 +29094,7 @@ static void tidesdb_recover_single_wal(tidesdb_column_family_t *cf, char *wal_pa
     imm->id = 0;
     imm->generation = 0;
     atomic_init(&imm->refcount, 1);
+    atomic_init(&imm->writers, 0);
     atomic_init(&imm->flushed, 0);
 
     if (queue_enqueue(cf->immutable_memtables, imm) != 0)
@@ -30119,6 +30149,26 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     uint64_t total_data_size = 0;
     uint64_t total_klog_size = 0;
 
+    /* immutable memtables still hold live data not yet on disk -- fold their
+     * bytes into memtable_size and their entries into total_keys. a flushed
+     * immutable is skipped, its data is already on disk and counted in the
+     * sstable totals, and it only lingers in the queue until batched cleanup */
+    if (cf->immutable_memtables)
+    {
+        queue_t *iq = cf->immutable_memtables;
+        pthread_rwlock_rdlock(&iq->read_lock);
+        for (queue_node_t *n = iq->head->next; n != NULL; n = n->next)
+        {
+            tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)n->data;
+            if (imm && imm->skip_list && !atomic_load_explicit(&imm->flushed, memory_order_acquire))
+            {
+                (*stats)->memtable_size += skip_list_get_size(imm->skip_list);
+                total_keys += (uint64_t)skip_list_count_entries(imm->skip_list);
+            }
+        }
+        pthread_rwlock_unlock(&iq->read_lock);
+    }
+
     /* btree stats aggregation */
     uint64_t btree_total_nodes = 0;
     uint32_t btree_max_height = 0;
@@ -30218,9 +30268,16 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
         (*stats)->avg_value_size = 0.0;
     }
 
-    /** we calculate read amplification -- worst case is 1 (memtable) + sum of sstables per level
-     *  note that levels[0] is L1 (first sstable level), L0 is the immutable memtables queue */
+    /** we calculate read amplification -- worst case is 1 (memtable) + the L0
+     *  immutable memtable queue + sum of sstables per level. levels[0] is L1
+     *  (first sstable level), L0 is the immutable memtables queue */
     double read_amp = 1.0; /* memtable lookup */
+
+    /* L0 -- every immutable memtable is also scanned on a point read. in unified
+     * mode the immutables live on the shared unified queue */
+    read_amp += (double)((cf->db && cf->db->unified_mt.enabled && cf->db->unified_mt.immutables)
+                             ? queue_size(cf->db->unified_mt.immutables)
+                             : queue_size(cf->immutable_memtables));
 
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
@@ -30279,8 +30336,9 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
     stats->num_open_sstables = atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed);
     stats->global_seq = atomic_load_explicit(&db->global_seq, memory_order_relaxed);
     stats->txn_memory_bytes = atomic_load_explicit(&db->txn_memory_bytes, memory_order_relaxed);
-    stats->total_memtable_bytes =
-        atomic_load_explicit(&db->cached_memtable_bytes, memory_order_relaxed);
+    /* total_memtable_bytes is the live skip list bytes of every memtable, active
+     * and immutable, across all column families and the unified memtable -- it
+     * is summed below, not taken from the reaper's whole-memory pressure total */
 
     if (db->flush_queue) stats->flush_queue_size = queue_size(db->flush_queue);
     if (db->compaction_queue) stats->compaction_queue_size = queue_size(db->compaction_queue);
@@ -30294,6 +30352,26 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
         if (!cf) continue;
 
         stats->total_immutable_count += (int)queue_size(cf->immutable_memtables);
+
+        /* per-cf active memtable + its immutable queue contribute to the
+         * memtable byte total (empty in unified mode, summed below instead).
+         * flushed immutables are skipped, their bytes are already on disk */
+        tidesdb_memtable_t *amt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+        if (amt && amt->skip_list)
+            stats->total_memtable_bytes += (int64_t)skip_list_get_size(amt->skip_list);
+        if (cf->immutable_memtables)
+        {
+            queue_t *iq = cf->immutable_memtables;
+            pthread_rwlock_rdlock(&iq->read_lock);
+            for (queue_node_t *n = iq->head->next; n != NULL; n = n->next)
+            {
+                tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)n->data;
+                if (imm && imm->skip_list &&
+                    !atomic_load_explicit(&imm->flushed, memory_order_acquire))
+                    stats->total_memtable_bytes += (int64_t)skip_list_get_size(imm->skip_list);
+            }
+            pthread_rwlock_unlock(&iq->read_lock);
+        }
 
         int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
         for (int l = 0; l < num_levels; l++)
@@ -30321,11 +30399,25 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
             atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
         if (umt && umt->skip_list)
             stats->unified_memtable_bytes = (int64_t)skip_list_get_size(umt->skip_list);
+        stats->total_memtable_bytes += stats->unified_memtable_bytes;
 
         if (db->unified_mt.immutables)
         {
             stats->unified_immutable_count = (int)queue_size(db->unified_mt.immutables);
             stats->total_immutable_count += stats->unified_immutable_count;
+
+            /* unified immutable queue bytes also count toward total_memtable_bytes,
+             * except flushed immutables whose bytes are already on disk */
+            queue_t *uiq = db->unified_mt.immutables;
+            pthread_rwlock_rdlock(&uiq->read_lock);
+            for (queue_node_t *n = uiq->head->next; n != NULL; n = n->next)
+            {
+                tidesdb_memtable_t *uimm = (tidesdb_memtable_t *)n->data;
+                if (uimm && uimm->skip_list &&
+                    !atomic_load_explicit(&uimm->flushed, memory_order_acquire))
+                    stats->total_memtable_bytes += (int64_t)skip_list_get_size(uimm->skip_list);
+            }
+            pthread_rwlock_unlock(&uiq->read_lock);
         }
 
         stats->unified_is_flushing =

@@ -6621,49 +6621,37 @@ static void test_dynamic_capacity_adjustment(void)
     }
 
     printf("Wrote %d keys, waiting for background operations...\n", total_keys_written);
-    for (int i = 0; i < 100; i++)
+
+    /* flush whatever is still in the active memtable so every key is persisted */
+    tidesdb_flush_memtable(cf);
+
+    /* wait for all background flush and compaction to fully settle. level growth
+     * happens in the geometry driven auto compaction that fires as flushes
+     * accumulate, so it must run to completion before we read num_active_levels.
+     * tidesdb_compact is deliberately not called here -- it now runs a full
+     * compaction that collapses every level into the largest and never adds a
+     * level, which would cement the tree at min_levels. the stable counter
+     * absorbs the flush completing then triggering one more compaction. */
+    for (int stable = 0, i = 0; i < 600 && stable < 5; i++)
     {
         usleep(50000);
-        if (queue_size(db->flush_queue) == 0) break;
-    }
-    sleep(2);
-
-    sleep(5);
-
-    /* trigger a few compaction rounds to push data through levels */
-    for (int round = 0; round < 5; round++)
-    {
-        tidesdb_compact(cf);
-        sleep(2);
-
-        int current_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-        printf("After compaction round %d: %d levels\n", round + 1, current_levels);
-
-        if (current_levels > initial_levels)
-        {
-            printf("Level growth detected!\n");
-            break;
-        }
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
+            atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
+            !atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
+            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
+            stable++;
+        else
+            stable = 0;
     }
 
     printf("Total keys written: %d\n", total_keys_written);
 
-    /* explicitly flush memtable to ensure all keys are persisted */
-    tidesdb_flush_memtable(cf);
-    sleep(1);
-
-    /* trigger final compaction to ensure all data is merged */
-    tidesdb_compact(cf);
-    sleep(2);
-
-    /* final */
-    sleep(3);
-
-    /* check final level count after flush and compaction */
+    /* check final level count */
     int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
     printf("Final levels: %d (growth: %d levels)\n", final_levels, final_levels - initial_levels);
 
-    /* verify DCA worked -- should have added levels */
+    /* verify DCA worked -- auto compaction should have added levels */
     ASSERT_TRUE(final_levels > initial_levels);
 
     /* verify data is accessible (skip verification of keys that may still be in memtable) */

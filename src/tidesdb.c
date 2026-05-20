@@ -17331,7 +17331,7 @@ static void *tidesdb_replica_sync_thread(void *arg)
         {
             uint64_t slice = sync_interval_us - slept;
             if (slice > TDB_REPLICA_SYNC_SLEEP_SLICE_US) slice = TDB_REPLICA_SYNC_SLEEP_SLICE_US;
-            usleep((useconds_t)slice);
+            usleep(slice);
             slept += slice;
         }
         if (!atomic_load_explicit(&db->replica_sync_thread_active, memory_order_acquire)) break;

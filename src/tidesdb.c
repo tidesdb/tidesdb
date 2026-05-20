@@ -334,8 +334,10 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_THREAD_NAME_LEN 16
 
 /* sstable reaper thread configuration */
-#define TDB_SSTABLE_REAPER_SLEEP_US    100000
-#define TDB_SSTABLE_REAPER_EVICT_RATIO 0.25
+#define TDB_SSTABLE_REAPER_SLEEP_US 100000
+/* how many cfs the reaper retries deferred flushes for in a single cycle */
+#define TDB_REAPER_DEFERRED_FLUSH_BATCH 64
+#define TDB_SSTABLE_REAPER_EVICT_RATIO  0.25
 
 #define TDB_WAL_STACK_BUFFER_SIZE 512
 
@@ -5204,15 +5206,16 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
 }
 
 /**
- * tdb_replica_replay_wal
+ * tdb_objstore_replay_remote_wals
  * discover all unified WAL files in the object store via list(), download and
- * replay each one in generation order into the unified memtable for near-real-time
- * reads. uses the list() callback to find all available WAL segments and derives
- * the current generation from the highest discovered WAL. sequence numbers
- * ensure idempotent replay.
- * @param db database instance in replica mode
+ * replay each one in generation order into the unified memtable. used by replica
+ * sync for near-real-time reads and by cold-start recovery so a primary rebuilt
+ * from the object store does not lose committed-but-unflushed writes. derives the
+ * current generation from the highest discovered WAL. sequence numbers ensure
+ * idempotent replay -- entries already covered by recovered sstables are skipped.
+ * @param db database instance with an object store and a unified memtable
  */
-static void tdb_replica_replay_wal(tidesdb_t *db)
+static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
 {
     if (!db->unified_mt.enabled || !db->object_store)
     {
@@ -17346,6 +17349,31 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         /* we sweep deferred free list every cycle to reclaim retired sstable arrays */
         tidesdb_deferred_free_sweep(db);
 
+        /*** retry flushes that were deferred because the global concurrent-flush
+         **  cap was hit. the cap frees as in-flight flushes finish, so a
+         *   deferred flush must not be left waiting for a future write to
+         **  re-trigger it. we collect the deferred cfs under the list lock and
+         *** flush them after releasing it, the same shape the memory pressure
+         **  victim below uses. flush_memtable_internal clears flush_deferred
+         *   itself once a flush actually proceeds, or re-sets it if still capped
+         **  so a later cycle retries again. */
+        {
+            tidesdb_column_family_t *deferred_cfs[TDB_REAPER_DEFERRED_FLUSH_BATCH];
+            int deferred_count = 0;
+            pthread_rwlock_rdlock(&db->cf_list_lock);
+            for (int i = 0;
+                 i < db->num_column_families && deferred_count < TDB_REAPER_DEFERRED_FLUSH_BATCH;
+                 i++)
+            {
+                tidesdb_column_family_t *cf = db->column_families[i];
+                if (cf && atomic_load_explicit(&cf->flush_deferred, memory_order_acquire))
+                    deferred_cfs[deferred_count++] = cf;
+            }
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            for (int i = 0; i < deferred_count; i++)
+                tidesdb_flush_memtable_internal(deferred_cfs[i], 0, 1);
+        }
+
         /*** global memory pressure computations
          * we scan all CFs to compute total memtable + cache + bloom/index memory
          * we store pressure level atomically for write path to consume
@@ -17614,6 +17642,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             uint64_t current_gen =
                 atomic_load_explicit(&db->unified_mt.wal_generation, memory_order_relaxed);
 
+            uint64_t cleanup_through = db->last_wal_cleanup_gen;
             for (uint64_t g = db->last_wal_cleanup_gen + 1; g <= uploaded_gen && g < current_gen;
                  g++)
             {
@@ -17621,9 +17650,22 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 snprintf(old_wal, sizeof(old_wal),
                          "%s" PATH_SEPARATOR TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
                          db->db_path, TDB_U64_CAST(g));
+
+                /*** last_uploaded_gen is a high-water mark advanced per job, so a
+                 **  generation at or below it may still be mid-upload on another
+                 *   upload worker. we delete the local WAL only once its remote
+                 **  copy is confirmed present, and we stop the cleanup cursor at
+                 *** the first unconfirmed generation so a later reaper cycle
+                 **  retries it. unlinking a WAL out from under an in-flight upload
+                 *   would fail that upload permanently and leave a remote gap. */
+                char wal_key[TDB_MAX_PATH_LEN];
+                tdb_path_to_object_key(db, old_wal, wal_key, sizeof(wal_key));
+                if (db->object_store->exists(db->object_store->ctx, wal_key, NULL) != 1) break;
+
                 tdb_unlink(old_wal); /* no-op if file already gone */
+                cleanup_through = g;
             }
-            if (uploaded_gen > db->last_wal_cleanup_gen) db->last_wal_cleanup_gen = uploaded_gen;
+            db->last_wal_cleanup_gen = cleanup_through;
         }
 
         /* replica MANIFEST sync and WAL replay. throttled by replica_sync_interval_us
@@ -17656,7 +17698,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 if (db->config.object_store_config &&
                     db->config.object_store_config->replica_replay_wal)
                 {
-                    tdb_replica_replay_wal(db);
+                    tdb_objstore_replay_remote_wals(db);
                 }
 
                 atomic_store_explicit(&db->replica_sync_in_progress, 0, memory_order_release);
@@ -19631,7 +19673,7 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
         if (db->unified_mt.enabled && db->config.object_store_config &&
             db->config.object_store_config->replica_replay_wal)
         {
-            tdb_replica_replay_wal(db);
+            tdb_objstore_replay_remote_wals(db);
         }
     }
 
@@ -20413,6 +20455,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->is_compacting, 0);
     atomic_init(&cf->is_flushing, 0);
     atomic_init(&cf->flush_pending_count, 0);
+    atomic_init(&cf->flush_deferred, 0);
     atomic_init(&cf->compaction_pending_count, 0);
     atomic_init(&cf->immutable_cleanup_counter, 0);
     atomic_init(&cf->pending_commits, 0);
@@ -21275,6 +21318,10 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     if (prev_slots >= slot_max)
     {
         atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
+        /* mark the flush deferred so the reaper retries it once a slot frees --
+         * a deferred flush must not be left waiting for a future write to
+         * re-trigger it, or an idle cf could sit over its threshold forever */
+        atomic_store_explicit(&cf->flush_deferred, 1, memory_order_release);
         if (!already_holds_lock)
         {
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -21283,6 +21330,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                       slot_max);
         return TDB_SUCCESS;
     }
+
+    /* a flush slot was acquired -- any pending deferral for this cf is now served */
+    atomic_store_explicit(&cf->flush_deferred, 0, memory_order_release);
 
     /* we check again after acquiring is_flushing in case drop happened between checks */
     if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
@@ -29411,6 +29461,28 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
                           "CF '%s' cold start: reconstructing %d SSTables from MANIFEST", cf->name,
                           manifest_count);
 
+            /*** the freshly created CF only has its initial levels, but the
+             **  MANIFEST can reference deeper ones produced by compaction. we
+             *   materialise every level up to the deepest the MANIFEST names
+             **  before adding sstables -- otherwise L2+ entries fail the
+             *** level_idx < num_active_levels check below and are silently
+             **  dropped, losing all data that compaction had pushed down. */
+            int max_manifest_level = 1;
+            for (int i = 0; i < manifest_count; i++)
+            {
+                if (cf->manifest->entries[i].level > max_manifest_level)
+                    max_manifest_level = cf->manifest->entries[i].level;
+            }
+            for (int lvl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+                 lvl < max_manifest_level && lvl < TDB_MAX_LEVELS; lvl++)
+            {
+                size_t lvl_capacity = tidesdb_calculate_level_capacity(
+                    lvl + 1, cf->config.write_buffer_size, cf->config.level_size_ratio);
+                cf->levels[lvl] = tidesdb_level_create(lvl + 1, lvl_capacity);
+                if (!cf->levels[lvl]) break;
+                atomic_store_explicit(&cf->num_active_levels, lvl + 1, memory_order_release);
+            }
+
             for (int i = 0; i < manifest_count; i++)
             {
                 tidesdb_manifest_entry_t *me = &cf->manifest->entries[i];
@@ -29988,11 +30060,35 @@ static int tidesdb_recover_database(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting database recovery from '%s'", db->db_path);
 
-    /*** if local directory is empty or missing but
-     **  object store has data, discover CFs from remote and download their
-     *   config.ini + MANIFEST before scanning locally */
+    /*** if local directory is empty or missing but object store has data,
+     **  discover CFs from remote and download their config.ini + MANIFEST
+     *   before scanning locally. we first record whether any CF directory
+     **  already exists locally -- a genuine cold start (none present) must also
+     *** replay the remote WALs once sstable recovery is done. */
+    int objstore_cold_start = 0;
     if (db->object_store)
     {
+        int local_cf_dir_seen = 0;
+        DIR *probe_dir = opendir(db->db_path);
+        if (probe_dir)
+        {
+            struct dirent *probe_ent;
+            while ((probe_ent = readdir(probe_dir)) != NULL)
+            {
+                if (probe_ent->d_name[0] == '.') continue;
+                char probe_path[MAX_FILE_PATH_LENGTH];
+                snprintf(probe_path, sizeof(probe_path), "%s%s%s", db->db_path, PATH_SEPARATOR,
+                         probe_ent->d_name);
+                struct STAT_STRUCT probe_st;
+                if (STAT_FUNC(probe_path, &probe_st) == 0 && S_ISDIR(probe_st.st_mode))
+                {
+                    local_cf_dir_seen = 1;
+                    break;
+                }
+            }
+            closedir(probe_dir);
+        }
+        objstore_cold_start = !local_cf_dir_seen;
         tdb_objstore_cold_start_discover(db);
     }
 
@@ -30102,6 +30198,20 @@ static int tidesdb_recover_database(tidesdb_t *db)
     if (db->unified_mt.enabled)
     {
         tidesdb_unified_wal_recover(db);
+    }
+
+    /*** on a cold start the reconstructed sstables cover only flushed data --
+     **  committed-but-unflushed writes live solely in the WALs that
+     *   wal_sync_on_commit / replicate_wal uploaded to the object store. replay
+     **  those remote WALs into the unified memtable so a primary rebuilt from
+     *** the object store does not lose acknowledged writes. seq numbers make the
+     **  replay idempotent, so generations already covered by recovered sstables
+     *   are skipped. object store mode always uses a unified memtable. */
+    if (objstore_cold_start && db->object_store && db->unified_mt.enabled)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Cold start: replaying remote WALs from object store for CF recovery");
+        tdb_objstore_replay_remote_wals(db);
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Database recovery completed successfully");

@@ -502,6 +502,7 @@ struct tidesdb_memtable_t
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param flush_pending_count per-CF count of queued + in-flight flush work items
+ * @param flush_deferred flag set when a flush was skipped at the global concurrent-flush cap
  * @param compaction_pending_count per-CF count of queued + in-flight compaction work items
  * @param immutable_cleanup_counter counter for batched immutable cleanup
  * @param marked_for_deletion flag indicating column family is marked for deletion
@@ -527,6 +528,7 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) flush_pending_count;
+    _Atomic(int) flush_deferred;
     _Atomic(int) compaction_pending_count;
     _Atomic(int) immutable_cleanup_counter;
     _Atomic(int) marked_for_deletion;

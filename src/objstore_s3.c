@@ -21,6 +21,7 @@
 
 #include "objstore_s3.h"
 
+#include <ctype.h>
 #include <curl/curl.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -64,6 +65,24 @@
 /* default region when none specified */
 #define TDB_S3_DEFAULT_REGION "us-east-1"
 
+/* network timeouts -- bound a hung connection so a dead or unreachable
+ * endpoint cannot block an upload worker, or a wal_sync_on_commit commit,
+ * forever. a hard total timeout is avoided so a legitimately slow large
+ * upload is not cut off; instead a stalled-transfer detector is used. */
+#define TDB_S3_CONNECT_TIMEOUT_S 15
+#define TDB_S3_LOW_SPEED_LIMIT   1  /* bytes per second */
+#define TDB_S3_LOW_SPEED_TIME_S  60 /* abort a transfer stalled below the limit this long */
+
+/* multipart upload -- objects at or above the threshold are uploaded in
+ * parts so the connector never buffers a whole large file in memory and is
+ * not bound by S3's 5 GiB single-PUT limit. S3 requires parts of at least
+ * 5 MiB (the final part may be smaller) and at most 10000 parts. */
+#define TDB_S3_MULTIPART_THRESHOLD ((size_t)64 * 1024 * 1024)
+#define TDB_S3_MULTIPART_PART_SIZE ((size_t)16 * 1024 * 1024)
+#define TDB_S3_MAX_PARTS           10000
+#define TDB_S3_ETAG_MAX            128
+#define TDB_S3_UPLOAD_ID_MAX       512
+
 /**
  * s3_uri_encode
  * URI-encode a string per the SigV4 spec. encodes all bytes except unreserved
@@ -91,6 +110,24 @@ static void s3_uri_encode(const char *src, char *dst, size_t dst_size)
         }
     }
     dst[pos] = '\0';
+}
+
+/**
+ * s3_curl_new
+ * create a curl easy handle with the connector's common options applied --
+ * a connection timeout and a stalled-transfer timeout so a dead endpoint
+ * cannot hang a worker, and NOSIGNAL for safe use from multiple threads.
+ * @return a configured handle, or NULL on allocation failure
+ */
+static CURL *s3_curl_new(void)
+{
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)TDB_S3_CONNECT_TIMEOUT_S);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, (long)TDB_S3_LOW_SPEED_LIMIT);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)TDB_S3_LOW_SPEED_TIME_S);
+    return curl;
 }
 
 /**
@@ -235,6 +272,10 @@ static void s3_build_host(const s3_ctx_t *ctx, char *host, size_t host_size)
         snprintf(host, host_size, "%s.%s", ctx->bucket, ctx->endpoint);
 }
 
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 /**
  * s3_sign_raw
  * create AWS SigV4 signed HTTP headers given explicit canonical URI and query string.
@@ -316,6 +357,9 @@ static struct curl_slist *s3_sign_raw(const s3_ctx_t *ctx, const char *method,
 
     return headers;
 }
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
 
 /**
  * s3_sign_request
@@ -426,75 +470,6 @@ static size_t s3_write_discard(void *ptr, size_t size, size_t nmemb, void *userd
 }
 
 /**
- * s3_put
- * upload a local file to S3 as an object
- * @param ctx opaque S3 connector context
- * @param key object key (path-like)
- * @param local_path path to the local file to upload
- * @return 0 on success, -1 on error
- */
-static int s3_put(void *ctx, const char *key, const char *local_path)
-{
-    s3_ctx_t *s3 = (s3_ctx_t *)ctx;
-
-    FILE *fp = fopen(local_path, "rb");
-    if (!fp) return -1;
-
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    /* we read file into memory for SHA256 */
-    void *file_data = malloc(file_size > 0 ? file_size : 1);
-    if (!file_data)
-    {
-        fclose(fp);
-        return -1;
-    }
-    if (file_size > 0)
-    {
-        if (fread(file_data, 1, file_size, fp) != (size_t)file_size)
-        {
-            free(file_data);
-            fclose(fp);
-            return -1;
-        }
-    }
-    fclose(fp);
-
-    char content_sha[TDB_S3_HASH_HEX_LEN];
-    sha256_hex(file_data, file_size > 0 ? file_size : 0, content_sha);
-
-    struct curl_slist *headers = s3_sign_request(s3, "PUT", key, content_sha, NULL, NULL);
-
-    char url[TDB_S3_MAX_PATH];
-    s3_build_url(s3, key, url, sizeof(url));
-
-    CURL *curl = curl_easy_init();
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_discard);
-
-    FILE *mem_fp = tdb_fmemopen(file_data, file_size > 0 ? file_size : 1, "rb");
-    curl_easy_setopt(curl, CURLOPT_READDATA, mem_fp);
-
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-    fclose(mem_fp);
-    free(file_data);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    return (res == CURLE_OK && http_code >= TDB_S3_HTTP_OK && http_code < TDB_S3_HTTP_REDIRECT)
-               ? 0
-               : -1;
-}
-
-/**
  * s3_get
  * download an S3 object to a local file, creating parent directories as needed
  * @param ctx opaque S3 connector context
@@ -543,7 +518,14 @@ static int s3_get(void *ctx, const char *key, const char *local_path)
 
     s3_write_ctx_t wctx = {.fp = fp};
 
-    CURL *curl = curl_easy_init();
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        fclose(fp);
+        unlink(local_path);
+        curl_slist_free_all(headers);
+        return -1;
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_to_file);
@@ -595,7 +577,12 @@ static ssize_t s3_range_get(void *ctx, const char *key, uint64_t offset, void *b
 
     s3_write_ctx_t wctx = {.buf = (char *)buf, .buf_size = size, .written = 0};
 
-    CURL *curl = curl_easy_init();
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_to_buf);
@@ -632,7 +619,12 @@ static int s3_delete_object(void *ctx, const char *key)
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = curl_easy_init();
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -667,7 +659,12 @@ static int s3_exists(void *ctx, const char *key, size_t *size_out)
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = curl_easy_init();
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -757,6 +754,548 @@ static size_t s3_write_to_response(void *ptr, size_t size, size_t nmemb, void *u
     return bytes;
 }
 
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+
+/**
+ * s3_full_key
+ * build the connector-prefixed object key (prefix + key).
+ * @param s3 S3 connector context
+ * @param key caller object key
+ * @param out output buffer
+ * @param out_size size of the output buffer
+ */
+static void s3_full_key(const s3_ctx_t *s3, const char *key, char *out, size_t out_size)
+{
+    if (s3->prefix[0])
+        snprintf(out, out_size, "%s%s", s3->prefix, key);
+    else
+        snprintf(out, out_size, "%s", key);
+}
+
+/**
+ * s3_canonical_uri
+ * build the SigV4 canonical URI for a full object key -- "/bucket/key" for
+ * path-style addressing, "/key" for virtual-hosted style.
+ * @param s3 S3 connector context
+ * @param full_key prefixed object key
+ * @param out output buffer
+ * @param out_size size of the output buffer
+ */
+static void s3_canonical_uri(const s3_ctx_t *s3, const char *full_key, char *out, size_t out_size)
+{
+    if (s3->use_path_style)
+        snprintf(out, out_size, "/%s/%s", s3->bucket, full_key);
+    else
+        snprintf(out, out_size, "/%s", full_key);
+}
+
+/**
+ * s3_header_ctx_t
+ * context for the multipart ETag response-header capture callback.
+ * @param etag receives the part ETag value (quotes included, as returned)
+ * @param found set to 1 once an ETag header has been captured
+ */
+typedef struct
+{
+    char etag[TDB_S3_ETAG_MAX];
+    int found;
+} s3_header_ctx_t;
+
+/**
+ * s3_capture_etag_header
+ * curl header callback that captures the ETag response header of an
+ * UploadPart request. header field names are case-insensitive per RFC 7230.
+ * @param buffer header line bytes (not NUL terminated)
+ * @param size size of each element
+ * @param nitems number of elements
+ * @param userdata pointer to s3_header_ctx_t
+ * @return number of bytes consumed (must equal size * nitems)
+ */
+static size_t s3_capture_etag_header(char *buffer, size_t size, size_t nitems, void *userdata)
+{
+    s3_header_ctx_t *h = (s3_header_ctx_t *)userdata;
+    size_t len = size * nitems;
+    if (len >= 5)
+    {
+        char name[6];
+        for (int i = 0; i < 5; i++) name[i] = (char)tolower((unsigned char)buffer[i]);
+        name[5] = '\0';
+        if (strcmp(name, "etag:") == 0)
+        {
+            const char *v = buffer + 5;
+            size_t vlen = len - 5;
+            while (vlen > 0 && (*v == ' ' || *v == '\t'))
+            {
+                v++;
+                vlen--;
+            }
+            while (vlen > 0 && (v[vlen - 1] == '\r' || v[vlen - 1] == '\n' || v[vlen - 1] == ' '))
+                vlen--;
+            if (vlen >= sizeof(h->etag)) vlen = sizeof(h->etag) - 1;
+            memcpy(h->etag, v, vlen);
+            h->etag[vlen] = '\0';
+            h->found = 1;
+        }
+    }
+    return len;
+}
+
+/**
+ * s3_multipart_create
+ * issue CreateMultipartUpload (POST <object>?uploads) and parse the upload
+ * id out of the XML response.
+ * @param s3 S3 connector context
+ * @param key object key
+ * @param upload_id_out receives the upload id
+ * @param upload_id_size size of the upload id buffer
+ * @return 0 on success, -1 on error
+ */
+static int s3_multipart_create(s3_ctx_t *s3, const char *key, char *upload_id_out,
+                               size_t upload_id_size)
+{
+    char empty_sha[TDB_S3_HASH_HEX_LEN];
+    sha256_hex("", 0, empty_sha);
+
+    char full_key[TDB_S3_MAX_PATH];
+    s3_full_key(s3, key, full_key, sizeof(full_key));
+    char canonical_uri[TDB_S3_MAX_PATH + 512];
+    s3_canonical_uri(s3, full_key, canonical_uri, sizeof(canonical_uri));
+
+    struct curl_slist *headers =
+        s3_sign_raw(s3, "POST", canonical_uri, "uploads=", empty_sha, NULL, NULL);
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+    char full_url[TDB_S3_MAX_PATH + 16];
+    snprintf(full_url, sizeof(full_url), "%s?uploads", url);
+
+    s3_response_buf_t resp = {
+        .data = malloc(TDB_S3_RESPONSE_INIT), .size = 0, .capacity = TDB_S3_RESPONSE_INIT};
+    if (!resp.data)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        free(resp.data);
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, full_url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_to_response);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    int rc = -1;
+    if (res == CURLE_OK && http_code == TDB_S3_HTTP_OK)
+    {
+        size_t id_len = 0;
+        const char *id = xml_find_tag(resp.data, "UploadId", &id_len);
+        if (id && id_len > 0 && id_len < upload_id_size)
+        {
+            memcpy(upload_id_out, id, id_len);
+            upload_id_out[id_len] = '\0';
+            rc = 0;
+        }
+    }
+    free(resp.data);
+    return rc;
+}
+
+/**
+ * s3_upload_part
+ * upload one part of a multipart upload (PUT <object>?partNumber=N&uploadId=I)
+ * and capture the part ETag from the response. the part body is small enough
+ * to hash, so each part keeps end-to-end integrity via x-amz-content-sha256.
+ * @param s3 S3 connector context
+ * @param key object key
+ * @param upload_id multipart upload id
+ * @param part_number 1-based part number
+ * @param part_data part bytes
+ * @param part_len number of part bytes
+ * @param etag_out receives the part ETag
+ * @param etag_size size of the ETag buffer
+ * @return 0 on success, -1 on error
+ */
+static int s3_upload_part(s3_ctx_t *s3, const char *key, const char *upload_id, int part_number,
+                          const void *part_data, size_t part_len, char *etag_out, size_t etag_size)
+{
+    char part_sha[TDB_S3_HASH_HEX_LEN];
+    sha256_hex(part_data, part_len, part_sha);
+
+    char enc_id[TDB_S3_UPLOAD_ID_MAX * 4];
+    s3_uri_encode(upload_id, enc_id, sizeof(enc_id));
+
+    char canonical_qs[TDB_S3_UPLOAD_ID_MAX * 4 + 64];
+    snprintf(canonical_qs, sizeof(canonical_qs), "partNumber=%d&uploadId=%s", part_number, enc_id);
+
+    char full_key[TDB_S3_MAX_PATH];
+    s3_full_key(s3, key, full_key, sizeof(full_key));
+    char canonical_uri[TDB_S3_MAX_PATH + 512];
+    s3_canonical_uri(s3, full_key, canonical_uri, sizeof(canonical_uri));
+
+    struct curl_slist *headers =
+        s3_sign_raw(s3, "PUT", canonical_uri, canonical_qs, part_sha, NULL, NULL);
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+    char full_url[TDB_S3_MAX_PATH + TDB_S3_UPLOAD_ID_MAX * 4 + 64];
+    snprintf(full_url, sizeof(full_url), "%s?partNumber=%d&uploadId=%s", url, part_number, enc_id);
+
+    FILE *mem_fp = tdb_fmemopen((void *)part_data, part_len, "rb");
+    if (!mem_fp)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+
+    s3_header_ctx_t hctx = {.found = 0};
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        fclose(mem_fp);
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, full_url);
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)part_len);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_READDATA, mem_fp);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_discard);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3_capture_etag_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hctx);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    fclose(mem_fp);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || http_code != TDB_S3_HTTP_OK || !hctx.found) return -1;
+    if (strlen(hctx.etag) >= etag_size) return -1;
+    snprintf(etag_out, etag_size, "%s", hctx.etag);
+    return 0;
+}
+
+/**
+ * s3_multipart_complete
+ * issue CompleteMultipartUpload with the XML manifest of part numbers and
+ * ETags. S3 can return HTTP 200 with an <Error> body on failure, so the
+ * response payload is inspected, not only the status code.
+ * @param s3 S3 connector context
+ * @param key object key
+ * @param upload_id multipart upload id
+ * @param etags packed part ETags, TDB_S3_ETAG_MAX bytes per entry
+ * @param part_count number of parts
+ * @return 0 on success, -1 on error
+ */
+static int s3_multipart_complete(s3_ctx_t *s3, const char *key, const char *upload_id,
+                                 const char *etags, int part_count)
+{
+    size_t body_cap = (size_t)part_count * (TDB_S3_ETAG_MAX + 64) + 64;
+    char *body = malloc(body_cap);
+    if (!body) return -1;
+
+    size_t off = 0;
+    off += (size_t)snprintf(body + off, body_cap - off, "<CompleteMultipartUpload>");
+    for (int i = 0; i < part_count; i++)
+    {
+        off += (size_t)snprintf(body + off, body_cap - off,
+                                "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>", i + 1,
+                                etags + (size_t)i * TDB_S3_ETAG_MAX);
+    }
+    off += (size_t)snprintf(body + off, body_cap - off, "</CompleteMultipartUpload>");
+
+    char body_sha[TDB_S3_HASH_HEX_LEN];
+    sha256_hex(body, off, body_sha);
+
+    char enc_id[TDB_S3_UPLOAD_ID_MAX * 4];
+    s3_uri_encode(upload_id, enc_id, sizeof(enc_id));
+    char canonical_qs[TDB_S3_UPLOAD_ID_MAX * 4 + 32];
+    snprintf(canonical_qs, sizeof(canonical_qs), "uploadId=%s", enc_id);
+
+    char full_key[TDB_S3_MAX_PATH];
+    s3_full_key(s3, key, full_key, sizeof(full_key));
+    char canonical_uri[TDB_S3_MAX_PATH + 512];
+    s3_canonical_uri(s3, full_key, canonical_uri, sizeof(canonical_uri));
+
+    struct curl_slist *headers =
+        s3_sign_raw(s3, "POST", canonical_uri, canonical_qs, body_sha, NULL, NULL);
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+    char full_url[TDB_S3_MAX_PATH + TDB_S3_UPLOAD_ID_MAX * 4 + 32];
+    snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url, enc_id);
+
+    s3_response_buf_t resp = {
+        .data = malloc(TDB_S3_RESPONSE_INIT), .size = 0, .capacity = TDB_S3_RESPONSE_INIT};
+    if (!resp.data)
+    {
+        free(body);
+        curl_slist_free_all(headers);
+        return -1;
+    }
+
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        free(body);
+        free(resp.data);
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, full_url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)off);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_to_response);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body);
+
+    /* CompleteMultipartUpload can return HTTP 200 with an <Error> body, so the
+     * success result element must be present and no error element present */
+    int rc = -1;
+    if (res == CURLE_OK && http_code == TDB_S3_HTTP_OK && resp.data &&
+        strstr(resp.data, "<CompleteMultipartUploadResult") != NULL &&
+        strstr(resp.data, "<Error") == NULL)
+    {
+        rc = 0;
+    }
+    free(resp.data);
+    return rc;
+}
+
+/**
+ * s3_multipart_abort
+ * issue AbortMultipartUpload to discard the parts of a failed multipart
+ * upload so they do not linger and accrue storage cost.
+ * @param s3 S3 connector context
+ * @param key object key
+ * @param upload_id multipart upload id
+ * @return 0 on success, -1 on error
+ */
+static int s3_multipart_abort(s3_ctx_t *s3, const char *key, const char *upload_id)
+{
+    char empty_sha[TDB_S3_HASH_HEX_LEN];
+    sha256_hex("", 0, empty_sha);
+
+    char enc_id[TDB_S3_UPLOAD_ID_MAX * 4];
+    s3_uri_encode(upload_id, enc_id, sizeof(enc_id));
+    char canonical_qs[TDB_S3_UPLOAD_ID_MAX * 4 + 32];
+    snprintf(canonical_qs, sizeof(canonical_qs), "uploadId=%s", enc_id);
+
+    char full_key[TDB_S3_MAX_PATH];
+    s3_full_key(s3, key, full_key, sizeof(full_key));
+    char canonical_uri[TDB_S3_MAX_PATH + 512];
+    s3_canonical_uri(s3, full_key, canonical_uri, sizeof(canonical_uri));
+
+    struct curl_slist *headers =
+        s3_sign_raw(s3, "DELETE", canonical_uri, canonical_qs, empty_sha, NULL, NULL);
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+    char full_url[TDB_S3_MAX_PATH + TDB_S3_UPLOAD_ID_MAX * 4 + 32];
+    snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url, enc_id);
+
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, full_url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_discard);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? 0 : -1;
+}
+
+/**
+ * s3_put_single
+ * upload an object with a single streaming PUT. the body is read straight
+ * from the open file by curl's default reader, and the request is signed
+ * with x-amz-content-sha256 UNSIGNED-PAYLOAD so the connector never buffers
+ * or hashes the whole file. transit integrity is covered by TLS and by the
+ * upload pipeline's post-upload size verification.
+ * @param s3 S3 connector context
+ * @param key object key
+ * @param fp open file positioned at offset 0
+ * @param file_size size of the file in bytes
+ * @return 0 on success, -1 on error
+ */
+static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size)
+{
+    struct curl_slist *headers = s3_sign_request(s3, "PUT", key, "UNSIGNED-PAYLOAD", NULL, NULL);
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+
+    CURL *curl = s3_curl_new();
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_discard);
+    curl_easy_setopt(curl, CURLOPT_READDATA, fp);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return (res == CURLE_OK && http_code >= TDB_S3_HTTP_OK && http_code < TDB_S3_HTTP_REDIRECT)
+               ? 0
+               : -1;
+}
+
+/**
+ * s3_put_multipart
+ * upload a large object as a multipart upload -- create, stream fixed-size
+ * parts from the file, then complete. on any failure the upload is aborted
+ * so no orphaned parts remain. only one part is held in memory at a time, so
+ * memory use is bounded regardless of file size.
+ * @param s3 S3 connector context
+ * @param key object key
+ * @param fp open file positioned at offset 0
+ * @param file_size size of the file in bytes
+ * @return 0 on success, -1 on error
+ */
+static int s3_put_multipart(s3_ctx_t *s3, const char *key, FILE *fp, long file_size)
+{
+    long parts_needed =
+        (long)(((size_t)file_size + TDB_S3_MULTIPART_PART_SIZE - 1) / TDB_S3_MULTIPART_PART_SIZE);
+    if (parts_needed < 1) parts_needed = 1;
+    if (parts_needed > TDB_S3_MAX_PARTS) return -1; /* file too large for the part size */
+
+    char upload_id[TDB_S3_UPLOAD_ID_MAX];
+    if (s3_multipart_create(s3, key, upload_id, sizeof(upload_id)) != 0) return -1;
+
+    char *part_buf = malloc(TDB_S3_MULTIPART_PART_SIZE);
+    char *etags = malloc((size_t)parts_needed * TDB_S3_ETAG_MAX);
+    if (!part_buf || !etags)
+    {
+        free(part_buf);
+        free(etags);
+        s3_multipart_abort(s3, key, upload_id);
+        return -1;
+    }
+
+    int part_count = 0;
+    int failed = 0;
+    for (;;)
+    {
+        size_t got = fread(part_buf, 1, TDB_S3_MULTIPART_PART_SIZE, fp);
+        if (got == 0)
+        {
+            if (ferror(fp)) failed = 1;
+            break;
+        }
+        if (part_count >= parts_needed)
+        {
+            failed = 1; /* file grew underneath us */
+            break;
+        }
+        if (s3_upload_part(s3, key, upload_id, part_count + 1, part_buf, got,
+                           etags + (size_t)part_count * TDB_S3_ETAG_MAX, TDB_S3_ETAG_MAX) != 0)
+        {
+            failed = 1;
+            break;
+        }
+        part_count++;
+        if (got < TDB_S3_MULTIPART_PART_SIZE) break; /* short read -- last part */
+    }
+
+    int rc = -1;
+    if (!failed && part_count > 0)
+    {
+        rc = s3_multipart_complete(s3, key, upload_id, etags, part_count);
+    }
+    if (rc != 0) s3_multipart_abort(s3, key, upload_id);
+
+    free(part_buf);
+    free(etags);
+    return rc;
+}
+
+/**
+ * s3_put
+ * upload a local file to S3 as an object. files below the multipart
+ * threshold use a single streaming PUT; files at or above it use a
+ * multipart upload, so the connector never buffers a whole large file in
+ * memory and is not bound by the 5 GiB single-PUT limit.
+ * @param ctx opaque S3 connector context
+ * @param key object key (path-like)
+ * @param local_path path to the local file to upload
+ * @return 0 on success, -1 on error
+ */
+static int s3_put(void *ctx, const char *key, const char *local_path)
+{
+    s3_ctx_t *s3 = (s3_ctx_t *)ctx;
+
+    FILE *fp = fopen(local_path, "rb");
+    if (!fp) return -1;
+
+    if (fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        return -1;
+    }
+    long file_size = ftell(fp);
+    if (file_size < 0)
+    {
+        fclose(fp);
+        return -1;
+    }
+    rewind(fp);
+
+    int rc;
+    if ((size_t)file_size >= TDB_S3_MULTIPART_THRESHOLD)
+        rc = s3_put_multipart(s3, key, fp, file_size);
+    else
+        rc = s3_put_single(s3, key, fp, file_size);
+
+    fclose(fp);
+    return rc;
+}
+
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
+
 /**
  * s3_list
  * enumerate S3 objects under a key prefix using ListObjectsV2, handling pagination
@@ -835,8 +1374,19 @@ static int s3_list(void *ctx, const char *prefix,
 
         s3_response_buf_t resp = {
             .data = malloc(TDB_S3_RESPONSE_INIT), .size = 0, .capacity = TDB_S3_RESPONSE_INIT};
+        if (!resp.data)
+        {
+            curl_slist_free_all(headers);
+            return count > 0 ? count : -1;
+        }
 
-        CURL *curl = curl_easy_init();
+        CURL *curl = s3_curl_new();
+        if (!curl)
+        {
+            free(resp.data);
+            curl_slist_free_all(headers);
+            return count > 0 ? count : -1;
+        }
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_to_response);

@@ -6574,11 +6574,10 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    /* config that will trigger level additions
-     * small write_buffer_size ensures frequent auto-flushes
-     * l1 capacity -- 1000 * 2^0 = 1000 bytes
-     * l2 capacity -- 1000 * 2^1 = 2000 bytes
-     * each key+value is ~48 bytes, so ~21 keys per flush */
+    /* a tiny write buffer drives frequent flushes and compaction cycles. the
+     * geometry driven compaction path ends every cycle by running
+     * tidesdb_apply_dca, so this exercises dynamic capacity adaptation. the
+     * size ratio T=2 keeps the expected capacity arithmetic easy to follow. */
     cf_config.write_buffer_size = 1000;
     cf_config.level_size_ratio = 2;
     cf_config.dividing_level_offset = 0; /* X = num_levels - 1, pushes data to largest level */
@@ -6594,14 +6593,12 @@ static void test_dynamic_capacity_adjustment(void)
 
     printf("Initial levels: %d\n", initial_levels);
 
-    /* write enough data to fill Level 2 and trigger level addition
-     * each key+value is ~160 bytes, need 400+ bytes in L2
-     * write many keys to ensure data flows through L0->L1->L2 via compaction */
+    /* write a large dataset relative to the tiny write buffer so many flushes
+     * and compaction cycles run, giving tidesdb_apply_dca real data to adapt
+     * the level capacities against */
     int total_keys_written = 0;
 
-    printf("Writing keys to trigger level growth...\n");
-    /* write 1500 keys -- with 1000 byte threshold, this will trigger ~70+ flushes
-     * total data -- ~72KB, well over L2's 2000 byte capacity */
+    printf("Writing keys to drive flushes and compaction...\n");
     for (int i = 0; i < 2500; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -6647,12 +6644,37 @@ static void test_dynamic_capacity_adjustment(void)
 
     printf("Total keys written: %d\n", total_keys_written);
 
-    /* check final level count */
     int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-    printf("Final levels: %d (growth: %d levels)\n", final_levels, final_levels - initial_levels);
+    printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
+    ASSERT_TRUE(final_levels >= 2);
 
-    /* verify DCA worked -- auto compaction should have added levels */
-    ASSERT_TRUE(final_levels > initial_levels);
+    /*** dynamic capacity adaptation check. tidesdb_apply_dca runs at the end of
+     **  every compaction cycle and recomputes each non-largest level capacity
+     *   as C_i = N_L / T^(L-1-i), floored at the write buffer size, where N_L
+     **  is the largest level's actual byte size. once the tree has quiesced
+     *** that relationship is a pure function of the observed state, so it holds
+     **  on every platform regardless of how the compaction heuristics batched
+     *   the work. asserting this invariant -- rather than a specific level
+     **  count, which is an emergent outcome that flakes under os scheduling
+     *   differences -- is what makes the test deterministic. */
+    tidesdb_level_t *largest_level = cf->levels[final_levels - 1];
+    size_t n_l = atomic_load_explicit(&largest_level->current_size, memory_order_acquire);
+    printf("Largest level L%d size N_L=%zu bytes\n", final_levels, n_l);
+
+    for (int i = 0; i < final_levels - 1; i++)
+    {
+        size_t divisor = 1;
+        for (int p = 0; p < final_levels - 1 - i; p++) divisor *= cf_config.level_size_ratio;
+        size_t expected_capacity = n_l / divisor;
+        if (expected_capacity < cf_config.write_buffer_size)
+            expected_capacity = cf_config.write_buffer_size;
+
+        size_t actual_capacity =
+            atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
+        printf("  L%d capacity actual=%zu expected=%zu\n", i + 1, actual_capacity,
+               expected_capacity);
+        ASSERT_EQ(actual_capacity, expected_capacity);
+    }
 
     /* verify data is accessible (skip verification of keys that may still be in memtable) */
     tidesdb_txn_t *txn = NULL;

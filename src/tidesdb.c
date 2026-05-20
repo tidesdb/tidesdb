@@ -1298,6 +1298,7 @@ static int tidesdb_sstable_get_seq(tidesdb_t *db, tidesdb_sstable_t *sst, const 
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst);
 static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity);
 static void tidesdb_level_free(const tidesdb_t *db, tidesdb_level_t *level);
+static int64_t tidesdb_sstable_aux_memory_bytes(const tidesdb_sstable_t *sst);
 static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *sst);
 static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *level,
                                         tidesdb_sstable_t *sst);
@@ -1399,6 +1400,7 @@ static void tidesdb_unified_flush_barrier_finish(tidesdb_unified_flush_barrier_t
 static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm);
 static int tidesdb_unified_memtable_rotate(tidesdb_t *db);
 static void *tidesdb_compaction_worker_thread(void *arg);
+static void tidesdb_ensure_btree_node_cache(tidesdb_t *db);
 static void *tidesdb_sync_worker_thread(void *arg);
 static void *tidesdb_sstable_reaper_thread(void *arg);
 static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, size_t key_size,
@@ -1456,6 +1458,10 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
     size_t stall = (size_t)cf->config.l0_queue_stall_threshold;
     if (cf->db)
     {
+        /* unified mode has a single shared immutable queue, so the per-CF
+         * memory-budget split below does not apply -- use the configured value */
+        if (cf->db->unified_mt.enabled) return stall;
+
         const int num_cfs = cf->db->num_column_families;
         if (num_cfs > 1)
         {
@@ -8697,6 +8703,12 @@ static void tidesdb_level_free(const tidesdb_t *db, tidesdb_level_t *level)
     {
         if (ssts[i])
         {
+            /* freeing the level drops these sstables without going through
+             * tidesdb_level_remove_sstable, so decrement the aux memory total here */
+            if (db)
+                atomic_fetch_sub_explicit(&((tidesdb_t *)db)->sstable_aux_memory_bytes,
+                                          tidesdb_sstable_aux_memory_bytes(ssts[i]),
+                                          memory_order_relaxed);
             tidesdb_sstable_unref(db, ssts[i]);
         }
     }
@@ -8936,6 +8948,31 @@ static void tidesdb_defer_removed_sst_unref(tidesdb_t *db, tidesdb_level_t *leve
 }
 
 /**
+ * tidesdb_sstable_aux_memory_bytes
+ * resident bloom filter + block index memory of one sstable. bloom filters and
+ * block indexes are immutable for the sstable's lifetime, so this is stable
+ * between level add and level remove and the running total stays exact.
+ * @param sst sstable
+ * @return bloom filter + block index bytes
+ */
+static int64_t tidesdb_sstable_aux_memory_bytes(const tidesdb_sstable_t *sst)
+{
+    int64_t bytes = 0;
+    if (sst->bloom_filter)
+    {
+        bytes +=
+            (int64_t)(sst->bloom_filter->size_in_words * sizeof(uint64_t) + sizeof(bloom_filter_t));
+    }
+    if (sst->block_indexes)
+    {
+        bytes += (int64_t)((size_t)sst->block_indexes->count *
+                               (sst->block_indexes->prefix_len * 2 + sizeof(uint64_t)) +
+                           sizeof(tidesdb_block_index_t));
+    }
+    return bytes;
+}
+
+/**
  * tidesdb_level_add_sstable
  * add an sstable to a level
  * @param level level to add sstable to
@@ -9013,6 +9050,9 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
+                atomic_fetch_add_explicit(&sst->db->sstable_aux_memory_bytes,
+                                          tidesdb_sstable_aux_memory_bytes(sst),
+                                          memory_order_relaxed);
 
                 tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
                     &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
@@ -9053,6 +9093,9 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
 
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
+                                          memory_order_relaxed);
+                atomic_fetch_add_explicit(&sst->db->sstable_aux_memory_bytes,
+                                          tidesdb_sstable_aux_memory_bytes(sst),
                                           memory_order_relaxed);
 
                 tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
@@ -9159,6 +9202,8 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
             /* success! we update size */
             atomic_fetch_sub_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                       memory_order_relaxed);
+            atomic_fetch_sub_explicit(&((tidesdb_t *)db)->sstable_aux_memory_bytes,
+                                      tidesdb_sstable_aux_memory_bytes(sst), memory_order_relaxed);
 
             /* we unref old array's surviving sstables immediately (safe--new array holds refs)
              * but skip the removed sstable -- readers may still hold raw pointers from old array
@@ -17288,8 +17333,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         if (atomic_load(&db->sstable_reaper_active))
         {
-            int wait_rc =
-                pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
+            /* return value intentionally ignored -- a timeout and a spurious
+             * wakeup are handled identically by re-checking the active flag */
+            (void)pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
         }
         int should_exit = !atomic_load(&db->sstable_reaper_active);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
@@ -17347,44 +17393,16 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 size_t imm_count = queue_size(cf->immutable_memtables);
                 total_mem_bytes += (int64_t)(imm_count * cf->config.write_buffer_size);
 
-                /* bloom filters + block indexes-- scan all levels
-                 * these are never evicted by the reaper and live for the sstable lifetime */
+                /* count sstables per cf for the compaction victim heuristic. bloom
+                 * filter and block index memory is not summed here -- it is tracked
+                 * by the sstable_aux_memory_bytes running total and added once below */
                 int total_cf_ssts = 0;
                 int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
                 for (int lv = 0; lv < num_levels && lv < TDB_MAX_LEVELS; lv++)
                 {
                     tidesdb_level_t *lvl = cf->levels[lv];
                     if (!lvl) continue;
-
-                    int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
-                    total_cf_ssts += num_ssts;
-
-                    tidesdb_sstable_t **ssts =
-                        atomic_load_explicit(&lvl->sstables, memory_order_acquire);
-                    if (!ssts) continue;
-
-                    for (int j = 0; j < num_ssts; j++)
-                    {
-                        tidesdb_sstable_t *sst = ssts[j];
-                        if (!sst) continue;
-
-                        /* bloom filter memory -- bitset + struct overhead */
-                        if (sst->bloom_filter)
-                        {
-                            total_mem_bytes +=
-                                (int64_t)(sst->bloom_filter->size_in_words * sizeof(uint64_t) +
-                                          sizeof(bloom_filter_t));
-                        }
-
-                        /* block index memory -- min_prefixes + max_prefixes + positions + struct */
-                        if (sst->block_indexes)
-                        {
-                            total_mem_bytes += (int64_t)((size_t)sst->block_indexes->count *
-                                                             (sst->block_indexes->prefix_len * 2 +
-                                                              sizeof(uint64_t)) +
-                                                         sizeof(tidesdb_block_index_t));
-                        }
-                    }
+                    total_cf_ssts += atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
                 }
 
                 /* we estimate compaction temp memory for actively compacting CFs.
@@ -17434,6 +17452,11 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     pthread_rwlock_unlock(&uimm_q->read_lock);
                 }
             }
+
+            /* bloom filter + block index memory across every sstable, maintained
+             * as a running total at level add and remove */
+            total_mem_bytes +=
+                atomic_load_explicit(&db->sstable_aux_memory_bytes, memory_order_relaxed);
 
             /* we add cache memory */
             if (db->clock_cache)
@@ -17685,6 +17708,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         int candidate_count = 0;
 
+        /* the candidates array is sized from current_open sampled above. flush and
+         * compaction workers can open more sstables while we scan, so the scan
+         * can find more closeable sstables than the array holds -- cap collection
+         * at this capacity and pick up any remainder on the next reaper cycle */
+        const int candidate_capacity = use_stack ? TDB_REAPER_STACK_CANDIDATES : current_open;
+
         if (!atomic_load(&db->sstable_reaper_active))
         {
             if (!use_stack) free(candidates);
@@ -17696,7 +17725,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
          * where the scan loop may take longer due to scheduler behavior */
         int shutdown_requested = 0;
         pthread_rwlock_rdlock(&db->cf_list_lock);
-        for (int i = 0; i < db->num_column_families && !shutdown_requested; i++)
+        for (int i = 0; i < db->num_column_families && !shutdown_requested &&
+                        candidate_count < candidate_capacity;
+             i++)
         {
             tidesdb_column_family_t *cf = db->column_families[i];
             if (!cf) continue;
@@ -17709,7 +17740,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
 
             int num_levels = atomic_load(&cf->num_active_levels);
-            for (int level = 0; level < num_levels && level < TDB_MAX_LEVELS; level++)
+            for (int level = 0; level < num_levels && level < TDB_MAX_LEVELS &&
+                                candidate_count < candidate_capacity;
+                 level++)
             {
                 tidesdb_level_t *lvl = cf->levels[level];
                 if (!lvl) continue;
@@ -17737,7 +17770,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
                 }
 
-                for (int j = 0; j < num_ssts; j++)
+                for (int j = 0; j < num_ssts && candidate_count < candidate_capacity; j++)
                 {
                     tidesdb_sstable_t *sst = ssts[j];
                     if (!sst) continue;
@@ -17935,6 +17968,35 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
     return TDB_ERR_NOT_FOUND;
 }
 
+/**
+ * tidesdb_ensure_btree_node_cache
+ * lazily create the btree node cache the first time a btree column family is
+ * seen. a database with no btree column family never pays for this cache, which
+ * matters when block_cache_size is large since clock_cache_create preallocates
+ * its partition slot and hash index tables. safe to call repeatedly and from
+ * multiple threads -- the one time creation is guarded by btree_cache_lock.
+ * @param db database instance
+ */
+static void tidesdb_ensure_btree_node_cache(tidesdb_t *db)
+{
+    if (!db || db->resolved_block_cache_size == 0) return;
+    if (db->btree_node_cache) return; /* already created -- avoid the lock */
+
+    pthread_mutex_lock(&db->btree_cache_lock);
+    if (!db->btree_node_cache)
+    {
+        db->btree_node_cache = btree_create_node_cache(db->resolved_block_cache_size);
+        if (db->btree_node_cache)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "B+tree node cache created on first btree column family with "
+                          "max_bytes=%.2f MB",
+                          (double)db->resolved_block_cache_size / (1024 * 1024));
+        }
+    }
+    pthread_mutex_unlock(&db->btree_cache_lock);
+}
+
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 {
     /* we auto-initialize with system allocator if not already initialized */
@@ -18121,6 +18183,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         *db = NULL;
         return TDB_ERR_MEMORY;
     }
+
+    /* initialized before recovery -- a recovered btree column family triggers
+     * lazy creation of btree_node_cache, which takes this lock */
+    pthread_mutex_init(&(*db)->btree_cache_lock, NULL);
 
     tidesdb_comparator_entry_t *initial_comparators =
         calloc(TDB_INITIAL_COMPARATOR_CAPACITY, sizeof(tidesdb_comparator_entry_t));
@@ -18353,20 +18419,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache disabled (block_cache_size=0)");
     }
 
-    /* we create btree node cache (uses same size as block cache for now) */
-    if (effective_block_cache_size > 0)
-    {
-        (*db)->btree_node_cache = btree_create_node_cache(effective_block_cache_size);
-        if ((*db)->btree_node_cache)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "B+tree node cache created with max_bytes=%.2f MB",
-                          (double)effective_block_cache_size / (1024 * 1024));
-        }
-    }
-    else
-    {
-        (*db)->btree_node_cache = NULL;
-    }
+    /* the btree node cache is created lazily on the first btree column family
+     * (see tidesdb_ensure_btree_node_cache) -- a database with no btree column
+     * family must not preallocate it, which for a large block_cache_size is a
+     * significant amount of wasted slot and hash index memory */
+    (*db)->btree_node_cache = NULL;
+    (*db)->resolved_block_cache_size = effective_block_cache_size;
 
     /*** we initialize cached_current_time before recovery so skip lists created during
      **  recovery have a valid time pointer for TTL checks
@@ -18811,6 +18869,17 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     pthread_cond_init(&(*db)->sync_thread_cond, NULL);
 #endif
 
+    /* create the btree node cache now if any recovered column family uses btree */
+    for (int i = 0; i < (*db)->num_column_families; i++)
+    {
+        tidesdb_column_family_t *bcf = (*db)->column_families[i];
+        if (bcf && bcf->config.use_btree)
+        {
+            tidesdb_ensure_btree_node_cache(*db);
+            break;
+        }
+    }
+
     if (needs_sync_thread && !atomic_load(&(*db)->sync_thread_active))
     {
         /* we only start if not already started during recovery by tidesdb_create_column_family */
@@ -18821,8 +18890,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                           "Failed to create sync worker thread -- cannot honor sync_interval_us "
                           "durability guarantee, refusing to open");
             atomic_store(&(*db)->sync_thread_active, 0);
-            pthread_mutex_destroy(&(*db)->sync_thread_mutex);
-            pthread_cond_destroy(&(*db)->sync_thread_cond);
+            /* tidesdb_close destroys sync_thread_mutex and sync_thread_cond
+             * unconditionally -- destroying them here too would double destroy */
             tidesdb_close(*db);
             *db = NULL;
             return TDB_ERR_IO;
@@ -19252,6 +19321,7 @@ int tidesdb_close(tidesdb_t *db)
     /*** we always destroy sync mutex/cond since they're always initialized */
     pthread_mutex_destroy(&db->sync_thread_mutex);
     pthread_cond_destroy(&db->sync_thread_cond);
+    pthread_mutex_destroy(&db->btree_cache_lock);
 
     if (atomic_load(&db->sstable_reaper_active))
     {
@@ -20465,6 +20535,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);
+
+    /* a btree column family needs the btree node cache -- create it lazily here
+     * so a database that never uses btree mode does not allocate it */
+    if (config->use_btree) tidesdb_ensure_btree_node_cache(db);
 
     /** we start sync thread if this CF needs interval syncing and thread isn't running
      *  but not during recovery -- tidesdb_open will handle thread creation after recovery */
@@ -21821,8 +21895,13 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    /* we check L0 immutable queue depth */
-    const size_t l0_queue_depth = queue_size(cf->immutable_memtables);
+    /* L0 depth -- in unified mode every write lands in the shared unified
+     * memtable, so the per-CF immutable queue stays empty and the unified
+     * immutable queue is the one to watch */
+    queue_t *l0_queue = (cf->db && cf->db->unified_mt.enabled && cf->db->unified_mt.immutables)
+                            ? cf->db->unified_mt.immutables
+                            : cf->immutable_memtables;
+    const size_t l0_queue_depth = queue_size(l0_queue);
 
     /* we check L1 file count */
     int l1_file_count = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
@@ -21844,7 +21923,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         /** we wait for queue to drain below threshold
          *  flush worker is processing in background, we just need to wait */
         int wait_iterations = 0;
-        while (queue_size(cf->immutable_memtables) >= effective_stall)
+        while (queue_size(l0_queue) >= effective_stall)
         {
             usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
             wait_iterations++;
@@ -29214,19 +29293,20 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
 
     if (tidesdb_sstable_load(cf->db, sst) != TDB_SUCCESS)
     {
-        TDB_DEBUG_LOG(TDB_LOG_WARN,
-                      "CF '%s' SSTable %" PRIu64 " failed to load (corrupted), deleting files",
-                      cf->name, sst_id);
-
-        char klog_path[TDB_MAX_PATH_LEN];
-        char vlog_path[TDB_MAX_PATH_LEN];
-        snprintf(klog_path, sizeof(klog_path), "%s", sst->klog_path);
-        snprintf(vlog_path, sizeof(vlog_path), "%s", sst->vlog_path);
+        /* this sstable is referenced by the manifest, so its files are kept on
+         * disk rather than deleted -- a load failure can come from a write side
+         * bug as readily as from genuine media corruption, and deleting
+         * manifest referenced data would turn a repairable fault into permanent
+         * loss. the sstable is skipped, so its keys are absent from this open
+         * until the files are repaired, and the loud log surfaces the fault.
+         * sst is not marked_for_deletion, so the unref frees only the struct. */
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "CF '%s' SSTable %" PRIu64
+                      " at level %d is referenced by the manifest but "
+                      "failed to load -- keeping its files on disk and skipping it",
+                      cf->name, sst_id, level_num);
 
         tidesdb_sstable_unref(cf->db, sst);
-
-        (void)remove(klog_path);
-        (void)remove(vlog_path);
         return;
     }
 
@@ -29556,7 +29636,14 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             atomic_store_explicit(&cs->max_seq, global_max_seq, memory_order_release);
         }
 
-        for (uint64_t seq = 1; seq <= global_max_seq; seq++)
+        /* the commit status is a ring of cs->capacity slots, so only the last
+         * capacity sequence numbers are distinguishable -- writing every seq
+         * from 1 makes recovery scale with the database's lifetime write count
+         * instead of the ring size */
+        uint64_t status_start = 1;
+        if (global_max_seq > (uint64_t)cs->capacity)
+            status_start = global_max_seq - (uint64_t)cs->capacity + 1;
+        for (uint64_t seq = status_start; seq <= global_max_seq; seq++)
         {
             const size_t idx = seq % cs->capacity;
             atomic_store_explicit(&cs->status[idx], TDB_COMMIT_STATUS_COMMITTED,

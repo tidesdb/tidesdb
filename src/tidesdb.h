@@ -679,7 +679,12 @@ struct tidesdb_level_t
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
- * @param btree_node_cache clock cache for hot btree nodes
+ * @param btree_node_cache clock cache for hot btree nodes, created lazily on the
+ *                         first btree column family so a database with no btree
+ *                         column family does not pay for it
+ * @param btree_cache_lock guards the one time lazy creation of btree_node_cache
+ * @param resolved_block_cache_size block cache size after clamping, reused when
+ *                                  btree_node_cache is created lazily
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
@@ -695,6 +700,10 @@ struct tidesdb_level_t
  * @param total_memory total system memory in bytes
  * @param resolved_memory_limit resolved global memory limit in bytes
  * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
+ * @param sstable_aux_memory_bytes running total of bloom filter + block index
+ *                                 memory across every sstable currently in a
+ *                                 level, maintained at level add and remove so
+ *                                 the reaper does not rescan every sstable
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
@@ -743,6 +752,8 @@ struct tidesdb_t
     pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;
     clock_cache_t *btree_node_cache;
+    pthread_mutex_t btree_cache_lock;
+    size_t resolved_block_cache_size;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
@@ -758,6 +769,7 @@ struct tidesdb_t
     uint64_t total_memory;
     _Atomic(size_t) resolved_memory_limit;
     _Atomic(int64_t) cached_memtable_bytes;
+    _Atomic(int64_t) sstable_aux_memory_bytes;
     _Atomic(int64_t) txn_memory_bytes;
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;

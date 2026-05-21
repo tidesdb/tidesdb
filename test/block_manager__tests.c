@@ -593,6 +593,66 @@ void test_block_manager_seek_and_goto()
     (void)remove("test.db");
 }
 
+void test_block_manager_cursor_goto_last_before()
+{
+    block_manager_t *bm = NULL;
+    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
+
+    /* we write five blocks -- the first three model an sstable data region and
+     * the last two model trailing blocks appended after it */
+    uint64_t data_region_end = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        char data[16] = {0};
+        snprintf(data, sizeof(data), "block_%d", i);
+        block_manager_block_t *block = block_manager_block_create(sizeof(data), data);
+        ASSERT_TRUE(block != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+        (void)block_manager_block_free(block);
+
+        if (i == 2) ASSERT_EQ(block_manager_get_size(bm, &data_region_end), 0);
+    }
+
+    block_manager_cursor_t *cursor;
+    if (block_manager_cursor_init(&cursor, bm) != 0)
+    {
+        (void)block_manager_close(bm);
+        return;
+    }
+
+    /* anchored at the data-region end, we land on block 2 -- not the trailing
+     * block 4 that a whole-file goto_last would reach */
+    ASSERT_EQ(block_manager_cursor_goto_last_before(cursor, data_region_end), 0);
+    block_manager_block_t *blk = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(blk != NULL);
+    ASSERT_EQ(memcmp(blk->data, "block_2", 8), 0);
+    (void)block_manager_block_free(blk);
+
+    /* whole-file goto_last still reaches the true last block */
+    ASSERT_EQ(block_manager_cursor_goto_last(cursor), 0);
+    blk = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(blk != NULL);
+    ASSERT_EQ(memcmp(blk->data, "block_4", 8), 0);
+    (void)block_manager_block_free(blk);
+
+    /* backward iteration works after an anchored seek */
+    ASSERT_EQ(block_manager_cursor_goto_last_before(cursor, data_region_end), 0);
+    ASSERT_EQ(block_manager_cursor_prev(cursor), 0);
+    blk = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(blk != NULL);
+    ASSERT_EQ(memcmp(blk->data, "block_1", 8), 0);
+    (void)block_manager_block_free(blk);
+
+    /* an end offset at or below the header has no block to find */
+    ASSERT_TRUE(block_manager_cursor_goto_last_before(cursor, BLOCK_MANAGER_HEADER_SIZE) != 0);
+    ASSERT_TRUE(block_manager_cursor_goto_last_before(cursor, 0) != 0);
+    ASSERT_TRUE(block_manager_cursor_goto_last_before(NULL, data_region_end) != 0);
+
+    (void)block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove("test.db");
+}
+
 block_manager_t *bm = NULL;
 
 pthread_mutex_t bm_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -3457,6 +3517,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_validate_last_block, tests_passed);
     RUN_TEST(test_block_manager_get_size, tests_passed);
     RUN_TEST(test_block_manager_seek_and_goto, tests_passed);
+    RUN_TEST(test_block_manager_cursor_goto_last_before, tests_passed);
     RUN_TEST(test_block_manager_validation_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
     RUN_TEST(test_block_manager_sync_modes, tests_passed);

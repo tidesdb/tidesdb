@@ -1106,15 +1106,17 @@ static void test_checkpoint_data_integrity_after_compaction(void)
         }
     }
 
-    /* we queue compaction and wait */
+    /* we queue compaction and wait. compaction_pending_count has no TOCTOU gap
+     * (incremented before enqueue, decremented after the worker finishes),
+     * unlike is_compacting which the worker sets only once it has dequeued. */
     tidesdb_compact(cf);
-    for (int i = 0, stable = 0; i < 300 && stable < 3; i++)
+    for (int i = 0, stable = 0; i < 600 && stable < 3; i++)
     {
         usleep(50000);
+        int pending = atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
         int is_flushing = atomic_load_explicit(&cf->is_flushing, memory_order_acquire);
-        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
-            !is_compacting && !is_flushing)
+        if (queue_size(db->flush_queue) == 0 && pending == 0 && !is_compacting && !is_flushing)
         {
             stable++;
         }
@@ -2182,12 +2184,18 @@ static void wait_for_flush_queue_drain(tidesdb_t *db)
  * compaction to finish so we can assert on post-compaction state. */
 static void wait_for_compaction_idle(tidesdb_t *db, tidesdb_column_family_t *cf)
 {
-    const int max_wait = 200;
+    (void)db;
+    const int max_wait = 400;
     for (int i = 0; i < max_wait; i++)
     {
         usleep(50000);
-        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        /* compaction_pending_count is incremented before the work item is
+         * enqueued and decremented only after the worker fully finishes, so it
+         * has no TOCTOU gap -- unlike is_compacting, which the worker sets only
+         * after it has already dequeued the item (the queue can be empty while
+         * is_compacting is still 0). */
+        if (atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
+            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
         {
             usleep(100000);
             break;
@@ -2270,12 +2278,10 @@ static void test_single_delete_pair_cancel_at_compaction(void)
     tidesdb_flush_memtable(cf);
     wait_for_flush_queue_drain(db);
 
-    /* run several compaction rounds. one tidesdb_compact() is not always enough
-     * because spooky's algo 2 may keep picking L1->L1 same-level merges when L1 is
-     * over capacity from many small flushes, leaving the SDs at L1 and the original
-     * puts at L2 perpetually unable to share a merge input. each pass reshuffles
-     * level capacities so eventually the SDs reach the level that holds the puts
-     * and pair-cancel fires. */
+    /* tidesdb_compact() runs a full compaction -- it merges every level into the
+     * largest, so the single-deletes and their puts always share a merge input
+     * and pair-cancel regardless of how the flushes were distributed across
+     * levels. one call suffices; the loop just exercises repeated compactions. */
     for (int i = 0; i < 8; i++)
     {
         tidesdb_compact(cf);
@@ -2297,10 +2303,10 @@ static void test_single_delete_pair_cancel_at_compaction(void)
     }
     tidesdb_txn_free(txn);
 
-    /* pair-cancel must have reaped both sides -- total_keys is at most the
-     * count of entries that never got paired (possible if some deletes and
-     * puts ended up in different compactions), but never the full 2*num_keys
-     * that regular tidesdb_txn_delete would preserve at a non-largest level. */
+    /* pair-cancel must have reaped both sides -- a full compaction merges the
+     * single-deletes with their puts at the largest level, so total_keys drops
+     * well below the 2*num_keys that regular tidesdb_txn_delete would preserve
+     * at a non-largest level. */
     tidesdb_stats_t *stats = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
     ASSERT_TRUE(stats != NULL);
@@ -2548,25 +2554,20 @@ static void run_put_then_delete_workload(tidesdb_t *db, tidesdb_column_family_t 
     }
 }
 
-/* single-delete vs regular delete head-to-head discrimination.
+/* a full compaction reaps every entry regardless of delete subtype.
  *
  * both column families run the exact same put-then-delete workload across
  * many sstables.  the only difference is whether the delete sweep uses
- * tidesdb_txn_delete (baseline) or tidesdb_txn_single_delete.  after the
- * same compaction invocation on each:
+ * tidesdb_txn_delete (baseline) or tidesdb_txn_single_delete.  tidesdb_compact
+ * runs a full compaction -- it merges every level into the largest, where a
+ * regular tombstone and a single-delete pair are reaped alike.  so after
+ * compaction:
  *
- *   -- iterator counts on both cfs must be zero (read parity -- a tombstone
- *     masks its put regardless of subtype)
- *   -- stats->total_keys on the single-delete cf must be strictly less than
- *     on the baseline cf (pair-cancel proof -- the single-delete path
- *     reaped puts and their tombstones together, the baseline path had to
- *     carry the tombstones forward because the merge target is not the
- *     largest level)
- *
- * small write_buffer_size + periodic flushes guarantee many sstables at
- * the source level so the compaction's merge input contains both the put
- * sstables and the delete sstables for every key. */
-static void test_single_delete_vs_regular_delete_discriminates(void)
+ *   -- iterator counts on both cfs must be zero (a tombstone masks its put
+ *     regardless of subtype)
+ *   -- stats->total_keys on both cfs must be zero (the full compaction
+ *     reclaimed every put and tombstone) */
+static void test_full_compaction_reaps_both_delete_types(void)
 {
     cleanup_test_dir();
     tidesdb_t *db = create_test_db();
@@ -2632,10 +2633,9 @@ static void test_single_delete_vs_regular_delete_discriminates(void)
     }
     tidesdb_txn_free(rtxn);
 
-    /* pair-cancel discrimination -- the single-delete cf must hold strictly
-     * fewer on-disk entries than the baseline cf.  baseline carries every
-     * tombstone forward because the compaction target is not the largest
-     * level; single-delete reaps both sides of each pair. */
+    /* a full compaction merges into the largest level, where regular
+     * tombstones and single-delete pairs alike are reaped -- both cfs must
+     * hold zero on-disk entries afterwards. */
     tidesdb_stats_t *stats_baseline = NULL;
     tidesdb_stats_t *stats_sd = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf_baseline, &stats_baseline), 0);
@@ -2643,7 +2643,8 @@ static void test_single_delete_vs_regular_delete_discriminates(void)
     ASSERT_TRUE(stats_baseline != NULL);
     ASSERT_TRUE(stats_sd != NULL);
 
-    ASSERT_TRUE(stats_sd->total_keys < stats_baseline->total_keys);
+    ASSERT_EQ(stats_baseline->total_keys, 0);
+    ASSERT_EQ(stats_sd->total_keys, 0);
 
     tidesdb_free_stats(stats_baseline);
     tidesdb_free_stats(stats_sd);
@@ -6573,11 +6574,10 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    /* config that will trigger level additions
-     * small write_buffer_size ensures frequent auto-flushes
-     * l1 capacity -- 1000 * 2^0 = 1000 bytes
-     * l2 capacity -- 1000 * 2^1 = 2000 bytes
-     * each key+value is ~48 bytes, so ~21 keys per flush */
+    /* a tiny write buffer drives frequent flushes and compaction cycles. the
+     * geometry driven compaction path ends every cycle by running
+     * tidesdb_apply_dca, so this exercises dynamic capacity adaptation. the
+     * size ratio T=2 keeps the expected capacity arithmetic easy to follow. */
     cf_config.write_buffer_size = 1000;
     cf_config.level_size_ratio = 2;
     cf_config.dividing_level_offset = 0; /* X = num_levels - 1, pushes data to largest level */
@@ -6593,14 +6593,12 @@ static void test_dynamic_capacity_adjustment(void)
 
     printf("Initial levels: %d\n", initial_levels);
 
-    /* write enough data to fill Level 2 and trigger level addition
-     * each key+value is ~160 bytes, need 400+ bytes in L2
-     * write many keys to ensure data flows through L0->L1->L2 via compaction */
+    /* write a large dataset relative to the tiny write buffer so many flushes
+     * and compaction cycles run, giving tidesdb_apply_dca real data to adapt
+     * the level capacities against */
     int total_keys_written = 0;
 
-    printf("Writing keys to trigger level growth...\n");
-    /* write 1500 keys -- with 1000 byte threshold, this will trigger ~70+ flushes
-     * total data -- ~72KB, well over L2's 2000 byte capacity */
+    printf("Writing keys to drive flushes and compaction...\n");
     for (int i = 0; i < 2500; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -6620,50 +6618,63 @@ static void test_dynamic_capacity_adjustment(void)
     }
 
     printf("Wrote %d keys, waiting for background operations...\n", total_keys_written);
-    for (int i = 0; i < 100; i++)
+
+    /* flush whatever is still in the active memtable so every key is persisted */
+    tidesdb_flush_memtable(cf);
+
+    /* wait for all background flush and compaction to fully settle. level growth
+     * happens in the geometry driven auto compaction that fires as flushes
+     * accumulate, so it must run to completion before we read num_active_levels.
+     * tidesdb_compact is deliberately not called here -- it now runs a full
+     * compaction that collapses every level into the largest and never adds a
+     * level, which would cement the tree at min_levels. the stable counter
+     * absorbs the flush completing then triggering one more compaction. */
+    for (int stable = 0, i = 0; i < 600 && stable < 5; i++)
     {
         usleep(50000);
-        if (queue_size(db->flush_queue) == 0) break;
-    }
-    sleep(2);
-
-    sleep(5);
-
-    /* trigger a few compaction rounds to push data through levels */
-    for (int round = 0; round < 5; round++)
-    {
-        tidesdb_compact(cf);
-        sleep(2);
-
-        int current_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-        printf("After compaction round %d: %d levels\n", round + 1, current_levels);
-
-        if (current_levels > initial_levels)
-        {
-            printf("Level growth detected!\n");
-            break;
-        }
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
+            atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
+            !atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
+            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
+            stable++;
+        else
+            stable = 0;
     }
 
     printf("Total keys written: %d\n", total_keys_written);
 
-    /* explicitly flush memtable to ensure all keys are persisted */
-    tidesdb_flush_memtable(cf);
-    sleep(1);
-
-    /* trigger final compaction to ensure all data is merged */
-    tidesdb_compact(cf);
-    sleep(2);
-
-    /* final */
-    sleep(3);
-
-    /* check final level count after flush and compaction */
     int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-    printf("Final levels: %d (growth: %d levels)\n", final_levels, final_levels - initial_levels);
+    printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
+    ASSERT_TRUE(final_levels >= 2);
 
-    /* verify DCA worked -- should have added levels */
-    ASSERT_TRUE(final_levels > initial_levels);
+    /*** dynamic capacity adaptation check. tidesdb_apply_dca runs at the end of
+     **  every compaction cycle and recomputes each non-largest level capacity
+     *   as C_i = N_L / T^(L-1-i), floored at the write buffer size, where N_L
+     **  is the largest level's actual byte size. once the tree has quiesced
+     *** that relationship is a pure function of the observed state, so it holds
+     **  on every platform regardless of how the compaction heuristics batched
+     *   the work. asserting this invariant -- rather than a specific level
+     **  count, which is an emergent outcome that flakes under os scheduling
+     *   differences -- is what makes the test deterministic. */
+    tidesdb_level_t *largest_level = cf->levels[final_levels - 1];
+    size_t n_l = atomic_load_explicit(&largest_level->current_size, memory_order_acquire);
+    printf("Largest level L%d size N_L=%zu bytes\n", final_levels, n_l);
+
+    for (int i = 0; i < final_levels - 1; i++)
+    {
+        size_t divisor = 1;
+        for (int p = 0; p < final_levels - 1 - i; p++) divisor *= cf_config.level_size_ratio;
+        size_t expected_capacity = n_l / divisor;
+        if (expected_capacity < cf_config.write_buffer_size)
+            expected_capacity = cf_config.write_buffer_size;
+
+        size_t actual_capacity =
+            atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
+        printf("  L%d capacity actual=%zu expected=%zu\n", i + 1, actual_capacity,
+               expected_capacity);
+        ASSERT_EQ(actual_capacity, expected_capacity);
+    }
 
     /* verify data is accessible (skip verification of keys that may still be in memtable) */
     tidesdb_txn_t *txn = NULL;
@@ -13456,17 +13467,7 @@ static void test_ttl_expiration_during_compaction(void)
     tidesdb_compact(cf);
 
     /* wait for compaction to complete */
-    for (int i = 0; i < 100; i++)
-    {
-        usleep(50000);
-        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
-            !is_compacting)
-        {
-            usleep(100000);
-            break;
-        }
-    }
+    wait_for_compaction_idle(db, cf);
 
     /* verify only non-expired keys remain */
     tidesdb_txn_t *txn = NULL;
@@ -23816,6 +23817,83 @@ void test_db_stats_basic(void)
     cleanup_test_dir();
 }
 
+static void test_db_stats_unified_immutable_bytes_accurate(void)
+{
+    cleanup_test_dir();
+
+    /* a generous unified write buffer so manual flushes drive rotation, not
+     * size pressure -- the rotated immutables stay tiny */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 1024 * 1024;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucf_bytes", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ucf_bytes");
+    ASSERT_TRUE(cf != NULL);
+
+    /* each round writes a few small entries then flushes -- every flush rotates
+     * a near-empty unified memtable into the immutable queue */
+    for (int round = 0; round < 4; round++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int i = 0; i < 8; i++)
+        {
+            char key[32], val[32];
+            snprintf(key, sizeof(key), "r%d_k%02d", round, i);
+            snprintf(val, sizeof(val), "v%d_%02d", round, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+        }
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+        ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    }
+
+    /* leave a few entries in the active memtable so total bytes are non-zero */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 8; i++)
+    {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "live_k%02d", i);
+        snprintf(val, sizeof(val), "live_v%02d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* the reaper recomputes cached memory roughly every 100ms */
+    usleep(400000);
+
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+    printf("  total_memtable_bytes=%" PRIu64 " unified_immutable_count=%d\n",
+           stats.total_memtable_bytes, stats.unified_immutable_count);
+
+    /* total_memtable_bytes must reflect the immutables' actual skip list size,
+     * not write_buffer_size charged per immutable -- so it stays well below the
+     * raw queue-capacity figure the old accounting reported */
+    ASSERT_TRUE(stats.total_memtable_bytes > 0);
+    if (stats.unified_immutable_count > 0)
+    {
+        const int64_t capacity_bound =
+            (int64_t)stats.unified_immutable_count * config.unified_memtable_write_buffer_size;
+        ASSERT_TRUE(stats.total_memtable_bytes < capacity_bound);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 void test_purge_cf_basic(void)
 {
     cleanup_test_dir();
@@ -28441,7 +28519,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_single_delete_pair_cancel_at_compaction, tests_passed);
     RUN_TEST(test_single_delete_many_sources_iterate_empty, tests_passed);
     RUN_TEST(test_single_delete_iterate_no_visible_entries, tests_passed);
-    RUN_TEST(test_single_delete_vs_regular_delete_discriminates, tests_passed);
+    RUN_TEST(test_full_compaction_reaps_both_delete_types, tests_passed);
     RUN_TEST(test_concurrent_writes, tests_passed);
     RUN_TEST(test_empty_value, tests_passed);
     RUN_TEST(test_delete_nonexistent_key, tests_passed);
@@ -28678,6 +28756,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_multi_cf_create_drop_churn_under_load, tests_passed);
     RUN_TEST(test_multi_cf_mixed_isolation_cross_txn, tests_passed);
     RUN_TEST(test_db_stats_basic, tests_passed);
+    RUN_TEST(test_db_stats_unified_immutable_bytes_accurate, tests_passed);
     RUN_TEST(test_tombstone_count_after_flush, tests_passed);
     RUN_TEST(test_tombstone_count_round_trip, tests_passed);
     RUN_TEST(test_tombstone_density_trigger_fires, tests_passed);

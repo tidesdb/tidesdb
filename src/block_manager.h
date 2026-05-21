@@ -384,6 +384,18 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor);
 int block_manager_cursor_goto_last(block_manager_cursor_t *cursor);
 
 /**
+ * block_manager_cursor_goto_last_before
+ * moves the cursor to the last block whose footer ends at end_offset, using
+ * footer-based O(1) positioning. lets callers seek to the last block of a
+ * logical region (e.g. an sstable's data blocks) without walking past
+ * trailing blocks appended after that region.
+ * @param cursor the cursor to move
+ * @param end_offset byte offset immediately after the target block's footer
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, uint64_t end_offset);
+
+/**
  * block_manager_cursor_goto
  * moves the cursor to a specific block
  * @param cursor the cursor to move

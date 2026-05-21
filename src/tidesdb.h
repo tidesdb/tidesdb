@@ -190,10 +190,14 @@ typedef enum
 } tidesdb_sync_mode_t;
 
 /* default configuration values */
-#define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024)
-#define TDB_DEFAULT_LEVEL_SIZE_RATIO            10
-#define TDB_DEFAULT_MIN_LEVELS                  5
-#define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2
+#define TDB_DEFAULT_WRITE_BUFFER_SIZE (64 * 1024 * 1024)
+#define TDB_DEFAULT_LEVEL_SIZE_RATIO  10
+/* cf trees grows organically -- L = log_T(N/B). starts with one disk
+ * level and let add_level deepen it, rather than pre-allocating empty levels */
+#define TDB_DEFAULT_MIN_LEVELS 1
+/* spooky generalized Spooky sets the dividing level X to L-2; with
+ * X = num_active_levels - 1 - offset that means offset = 1 */
+#define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       1
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
 #define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES      4
@@ -467,6 +471,7 @@ typedef struct tidesdb_config_t
  * @param id unique identifier for this memtable
  * @param generation generation counter for memtable rotation
  * @param refcount reference count for safe concurrent access
+ * @param writers count of commit-path writers actively mutating the WAL and skip list
  * @param flushed flag indicating if memtable has been flushed to disk
  */
 struct tidesdb_memtable_t
@@ -476,6 +481,7 @@ struct tidesdb_memtable_t
     uint64_t id;
     uint64_t generation;
     _Atomic(int) refcount;
+    _Atomic(int) writers;
     _Atomic(int) flushed;
 };
 
@@ -496,6 +502,7 @@ struct tidesdb_memtable_t
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param flush_pending_count per-CF count of queued + in-flight flush work items
+ * @param flush_deferred flag set when a flush was skipped at the global concurrent-flush cap
  * @param compaction_pending_count per-CF count of queued + in-flight compaction work items
  * @param immutable_cleanup_counter counter for batched immutable cleanup
  * @param marked_for_deletion flag indicating column family is marked for deletion
@@ -521,6 +528,7 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) flush_pending_count;
+    _Atomic(int) flush_deferred;
     _Atomic(int) compaction_pending_count;
     _Atomic(int) immutable_cleanup_counter;
     _Atomic(int) marked_for_deletion;
@@ -675,7 +683,12 @@ struct tidesdb_level_t
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
- * @param btree_node_cache clock cache for hot btree nodes
+ * @param btree_node_cache clock cache for hot btree nodes, created lazily on the
+ *                         first btree column family so a database with no btree
+ *                         column family does not pay for it
+ * @param btree_cache_lock guards the one time lazy creation of btree_node_cache
+ * @param resolved_block_cache_size block cache size after clamping, reused when
+ *                                  btree_node_cache is created lazily
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
@@ -691,6 +704,10 @@ struct tidesdb_level_t
  * @param total_memory total system memory in bytes
  * @param resolved_memory_limit resolved global memory limit in bytes
  * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
+ * @param sstable_aux_memory_bytes running total of bloom filter + block index
+ *                                 memory across every sstable currently in a
+ *                                 level, maintained at level add and remove so
+ *                                 the reaper does not rescan every sstable
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
@@ -711,7 +728,7 @@ struct tidesdb_level_t
  * @param total_uploads lifetime count of objects uploaded to object store
  * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
  * @param replica_mode 1 if running as read-only replica, 0 if primary
- * @param replica_sync_counter reaper cycle counter for MANIFEST poll throttling
+ * @param replica_sync_thread_active 1 while the dedicated replica sync thread runs
  */
 struct tidesdb_t
 {
@@ -739,6 +756,8 @@ struct tidesdb_t
     pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;
     clock_cache_t *btree_node_cache;
+    pthread_mutex_t btree_cache_lock;
+    size_t resolved_block_cache_size;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
@@ -754,6 +773,7 @@ struct tidesdb_t
     uint64_t total_memory;
     _Atomic(size_t) resolved_memory_limit;
     _Atomic(int64_t) cached_memtable_bytes;
+    _Atomic(int64_t) sstable_aux_memory_bytes;
     _Atomic(int64_t) txn_memory_bytes;
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;
@@ -796,12 +816,11 @@ struct tidesdb_t
     _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
     _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
     uint64_t last_wal_sync_size;             /* WAL file size at last object store sync */
-    uint64_t last_wal_cleanup_gen;           /* highest WAL gen cleaned up by reaper */
 
     /* replica mode runtime state */
-    _Atomic(int) replica_mode;             /* 1 = read-only replica, 0 = primary */
-    _Atomic(int) replica_sync_counter;     /* reaper cycle counter for MANIFEST poll */
-    _Atomic(int) replica_sync_in_progress; /* 1 while reaper is running sync cycle */
+    _Atomic(int) replica_mode;               /* 1 = read-only replica, 0 = primary */
+    pthread_t replica_sync_thread;           /* dedicated replica MANIFEST/WAL sync thread */
+    _Atomic(int) replica_sync_thread_active; /* 1 while the replica sync thread runs */
 };
 
 /**

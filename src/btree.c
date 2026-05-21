@@ -481,6 +481,9 @@ typedef struct btree_level_entry_t
 struct btree_builder_t
 {
     block_manager_t *bm;
+    block_manager_t *leaf_bm; /* uncompressed leaves stage here -- a temp file
+                               * when compression is on, so the real klog never
+                               * keeps the discarded pre-compression copies */
     btree_config_t config;
 
     btree_pending_leaf_t *current_leaf;
@@ -499,6 +502,7 @@ struct btree_builder_t
     uint64_t entry_count;
     uint64_t node_count;
     uint64_t max_seq;
+    uint32_t height;
 
     uint8_t *min_key;
     size_t min_key_size;
@@ -1538,6 +1542,30 @@ int btree_builder_new(btree_builder_t **builder, block_manager_t *bm, const btre
         return -1;
     }
 
+    /* uncompressed leaves are staged before compression. with compression on,
+     * stage them in a temp file so the klog receives only the final compressed
+     * leaves -- staging them in the klog would leave the discarded uncompressed
+     * copies behind as permanent dead weight. with compression off the first
+     * write is already final, so stage straight into the klog. */
+    b->leaf_bm = bm;
+    if (b->config.compression_algo != TDB_COMPRESS_NONE)
+    {
+        char tmp_path[MAX_FILE_PATH_LENGTH];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.lstmp", bm->file_path);
+        block_manager_t *tmp_bm = NULL;
+        if (block_manager_open(&tmp_bm, tmp_path, BLOCK_MANAGER_SYNC_NONE) == 0 &&
+            block_manager_truncate(tmp_bm) == 0)
+        {
+            b->leaf_bm = tmp_bm;
+        }
+        else if (tmp_bm)
+        {
+            /* temp file unavailable -- fall back to staging in the klog so the
+             * build still succeeds (correctness over space) */
+            block_manager_close(tmp_bm);
+        }
+    }
+
     *builder = b;
     return 0;
 }
@@ -1573,7 +1601,7 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
 
     if (!block) return -1;
 
-    const int64_t offset = block_manager_block_write(builder->bm, block);
+    const int64_t offset = block_manager_block_write(builder->leaf_bm, block);
     block_manager_block_free(block);
 
     if (offset < 0) return -1;
@@ -1692,18 +1720,23 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
 {
     if (builder->num_level_entries == 0)
     {
+        builder->height = 1;
         *root_offset = -1;
         return 0;
     }
 
     if (builder->num_level_entries == 1)
     {
+        builder->height = 1; /* a single leaf is the whole tree */
         *root_offset = builder->level_entries[0].child_offset;
         return 0;
     }
 
     btree_level_entry_t *current_level = builder->level_entries;
     uint32_t current_count = builder->num_level_entries;
+
+    /* each pass of the loop builds one internal level above the leaf level */
+    uint32_t internal_levels = 0;
 
     while (current_count > 1)
     {
@@ -1823,8 +1856,10 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
 
         current_level = next_level;
         current_count = next_count;
+        internal_levels++;
     }
 
+    builder->height = 1 + internal_levels;
     *root_offset = current_level[0].child_offset;
 
     if (current_level != builder->level_entries)
@@ -1865,7 +1900,7 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         int64_t next_leaf_offset = builder->leaf_offsets[i + 1];
 
         block_manager_cursor_t cursor;
-        cursor.bm = builder->bm;
+        cursor.bm = builder->leaf_bm;
         cursor.current_pos = leaf_offset;
         cursor.block_size_valid = 0;
 
@@ -1885,14 +1920,14 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
 
         uint8_t checksum_bytes[4];
         encode_uint32_le_compat(checksum_bytes, new_checksum);
-        if (block_manager_write_at(builder->bm, leaf_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE,
+        if (block_manager_write_at(builder->leaf_bm, leaf_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE,
                                    checksum_bytes, 4) != 0)
         {
             block_manager_block_free(block);
             return -1;
         }
 
-        if (block_manager_write_at(builder->bm, leaf_offset + block_header_size + off,
+        if (block_manager_write_at(builder->leaf_bm, leaf_offset + block_header_size + off,
                                    (uint8_t *)&next_leaf_offset, sizeof(int64_t)) != 0)
         {
             block_manager_block_free(block);
@@ -1914,7 +1949,7 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         for (uint32_t i = 0; i < builder->num_leaf_offsets; i++)
         {
             block_manager_cursor_t cursor;
-            cursor.bm = builder->bm;
+            cursor.bm = builder->leaf_bm;
             cursor.current_pos = builder->leaf_offsets[i];
             cursor.block_size_valid = 0;
 
@@ -2069,7 +2104,7 @@ int btree_builder_finish(btree_builder_t *builder, btree_t **tree)
     t->entry_count = builder->entry_count;
     t->node_count = builder->node_count;
     t->max_seq = builder->max_seq;
-    t->height = 1;
+    t->height = builder->height ? builder->height : 1;
 
     if (builder->min_key)
     {
@@ -2092,6 +2127,15 @@ int btree_builder_finish(btree_builder_t *builder, btree_t **tree)
 void btree_builder_free(btree_builder_t *builder)
 {
     if (!builder) return;
+
+    /* drop the temp leaf-staging file (only created when compression is on) */
+    if (builder->leaf_bm && builder->leaf_bm != builder->bm)
+    {
+        char tmp_path[MAX_FILE_PATH_LENGTH];
+        snprintf(tmp_path, sizeof(tmp_path), "%s", builder->leaf_bm->file_path);
+        block_manager_close(builder->leaf_bm);
+        remove(tmp_path);
+    }
 
     btree_pending_leaf_free(builder->current_leaf);
 

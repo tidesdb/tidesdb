@@ -378,6 +378,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     /* we initialize atomic variable to prevent reading uninitialized memory */
     atomic_init(&new_bm->current_file_size, 0);
     atomic_init(&new_bm->preallocated_size, 0);
+    atomic_init(&new_bm->group_durable_size, 0);
+    new_bm->group_sync_active = 0;
 
     new_bm->sync_mode = sync_mode;
     new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);

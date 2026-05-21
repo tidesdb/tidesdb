@@ -562,6 +562,31 @@ typedef struct
 } tidesdb_multi_cf_txn_metadata_t;
 #pragma pack(pop)
 
+/* tidesdb_kv_arena_t
+ * bump arena for a klog block's per-entry key and value copies on the write path.
+ * allocations come from reusable chunks that are reset between blocks, so filling a
+ * block needs no per-entry malloc or free. chunks are never moved once allocated, so
+ * pointers handed out stay valid until the arena is reset or destroyed.
+ * @param chunks chunk base pointers
+ * @param sizes per-chunk capacity
+ * @param count number of allocated chunks
+ * @param cap capacity of the chunks/sizes arrays
+ * @param cur current chunk being filled
+ * @param off bump offset within the current chunk
+ */
+#define TDB_KLOG_ARENA_CHUNK       (128 * 1024) /* default chunk size */
+#define TDB_KLOG_ARENA_ALIGN       8            /* allocation alignment */
+#define TDB_KLOG_ARENA_INIT_CHUNKS 4            /* initial chunks/sizes array capacity */
+typedef struct
+{
+    uint8_t **chunks;
+    size_t *sizes;
+    int count;
+    int cap;
+    int cur;
+    size_t off;
+} tidesdb_kv_arena_t;
+
 /**
  * tidesdb_klog_block_t
  * a block in the klog containing multiple key entries
@@ -576,6 +601,7 @@ typedef struct
  * @param max_key maximum key in this block
  * @param max_key_size size of maximum key
  * @param data_ref owned reference to external data buffer (freed on block_free if non-NULL)
+ * @param kv_arena bump arena holding the per-entry key/value copies (write path only)
  */
 typedef struct
 {
@@ -590,6 +616,7 @@ typedef struct
     uint8_t *max_key;
     size_t max_key_size;
     uint8_t *data_ref;
+    tidesdb_kv_arena_t kv_arena;
 } tidesdb_klog_block_t;
 
 /**
@@ -2623,6 +2650,84 @@ static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv)
 }
 
 /**
+ * tidesdb_kv_arena_alloc
+ * bump-allocate size bytes (8-byte aligned) from the arena
+ * @param a the arena
+ * @param size number of bytes
+ * @return pointer to the allocation, NULL on out of memory
+ */
+static uint8_t *tidesdb_kv_arena_alloc(tidesdb_kv_arena_t *a, size_t size)
+{
+    const size_t need = (size + (TDB_KLOG_ARENA_ALIGN - 1)) & ~(size_t)(TDB_KLOG_ARENA_ALIGN - 1);
+
+    /* current chunk has room */
+    if (a->count > 0 && a->off + need <= a->sizes[a->cur])
+    {
+        uint8_t *p = a->chunks[a->cur] + a->off;
+        a->off += need;
+        return p;
+    }
+
+    /* reuse the next already-allocated chunk if it fits (common after a reset) */
+    if (a->cur + 1 < a->count && need <= a->sizes[a->cur + 1])
+    {
+        a->cur++;
+        a->off = need;
+        return a->chunks[a->cur];
+    }
+
+    /* grow -- append a new chunk. existing chunks are never moved so live pointers hold */
+    if (a->count == a->cap)
+    {
+        const int nc = a->cap ? a->cap * 2 : TDB_KLOG_ARENA_INIT_CHUNKS;
+        uint8_t **nch = realloc(a->chunks, (size_t)nc * sizeof(uint8_t *));
+        if (!nch) return NULL;
+        a->chunks = nch;
+        size_t *nsz = realloc(a->sizes, (size_t)nc * sizeof(size_t));
+        if (!nsz) return NULL;
+        a->sizes = nsz;
+        a->cap = nc;
+    }
+
+    const size_t csz = need > TDB_KLOG_ARENA_CHUNK ? need : TDB_KLOG_ARENA_CHUNK;
+    uint8_t *chunk = malloc(csz);
+    if (!chunk) return NULL;
+    a->chunks[a->count] = chunk;
+    a->sizes[a->count] = csz;
+    a->cur = a->count;
+    a->count++;
+    a->off = need;
+    return chunk;
+}
+
+/**
+ * tidesdb_kv_arena_reset
+ * rewinds the arena for reuse on the next block, keeping chunks allocated
+ * @param a the arena
+ */
+static void tidesdb_kv_arena_reset(tidesdb_kv_arena_t *a)
+{
+    a->cur = 0;
+    a->off = 0;
+}
+
+/**
+ * tidesdb_kv_arena_destroy
+ * frees all chunks and bookkeeping arrays
+ * @param a the arena
+ */
+static void tidesdb_kv_arena_destroy(tidesdb_kv_arena_t *a)
+{
+    for (int i = 0; i < a->count; i++) free(a->chunks[i]);
+    free(a->chunks);
+    free(a->sizes);
+    a->chunks = NULL;
+    a->sizes = NULL;
+    a->count = a->cap = a->cur = 0;
+    a->off = 0;
+}
+
+/**
  * tidesdb_klog_block_create
  * create a new klog block
  * @return new klog block
@@ -2684,18 +2789,29 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
     }
     else
     {
-        /* separate allocations thus we free each component individually */
-        for (uint32_t i = 0; i < block->num_entries; i++)
-        {
-            free(block->keys[i]);
-            free(block->inline_values[i]);
-        }
+        /* per-entry key/value copies live in the bump arena -- released in one shot */
+        tidesdb_kv_arena_destroy(&block->kv_arena);
         free(block->entries);
         free(block->keys);
         free(block->inline_values);
         free(block->max_key);
         free(block);
     }
+}
+
+/**
+ * tidesdb_klog_block_reset
+ * rewinds a klog block for reuse as the next block in a flush or merge -- clears the
+ * entry count and bump arena while keeping the arrays and chunks allocated, avoiding a
+ * free/create cycle per block
+ * @param block klog block to reset
+ */
+static void tidesdb_klog_block_reset(tidesdb_klog_block_t *block)
+{
+    if (!block) return;
+    tidesdb_kv_arena_reset(&block->kv_arena);
+    block->num_entries = 0;
+    block->block_size = 0;
 }
 
 /**
@@ -2769,13 +2885,14 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
 
     memcpy(&block->entries[block->num_entries], &kv->entry, sizeof(tidesdb_klog_entry_t));
 
-    block->keys[block->num_entries] = malloc(kv->entry.key_size);
+    block->keys[block->num_entries] = tidesdb_kv_arena_alloc(&block->kv_arena, kv->entry.key_size);
     if (!block->keys[block->num_entries]) return TDB_ERR_MEMORY;
     memcpy(block->keys[block->num_entries], kv->key, kv->entry.key_size);
 
     if (inline_value && kv->entry.value_size > 0)
     {
-        block->inline_values[block->num_entries] = malloc(kv->entry.value_size);
+        block->inline_values[block->num_entries] =
+            tidesdb_kv_arena_alloc(&block->kv_arena, kv->entry.value_size);
         if (!block->inline_values[block->num_entries]) return TDB_ERR_MEMORY;
         memcpy(block->inline_values[block->num_entries], kv->value, kv->entry.value_size);
         block->entries[block->num_entries].vlog_offset = 0;
@@ -7650,8 +7767,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_column_fam
                         goto cleanup;
                     }
 
-                    tidesdb_klog_block_free(current_klog_block);
-                    current_klog_block = tidesdb_klog_block_create();
+                    tidesdb_klog_block_reset(current_klog_block);
 
                     /* we reset sizes but keep buffers for reuse */
                     block_first_key_size = 0;
@@ -12714,8 +12830,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                         free(final_data);
                     }
 
-                    tidesdb_klog_block_free(current_klog_block);
-                    current_klog_block = tidesdb_klog_block_create();
+                    tidesdb_klog_block_reset(current_klog_block);
 
                     free(block_first_key);
                     free(block_last_key);
@@ -13399,8 +13514,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
                         free(final_data);
                     }
 
-                    tidesdb_klog_block_free(current_klog_block);
-                    current_klog_block = tidesdb_klog_block_create();
+                    tidesdb_klog_block_reset(current_klog_block);
 
                     free(block_first_key);
                     free(block_last_key);
@@ -18623,7 +18737,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         const float umt_probability = config->unified_memtable_skip_list_probability > 0.0f
                                           ? config->unified_memtable_skip_list_probability
                                           : TDB_SKIP_LIST_PROBABILITY;
-        const int umt_sync_mode = config->unified_memtable_sync_mode;
+        /* the unified WAL is opened without block-manager self-sync; durability is owned by
+         * the commit-path group fsync (FULL) or the sync worker (INTERVAL) */
+        const int umt_sync_mode = BLOCK_MANAGER_SYNC_NONE;
 
         /* we create the initial unified skip_list + WAL */
         skip_list_t *umt_sl = NULL;
@@ -18761,6 +18877,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         (*db)->unified_mt.cf_index_map_count = 0;
         (*db)->unified_mt.cf_index_map_capacity = 0;
         pthread_mutex_init(&(*db)->unified_mt.cf_index_map_lock, NULL);
+        pthread_mutex_init(&(*db)->unified_mt.wal_group_sync_lock, NULL);
+        pthread_cond_init(&(*db)->unified_mt.wal_group_sync_cond, NULL);
         /* a cold-started node (no local UNIMAP) pulls the map from the object
          * store so its cf indexes match the primary that wrote the uploaded
          * unified wal; a node with a local map keeps its own */
@@ -20161,6 +20279,8 @@ static void tidesdb_unimap_free(tidesdb_t *db)
     db->unified_mt.cf_index_map_count = 0;
     db->unified_mt.cf_index_map_capacity = 0;
     pthread_mutex_destroy(&db->unified_mt.cf_index_map_lock);
+    pthread_mutex_destroy(&db->unified_mt.wal_group_sync_lock);
+    pthread_cond_destroy(&db->unified_mt.wal_group_sync_cond);
 }
 
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
@@ -25433,6 +25553,59 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
 }
 
 /**
+ * tidesdb_unified_wal_group_sync
+ * group commit -- coalesce the fdatasync of concurrent committers on the unified WAL. one
+ * committer (the leader) fdatasyncs the WAL once, making every committer whose bytes were
+ * already written durable; the rest wait for it instead of each issuing their own fsync.
+ * durability is preserved -- a commit returns only once the WAL is fdatasync'd past its end
+ * offset. durable progress is tracked per WAL (on the block manager), so a rotation that
+ * swaps the active WAL cannot make a new-WAL committer see old-WAL durability.
+ * @param db database instance
+ * @param wal the committer's pinned unified WAL block manager
+ * @param my_end the WAL offset that must be durable before this commit returns
+ * @return 0 on success, -1 if the fdatasync failed
+ */
+static int tidesdb_unified_wal_group_sync(tidesdb_t *db, block_manager_t *wal, uint64_t my_end)
+{
+    /* fast path -- a recent leader already flushed past us */
+    if (atomic_load_explicit(&wal->group_durable_size, memory_order_acquire) >= my_end) return 0;
+
+    pthread_mutex_lock(&db->unified_mt.wal_group_sync_lock);
+    while (atomic_load_explicit(&wal->group_durable_size, memory_order_relaxed) < my_end)
+    {
+        if (wal->group_sync_active)
+        {
+            /* follower -- wait for the in-flight leader's fsync to publish */
+            pthread_cond_wait(&db->unified_mt.wal_group_sync_cond,
+                              &db->unified_mt.wal_group_sync_lock);
+            continue;
+        }
+
+        /* leader -- capture the high-water, fsync once, publish */
+        wal->group_sync_active = 1;
+        const uint64_t flush_to =
+            atomic_load_explicit(&wal->current_file_size, memory_order_acquire);
+        pthread_mutex_unlock(&db->unified_mt.wal_group_sync_lock);
+
+        const int rc = block_manager_escalate_fsync(wal);
+
+        pthread_mutex_lock(&db->unified_mt.wal_group_sync_lock);
+        if (rc == 0 &&
+            flush_to > atomic_load_explicit(&wal->group_durable_size, memory_order_relaxed))
+            atomic_store_explicit(&wal->group_durable_size, flush_to, memory_order_release);
+        wal->group_sync_active = 0;
+        pthread_cond_broadcast(&db->unified_mt.wal_group_sync_cond);
+        if (rc != 0)
+        {
+            pthread_mutex_unlock(&db->unified_mt.wal_group_sync_lock);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&db->unified_mt.wal_group_sync_lock);
+    return 0;
+}
+
+/**
  * tidesdb_unified_memtable_rotate
  * rotate the unified active memtable -- push current to immutable queue, create new active
  * caller must hold db->unified_mt.is_flushing CAS admission (set to 1)
@@ -25454,7 +25627,9 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     const float umt_probability = db->config.unified_memtable_skip_list_probability > 0.0f
                                       ? db->config.unified_memtable_skip_list_probability
                                       : TDB_SKIP_LIST_PROBABILITY;
-    const int umt_sync_mode = db->config.unified_memtable_sync_mode;
+    /* the unified WAL is opened without block-manager self-sync; durability is owned by
+     * the commit-path group fsync (FULL) or the sync worker (INTERVAL) */
+    const int umt_sync_mode = BLOCK_MANAGER_SYNC_NONE;
 
     skip_list_t *new_sl = NULL;
     if (skip_list_new_with_arena(&new_sl, umt_max_level, umt_probability,
@@ -25634,6 +25809,21 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 
         if (uwal_batch && uwal_batch != uwal_stack_buf) free(uwal_batch);
+
+        /* group-commit durability -- one fdatasync per batch of concurrent committers.
+         * runs while writers is still held so a rotation cannot swap this WAL out from under
+         * us. only when configured FULL; INTERVAL is handled by the sync worker, NONE skips. */
+        if (txn->db->config.unified_memtable_sync_mode == TDB_SYNC_FULL && umt->wal)
+        {
+            const uint64_t my_end =
+                atomic_load_explicit(&umt->wal->current_file_size, memory_order_acquire);
+            if (tidesdb_unified_wal_group_sync(txn->db, umt->wal, my_end) != 0)
+            {
+                atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
+                atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
+                return TDB_ERR_IO;
+            }
+        }
 
         /* sync-on-commit WAL upload for RPO=0 replication */
         if (txn->db->object_store && txn->db->config.object_store_config &&

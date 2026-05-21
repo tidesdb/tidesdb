@@ -487,7 +487,9 @@ typedef int (*skip_list_visibility_check_fn)(void *opaque_ctx, uint64_t seq);
  * @param ttl pointer to ttl
  * @param deleted pointer to deleted flag
  * @param seq pointer to sequence number (output)
- * @param snapshot_seq snapshot sequence number (0 = latest, >0 = read version <= snapshot_seq)
+ * @param snapshot_seq snapshot sequence number. UINT64_MAX reads the latest version with no
+ *                     snapshot filtering; any other value reads the newest version with seq <=
+ *                     snapshot_seq, so 0 matches nothing because sequence numbers start at 1
  * @param visibility_check callback to check if a sequence is committed (NULL = skip check)
  * @param visibility_ctx context for visibility check callback
  * @return 0 on success, -1 on failure
@@ -510,7 +512,8 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
  * @param ttl pointer to ttl
  * @param deleted pointer to deleted flag
  * @param seq pointer to sequence number (output)
- * @param snapshot_seq snapshot sequence number
+ * @param snapshot_seq snapshot sequence number (UINT64_MAX = latest; otherwise the newest version
+ *                     with seq <= snapshot_seq, and 0 matches nothing since seqs start at 1)
  * @param visibility_check callback to check if a sequence is committed
  * @param visibility_ctx context for visibility check callback
  * @return 0 on success, -1 on failure

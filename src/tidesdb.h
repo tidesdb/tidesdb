@@ -713,6 +713,8 @@ struct tidesdb_level_t
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
  * @param active_flushes global semaphore counter for in-flight flushes across all column
  *                       families. capped by config.max_concurrent_flushes.
+ * @param flush_heartbeat monotonic counter bumped by flush workers as they make progress;
+ *                        backpressure reads it to distinguish a slow flush from a wedged one
  * @param os_check_counter counter for periodic os-level memory checks
  * @param cf_list_lock rwlock for cf list modifications
  * @param deferred_free_list lock-free singly-linked list of deferred free nodes for retired arrays
@@ -778,6 +780,7 @@ struct tidesdb_t
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;
     _Atomic(int) active_flushes;
+    _Atomic(uint64_t) flush_heartbeat;
     int os_check_counter;
     pthread_rwlock_t cf_list_lock;
     _Atomic(tidesdb_deferred_free_node_t *) deferred_free_list;
@@ -875,6 +878,10 @@ struct tidesdb_t
  * @param isolation_level isolation level for this transaction
  * @param has_rw_conflict_in flag indicating rw-conflict-in (another txn read our writes)
  * @param has_rw_conflict_out flag indicating rw-conflict-out (we read another txn's writes)
+ * @param mem_bytes running total of this txn's op buffer + read-key arena bytes (owned by the
+ *                  committing thread, so plain non-atomic accounting)
+ * @param mem_published amount of mem_bytes already reflected in db->txn_memory_bytes; the delta
+ *                      is flushed to the global counter in threshold-sized batches
  */
 struct tidesdb_txn_t
 {
@@ -911,6 +918,8 @@ struct tidesdb_txn_t
     tidesdb_isolation_level_t isolation_level;
     int has_rw_conflict_in;
     int has_rw_conflict_out;
+    int64_t mem_bytes;
+    int64_t mem_published;
 };
 
 /**

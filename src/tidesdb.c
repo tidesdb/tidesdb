@@ -291,6 +291,10 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_TXN_READ_KEY_ARENA_SIZE 4096
 /* initial arena array capacity */
 #define TDB_TXN_READ_KEY_ARENA_INITIAL_CAPACITY 4
+/* batch transaction-memory publishes to db->txn_memory_bytes in chunks this large so the
+ * per-op write/read paths never hit the shared atomic; the global counter stays accurate to
+ * within roughly this much per large in-flight transaction */
+#define TDB_TXN_MEM_PUBLISH_THRESHOLD (256 * 1024)
 /* initial capacity for active txn list */
 #define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024
 /* hash table capacity for write set (power of 2) */
@@ -389,9 +393,11 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 
 /* backpressure timing configuration
  * */
-#define TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US  10000 /* 10ms between stall checks */
-#define TDB_BACKPRESSURE_STALL_MAX_ITERATIONS     1000  /* max 10 seconds stall */
-#define TDB_BACKPRESSURE_HIGH_DELAY_US            2000  /* 2ms for high pressure */
+#define TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US 10000 /* 10ms between stall checks */
+#define TDB_BACKPRESSURE_STALL_MAX_ITERATIONS                                                    \
+    1000 /* ~10s poll budget at STALL_CHECK_INTERVAL_US; L0 stall counts consecutive no-progress \
+            polls, memory-pressure stall counts total */
+#define TDB_BACKPRESSURE_HIGH_DELAY_US            2000 /* 2ms for high pressure */
 #define TDB_BACKPRESSURE_ELEVATED_DELAY_US        200 /* 0.2ms yield for elevated memory pressure */
 #define TDB_BACKPRESSURE_MODERATE_DELAY_US        500 /* 0.5ms for moderate pressure */
 #define TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO     0.8 /* 80% of stall threshold */
@@ -1485,6 +1491,27 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
         }
     }
     return stall;
+}
+
+/**
+ * tidesdb_txn_mem_publish
+ * reflect a transaction's accumulated op + arena memory into the database-wide
+ * txn_memory_bytes counter, but only in coarse threshold-sized batches so the
+ * per-op write/read paths never touch the shared atomic. mem_bytes is mutated
+ * only by the owning thread (a txn is single-threaded), so it needs no atomic;
+ * the global counter is updated by the net delta when it crosses the threshold.
+ * the full published amount is reconciled back at txn free/reset, so this can
+ * never drift the global counter even if a per-op delta is mis-estimated.
+ * @param txn the transaction whose memory delta to (maybe) publish
+ */
+static inline void tidesdb_txn_mem_publish(tidesdb_txn_t *txn)
+{
+    const int64_t delta = txn->mem_bytes - txn->mem_published;
+    if (delta >= TDB_TXN_MEM_PUBLISH_THRESHOLD || delta <= -TDB_TXN_MEM_PUBLISH_THRESHOLD)
+    {
+        atomic_fetch_add_explicit(&txn->db->txn_memory_bytes, delta, memory_order_relaxed);
+        txn->mem_published = txn->mem_bytes;
+    }
 }
 
 /**
@@ -6913,6 +6940,9 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_colu
 
     while (skip_list_cursor_valid(cursor))
     {
+        /* flush progress heartbeat -- lets backpressure tell a slow flush from a wedged one */
+        atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
+
         if (tidesdb_cf_abort_requested(cf))
         {
             aborted = 1;
@@ -7520,6 +7550,9 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_column_fam
 
         do
         {
+            /* flush progress heartbeat -- lets backpressure tell a slow flush from a wedged one */
+            atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
+
             if (tidesdb_cf_abort_requested(cf))
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting flush write for SSTable %" PRIu64,
@@ -16457,6 +16490,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker has received work for SSTable %" PRIu64,
                       work->sst_id);
 
+        /* flush progress heartbeat -- a picked-up work item is forward progress */
+        atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
+
         tidesdb_column_family_t *cf = work->cf;
         tidesdb_immutable_memtable_t *imm = work->imm;
 
@@ -18445,6 +18481,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_init(&(*db)->memory_pressure_level, TDB_MEMORY_PRESSURE_NORMAL);
         atomic_init(&(*db)->flush_pending_count, 0);
         atomic_init(&(*db)->active_flushes, 0);
+        atomic_init(&(*db)->flush_heartbeat, 0);
         (*db)->os_check_counter = 0;
     }
     else
@@ -22070,27 +22107,47 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                       cf->name, l0_queue_depth, effective_stall,
                       cf->config.l0_queue_stall_threshold);
 
-        /** we wait for queue to drain below threshold
-         *  flush worker is processing in background, we just need to wait */
-        int wait_iterations = 0;
+        /** flow-control wait in which we block while the flush worker drains the queue below the
+         *  threshold. we keep waiting as long as progress is happening -- either the
+         *  queue depth shrinks or the global flush heartbeat advances (a worker is
+         *  actively flushing). we only give up after TDB_BACKPRESSURE_STALL_MAX_ITERATIONS
+         *  consecutive polls with zero progress, which means the flush engine is genuinely
+         *  wedged rather than merely slow. a healthy but saturated system simply paces the
+         *  writer here instead of failing the commit. */
+        int total_iterations = 0;
+        int no_progress = 0;
+        size_t best_depth = queue_size(l0_queue);
+        uint64_t last_heartbeat =
+            atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
         while (queue_size(l0_queue) >= effective_stall)
         {
             usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
-            wait_iterations++;
+            total_iterations++;
 
-            if (wait_iterations >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
+            const size_t cur_depth = queue_size(l0_queue);
+            const uint64_t cur_heartbeat =
+                atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
+
+            if (cur_depth < best_depth || cur_heartbeat != last_heartbeat)
+            {
+                /* progress: queue is draining or a flush worker is actively working */
+                best_depth = cur_depth;
+                last_heartbeat = cur_heartbeat;
+                no_progress = 0;
+            }
+            else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "CF '%s' L0 queue stall timeout after %d iterations - "
-                              "flush worker may be stuck",
-                              cf->name, wait_iterations);
-                return TDB_ERR_IO; /* flush worker appears stuck */
+                              "CF '%s' L0 queue stall: no flush progress for %dms - "
+                              "flush engine appears wedged",
+                              cf->name,
+                              no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+                return TDB_ERR_IO; /* flush engine genuinely stuck, not merely slow */
             }
         }
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' L0 queue stall resolved after %d iterations (%dms)",
-                      cf->name, wait_iterations,
-                      wait_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' L0 queue stall resolved after %dms", cf->name,
+                      total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
         l0_delayed = 1;
     }
     /** coordinated L0/L1 backpressure
@@ -22371,6 +22428,11 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         txn->read_key_arenas[txn->read_key_arena_count++] = new_arena;
         key_ptr = new_arena;
         txn->read_key_arena_used = key_size;
+
+        /* account the newly allocated read-key arena (amortized per arena, off the per-read path)
+         */
+        txn->mem_bytes += (int64_t)arena_size;
+        tidesdb_txn_mem_publish(txn);
     }
 
     memcpy(key_ptr, key, key_size);
@@ -22722,6 +22784,10 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     op->cf = cf;
 
     txn->num_ops++;
+
+    /* account this op's coalesced key+value buffer (threshold-batched, off the hot path) */
+    txn->mem_bytes += (int64_t)(op->key_size + op->value_size);
+    tidesdb_txn_mem_publish(txn);
 
     if (txn->num_ops == TDB_TXN_WRITE_HASH_THRESHOLD && !txn->write_set_hash)
     {
@@ -23403,6 +23469,10 @@ static int tidesdb_txn_delete_internal(tidesdb_txn_t *txn, tidesdb_column_family
 
     txn->num_ops++;
 
+    /* account this op's key buffer (value_size is 0 for deletes) */
+    txn->mem_bytes += (int64_t)(op->key_size + op->value_size);
+    tidesdb_txn_mem_publish(txn);
+
     /* we create hash table when we cross threshold for O(1) lookups */
     if (txn->num_ops == TDB_TXN_WRITE_HASH_THRESHOLD && !txn->write_set_hash)
     {
@@ -23458,6 +23528,11 @@ void tidesdb_txn_free(tidesdb_txn_t *txn)
     /* defensive remove in case the caller frees without committing or rolling back.
      * leaving a freed pointer in active_txns lets compaction or SSI dereference it */
     tidesdb_txn_remove_from_active_list(txn);
+
+    /* return whatever this txn published to the global counter so it nets to baseline */
+    if (txn->db && txn->mem_published)
+        atomic_fetch_sub_explicit(&txn->db->txn_memory_bytes, txn->mem_published,
+                                  memory_order_relaxed);
 
     for (int i = 0; i < txn->num_ops; i++)
     {
@@ -23537,6 +23612,13 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
     }
     txn->read_key_arena_count = 0;
     txn->read_key_arena_used = 0;
+
+    /* return this txn's published memory to the global counter and reset the accumulator */
+    if (txn->mem_published)
+        atomic_fetch_sub_explicit(&txn->db->txn_memory_bytes, txn->mem_published,
+                                  memory_order_relaxed);
+    txn->mem_bytes = 0;
+    txn->mem_published = 0;
 
     /* we allocate read set arrays if switching to isolation that needs read tracking */
     if ((isolation == TDB_ISOLATION_REPEATABLE_READ || isolation == TDB_ISOLATION_SERIALIZABLE) &&
@@ -26013,10 +26095,14 @@ int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name)
     const int saved_num_cfs = txn->savepoint_cf_counts[savepoint_idx];
 
     /* we free ops appended after the savepoint */
+    int64_t freed_bytes = 0;
     for (int i = saved_num_ops; i < txn->num_ops; i++)
     {
+        freed_bytes += (int64_t)(txn->ops[i].key_size + txn->ops[i].value_size);
         free(txn->ops[i].key); /* coalesced buffer owns key+value */
     }
+    txn->mem_bytes -= freed_bytes;
+    tidesdb_txn_mem_publish(txn);
 
     /* we truncate back to savepoint */
     txn->num_ops = saved_num_ops;

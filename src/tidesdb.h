@@ -510,6 +510,7 @@ struct tidesdb_memtable_t
  * @param db parent database reference
  * @param imm_snaps double-buffered lock-free immutable memtable snapshot slots
  * @param imm_snap_active index (0 or 1) of the currently active snapshot slot
+ * @param imm_snap_publish_lock serializes concurrent snapshot publishers
  * @param unified_cf_index unified memtable column family index (4-byte big-endian prefix)
  */
 struct tidesdb_column_family_t
@@ -540,6 +541,11 @@ struct tidesdb_column_family_t
      * writers rebuild in inactive slot, swap active, wait for old readers */
     tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
     _Atomic(int) imm_snap_active; /* 0 or 1, index of current snapshot */
+
+    /* publishers rebuild the inactive slot then swap -- the RCU design tolerates
+     * many readers but only one writer, so concurrent publishers (flush worker
+     * cleanup vs compaction-triggered flush) must serialize on this lock */
+    pthread_mutex_t imm_snap_publish_lock;
 
     /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
     uint32_t unified_cf_index;

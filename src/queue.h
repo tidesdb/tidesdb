@@ -30,12 +30,14 @@
  * queue_node_t
  * internal node structure for the queue
  * @param data pointer to user data
- * @param next pointer to next node
+ * @param next pointer to next node, published with release and consumed with
+ *        acquire -- this is the only happens-before edge across the separate
+ *        head_lock / tail_lock, so a node's payload stays visible to consumers
  */
 typedef struct queue_node_t
 {
     void *data;
-    struct queue_node_t *next;
+    _Atomic(struct queue_node_t *) next;
 } queue_node_t;
 
 /**

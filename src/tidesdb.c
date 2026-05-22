@@ -6547,7 +6547,7 @@ static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
 }
 
 /**
- * tidesdb_imm_snap_publish
+ * tidesdb_imm_snap_publish_locked
  * rebuild the lock-free immutable snapshot from the current queue contents
  * uses double-buffered RCU, building in inactive slot, swap active index,
  * wait for old-slot readers to drain, then clear old slot
@@ -6556,9 +6556,13 @@ static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
  * the caller should already be in a context where the queue is stable
  * (e.g. after queue_enqueue returns, or after queue_dequeue returns).
  *
+ * the caller MUST hold cf->imm_snap_publish_lock -- the RCU scheme has a single
+ * inactive slot, so two concurrent publishers would rebuild the same slot's
+ * items[] array at once and produce a torn snapshot.
+ *
  * @param cf column family whose snapshot to publish
  */
-static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
+static void tidesdb_imm_snap_publish_locked(tidesdb_column_family_t *cf)
 {
     const int active = atomic_load_explicit(&cf->imm_snap_active, memory_order_acquire);
     const int next_idx = 1 - active;
@@ -6591,6 +6595,18 @@ static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
      ** NON-BLOCKING**** old slot readers drain on their own, no spin-wait here
      * this avoids the flush worker stalling on slow readers (sstable I/O) */
     atomic_store_explicit(&cf->imm_snap_active, next_idx, memory_order_release);
+}
+
+/**
+ * tidesdb_imm_snap_publish
+ * acquire the per-CF publisher lock and rebuild + swap the immutable snapshot
+ * @param cf column family whose snapshot to publish
+ */
+static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
+{
+    pthread_mutex_lock(&cf->imm_snap_publish_lock);
+    tidesdb_imm_snap_publish_locked(cf);
+    pthread_mutex_unlock(&cf->imm_snap_publish_lock);
 }
 
 /**
@@ -16733,6 +16749,7 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
         tidesdb_manifest_close(cf->manifest);
     }
 
+    pthread_mutex_destroy(&cf->imm_snap_publish_lock);
     free(cf->name);
     free(cf->directory);
     free(cf);
@@ -17353,12 +17370,17 @@ static void *tidesdb_flush_worker_thread(void *arg)
             if (cleaned > 0)
             {
                 /** we republish lock-free snapshot -- non-blocking, rebuilds without
-                 * the removed items and swaps active index immediately */
-                tidesdb_imm_snap_publish(cf);
+                 * the removed items and swaps active index immediately.
+                 * publish + drain are held under the publisher lock as one unit so a
+                 * concurrent publisher cannot flip the active slot between them and
+                 * make drain wait on the wrong slot. */
+                pthread_mutex_lock(&cf->imm_snap_publish_lock);
+                tidesdb_imm_snap_publish_locked(cf);
 
                 /** we wait for old-slot readers to drain before freeing
                  * this is the only path that needs blocking drain (items being freed) */
                 tidesdb_imm_snap_drain_previous(cf);
+                pthread_mutex_unlock(&cf->imm_snap_publish_lock);
 
                 /* now safe to free -- no reader can still be accessing these */
                 for (int fi = 0; fi < to_free_count; fi++)
@@ -17848,19 +17870,25 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 tidesdb_column_family_t *cf = db->column_families[i];
                 if (!cf) continue;
 
-                /* active memtable -- exact size via atomic load (O(1)) */
+                /* active memtable -- exact size via atomic load (O(1)).
+                 * we take a ref so the memtable cannot rotate to immutable and be
+                 * freed underneath skip_list_get_size by a flush worker */
                 tidesdb_memtable_t *mt =
                     atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-                if (mt && mt->skip_list)
+                if (tidesdb_memtable_try_ref(mt))
                 {
-                    size_t mt_size = skip_list_get_size(mt->skip_list);
-                    total_mem_bytes += (int64_t)mt_size;
-                    if (mt_size > flush_victim_size &&
-                        !atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
+                    if (mt->skip_list)
                     {
-                        flush_victim_size = mt_size;
-                        flush_victim = cf;
+                        size_t mt_size = skip_list_get_size(mt->skip_list);
+                        total_mem_bytes += (int64_t)mt_size;
+                        if (mt_size > flush_victim_size &&
+                            !atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
+                        {
+                            flush_victim_size = mt_size;
+                            flush_victim = cf;
+                        }
                     }
+                    tidesdb_immutable_memtable_unref(mt);
                 }
 
                 /* immutable queue -- conservative estimate using write_buffer_size.
@@ -20708,6 +20736,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         atomic_init(&cf->imm_snaps[s].readers, 0);
     }
     atomic_init(&cf->imm_snap_active, 0);
+    pthread_mutex_init(&cf->imm_snap_publish_lock, NULL);
 
     /*** in unified memtable mode, writes go through the unified WAL so
      **  per-CF WAL files are not needed. skip creation to avoid wasted

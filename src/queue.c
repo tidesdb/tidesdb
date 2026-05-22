@@ -47,7 +47,7 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
     if (QUEUE_LIKELY(queue->node_pool != NULL))
     {
         queue_node_t *node = queue->node_pool;
-        queue->node_pool = node->next;
+        queue->node_pool = atomic_load_explicit(&node->next, memory_order_relaxed);
         /* load+store avoids lock-prefixed instruction; mutex provides ordering */
         const size_t ps = atomic_load_explicit(&queue->pool_size, memory_order_relaxed);
         atomic_store_explicit(&queue->pool_size, ps - 1, memory_order_relaxed);
@@ -85,7 +85,7 @@ static inline void queue_free_node(queue_t *queue, queue_node_t *node)
     if (QUEUE_LIKELY(ps < queue->max_pool_size))
     {
         /* return to pool */
-        node->next = queue->node_pool;
+        atomic_store_explicit(&node->next, queue->node_pool, memory_order_relaxed);
         queue->node_pool = node;
         /* load+store avoids lock-prefixed instruction; mutex provides ordering */
         atomic_store_explicit(&queue->pool_size, ps + 1, memory_order_relaxed);
@@ -113,7 +113,7 @@ queue_t *queue_new(void)
         return NULL;
     }
     dummy->data = NULL;
-    dummy->next = NULL;
+    atomic_store_explicit(&dummy->next, NULL, memory_order_relaxed);
 
     queue->head = dummy;
     queue->tail = dummy;
@@ -184,12 +184,14 @@ int queue_enqueue(queue_t *queue, void *data)
     }
 
     node->data = data;
-    node->next = NULL;
+    atomic_store_explicit(&node->next, NULL, memory_order_relaxed);
 
     /* we only lock tail for enqueue -- the head operations are independent */
     pthread_mutex_lock(&queue->tail_lock);
 
-    queue->tail->next = node;
+    /* release publish -- node->data and node->next above must be visible to
+     * any consumer that acquire-loads this next pointer under head_lock */
+    atomic_store_explicit(&queue->tail->next, node, memory_order_release);
     queue->tail = node;
 
     /* we check if we need to signal before releasing lock */
@@ -220,7 +222,9 @@ int queue_enqueue(queue_t *queue, void *data)
 static inline void *queue_dequeue_internal(queue_t *queue)
 {
     queue_node_t *old_head = queue->head;
-    queue_node_t *new_head = old_head->next;
+    /* acquire consume -- pairs with the release publish in queue_enqueue so the
+     * dequeued node's data is visible despite head_lock != tail_lock */
+    queue_node_t *new_head = atomic_load_explicit(&old_head->next, memory_order_acquire);
 
     /* if next is NULL, queue is empty */
     if (QUEUE_UNLIKELY(new_head == NULL))
@@ -281,7 +285,7 @@ void *queue_dequeue_wait(queue_t *queue)
 
     atomic_fetch_add_explicit(&queue->waiter_count, 1, memory_order_relaxed);
 
-    while (queue->head->next == NULL &&
+    while (atomic_load_explicit(&queue->head->next, memory_order_acquire) == NULL &&
            !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
     {
         struct timespec ts;
@@ -306,7 +310,7 @@ void *queue_dequeue_wait(queue_t *queue)
 
     /* if shutdown and no data, return NULL */
     if (QUEUE_UNLIKELY(atomic_load_explicit(&queue->shutdown, memory_order_acquire) &&
-                       queue->head->next == NULL))
+                       atomic_load_explicit(&queue->head->next, memory_order_acquire) == NULL))
     {
         pthread_mutex_unlock(&queue->head_lock);
         return NULL;
@@ -322,7 +326,7 @@ void *queue_dequeue_wait(queue_t *queue)
         pthread_mutex_lock(&queue->head_lock);
 
         /** we check if data is still available */
-        if (queue->head->next != NULL)
+        if (atomic_load_explicit(&queue->head->next, memory_order_acquire) != NULL)
         {
             void *data = queue_dequeue_internal(queue);
             pthread_mutex_unlock(&queue->head_lock);
@@ -342,7 +346,7 @@ void *queue_dequeue_wait(queue_t *queue)
         /* we increment waiter count and wait for more data */
         atomic_fetch_add_explicit(&queue->waiter_count, 1, memory_order_relaxed);
 
-        while (queue->head->next == NULL &&
+        while (atomic_load_explicit(&queue->head->next, memory_order_acquire) == NULL &&
                !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
         {
             struct timespec ts;
@@ -360,7 +364,7 @@ void *queue_dequeue_wait(queue_t *queue)
 
         /* we check for shutdown after waking */
         if (atomic_load_explicit(&queue->shutdown, memory_order_acquire) &&
-            queue->head->next == NULL)
+            atomic_load_explicit(&queue->head->next, memory_order_acquire) == NULL)
         {
             pthread_mutex_unlock(&queue->head_lock);
             return NULL;
@@ -376,9 +380,10 @@ void *queue_peek(queue_t *queue)
 
     void *data = NULL;
     /* with dummy node, actual data is in head->next */
-    if (QUEUE_LIKELY(queue->head->next != NULL))
+    queue_node_t *first = atomic_load_explicit(&queue->head->next, memory_order_acquire);
+    if (QUEUE_LIKELY(first != NULL))
     {
-        data = queue->head->next->data;
+        data = first->data;
     }
 
     pthread_rwlock_unlock(&queue->read_lock);
@@ -409,17 +414,17 @@ int queue_clear(queue_t *queue)
     pthread_mutex_lock(&queue->head_lock);
     pthread_mutex_lock(&queue->tail_lock);
 
-    /* we free all nodes after the dummy */
-    queue_node_t *current = queue->head->next;
+    /* we free all nodes after the dummy -- exclusive locks held, so relaxed */
+    queue_node_t *current = atomic_load_explicit(&queue->head->next, memory_order_relaxed);
     while (current != NULL)
     {
-        queue_node_t *next = current->next;
+        queue_node_t *next = atomic_load_explicit(&current->next, memory_order_relaxed);
         queue_free_node(queue, current);
         current = next;
     }
 
     /* we reset to empty state with just the dummy */
-    queue->head->next = NULL;
+    atomic_store_explicit(&queue->head->next, NULL, memory_order_relaxed);
     queue->tail = queue->head;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
@@ -441,15 +446,17 @@ size_t queue_remove_if(queue_t *queue, int (*predicate)(void *data, void *contex
 
     size_t removed = 0;
     queue_node_t *prev = queue->head; /* dummy sentinel */
-    queue_node_t *cur = queue->head->next;
+    /* exclusive locks held (rwlock-wr + head + tail), so relaxed throughout */
+    queue_node_t *cur = atomic_load_explicit(&queue->head->next, memory_order_relaxed);
     while (cur != NULL)
     {
+        queue_node_t *cur_next = atomic_load_explicit(&cur->next, memory_order_relaxed);
         if (predicate(cur->data, context))
         {
             queue_node_t *victim = cur;
-            prev->next = cur->next;
+            atomic_store_explicit(&prev->next, cur_next, memory_order_relaxed);
             if (queue->tail == cur) queue->tail = prev;
-            cur = cur->next;
+            cur = cur_next;
 
             if (on_remove) on_remove(victim->data, context);
             queue_free_node(queue, victim);
@@ -458,7 +465,7 @@ size_t queue_remove_if(queue_t *queue, int (*predicate)(void *data, void *contex
         else
         {
             prev = cur;
-            cur = cur->next;
+            cur = cur_next;
         }
     }
 
@@ -484,16 +491,17 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
     pthread_rwlock_rdlock(&queue->read_lock);
 
     int count = 0;
-    const queue_node_t *current = queue->head->next;
+    const queue_node_t *current = atomic_load_explicit(&queue->head->next, memory_order_acquire);
     while (QUEUE_LIKELY(current != NULL))
     {
-        if (QUEUE_LIKELY(current->next != NULL))
+        queue_node_t *next = atomic_load_explicit(&current->next, memory_order_acquire);
+        if (QUEUE_LIKELY(next != NULL))
         {
-            PREFETCH_READ(current->next);
+            PREFETCH_READ(next);
         }
         fn(current->data, context);
         count++;
-        current = current->next;
+        current = next;
     }
 
     pthread_rwlock_unlock(&queue->read_lock);
@@ -513,15 +521,16 @@ void *queue_peek_at(queue_t *queue, const size_t index)
     pthread_rwlock_rdlock(&queue->read_lock);
 
     /* with dummy node, actual data starts at head->next */
-    const queue_node_t *current = queue->head->next;
+    const queue_node_t *current = atomic_load_explicit(&queue->head->next, memory_order_acquire);
     for (size_t i = 0; i < index && QUEUE_LIKELY(current != NULL); i++)
     {
+        queue_node_t *next = atomic_load_explicit(&current->next, memory_order_acquire);
         /* we prefetch next node to overlap memory latency with loop iteration */
-        if (QUEUE_LIKELY(current->next != NULL))
+        if (QUEUE_LIKELY(next != NULL))
         {
-            PREFETCH_READ(current->next);
+            PREFETCH_READ(next);
         }
-        current = current->next;
+        current = next;
     }
 
     void *data = QUEUE_LIKELY(current != NULL) ? current->data : NULL;
@@ -538,11 +547,11 @@ size_t queue_snapshot(queue_t *queue, void **out, size_t max_items)
     pthread_rwlock_rdlock(&queue->read_lock);
 
     size_t count = 0;
-    const queue_node_t *current = queue->head->next;
+    const queue_node_t *current = atomic_load_explicit(&queue->head->next, memory_order_acquire);
     while (QUEUE_LIKELY(current != NULL) && count < max_items)
     {
         out[count++] = current->data;
-        current = current->next;
+        current = atomic_load_explicit(&current->next, memory_order_acquire);
     }
 
     pthread_rwlock_unlock(&queue->read_lock);
@@ -598,7 +607,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     queue_node_t *current = queue->head;
     while (current != NULL)
     {
-        queue_node_t *next = current->next;
+        queue_node_t *next = atomic_load_explicit(&current->next, memory_order_relaxed);
         if (free_fn != NULL && current->data != NULL)
         {
             free_fn(current->data);
@@ -611,7 +620,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     current = queue->node_pool;
     while (current != NULL)
     {
-        queue_node_t *next = current->next;
+        queue_node_t *next = atomic_load_explicit(&current->next, memory_order_relaxed);
         free(current);
         current = next;
     }

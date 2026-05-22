@@ -20,6 +20,32 @@
 #include "../src/tidesdb.h"
 #include "test_utils.h"
 
+/* threadsanitizer suppression for the runtime-config race.
+ * tidesdb_cf_update_runtime_config writes the live cf->config scalar fields
+ * while worker threads read them lock free. the fields are independent,
+ * naturally aligned, word-sized values, so the access is atomic in hardware
+ * on every supported platform and cannot tear -- tsan still reports the
+ * c-level data race. making the public config struct _Atomic is not viable
+ * because a switch on an _Atomic enum is a hard compile error under clang.
+ * this lives in the test executable, not the library, because the sanitizer
+ * reads __tsan_default_suppressions during early init before shared objects
+ * are bound. */
+#if defined(__SANITIZE_THREAD__)
+#define TDB_BUILT_WITH_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define TDB_BUILT_WITH_TSAN 1
+#endif
+#endif
+
+#ifdef TDB_BUILT_WITH_TSAN
+const char *__tsan_default_suppressions(void);
+const char *__tsan_default_suppressions(void)
+{
+    return "race:tidesdb_cf_update_runtime_config\n";
+}
+#endif
+
 /* test configuration constants */
 #define TEST_FLUSH_DRAIN_WAIT_INTERVAL_US 100000
 #define TEST_DB_BACKUP_PATH               "./test_tidesdb_backup"

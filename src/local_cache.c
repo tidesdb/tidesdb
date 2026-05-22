@@ -62,7 +62,7 @@ int tdb_local_cache_init(tdb_local_cache_t *cache, const char *cache_dir, size_t
     pthread_mutex_init(&cache->lock, NULL);
     cache->lru_head = NULL;
     cache->lru_tail = NULL;
-    cache->num_entries = 0;
+    atomic_init(&cache->num_entries, 0);
     memset(cache->buckets, 0, sizeof(cache->buckets));
 
     return 0;
@@ -83,7 +83,7 @@ void tdb_local_cache_destroy(tdb_local_cache_t *cache)
     }
     cache->lru_head = NULL;
     cache->lru_tail = NULL;
-    cache->num_entries = 0;
+    atomic_store(&cache->num_entries, 0);
     atomic_store(&cache->current_bytes, 0);
     memset(cache->buckets, 0, sizeof(cache->buckets));
 
@@ -217,7 +217,7 @@ static void cache_remove_entry(tdb_local_cache_t *cache, tdb_cache_entry_t *entr
 
     *current -= entry->size;
     atomic_store_explicit(&cache->current_bytes, *current, memory_order_relaxed);
-    cache->num_entries--;
+    atomic_fetch_sub_explicit(&cache->num_entries, 1, memory_order_relaxed);
 }
 
 /**
@@ -320,7 +320,7 @@ int tdb_local_cache_track(tdb_local_cache_t *cache, const char *local_path)
     entry->hash = h;
     lru_push_head(cache, entry);
     hash_insert(cache, entry);
-    cache->num_entries++;
+    atomic_fetch_add_explicit(&cache->num_entries, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&cache->current_bytes, file_size, memory_order_relaxed);
 
     pthread_mutex_unlock(&cache->lock);

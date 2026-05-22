@@ -1458,9 +1458,11 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor)
     cursor->current_version = NULL;
     if (cursor->current == NULL || cursor->current == cursor->cached_tail) return -1;
 
-    /* we prefetch next node, its key, and its version to hide memory latency */
+    /* we prefetch next node, its key, and its version to hide memory latency.
+     * acquire (not relaxed) -- next is dereferenced below (NODE_IS_SENTINEL,
+     * ->key) so it must synchronize with the release-CAS that published it */
     skip_list_node_t *next =
-        atomic_load_explicit(&cursor->current->forward[0], memory_order_relaxed);
+        atomic_load_explicit(&cursor->current->forward[0], memory_order_acquire);
     if (next && !NODE_IS_SENTINEL(next))
     {
         PREFETCH_READ(next);
@@ -1482,9 +1484,11 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor)
     cursor->current_version = NULL;
     if (cursor->current == NULL || cursor->current == cursor->cached_header) return -1;
 
-    /* we prefetch backward neighbor and version for the current node */
+    /* we prefetch backward neighbor and version for the current node.
+     * acquire (not relaxed) -- prev is dereferenced below so it must
+     * synchronize with the release store that published it */
     skip_list_node_t *prev = atomic_load_explicit(
-        &BACKWARD_PTR(cursor->current, 0, cursor->current->level), memory_order_relaxed);
+        &BACKWARD_PTR(cursor->current, 0, cursor->current->level), memory_order_acquire);
     if (prev && !NODE_IS_SENTINEL(prev))
     {
         PREFETCH_READ(prev);
@@ -1604,9 +1608,11 @@ int skip_list_cursor_next_get(skip_list_cursor_t *cursor, uint8_t **key, size_t 
     cursor->current_version = NULL;
     if (cursor->current == NULL || cursor->current == cursor->cached_tail) return -1;
 
-    /* we prefetch next node for the next call to this function */
+    /* we prefetch next node for the next call to this function.
+     * acquire (not relaxed) -- next is dereferenced below so it must
+     * synchronize with the release-CAS that published it */
     skip_list_node_t *next =
-        atomic_load_explicit(&cursor->current->forward[0], memory_order_relaxed);
+        atomic_load_explicit(&cursor->current->forward[0], memory_order_acquire);
     if (next && !NODE_IS_SENTINEL(next))
     {
         PREFETCH_READ(next);

@@ -483,7 +483,9 @@ typedef struct tidesdb_config_t
 struct tidesdb_memtable_t
 {
     skip_list_t *skip_list;
-    block_manager_t *wal;
+    /* _Atomic -- a flush worker closes a rotated memtable's wal and clears this
+     * while the reaper and sync worker may still read it on the active one */
+    _Atomic(block_manager_t *) wal;
     uint64_t id;
     uint64_t generation;
     _Atomic(int) refcount;
@@ -621,8 +623,11 @@ struct tidesdb_sstable_t
     bloom_filter_t *bloom_filter;
     tidesdb_block_index_t *block_indexes;
     _Atomic(int) refcount;
-    block_manager_t *klog_bm;
-    block_manager_t *vlog_bm;
+    /* opened lazily by tidesdb_sstable_ensure_open and published by CAS, so the
+     * pointers are _Atomic -- readers acquire-load them and so observe the fully
+     * initialized block_manager the opener built before the publishing CAS */
+    _Atomic(block_manager_t *) klog_bm;
+    _Atomic(block_manager_t *) vlog_bm;
     tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
     _Atomic(time_t) last_access_time;
@@ -749,7 +754,9 @@ struct tidesdb_t
     char *db_path;
     tidesdb_config_t config;
     tidesdb_column_family_t **column_families;
-    int num_column_families;
+    /* _Atomic -- written under cf_list_lock on cf create/drop but read
+     * lock-free by tdb_cf_effective_stall on the backpressure hot path */
+    _Atomic(int) num_column_families;
     int cf_capacity;
     _Atomic(int) is_open;
     _Atomic(int) is_recovering;
@@ -769,7 +776,9 @@ struct tidesdb_t
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;
-    clock_cache_t *btree_node_cache;
+    /* created lazily after worker threads are running, so the pointer is
+     * _Atomic -- btree_cache_lock still serializes the one-time creation */
+    _Atomic(clock_cache_t *) btree_node_cache;
     pthread_mutex_t btree_cache_lock;
     size_t resolved_block_cache_size;
     _Atomic(int) num_open_sstables;
@@ -832,7 +841,8 @@ struct tidesdb_t
     _Atomic(uint64_t) last_uploaded_gen;     /* highest WAL gen confirmed uploaded */
     _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
     _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
-    uint64_t last_wal_sync_size;             /* WAL file size at last object store sync */
+    _Atomic(uint64_t) last_wal_sync_size;    /* WAL file size at last object store sync;
+                                              * _Atomic -- reaper writes it, open seeds it */
 
     /* replica mode runtime state */
     _Atomic(int) replica_mode;               /* 1 = read-only replica, 0 = primary */
@@ -933,11 +943,13 @@ struct tidesdb_txn_t
     char **savepoint_names;
     int num_savepoints;
     int savepoints_capacity;
-    int is_committed;
-    int is_aborted;
+    /* these flags are read cross-txn by tidesdb_txn_check_ssi_conflicts while
+     * the owning txn writes them on commit/abort, so they are _Atomic */
+    _Atomic(int) is_committed;
+    _Atomic(int) is_aborted;
     tidesdb_isolation_level_t isolation_level;
-    int has_rw_conflict_in;
-    int has_rw_conflict_out;
+    _Atomic(int) has_rw_conflict_in;
+    _Atomic(int) has_rw_conflict_out;
     int64_t mem_bytes;
     int64_t mem_published;
 };

@@ -5800,8 +5800,7 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         }
         /* CAS to set klog_bm -- if another thread already set it, close ours */
         block_manager_t *expected = NULL;
-        if (!atomic_compare_exchange_strong((atomic_uintptr_t *)&sst->klog_bm,
-                                            (uintptr_t *)&expected, (uintptr_t)new_klog_bm))
+        if (!atomic_compare_exchange_strong(&sst->klog_bm, &expected, new_klog_bm))
         {
             /* another thread already opened it,we  close our duplicate */
             block_manager_close(new_klog_bm);
@@ -5824,8 +5823,7 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
 
         /* CAS to set vlog_bm -- if another thread already set it, we close ours */
         block_manager_t *expected = NULL;
-        if (!atomic_compare_exchange_strong((atomic_uintptr_t *)&sst->vlog_bm,
-                                            (uintptr_t *)&expected, (uintptr_t)new_vlog_bm))
+        if (!atomic_compare_exchange_strong(&sst->vlog_bm, &expected, new_vlog_bm))
         {
             /* another thread already opened it, we close our duplicate */
             block_manager_close(new_vlog_bm);
@@ -18166,23 +18164,31 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             {
                 tidesdb_memtable_t *umt =
                     atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
-                if (umt && umt->wal)
+                /* we ref and reconfirm the active unified memtable -- only a
+                 * rotated immutable's wal is closed by tidesdb_unified_close_wal,
+                 * never the active one, so a confirmed-active umt is safe to read */
+                if (tidesdb_memtable_try_ref(umt))
                 {
-                    uint64_t wal_size =
-                        atomic_load_explicit(&umt->wal->current_file_size, memory_order_relaxed);
-                    if (wal_size >= db->last_wal_sync_size + threshold)
+                    if (umt == atomic_load_explicit(&db->unified_mt.active, memory_order_acquire) &&
+                        umt->wal)
                     {
-                        /* enqueue on the upload worker pool instead of uploading
-                         * inline -- a synchronous multi-MB S3 PUT here blocks the
-                         * reaper thread, stalling deferred-flush retry, memory
-                         * pressure tracking and sstable eviction. generation 0
-                         * means a plain snapshot upload -- the worker must not
-                         * fence or delete the still-active WAL. */
-                        tdb_objstore_enqueue_upload(db, umt->wal->file_path, 0);
-                        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                                      "Reaper: unified WAL sync enqueued for async upload");
-                        db->last_wal_sync_size = wal_size;
+                        uint64_t wal_size = atomic_load_explicit(&umt->wal->current_file_size,
+                                                                 memory_order_relaxed);
+                        if (wal_size >= db->last_wal_sync_size + threshold)
+                        {
+                            /* enqueue on the upload worker pool instead of uploading
+                             * inline -- a synchronous multi-MB S3 PUT here blocks the
+                             * reaper thread, stalling deferred-flush retry, memory
+                             * pressure tracking and sstable eviction. generation 0
+                             * means a plain snapshot upload -- the worker must not
+                             * fence or delete the still-active WAL. */
+                            tdb_objstore_enqueue_upload(db, umt->wal->file_path, 0);
+                            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                          "Reaper: unified WAL sync enqueued for async upload");
+                            db->last_wal_sync_size = wal_size;
+                        }
                     }
+                    tidesdb_immutable_memtable_unref(umt);
                 }
             }
         }
@@ -21482,7 +21488,9 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
             char wal_path[MAX_FILE_PATH_LENGTH];
             snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
                      cf->directory, old_wal_id);
-            block_manager_open(&active_mt->wal, wal_path, cf->config.sync_mode);
+            block_manager_t *reopened = NULL;
+            block_manager_open(&reopened, wal_path, cf->config.sync_mode);
+            atomic_store_explicit(&active_mt->wal, reopened, memory_order_release);
         }
         atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
         pthread_rwlock_unlock(&db->cf_list_lock);
@@ -21498,11 +21506,13 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                      new_directory, old_wal_id);
         if (wal_written > 0 && (size_t)wal_written < sizeof(new_wal_path))
         {
-            if (block_manager_open(&active_mt->wal, new_wal_path, cf->config.sync_mode) != 0)
+            block_manager_t *reopened = NULL;
+            if (block_manager_open(&reopened, new_wal_path, cf->config.sync_mode) != 0)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename",
                               new_wal_path);
             }
+            atomic_store_explicit(&active_mt->wal, reopened, memory_order_release);
         }
     }
 

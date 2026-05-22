@@ -10321,11 +10321,10 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_unified_memtable(
     }
 
     /*** we seek to the start of this CF's key range.
-     **  skip_list_cursor_seek positions before target, cursor_next moves to first >= target.
-     *   then advance_to_cf filters to entries matching our CF prefix. */
-    if (skip_list_cursor_seek(source->source.unified.cursor, source->source.unified.prefix,
-                              TDB_UNIFIED_CF_PREFIX_SIZE) == 0 &&
-        skip_list_cursor_next(source->source.unified.cursor) == 0)
+     **  seek_ge lands on the first key >= the CF prefix and is robust to a concurrent put
+     *   splicing a sub-target node into forward[0]; advance_to_cf then filters to our CF. */
+    if (skip_list_cursor_seek_ge(source->source.unified.cursor, source->source.unified.prefix,
+                                 TDB_UNIFIED_CF_PREFIX_SIZE) == 0)
     {
         tidesdb_unified_source_advance_to_cf(source, 1);
     }
@@ -27107,24 +27106,22 @@ static void tidesdb_iter_seek_memtable_source(tidesdb_merge_source_t *source, co
 
     if (direction > 0)
     {
-        /** forward seek -- we find first entry >= key
-         *  skip_list_cursor_seek positions at node before target, must call next */
-        if (skip_list_cursor_seek(cursor, (uint8_t *)key, key_size) == 0)
+        /** forward seek -- first entry >= key. seek_ge folds the advance in and is
+         *  robust to a concurrent put splicing a sub-target node into forward[0],
+         *  which a seek+next pair would return as a key below target */
+        if (skip_list_cursor_seek_ge(cursor, (uint8_t *)key, key_size) == 0)
         {
-            if (skip_list_cursor_next(cursor) == 0)
-            {
-                uint8_t *k, *v;
-                size_t k_size, v_size;
-                int64_t ttl;
-                uint8_t deleted;
-                uint64_t seq;
+            uint8_t *k, *v;
+            size_t k_size, v_size;
+            int64_t ttl;
+            uint8_t deleted;
+            uint64_t seq;
 
-                if (skip_list_cursor_get_with_seq(cursor, &k, &k_size, &v, &v_size, &ttl, &deleted,
-                                                  &seq) == 0)
-                {
-                    tidesdb_memtable_source_set_inline_borrowed(source, k, k_size, v, v_size, ttl,
-                                                                seq, deleted);
-                }
+            if (skip_list_cursor_get_with_seq(cursor, &k, &k_size, &v, &v_size, &ttl, &deleted,
+                                              &seq) == 0)
+            {
+                tidesdb_memtable_source_set_inline_borrowed(source, k, k_size, v, v_size, ttl, seq,
+                                                            deleted);
             }
         }
     }
@@ -28604,8 +28601,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
             {
                 tdb_build_prefixed_key(source->source.unified.cf_index, key, key_size, pk);
                 skip_list_cursor_t *cursor = source->source.unified.cursor;
-                if (skip_list_cursor_seek(cursor, pk, pk_total) == 0 &&
-                    skip_list_cursor_next(cursor) == 0)
+                if (skip_list_cursor_seek_ge(cursor, pk, pk_total) == 0)
                 {
                     tidesdb_unified_source_advance_to_cf(source, 1);
                 }

@@ -691,6 +691,20 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
 
 /**
+ * skip_list_cursor_seek_ge
+ * seeks cursor directly to the first key >= target, positioning cursor->current on it.
+ * unlike skip_list_cursor_seek (which parks on the predecessor and requires a separate
+ * skip_list_cursor_next), this folds the advance in and re-reads forward[0] so a concurrent
+ * skip_list_put that splices a node < target into the predecessor's forward[0] between the
+ * descent and the advance cannot leave the cursor on a key below target.
+ * @param cursor cursor
+ * @param key target key
+ * @param key_size size of target key
+ * @return 0 if positioned on a key >= target, -1 if no such key exists (cursor at end)
+ */
+int skip_list_cursor_seek_ge(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
+
+/**
  * skip_list_cursor_seek_for_prev
  * seeks cursor to last key <= target
  * @param cursor cursor

@@ -56,7 +56,7 @@ typedef struct tdb_cache_entry
  * @param lock mutex protecting the LRU list and hash table
  * @param lru_head pointer to the most recently used entry
  * @param lru_tail pointer to the least recently used entry (eviction candidate)
- * @param num_entries number of entries currently in the cache
+ * @param num_entries atomic counter of entries currently in the cache
  * @param buckets hash table buckets for O(1) path lookups
  */
 typedef struct
@@ -67,7 +67,7 @@ typedef struct
     pthread_mutex_t lock;
     tdb_cache_entry_t *lru_head;
     tdb_cache_entry_t *lru_tail;
-    int num_entries;
+    _Atomic(int) num_entries;
     tdb_cache_entry_t *buckets[TDB_LOCAL_CACHE_HASH_BUCKETS];
 } tdb_local_cache_t;
 

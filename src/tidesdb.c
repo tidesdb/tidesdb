@@ -37,7 +37,7 @@
 #endif
 
 /* global log level definition */
-int _tidesdb_log_level = TDB_LOG_DEBUG;
+_Atomic(int) _tidesdb_log_level = TDB_LOG_DEBUG;
 
 /* global log file pointer (NULL = stderr, non-NULL = file) */
 FILE *_tidesdb_log_file = NULL;
@@ -12147,13 +12147,26 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     size_t new_capacity = tidesdb_calculate_level_capacity(
         old_num_levels + 1, cf->config.write_buffer_size, cf->config.level_size_ratio);
 
-    /* we create new largest level at next slot */
-    tidesdb_level_t *new_level = tidesdb_level_create(old_num_levels + 1, new_capacity);
-    if (!new_level)
+    /* a previously removed level may be parked in this slot. reusing it keeps
+     * the level struct from ever being freed mid-life, so lock-free readers
+     * iterating cf->levels cannot dereference freed memory. a parked level is
+     * always empty (remove only parks empty levels) so only capacity needs
+     * resetting; otherwise we create a fresh level at the next slot. */
+    tidesdb_level_t *new_level = cf->levels[old_num_levels];
+    if (new_level)
     {
-        return TDB_ERR_MEMORY;
+        atomic_store_explicit(&new_level->capacity, new_capacity, memory_order_release);
+        atomic_store_explicit(&new_level->current_size, 0, memory_order_release);
     }
-    cf->levels[old_num_levels] = new_level;
+    else
+    {
+        new_level = tidesdb_level_create(old_num_levels + 1, new_capacity);
+        if (!new_level)
+        {
+            return TDB_ERR_MEMORY;
+        }
+        cf->levels[old_num_levels] = new_level;
+    }
 
     /* new level is empty -- data will flow down naturally through compaction.
      * old largest level keeps its ssts.
@@ -12240,12 +12253,12 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
                       new_largest->level_num, new_largest_capacity);
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing removed level %d (num_sstables=%d, current_size=%zu)",
-                  largest->level_num,
-                  atomic_load_explicit(&largest->num_sstables, memory_order_acquire),
-                  atomic_load_explicit(&largest->current_size, memory_order_relaxed));
-    tidesdb_level_free(cf->db, largest);
-    cf->levels[old_num_levels - 1] = NULL;
+    /* we do not free the removed level. lock-free readers iterate cf->levels up
+     * to a possibly stale num_active_levels, so freeing the struct here would be
+     * a use after free. instead the empty level stays parked in its slot and
+     * tidesdb_add_level reuses it, which bounds level structs to TDB_MAX_LEVELS
+     * per cf; tidesdb_column_family_free frees them all at close. */
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Parking removed empty level %d for reuse", largest->level_num);
 
     /* we update num_active_levels to reflect removed level
      * release ordering ensures the level removal is visible to other threads */
@@ -17638,9 +17651,17 @@ static void *tidesdb_sync_worker_thread(void *arg)
             if (cf && cf->config.sync_mode == TDB_SYNC_INTERVAL && cf->config.sync_interval_us > 0)
             {
                 tidesdb_memtable_t *mt = atomic_load(&cf->active_memtable);
-                if (mt && mt->wal)
+                /* we take a ref and re-confirm mt is still the active memtable.
+                 * only immutable wals are closed by flush workers, never an
+                 * active one, so a confirmed-active mt is safe to fsync. if it
+                 * rotated, the rotation path already escalated the old wal. */
+                if (tidesdb_memtable_try_ref(mt))
                 {
-                    block_manager_escalate_fsync(mt->wal);
+                    if (mt == atomic_load(&cf->active_memtable) && mt->wal)
+                    {
+                        block_manager_escalate_fsync(mt->wal);
+                    }
+                    tidesdb_immutable_memtable_unref(mt);
                 }
             }
         }
@@ -17652,9 +17673,13 @@ static void *tidesdb_sync_worker_thread(void *arg)
         if (db->unified_mt.enabled && db->config.unified_memtable_sync_mode == TDB_SYNC_INTERVAL)
         {
             tidesdb_memtable_t *umt = atomic_load(&db->unified_mt.active);
-            if (umt && umt->wal)
+            if (tidesdb_memtable_try_ref(umt))
             {
-                block_manager_escalate_fsync(umt->wal);
+                if (umt == atomic_load(&db->unified_mt.active) && umt->wal)
+                {
+                    block_manager_escalate_fsync(umt->wal);
+                }
+                tidesdb_immutable_memtable_unref(umt);
             }
         }
 
@@ -18538,11 +18563,15 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     _tidesdb_log_level = config->log_level;
 
-    /* we initialize log file to NULL (stderr) by default */
+    /* we initialize log file to NULL (stderr) by default. the log file globals
+     * are read by tidesdb_log_write under tidesdb_log_mutex, so writes here take
+     * the same lock to stay consistent when another db instance is logging. */
     (*db)->log_file = NULL;
+    pthread_mutex_lock(&tidesdb_log_mutex);
     _tidesdb_log_file = NULL;
     _tidesdb_log_truncate = 0;
     _tidesdb_log_path[0] = '\0';
+    pthread_mutex_unlock(&tidesdb_log_mutex);
 
     if (mkdir((*db)->db_path, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
     {
@@ -18563,16 +18592,19 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         (*db)->log_file = fopen(log_path, "a");
         if ((*db)->log_file)
         {
-            _tidesdb_log_file = (*db)->log_file;
             /* we must set line buffering for better real-time logging */
             tdb_setlinebuf((*db)->log_file);
 
-            /* we set up log truncation if configured */
+            /* we publish the log file globals under tidesdb_log_mutex so a
+             * concurrent logger never reads a half-updated file/path pair */
+            pthread_mutex_lock(&tidesdb_log_mutex);
+            _tidesdb_log_file = (*db)->log_file;
             _tidesdb_log_truncate = config->log_truncation_at;
             if (_tidesdb_log_truncate > 0)
             {
                 snprintf(_tidesdb_log_path, sizeof(_tidesdb_log_path), "%s", log_path);
             }
+            pthread_mutex_unlock(&tidesdb_log_mutex);
         }
         else
         {

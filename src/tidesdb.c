@@ -465,7 +465,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BLOCK_INDEX_PREFIX_MAX 256
 #define TDB_BLOCK_INDEX_MAX_COUNT  1000000
 
-/* empty block index placeholder: 4 byte LE count (0) followed by 1 byte prefix_len */
+/* empty block index placeholder ( 4 byte LE count (0) followed by 1 byte prefix_len ) */
 #define TDB_EMPTY_BLOCK_INDEX_SIZE 5
 
 /* merge and serialization configuration */
@@ -1788,7 +1788,7 @@ static int tidesdb_cache_raw_block_put(tidesdb_t *db, const char *cf_name,
  * tidesdb_cache_raw_block_get_pinned
  * zero-copy cache access -- returns a direct pointer into the cache entry's payload
  * without malloc or memcpy.  the cache entry is pinned (reader ref held) so it
- * cannot be evicted while the caller uses the data.  caller MUST call
+ * cannot be evicted while the caller uses the data.  caller must call
  * clock_cache_release(*pin_out) when done with the returned pointer.
  * @param db the database
  * @param cf_name column family name
@@ -6567,7 +6567,7 @@ static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
  * the caller should already be in a context where the queue is stable
  * (e.g. after queue_enqueue returns, or after queue_dequeue returns).
  *
- * the caller MUST hold cf->imm_snap_publish_lock -- the RCU scheme has a single
+ * the caller must hold cf->imm_snap_publish_lock -- the RCU scheme has a single
  * inactive slot, so two concurrent publishers would rebuild the same slot's
  * items[] array at once and produce a torn snapshot.
  *
@@ -21293,6 +21293,29 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
         }
     }
 
+    /* we drain in-flight commit-path writers before tearing the cf down -- a
+     * committer that bumped the active memtable's writers before
+     * marked_for_deletion became visible is still writing through the memtable
+     * and its WAL, both of which tidesdb_column_family_free is about to release.
+     * the seq_cst fence pairs with the one in the commit path between its
+     * writers bump and its marked_for_deletion check */
+    tidesdb_memtable_t *drop_active_mt = atomic_load(&cf_to_drop->active_memtable);
+    if (drop_active_mt)
+    {
+        atomic_thread_fence(memory_order_seq_cst);
+        wait_count = 0;
+        while (atomic_load_explicit(&drop_active_mt->writers, memory_order_acquire) > 0)
+        {
+            usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+            if (++wait_count % 100 == 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' drop waiting for in-flight WAL writers to drain",
+                              cf_to_drop->name);
+            }
+        }
+    }
+
     /* we invalidate all block cache entries for this column family before freeing */
     tidesdb_invalidate_block_cache_for_cf(db, cf_to_drop->name);
 
@@ -21477,14 +21500,32 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         return TDB_ERR_EXISTS;
     }
 
-    /*** we close the active memtable's WAL. this is safe because the flush above rotated
-     **  the memtable and we drained all in-flight operations, so no thread can
-     *   be writing to this WAL. */
+    /*** we close the active memtable's WAL. a concurrent tidesdb_txn_commit can
+     **  still be writing through this WAL handle, so we drain in-flight writers
+     **  first. marked_for_deletion is already set, so the commit path refuses to
+     **  bump writers on this cf and a committer that bumped writers before the
+     *   flag became visible decrements it and bails on its way out. */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     block_manager_t *old_wal = NULL;
     uint64_t old_wal_id = 0;
     if (active_mt && active_mt->wal)
     {
+        /* the seq_cst fence pairs with the one the commit path runs between its
+         * writers bump and its marked_for_deletion check, so a writer we do not
+         * observe here is guaranteed to observe the flag and back off */
+        atomic_thread_fence(memory_order_seq_cst);
+        int wal_drain_iters = 0;
+        while (atomic_load_explicit(&active_mt->writers, memory_order_acquire) > 0)
+        {
+            usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+            if (++wal_drain_iters % 100 == 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' rename waiting for in-flight WAL writers to drain",
+                              cf->name);
+            }
+        }
+
         old_wal = active_mt->wal;
         old_wal_id = active_mt->id;
         block_manager_close(old_wal);
@@ -22596,7 +22637,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 
             if (cur_depth < best_depth || cur_heartbeat != last_heartbeat)
             {
-                /* progress: queue is draining or a flush worker is actively working */
+                /* queue prog is draining or a flush worker is actively working */
                 best_depth = cur_depth;
                 last_heartbeat = cur_heartbeat;
                 no_progress = 0;
@@ -26339,6 +26380,19 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 atomic_fetch_add_explicit(&mt->writers, 1, memory_order_acq_rel);
                 atomic_thread_fence(memory_order_seq_cst);
+                /* a rename or drop that set marked_for_deletion drains writers
+                 * before closing this cf's WAL. the seq_cst fence above pairs
+                 * with the one the ddl runs before its drain, so if we miss the
+                 * flag the ddl is guaranteed to see our writers bump and wait.
+                 * backing off here keeps the drain bounded and stops us writing
+                 * through a WAL handle the ddl is about to close */
+                if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+                {
+                    atomic_fetch_sub_explicit(&mt->writers, 1, memory_order_release);
+                    atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
+                    result = TDB_ERR_NOT_FOUND;
+                    goto cleanup;
+                }
                 if (mt == atomic_load_explicit(&cf->active_memtable, memory_order_acquire)) break;
                 atomic_fetch_sub_explicit(&mt->writers, 1, memory_order_release);
                 atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
@@ -28841,7 +28895,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
      ****  iter->current. a source whose current_kv is already >= target is then still the
      ***   correct "first entry >= target" answer, since no source has an entry in
      **    (last_result, current_kv) and a strictly-greater target keeps [target, current_kv)
-     *     inside that gap. the comparison MUST be strict: iter_next pops iter->current and
+     *     inside that gap. the comparison must be strict-- iter_next pops iter->current and
      *     advances its sources one entry past it, so a re-seek to exactly iter->current has
      *     to fall through and re-seek -- iter->current itself sits behind those cursors and
      *     a >= test would skip it, returning the following key. */
@@ -28985,7 +29039,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
     /** a strictly-backward seek (new target < last result) lets sources with
-     *  current_kv <= target keep their position. the comparison MUST be strict:
+     *  current_kv <= target keep their position. the comparison must be strict,
      *  iter_prev pops iter->current and advances its sources one entry past it,
      *  so a re-seek to exactly iter->current has to fall through and re-seek --
      *  a <= test would skip it and return the preceding key. */
@@ -30988,54 +31042,52 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
         int num_sstables = atomic_load_explicit(&cf->levels[i]->num_sstables, memory_order_acquire);
         (*stats)->level_num_sstables[i] = num_sstables;
 
-        /* we count keys per level from sstables */
+        /* we count keys per level from sstables. we hold array_readers across
+         * the walk so a concurrent compaction cannot retire and free the
+         * sstables array, or unref a removed sstable, while we read per-sstable
+         * fields. the array is calloc(capacity + 1) and NULL terminated, so the
+         * NULL-bounded loop cannot run off the end */
         uint64_t level_keys = 0;
         uint64_t level_tombstones = 0;
-        tidesdb_sstable_t **sstables =
-            atomic_load_explicit(&cf->levels[i]->sstables, memory_order_acquire);
-        for (int j = 0; j < num_sstables; j++)
+        tidesdb_level_t *lvl = cf->levels[i];
+        atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+        for (int j = 0; sstables[j] != NULL; j++)
         {
             tidesdb_sstable_t *sst = sstables[j];
+            level_keys += sst->num_entries;
+            total_data_size += sst->klog_size + sst->vlog_size;
+            total_klog_size += sst->klog_size;
 
-            /* we ref the sstable so a concurrent compaction worker cannot free it
-             * out from under the field reads below */
-            if (sst && tidesdb_sstable_try_ref(sst))
+            /* we aggregate btree stats if this sstable uses btree */
+            if (sst->use_btree && sst->btree_root_offset >= 0)
             {
-                level_keys += sst->num_entries;
-                total_data_size += sst->klog_size + sst->vlog_size;
-                total_klog_size += sst->klog_size;
-
-                /* we aggregate btree stats if this sstable uses btree */
-                if (sst->use_btree && sst->btree_root_offset >= 0)
+                btree_sstable_count++;
+                btree_total_nodes += sst->btree_node_count;
+                btree_height_sum += sst->btree_height;
+                if (sst->btree_height > btree_max_height)
                 {
-                    btree_sstable_count++;
-                    btree_total_nodes += sst->btree_node_count;
-                    btree_height_sum += sst->btree_height;
-                    if (sst->btree_height > btree_max_height)
+                    btree_max_height = sst->btree_height;
+                }
+            }
+
+            /** sstables with unknown tombstone counts (legacy footers) contribute
+             *  nothing to the totals or the max-density witness */
+            if (sst->tombstone_count != TDB_TOMBSTONE_COUNT_UNKNOWN)
+            {
+                level_tombstones += sst->tombstone_count;
+                if (sst->num_entries > 0)
+                {
+                    const double d = (double)sst->tombstone_count / (double)sst->num_entries;
+                    if (d > max_density)
                     {
-                        btree_max_height = sst->btree_height;
+                        max_density = d;
+                        max_density_level = i + 1;
                     }
                 }
-
-                /** sstables with unknown tombstone counts (legacy footers) contribute
-                 *  nothing to the totals or the max-density witness */
-                if (sst->tombstone_count != TDB_TOMBSTONE_COUNT_UNKNOWN)
-                {
-                    level_tombstones += sst->tombstone_count;
-                    if (sst->num_entries > 0)
-                    {
-                        const double d = (double)sst->tombstone_count / (double)sst->num_entries;
-                        if (d > max_density)
-                        {
-                            max_density = d;
-                            max_density_level = i + 1;
-                        }
-                    }
-                }
-
-                tidesdb_sstable_unref(cf->db, sst);
             }
         }
+        atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
         (*stats)->level_key_counts[i] = level_keys;
         (*stats)->level_tombstone_counts[i] = level_tombstones;
         total_keys += level_keys;
@@ -31183,17 +31235,17 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
         int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
         for (int l = 0; l < num_levels; l++)
         {
-            if (!cf->levels[l]) continue;
-            int n = atomic_load_explicit(&cf->levels[l]->num_sstables, memory_order_relaxed);
-            stats->total_sstable_count += n;
+            tidesdb_level_t *lvl = cf->levels[l];
+            if (!lvl) continue;
+            stats->total_sstable_count +=
+                atomic_load_explicit(&lvl->num_sstables, memory_order_relaxed);
 
-            tidesdb_sstable_t **ssts =
-                atomic_load_explicit(&cf->levels[l]->sstables, memory_order_acquire);
-            for (int s = 0; s < n; s++)
-            {
-                if (ssts[s])
-                    stats->total_data_size_bytes += ssts[s]->klog_size + ssts[s]->vlog_size;
-            }
+            /* we sum the level's maintained byte counter rather than walking the
+             * sstables array -- a concurrent compaction can retire and free that
+             * array, and current_size already tracks the klog+vlog bytes the
+             * per-sstable walk would otherwise add up */
+            stats->total_data_size_bytes +=
+                (int64_t)atomic_load_explicit(&lvl->current_size, memory_order_relaxed);
         }
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
@@ -31501,39 +31553,29 @@ int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, const 
     for (int i = 0; i < num_levels; i++)
     {
         tidesdb_level_t *level = cf->levels[i];
-        const int num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+        /* we hold array_readers across the walk so a concurrent compaction
+         * cannot retire and free the sstables array, or unref a removed
+         * sstable, while we read per-sstable fields below. the array is
+         * calloc(capacity + 1) and NULL terminated, so the NULL-bounded loop
+         * cannot run off the end */
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
-        for (int j = 0; j < num_sstables; j++)
+        for (int j = 0; sstables[j] != NULL; j++)
         {
             tidesdb_sstable_t *sst = sstables[j];
 
-            /* we ref the sstable so a concurrent compaction worker cannot free it
-             * out from under the field reads below */
-            if (!sst || !tidesdb_sstable_try_ref(sst)) continue;
-
-            if (!sst->min_key || !sst->max_key)
-            {
-                tidesdb_sstable_unref(cf->db, sst);
-                continue;
-            }
+            if (!sst->min_key || !sst->max_key) continue;
 
             /* we check range overlap; we skip if [lo, hi] does not intersect [min_key, max_key] */
             const int lo_vs_max =
                 comparator_fn(lo, lo_size, sst->max_key, sst->max_key_size, comparator_ctx);
-            if (lo_vs_max > 0) /* lo is past this sstable */
-            {
-                tidesdb_sstable_unref(cf->db, sst);
-                continue;
-            }
+            if (lo_vs_max > 0) continue; /* lo is past this sstable */
 
             const int hi_vs_min =
                 comparator_fn(hi, hi_size, sst->min_key, sst->min_key_size, comparator_ctx);
-            if (hi_vs_min < 0) /* hi is before this sstable */
-            {
-                tidesdb_sstable_unref(cf->db, sst);
-                continue;
-            }
+            if (hi_vs_min < 0) continue; /* hi is before this sstable */
 
             overlapping_sources++;
 
@@ -31608,9 +31650,8 @@ int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, const 
             /* we accumulate cost--block I/O dominates, entries are cheap in comparison */
             total_cost += est_blocks * compression_weight; /* block read + decompress */
             total_cost += est_entries * TDB_RANGE_COST_PER_ENTRY_WEIGHT; /* per-entry processing */
-
-            tidesdb_sstable_unref(cf->db, sst);
         }
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
     }
 
     /* we add merge overhead -- more overlapping sources means more heap operations */

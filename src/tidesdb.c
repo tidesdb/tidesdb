@@ -17498,6 +17498,19 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             continue;
         }
 
+        /* compaction pause gate -- a backup in progress blocks new compactions
+         * so its file copy cannot race a manifest + sstable rewrite. we park
+         * here holding the work item until the backup lifts the pause. */
+        pthread_mutex_lock(&db->compaction_gate_lock);
+        while (db->compaction_paused)
+        {
+            pthread_mutex_unlock(&db->compaction_gate_lock);
+            usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+            pthread_mutex_lock(&db->compaction_gate_lock);
+        }
+        atomic_fetch_add_explicit(&db->active_compactions, 1, memory_order_acq_rel);
+        pthread_mutex_unlock(&db->compaction_gate_lock);
+
         if (work->steer_to_bottom)
         {
             /* tombstone-steered compaction -- targeted-merge the dense sstable's
@@ -17519,6 +17532,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             free(work->steer_min_key);
             free(work->steer_max_key);
             atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&db->active_compactions, 1, memory_order_acq_rel);
             free(work);
             continue;
         }
@@ -17534,6 +17548,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
         }
 
         atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&db->active_compactions, 1, memory_order_acq_rel);
         free(work);
     }
 
@@ -18700,6 +18715,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* initialized before recovery -- a recovered btree column family triggers
      * lazy creation of btree_node_cache, which takes this lock */
     pthread_mutex_init(&(*db)->btree_cache_lock, NULL);
+
+    pthread_mutex_init(&(*db)->compaction_gate_lock, NULL);
+    (*db)->compaction_paused = 0;
+    atomic_init(&(*db)->active_compactions, 0);
 
     tidesdb_comparator_entry_t *initial_comparators =
         calloc(TDB_INITIAL_COMPARATOR_CAPACITY, sizeof(tidesdb_comparator_entry_t));
@@ -19868,6 +19887,7 @@ int tidesdb_close(tidesdb_t *db)
     pthread_mutex_destroy(&db->sync_thread_mutex);
     pthread_cond_destroy(&db->sync_thread_cond);
     pthread_mutex_destroy(&db->btree_cache_lock);
+    pthread_mutex_destroy(&db->compaction_gate_lock);
 
     if (atomic_load(&db->sstable_reaper_active))
     {
@@ -28751,11 +28771,14 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
-    /***** we detect forward-monotonic seeks (new target >= last result) before freeing
-     ****  iter->current. when the seek target advances forward, each source's current_kv
-     ***   that is already >= target is still the correct "first entry >= target" answer
-     **    because no entries exist between the old target and current_kv (by definition of
-     *     the previous seek). */
+    /***** we detect strictly-forward seeks (new target > last result) before freeing
+     ****  iter->current. a source whose current_kv is already >= target is then still the
+     ***   correct "first entry >= target" answer, since no source has an entry in
+     **    (last_result, current_kv) and a strictly-greater target keeps [target, current_kv)
+     *     inside that gap. the comparison MUST be strict: iter_next pops iter->current and
+     *     advances its sources one entry past it, so a re-seek to exactly iter->current has
+     *     to fall through and re-seek -- iter->current itself sits behind those cursors and
+     *     a >= test would skip it, returning the following key. */
     int forward_monotonic = 0;
     const skip_list_comparator_fn cmp_fn = iter->heap->comparator;
     void *cmp_ctx = iter->heap->comparator_ctx;
@@ -28764,7 +28787,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
     {
         const int cmp =
             cmp_fn(key, key_size, iter->current->key, iter->current->entry.key_size, cmp_ctx);
-        if (cmp >= 0) forward_monotonic = 1;
+        if (cmp > 0) forward_monotonic = 1;
     }
 
     tidesdb_kv_pair_free(iter->current);
@@ -28895,8 +28918,11 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
-    /** the new target <= last result means sources
-     *  with current_kv->key <= target are still correctly positioned */
+    /** a strictly-backward seek (new target < last result) lets sources with
+     *  current_kv <= target keep their position. the comparison MUST be strict:
+     *  iter_prev pops iter->current and advances its sources one entry past it,
+     *  so a re-seek to exactly iter->current has to fall through and re-seek --
+     *  a <= test would skip it and return the preceding key. */
     int backward_monotonic = 0;
     const skip_list_comparator_fn cmp_fn = iter->heap->comparator;
     void *cmp_ctx = iter->heap->comparator_ctx;
@@ -28905,7 +28931,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
     {
         const int cmp =
             cmp_fn(key, key_size, iter->current->key, iter->current->entry.key_size, cmp_ctx);
-        if (cmp <= 0) backward_monotonic = 1;
+        if (cmp < 0) backward_monotonic = 1;
     }
 
     tidesdb_kv_pair_free(iter->current);
@@ -31833,8 +31859,15 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting backup to directory '%s'", dir);
 
+    /* we pause compaction for the whole backup so the file copy cannot race a
+     * compaction rewriting the manifest + sstable set into an inconsistent
+     * pair that recovery from the backup would then reject. */
+    pthread_mutex_lock(&db->compaction_gate_lock);
+    db->compaction_paused = 1;
+    pthread_mutex_unlock(&db->compaction_gate_lock);
+
     int result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_IMMUTABLE);
-    if (result != TDB_SUCCESS) return result;
+    if (result != TDB_SUCCESS) goto backup_unpause;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Flushing memtables before final backup copy");
     pthread_rwlock_rdlock(&db->cf_list_lock);
@@ -31854,7 +31887,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
         if (result != TDB_SUCCESS)
         {
             pthread_rwlock_unlock(&db->cf_list_lock);
-            return result;
+            goto backup_unpause;
         }
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
@@ -31904,55 +31937,24 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
 
+    /* compaction is paused, so no new compaction can start. we drain the
+     * compactions that were already past the gate when we paused so the final
+     * copy sees a stable manifest + sstable set. */
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for in-progress compactions to complete");
-    int compaction_wait_count = 0;
-    while (1)
+    while (atomic_load_explicit(&db->active_compactions, memory_order_acquire) > 0)
     {
-        int any_compacting = 0;
-        size_t compaction_queue_size = 0;
-
-        pthread_rwlock_rdlock(&db->cf_list_lock);
-        for (int i = 0; i < db->num_column_families; i++)
-        {
-            if (db->column_families[i])
-            {
-                if (atomic_load_explicit(&db->column_families[i]->is_compacting,
-                                         memory_order_acquire))
-                {
-                    any_compacting = 1;
-                    break;
-                }
-            }
-        }
-        pthread_rwlock_unlock(&db->cf_list_lock);
-
-        if (db->compaction_queue)
-        {
-            compaction_queue_size = queue_size(db->compaction_queue);
-        }
-
-        if (!any_compacting && compaction_queue_size == 0)
-        {
-            break;
-        }
-
-        if (compaction_wait_count % 100 == 0 && compaction_wait_count > 0)
-        {
-            TDB_DEBUG_LOG(
-                TDB_LOG_INFO,
-                "Still waiting for in-progress compactions (waited %d ms, queue_size=%zu)",
-                compaction_wait_count, compaction_queue_size);
-        }
-
         usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
-        compaction_wait_count++;
     }
 
     result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_FINAL);
-    if (result != TDB_SUCCESS) return result;
+    if (result == TDB_SUCCESS)
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully in '%s'", dir);
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully in '%s'", dir);
-    return TDB_SUCCESS;
+backup_unpause:
+    pthread_mutex_lock(&db->compaction_gate_lock);
+    db->compaction_paused = 0;
+    pthread_mutex_unlock(&db->compaction_gate_lock);
+    return result;
 }
 
 /**

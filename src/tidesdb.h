@@ -838,6 +838,12 @@ struct tidesdb_t
     _Atomic(int) replica_mode;               /* 1 = read-only replica, 0 = primary */
     pthread_t replica_sync_thread;           /* dedicated replica MANIFEST/WAL sync thread */
     _Atomic(int) replica_sync_thread_active; /* 1 while the replica sync thread runs */
+
+    /* compaction pause gate -- tidesdb_backup holds this across its file copy
+     * so the copy cannot race a compaction rewriting the manifest + sstable set */
+    pthread_mutex_t compaction_gate_lock;
+    int compaction_paused;           /* guarded by compaction_gate_lock */
+    _Atomic(int) active_compactions; /* compactions past the gate, in flight */
 };
 
 /**

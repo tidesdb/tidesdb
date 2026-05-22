@@ -807,6 +807,8 @@ struct tidesdb_t
         int cf_index_map_count;
         int cf_index_map_capacity;
         pthread_mutex_t cf_index_map_lock;
+        pthread_mutex_t wal_group_sync_lock; /* coordinates group-commit fsync on the unified WAL */
+        pthread_cond_t wal_group_sync_cond;
     } unified_mt;
 
     /* object store mode runtime state */

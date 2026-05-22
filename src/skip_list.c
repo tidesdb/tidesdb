@@ -1749,6 +1749,54 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
     return 0;
 }
 
+int skip_list_cursor_seek_ge(skip_list_cursor_t *cursor, const uint8_t *key, const size_t key_size)
+{
+    if (cursor == NULL || key == NULL || key_size == 0) return -1;
+
+    skip_list_node_t *current = cursor->cached_header;
+    const int max_level = atomic_load_explicit(&cursor->list->level, memory_order_acquire);
+    const skip_list_cmp_type_t cmp_type = cursor->list->cmp_type;
+
+    /* we find the node before target */
+    for (int i = max_level; i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        while (next != NULL && !NODE_IS_SENTINEL(next))
+        {
+            int cmp = skip_list_compare_keys_with_type(cmp_type, cursor->list, next->key,
+                                                       next->key_size, key, key_size);
+            if (cmp >= 0) break;
+            current = next;
+            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        }
+    }
+
+    /* we land directly on the first entry >= target rather than parking before it and
+     * leaving a separate next() to read forward[0]. a concurrent put can splice a node
+     * whose key is < target into forward[0] in that window, so a seek+next pair can
+     * return a key below target; re-reading forward[0] until we pass target closes it.
+     * once current points at a node >= target, later sub-target inserts splice in before
+     * it and do not move the cursor. */
+    for (;;)
+    {
+        skip_list_node_t *nx = atomic_load_explicit(&current->forward[0], memory_order_acquire);
+        if (nx == NULL || NODE_IS_SENTINEL(nx))
+        {
+            cursor->current = nx;
+            cursor->current_version = NULL;
+            return -1;
+        }
+        if (skip_list_compare_keys_with_type(cmp_type, cursor->list, nx->key, nx->key_size, key,
+                                             key_size) >= 0)
+        {
+            cursor->current = nx;
+            cursor->current_version = NULL;
+            return 0;
+        }
+        current = nx;
+    }
+}
+
 int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key,
                                    const size_t key_size)
 {

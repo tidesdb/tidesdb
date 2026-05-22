@@ -27,6 +27,10 @@
  * @param m the size of the bloom filter in bits
  * @param h the number of hash functions
  * @param size_in_words number of uint64_t words in bitset
+ * @param hash_version index-derivation hash version 1 = legacy, 2 = fmix-finalized
+ *                     (better avalanche / lower FPR on short keys). carried with the
+ *                     filter and honored by add/contains so on-disk filters built with
+ *                     an older hash keep querying with that same hash (no false negatives).
  */
 typedef struct
 {
@@ -34,6 +38,7 @@ typedef struct
     unsigned int m;
     unsigned int h;
     unsigned int size_in_words;
+    unsigned int hash_version;
 } bloom_filter_t;
 
 /**

@@ -90,6 +90,9 @@ typedef enum
  *                          and skip the kernel's per-inode write lock fast path.
  *                          set to UINT64_MAX if preallocation is unsupported on this
  *                          platform/fs to disable further attempts.
+ * @param group_durable_size bytes of the file confirmed fdatasync'd, used by group-commit
+ *                           callers to tell whether their write is already durable
+ * @param group_sync_active set while a group-commit leader is mid-fdatasync on this file
  */
 typedef struct
 {
@@ -100,6 +103,8 @@ typedef struct
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;
+    ATOMIC_ALIGN(8) _Atomic uint64_t group_durable_size;
+    int group_sync_active;
 } block_manager_t;
 
 /**

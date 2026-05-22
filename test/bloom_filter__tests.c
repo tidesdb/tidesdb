@@ -752,12 +752,83 @@ void test_bloom_filter_deserialize_overflow_m(void)
     ASSERT_TRUE(bf == NULL);
 }
 
+/* exercises the hash-version logic: new filters are v2 and carry the sentinel;
+ * a legacy v1 filter (no sentinel) round-trips back as v1 and stays correct,
+ * proving a filter is always queried with the hash that built it (no FN). */
+void test_bloom_filter_hash_versioning()
+{
+    const char *keys[] = {"alpha", "beta", "gamma", "delta", "epsilon"};
+
+    /* v2: a freshly built filter uses the current hash and serializes with the
+     * 0x00 version sentinel */
+    bloom_filter_t *v2;
+    (void)bloom_filter_new(&v2, 0.01, 1000);
+    ASSERT_EQ(v2->hash_version, 2);
+    for (int i = 0; i < 5; i++)
+        (void)bloom_filter_add(v2, (const uint8_t *)keys[i], strlen(keys[i]));
+
+    size_t v2_size;
+    uint8_t *v2_blob = bloom_filter_serialize(v2, &v2_size);
+    ASSERT_TRUE(v2_blob != NULL);
+    ASSERT_EQ(v2_blob[0], 0x00); /* v2 leads with the version sentinel */
+
+    bloom_filter_t *v2_rt = bloom_filter_deserialize(v2_blob);
+    ASSERT_TRUE(v2_rt != NULL);
+    ASSERT_EQ(v2_rt->hash_version, 2);
+    ASSERT_EQ(v2_rt->m, v2->m);
+    ASSERT_EQ(v2_rt->h, v2->h);
+    for (int i = 0; i < 5; i++)
+        ASSERT_EQ(bloom_filter_contains(v2_rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
+
+    /* legacy v1: simulate an on-disk filter built with the old hash. force the
+     * version to 1 BEFORE adding so the bits are set with the v1 hash. */
+    bloom_filter_t *v1;
+    (void)bloom_filter_new(&v1, 0.01, 1000);
+    v1->hash_version = 1;
+    for (int i = 0; i < 5; i++)
+        (void)bloom_filter_add(v1, (const uint8_t *)keys[i], strlen(keys[i]));
+
+    size_t v1_size;
+    uint8_t *v1_blob = bloom_filter_serialize(v1, &v1_size);
+    ASSERT_TRUE(v1_blob != NULL);
+    ASSERT_TRUE(v1_blob[0] != 0x00); /* legacy format: first byte is varint(m), never 0 */
+
+    /* the legacy blob must come back as v1 and still find every key -- a
+     * regression that queried v1 bits with the v2 hash would false-negative here */
+    bloom_filter_t *v1_rt = bloom_filter_deserialize(v1_blob);
+    ASSERT_TRUE(v1_rt != NULL);
+    ASSERT_EQ(v1_rt->hash_version, 1);
+    for (int i = 0; i < 5; i++)
+        ASSERT_EQ(bloom_filter_contains(v1_rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
+
+    /* v1 round-trip must answer identically to the original v1 filter on a probe
+     * set, proving consistent hash routing across serialize */
+    int mismatch = 0;
+    char probe[32];
+    for (int i = 0; i < 5000; i++)
+    {
+        int n = snprintf(probe, sizeof(probe), "probe-%d", i);
+        if (bloom_filter_contains(v1, (const uint8_t *)probe, (size_t)n) !=
+            bloom_filter_contains(v1_rt, (const uint8_t *)probe, (size_t)n))
+            mismatch++;
+    }
+    ASSERT_EQ(mismatch, 0);
+
+    free(v2_blob);
+    free(v1_blob);
+    (void)bloom_filter_free(v2);
+    (void)bloom_filter_free(v2_rt);
+    (void)bloom_filter_free(v1);
+    (void)bloom_filter_free(v1_rt);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_bloom_filter_new, tests_passed);
     RUN_TEST(test_bloom_filter_add_and_contains, tests_passed);
     RUN_TEST(test_bloom_filter_serialize_deserialize, tests_passed);
+    RUN_TEST(test_bloom_filter_hash_versioning, tests_passed);
     RUN_TEST(test_false_positive_rate, tests_passed);
     RUN_TEST(test_boundary_conditions, tests_passed);
     RUN_TEST(test_bloom_filter_edge_cases, tests_passed);

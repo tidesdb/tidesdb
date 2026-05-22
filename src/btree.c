@@ -44,6 +44,9 @@
 /* fixed-size empty-leaf encoding -- type byte, num_entries=0 varint, prev/next int64 */
 #define BTREE_LEAF_EMPTY_BUF_SIZE 32
 
+/* suffix for the temp file uncompressed leaves are staged into before compression */
+#define BTREE_LEAF_STAGE_SUFFIX ".lstmp"
+
 /* compressed-node block layout written by btree_node_serialize_with_compression and read
  * back by btree_node_read_with_compression. format is
  * [original_size:u32][prev_offset:i64][next_offset:i64][compressed_data] */
@@ -1550,8 +1553,10 @@ int btree_builder_new(btree_builder_t **builder, block_manager_t *bm, const btre
     b->leaf_bm = bm;
     if (b->config.compression_algo != TDB_COMPRESS_NONE)
     {
-        char tmp_path[MAX_FILE_PATH_LENGTH];
-        snprintf(tmp_path, sizeof(tmp_path), "%s.lstmp", bm->file_path);
+        /* sizeof the suffix literal already includes its null terminator, so this
+         * holds a full-length file_path plus the suffix without truncation */
+        char tmp_path[MAX_FILE_PATH_LENGTH + sizeof(BTREE_LEAF_STAGE_SUFFIX)];
+        snprintf(tmp_path, sizeof(tmp_path), "%s" BTREE_LEAF_STAGE_SUFFIX, bm->file_path);
         block_manager_t *tmp_bm = NULL;
         if (block_manager_open(&tmp_bm, tmp_path, BLOCK_MANAGER_SYNC_NONE) == 0 &&
             block_manager_truncate(tmp_bm) == 0)

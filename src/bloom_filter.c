@@ -36,6 +36,18 @@
  * the multiplicative mix below. */
 #define BF_HASH_PRIME 0xc6a4a793u
 
+/* index-derivation hash versions. version 1 is the original hash. version 2
+ * appends a murmur3 fmix32 finalizer so short keys fully avalanche, which
+ * decorrelates h1/h2 and lowers the false-positive rate on small structured
+ * keys. the version is stored per filter; a filter is always queried with the
+ * same hash that built it, so existing on-disk (v1) filters stay correct. */
+#define BF_HASH_VERSION_LEGACY  1u
+#define BF_HASH_VERSION_CURRENT 2u
+/* serialized v2 filters carry a 0x00 sentinel + version byte. a v1 filter can
+ * never start with 0x00 because its first field is varint32(m) and m >= 1. */
+#define BF_SERIALIZE_VERSION_SENTINEL 0x00u
+#define BF_SERIALIZE_VERSION_BYTES    2
+
 /* upper bound on the number of hash functions accepted by bloom_filter_new.
  * derived h grows logarithmically with target false-positive rate; even at
  * p = 1e-30 the formula yields h ~ 100, so this is a generous sanity ceiling
@@ -125,6 +137,42 @@ static inline uint32_t bf_hash_inline(const uint8_t *entry, const size_t size, c
     return h;
 }
 
+/* murmur3 fmix32 -- full-avalanche finalizer. applied by the v2 hash so even a
+ * short key whose base hash had weak mixing produces well-spread index bits. */
+static inline uint32_t bf_fmix32(uint32_t h)
+{
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+/* v2 index hash: base hash plus the fmix32 finalizer */
+static inline uint32_t bf_hash_v2_inline(const uint8_t *entry, const size_t size,
+                                         const uint32_t seed)
+{
+    return bf_fmix32(bf_hash_inline(entry, size, seed));
+}
+
+/* derive the two base hashes for a filter using the hash version it was built with,
+ * so a filter is always queried with the same scheme that set its bits */
+static inline void bf_derive_hashes(const bloom_filter_t *bf, const uint8_t *entry,
+                                    const size_t size, uint32_t *h1, uint32_t *h2)
+{
+    if (bf->hash_version >= BF_HASH_VERSION_CURRENT)
+    {
+        *h1 = bf_hash_v2_inline(entry, size, 0);
+        *h2 = bf_hash_v2_inline(entry, size, 1);
+    }
+    else
+    {
+        *h1 = bf_hash_inline(entry, size, 0);
+        *h2 = bf_hash_inline(entry, size, 1);
+    }
+}
+
 int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 {
     if (p <= 0.0 || p >= 1.0 || n <= 0)
@@ -187,6 +235,9 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
         return -1;
     }
 
+    /* freshly built filters use the current (best) index hash */
+    (*bf)->hash_version = BF_HASH_VERSION_CURRENT;
+
     return 0;
 }
 
@@ -200,8 +251,8 @@ void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size
     const unsigned int m = bf->m;
     uint64_t *const bitset = bf->bitset;
 
-    const uint32_t h1 = bf_hash_inline(entry, size, 0);
-    const uint32_t h2 = bf_hash_inline(entry, size, 1);
+    uint32_t h1, h2;
+    bf_derive_hashes(bf, entry, size, &h1, &h2);
 
     for (unsigned int i = 0; i < h; i++)
     {
@@ -223,8 +274,8 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
 
     /* k-mitzenmacher + fast range reduction
      * 2 hashes + h cheap probes instead of h full hashes + h divisions */
-    const uint32_t h1 = bf_hash_inline(entry, size, 0);
-    const uint32_t h2 = bf_hash_inline(entry, size, 1);
+    uint32_t h1, h2;
+    bf_derive_hashes(bf, entry, size, &h1, &h2);
 
     for (unsigned int i = 0; i < h; i++)
     {
@@ -295,8 +346,8 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
      * -- header            3 varint32s (m, h, non_zero_count)
      * -- sparse data       each non-zero word = varint32 index + varint64 value
      */
-    const size_t max_size =
-        BF_SERIALIZE_HEADER_MAX_BYTES + (size_t)non_zero_count * BF_SERIALIZE_WORD_MAX_BYTES;
+    const size_t max_size = BF_SERIALIZE_VERSION_BYTES + BF_SERIALIZE_HEADER_MAX_BYTES +
+                            (size_t)non_zero_count * BF_SERIALIZE_WORD_MAX_BYTES;
     uint8_t *buffer = malloc(max_size);
     if (buffer == NULL)
     {
@@ -304,6 +355,15 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     }
 
     uint8_t *ptr = buffer;
+
+    /* v2+ filters lead with a 0x00 sentinel (impossible for a v1 filter, whose
+     * first byte is varint32(m) with m >= 1) followed by the hash version byte,
+     * so deserialize can route the filter back to the hash that built it */
+    if (bf->hash_version >= BF_HASH_VERSION_CURRENT)
+    {
+        *ptr++ = BF_SERIALIZE_VERSION_SENTINEL;
+        *ptr++ = (uint8_t)bf->hash_version;
+    }
 
     /* we write header with varint encoding */
     ptr = encode_varint32(ptr, (uint32_t)bf->m);
@@ -334,6 +394,16 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     }
 
     const uint8_t *ptr = data;
+
+    /* a leading 0x00 marks the versioned format (v1 can never start with 0x00,
+     * its first field is varint32(m) with m >= 1). absent it, this is a legacy
+     * v1 filter that must keep being queried with the v1 hash. */
+    unsigned int hash_version = BF_HASH_VERSION_LEGACY;
+    if (ptr[0] == BF_SERIALIZE_VERSION_SENTINEL)
+    {
+        ptr++;                               /* skip sentinel */
+        hash_version = (unsigned int)*ptr++; /* read hash version */
+    }
 
     /* we read header with varint decoding */
     uint32_t m_u32, h_u32, non_zero_count;
@@ -394,6 +464,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     bf->h = h;
     bf->bitset = bitset;
     bf->size_in_words = size_in_words;
+    bf->hash_version = hash_version;
 
     return bf;
 }

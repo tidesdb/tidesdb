@@ -9401,6 +9401,150 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
 }
 
 /**
+ * tidesdb_level_remove_sstables_batch
+ * excise every sstable in the to_remove set that is currently in this level, in a single
+ * atomic array swap. removing a merge's same-level inputs one at a time lets a concurrent
+ * point get observe a level holding an input's older put without its tombstone -- the get
+ * stops at the first level that has the key, so it returns the orphaned put and a deleted
+ * key reappears until compaction settles. one swap means a reader sees all of this level's
+ * merged inputs or none of them.
+ * @param db database instance
+ * @param level level to remove from
+ * @param to_remove set of sstables to remove
+ * @param to_remove_count size of the set
+ * @param out_removed per-entry flags, set to 1 for each to_remove[j] excised here
+ * @return TDB_SUCCESS if any were removed, TDB_ERR_NOT_FOUND if none, TDB_ERR_MEMORY on alloc fail
+ */
+static int tidesdb_level_remove_sstables_batch(const tidesdb_t *db, tidesdb_level_t *level,
+                                               tidesdb_sstable_t **to_remove, int to_remove_count,
+                                               uint8_t *out_removed)
+{
+    while (1)
+    {
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
+
+        int old_num = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        const int old_capacity =
+            atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
+        tidesdb_sstable_t **old_arr = atomic_load_explicit(&level->sstables, memory_order_acquire);
+
+        /* we spin until (old_arr, old_num) are consistent -- see tidesdb_level_remove_sstable */
+        if (old_arr[old_num] != NULL)
+        {
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+            cpu_pause();
+            continue;
+        }
+        if (old_num > 0 && old_arr[old_num - 1] == NULL)
+        {
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+            cpu_pause();
+            continue;
+        }
+
+        tidesdb_sstable_t **new_arr = calloc(old_capacity + 1, sizeof(tidesdb_sstable_t *));
+        if (!new_arr)
+        {
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+            return TDB_ERR_MEMORY;
+        }
+
+        int new_idx = 0;
+        int removed_here = 0;
+        for (int i = 0; i < old_num; i++)
+        {
+            int rm = 0;
+            for (int j = 0; j < to_remove_count; j++)
+            {
+                if (old_arr[i] == to_remove[j])
+                {
+                    rm = 1;
+                    break;
+                }
+            }
+            if (rm)
+            {
+                removed_here++;
+                continue;
+            }
+            new_arr[new_idx] = old_arr[i];
+            tidesdb_sstable_ref(new_arr[new_idx]);
+            new_idx++;
+        }
+
+        if (removed_here == 0)
+        {
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+            free(new_arr);
+            return TDB_ERR_NOT_FOUND;
+        }
+
+        if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
+                                                    memory_order_release, memory_order_acquire))
+        {
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+
+            atomic_thread_fence(memory_order_seq_cst);
+            atomic_store_explicit(&level->num_sstables, new_idx, memory_order_release);
+
+            /* we unref old array's surviving sstables -- new array holds their refs */
+            for (int i = 0; i < old_num; i++)
+            {
+                int rm = 0;
+                for (int j = 0; j < to_remove_count; j++)
+                {
+                    if (old_arr[i] == to_remove[j])
+                    {
+                        rm = 1;
+                        break;
+                    }
+                }
+                if (!rm) tidesdb_sstable_unref(db, old_arr[i]);
+            }
+
+            tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
+                &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
+            tidesdb_retire_array((tidesdb_t *)db, prev_retired, level);
+
+            /* for each sstable excised in this swap we account the freed space and defer its
+             * unref until array_readers drains, since readers may still hold raw pointers
+             * from the old array */
+            for (int j = 0; j < to_remove_count; j++)
+            {
+                int was_here = 0;
+                for (int i = 0; i < old_num; i++)
+                {
+                    if (old_arr[i] == to_remove[j])
+                    {
+                        was_here = 1;
+                        break;
+                    }
+                }
+                if (!was_here) continue;
+                out_removed[j] = 1;
+                atomic_fetch_sub_explicit(&level->current_size,
+                                          to_remove[j]->klog_size + to_remove[j]->vlog_size,
+                                          memory_order_relaxed);
+                atomic_fetch_sub_explicit(&((tidesdb_t *)db)->sstable_aux_memory_bytes,
+                                          tidesdb_sstable_aux_memory_bytes(to_remove[j]),
+                                          memory_order_relaxed);
+                tidesdb_defer_removed_sst_unref((tidesdb_t *)db, level, to_remove[j]);
+            }
+
+            return TDB_SUCCESS;
+        }
+
+        /* CAS failed, we release reader count, cleanup and retry */
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+        for (int i = 0; i < new_idx; i++)
+        {
+            tidesdb_sstable_unref(db, new_arr[i]);
+        }
+        free(new_arr);
+    }
+}
+
+/**
  * tidesdb_level_sort_by_min_key
  * reorder a level's sstable array ascending by min_key via a single CAS swap.
  * the spooky 4.3 skew optimization leaves skipped largest-level files at their
@@ -12357,60 +12501,106 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
 {
     const int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    while (!queue_is_empty(delete_queue))
+    const int total = queue_size(delete_queue);
+    if (total <= 0) return;
+
+    /* we drain the queue into one array so each level's merged inputs are excised in a
+     * single atomic swap. removing them one at a time leaves a window where a level holds
+     * an input's older put without its tombstone, and a concurrent point get -- which
+     * stops at the first level that has the key -- returns that orphaned put, so a deleted
+     * key reappears until compaction settles. */
+    tidesdb_sstable_t **ssts = malloc((size_t)total * sizeof(tidesdb_sstable_t *));
+    if (!ssts)
     {
-        /* drop_column_family will sweep the cf directory in a moment; skip per-sstable
-         * manifest commits when the CF is on its way out */
-        if (tidesdb_cf_abort_requested(cf))
+        /* alloc failed -- last-resort one-at-a-time removal */
+        while (!queue_is_empty(delete_queue))
         {
             tidesdb_sstable_t *sst = queue_dequeue(delete_queue);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-            continue;
-        }
-
-        tidesdb_sstable_t *sst = queue_dequeue(delete_queue);
-        if (!sst) continue;
-
-        atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
-
-        int removed = 0;
-        int removed_level = -1;
-
-        for (int level = start_level; level <= end_level && level < num_levels; level++)
-        {
-            tidesdb_level_t *lvl = cf->levels[level];
-            const int result = tidesdb_level_remove_sstable(cf->db, lvl, sst);
-            if (result == TDB_SUCCESS)
+            if (!sst) continue;
+            atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
+            if (!tidesdb_cf_abort_requested(cf))
             {
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "Removed SSTable %" PRIu64 " from level %d", sst->id,
-                              lvl->level_num);
-                tidesdb_bump_sstable_layout_version(cf);
-                removed = 1;
-                removed_level = lvl->level_num;
-                break;
+                for (int level = start_level; level <= end_level && level < num_levels; level++)
+                {
+                    if (tidesdb_level_remove_sstable(cf->db, cf->levels[level], sst) == TDB_SUCCESS)
+                    {
+                        tidesdb_bump_sstable_layout_version(cf);
+                        break;
+                    }
+                }
             }
+            tidesdb_sstable_unref(cf->db, sst);
         }
-
-        if (removed)
-        {
-            tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
-            if (manifest_result != 0)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "Failed to commit manifest after removing SSTable %" PRIu64
-                              " (error: %d)",
-                              sst->id, manifest_result);
-            }
-            tdb_objstore_upload_manifest(cf->db, cf);
-        }
-        else
-        {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " not found in any level", sst->id);
-        }
-
-        tidesdb_sstable_unref(cf->db, sst);
+        return;
     }
+
+    int n = 0;
+    while (!queue_is_empty(delete_queue))
+    {
+        tidesdb_sstable_t *sst = queue_dequeue(delete_queue);
+        if (sst) ssts[n++] = sst;
+    }
+
+    for (int i = 0; i < n; i++)
+        atomic_store_explicit(&ssts[i]->marked_for_deletion, 1, memory_order_release);
+
+    /* drop_column_family will sweep the cf directory shortly; skip the level/manifest work
+     * when the CF is on its way out, but still release our queue references below */
+    if (!tidesdb_cf_abort_requested(cf))
+    {
+        uint8_t *removed = calloc((size_t)n, 1);
+        int *removed_level = malloc((size_t)n * sizeof(int));
+        if (removed && removed_level)
+        {
+            for (int i = 0; i < n; i++) removed_level[i] = -1;
+
+            /* we remove input levels deepest-first. for any key, its tombstone input sits at
+             * a level shallower-or-equal to its older put input, so removing deep before
+             * shallow guarantees that whenever a put input is gone its tombstone input is
+             * still present (or the merged output is reachable) -- a concurrent get can never
+             * see the orphaned put alone. */
+            int deepest = (end_level < num_levels - 1) ? end_level : num_levels - 1;
+            for (int level = deepest; level >= start_level; level--)
+            {
+                tidesdb_level_t *lvl = cf->levels[level];
+                tidesdb_level_remove_sstables_batch(cf->db, lvl, ssts, n, removed);
+                for (int i = 0; i < n; i++)
+                {
+                    if (removed[i] && removed_level[i] == -1) removed_level[i] = lvl->level_num;
+                }
+            }
+
+            int any_removed = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (removed[i])
+                {
+                    any_removed = 1;
+                    tidesdb_manifest_remove_sstable(cf->manifest, removed_level[i], ssts[i]->id);
+                }
+                else
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " not found in any level",
+                                  ssts[i]->id);
+                }
+            }
+
+            if (any_removed)
+            {
+                tidesdb_bump_sstable_layout_version(cf);
+                if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path) != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to commit manifest after merge cleanup");
+                }
+                tdb_objstore_upload_manifest(cf->db, cf);
+            }
+        }
+        free(removed);
+        free(removed_level);
+    }
+
+    for (int i = 0; i < n; i++) tidesdb_sstable_unref(cf->db, ssts[i]);
+    free(ssts);
 }
 
 /**

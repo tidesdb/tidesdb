@@ -9474,7 +9474,14 @@ static int tidesdb_level_remove_sstables_batch(const tidesdb_t *db, tidesdb_leve
 
         if (removed_here == 0)
         {
+            /* none of the targets are in this level -- new_arr already holds a ref on every
+             * survivor from the build loop above; drop those before discarding new_arr or the
+             * level's sstables leak a ref each (cleanup calls this for every level in range) */
             atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+            for (int i = 0; i < new_idx; i++)
+            {
+                tidesdb_sstable_unref(db, new_arr[i]);
+            }
             free(new_arr);
             return TDB_ERR_NOT_FOUND;
         }
@@ -9487,7 +9494,10 @@ static int tidesdb_level_remove_sstables_batch(const tidesdb_t *db, tidesdb_leve
             atomic_thread_fence(memory_order_seq_cst);
             atomic_store_explicit(&level->num_sstables, new_idx, memory_order_release);
 
-            /* we unref old array's surviving sstables -- new array holds their refs */
+            /* old_arr must be fully consumed before the atomic_exchange below puts it into
+             * retired_sstables_arr -- once retired, a concurrent tidesdb_level_add_sstable
+             * can retire it again and free it, so reading old_arr afterward is a use after
+             * free. we unref the survivors and resolve every removed sstable here first. */
             for (int i = 0; i < old_num; i++)
             {
                 int rm = 0;
@@ -9501,10 +9511,6 @@ static int tidesdb_level_remove_sstables_batch(const tidesdb_t *db, tidesdb_leve
                 }
                 if (!rm) tidesdb_sstable_unref(db, old_arr[i]);
             }
-
-            tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
-                &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
-            tidesdb_retire_array((tidesdb_t *)db, prev_retired, level);
 
             /* for each sstable excised in this swap we account the freed space and defer its
              * unref until array_readers drains, since readers may still hold raw pointers
@@ -9530,6 +9536,10 @@ static int tidesdb_level_remove_sstables_batch(const tidesdb_t *db, tidesdb_leve
                                           memory_order_relaxed);
                 tidesdb_defer_removed_sst_unref((tidesdb_t *)db, level, to_remove[j]);
             }
+
+            tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
+                &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
+            tidesdb_retire_array((tidesdb_t *)db, prev_retired, level);
 
             return TDB_SUCCESS;
         }

@@ -367,38 +367,34 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
 typedef struct tidesdb_column_family_config_t
 {
     char name[TDB_MAX_CF_NAME_LEN];
-    /* the fields written by tidesdb_cf_update_runtime_config are _Atomic so a
-     * live reconfigure does not data race with worker threads reading them.
-     * all are word-sized scalars, so _Atomic leaves struct size, alignment and
-     * field offsets unchanged -- the ABI and FFI bindings are unaffected. */
-    _Atomic(size_t) write_buffer_size;
-    _Atomic(size_t) level_size_ratio;
-    _Atomic(int) min_levels;
-    _Atomic(int) dividing_level_offset;
-    _Atomic(size_t) klog_value_threshold;
-    _Atomic(compression_algorithm) compression_algorithm;
-    _Atomic(int) enable_bloom_filter;
-    _Atomic(double) bloom_fpr;
-    _Atomic(int) enable_block_indexes;
-    _Atomic(int) index_sample_ratio;
-    _Atomic(int) block_index_prefix_len;
-    _Atomic(int) sync_mode;
-    _Atomic(uint64_t) sync_interval_us;
+    size_t write_buffer_size;
+    size_t level_size_ratio;
+    int min_levels;
+    int dividing_level_offset;
+    size_t klog_value_threshold;
+    compression_algorithm compression_algorithm;
+    int enable_bloom_filter;
+    double bloom_fpr;
+    int enable_block_indexes;
+    int index_sample_ratio;
+    int block_index_prefix_len;
+    int sync_mode;
+    uint64_t sync_interval_us;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
     char comparator_ctx_str[TDB_MAX_COMPARATOR_CTX];
     skip_list_comparator_fn comparator_fn_cached;
     void *comparator_ctx_cached;
-    _Atomic(int) skip_list_max_level;
-    _Atomic(float) skip_list_probability;
-    _Atomic(tidesdb_isolation_level_t) default_isolation_level;
-    _Atomic(uint64_t) min_disk_space;
-    _Atomic(int) l1_file_count_trigger;
-    _Atomic(int) l0_queue_stall_threshold;
-    _Atomic(double) tombstone_density_trigger;
-    _Atomic(uint64_t) tombstone_density_min_entries;
+    int skip_list_max_level;
+    float skip_list_probability;
+    tidesdb_isolation_level_t default_isolation_level;
+    uint64_t min_disk_space;
+    int l1_file_count_trigger;
+    int l0_queue_stall_threshold;
+    double tombstone_density_trigger;
+    uint64_t tombstone_density_min_entries;
     int use_btree;
-    _Atomic(tidesdb_commit_hook_fn) commit_hook_fn;
-    _Atomic(void *) commit_hook_ctx;
+    tidesdb_commit_hook_fn commit_hook_fn;
+    void *commit_hook_ctx;
     size_t object_target_file_size; /* reserved, not used */
     int object_lazy_compaction;
     int object_prefetch_compaction;

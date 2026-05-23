@@ -508,6 +508,8 @@ struct tidesdb_memtable_t
  * @param flush_pending_count per-CF count of queued + in-flight flush work items
  * @param flush_deferred flag set when a flush was skipped at the global concurrent-flush cap
  * @param compaction_pending_count per-CF count of queued + in-flight compaction work items
+ * @param compaction_armed flag set when an enqueue was skipped because is_compacting was 1; the
+ * worker drains this when its current job ends and self-enqueues a follow-up
  * @param immutable_cleanup_counter counter for batched immutable cleanup
  * @param marked_for_deletion flag indicating column family is marked for deletion
  * @param manifest manifest for column family
@@ -535,6 +537,7 @@ struct tidesdb_column_family_t
     _Atomic(int) flush_pending_count;
     _Atomic(int) flush_deferred;
     _Atomic(int) compaction_pending_count;
+    _Atomic(int) compaction_armed;
     _Atomic(int) immutable_cleanup_counter;
     _Atomic(int) marked_for_deletion;
     tidesdb_manifest_t *manifest;
@@ -550,6 +553,15 @@ struct tidesdb_column_family_t
      * many readers but only one writer, so concurrent publishers (flush worker
      * cleanup vs compaction-triggered flush) must serialize on this lock */
     pthread_mutex_t imm_snap_publish_lock;
+
+    /* read-side epoch for the active_memtable slot. a reader bumps this before
+     * loading active_memtable + try_ref'ing the loaded pointer, drops it once
+     * try_ref has finished (success means refcount is now pinned, failure means
+     * we never touched the struct after the cas). the immutable cleanup loop
+     * drains this counter to 0 before free()ing a memtable struct so a reader
+     * holding a stale active_memtable pointer cannot UAF on try_ref's refcount
+     * read. mirrors imm_snap_t.readers but for the direct-active read path */
+    _Atomic(int) active_mt_readers;
 
     /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
     uint32_t unified_cf_index;
@@ -812,6 +824,9 @@ struct tidesdb_t
     {
         int enabled;
         _Atomic(tidesdb_memtable_t *) active;
+        /* read-side epoch for the unified active slot. see the analogous
+         * cf->active_mt_readers field for the protocol */
+        _Atomic(int) active_mt_readers;
         queue_t *immutables;
         tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
         _Atomic(int) imm_snap_active;
@@ -1638,7 +1653,11 @@ int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_
 
 /**
  * tidesdb_compact
- * compacts a column family. enqueues a compaction task
+ * runs a full compaction on a column family. every active level is merged
+ * into the largest so all garbage (tombstones, single-delete pairs,
+ * superseded puts) is reclaimed; with a single disk level the merge is a
+ * self-rewrite of that level. blocks until the work item has been
+ * serviced, including any compaction already in flight on this cf
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */

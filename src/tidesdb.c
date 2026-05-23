@@ -15671,12 +15671,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                                                comparator_fn, comparator_ctx);
             }
 
-            /* we branch to btree output if use_btree is enabled
-             * partitioned merge goes to the level before largest, so not largest level */
+            /* btree output. is_largest_level mirrors the non-btree branch
+             * below so a partition that targets L can still reap tombstones */
             if (cf->config.use_btree)
             {
-                int btree_result = tidesdb_sstable_write_from_heap_btree(cf, new_sst, heap, klog_bm,
-                                                                         vlog_bm, bloom, NULL, 0);
+                int btree_result = tidesdb_sstable_write_from_heap_btree(
+                    cf, new_sst, heap, klog_bm, vlog_bm, bloom, NULL, targeting_largest);
                 block_manager_close(klog_bm);
                 block_manager_close(vlog_bm);
                 tidesdb_merge_heap_free(heap);

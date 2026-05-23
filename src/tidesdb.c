@@ -6558,6 +6558,42 @@ static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
 }
 
 /**
+ * tidesdb_active_memtable_try_ref
+ * pinned acquire of the active memtable slot.  the reader bumps the per-slot
+ * reader epoch, loads the slot, then try_ref's the loaded pointer.  the epoch
+ * is dropped immediately after the try_ref outcome is known -- if try_ref
+ * succeeded the caller now holds a refcount ref so the struct cannot be freed
+ * out from under it, and if it failed the caller never touches the struct
+ * again.  the immutable-cleanup loop drains this epoch to 0 before free()ing
+ * memtable structs, which closes the load/try_ref window that otherwise leaks
+ * a UAF on mt->refcount when cf->active_memtable's old target has been
+ * rotated to immutable, flushed, and unref'd to 0 in between the load and
+ * the try_ref.  mirrors the imm_snap_t.readers epoch but for the direct read
+ * path through the active slot.
+ * @param epoch the per-slot reader epoch counter (cf->active_mt_readers or
+ *              db->unified_mt.active_mt_readers)
+ * @param slot the atomic memtable pointer (&cf->active_memtable or
+ *             &db->unified_mt.active)
+ * @param out_mt receives the pinned memtable on success, NULL on failure
+ * @return 1 if a memtable was pinned, 0 if the slot was empty or the loaded
+ *         memtable had already been claimed for cleanup
+ */
+static int tidesdb_active_memtable_try_ref(_Atomic(int) *epoch, _Atomic(tidesdb_memtable_t *) *slot,
+                                           tidesdb_memtable_t **out_mt)
+{
+    atomic_fetch_add_explicit(epoch, 1, memory_order_acq_rel);
+    /* StoreLoad fence pairs with the cleanup drain's matching seq_cst fence.
+     * RMWs are full barriers on x86 but acq_rel RMW on aarch64/ppc is not, so
+     * the explicit fence is required for portability */
+    atomic_thread_fence(memory_order_seq_cst);
+    tidesdb_memtable_t *mt = atomic_load_explicit(slot, memory_order_acquire);
+    int ok = mt ? tidesdb_memtable_try_ref(mt) : 0;
+    atomic_fetch_sub_explicit(epoch, 1, memory_order_release);
+    *out_mt = ok ? mt : NULL;
+    return ok;
+}
+
+/**
  * tidesdb_imm_snap_publish_locked
  * rebuild the lock-free immutable snapshot from the current queue contents
  * uses double-buffered RCU, building in inactive slot, swap active index,
@@ -9049,6 +9085,86 @@ static void tidesdb_deferred_free_drain(tidesdb_t *db)
         free(list->ptr);
         free(list);
         list = next;
+    }
+}
+
+/**
+ * tidesdb_deferred_free_drain_for_cf
+ * drain deferred free entries whose level belongs to the given cf so the cf's
+ * levels can be released without the reaper later dereferencing a freed level.
+ * walks the list once, frees items pointing at any of cf->levels[i], and
+ * re-enqueues everything else for the regular reaper sweep to handle.
+ *
+ * the caller must hold db->reaper_thread_mutex around this call -- otherwise
+ * the reaper could be mid-walk holding items for this cf in its locally-stolen
+ * list and UAF on level->array_readers once tidesdb_column_family_free
+ * releases the level structs.
+ *
+ * @param db database handle
+ * @param cf column family whose pending items should be drained now
+ */
+static void tidesdb_deferred_free_drain_for_cf(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    tidesdb_deferred_free_node_t *list =
+        atomic_exchange_explicit(&db->deferred_free_list, NULL, memory_order_acq_rel);
+    tidesdb_deferred_free_node_t *keep = NULL;
+
+    while (list)
+    {
+        tidesdb_deferred_free_node_t *next = list->next;
+
+        int is_ours = 0;
+        for (int i = 0; i < TDB_MAX_LEVELS; i++)
+        {
+            if (cf->levels[i] && cf->levels[i] == list->level)
+            {
+                is_ours = 1;
+                break;
+            }
+        }
+
+        if (is_ours)
+        {
+            /* drop has already drained is_compacting, writers, and
+             * active_mt_readers, and the caller contract is that no
+             * iterators/gets remain on a dropped cf, so array_readers
+             * should be 0. spin defensively in case the contract was
+             * violated -- better to hang drop than UAF */
+            while (atomic_load_explicit(&list->level->array_readers, memory_order_acquire) > 0)
+            {
+                cpu_yield();
+            }
+            if (list->sst_unrefs_count > 0 && list->sst_unrefs)
+            {
+                for (int i = 0; i < list->sst_unrefs_count; i++)
+                {
+                    tidesdb_sstable_unref(list->db, list->sst_unrefs[i]);
+                }
+                free(list->sst_unrefs);
+            }
+            free(list->ptr);
+            free(list);
+        }
+        else
+        {
+            list->next = keep;
+            keep = list;
+        }
+        list = next;
+    }
+
+    /* re-enqueue items we kept onto the lock-free list */
+    while (keep)
+    {
+        tidesdb_deferred_free_node_t *next = keep->next;
+        tidesdb_deferred_free_node_t *old_head =
+            atomic_load_explicit(&db->deferred_free_list, memory_order_acquire);
+        do
+        {
+            keep->next = old_head;
+        } while (!atomic_compare_exchange_weak_explicit(
+            &db->deferred_free_list, &old_head, keep, memory_order_release, memory_order_acquire));
+        keep = next;
     }
 }
 
@@ -16927,9 +17043,27 @@ static void *tidesdb_flush_worker_thread(void *arg)
             /* we evict every flushed immutable from the read path -- their data
              * now lives in per-CF sstables. queue_remove_if takes the queue write
              * lock so it cannot race a snapshot reader; it drops the queue's ref
-             * per item and the last concurrent reader frees the structure */
+             * per item and the last concurrent reader frees the structure.
+             * we drain unified_mt.active_mt_readers first so a reader who
+             * loaded the about-to-be-removed pointer from unified_mt.active
+             * has completed its try_ref before queue_remove_if drops the
+             * queue's ref -- otherwise the queue's drop could win, free the
+             * struct, and the reader's try_ref would UAF on refcount. seq_cst
+             * fence pairs with the matching fence in
+             * tidesdb_active_memtable_try_ref */
             if (db->unified_mt.immutables)
             {
+                atomic_thread_fence(memory_order_seq_cst);
+                int uamr_spins = 0;
+                while (atomic_load_explicit(&db->unified_mt.active_mt_readers,
+                                            memory_order_acquire) > 0)
+                {
+                    if (uamr_spins < TDB_IMM_SNAP_ACQUIRE_SPIN_LIMIT)
+                        cpu_pause();
+                    else
+                        cpu_yield();
+                    uamr_spins++;
+                }
                 queue_remove_if(db->unified_mt.immutables, tidesdb_unified_immutable_is_flushed,
                                 NULL, tidesdb_unified_immutable_drop_queue_ref);
             }
@@ -17437,6 +17571,25 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 tidesdb_imm_snap_drain_previous(cf);
                 pthread_mutex_unlock(&cf->imm_snap_publish_lock);
 
+                /* the snap drain covers readers walking the immutable snapshot;
+                 * we also drain active_mt_readers so a reader that loaded a now
+                 * retired pointer from cf->active_memtable (rotation moved this
+                 * memtable to immutable, the reader still has the pre swap
+                 * pointer) cannot UAF on try_ref's refcount load.  the seq_cst
+                 * fence pairs with the matching fence in
+                 * tidesdb_active_memtable_try_ref between its epoch bump and
+                 * slot load */
+                atomic_thread_fence(memory_order_seq_cst);
+                int amr_spins = 0;
+                while (atomic_load_explicit(&cf->active_mt_readers, memory_order_acquire) > 0)
+                {
+                    if (amr_spins < TDB_IMM_SNAP_ACQUIRE_SPIN_LIMIT)
+                        cpu_pause();
+                    else
+                        cpu_yield();
+                    amr_spins++;
+                }
+
                 /* now safe to free -- no reader can still be accessing these */
                 for (int fi = 0; fi < to_free_count; fi++)
                 {
@@ -17707,12 +17860,13 @@ static void *tidesdb_sync_worker_thread(void *arg)
             tidesdb_column_family_t *cf = db->column_families[i];
             if (cf && cf->config.sync_mode == TDB_SYNC_INTERVAL && cf->config.sync_interval_us > 0)
             {
-                tidesdb_memtable_t *mt = atomic_load(&cf->active_memtable);
-                /* we take a ref and re-confirm mt is still the active memtable.
+                /* we pin and re-confirm mt is still the active memtable.
                  * only immutable wals are closed by flush workers, never an
                  * active one, so a confirmed-active mt is safe to fsync. if it
                  * rotated, the rotation path already escalated the old wal. */
-                if (tidesdb_memtable_try_ref(mt))
+                tidesdb_memtable_t *mt = NULL;
+                if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
+                                                    &mt))
                 {
                     if (mt == atomic_load(&cf->active_memtable) && mt->wal)
                     {
@@ -17729,8 +17883,9 @@ static void *tidesdb_sync_worker_thread(void *arg)
          * above never reaches it. */
         if (db->unified_mt.enabled && db->config.unified_memtable_sync_mode == TDB_SYNC_INTERVAL)
         {
-            tidesdb_memtable_t *umt = atomic_load(&db->unified_mt.active);
-            if (tidesdb_memtable_try_ref(umt))
+            tidesdb_memtable_t *umt = NULL;
+            if (tidesdb_active_memtable_try_ref(&db->unified_mt.active_mt_readers,
+                                                &db->unified_mt.active, &umt))
             {
                 if (umt == atomic_load(&db->unified_mt.active) && umt->wal)
                 {
@@ -17891,8 +18046,14 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             break;
         }
 
-        /* we sweep deferred free list every cycle to reclaim retired sstable arrays */
+        /* we sweep deferred free list every cycle to reclaim retired sstable arrays.
+         * reaper_thread_mutex serializes us with tidesdb_drop_column_family_internal's
+         * targeted drain -- otherwise a drop could free a level while we hold the
+         * stolen list with an item pointing at it, and the next iteration would
+         * UAF on level->array_readers */
+        pthread_mutex_lock(&db->reaper_thread_mutex);
         tidesdb_deferred_free_sweep(db);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
 
         /*** retry flushes that were deferred because the global concurrent-flush
          **  cap was hit. the cap frees as in-flight flushes finish, so a
@@ -17953,11 +18114,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 if (!cf) continue;
 
                 /* active memtable -- exact size via atomic load (O(1)).
-                 * we take a ref so the memtable cannot rotate to immutable and be
-                 * freed underneath skip_list_get_size by a flush worker */
-                tidesdb_memtable_t *mt =
-                    atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-                if (tidesdb_memtable_try_ref(mt))
+                 * we pin under the active_mt_readers epoch so the memtable
+                 * cannot be freed by a flush worker between the load and the
+                 * try_ref */
+                tidesdb_memtable_t *mt = NULL;
+                if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
+                                                    &mt))
                 {
                     if (mt->skip_list)
                     {
@@ -18206,12 +18368,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                                    : 0;
             if (threshold > 0)
             {
-                tidesdb_memtable_t *umt =
-                    atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
-                /* we ref and reconfirm the active unified memtable -- only a
+                /* we pin and reconfirm the active unified memtable -- only a
                  * rotated immutable's wal is closed by tidesdb_unified_close_wal,
                  * never the active one, so a confirmed-active umt is safe to read */
-                if (tidesdb_memtable_try_ref(umt))
+                tidesdb_memtable_t *umt = NULL;
+                if (tidesdb_active_memtable_try_ref(&db->unified_mt.active_mt_readers,
+                                                    &db->unified_mt.active, &umt))
                 {
                     if (umt == atomic_load_explicit(&db->unified_mt.active, memory_order_acquire) &&
                         umt->wal)
@@ -19054,6 +19216,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             atomic_init(&(*db)->unified_mt.imm_snaps[s].readers, 0);
         }
         atomic_init(&(*db)->unified_mt.imm_snap_active, 0);
+        atomic_init(&(*db)->unified_mt.active_mt_readers, 0);
         atomic_init(&(*db)->unified_mt.is_flushing, 0);
         atomic_init(&(*db)->unified_mt.immutable_cleanup_counter, 0);
         atomic_init(&(*db)->unified_mt.next_cf_index, 0);
@@ -20838,6 +21001,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         atomic_init(&cf->imm_snaps[s].readers, 0);
     }
     atomic_init(&cf->imm_snap_active, 0);
+    atomic_init(&cf->active_mt_readers, 0);
     pthread_mutex_init(&cf->imm_snap_publish_lock, NULL);
 
     /*** in unified memtable mode, writes go through the unified WAL so
@@ -21327,6 +21491,31 @@ static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
             }
         }
     }
+
+    /* we drain readers pinning cf->active_memtable through the active_mt_readers
+     * epoch.  tidesdb_column_family_free will release the cf struct that holds
+     * the counter, so a reader still mid try_ref would UAF on the counter as
+     * well as on the memtable */
+    atomic_thread_fence(memory_order_seq_cst);
+    wait_count = 0;
+    while (atomic_load_explicit(&cf_to_drop->active_mt_readers, memory_order_acquire) > 0)
+    {
+        usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+        if (++wait_count % 100 == 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' drop waiting for active_memtable readers to drain",
+                          cf_to_drop->name);
+        }
+    }
+
+    /* drain deferred-free items for this cf's levels before column_family_free
+     * releases them.  the reaper's periodic sweep could otherwise be holding
+     * items pointing at our levels in its locally-stolen list and UAF on the
+     * next iteration's array_readers load. reaper_thread_mutex serializes us
+     * with the sweep so we cannot race a mid-walk reaper */
+    pthread_mutex_lock(&db->reaper_thread_mutex);
+    tidesdb_deferred_free_drain_for_cf(db, cf_to_drop);
+    pthread_mutex_unlock(&db->reaper_thread_mutex);
 
     /* we invalidate all block cache entries for this column family before freeing */
     tidesdb_invalidate_block_cache_for_cf(db, cf_to_drop->name);
@@ -22145,10 +22334,13 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         return TDB_SUCCESS;
     }
 
-    /* we reuse old_mt directly as the immutable memtable instead of allocating a new structure
-     * this avoids a race condition where another thread still holds a pointer to old_mt
-     * and tries to decrement its refcount after we free it
-     * the old_mt structure stays alive until all references are released */
+    /* we reuse old_mt directly as the immutable memtable instead of allocating
+     * a new structure. another thread that loaded cf->active_memtable before
+     * the swap below still holds the old_mt pointer and will try_ref it via
+     * the active_mt_readers epoch.  the immutable-cleanup loop drains that
+     * epoch before free()ing the struct so the late try_ref's refcount load
+     * is on live memory (and correctly returns 0 if cleanup already CAS'd
+     * refcount to 0) */
     tidesdb_immutable_memtable_t *immutable = old_mt;
     if (!immutable)
     {
@@ -23486,9 +23678,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         uint64_t found_seq_u = 0;
 
         /* we search unified active memtable */
-        tidesdb_memtable_t *umt =
-            atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-        int umt_refed = tidesdb_memtable_try_ref(umt);
+        tidesdb_memtable_t *umt = NULL;
+        int umt_refed = tidesdb_active_memtable_try_ref(&txn->db->unified_mt.active_mt_readers,
+                                                        &txn->db->unified_mt.active, &umt);
         if (umt_refed)
         {
             int mr = skip_list_get_with_seq_ref(umt->skip_list, prefixed_key, pk_size, &temp_val,
@@ -23627,9 +23819,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
      **   so the memtable must stay alive through the memcpy.
      *    we use CAS-based try_ref to safely handle concurrent rotation+cleanup.
      *    if try_ref fails the memtable is being freed, we fall through to immutables */
-    tidesdb_memtable_t *active_mt_struct =
-        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    int active_mt_refed = tidesdb_memtable_try_ref(active_mt_struct);
+    tidesdb_memtable_t *active_mt_struct = NULL;
+    int active_mt_refed = tidesdb_active_memtable_try_ref(&cf->active_mt_readers,
+                                                          &cf->active_memtable, &active_mt_struct);
     skip_list_t *active_mt = active_mt_refed ? active_mt_struct->skip_list : NULL;
 
     atomic_thread_fence(memory_order_acquire);
@@ -24399,8 +24591,9 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
     }
 
     /* we check per-CF active memtable */
-    tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    int mt_refed = tidesdb_memtable_try_ref(mt);
+    tidesdb_memtable_t *mt = NULL;
+    int mt_refed =
+        tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt);
 
     if (mt_refed && tidesdb_txn_check_seq_conflict(mt->skip_list, key, key_size, threshold_seq))
     {
@@ -24412,9 +24605,9 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
     /* we check unified memtable if enabled (data lives there, not in per-CF memtable) */
     if (txn->db->unified_mt.enabled)
     {
-        tidesdb_memtable_t *umt =
-            atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-        const int umt_refed = tidesdb_memtable_try_ref(umt);
+        tidesdb_memtable_t *umt = NULL;
+        const int umt_refed = tidesdb_active_memtable_try_ref(
+            &txn->db->unified_mt.active_mt_readers, &txn->db->unified_mt.active, &umt);
         if (umt_refed)
         {
             /* we build prefixed key for unified skip list lookup */
@@ -26161,9 +26354,8 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         int umt_attempts = 0;
         for (;;)
         {
-            umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-            if (!umt) return TDB_ERR_UNKNOWN;
-            if (!tidesdb_memtable_try_ref(umt))
+            if (!tidesdb_active_memtable_try_ref(&txn->db->unified_mt.active_mt_readers,
+                                                 &txn->db->unified_mt.active, &umt))
             {
                 if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
                 continue;
@@ -26387,8 +26579,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         int acquire_attempts = 0;
         for (;;)
         {
-            mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-            if (mt && tidesdb_memtable_try_ref(mt))
+            if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt))
             {
                 atomic_fetch_add_explicit(&mt->writers, 1, memory_order_acq_rel);
                 atomic_thread_fence(memory_order_seq_cst);
@@ -26846,17 +27037,17 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     tidesdb_immutable_memtable_t **imm_snapshot =
         tidesdb_snapshot_immutable_memtables(cf, &imm_count);
 
-    /*** we pin the active memtable with try_ref to prevent use-after-free
-     *   if rotation+flush races between our load and merge_source_from_memtable's ref.
-     **  without try_ref, the memtable could rotate to immutable, flush, and free
-     *** before the unconditional ref in merge_source_from_memtable fires. */
-    tidesdb_memtable_t *active_mt_struct =
-        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    if (active_mt_struct && !tidesdb_memtable_try_ref(active_mt_struct))
+    /*** we pin the active memtable to prevent use-after-free if rotation +
+     *   flush races between our load and merge_source_from_memtable's ref.
+     **  the helper bumps active_mt_readers across the load + try_ref so the
+     *** cleanup loop cannot free the struct between them. */
+    tidesdb_memtable_t *active_mt_struct = NULL;
+    if (!tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
+                                         &active_mt_struct))
     {
         /* rotation raced with our load, we retry once */
-        active_mt_struct = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-        if (active_mt_struct) tidesdb_memtable_try_ref(active_mt_struct);
+        (void)tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
+                                              &active_mt_struct);
     }
     skip_list_t *active_mt =
         (active_mt_struct && active_mt_struct->skip_list) ? active_mt_struct->skip_list : NULL;
@@ -26944,13 +27135,13 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
          *     atomic_load and the source creation's internal ref call. */
         if (txn->db->unified_mt.enabled)
         {
-            tidesdb_memtable_t *umt =
-                atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-            if (!umt || !tidesdb_memtable_try_ref(umt))
+            tidesdb_memtable_t *umt = NULL;
+            if (!tidesdb_active_memtable_try_ref(&txn->db->unified_mt.active_mt_readers,
+                                                 &txn->db->unified_mt.active, &umt))
             {
                 /* we retry once if rotation raced with our load */
-                umt = atomic_load_explicit(&txn->db->unified_mt.active, memory_order_acquire);
-                if (umt) tidesdb_memtable_try_ref(umt);
+                (void)tidesdb_active_memtable_try_ref(&txn->db->unified_mt.active_mt_readers,
+                                                      &txn->db->unified_mt.active, &umt);
             }
             if (umt && umt->skip_list)
             {
@@ -33602,12 +33793,11 @@ int tidesdb_sync_wal(tidesdb_column_family_t *cf)
     if (!cf || !cf->db) return TDB_ERR_INVALID_ARGS;
 
     /* we load active memtable with refcount protection to safely access its WAL */
-    tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    if (!tidesdb_memtable_try_ref(mt))
+    tidesdb_memtable_t *mt = NULL;
+    if (!tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt))
     {
         /* the memtable was rotated, we must reload */
-        mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-        if (!tidesdb_memtable_try_ref(mt))
+        if (!tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt))
         {
             return TDB_ERR_IO;
         }

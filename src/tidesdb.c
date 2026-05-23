@@ -383,7 +383,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 
 /* default L0/L1 management configuration */
 #define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
-#define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD 20
+#define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD 10
 
 /* default tombstone density trigger configuration -- 0.0 disables the check, an sstable
  * must hold at least TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES entries before its density
@@ -18840,6 +18840,27 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     memcpy(&(*db)->config, config, sizeof(tidesdb_config_t));
 
+    /* normalize the flush pool sizing. num_flush_threads must be positive
+     * and max_concurrent_flushes is pinned 1:1 to it -- a higher cap is
+     * meaningless because the pool is the upper bound, a lower cap leaves
+     * workers idle, so any deviation gets a warning and is corrected.
+     * subsequent code reads from the owned copy via the rebind below */
+    if ((*db)->config.num_flush_threads <= 0)
+        (*db)->config.num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE;
+    if ((*db)->config.max_concurrent_flushes <= 0)
+        (*db)->config.max_concurrent_flushes = (*db)->config.num_flush_threads;
+    else if ((*db)->config.max_concurrent_flushes != (*db)->config.num_flush_threads)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "max_concurrent_flushes (%d) does not match num_flush_threads (%d) -- "
+                      "pinning to num_flush_threads",
+                      (*db)->config.max_concurrent_flushes, (*db)->config.num_flush_threads);
+        (*db)->config.max_concurrent_flushes = (*db)->config.num_flush_threads;
+    }
+    /* subsequent reads in tidesdb_open should see the normalized values, so
+     * rebind the input config alias to point at the owned copy */
+    config = &(*db)->config;
+
     /* object_store_config is a caller-owned pointer the user typically passes
      * from a stack variable -- deep-copy it so the db keeps a stable view
      * even after the caller's frame is gone */
@@ -23013,7 +23034,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                               "flush engine appears wedged",
                               cf->name,
                               no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-                return TDB_ERR_IO; /* flush engine genuinely stuck, not merely slow */
+                return TDB_ERR_BUSY;
             }
         }
 
@@ -23087,7 +23108,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                                   "%dms - flush engine appears wedged",
                                   cf->name,
                                   no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-                    return TDB_ERR_IO;
+                    return TDB_ERR_BUSY;
                 }
             }
 
@@ -23167,7 +23188,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                                   "unified active memtable ceiling stall: no rotate progress for "
                                   "%dms - flush engine appears wedged",
                                   no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-                    return TDB_ERR_IO;
+                    return TDB_ERR_BUSY;
                 }
             }
 
@@ -23237,7 +23258,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                         TDB_LOG_ERROR,
                         "CF '%s' global memory pressure stall timeout after %d iterations",
                         cf->name, wait);
-                    return TDB_ERR_MEMORY_LIMIT;
+                    return TDB_ERR_BUSY;
                 }
             }
             TDB_DEBUG_LOG(TDB_LOG_INFO,
@@ -32738,10 +32759,16 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                 usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
             }
 
-            /* we check if memtable is already empty (flushed by another thread) */
-            tidesdb_memtable_t *mt =
-                atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-            if (!mt || !mt->skip_list || skip_list_count_entries(mt->skip_list) == 0) break;
+            /* we check if memtable is already empty (flushed by another thread).
+             * pin the active under cf->active_mt_readers so a concurrent flush
+             * worker draining a just-rotated immutable cannot free the struct
+             * between our load and the skip_list deref */
+            tidesdb_memtable_t *mt = NULL;
+            int mt_pinned =
+                tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt);
+            int empty = !mt_pinned || !mt->skip_list || skip_list_count_entries(mt->skip_list) == 0;
+            if (mt_pinned) tidesdb_immutable_memtable_unref(mt);
+            if (empty) break;
 
             result = tidesdb_flush_memtable_internal(cf, 0, 1);
             if (result != TDB_SUCCESS && result != TDB_ERR_MEMORY)

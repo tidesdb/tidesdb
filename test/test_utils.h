@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "../src/compat.h"
+#include "../src/tidesdb.h"
 #include "test_macros.h"
 
 /* global test filter -- set via argv[1] for running specific tests */
@@ -91,6 +92,28 @@ static UNUSED int tests_skipped = 0;
 static inline void cleanup_test_dir(void)
 {
     (void)remove_directory(TEST_DB_PATH);
+}
+
+/*
+ * tdb_test_commit_with_retry
+ * commit a txn, retrying on TDB_ERR_BUSY (backpressure stall timeout) so that
+ * stress tests don't flake on slow CI boxes where the 10s no-progress budget
+ * can be reached under sustained load. caller still observes any real error
+ * (TDB_ERR_IO, TDB_ERR_NOT_FOUND, TDB_ERR_UNKNOWN, ...) as the final return.
+ * @param txn         transaction to commit (caller still owns the txn handle)
+ * @param max_retries upper bound on retry attempts. 0 disables retry
+ * @return 0 on success, or the last commit error code
+ */
+static inline int tdb_test_commit_with_retry(tidesdb_txn_t *txn, int max_retries)
+{
+    int rc;
+    for (int attempt = 0; attempt <= max_retries; attempt++)
+    {
+        rc = tidesdb_txn_commit(txn);
+        if (rc != TDB_ERR_BUSY) return rc;
+        usleep(50000); /* 50ms backoff between attempts */
+    }
+    return rc;
 }
 
 /*

@@ -161,6 +161,7 @@ typedef enum
 #define TDB_ERR_UNKNOWN      -11
 #define TDB_ERR_LOCKED       -12
 #define TDB_ERR_READONLY     -13
+#define TDB_ERR_BUSY         -14
 
 /** configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64

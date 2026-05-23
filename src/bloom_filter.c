@@ -196,6 +196,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
     if (m_double <= 0.0 || m_double > (double)UINT32_MAX)
     {
         free(*bf);
+        *bf = NULL;
         return -1;
     }
 
@@ -212,6 +213,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
     if (h_double <= 0.0 || h_double > (double)BF_MAX_HASH_FUNCTIONS)
     {
         free(*bf);
+        *bf = NULL;
         return -1;
     }
 
@@ -224,6 +226,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
     if ((*bf)->size_in_words == 0 || (*bf)->size_in_words > UINT32_MAX / sizeof(uint64_t))
     {
         free(*bf);
+        *bf = NULL;
         return -1;
     }
 
@@ -232,6 +235,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
     if ((*bf)->bitset == NULL)
     {
         free(*bf);
+        *bf = NULL;
         return -1;
     }
 

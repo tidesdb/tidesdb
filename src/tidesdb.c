@@ -15898,8 +15898,20 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                             block_indexes = NULL;
                             if (cf->config.enable_bloom_filter)
                             {
-                                bloom_filter_new(&bloom, cf->config.bloom_fpr,
-                                                 (int)estimated_entries);
+                                /* bloom_filter_new nulls bloom on failure
+                                 * (see contract in src/bloom_filter.c), so a
+                                 * miss here leaves bloom NULL and the merge
+                                 * loop skips bloom_filter_add */
+                                if (bloom_filter_new(&bloom, cf->config.bloom_fpr,
+                                                     (int)estimated_entries) != 0)
+                                {
+                                    TDB_DEBUG_LOG(
+                                        TDB_LOG_WARN,
+                                        "Partitioned merge partition %d: bloom_filter_new "
+                                        "failed on file_max split (estimated_entries=%" PRIu64
+                                        "), continuing without bloom for this split sstable",
+                                        partition, estimated_entries);
+                                }
                             }
                             if (cf->config.enable_block_indexes && !cf->config.use_btree)
                             {

@@ -772,6 +772,11 @@ struct tidesdb_unified_flush_barrier_t
  * @param steer_min_key_size size of steer_min_key
  * @param steer_max_key malloc'd copy of the dense sstable's max key (worker frees)
  * @param steer_max_key_size size of steer_max_key
+ * @param done_mu when non-NULL, the worker signals done_flag + broadcasts done_cv under done_mu on
+ * every exit path that consumes this work item, so a blocking caller can park on the signal until
+ * the work is serviced or discarded
+ * @param done_cv paired with done_mu
+ * @param done_flag paired with done_mu
  */
 struct tidesdb_compaction_work_t
 {
@@ -784,6 +789,9 @@ struct tidesdb_compaction_work_t
     size_t steer_min_key_size;
     uint8_t *steer_max_key;
     size_t steer_max_key_size;
+    pthread_mutex_t *done_mu;
+    pthread_cond_t *done_cv;
+    _Atomic(int) *done_flag;
 };
 
 /**
@@ -1418,6 +1426,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  int is_largest_level);
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction);
+static int tidesdb_compact_internal(tidesdb_column_family_t *cf, int full_compaction, int blocking);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable);
 static int tidesdb_wal_replay_into(tidesdb_column_family_t *cf, block_manager_t *wal,
@@ -16309,8 +16318,10 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
     if (!atomic_compare_exchange_strong_explicit(&cf->is_compacting, &expected, 1,
                                                  memory_order_acquire, memory_order_relaxed))
     {
-        /* another compaction is already running, skip this one */
-        return TDB_SUCCESS;
+        /* another compaction is already running. callers that care (the
+         * compaction worker on a blocking work item) requeue; callers that do
+         * not (the legacy direct paths) treat this as a coalesced skip */
+        return TDB_ERR_LOCKED;
     }
 
     /* we check again after acquiring is_compacting in case drop happened between checks */
@@ -17623,6 +17634,21 @@ static void *tidesdb_flush_worker_thread(void *arg)
 }
 
 /**
+ * tidesdb_compaction_work_signal_done
+ * signal a blocking caller that its work item has been serviced. no-op when
+ * the work item carries no signal (the common fire-and-forget case).
+ * @param work compaction work item
+ */
+static void tidesdb_compaction_work_signal_done(tidesdb_compaction_work_t *work)
+{
+    if (!work || !work->done_mu) return;
+    pthread_mutex_lock(work->done_mu);
+    atomic_store_explicit(work->done_flag, 1, memory_order_release);
+    pthread_cond_broadcast(work->done_cv);
+    pthread_mutex_unlock(work->done_mu);
+}
+
+/**
  * tidesdb_compaction_worker_thread
  * worker thread that processes compaction work items from the queue
  *
@@ -17667,6 +17693,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
         if (cf == NULL)
         {
+            tidesdb_compaction_work_signal_done(work);
             free(work);
             continue;
         }
@@ -17678,6 +17705,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
                           cf->name);
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+            tidesdb_compaction_work_signal_done(work);
             free(work);
             continue;
         }
@@ -17694,6 +17722,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             /* we clear is_compacting flag so compaction can be retried later */
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+            tidesdb_compaction_work_signal_done(work);
             free(work);
             continue;
         }
@@ -17733,12 +17762,30 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             free(work->steer_max_key);
             atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
             atomic_fetch_sub_explicit(&db->active_compactions, 1, memory_order_acq_rel);
+            tidesdb_compaction_work_signal_done(work);
             free(work);
             continue;
         }
 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Compacting CF '%s'", cf->name);
         const int result = tidesdb_trigger_compaction(cf, work->full_compaction);
+        if (result == TDB_ERR_LOCKED)
+        {
+            /* another worker is mid-compaction on this cf. requeue this item
+             * without signaling so a blocking caller's intent is preserved --
+             * its work runs once the holder releases is_compacting. brief
+             * back-off avoids a hot-loop against the lock holder */
+            atomic_fetch_sub_explicit(&db->active_compactions, 1, memory_order_acq_rel);
+            if (queue_enqueue(db->compaction_queue, work) != 0)
+            {
+                atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+                tidesdb_compaction_work_signal_done(work);
+                free(work);
+                continue;
+            }
+            usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
+            continue;
+        }
         if (result != TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' compaction failed with error %d", cf->name,
@@ -17747,8 +17794,15 @@ static void *tidesdb_compaction_worker_thread(void *arg)
              * failure */
         }
 
+        /* drain any auto-trigger that arrived while is_compacting was held.
+         * exchange-to-zero so a re-arm after this point queues another
+         * follow-up rather than being swallowed here */
+        if (atomic_exchange_explicit(&cf->compaction_armed, 0, memory_order_acq_rel))
+            tidesdb_enqueue_compaction(cf, 0);
+
         atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
         atomic_fetch_sub_explicit(&db->active_compactions, 1, memory_order_acq_rel);
+        tidesdb_compaction_work_signal_done(work);
         free(work);
     }
 
@@ -18095,6 +18149,31 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
         }
 
+        /* drain any compaction triggers that were coalesced against an
+         * in-flight compaction. the worker that finished the compaction also
+         * drains the armed flag, this pass is a backstop for the case where a
+         * trigger arrives after the worker checked but before is_compacting
+         * cleared, leaving the flag set with no worker to service it */
+        {
+            tidesdb_column_family_t *armed_cfs[TDB_REAPER_DEFERRED_FLUSH_BATCH];
+            int armed_count = 0;
+            pthread_rwlock_rdlock(&db->cf_list_lock);
+            for (int i = 0;
+                 i < db->num_column_families && armed_count < TDB_REAPER_DEFERRED_FLUSH_BATCH; i++)
+            {
+                tidesdb_column_family_t *cf = db->column_families[i];
+                if (cf && atomic_load_explicit(&cf->compaction_armed, memory_order_acquire))
+                    armed_cfs[armed_count++] = cf;
+            }
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            for (int i = 0; i < armed_count; i++)
+            {
+                if (atomic_exchange_explicit(&armed_cfs[i]->compaction_armed, 0,
+                                             memory_order_acq_rel))
+                    tidesdb_enqueue_compaction(armed_cfs[i], 0);
+            }
+        }
+
         /*** global memory pressure computations
          * we scan all CFs to compute total memtable + cache + bloom/index memory
          * we store pressure level atomically for write path to consume
@@ -18347,7 +18426,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                                   "(%d SSTables, most in system)",
                                   level == TDB_MEMORY_PRESSURE_CRITICAL ? "CRITICAL" : "HIGH",
                                   compact_victim->name, compact_victim_sst_count);
-                    tidesdb_compact(compact_victim);
+                    /* non-blocking -- the reaper cannot park on a multi-minute
+                     * compaction without starving every other duty */
+                    tidesdb_compact_internal(compact_victim, 1, 0);
                 }
             }
 
@@ -20167,7 +20248,14 @@ int tidesdb_close(tidesdb_t *db)
         {
             tidesdb_compaction_work_t *work =
                 (tidesdb_compaction_work_t *)queue_dequeue(db->compaction_queue);
-            if (work) free(work);
+            if (work)
+            {
+                /* signal a blocking caller before discarding so it does not
+                 * park forever on a work item the close path drained without
+                 * running */
+                tidesdb_compaction_work_signal_done(work);
+                free(work);
+            }
         }
         queue_free(db->compaction_queue);
     }
@@ -21212,6 +21300,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->flush_pending_count, 0);
     atomic_init(&cf->flush_deferred, 0);
     atomic_init(&cf->compaction_pending_count, 0);
+    atomic_init(&cf->compaction_armed, 0);
     atomic_init(&cf->immutable_cleanup_counter, 0);
     atomic_init(&cf->pending_commits, 0);
 
@@ -22505,7 +22594,10 @@ static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_comp
 
     if (atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
     {
-        /* compaction already running, skip */
+        /* compaction already running. arm a follow-up so the worker
+         * re-enqueues once it finishes this round, otherwise a trigger that
+         * arrived mid-compaction is silently coalesced into nothing */
+        atomic_store_explicit(&cf->compaction_armed, 1, memory_order_release);
         return TDB_SUCCESS;
     }
 
@@ -22530,13 +22622,72 @@ static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_comp
     return TDB_SUCCESS;
 }
 
+/**
+ * tidesdb_compact_internal
+ * shared body for manual full compaction. blocking=0 enqueues and returns
+ * immediately, the auto-trigger and reaper paths use this shape. blocking=1
+ * parks the caller on a per-call done signal that the worker fires on every
+ * exit path that consumes the work item, and never coalesces against an
+ * in-flight compaction -- the caller's request runs as its own work item
+ * @param cf column family
+ * @param full_compaction 1 for a true full merge, 0 for geometry-driven
+ * @param blocking 1 to wait until the work item is serviced
+ * @return TDB_SUCCESS once the work has been serviced (blocking) or enqueued
+ *         (non-blocking); error codes on alloc/queue failure
+ */
+static int tidesdb_compact_internal(tidesdb_column_family_t *cf, int full_compaction, int blocking)
+{
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+
+    if (!blocking) return tidesdb_enqueue_compaction(cf, full_compaction);
+
+    pthread_mutex_t done_mu;
+    pthread_cond_t done_cv;
+    _Atomic(int) done_flag;
+    pthread_mutex_init(&done_mu, NULL);
+    pthread_cond_init(&done_cv, NULL);
+    atomic_init(&done_flag, 0);
+
+    tidesdb_compaction_work_t *work = calloc(1, sizeof(tidesdb_compaction_work_t));
+    if (!work)
+    {
+        pthread_cond_destroy(&done_cv);
+        pthread_mutex_destroy(&done_mu);
+        return TDB_ERR_MEMORY;
+    }
+    work->cf = cf;
+    work->full_compaction = full_compaction;
+    work->done_mu = &done_mu;
+    work->done_cv = &done_cv;
+    work->done_flag = &done_flag;
+
+    atomic_fetch_add_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+    if (queue_enqueue(cf->db->compaction_queue, work) != 0)
+    {
+        atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
+        free(work);
+        pthread_cond_destroy(&done_cv);
+        pthread_mutex_destroy(&done_mu);
+        return TDB_ERR_MEMORY;
+    }
+
+    pthread_mutex_lock(&done_mu);
+    while (!atomic_load_explicit(&done_flag, memory_order_acquire))
+        pthread_cond_wait(&done_cv, &done_mu);
+    pthread_mutex_unlock(&done_mu);
+    pthread_cond_destroy(&done_cv);
+    pthread_mutex_destroy(&done_mu);
+    return TDB_SUCCESS;
+}
+
 int tidesdb_compact(tidesdb_column_family_t *cf)
 {
-    /* the public manual API runs a true full compaction -- merge every level
-     * into the largest so all garbage (tombstones, single-delete pairs,
-     * superseded puts) is reclaimed.  the internal auto-compaction triggers use
-     * the geometry-driven path via tidesdb_enqueue_compaction(cf, 0). */
-    return tidesdb_enqueue_compaction(cf, 1);
+    /* manual full compaction. merges every level into the largest so all
+     * garbage (tombstones, single-delete pairs, superseded puts) is
+     * reclaimed. blocks until the worker has finished servicing the request,
+     * including any in-flight compaction the worker is already running on
+     * this cf */
+    return tidesdb_compact_internal(cf, 1, 1);
 }
 
 /**
@@ -22567,7 +22718,11 @@ static int tidesdb_compact_steer_to_bottom(tidesdb_column_family_t *cf, uint8_t 
 
     if (atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
     {
-        /* compaction already running -- skip, the keys are no longer needed */
+        /* compaction already running -- skip, the keys are no longer needed.
+         * arm a follow-up so the worker schedules a geometry round once it
+         * finishes; the density witness state cannot survive the drop but
+         * the next flush's witness check will re-detect it if still dense */
+        atomic_store_explicit(&cf->compaction_armed, 1, memory_order_release);
         free(min_key);
         free(max_key);
         return TDB_SUCCESS;

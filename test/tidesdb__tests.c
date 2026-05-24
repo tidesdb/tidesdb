@@ -24244,7 +24244,17 @@ static void test_perf_txn_put_throughput(void)
     ASSERT_TRUE(db != NULL);
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    /* arena allocates write_buffer_size * 2, on a 32 bit i386 ASan build
+     * the address space is ~1.5 GiB after ASan shadow and a 128 MiB buffer
+     * means a 256 MiB single allocation per memtable plus a second 256 MiB
+     * arena on the close path rotate, intermittently OOMs the process. the
+     * workload only fills ~11 MiB so 16 MiB is enough headroom to never
+     * rotate during the put loop while staying safe on 32 bit */
+#if INTPTR_MAX == INT32_MAX
+    cf_config.write_buffer_size = 16 * 1024 * 1024;
+#else
     cf_config.write_buffer_size = 128 * 1024 * 1024;
+#endif
     cf_config.sync_mode = TDB_SYNC_NONE;
     ASSERT_EQ(tidesdb_create_column_family(db, "put_perf_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "put_perf_cf");

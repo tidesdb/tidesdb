@@ -11179,7 +11179,11 @@ static void test_cf_drop_during_active_compaction(void)
             ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                       strlen(value) + 1, -1),
                       TDB_SUCCESS);
-            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            /* see tdb_test_commit_with_retry -- inline batches with a forced
+             * flush per outer iteration push the L0 queue under load, a slow
+             * runner can reach the backpressure no-progress budget on one of
+             * these commits without any real failure */
+            ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), TDB_SUCCESS);
             tidesdb_txn_free(txn);
         }
 

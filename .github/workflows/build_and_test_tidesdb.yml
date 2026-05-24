@@ -410,9 +410,22 @@ jobs:
         run: |
           cd build
           if [ "${{ matrix.arch }}" == "ppc" ]; then
-            echo "**Linux PowerPC 32-bit: build verified, runtime tests skipped (QEMU usermode PPC emulation segfaults on pthreads/atomics)"
+            # Linux PowerPC 32-bit: attempt qemu-user-static execution. older qemu
+            # versions segfaulted on PowerPC pthread mutex internals and lwsync
+            # barrier translation; modern qemu (8.x+) has improved this. trailing
+            # || true keeps the workflow green on emulation regressions while still
+            # logging the segfault for diagnosis. wrap in `timeout` so a hung qemu
+            # cannot burn the full ctest budget.
+            echo "**Linux PowerPC 32-bit: running tests via qemu-user-static (best effort)"
+            timeout 1800 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests \
+              || echo "**qemu-ppc-static exit non-zero -- see log above; build verification still valid"
           elif [ "${{ matrix.arch }}" == "ppc-macos" ]; then
-            echo "**macOS PowerPC (G5): build verified, runtime tests skipped (QEMU usermode PPC emulation segfaults on pthreads/atomics)"
+            # macOS PowerPC (G5): the cross-build emits Mach-O PowerPC binaries
+            # targeting Mac OS X 10.6.8 which Linux has no way to execute --
+            # Darling does not support PowerPC, and qemu-system-ppc booting an
+            # actual OS X PowerPC VM is impractical (licensed installer ISO +
+            # 10+ min boot per CI). build verification is the realistic ceiling.
+            echo "**macOS PowerPC (G5): build verified, runtime tests not possible on a Linux runner (Mach-O PPC has no Linux execution path)"
           elif [ "${{ matrix.arch }}" == "riscv64" ]; then
             CTEST_OUTPUT_ON_FAILURE=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
             echo "**Linux RISC-V 64-bit tests run via QEMU emulation"

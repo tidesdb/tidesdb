@@ -15723,7 +15723,11 @@ static void test_seek_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* see tdb_test_commit_with_retry -- with a 64 KiB write buffer and
+         * VALUE_SIZE large values every commit triggers a flush check, slow
+         * BSD CI runners reach the backpressure budget without anything
+         * actually being broken */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         /* we force flush every KEYS_PER_FLUSH keys to create multiple ssts */
@@ -20544,7 +20548,11 @@ static void *unified_writer_thread(void *arg)
             tidesdb_txn_delete(txn, d->cf, (uint8_t *)del_key, strlen(del_key) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) != 0)
+        /* see tdb_test_commit_with_retry -- 4 KiB write buffer + 6 writers
+         * + 2 flushers + 2 compactors all hammering the same cf can starve
+         * the flush worker enough on slow CI to reach the backpressure
+         * no-progress budget. a real commit bug still surfaces as nonzero */
+        if (tdb_test_commit_with_retry(txn, 20) != 0)
         {
             atomic_fetch_add(d->commit_errors, 1);
         }
@@ -20897,6 +20905,19 @@ static void test_range_cost(void)
 
     wait_count = 0;
     while (tidesdb_is_flushing(cf) && wait_count < 100)
+    {
+        usleep(10000);
+        wait_count++;
+    }
+
+    /* drain auto-compactions too. with a 4 KiB write buffer the 400 commits
+     * generate enough L0 ssts to trip the file-count and size triggers, and
+     * the cost comparisons below need a stable on-disk layout -- otherwise
+     * a compaction completing between the wide_cost and reversed_cost
+     * measurements collapses ssts under the second call and produces a
+     * legitimately different number for the same key range */
+    wait_count = 0;
+    while ((tidesdb_is_compacting(cf) || tidesdb_is_flushing(cf)) && wait_count < 1000)
     {
         usleep(10000);
         wait_count++;

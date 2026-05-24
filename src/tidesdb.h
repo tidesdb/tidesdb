@@ -138,6 +138,9 @@ typedef enum
 #define TDB_ERR_UNKNOWN      -11
 #define TDB_ERR_LOCKED       -12
 #define TDB_ERR_READONLY     -13
+/* system is at capacity and the operation gave up after the backpressure
+ * stall hit its no-progress budget. transient; callers should retry */
+#define TDB_ERR_BUSY -14
 
 #ifdef TDB_ENABLE_READ_PROFILING
 /**
@@ -328,7 +331,20 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param write_buffer_size size of write buffer
  * @param level_size_ratio ratio of level sizes
  * @param min_levels minimum number of levels
- * @param dividing_level_offset offset for dividing level
+ * @param dividing_level_offset selects spooky's dividing level X via
+ *                              X = num_levels - 1 - offset (X clamped to >= 1).
+ *                              offset=0 means X=L-1 (the second-largest level)
+ *                              and gives the 2L-spooky variant from the paper
+ *                              with transient space-amp bounded by 1/T but the
+ *                              highest write-amp. offset=1 means X=L-2 and is
+ *                              the paper's recommended generalized tuning,
+ *                              trading some ingest throughput for noticeably
+ *                              lower compaction write-amp. higher offsets push
+ *                              X further up the tree, reducing write-amp again
+ *                              but multiplying the number of open files per
+ *                              spooky equation 12. default 0 favors ingest
+ *                              throughput; set to 1 for write-amp-sensitive
+ *                              workloads.
  * @param klog_value_threshold threshold for klog value
  * @param compression_algorithm compression algorithm
  * @param enable_bloom_filter enable bloom filter
@@ -441,7 +457,10 @@ typedef struct tidesdb_comparator_entry_t
  * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
  *                               across all column families. bounds total transient memory and
  *                               work-queue depth when many column families flush at once.
- *                               0 falls back to TDB_DEFAULT_MAX_CONCURRENT_FLUSHES.
+ *                               pinned 1:1 to num_flush_threads at open -- a higher cap is
+ *                               meaningless because the pool size is the upper bound, a lower
+ *                               cap leaves workers idle. 0 means "match num_flush_threads",
+ *                               any other mismatch is corrected with a warning.
  */
 typedef struct tidesdb_config_t
 {

@@ -6637,7 +6637,11 @@ static void test_dynamic_capacity_adjustment(void)
         ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                   strlen(value) + 1, 0),
                   0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* see tdb_test_commit_with_retry -- with a 1 KiB write buffer every
+         * commit is a flush trigger, so a slow CI box can reach the backpressure
+         * stall budget on one of these 2500 commits without the dca logic
+         * being broken */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         total_keys_written++;
@@ -11175,7 +11179,11 @@ static void test_cf_drop_during_active_compaction(void)
             ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                       strlen(value) + 1, -1),
                       TDB_SUCCESS);
-            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            /* see tdb_test_commit_with_retry -- inline batches with a forced
+             * flush per outer iteration push the L0 queue under load, a slow
+             * runner can reach the backpressure no-progress budget on one of
+             * these commits without any real failure */
+            ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), TDB_SUCCESS);
             tidesdb_txn_free(txn);
         }
 
@@ -15719,7 +15727,11 @@ static void test_seek_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* see tdb_test_commit_with_retry -- with a 64 KiB write buffer and
+         * VALUE_SIZE large values every commit triggers a flush check, slow
+         * BSD CI runners reach the backpressure budget without anything
+         * actually being broken */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         /* we force flush every KEYS_PER_FLUSH keys to create multiple ssts */
@@ -20272,7 +20284,10 @@ static void *mt_mixed_rw_writer_thread(void *arg)
                         uval_size, 0);
         free(uval);
 
-        int commit_rc = tidesdb_txn_commit(txn);
+        /* retry on TDB_ERR_BUSY -- a slow CI box can reach the backpressure
+         * stall no-progress budget under sustained contention. a real commit
+         * failure still surfaces in the final rc */
+        int commit_rc = tdb_test_commit_with_retry(txn, 20);
         if (commit_rc == 0)
         {
             atomic_fetch_add(data->commit_ok, 1);
@@ -20537,7 +20552,11 @@ static void *unified_writer_thread(void *arg)
             tidesdb_txn_delete(txn, d->cf, (uint8_t *)del_key, strlen(del_key) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) != 0)
+        /* see tdb_test_commit_with_retry -- 4 KiB write buffer + 6 writers
+         * + 2 flushers + 2 compactors all hammering the same cf can starve
+         * the flush worker enough on slow CI to reach the backpressure
+         * no-progress budget. a real commit bug still surfaces as nonzero */
+        if (tdb_test_commit_with_retry(txn, 20) != 0)
         {
             atomic_fetch_add(d->commit_errors, 1);
         }
@@ -20890,6 +20909,19 @@ static void test_range_cost(void)
 
     wait_count = 0;
     while (tidesdb_is_flushing(cf) && wait_count < 100)
+    {
+        usleep(10000);
+        wait_count++;
+    }
+
+    /* drain auto-compactions too. with a 4 KiB write buffer the 400 commits
+     * generate enough L0 ssts to trip the file-count and size triggers, and
+     * the cost comparisons below need a stable on-disk layout -- otherwise
+     * a compaction completing between the wide_cost and reversed_cost
+     * measurements collapses ssts under the second call and produces a
+     * legitimately different number for the same key range */
+    wait_count = 0;
+    while ((tidesdb_is_compacting(cf) || tidesdb_is_flushing(cf)) && wait_count < 1000)
     {
         usleep(10000);
         wait_count++;
@@ -22083,7 +22115,9 @@ static void *iter_direction_writer_thread(void *arg)
             tidesdb_txn_delete(txn, d->cf, (uint8_t *)del_key, strlen(del_key) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
+        /* see tdb_test_commit_with_retry -- TDB_ERR_BUSY is a slow-box
+         * artifact, not a test bug, so we retry before counting an error */
+        if (tdb_test_commit_with_retry(txn, 20) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -22597,19 +22631,25 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
             ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                       vlen, 0),
                       0);
-            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
             tidesdb_txn_free(txn);
         }
 
+        /* the post-flush and post-compact wait budgets are widened to 20s
+         * (1000 x 20ms) from the original 4s because a slow CI box can
+         * legitimately take that long to drain a multi-level compaction
+         * triggered by a 512B write buffer. dropping through with mid-flush
+         * state visible to the concurrent stress phase below is the actual
+         * fragility this test has on constrained runners */
         tidesdb_flush_memtable(cf);
-        for (int w = 0; w < 200; w++)
+        for (int w = 0; w < 1000; w++)
         {
             if (!atomic_load(&cf->is_flushing) && queue_size(db->flush_queue) == 0) break;
             usleep(20000);
         }
 
         tidesdb_compact(cf);
-        for (int w = 0; w < 200; w++)
+        for (int w = 0; w < 1000; w++)
         {
             if (!atomic_load(&cf->is_compacting)) break;
             usleep(20000);
@@ -22889,7 +22929,10 @@ static void *mcf_sat_writer_thread(void *arg)
         tidesdb_txn_put(txn, d->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
                         strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
+        /* see tdb_test_commit_with_retry -- saturating the flush queue is
+         * the whole point of this test, so TDB_ERR_BUSY is expected and we
+         * back off rather than counting it as an error */
+        if (tdb_test_commit_with_retry(txn, 20) != 0) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -24201,7 +24244,17 @@ static void test_perf_txn_put_throughput(void)
     ASSERT_TRUE(db != NULL);
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    /* arena allocates write_buffer_size * 2, on a 32 bit i386 ASan build
+     * the address space is ~1.5 GiB after ASan shadow and a 128 MiB buffer
+     * means a 256 MiB single allocation per memtable plus a second 256 MiB
+     * arena on the close path rotate, intermittently OOMs the process. the
+     * workload only fills ~11 MiB so 16 MiB is enough headroom to never
+     * rotate during the put loop while staying safe on 32 bit */
+#if INTPTR_MAX == INT32_MAX
+    cf_config.write_buffer_size = 16 * 1024 * 1024;
+#else
     cf_config.write_buffer_size = 128 * 1024 * 1024;
+#endif
     cf_config.sync_mode = TDB_SYNC_NONE;
     ASSERT_EQ(tidesdb_create_column_family(db, "put_perf_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "put_perf_cf");

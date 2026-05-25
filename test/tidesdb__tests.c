@@ -2206,6 +2206,27 @@ static void wait_for_flush_queue_drain(tidesdb_t *db)
     }
 }
 
+/* wait until a CF is fully flush-idle. an empty flush_queue is NOT sufficient: a flush deferred by
+ * global-cap backpressure leaves the queue empty with flush_deferred set for the reaper to retry,
+ * and a dequeued flush is still in flight until the sstable is added to its level.
+ * flush_pending_count is incremented at enqueue and decremented only after that level-add, so it
+ * has no TOCTOU gap -- mirroring wait_for_compaction_idle's use of compaction_pending_count.
+ * callers that then compact and assert on reaped state must use this, or the compaction can run
+ * before the tombstones land. */
+static void wait_for_cf_flush_idle(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    const int max_wait = 600; /* up to ~6s on a slow runner */
+    for (int i = 0; i < max_wait; i++)
+    {
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
+            !atomic_load_explicit(&cf->flush_deferred, memory_order_acquire) &&
+            !tidesdb_is_flushing(cf))
+            break;
+        usleep(10000);
+    }
+}
+
 /* helper used by the single-delete compaction tests -- waits for an in-flight
  * compaction to finish so we can assert on post-compaction state. */
 static void wait_for_compaction_idle(tidesdb_t *db, tidesdb_column_family_t *cf)
@@ -2546,7 +2567,7 @@ static void run_put_then_delete_workload(tidesdb_t *db, tidesdb_column_family_t 
         tidesdb_txn_free(txn);
 
         tidesdb_flush_memtable(cf);
-        wait_for_flush_queue_drain(db);
+        wait_for_cf_flush_idle(db, cf);
     }
 
     for (int b = 0; b < num_batches; b++)
@@ -2576,7 +2597,7 @@ static void run_put_then_delete_workload(tidesdb_t *db, tidesdb_column_family_t 
         tidesdb_txn_free(txn);
 
         tidesdb_flush_memtable(cf);
-        wait_for_flush_queue_drain(db);
+        wait_for_cf_flush_idle(db, cf);
     }
 }
 

@@ -580,8 +580,8 @@ static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path
  */
 /**
  * tidesdb_sstable_open_budget
- * the descriptor budget for resident open sstables: max_open_sstables minus the reserve held for
- * flush/compaction. BOTH the reader admission check and the reaper's eviction trigger use this, so
+ * the descriptor budget for resident open sstables, max_open_sstables minus the reserve held for
+ * flush/compaction. both the reader admission check and the reaper's eviction trigger use this, so
  * the reaper keeps num_open_sstables at or below the budget the readers stop at -- otherwise reads
  * would back off in the [budget, max_open) gap while the reaper (triggering only at max_open) frees
  * nothing, starving reads with no relief on fd-constrained hosts.
@@ -605,15 +605,23 @@ static int tidesdb_reader_fd_budget_ok(tidesdb_t *db, tidesdb_sstable_t *sst)
      * needs no new tracked descriptor and is never blocked (the lazy vlog rides along) */
     if (atomic_load_explicit(&sst->klog_bm, memory_order_acquire)) return 1;
 
-    const int budget = tidesdb_sstable_open_budget(db);
+    /* reads may open up to max_open_sstables -- the open-file clamp keeps that descriptor-safe, and
+     * respecting it (rather than opening every source unbounded) is what prevents the original
+     * full-scan fd-exhaustion wedge. the reaper evicts IDLE sstables down to the smaller
+     * open-budget (max_open - reserve), so [open_budget, max_open) is burst headroom for active
+     * reads and compaction; a read only backs off with a retryable error at the hard cap. a
+     * k-way-merge iterator needs its whole source set open at once, so it must use this full cap
+     * too -- a smaller per-read reserve would make any scan over more than (budget) sstables
+     * impossible. */
+    const int max_open = (int)db->config.max_open_sstables;
 
-    if (atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < budget) return 1;
+    if (atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open) return 1;
 
     /* over budget for a new open -- give the reaper a chance to reclaim idle sstables, then recheck
      */
     tidesdb_wake_reaper(db);
     usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
-    return atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < budget;
+    return atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open;
 }
 
 /* empty block index placeholder ( 4 byte LE count (0) followed by 1 byte prefix_len ) */
@@ -19290,8 +19298,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         int current_open = atomic_load(&db->num_open_sstables);
         int max_open = (int)db->config.max_open_sstables;
-        /* evict down to the reader budget, not max_open: keeping num_open at/below the budget
-         * leaves the reserve free for flush/compaction AND gives readers headroom to open, closing
+        /* evict down to the reader budget, not max_open, keeping num_open at/below the budget
+         * leaves the reserve free for flush/compaction and gives readers headroom to open, closing
          * the [budget, max_open) starvation gap where reads back off but eviction never fired. */
         const int reap_target = tidesdb_sstable_open_budget(db);
 
@@ -22733,6 +22741,10 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
             tidesdb_sstable_t *sst = sstables[s];
             if (!sst) continue;
 
+            /* num_open_sstables is keyed on the klog; a klog-open sstable counts one, so dropping
+             * its handle here must decrement or the rename leaks the count for every open sstable
+             */
+            const int had_open_klog = (sst->klog_bm != NULL);
             if (sst->klog_bm)
             {
                 block_manager_close(sst->klog_bm);
@@ -22743,6 +22755,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                 block_manager_close(sst->vlog_bm);
                 sst->vlog_bm = NULL;
             }
+            if (had_open_klog) atomic_fetch_sub(&cf->db->num_open_sstables, 1);
         }
     }
 
@@ -25277,9 +25290,10 @@ unified_sst_search:;
                 continue;
             }
 
-            /* reader fd budget, don't open a new sstable for this read if doing so would eat into
-             * the flush/compaction reserve. back off with a retryable error rather than starving
-             * the write path; an already-open sstable is never blocked (see helper). */
+            /* reader fd budget -- don't open past the max_open cap; back off with a retryable error
+             * rather than starving the write path. an already-open sstable is never blocked, and
+             * the reaper keeps idle sstables below the cap so a point-get normally has headroom
+             * (see helper). */
             if (!tidesdb_reader_fd_budget_ok(cf->db, sst))
             {
                 tidesdb_sstable_unref(cf->db, sst);
@@ -26999,6 +27013,12 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
         if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
         if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
     }
+    /* the write opened the klog via tidesdb_sstable_ensure_open, which counted it in
+     * num_open_sstables (the count is keyed on the klog). closing it here must drop that count or
+     * num_open leaks one per flush -- the published sstable carries klog_bm == NULL, so the reaper,
+     * which only reclaims klog-open in-level sstables, can never bring the count back down and it
+     * climbs until it pegs max_open_sstables and reads start backing off with TDB_ERR_BUSY */
+    const int had_open_klog = (sst->klog_bm != NULL);
     if (sst->klog_bm)
     {
         block_manager_close(sst->klog_bm);
@@ -27009,6 +27029,7 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
         block_manager_close(sst->vlog_bm);
         sst->vlog_bm = NULL;
     }
+    if (had_open_klog) atomic_fetch_sub(&db->num_open_sstables, 1);
 
     /* drop may have fired during the fsync/close above; check once more before publishing
      * to the level so we do not leave a fresh sstable behind for remove_directory to race */
@@ -28735,9 +28756,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_sstable_t *sst = ssts_array[i];
 
-            /* reader fd budget--a full-scan iterator opens every source; refuse to exceed the
-             * reader budget (reserve held for flush/compaction). fail creation with a retryable
-             * error rather than starving the write path -- the caller retries once fds free. */
+            /* reader fd budget -- a full-scan iterator opens its entire source set at once, bounded
+             * by the max_open cap (clamp keeps it descriptor-safe); only a source set larger than
+             * max_open fails (a real fd limit). */
             if (!tidesdb_reader_fd_budget_ok(cf->db, sst))
             {
                 for (int k = i; k < sst_count; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);
@@ -28963,7 +28984,8 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
     {
         tidesdb_sstable_t *sst = ssts_array[i];
 
-        /* reader fd budget (see helper) -- back off rather than starving flush/compaction */
+        /* reader fd budget -- iterator source-cache rebuild also opens the whole set at once,
+         * bounded by the max_open cap, same as iter_new */
         if (!tidesdb_reader_fd_budget_ok(cf->db, sst))
         {
             for (int k = i; k < sst_count; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);

@@ -25147,39 +25147,43 @@ static void test_unified_concurrent_multi_cf_read_write(void)
     ASSERT_EQ(final_fail, 0);
     ASSERT_EQ(final_ok, NUM_WRITERS * W_OPS);
 
-    /* wait for background flushes to settle */
-    usleep(500000);
+    /* wait for flushes AND compaction to settle before verifying. on an fd-constrained host a read
+     * that races active flush/compaction is correctly rejected with the retryable TDB_ERR_BUSY by
+     * the reader fd reserve, which would otherwise be miscounted as a missing key. */
+    for (int c = 0; c < NUM_CFS; c++) wait_for_cf_flush_idle(db, cfs[c]);
+    for (int c = 0; c < NUM_CFS; c++) wait_for_compaction_idle(db, cfs[c]);
 
-    /* verify CF isolation -- each CF should have its own data */
+    /* verify CF isolation -- each CF should have its own data. one txn per get: a long-lived read
+     * txn pins every sstable it touches for its lifetime, so reading all 50 keys in a single txn
+     * would accumulate open sstables past max_open on an fd-constrained host and the rest would
+     * fail with TDB_ERR_BUSY. independent point lookups release each pin, keeping num_open bounded.
+     */
     for (int c = 0; c < NUM_CFS; c++)
     {
-        tidesdb_txn_t *vtxn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
-
         int found = 0;
         for (int i = 0; i < 50; i++)
         {
+            tidesdb_txn_t *vtxn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
             char key[64];
             snprintf(key, sizeof(key), "ushared_%06d", i);
             uint8_t *val = NULL;
             size_t vs = 0;
             /* shared keys may have been deleted by interleaved deletes, so some misses are OK */
-            if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+            if (tdb_test_get_with_retry(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) ==
+                0)
             {
                 found++;
                 free(val);
             }
+            tidesdb_txn_free(vtxn);
         }
         printf("  %s: %d/50 shared keys found\n", cf_names[c], found);
         /* at least some shared keys should survive (deletes only hit ~1/11 of ops) */
         ASSERT_TRUE(found > 20);
-
-        tidesdb_txn_free(vtxn);
     }
 
-    /* verify unique keys from each writer are present */
-    tidesdb_txn_t *vtxn = NULL;
-    ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
+    /* verify unique keys from each writer are present (fresh txn per get, same reasoning) */
     int unique_found = 0;
     for (int t = 0; t < NUM_WRITERS; t++)
     {
@@ -25187,18 +25191,21 @@ static void test_unified_concurrent_multi_cf_read_write(void)
         {
             if (i % 4 == 0) continue; /* shared key pattern, skip */
             int cf_idx = (t + i) % NUM_CFS;
+            tidesdb_txn_t *vtxn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
             char key[64];
             snprintf(key, sizeof(key), "uuniq_t%d_%06d", t, i);
             uint8_t *val = NULL;
             size_t vs = 0;
-            if (tidesdb_txn_get(vtxn, cfs[cf_idx], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+            if (tdb_test_get_with_retry(vtxn, cfs[cf_idx], (uint8_t *)key, strlen(key) + 1, &val,
+                                        &vs) == 0)
             {
                 unique_found++;
                 free(val);
             }
+            tidesdb_txn_free(vtxn);
         }
     }
-    tidesdb_txn_free(vtxn);
     printf("  unique keys found: %d\n", unique_found);
     ASSERT_TRUE(unique_found > 0);
 

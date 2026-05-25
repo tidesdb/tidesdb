@@ -577,6 +577,12 @@ struct tidesdb_column_family_t
      * cleanup vs compaction-triggered flush) must serialize on this lock */
     pthread_mutex_t imm_snap_publish_lock;
 
+    /* a single compaction round (serialized per CF by is_compacting) may run its
+     * partition sub-merges across multiple sub-compaction threads; this serializes the
+     * per-partition commit section (level add + manifest commit + layout bump) so the
+     * heavy merge work parallelizes while shared-state mutation stays single-threaded */
+    pthread_mutex_t compaction_commit_lock;
+
     /* read-side epoch for the active_memtable slot. a reader bumps this before
      * loading active_memtable + try_ref'ing the loaded pointer, drops it once
      * try_ref has finished (success means refcount is now pinned, failure means
@@ -593,7 +599,6 @@ struct tidesdb_column_family_t
      * zero-initialized by calloc, so the first event in each category logs immediately. */
     _Atomic(time_t) last_ceiling_stall_log_sec;
     _Atomic(time_t) last_imm_critical_log_sec;
-    _Atomic(time_t) last_l1_stop_log_sec;
 };
 
 /**
@@ -804,6 +809,10 @@ struct tidesdb_t
     queue_t *flush_queue;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
+    /* budget of ephemeral sub-compaction helper threads a compaction round may spawn,
+     * initialized to num_compaction_threads at open. bounds total concurrent sub-merge
+     * threads across all CFs so parallel compaction never oversubscribes the pool. */
+    _Atomic(int) compaction_helper_budget;
     pthread_t sync_thread;
     _Atomic(int) sync_thread_active;
     pthread_mutex_t sync_thread_mutex;

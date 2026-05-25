@@ -402,11 +402,6 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO 0.5 /* 50% of stall threshold */
 #define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       4   /* 4x L1 trigger = high  */
 #define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   3   /* 3x L1 trigger = moderate */
-/* hard write-stop, once the first disk level holds this many x the trigger, compaction has fallen
- * so far behind that the on-disk file count (and thus open fds + aux memory) would grow without
- * bound. block writers here until compaction drains it, instead of only delaying. ~2x the HIGH
- * slowdown band, mirroring the slowdown/stop split of leveled LSMs. */
-#define TDB_BACKPRESSURE_L1_STOP_MULTIPLIER 8
 /* active memtable hard ceiling as a multiple of write_buffer_size. the
  * commit-time threshold check allows up to 1.5x for batching headroom; this
  * leaves a small overshoot margin above that before apply_backpressure
@@ -13064,6 +13059,149 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
 }
 
 /**
+ * tidesdb_subcompaction_t
+ * shared coordination state for running a single compaction round's independent partition
+ * sub-merges across multiple ephemeral helper threads. each partition is a disjoint key range
+ * with its own heap/output; workers steal partitions via next_partition and each calls
+ * run_partition, which performs that partition's commit under cf->compaction_commit_lock.
+ * @param db database (for the helper-thread budget)
+ * @param merge_ctx opaque per-merge context passed to run_partition
+ * @param run_partition per-partition worker; returns TDB_SUCCESS or a hard error
+ * @param num_partitions number of partitions to process
+ * @param next_partition work-stealing cursor
+ * @param aborted set when a partition observes an external abort (e.g. CF drop)
+ * @param error first hard error code observed across partitions (TDB_SUCCESS = none)
+ */
+typedef struct
+{
+    tidesdb_t *db;
+    void *merge_ctx;
+    int (*run_partition)(void *merge_ctx, int partition);
+    int num_partitions;
+    _Atomic(int) next_partition;
+    _Atomic(int) aborted;
+    _Atomic(int) error;
+} tidesdb_subcompaction_t;
+
+/**
+ * tidesdb_subcompaction_worker
+ * helper-thread body-- steal partition indices and run each until exhausted or aborted
+ */
+static void *tidesdb_subcompaction_worker(void *arg)
+{
+    tidesdb_subcompaction_t *sc = (tidesdb_subcompaction_t *)arg;
+    tdb_set_thread_name("tdb-subcompact");
+    for (;;)
+    {
+        if (atomic_load_explicit(&sc->aborted, memory_order_acquire)) break;
+        const int p = atomic_fetch_add_explicit(&sc->next_partition, 1, memory_order_acq_rel);
+        if (p >= sc->num_partitions) break;
+        const int rc = sc->run_partition(sc->merge_ctx, p);
+        if (rc != TDB_SUCCESS)
+        {
+            int expected = TDB_SUCCESS;
+            atomic_compare_exchange_strong_explicit(&sc->error, &expected, rc,
+                                                    memory_order_acq_rel, memory_order_relaxed);
+        }
+    }
+    return NULL;
+}
+
+/**
+ * tidesdb_run_subcompactions
+ * run num_partitions independent partition merges concurrently. borrows up to
+ * (num_partitions - 1) helper threads from db->compaction_helper_budget (bounded so parallel
+ * rounds across CFs never oversubscribe the pool); the calling thread also works, so progress
+ * is guaranteed even when the budget is zero or pthread_create fails (work is stolen, never
+ * dropped). run_partition owns each partition's heap/output and commits under the CF lock.
+ * @return the first hard error from any partition, or TDB_SUCCESS
+ */
+static int tidesdb_run_subcompactions(tidesdb_t *db, void *merge_ctx,
+                                      int (*run_partition)(void *, int), int num_partitions)
+{
+    if (num_partitions <= 0) return TDB_SUCCESS;
+
+    tidesdb_subcompaction_t sc;
+    sc.db = db;
+    sc.merge_ctx = merge_ctx;
+    sc.run_partition = run_partition;
+    sc.num_partitions = num_partitions;
+    atomic_init(&sc.next_partition, 0);
+    atomic_init(&sc.aborted, 0);
+    atomic_init(&sc.error, TDB_SUCCESS);
+
+    /* borrow helpers from the global budget; the calling thread is always an extra worker so we
+     * never need more than num_partitions - 1 helpers. a CAS loop claims whatever is available. */
+    int want = num_partitions - 1;
+    int helpers = 0;
+    if (want > 0)
+    {
+        int avail = atomic_load_explicit(&db->compaction_helper_budget, memory_order_acquire);
+        while (avail > 0)
+        {
+            const int claim = (want < avail) ? want : avail;
+            if (atomic_compare_exchange_weak_explicit(&db->compaction_helper_budget, &avail,
+                                                      avail - claim, memory_order_acq_rel,
+                                                      memory_order_acquire))
+            {
+                helpers = claim;
+                break;
+            }
+        }
+    }
+
+    pthread_t *threads = (helpers > 0) ? malloc((size_t)helpers * sizeof(pthread_t)) : NULL;
+    int launched = 0;
+    for (int i = 0; threads && i < helpers; i++)
+    {
+        if (pthread_create(&threads[launched], NULL, tidesdb_subcompaction_worker, &sc) == 0)
+            launched++;
+    }
+
+    /* the calling thread participates as a worker too -- guarantees forward progress */
+    tidesdb_subcompaction_worker(&sc);
+
+    for (int i = 0; i < launched; i++) pthread_join(threads[i], NULL);
+    free(threads);
+
+    /* return exactly what we claimed (failed pthread_create leaves work to the stealers) */
+    if (helpers > 0)
+        atomic_fetch_add_explicit(&db->compaction_helper_budget, helpers, memory_order_release);
+
+    return atomic_load_explicit(&sc.error, memory_order_acquire);
+}
+
+/**
+ * tidesdb_full_preemptive_ctx_t / _shard
+ * shared read-only context for a full preemptive merge's parallel shards (RocksDB-style
+ * subcompactions). the single-output merge is split into key-range shards whose boundaries are
+ * sampled from the input sstables' min keys; each shard builds its own heap from overlapping
+ * inputs, range-filters the merge, and writes its own output sstable at output_level. the commit
+ * is serialized on cf->compaction_commit_lock; per-merge teardown (input cleanup) runs once after
+ * the shards join. the btree branch writes the shard heap unfiltered, matching dividing/partitioned.
+ */
+typedef struct
+{
+    tidesdb_column_family_t *cf;
+    int start_level;
+    int target_level;
+    int output_level;
+    int is_largest_level;
+    skip_list_comparator_fn comparator_fn;
+    void *comparator_ctx;
+    tidesdb_sstable_t **del_snap;
+    size_t del_snap_count;
+    uint8_t **boundaries;
+    size_t *boundary_sizes;
+    int num_boundaries;
+    uint64_t min_snapshot_seq;
+    queue_t *sstables_to_delete;
+    _Atomic(int) aborted;
+} tidesdb_full_preemptive_ctx_t;
+
+static int tidesdb_full_preemptive_shard(void *vctx, int shard);
+
+/**
  * tidesdb_full_preemptive_merge
  * perform a full preemptive merge on the column family
  * @param cf the column family
@@ -13146,89 +13284,221 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         tdb_objstore_prefetch_sstables(cf->db, ssts_array, sst_count);
     }
 
-    tidesdb_add_ssts_to_merge_heap(cf->db, cf, ssts_array, sst_count, heap, sstables_to_delete);
+    /* sub-compaction sharding, the single output is split into key-range shards,
+     * each merged in parallel. boundaries come from the output level's existing sstable min keys
+     * (already sorted and non-overlapping -- the same source dividing_merge uses). an empty output
+     * level yields one shard, i.e. the original single-output behaviour with no regression. inputs
+     * are enqueued for cleanup and snapshotted into an array each shard reads from. */
+    for (int i = 0; i < sst_count; i++) queue_enqueue(sstables_to_delete, ssts_array[i]);
     free(ssts_array);
+    tidesdb_merge_heap_free(heap); /* setup heap is unused -- each shard builds its own */
 
-    uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
-    char path[MAX_FILE_PATH_LENGTH];
-    /* the merged run is written at output_level -- normally the deepest input
-     * level, one shallower for a level-collapse merge */
-    snprintf(path, sizeof(path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d", cf->directory,
-             output_level + 1);
-
-    tidesdb_sstable_t *new_sst = tidesdb_sstable_create(cf->db, path, new_id, &cf->config);
-    if (!new_sst)
+    const size_t fp_del_count = queue_size(sstables_to_delete);
+    tidesdb_sstable_t **fp_del_snap =
+        malloc((fp_del_count ? fp_del_count : 1) * sizeof(tidesdb_sstable_t *));
+    if (!fp_del_snap)
     {
-        tidesdb_merge_heap_free(heap);
         tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
         queue_free(sstables_to_delete);
         tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
         return TDB_ERR_MEMORY;
     }
+    const size_t fp_del_n = queue_snapshot(sstables_to_delete, (void **)fp_del_snap, fp_del_count);
 
-    block_manager_t *klog_bm = NULL;
-    block_manager_t *vlog_bm = NULL;
-
-    if (block_manager_open(&klog_bm, new_sst->klog_path,
-                           convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                 ? TDB_SYNC_FULL
-                                                 : cf->config.sync_mode)) != 0)
+    int fp_num_boundaries = 0;
+    uint8_t **fp_boundaries = NULL;
+    size_t *fp_boundary_sizes = NULL;
     {
-        tidesdb_sstable_unref(cf->db, new_sst);
-        tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
-        queue_free(sstables_to_delete);
-        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-        return TDB_ERR_IO;
-    }
-
-    if (block_manager_open(&vlog_bm, new_sst->vlog_path,
-                           convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                 ? TDB_SYNC_FULL
-                                                 : cf->config.sync_mode)) != 0)
-    {
-        block_manager_close(klog_bm);
-        tidesdb_sstable_unref(cf->db, new_sst);
-        tidesdb_merge_heap_free(heap);
-        tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
-        queue_free(sstables_to_delete);
-        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-        return TDB_ERR_IO;
-    }
-
-    /* we calc expected number of entries for bloom filter sizing
-     * during merge, duplicates are eliminated and tombstones may be removed,
-     * so the actual count will be lower. we use the sum as an upper bound to ensure
-     * the bloom filter is adequately sized. */
-    uint64_t estimated_entries = 0;
-
-    /* we reload levels for estimated entries calculation */
-    for (int level = start_level; level <= target_level; level++)
-    {
-        tidesdb_level_t *lvl = cf->levels[level];
-
-        /* we hold array_readers to prevent retire_array from freeing the array
-         * while we iterate -- a concurrent flush on L1 can swap the array */
-        atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
-
-        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
-        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
-
-        for (int i = 0; i < num_ssts; i++)
+        tidesdb_level_t *out_lvl = cf->levels[output_level];
+        atomic_fetch_add_explicit(&out_lvl->array_readers, 1, memory_order_acq_rel);
+        const int out_n = atomic_load_explicit(&out_lvl->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **out_ssts =
+            atomic_load_explicit(&out_lvl->sstables, memory_order_acquire);
+        if (out_n > 0)
         {
-            tidesdb_sstable_t *sst = sstables[i];
-            /* we check for null as concurrent compactions may have removed sstables */
-            if (sst)
+            fp_boundaries = malloc((size_t)out_n * sizeof(uint8_t *));
+            fp_boundary_sizes = malloc((size_t)out_n * sizeof(size_t));
+        }
+        if (fp_boundaries && fp_boundary_sizes)
+        {
+            /* shard boundaries are the output sstables' min keys; the first sstable's min key is
+             * skipped so keys below it land in shard 0 (range_start = NULL) */
+            for (int i = 1; i < out_n; i++)
             {
-                estimated_entries += sst->num_entries;
+                tidesdb_sstable_t *s = out_ssts[i];
+                if (s && s->min_key && s->min_key_size > 0)
+                {
+                    fp_boundaries[fp_num_boundaries] = malloc(s->min_key_size);
+                    if (fp_boundaries[fp_num_boundaries])
+                    {
+                        memcpy(fp_boundaries[fp_num_boundaries], s->min_key, s->min_key_size);
+                        fp_boundary_sizes[fp_num_boundaries] = s->min_key_size;
+                        fp_num_boundaries++;
+                    }
+                }
             }
         }
-
-        atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&out_lvl->array_readers, 1, memory_order_release);
     }
 
-    if (estimated_entries < TDB_MERGE_MIN_ESTIMATED_ENTRIES)
-        estimated_entries = TDB_MERGE_MIN_ESTIMATED_ENTRIES;
+    tidesdb_full_preemptive_ctx_t fctx;
+    fctx.cf = cf;
+    fctx.start_level = start_level;
+    fctx.target_level = target_level;
+    fctx.output_level = output_level;
+    fctx.is_largest_level = is_largest_level;
+    fctx.comparator_fn = comparator_fn;
+    fctx.comparator_ctx = comparator_ctx;
+    fctx.del_snap = fp_del_snap;
+    fctx.del_snap_count = fp_del_n;
+    fctx.boundaries = fp_boundaries;
+    fctx.boundary_sizes = fp_boundary_sizes;
+    fctx.num_boundaries = fp_num_boundaries;
+    fctx.min_snapshot_seq = 0;
+    fctx.sstables_to_delete = sstables_to_delete;
+    atomic_init(&fctx.aborted, 0);
+
+    /* run the shards across the sub-compaction helper pool (calling thread works too); each shard
+     * commits its own output under cf->compaction_commit_lock */
+    tidesdb_run_subcompactions(cf->db, &fctx, tidesdb_full_preemptive_shard, fp_num_boundaries + 1);
+
+    const int fp_aborted = atomic_load_explicit(&fctx.aborted, memory_order_acquire);
+
+    for (int i = 0; i < fp_num_boundaries; i++) free(fp_boundaries[i]);
+    free(fp_boundaries);
+    free(fp_boundary_sizes);
+    free(fp_del_snap);
+
+    if (fp_aborted)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting full preemptive merge", cf->name);
+        while (!queue_is_empty(sstables_to_delete))
+        {
+            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
+        }
+        queue_free(sstables_to_delete);
+        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+        return TDB_SUCCESS;
+    }
+
+    tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+    queue_free(sstables_to_delete);
+    tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge complete for CF '%s'", cf->name);
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_full_preemptive_shard
+ * one key-range shard of a full preemptive merge (see ctx doc above). builds a heap from the
+ * inputs overlapping its range, then runs the original single-output merge body range-filtered,
+ * writing one output sstable at output_level. wrapped in do/while(0), a top-level break/continue
+ * skips this shard; the abort paths set the shared aborted flag.
+ */
+static int tidesdb_full_preemptive_shard(void *vctx, int shard)
+{
+    tidesdb_full_preemptive_ctx_t *c = (tidesdb_full_preemptive_ctx_t *)vctx;
+    tidesdb_column_family_t *cf = c->cf;
+    const int start_level = c->start_level;
+    const int target_level = c->target_level;
+    const int output_level = c->output_level;
+    const int is_largest_level = c->is_largest_level;
+    skip_list_comparator_fn comparator_fn = c->comparator_fn;
+    void *comparator_ctx = c->comparator_ctx;
+    tidesdb_sstable_t **del_snap = c->del_snap;
+    const size_t del_snap_count = c->del_snap_count;
+    uint8_t **boundaries = c->boundaries;
+    size_t *boundary_sizes = c->boundary_sizes;
+    const int num_boundaries = c->num_boundaries;
+    queue_t *sstables_to_delete = c->sstables_to_delete;
+    int aborted = 0;
+    (void)start_level;
+    (void)target_level;
+
+    do
+    {
+        if (tidesdb_cf_abort_requested(cf))
+        {
+            aborted = 1;
+            break;
+        }
+
+        uint8_t *range_start = (shard > 0) ? boundaries[shard - 1] : NULL;
+        size_t range_start_size = (shard > 0) ? boundary_sizes[shard - 1] : 0;
+        uint8_t *range_end = (shard < num_boundaries) ? boundaries[shard] : NULL;
+        size_t range_end_size = (shard < num_boundaries) ? boundary_sizes[shard] : 0;
+
+        tidesdb_merge_heap_t *heap = tidesdb_merge_heap_create(comparator_fn, comparator_ctx);
+        if (!heap) break;
+
+        uint64_t estimated_entries = 0;
+        for (size_t i = 0; i < del_snap_count; i++)
+        {
+            tidesdb_sstable_t *sst = del_snap[i];
+            if (!sst) continue;
+            int overlaps = 1;
+            if (range_start && comparator_fn(sst->max_key, sst->max_key_size, range_start,
+                                             range_start_size, comparator_ctx) < 0)
+                overlaps = 0;
+            if (overlaps && range_end &&
+                comparator_fn(sst->min_key, sst->min_key_size, range_end, range_end_size,
+                              comparator_ctx) >= 0)
+                overlaps = 0;
+            if (overlaps)
+            {
+                tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
+                if (source)
+                {
+                    if (source->current_kv &&
+                        tidesdb_merge_heap_add_source(heap, source) == TDB_SUCCESS)
+                        estimated_entries += sst->num_entries;
+                    else
+                        tidesdb_merge_source_free(source);
+                }
+            }
+        }
+        if (estimated_entries < TDB_MERGE_MIN_ESTIMATED_ENTRIES)
+            estimated_entries = TDB_MERGE_MIN_ESTIMATED_ENTRIES;
+
+        if (tidesdb_merge_heap_empty(heap))
+        {
+            tidesdb_merge_heap_free(heap);
+            break;
+        }
+
+        uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
+        char path[MAX_FILE_PATH_LENGTH];
+        snprintf(path, sizeof(path),
+                 "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX "%d",
+                 cf->directory, output_level + 1, shard);
+
+        tidesdb_sstable_t *new_sst = tidesdb_sstable_create(cf->db, path, new_id, &cf->config);
+        if (!new_sst)
+        {
+            tidesdb_merge_heap_free(heap);
+            break;
+        }
+
+        block_manager_t *klog_bm = NULL;
+        block_manager_t *vlog_bm = NULL;
+        if (tidesdb_bm_open(cf->db, &klog_bm, new_sst->klog_path,
+                            convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                  ? TDB_SYNC_FULL
+                                                  : cf->config.sync_mode)) != 0 ||
+            tidesdb_bm_open(cf->db, &vlog_bm, new_sst->vlog_path,
+                            convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                  ? TDB_SYNC_FULL
+                                                  : cf->config.sync_mode)) != 0)
+        {
+            if (klog_bm) block_manager_close(klog_bm);
+            if (vlog_bm) block_manager_close(vlog_bm);
+            tidesdb_sstable_unref(cf->db, new_sst);
+            tidesdb_merge_heap_free(heap);
+            aborted = 1;
+            break;
+        }
 
     bloom_filter_t *bloom = NULL;
     tidesdb_block_index_t *block_indexes = NULL;
@@ -13284,10 +13554,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             /* mark so sstable_free unlinks the partial klog/vlog files */
             atomic_store_explicit(&new_sst->marked_for_deletion, 1, memory_order_release);
             tidesdb_sstable_unref(cf->db, new_sst);
-            tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
-            queue_free(sstables_to_delete);
-            tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-            return btree_result;
+            aborted = 1;
+            break;
         }
 
         bloom = NULL;
@@ -13316,7 +13584,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     tidesdb_kv_pair_t *pending = NULL;
     int pending_is_single_delete = 0;
     int pending_sd_paired_with_put = 0;
-    int aborted = 0;
 
     /* merge using heap */
     while (!tidesdb_merge_heap_empty(heap) || pending != NULL)
@@ -13340,7 +13607,28 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
                               "Detected corrupted SSTable %" PRIu64 ", marking for deletion",
                               corrupted_sst->id);
+                /* shared cleanup queue -- guard against concurrent shards */
+                pthread_mutex_lock(&cf->compaction_commit_lock);
                 queue_enqueue(sstables_to_delete, corrupted_sst);
+                pthread_mutex_unlock(&cf->compaction_commit_lock);
+            }
+        }
+
+        /* range filter -- this shard only writes keys in [range_start, range_end). a filtered
+         * key cannot pair with pending (pending is in range), matching dividing_merge. */
+        if (kv)
+        {
+            if (range_start && comparator_fn(kv->key, kv->entry.key_size, range_start,
+                                             range_start_size, comparator_ctx) < 0)
+            {
+                tidesdb_kv_pair_free(kv);
+                continue;
+            }
+            if (range_end && comparator_fn(kv->key, kv->entry.key_size, range_end, range_end_size,
+                                           comparator_ctx) >= 0)
+            {
+                tidesdb_kv_pair_free(kv);
+                continue;
             }
         }
 
@@ -13548,14 +13836,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         remove(new_sst->klog_path);
         remove(new_sst->vlog_path);
         tidesdb_sstable_unref(cf->db, new_sst);
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-        }
-        queue_free(sstables_to_delete);
-        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-        return TDB_SUCCESS;
+        break; /* per-merge teardown happens once after the shards join */
     }
 
     new_sst->max_seq = max_seq;
@@ -13751,14 +14032,10 @@ merge_complete:;
     /* we save metadata for logging before potentially freeing sstable */
     const uint64_t sst_id = new_sst->id;
     const uint64_t num_entries = new_sst->num_entries;
-    const uint64_t num_klog_blocks = new_sst->num_klog_blocks;
-    const uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
 
     /* drop_column_family marked us after the inner loop finished -- skip publishing the
-     * merged sstable into the level/manifest so remove_directory does not race against
-     * new files appearing in the CF directory. remove() drops the half-written files we
-     * already created on disk; cleanup_merged_sstables sees the marked flag and unrefs
-     * inputs without touching the manifest */
+     * merged sstable; remove() drops the half-written files we already created on disk and the
+     * post-join teardown unrefs inputs without touching the manifest */
     if (tidesdb_cf_abort_requested(cf))
     {
         if (bloom) bloom_filter_free(bloom);
@@ -13766,22 +14043,15 @@ merge_complete:;
         remove(new_sst->klog_path);
         remove(new_sst->vlog_path);
         tidesdb_sstable_unref(cf->db, new_sst);
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-        }
-        queue_free(sstables_to_delete);
-        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-        return TDB_SUCCESS;
+        aborted = 1;
+        break;
     }
 
     /* we only add sstable if it has entries -- empty sstables cause corruption */
     if (num_entries > 0)
     {
-        /* we reload levels and num_levels as DCA may have changed them
-         * we load num_levels first to match store order */
-        num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+        /* we reload num_levels as DCA may have changed it */
+        int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
         /* we find the output level by level_num, not by stale array index */
         int target_level_num = output_level + 1;
@@ -13810,6 +14080,8 @@ merge_complete:;
             TDB_DEBUG_LOG(TDB_LOG_INFO,
                           "Adding merged SSTable %" PRIu64 " to level %d (array index %d)",
                           new_sst->id, cf->levels[target_idx]->level_num, target_idx);
+            /* commit serialized across shards (shared level array + manifest) */
+            pthread_mutex_lock(&cf->compaction_commit_lock);
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
             tidesdb_bump_sstable_layout_version(cf);
 
@@ -13828,6 +14100,7 @@ merge_complete:;
             /** we upload manifest to object store so replicas and cold-start nodes
              *  can see the new sstable before old inputs are cleaned up */
             tdb_objstore_upload_manifest(cf->db, cf);
+            pthread_mutex_unlock(&cf->compaction_commit_lock);
 
             tidesdb_sstable_unref(cf->db, new_sst);
         }
@@ -13841,16 +14114,9 @@ merge_complete:;
         remove(new_sst->vlog_path);
         tidesdb_sstable_unref(cf->db, new_sst);
     }
+    } while (0);
 
-    tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
-    queue_free(sstables_to_delete);
-    tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-
-    TDB_DEBUG_LOG(TDB_LOG_INFO,
-                  "Full preemptive merge completed for CF '%s', created SSTable %" PRIu64
-                  " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64 " vlog blocks",
-                  cf->name, sst_id, num_entries, num_klog_blocks, num_vlog_blocks);
-
+    if (aborted) atomic_store_explicit(&c->aborted, 1, memory_order_release);
     return TDB_SUCCESS;
 }
 
@@ -14491,6 +14757,31 @@ merge_complete:;
 }
 
 /**
+ * tidesdb_dividing_merge_ctx_t
+ * shared read-only context for a dividing merge's parallel partition sub-merges. each partition
+ * is a disjoint key range with its own heap and output sstable, so the only shared mutation is the
+ * commit (level add + manifest), which the worker serializes on cf->compaction_commit_lock.
+ */
+typedef struct
+{
+    tidesdb_column_family_t *cf;
+    int target_level;
+    int is_largest_level;
+    int num_boundaries;
+    uint8_t **file_boundaries;
+    size_t *boundary_sizes;
+    tidesdb_sstable_t **del_snap;
+    size_t del_snap_count;
+    skip_list_comparator_fn comparator_fn;
+    void *comparator_ctx;
+    uint64_t partition_estimated_entries;
+    uint64_t min_snapshot_seq;
+    _Atomic(int) aborted;
+} tidesdb_dividing_merge_ctx_t;
+
+static int tidesdb_dividing_merge_partition(void *vctx, int partition);
+
+/**
  * tidesdb_dividing_merge
  * dividing merge into level X and partition based on largest level boundaries
  * @param cf column family
@@ -14679,7 +14970,75 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     int aborted = 0;
 
-    for (int partition = 0; partition < num_partitions; partition++)
+    tidesdb_dividing_merge_ctx_t dctx;
+    dctx.cf = cf;
+    dctx.target_level = target_level;
+    dctx.is_largest_level = is_largest_level;
+    dctx.num_boundaries = num_boundaries;
+    dctx.file_boundaries = file_boundaries;
+    dctx.boundary_sizes = boundary_sizes;
+    dctx.del_snap = del_snap;
+    dctx.del_snap_count = del_snap_count;
+    dctx.comparator_fn = comparator_fn;
+    dctx.comparator_ctx = comparator_ctx;
+    dctx.partition_estimated_entries = partition_estimated_entries;
+    dctx.min_snapshot_seq = min_snapshot_seq;
+    atomic_init(&dctx.aborted, 0);
+
+    /* run the partition sub-merges across the sub-compaction helper pool (the calling thread
+     * participates too); each partition commits its own output under cf->compaction_commit_lock */
+    tidesdb_run_subcompactions(cf->db, &dctx, tidesdb_dividing_merge_partition, num_partitions);
+
+    if (atomic_load_explicit(&dctx.aborted, memory_order_acquire)) aborted = 1;
+
+    free(del_snap);
+
+    if (aborted)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting dividing merge", cf->name);
+        while (!queue_is_empty(sstables_to_delete))
+        {
+            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
+        }
+        queue_free(sstables_to_delete);
+        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+        return TDB_SUCCESS;
+    }
+
+    tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, 0, target_level);
+    queue_free(sstables_to_delete);
+    tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Completed dividing merge for CF '%s'", cf->name);
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_dividing_merge_partition
+ * one partition's sub-merge for tidesdb_dividing_merge. body is the original serial partition
+ * loop iteration, wrapped in do/while(0)-- a top-level continue still skips this partition and the
+ * abort break still bails. shared context arrives via vctx; the commit section is serialized on
+ * cf->compaction_commit_lock.
+ */
+static int tidesdb_dividing_merge_partition(void *vctx, int partition)
+{
+    tidesdb_dividing_merge_ctx_t *c = (tidesdb_dividing_merge_ctx_t *)vctx;
+    tidesdb_column_family_t *cf = c->cf;
+    const int target_level = c->target_level;
+    const int is_largest_level = c->is_largest_level;
+    const int num_boundaries = c->num_boundaries;
+    uint8_t **file_boundaries = c->file_boundaries;
+    size_t *boundary_sizes = c->boundary_sizes;
+    tidesdb_sstable_t **del_snap = c->del_snap;
+    const size_t del_snap_count = c->del_snap_count;
+    skip_list_comparator_fn comparator_fn = c->comparator_fn;
+    void *comparator_ctx = c->comparator_ctx;
+    uint64_t partition_estimated_entries = c->partition_estimated_entries;
+    const uint64_t min_snapshot_seq = c->min_snapshot_seq;
+    int aborted = 0;
+
+    do
     {
         if (tidesdb_cf_abort_requested(cf))
         {
@@ -14880,12 +15239,14 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 continue;
             }
 
-            /* we add the btree sstable to target level */
+            /* we add the btree sstable to target level (commit serialized across partitions) */
+            pthread_mutex_lock(&cf->compaction_commit_lock);
             tidesdb_level_add_sstable(cf->levels[target_level], new_sst);
             tidesdb_bump_sstable_layout_version(cf);
             tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_level]->level_num,
                                          new_sst->id, new_sst->num_entries,
                                          new_sst->klog_size + new_sst->vlog_size);
+            pthread_mutex_unlock(&cf->compaction_commit_lock);
             tidesdb_sstable_unref(cf->db, new_sst);
             continue;
         }
@@ -15362,6 +15723,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     TDB_LOG_INFO,
                     "Partition %d: Adding merged SSTable %" PRIu64 " to level %d (array index %d)",
                     partition, new_sst->id, cf->levels[target_idx]->level_num, target_idx);
+                /* commit serialized across partitions (shared level array + manifest) */
+                pthread_mutex_lock(&cf->compaction_commit_lock);
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
                 tidesdb_bump_sstable_layout_version(cf);
 
@@ -15379,6 +15742,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 }
 
                 tdb_objstore_upload_manifest(cf->db, cf);
+                pthread_mutex_unlock(&cf->compaction_commit_lock);
 
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
@@ -15396,28 +15760,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             remove(new_sst->vlog_path);
             tidesdb_sstable_unref(cf->db, new_sst);
         }
-    }
+    } while (0);
 
-    free(del_snap);
-
-    if (aborted)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting dividing merge", cf->name);
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-        }
-        queue_free(sstables_to_delete);
-        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-        return TDB_SUCCESS;
-    }
-
-    tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, 0, target_level);
-    queue_free(sstables_to_delete);
-    tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Completed dividing merge for CF '%s'", cf->name);
+    if (aborted) atomic_store_explicit(&c->aborted, 1, memory_order_release);
     return TDB_SUCCESS;
 }
 
@@ -15579,6 +15924,10 @@ static int tdb_partitioned_merge_finalize_sst(
             return -1;
         }
 
+        /* commit serialized across partitions (shared level array + manifest); finalize is
+         * called from each partition sub-merge, possibly concurrently, and also mid-partition
+         * on a file_max split, so the lock guards every output's publish */
+        pthread_mutex_lock(&cf->compaction_commit_lock);
         tidesdb_level_add_sstable(cf->levels[target_idx], sst);
         tidesdb_bump_sstable_layout_version(cf);
 
@@ -15595,6 +15944,7 @@ static int tdb_partitioned_merge_finalize_sst(
         }
 
         tdb_objstore_upload_manifest(cf->db, cf);
+        pthread_mutex_unlock(&cf->compaction_commit_lock);
 
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Partitioned merge partition %d finalized SSTable %" PRIu64 " with %" PRIu64
@@ -15613,6 +15963,31 @@ static int tdb_partitioned_merge_finalize_sst(
 
     return 0;
 }
+
+/**
+ * tidesdb_partitioned_merge_ctx_t / _partition
+ * shared read-only context for a partitioned merge's parallel partition sub-merges. each partition
+ * is a disjoint key range with its own heap and output sstable(s); commits go through
+ * tdb_partitioned_merge_finalize_sst (or the inline btree path), both serialized on
+ * cf->compaction_commit_lock. the per-partition body is the original serial iteration wrapped in
+ * do/while(0) so top-level continue/break keep their meaning.
+ */
+typedef struct
+{
+    tidesdb_column_family_t *cf;
+    int start_idx;
+    int end_idx;
+    int end_level;
+    int num_partitions;
+    uint8_t **boundaries;
+    size_t *boundary_sizes;
+    int *partition_skipped;
+    size_t file_max;
+    int targeting_largest;
+    _Atomic(int) aborted;
+} tidesdb_partitioned_merge_ctx_t;
+
+static int tidesdb_partitioned_merge_partition(void *vctx, int partition);
 
 static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level)
 {
@@ -15792,8 +16167,106 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
     int aborted = 0;
 
-    /* we merge one partition at a time */
-    for (int partition = 0; partition < num_partitions; partition++)
+    tidesdb_partitioned_merge_ctx_t pctx;
+    pctx.cf = cf;
+    pctx.start_idx = start_idx;
+    pctx.end_idx = end_idx;
+    pctx.end_level = end_level;
+    pctx.num_partitions = num_partitions;
+    pctx.boundaries = boundaries;
+    pctx.boundary_sizes = boundary_sizes;
+    pctx.partition_skipped = partition_skipped;
+    pctx.file_max = file_max;
+    pctx.targeting_largest = targeting_largest;
+    atomic_init(&pctx.aborted, 0);
+
+    /* run the partition sub-merges across the sub-compaction helper pool (calling thread works
+     * too); each partition commits its output(s) under cf->compaction_commit_lock */
+    tidesdb_run_subcompactions(cf->db, &pctx, tidesdb_partitioned_merge_partition, num_partitions);
+
+    if (atomic_load_explicit(&pctx.aborted, memory_order_acquire)) aborted = 1;
+
+    if (aborted)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting partitioned merge", cf->name);
+        while (!queue_is_empty(sstables_to_delete))
+        {
+            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
+        }
+        queue_free(sstables_to_delete);
+        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+        for (int i = 0; i < num_partitions; i++)
+        {
+            free(boundaries[i]);
+        }
+        free(boundaries);
+        free(boundary_sizes);
+        free(partition_skipped);
+        return TDB_SUCCESS;
+    }
+
+    tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_idx, end_idx);
+    queue_free(sstables_to_delete);
+    tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+
+    /* the skew optimization can leave the largest level out of key order
+     * (skipped files keep their old slots while merged partitions append) --
+     * restore the ascending-min_key order the next partitioned merge relies on
+     * when it derives partition boundaries from this level */
+    if (skipped_any)
+    {
+        skip_list_comparator_fn sort_cmp = NULL;
+        void *sort_cmp_ctx = NULL;
+        tidesdb_resolve_comparator(cf->db, &cf->config, &sort_cmp, &sort_cmp_ctx);
+        if (sort_cmp && tidesdb_level_sort_by_min_key(cf->db, cf->levels[end_idx], sort_cmp,
+                                                      sort_cmp_ctx) != TDB_SUCCESS)
+        {
+            /* the largest level is left unsorted -- the next partitioned merge will derive
+             * boundaries from an out-of-order array. not fatal to this merge (sstables are
+             * already committed), but surface it. */
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' failed to re-sort level %d by min_key after partitioned merge "
+                          "(out of memory); next merge's partition boundaries may be skewed",
+                          cf->name, cf->levels[end_idx]->level_num);
+        }
+    }
+
+    for (int i = 0; i < num_partitions; i++)
+    {
+        free(boundaries[i]);
+    }
+    free(boundaries);
+    free(boundary_sizes);
+    free(partition_skipped);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Partitioned merge complete for CF '%s', processed %d partitions",
+                  cf->name, num_partitions);
+
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_partitioned_merge_partition
+ * one partition's sub-merge for tidesdb_partitioned_merge (see ctx doc above). body is the
+ * original serial iteration wrapped in do/while(0).
+ */
+static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
+{
+    tidesdb_partitioned_merge_ctx_t *c = (tidesdb_partitioned_merge_ctx_t *)vctx;
+    tidesdb_column_family_t *cf = c->cf;
+    const int start_idx = c->start_idx;
+    const int end_idx = c->end_idx;
+    const int end_level = c->end_level;
+    const int num_partitions = c->num_partitions;
+    uint8_t **boundaries = c->boundaries;
+    size_t *boundary_sizes = c->boundary_sizes;
+    int *partition_skipped = c->partition_skipped;
+    const size_t file_max = c->file_max;
+    const int targeting_largest = c->targeting_largest;
+    int aborted = 0;
+
+    do
     {
         if (tidesdb_cf_abort_requested(cf))
         {
@@ -15993,12 +16466,14 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     continue;
                 }
 
-                /* we add the btree sstable to target level */
+                /* we add the btree sstable to target level (commit serialized across partitions) */
+                pthread_mutex_lock(&cf->compaction_commit_lock);
                 tidesdb_level_add_sstable(cf->levels[end_idx], new_sst);
                 tidesdb_bump_sstable_layout_version(cf);
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[end_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
+                pthread_mutex_unlock(&cf->compaction_commit_lock);
                 tidesdb_sstable_unref(cf->db, new_sst);
                 continue;
             }
@@ -16484,66 +16959,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         }
 
         tidesdb_merge_heap_free(heap);
-        if (aborted) break;
-    }
+    } while (0);
 
-    if (aborted)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting partitioned merge", cf->name);
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-        }
-        queue_free(sstables_to_delete);
-        tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-        for (int i = 0; i < num_partitions; i++)
-        {
-            free(boundaries[i]);
-        }
-        free(boundaries);
-        free(boundary_sizes);
-        free(partition_skipped);
-        return TDB_SUCCESS;
-    }
-
-    tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_idx, end_idx);
-    queue_free(sstables_to_delete);
-    tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
-
-    /* the skew optimization can leave the largest level out of key order
-     * (skipped files keep their old slots while merged partitions append) --
-     * restore the ascending-min_key order the next partitioned merge relies on
-     * when it derives partition boundaries from this level */
-    if (skipped_any)
-    {
-        skip_list_comparator_fn sort_cmp = NULL;
-        void *sort_cmp_ctx = NULL;
-        tidesdb_resolve_comparator(cf->db, &cf->config, &sort_cmp, &sort_cmp_ctx);
-        if (sort_cmp && tidesdb_level_sort_by_min_key(cf->db, cf->levels[end_idx], sort_cmp,
-                                                      sort_cmp_ctx) != TDB_SUCCESS)
-        {
-            /* the largest level is left unsorted -- the next partitioned merge will derive
-             * boundaries from an out-of-order array. not fatal to this merge (sstables are
-             * already committed), but surface it. */
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "CF '%s' failed to re-sort level %d by min_key after partitioned merge "
-                          "(out of memory); next merge's partition boundaries may be skewed",
-                          cf->name, cf->levels[end_idx]->level_num);
-        }
-    }
-
-    for (int i = 0; i < num_partitions; i++)
-    {
-        free(boundaries[i]);
-    }
-    free(boundaries);
-    free(boundary_sizes);
-    free(partition_skipped);
-
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Partitioned merge complete for CF '%s', processed %d partitions",
-                  cf->name, num_partitions);
-
+    if (aborted) atomic_store_explicit(&c->aborted, 1, memory_order_release);
     return TDB_SUCCESS;
 }
 
@@ -17298,6 +17716,7 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
     }
 
     pthread_mutex_destroy(&cf->imm_snap_publish_lock);
+    pthread_mutex_destroy(&cf->compaction_commit_lock);
     free(cf->name);
     free(cf->directory);
     free(cf);
@@ -19459,6 +19878,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     (*db)->flush_queue = queue_new();
     (*db)->compaction_queue = queue_new();
+    /* sub-compaction helper-thread budget-- a parallel compaction round borrows up to this
+     * many ephemeral helpers, so total sub-merge threads across CFs stay within the pool */
+    atomic_init(&(*db)->compaction_helper_budget, config->num_compaction_threads);
 
     if (!(*db)->flush_queue || !(*db)->compaction_queue)
     {
@@ -21516,6 +21938,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->imm_snap_active, 0);
     atomic_init(&cf->active_mt_readers, 0);
     pthread_mutex_init(&cf->imm_snap_publish_lock, NULL);
+    pthread_mutex_init(&cf->compaction_commit_lock, NULL);
 
     /*** in unified memtable mode, writes go through the unified WAL so
      **  per-CF WAL files are not needed. skip creation to avoid wasted
@@ -23457,62 +23880,13 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         l0_delayed = 1;
     }
 
-    /* L1 (first disk level) hard write-stop. the graduated delays below only *slow* writes when L1
-     * exceeds a few x the trigger; under sustained ingest that compaction cannot match, the file
-     * count would still grow without bound -- the on-disk working set readers pin, and thus open
-     * fds and per-sstable aux memory, with it (the fd-exhaustion wedge). stop writers once L1
-     * reaches a high multiple of the trigger and hold until compaction drains it. like the L0 queue
-     * stall, we pace while compaction makes progress (file count shrinks or the sstable layout
-     * version advances) and only return BUSY if compaction is genuinely wedged. */
-    const int l1_stop_watermark = effective_l1_trigger * TDB_BACKPRESSURE_L1_STOP_MULTIPLIER;
-    if (l1_file_count >= l1_stop_watermark)
-    {
-        if (tdb_log_throttle(cf->db, &cf->last_l1_stop_log_sec,
-                             TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "CF '%s' L1 file-count stall: %d >= %d (%dx trigger) -- blocking until "
-                          "compaction drains",
-                          cf->name, l1_file_count, l1_stop_watermark,
-                          TDB_BACKPRESSURE_L1_STOP_MULTIPLIER);
-
-        /* ensure compaction is actually working the backlog down */
-        if (!atomic_load_explicit(&cf->is_compacting, memory_order_relaxed))
-            tidesdb_enqueue_compaction(cf, 0);
-
-        int total_iterations = 0;
-        int no_progress = 0;
-        int best_count = l1_file_count;
-        uint64_t last_layout =
-            atomic_load_explicit(&cf->sstable_layout_version, memory_order_relaxed);
-        while (atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire) >=
-               l1_stop_watermark)
-        {
-            usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
-            total_iterations++;
-            const int cur =
-                atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-            const uint64_t cur_layout =
-                atomic_load_explicit(&cf->sstable_layout_version, memory_order_relaxed);
-            if (cur < best_count || cur_layout != last_layout)
-            {
-                best_count = cur;
-                last_layout = cur_layout;
-                no_progress = 0;
-            }
-            else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "CF '%s' L1 file-count stall: no compaction progress for %dms -- "
-                              "compaction appears wedged",
-                              cf->name,
-                              no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-                return TDB_ERR_BUSY;
-            }
-        }
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' L1 file-count stall resolved after %dms", cf->name,
-                      total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-        l0_delayed = 1;
-    }
+    /* L1 file count does NOT gate writes. compaction (L1->L2+) is serialized per CF and is
+     * structurally slower than flush inflow, so L1 settles at a workload-dependent count; blocking
+     * the write/flush pipeline on it only converts a compaction-throughput limit into a stop-start
+     * stall and starves flushing (which is independent of compaction). the L1 graduated *delays*
+     * below pace writes gently without stopping them, memtable memory is bounded by the L0 queue
+     * stall and the active-memtable ceiling, and the open-fd working set is bounded by the reader
+     * fd reserve plus the reaper -- none of which need L1 file count as a write gate. */
 
     /* per-cf active memtable ceiling. tidesdb_flush_memtable_internal silently
      * defers the rotate when the active_flushes slot cap is reached, so the L0

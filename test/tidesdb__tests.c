@@ -2250,6 +2250,22 @@ static void wait_for_compaction_idle(tidesdb_t *db, tidesdb_column_family_t *cf)
     }
 }
 
+/* point-get that tolerates the retryable TDB_ERR_BUSY the reader fd reserve returns under fd
+ * pressure (low ulimit -n -> small max_open_sstables -> small reader budget; a scan that must open
+ * more sstables than the budget allows is rejected rather than starving flush/compaction of fds).
+ * the reaper frees idle descriptors between attempts, so a bounded retry succeeds. */
+static int tdb_test_get_with_retry(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
+                                   const uint8_t *k, size_t ksz, uint8_t **v, size_t *vs)
+{
+    int rc = tidesdb_txn_get(txn, cf, k, ksz, v, vs);
+    for (int a = 0; a < 500 && rc == TDB_ERR_BUSY; a++)
+    {
+        usleep(10000);
+        rc = tidesdb_txn_get(txn, cf, k, ksz, v, vs);
+    }
+    return rc;
+}
+
 /* single-delete + put pair-cancel at compaction.
  *
  * we lay down a sstable of puts and a separate sstable of matching single-
@@ -24806,8 +24822,17 @@ static void test_unified_multi_cf_flush_and_recovery(void)
         tidesdb_txn_free(txn);
     }
 
-    /* let background flushes drain */
-    usleep(500000);
+    /* wait for background flushes AND the parallel compaction to settle before verifying. a fixed
+     * sleep is not enough on a slow / fd-constrained runner: while compaction is still churning,
+     * num_open is elevated and a read that must open another sstable is correctly rejected with
+     * TDB_ERR_BUSY by the reader fd reserve, so the get returns non-zero through no fault of the
+     * data. waiting for idle drops num_open below the reserve so reads always proceed. */
+    wait_for_cf_flush_idle(db, cfa);
+    wait_for_cf_flush_idle(db, cfb);
+    wait_for_cf_flush_idle(db, cfc);
+    wait_for_compaction_idle(db, cfa);
+    wait_for_compaction_idle(db, cfb);
+    wait_for_compaction_idle(db, cfc);
 
     /* we verify before close */
     for (int i = 0; i < N; i++)
@@ -24824,19 +24849,19 @@ static void test_unified_multi_cf_flush_and_recovery(void)
         uint8_t *rv = NULL;
         size_t rs = 0;
 
-        ASSERT_EQ(tidesdb_txn_get(txn, cfa, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cfa, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
         ASSERT_EQ(rs, strlen(ea) + 1);
         ASSERT_TRUE(memcmp(rv, ea, rs) == 0);
         free(rv);
         rv = NULL;
 
-        ASSERT_EQ(tidesdb_txn_get(txn, cfb, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cfb, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
         ASSERT_EQ(rs, strlen(eb) + 1);
         ASSERT_TRUE(memcmp(rv, eb, rs) == 0);
         free(rv);
         rv = NULL;
 
-        ASSERT_EQ(tidesdb_txn_get(txn, cfc, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cfc, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
         ASSERT_EQ(rs, strlen(ec) + 1);
         ASSERT_TRUE(memcmp(rv, ec, rs) == 0);
         free(rv);
@@ -24860,6 +24885,14 @@ static void test_unified_multi_cf_flush_and_recovery(void)
     cfc = tidesdb_get_column_family(db, "ucf_fr_c");
     ASSERT_TRUE(cfa != NULL && cfb != NULL && cfc != NULL);
 
+    /* recovery can re-trigger flush/compaction; settle before verifying (see note above) */
+    wait_for_cf_flush_idle(db, cfa);
+    wait_for_cf_flush_idle(db, cfb);
+    wait_for_cf_flush_idle(db, cfc);
+    wait_for_compaction_idle(db, cfa);
+    wait_for_compaction_idle(db, cfb);
+    wait_for_compaction_idle(db, cfc);
+
     for (int i = 0; i < N; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -24874,19 +24907,19 @@ static void test_unified_multi_cf_flush_and_recovery(void)
         uint8_t *rv = NULL;
         size_t rs = 0;
 
-        ASSERT_EQ(tidesdb_txn_get(txn, cfa, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cfa, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
         ASSERT_EQ(rs, strlen(ea) + 1);
         ASSERT_TRUE(memcmp(rv, ea, rs) == 0);
         free(rv);
         rv = NULL;
 
-        ASSERT_EQ(tidesdb_txn_get(txn, cfb, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cfb, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
         ASSERT_EQ(rs, strlen(eb) + 1);
         ASSERT_TRUE(memcmp(rv, eb, rs) == 0);
         free(rv);
         rv = NULL;
 
-        ASSERT_EQ(tidesdb_txn_get(txn, cfc, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cfc, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
         ASSERT_EQ(rs, strlen(ec) + 1);
         ASSERT_TRUE(memcmp(rv, ec, rs) == 0);
         free(rv);

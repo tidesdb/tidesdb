@@ -403,8 +403,12 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     new_bm->fd = open(file_path, flags, mode);
     if (new_bm->fd == -1)
     {
+        /* preserve the open() errno across free() so the caller can report the real cause
+         * (EMFILE/ENFILE = fd exhaustion, ENOSPC = disk full, EACCES, ...) */
+        const int open_errno = errno;
         free(new_bm);
         *bm = NULL;
+        errno = open_errno;
         return -1;
     }
 
@@ -415,9 +419,11 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     {
         if (read_header(new_bm->fd) != 0)
         {
+            const int hdr_errno = errno;
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
+            errno = hdr_errno;
             return -1;
         }
     }
@@ -425,9 +431,11 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     {
         if (write_header(new_bm->fd) != 0)
         {
+            const int hdr_errno = errno;
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
+            errno = hdr_errno;
             return -1;
         }
         /* if O_DSYNC is available, pwrite already synced the header
@@ -436,9 +444,11 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         {
             if (fdatasync(new_bm->fd) != 0)
             {
+                const int sync_errno = errno;
                 close(new_bm->fd);
                 free(new_bm);
                 *bm = NULL;
+                errno = sync_errno;
                 return -1;
             }
         }

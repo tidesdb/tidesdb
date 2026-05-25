@@ -588,6 +588,11 @@ struct tidesdb_column_family_t
 
     /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
     uint32_t unified_cf_index;
+
+    /* last-emit timestamps (seconds) for throttled backpressure warnings -- see tdb_log_throttle.
+     * zero-initialized by calloc, so the first event in each category logs immediately. */
+    _Atomic(time_t) last_ceiling_stall_log_sec;
+    _Atomic(time_t) last_imm_critical_log_sec;
 };
 
 /**
@@ -864,6 +869,8 @@ struct tidesdb_t
         pthread_mutex_t cf_index_map_lock;
         pthread_mutex_t wal_group_sync_lock; /* coordinates group-commit fsync on the unified WAL */
         pthread_cond_t wal_group_sync_cond;
+        /* last-emit timestamp (seconds) for the throttled unified ceiling-stall warning */
+        _Atomic(time_t) last_ceiling_stall_log_sec;
     } unified_mt;
 
     /* object store mode runtime state */

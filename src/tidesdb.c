@@ -410,6 +410,12 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
  * stalls the writer until rotation completes */
 #define TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT 2
 
+/* backpressure stall warnings (ceiling stall, immutable-queue-critical) are emitted from the
+ * write/flush hot paths -- a per-event log floods under sustained backpressure (every stalling
+ * writer, every flush completion). throttle each to at most one line per CF per this many seconds
+ * so the condition stays visible without drowning the log. see tdb_log_throttle. */
+#define TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC 1
+
 /* global memory pressure configuration (computed by reaper, consumed by write path)
  * graduated response based on ratio of used memory to resolved_memory_limit */
 #define TDB_MEMORY_PRESSURE_NORMAL         0    /* < 60% -- no action */
@@ -469,6 +475,26 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BLOCK_INDEX_PREFIX_MIN 4
 #define TDB_BLOCK_INDEX_PREFIX_MAX 256
 #define TDB_BLOCK_INDEX_MAX_COUNT  1000000
+
+/**
+ * tdb_log_throttle
+ * rate-limit a hot-path log line. returns 1 at most once per interval_sec for a given
+ * last_log_sec slot, 0 otherwise. a CAS picks a single winner among concurrent callers so the
+ * line is emitted once per window even under many simultaneous writers/flushers.
+ * uses db->cached_current_time (maintained by the reaper) to avoid a clock syscall on the hot path.
+ * @param db database (source of cached time)
+ * @param last_log_sec per-CF / per-mode atomic holding the last emit time in seconds
+ * @param interval_sec minimum seconds between emissions
+ * @return 1 if the caller should emit now, 0 to suppress
+ */
+static int tdb_log_throttle(tidesdb_t *db, _Atomic(time_t) *last_log_sec, int interval_sec)
+{
+    const time_t now = atomic_load_explicit(&db->cached_current_time, memory_order_relaxed);
+    time_t last = atomic_load_explicit(last_log_sec, memory_order_relaxed);
+    if (now - last < interval_sec) return 0;
+    return atomic_compare_exchange_strong_explicit(last_log_sec, &last, now, memory_order_relaxed,
+                                                   memory_order_relaxed);
+}
 
 /* empty block index placeholder ( 4 byte LE count (0) followed by 1 byte prefix_len ) */
 #define TDB_EMPTY_BLOCK_INDEX_SIZE 5
@@ -5836,6 +5862,8 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
                                                      ? TDB_SYNC_FULL
                                                      : sst->config->sync_mode)) != 0)
         {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open klog '%s': %s", sst->klog_path,
+                          strerror(errno));
             return -1;
         }
         /* CAS to set klog_bm -- if another thread already set it, close ours */
@@ -5854,6 +5882,8 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
                                convert_sync_mode(sst->config->sync_mode)) != 0)
         {
             /* we dont close klog_bm here -- it may be used by another thread */
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open vlog '%s': %s", sst->vlog_path,
+                          strerror(errno));
             return -1;
         }
 
@@ -17363,8 +17393,12 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        /* we validate flush ordering -- new sst should have higher sequence than existing ones
-         * this maintains LSM invariant that newer data has higher sequence numbers */
+        /* out-of-order L0 insertion check. concurrent flush threads finish out of id order, so a
+         * lower-max_seq sstable can land after a higher one. this is benign: both point reads and
+         * the merge-heap iterators resolve versions by per-entry seq, never by L0 array position
+         * (the array is append-only and unsorted). logged at DEBUG as a flush-concurrency signal
+         * only -- it is not a correctness violation. one line per out-of-order add (not per pair)
+         * to avoid an O(n) burst when an old sstable lands behind many newer ones. */
         int num_existing = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
         if (num_existing > 0)
         {
@@ -17374,13 +17408,13 @@ static void *tidesdb_flush_worker_thread(void *arg)
             {
                 if (existing_ssts[i] && existing_ssts[i]->max_seq >= sst->max_seq)
                 {
-                    TDB_DEBUG_LOG(TDB_LOG_WARN,
-                                  "CF '%s' flush ordering violation - SSTable %" PRIu64
-                                  " (max_seq=%" PRIu64
-                                  ") "
-                                  "added after SSTable %" PRIu64 " (max_seq=%" PRIu64 ")",
+                    TDB_DEBUG_LOG(TDB_LOG_DEBUG,
+                                  "CF '%s' SSTable %" PRIu64 " (max_seq=%" PRIu64
+                                  ") added to L0 out of seq order behind SSTable %" PRIu64
+                                  " (max_seq=%" PRIu64 ") -- benign, reads resolve by seq",
                                   cf->name, work->sst_id, sst->max_seq, existing_ssts[i]->id,
                                   existing_ssts[i]->max_seq);
+                    break;
                 }
             }
         }
@@ -17558,7 +17592,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
             (counter % cleanup_threshold == 0) || (current_queue_size > max_queue_size);
         int force_cleanup = (current_queue_size >= force_cleanup_size);
 
-        if (force_cleanup)
+        if (force_cleanup && tdb_log_throttle(cf->db, &cf->last_imm_critical_log_sec,
+                                              TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
         {
             TDB_DEBUG_LOG(
                 TDB_LOG_WARN,
@@ -22518,7 +22553,8 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
 
         if (block_manager_open(&new_wal, wal_path, convert_sync_mode(cf->config.sync_mode)) != 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL: %s", cf->name, wal_path);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL '%s': %s", cf->name,
+                          wal_path, strerror(errno));
             skip_list_free(new_memtable);
             atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -23187,9 +23223,12 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         }
         if (active_size >= ceiling)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "CF '%s' active memtable ceiling stall: %zu bytes >= %zu (%dx wbuf)",
-                          cf->name, active_size, ceiling, TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
+            if (tdb_log_throttle(cf->db, &cf->last_ceiling_stall_log_sec,
+                                 TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "CF '%s' active memtable ceiling stall: %zu bytes >= %zu (%dx wbuf)",
+                              cf->name, active_size, ceiling,
+                              TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
 
             /* kick a force-flush so rotation runs as soon as a slot frees, instead
              * of waiting for the reaper's deferred-flush retry cycle. if the slot
@@ -23265,9 +23304,11 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         }
         if (u_size >= u_ceiling)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "unified active memtable ceiling stall: %zu bytes >= %zu (%dx wbuf)",
-                          u_size, u_ceiling, TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
+            if (tdb_log_throttle(cf->db, &cf->db->unified_mt.last_ceiling_stall_log_sec,
+                                 TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "unified active memtable ceiling stall: %zu bytes >= %zu (%dx wbuf)",
+                              u_size, u_ceiling, TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
 
             int expected = 0;
             if (atomic_compare_exchange_strong_explicit(&cf->db->unified_mt.is_flushing, &expected,

@@ -3500,4 +3500,37 @@ static inline FILE *tdb_fmemopen(void *buf, size_t size, const char *mode)
 #endif
 }
 
+#ifndef _WIN32
+#include <sys/resource.h> /* getrlimit / RLIMIT_NOFILE for tdb_max_open_files */
+#endif
+
+/* fallback open-file ceilings used when the OS limit cannot be queried */
+#define TDB_FALLBACK_MAX_OPEN_FILES_POSIX 1024 /* POSIX-typical default RLIMIT_NOFILE soft cap */
+#define TDB_FALLBACK_MAX_OPEN_FILES_WIN \
+    2048 /* conservative floor for the Windows CRT low-IO layer */
+
+/**
+ * tdb_max_open_files
+ * report the process's maximum number of simultaneously open file descriptors, so callers can
+ * size their fd budgets (e.g. max_open_sstables) to fit the OS limit. returns a conservative
+ * fallback when the limit cannot be determined or is unlimited.
+ * @return the open-file ceiling as a long
+ */
+static inline long tdb_max_open_files(void)
+{
+#if defined(_WIN32)
+    /* windows has no RLIMIT_NOFILE. the CRT low-IO layer permits a large but not directly
+     * queryable number of _open handles; _getmaxstdio reports the (smaller) stdio stream cap.
+     * use the larger of that and a conservative floor so we neither over- nor under-budget. */
+    const int stdio_cap = _getmaxstdio();
+    const long win_floor = TDB_FALLBACK_MAX_OPEN_FILES_WIN;
+    return (stdio_cap > win_floor) ? (long)stdio_cap : win_floor;
+#else
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0)
+        return (long)rl.rlim_cur;
+    return TDB_FALLBACK_MAX_OPEN_FILES_POSIX;
+#endif
+}
+
 #endif /* __COMPAT_H__ */

@@ -438,6 +438,23 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_SST_RETRY_MAX_SPINS         16 /* maximum cpu_pause count per retry */
 #define TDB_SST_RETRY_MAX_LEVEL_RETRIES 4  /* max full level restarts before skipping dead ssts */
 
+/* file-open descriptor-pressure handling. block_manager_open can fail with EMFILE/ENFILE when the
+ * process is momentarily at its open-fd ceiling (many sstables open under heavy flush+compaction).
+ * tidesdb_bm_open treats that as transient backpressure: it wakes the reaper to close idle sstables
+ * and retries a bounded number of times before failing, so an fd spike does not permanently wedge
+ * flush or compaction. all other errors (and success) return immediately. */
+#define TDB_BM_OPEN_EMFILE_MAX_RETRIES 5
+#define TDB_BM_OPEN_EMFILE_BACKOFF_US \
+    20000 /* 20ms between retries -- reaper evicts idle ssts on wake */
+
+/* sstable fd budget. each open sstable holds two descriptors (klog + vlog). at open we bound
+ * max_open_sstables so 2*cap fits under the process open-file limit, reserving headroom for WALs,
+ * the manifest, object-store handles, and stdio. the floor keeps the db usable even on a tiny
+ * descriptor limit (the EMFILE retry in tidesdb_bm_open then absorbs transient overshoot). */
+#define TDB_FDS_PER_SSTABLE        2
+#define TDB_FD_RESERVE_NON_SSTABLE 64 /* descriptors reserved for WALs/manifest/objstore/stdio */
+#define TDB_MIN_OPEN_SSTABLES      4  /* never clamp the sstable budget below this */
+
 /* sstable reaper eviction sentinel -- set on refcount during block manager close
  * to prevent concurrent try_ref from acquiring a reference on an evicting sstable */
 #define TDB_REFCOUNT_EVICTING (-1)
@@ -494,6 +511,49 @@ static int tdb_log_throttle(tidesdb_t *db, _Atomic(time_t) *last_log_sec, int in
     if (now - last < interval_sec) return 0;
     return atomic_compare_exchange_strong_explicit(last_log_sec, &last, now, memory_order_relaxed,
                                                    memory_order_relaxed);
+}
+
+/**
+ * tidesdb_wake_reaper
+ * nudge the sstable reaper to run its eviction pass now so it closes idle (unreferenced) sstable
+ * block managers and reclaims their file descriptors. uses trylock -- if the reaper mutex is held
+ * (reaper mid-cycle, or we are on the reaper thread itself) the signal is skipped, which is safe:
+ * the reaper runs on its own 100ms timer regardless. never blocks the caller.
+ * @param db database instance
+ */
+static void tidesdb_wake_reaper(tidesdb_t *db)
+{
+    if (pthread_mutex_trylock(&db->reaper_thread_mutex) == 0)
+    {
+        pthread_cond_signal(&db->reaper_thread_cond);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
+    }
+}
+
+/**
+ * tidesdb_bm_open
+ * open a block manager, treating file-descriptor exhaustion (EMFILE/ENFILE) as transient
+ * backpressure rather than a hard failure: wake the reaper to close idle sstables and retry a
+ * bounded number of times. every other errno (and success) returns immediately. errno is preserved
+ * by block_manager_open across its own cleanup, so the EMFILE/ENFILE check sees the real cause.
+ * @param db database instance (for waking the reaper)
+ * @param bm out: opened block manager
+ * @param path file path
+ * @param sync_mode block-manager sync mode (already converted)
+ * @return 0 on success, -1 on failure (errno set)
+ */
+static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path, int sync_mode)
+{
+    for (int attempt = 0;; attempt++)
+    {
+        if (block_manager_open(bm, path, sync_mode) == 0) return 0;
+        if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)
+            return -1;
+        /* fd table is full but idle sstables can usually be closed -- wake the reaper and give it
+         * a moment to reclaim descriptors before retrying. */
+        tidesdb_wake_reaper(db);
+        usleep(TDB_BM_OPEN_EMFILE_BACKOFF_US);
+    }
 }
 
 /* empty block index placeholder ( 4 byte LE count (0) followed by 1 byte prefix_len ) */
@@ -5857,10 +5917,10 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (!sst->klog_bm)
     {
         block_manager_t *new_klog_bm = NULL;
-        if (block_manager_open(&new_klog_bm, sst->klog_path,
-                               convert_sync_mode(sst->config->sync_mode == TDB_SYNC_INTERVAL
-                                                     ? TDB_SYNC_FULL
-                                                     : sst->config->sync_mode)) != 0)
+        if (tidesdb_bm_open(db, &new_klog_bm, sst->klog_path,
+                            convert_sync_mode(sst->config->sync_mode == TDB_SYNC_INTERVAL
+                                                  ? TDB_SYNC_FULL
+                                                  : sst->config->sync_mode)) != 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open klog '%s': %s", sst->klog_path,
                           strerror(errno));
@@ -5878,8 +5938,8 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (!sst->vlog_bm)
     {
         block_manager_t *new_vlog_bm = NULL;
-        if (block_manager_open(&new_vlog_bm, sst->vlog_path,
-                               convert_sync_mode(sst->config->sync_mode)) != 0)
+        if (tidesdb_bm_open(db, &new_vlog_bm, sst->vlog_path,
+                            convert_sync_mode(sst->config->sync_mode)) != 0)
         {
             /* we dont close klog_bm here -- it may be used by another thread */
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open vlog '%s': %s", sst->vlog_path,
@@ -18987,6 +19047,31 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                       (*db)->config.max_concurrent_flushes, (*db)->config.num_flush_threads);
         (*db)->config.max_concurrent_flushes = (*db)->config.num_flush_threads;
     }
+
+    /* bound the sstable fd budget to the OS open-file limit. each open sstable holds two
+     * descriptors; if the configured cap would need more fds than the limit can honor, opens
+     * fail with EMFILE under load, so clamp it down and tell the operator to raise ulimit -n.
+     * the reserve leaves headroom for WALs, the manifest, object-store handles, and stdio. */
+    {
+        const long fd_limit = tdb_max_open_files();
+        long fd_budget_ssts = (fd_limit - TDB_FD_RESERVE_NON_SSTABLE) / TDB_FDS_PER_SSTABLE;
+        if (fd_budget_ssts < TDB_MIN_OPEN_SSTABLES) fd_budget_ssts = TDB_MIN_OPEN_SSTABLES;
+        if ((long)(*db)->config.max_open_sstables > fd_budget_ssts)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "max_open_sstables (%zu) exceeds what the open-file limit can honor "
+                          "(%ld sstables for fd limit %ld) -- clamping. raise the process fd "
+                          "limit (ulimit -n) to keep more sstables open",
+                          (*db)->config.max_open_sstables, fd_budget_ssts, fd_limit);
+            (*db)->config.max_open_sstables = (size_t)fd_budget_ssts;
+        }
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "sstable fd budget: max_open_sstables=%zu (up to %ld fds), process fd "
+                      "limit=%ld",
+                      (*db)->config.max_open_sstables,
+                      (long)(*db)->config.max_open_sstables * TDB_FDS_PER_SSTABLE, fd_limit);
+    }
+
     /* subsequent reads in tidesdb_open should see the normalized values, so
      * rebind the input config alias to point at the owned copy */
     config = &(*db)->config;
@@ -22551,7 +22636,8 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                  "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, cf->directory,
                  TDB_U64_CAST(wal_id));
 
-        if (block_manager_open(&new_wal, wal_path, convert_sync_mode(cf->config.sync_mode)) != 0)
+        if (tidesdb_bm_open(cf->db, &new_wal, wal_path, convert_sync_mode(cf->config.sync_mode)) !=
+            0)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL '%s': %s", cf->name,
                           wal_path, strerror(errno));

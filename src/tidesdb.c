@@ -362,14 +362,12 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 /* immutable memtable cleanup configuration
  * cleanup runs frequently to prevent memory exhaustion from old immutables
  * only flushed immutables with no active readers are removed (safe cleanup) */
-#define TDB_IMMUTABLE_CLEANUP_THRESHOLD      2    /* check every 2 flushes */
-#define TDB_IMMUTABLE_MAX_QUEUE_SIZE         4    /* trigger cleanup when queue > 4 */
-#define TDB_IMMUTABLE_FORCE_CLEANUP_SIZE     8    /* force blocking cleanup at this size */
-#define TDB_IMMUTABLE_HARD_CAP               16   /* hard cap on immutable queue -- block enqueue */
-#define TDB_IMMUTABLE_HARD_CAP_WAIT_US       1000 /* 1ms poll interval when blocked at hard cap */
-#define TDB_IMMUTABLE_HARD_CAP_MAX_WAIT      5000 /* max 5s wait (5000 iterations * 1ms) */
-#define TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US  100  /* spin interval when waiting for readers */
-#define TDB_IMMUTABLE_FORCE_CLEANUP_MAX_WAIT 1000000 /* max 1 second wait per immutable */
+#define TDB_IMMUTABLE_CLEANUP_THRESHOLD  2    /* check every 2 flushes */
+#define TDB_IMMUTABLE_MAX_QUEUE_SIZE     4    /* trigger cleanup when queue > 4 */
+#define TDB_IMMUTABLE_FORCE_CLEANUP_SIZE 8    /* run a cleanup pass once the queue reaches this */
+#define TDB_IMMUTABLE_HARD_CAP           16   /* hard cap on immutable queue -- block enqueue */
+#define TDB_IMMUTABLE_HARD_CAP_WAIT_US   1000 /* 1ms poll interval when blocked at hard cap */
+#define TDB_IMMUTABLE_HARD_CAP_MAX_WAIT  5000 /* max 5s wait (5000 iterations * 1ms) */
 
 /* refcount drain configuration for flush worker
  * used when waiting for in-flight writers to finish before flushing memtable */
@@ -6748,8 +6746,26 @@ static void tidesdb_imm_snap_publish_locked(tidesdb_column_family_t *cf)
     /* we rebuild snapshot in the inactive slot from the queue
      * no refs needed -- the RCU mechanism guarantees items are valid while any
      * reader holds the slot. the queue itself holds the base ref on each item */
-    size_t count =
+    size_t raw =
         queue_snapshot(cf->immutable_memtables, (void **)next->items, TDB_IMM_SNAP_MAX_ITEMS);
+
+    /* drop already-flushed immutables from the READER snapshot. once an immutable is flushed its
+     * data is durable in an L1 sstable that was added to the level (with release) BEFORE `flushed`
+     * was set (also release), so any reader that observes this republished slot -- via the
+     * release/acquire pair on imm_snap_active below -- is guaranteed to also observe that sstable.
+     * excluding flushed immutables stops new iterators from taking a long-lived merge-source ref on
+     * them (tidesdb_merge_source_from_memtable), which is the only way their refcount can fall back
+     * to 1 so cleanup can reclaim them. without this, a steady stream of readers keeps re-pinning a
+     * flushed immutable, its refcount never reaches 1, the immutable queue cannot drain, and the
+     * flush worker wedges. the immutable stays in the queue until reclaimed -- only the snapshot
+     * drops it early. */
+    size_t count = 0;
+    for (size_t i = 0; i < raw; i++)
+    {
+        tidesdb_memtable_t *m = next->items[i];
+        if (m && atomic_load_explicit(&m->flushed, memory_order_acquire)) continue;
+        next->items[count++] = m;
+    }
     atomic_store_explicit(&next->count, count, memory_order_release);
 
     /* we ensure the new slot contents are visible before swapping active index */
@@ -17657,7 +17673,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         {
             TDB_DEBUG_LOG(
                 TDB_LOG_WARN,
-                "CF '%s' immutable queue critical size %zu >= %zu, forcing blocking cleanup",
+                "CF '%s' immutable queue at %zu >= %zu, running cleanup (reader-pinned immutables "
+                "are left for a later pass)",
                 cf->name, current_queue_size, force_cleanup_size);
         }
 
@@ -17673,7 +17690,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
         if (should_cleanup || force_cleanup)
         {
             int cleaned = 0;
-            int force_cleaned = 0;
             size_t items_to_process = queue_size(cf->immutable_memtables);
 
             /* we collect items to free -- we must publish snapshot (draining old readers)
@@ -17700,41 +17716,20 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
                 if (is_flushed)
                 {
-                    /* we try to claim the last reference atomically */
+                    /* we try to claim the last reference atomically. this is a single,
+                     * NON-BLOCKING attempt -- it succeeds only when refcount==1 (no reader holds a
+                     * merge-source ref). a pinned immutable is left in the queue and reclaimed on a
+                     * later pass once its readers drain. we must NOT spin-wait here: a flushed
+                     * immutable is now excluded from the reader snapshot (see
+                     * tidesdb_imm_snap_publish_locked), so no NEW reader can pin it and its
+                     * refcount will fall to 1 on its own -- blocking the flush worker to wait for
+                     * that is what collapsed flush throughput and wedged writes under reader load.
+                     */
                     if (atomic_compare_exchange_strong_explicit(
                             &queued_imm->refcount, &expected_refcount, 0, memory_order_acquire,
                             memory_order_relaxed))
                     {
                         can_cleanup = 1;
-                    }
-                    else if (force_cleanup)
-                    {
-                        /* we force cleanup, spin waiting for readers to finish */
-                        int64_t waited_us = 0;
-                        while (waited_us < TDB_IMMUTABLE_FORCE_CLEANUP_MAX_WAIT)
-                        {
-                            expected_refcount = 1;
-                            if (atomic_compare_exchange_strong_explicit(
-                                    &queued_imm->refcount, &expected_refcount, 0,
-                                    memory_order_acquire, memory_order_relaxed))
-                            {
-                                can_cleanup = 1;
-                                force_cleaned++;
-                                break;
-                            }
-                            usleep(TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US);
-                            waited_us += TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US;
-                        }
-                        if (!can_cleanup)
-                        {
-                            TDB_DEBUG_LOG(
-                                TDB_LOG_WARN,
-                                "CF '%s' force cleanup timed out waiting for "
-                                "immutable refcount "
-                                "(refcount=%d)",
-                                cf->name,
-                                atomic_load_explicit(&queued_imm->refcount, memory_order_acquire));
-                        }
                     }
                 }
 
@@ -17804,11 +17799,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     free(to_free[fi]);
                 }
 
-                TDB_DEBUG_LOG(
-                    TDB_LOG_INFO,
-                    "CF '%s' cleaned up %d flushed immutable(s) (%d forced) with no active "
-                    "readers",
-                    cf->name, cleaned, force_cleaned);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' cleaned up %d flushed immutable(s) with no active readers",
+                              cf->name, cleaned);
             }
         }
 

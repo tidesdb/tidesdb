@@ -26,12 +26,11 @@
 
 #include "compat.h"
 
-#ifndef _WIN32
-#include <signal.h>
-#endif
-
 /* snappy, lz4, zstd supported to use for compression purposes */
 /* snappy is not available on SunOS/OmniOS/Illumos */
+/* ABI/on-disk contract, these numeric values are persisted in sstable/vlog metadata and are
+ * duplicated in db.h (the standalone FFI header). the two copies MUST stay identical; compress.c
+ * pins these values with _Static_assert to catch drift at build time. */
 typedef enum
 {
     TDB_COMPRESS_NONE = 0,

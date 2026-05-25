@@ -431,7 +431,11 @@ typedef struct
  * @param list skip list
  * @param entries array of batch entries
  * @param count number of entries
- * @return number of successfully inserted entries, -1 on critical failure
+ * @return number of successfully inserted entries; this MAY be less than count when
+ *         individual entries are skipped (e.g. duplicate (key,seq) or a per-entry
+ *         allocation failure) -- compare the result against count to detect a partial
+ *         batch. returns -1 only on a critical failure that inserts nothing, NULL list/
+ *         entries, count == 0, or the update-array allocation failing.
  */
 int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entries, size_t count);
 

@@ -169,9 +169,24 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
     if (fgets(line, sizeof(line), fp))
     {
-        atomic_store(&manifest->sequence, strtoull(line, NULL, 10));
+        char *seq_endptr;
+        const unsigned long long seq = strtoull(line, &seq_endptr, 10);
+        /* the sequence line must be a number terminated by end-of-line. reject junk
+         * (e.g. "123abc") rather than silently truncating it -- an under-parsed
+         * sequence under-seeds next_sstable_id on recovery and risks id collisions */
+        if (seq_endptr == line ||
+            (*seq_endptr != '\0' && *seq_endptr != '\n' && *seq_endptr != '\r'))
+        {
+            fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
+        atomic_store(&manifest->sequence, seq);
     }
 
+    int skipped_lines = 0;
     while (fgets(line, sizeof(line), fp))
     {
         const char *ptr = line;
@@ -179,25 +194,49 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
         /* parse level */
         const long level_val = strtol(ptr, &endptr, 10);
-        if (endptr == ptr || *endptr != ',') continue;
+        if (endptr == ptr || *endptr != ',')
+        {
+            skipped_lines++;
+            continue;
+        }
         const int level = (int)level_val;
         ptr = endptr + 1;
 
         /* parse id */
         const uint64_t id = strtoull(ptr, &endptr, 10);
-        if (endptr == ptr || *endptr != ',') continue;
+        if (endptr == ptr || *endptr != ',')
+        {
+            skipped_lines++;
+            continue;
+        }
         ptr = endptr + 1;
 
         /* parse num_entries */
         const uint64_t num_entries = strtoull(ptr, &endptr, 10);
-        if (endptr == ptr || *endptr != ',') continue;
+        if (endptr == ptr || *endptr != ',')
+        {
+            skipped_lines++;
+            continue;
+        }
         ptr = endptr + 1;
 
         /* parse size_bytes */
         const uint64_t size_bytes = strtoull(ptr, &endptr, 10);
-        if (endptr == ptr) continue;
+        if (endptr == ptr)
+        {
+            skipped_lines++;
+            continue;
+        }
 
         tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+    }
+
+    /* surface silent data loss, malformed entry lines were dropped. this leaf module has
+     * no access to the db log, so a single stderr line is the best signal available. */
+    if (skipped_lines > 0)
+    {
+        fprintf(stderr, "tidesdb manifest: skipped %d malformed entry line(s) while loading %s\n",
+                skipped_lines, manifest->path ? manifest->path : "(unknown)");
     }
 
     /* we keep file open for future use */
@@ -319,8 +358,11 @@ void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t seq
 {
     if (!manifest) return;
 
-    /* sequence is atomic, no lock needed for simple store */
-    atomic_store(&manifest->sequence, sequence);
+    /* monotonic guard, the sequence seeds next_sstable_id on recovery, so it must never
+     * regress or recovery would re-hand-out live sstable ids and collide. only advance.
+     * (best-effort under concurrency; this API is not on a hot path.) */
+    const uint64_t cur = atomic_load(&manifest->sequence);
+    if (sequence > cur) atomic_store(&manifest->sequence, sequence);
 }
 
 int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
@@ -402,7 +444,9 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
      * without this, a crash after rename could lose the directory entry
      * on POSIX systems that don't flush directory metadata automatically. */
     {
-        char dir_buf[1024];
+        /* sized to the full manifest path length -- a 1024-byte buffer silently truncated
+         * paths > 1023 chars and synced the wrong directory */
+        char dir_buf[MANIFEST_PATH_LEN];
         strncpy(dir_buf, path, sizeof(dir_buf) - 1);
         dir_buf[sizeof(dir_buf) - 1] = '\0';
         char *last_sep = strrchr(dir_buf, '/');

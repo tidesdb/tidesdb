@@ -456,6 +456,45 @@ void test_objstore_s3_minio(void)
     free(store);
     remove_directory(TEST_OBJSTORE_DIR2);
 }
+
+/* construct-only coverage for the config-driven S3 constructor, it must build a connector with
+ * TLS + multipart settings without touching the network, reject missing required fields, and the
+ * positional wrapper must still build a connector with secure defaults. network behavior needs a
+ * live endpoint -- see test_objstore_s3_minio. */
+void test_objstore_s3_create_config(void)
+{
+    tidesdb_objstore_s3_config_t cfg = {0};
+    cfg.endpoint = "localhost:9000";
+    cfg.bucket = "testbucket";
+    cfg.access_key = "ak";
+    cfg.secret_key = "sk";
+    cfg.use_ssl = 1;
+    cfg.use_path_style = 1;
+    cfg.tls_ca_path = "/path/to/ca-bundle.crt"; /* stored verbatim; need not exist to construct */
+    cfg.tls_insecure_skip_verify = 1;
+    cfg.multipart_threshold = (size_t)32 * 1024 * 1024; /* non-default, exercises the override */
+    cfg.multipart_part_size = (size_t)16 * 1024 * 1024;
+
+    tidesdb_objstore_t *store = tidesdb_objstore_s3_create_config(&cfg);
+    ASSERT_TRUE(store != NULL);
+    ASSERT_EQ(store->backend, TDB_BACKEND_S3);
+    ASSERT_TRUE(store->put != NULL && store->destroy != NULL && store->ctx != NULL);
+    store->destroy(store->ctx);
+    free(store);
+
+    /* required-field validation */
+    ASSERT_TRUE(tidesdb_objstore_s3_create_config(NULL) == NULL);
+    tidesdb_objstore_s3_config_t missing = {0};
+    missing.endpoint = "localhost:9000"; /* no bucket/keys */
+    ASSERT_TRUE(tidesdb_objstore_s3_create_config(&missing) == NULL);
+
+    /* the positional wrapper must still build a connector (secure defaults) */
+    tidesdb_objstore_t *store2 =
+        tidesdb_objstore_s3_create("localhost:9000", "testbucket", NULL, "ak", "sk", NULL, 0, 1);
+    ASSERT_TRUE(store2 != NULL);
+    store2->destroy(store2->ctx);
+    free(store2);
+}
 #endif
 
 int main(int argc, char **argv)
@@ -474,6 +513,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_fs_overwrite, tests_passed);
     RUN_TEST(test_objstore_fs_nested_keys, tests_passed);
 #ifdef TIDESDB_WITH_S3
+    RUN_TEST(test_objstore_s3_create_config, tests_passed);
     RUN_TEST(test_objstore_s3_minio, tests_passed);
 #endif
 

@@ -1300,7 +1300,7 @@ void test_concurrent_put_delete_same_key(void)
     for (int i = 0; i < num_putters; i++) pthread_join(putters[i], NULL);
     for (int i = 0; i < num_deleters; i++) pthread_join(deleters[i], NULL);
 
-    /* final state: key may or may not exist */
+    /* final state-- key may or may not exist */
     size_t len;
     uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
     if (data)
@@ -1482,6 +1482,67 @@ void test_zero_copy_get_release(void)
 
     clock_cache_destroy(cache);
     printf("  ✓ Zero-copy get/release test passed\n");
+}
+
+void test_reader_saturation_refuses_pin(void)
+{
+    printf("Testing reader-count saturation refuses pins instead of wrapping...\n");
+
+    /* the ref_bit reader field is 7 bits, so at most this many readers can pin one entry at
+     * once. an unconditional increment would wrap the 128th pin to 0 and let a concurrent
+     * delete/evict free the entry under live readers (use-after-free). the acquire must instead
+     * refuse the over-cap pin and report a miss, leaving earlier pins valid. */
+    const int max_readers = 127;
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 256};
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const char *key = "saturation_key";
+    const uint8_t payload[] = "saturation_payload_data";
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
+
+    clock_cache_entry_t *held[128] = {0};
+    const uint8_t *first_data = NULL;
+
+    /* pin up to the reader cap -- all of these must succeed */
+    for (int i = 0; i < max_readers; i++)
+    {
+        size_t len = 0;
+        const uint8_t *data = clock_cache_get_zero_copy(cache, key, strlen(key), &len, &held[i]);
+        ASSERT_TRUE(data != NULL);
+        ASSERT_TRUE(held[i] != NULL);
+        if (i == 0) first_data = data;
+    }
+
+    /* the next pin would overflow the reader field -- it must be refused (reported as a miss) */
+    {
+        size_t len = 0;
+        clock_cache_entry_t *over = NULL;
+        const uint8_t *data = clock_cache_get_zero_copy(cache, key, strlen(key), &len, &over);
+        ASSERT_TRUE(data == NULL);
+        ASSERT_TRUE(over == NULL);
+    }
+
+    /* delete while all readers are held -- free_entry must NOT reclaim the entry (it reverts to
+     * VALID and aborts), so the held payload stays valid and readable; a use-after-free here
+     * would trip ASan, and a wrapped reader field would have let the free through. */
+    clock_cache_delete(cache, key, strlen(key));
+    ASSERT_TRUE(memcmp(first_data, payload, sizeof(payload)) == 0);
+
+    /* release every reader, then delete again -- with no readers held the delete now takes */
+    for (int i = 0; i < max_readers; i++) clock_cache_release(held[i]);
+    clock_cache_delete(cache, key, strlen(key));
+    {
+        size_t len = 0;
+        clock_cache_entry_t *e = NULL;
+        const uint8_t *data = clock_cache_get_zero_copy(cache, key, strlen(key), &len, &e);
+        ASSERT_TRUE(data == NULL);
+    }
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Reader saturation refuses over-cap pins, no wrap, no use-after-free\n");
 }
 
 void test_large_payload(void)
@@ -1889,7 +1950,7 @@ static inline uint32_t xorshift32(uint32_t *state)
     return x;
 }
 
-/* approximate Zipfian: pick index in [0, n) biased toward low indices.
+/* approximate Zipfian, pick index in [0, n) biased toward low indices.
  * models real-world "hot key" patterns -- a few btree root/internal nodes
  * are accessed far more often than deep leaf nodes. */
 static inline int zipf_pick(uint32_t *rng, int n)
@@ -1901,7 +1962,7 @@ static inline int zipf_pick(uint32_t *rng, int n)
     return (idx >= n) ? n - 1 : idx;
 }
 
-/* variable block size: models real btree nodes that range from ~200B (small leaf)
+/* variable block size, models real btree nodes that range from ~200B (small leaf)
  * to ~4KB (large internal node with many keys). returns a size in [lo, hi). */
 static inline size_t variable_block_size(uint32_t *rng, size_t lo, size_t hi)
 {
@@ -1966,7 +2027,7 @@ void test_realistic_block_cache_eviction(void)
     size_t block_sizes[2000];
     for (int i = 0; i < num_blocks; i++) block_sizes[i] = variable_block_size(&rng, 200, 2048);
 
-    /* phase 1: warm-up -- insert all blocks (simulates initial table scan / SST open) */
+    /* warm-up -- insert all blocks (simulates initial table scan / SST open) */
     printf("  Phase 1: inserting %d variable-size blocks (200B-2KB)...\n", num_blocks);
     for (int i = 0; i < num_blocks; i++)
     {
@@ -1994,7 +2055,7 @@ void test_realistic_block_cache_eviction(void)
     printf("    Total data offered: %zu bytes (%.1fx cache size)\n", total_data_inserted,
            (double)total_data_inserted / max_bytes);
 
-    /* phase 2: steady-state Zipfian workload (90% read, 10% new-block writes).
+    /* steady-state Zipfian workload (90% read, 10% new-block writes).
      * on cache miss, we re-insert the block (simulating a real disk read that
      * populates the cache -- this is how btree_node_read_cached works). */
     printf("  Phase 2: 20000 Zipfian accesses (90%% read, 10%% write)...\n");
@@ -2058,13 +2119,13 @@ void test_realistic_block_cache_eviction(void)
     ASSERT_TRUE(hits > 0);
     ASSERT_TRUE(corruptions == 0);
 
-    /* verify byte budget is still respected after steady-state phase */
+    /* we verify byte budget is still respected after steady-state phase */
     clock_cache_stats_t mid_stats;
     clock_cache_get_stats(cache, &mid_stats);
     printf("    Post-steady-state: bytes_used=%zu / %zu\n", mid_stats.total_bytes, max_bytes);
     ASSERT_TRUE(mid_stats.total_bytes <= max_bytes * 2);
 
-    /* phase 3: scan burst -- sequential scan of 500 cold blocks forces eviction
+    /* scan burst -- sequential scan of 500 cold blocks forces eviction
      * of working set, then re-access hot keys to verify cache recovers */
     printf("  Phase 3: sequential scan burst (500 cold blocks)...\n");
     for (int i = 0; i < 500; i++)
@@ -2127,16 +2188,15 @@ void test_realistic_node_cache_external_bytes(void)
     const int num_nodes = 500; /* more nodes than fit in cache */
     uint32_t rng = 12345;
 
-    /* phase 1: populate -- each entry is a small pointer (8B inline) + large external cost */
     printf("  Inserting %d nodes with variable external_bytes (1-8 KB each)...\n", num_nodes);
     size_t total_external_offered = 0;
 
     for (int i = 0; i < num_nodes; i++)
     {
-        /* inline payload: simulates a pointer value */
+        /* inline payload-- simulates a pointer value */
         uint64_t fake_ptr = (uint64_t)(0xCAFE0000 + i);
 
-        /* external_bytes: simulates the real heap cost of the node */
+        /* external_bytes-- simulates the real heap cost of the node */
         size_t ext = variable_block_size(&rng, 1024, 8192);
         total_external_offered += ext;
 
@@ -2156,7 +2216,7 @@ void test_realistic_node_cache_external_bytes(void)
     ASSERT_TRUE(stats.total_entries < (size_t)num_nodes);
     ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
 
-    /* phase 2: Zipfian reads with miss-fill -- simulates btree_node_read_cached:
+    /* Zipfian reads with miss-fill -- simulates btree_node_read_cached:
      * on miss, read from "disk" and re-populate cache with external_bytes cost.
      * hot root/internal nodes get re-cached and stay cached. */
     printf("  Zipfian reads of %d nodes (with miss-fill)...\n", num_nodes);
@@ -2182,7 +2242,7 @@ void test_realistic_node_cache_external_bytes(void)
         }
         else
         {
-            /* cache miss -- simulate disk read: re-insert with external_bytes */
+            /* cache miss -- simulate disk read re-insert with external_bytes */
             uint64_t fake_ptr = (uint64_t)(0xCAFE0000 + nid);
             size_t ext = variable_block_size(&rng, 1024, 8192);
             clock_cache_put(cache, key, strlen(key), &fake_ptr, sizeof(fake_ptr), ext);
@@ -2194,7 +2254,6 @@ void test_realistic_node_cache_external_bytes(void)
     /* with miss-fill and Zipfian skew, hot nodes get re-cached */
     ASSERT_TRUE(hits > 0);
 
-    /* phase 3: compare with no external_bytes -- should fit far more entries */
     clock_cache_clear(cache);
     for (int i = 0; i < num_nodes; i++)
     {
@@ -2222,7 +2281,7 @@ void test_realistic_node_cache_external_bytes(void)
  *   -- 2 writer threads (insert new blocks + update existing -- simulates INSERT/UPDATE)
  *   -- cache sized to hold ~30% of working set (forces realistic eviction pressure)
  *   -- runs for ~1 second, sampling stats every 200ms
- *   -- verifies: byte budget, data integrity, reasonable hit rates, no crashes
+ *   -- verifies-- byte budget, data integrity, reasonable hit rates, no crashes
  */
 #define OLTP_NUM_BLOCKS    10000 /* total block keyspace */
 #define OLTP_BLOCK_MIN_SZ  256
@@ -2513,9 +2572,9 @@ void test_realistic_working_set_shift(void)
 /**
  * test_realistic_mixed_block_sizes
  * models a column family with mixed SST block sizes:
- *   -- index blocks: small (~128B), frequently accessed
- *   -- data blocks: large (~2-8KB), less frequently accessed
- *   -- filter/bloom blocks: medium (~512B), accessed on every query
+ *   -- index blocks          small (~128B), frequently accessed
+ *   -- data blocks           large (~2-8KB), less frequently accessed
+ *   -- filter/bloom blocks   medium (~512B), accessed on every query
  * verifies that the cache fairly handles mixed sizes and that
  * small hot entries don't get unfairly evicted by large cold entries.
  */
@@ -2580,7 +2639,7 @@ void test_realistic_mixed_block_sizes(void)
     printf("    bytes=%zu/%zu, entries=%zu\n", stats.total_bytes, max_bytes, stats.total_entries);
     ASSERT_TRUE(stats.total_bytes <= max_bytes * 2);
 
-    /* now simulate realistic query pattern: each query reads 1 index + 1 filter + 1 data block
+    /* now simulate realistic query pattern where each query reads 1 index + 1 filter + 1 data block
      * index/filter blocks are Zipfian-hot, data blocks are more uniformly accessed */
     printf("  Simulating 5000 queries (idx + flt + dat per query)...\n");
     int idx_hits = 0, flt_hits = 0, dat_hits = 0;
@@ -2603,7 +2662,7 @@ void test_realistic_mixed_block_sizes(void)
         }
         else
         {
-            /* miss-fill: simulate disk read populating cache */
+            /* miss-fill we simulate disk read populating cache */
             size_t bsz = variable_block_size(&rng, 64, 192);
             uint8_t *block = (uint8_t *)malloc(bsz);
             fill_block_payload(block, bsz, (uint32_t)(10000 + iid));
@@ -2702,6 +2761,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_hash_collision_concurrent, tests_passed);
     RUN_TEST(test_shutdown_during_operations, tests_passed);
     RUN_TEST(test_zero_copy_get_release, tests_passed);
+    RUN_TEST(test_reader_saturation_refuses_pin, tests_passed);
     RUN_TEST(test_large_payload, tests_passed);
     RUN_TEST(test_many_small_entries, tests_passed);
     RUN_TEST(test_foreach_prefix_concurrent, tests_passed);

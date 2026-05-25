@@ -208,11 +208,17 @@ static void cache_remove_entry(tdb_local_cache_t *cache, tdb_cache_entry_t *entr
 
     if (delete_file)
     {
-#ifdef _WIN32
-        _unlink(entry->path);
-#else
-        unlink(entry->path);
-#endif
+        /* tdb_unlink clears the Windows read-only attribute that can otherwise block
+         * deletion. surface a failure, a swallowed unlink error leaks the file on disk
+         * while the byte counter below is decremented as if reclaimed. this leaf module has
+         * no db log, so stderr is the available channel. the counter is still decremented
+         * because the entry is being untracked regardless -- the leak is an OS-level issue
+         * the operator must clear, not a tracker-accounting one. */
+        if (tdb_unlink(entry->path) != 0)
+        {
+            fprintf(stderr, "tidesdb local_cache: failed to unlink %s; file leaked on disk\n",
+                    entry->path);
+        }
     }
 
     *current -= entry->size;

@@ -1370,8 +1370,8 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *level,
                                         tidesdb_sstable_t *sst);
 static int tidesdb_level_update_boundaries(tidesdb_level_t *level, tidesdb_level_t *largest_level);
-static void tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
-                                          skip_list_comparator_fn cmp, void *cmp_ctx);
+static int tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
+                                         skip_list_comparator_fn cmp, void *cmp_ctx);
 static tidesdb_merge_heap_t *tidesdb_merge_heap_create(skip_list_comparator_fn comparator,
                                                        void *comparator_ctx);
 static void tidesdb_merge_heap_free(tidesdb_merge_heap_t *heap);
@@ -1389,7 +1389,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
                                                                tidesdb_sstable_t *sst);
 static int tidesdb_btree_read_vlog_value(block_manager_cursor_t *vlog_cursor, uint64_t vlog_offset,
                                          const tidesdb_column_family_config_t *config,
-                                         uint8_t **value_out, size_t *value_size_out);
+                                         uint8_t **value_out, size_t *value_size_out,
+                                         size_t expected_value_size);
 static void tidesdb_iter_clear_block_stash(tidesdb_merge_source_t *source);
 static void tidesdb_iter_clear_lazy(tidesdb_merge_source_t *source);
 static tidesdb_column_family_t *tidesdb_get_column_family_internal(tidesdb_t *db, const char *name);
@@ -2063,42 +2064,11 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, const size_t key_size, const 
     return 0;
 }
 
-/**
- * sstable_metadata_header_t
- * @param magic magic number for validation
- * @param num_entries total number of entries
- * @param num_klog_blocks number of klog blocks
- * @param num_vlog_blocks number of vlog blocks
- * @param klog_size size of klog file
- * @param vlog_size size of vlog file
- * @param min_key_size size of min key
- * @param max_key_size size of max key
- * @param compression_algorithm compression algorithm used (0=none, 1=snappy, 2=lz4, 3=zstd,
- * 4=lz4_fast)
- * @param flags metadata flags (bit 0 = use_btree, bits 1-31 reserved)
- * @param checksum xxHash64 checksum of all fields except checksum itself
- *
- * if flags & SSTABLE_FLAG_BTREE is set, additional btree metadata follows after max_key:
- *   -- int64_t btree_root_offset
- *   -- int64_t btree_first_leaf
- *   -- int64_t btree_last_leaf
- *   -- uint64_t btree_node_count
- *   -- uint32_t btree_height
- */
-typedef struct
-{
-    uint32_t magic;
-    uint64_t num_entries;
-    uint64_t num_klog_blocks;
-    uint64_t num_vlog_blocks;
-    uint64_t klog_size;
-    uint64_t vlog_size;
-    uint64_t min_key_size;
-    uint64_t max_key_size;
-    uint32_t compression_algorithm;
-    uint32_t flags;
-    uint64_t checksum;
-} sstable_metadata_header_t;
+/* the on-disk sstable metadata header is serialized/deserialized field-by-field with the
+ * encode_*_le_compat helpers in sstable_metadata_serialize / sstable_metadata_deserialize --
+ * see those functions (and design/tidesdb_sstable_format.md S7.4) for the authoritative wire
+ * layout. a stale `sstable_metadata_header_t` struct used to live here but was never
+ * referenced and omitted two serialized fields (klog_data_end_offset, max_seq); removed. */
 
 /* sstable metadata flags */
 #define SSTABLE_FLAG_BTREE 0x01 /* sstable uses btree format instead of klog blocks */
@@ -4485,38 +4455,41 @@ static void *tdb_upload_worker_thread(void *arg)
             for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
             {
                 rc = db->object_store->put(db->object_store->ctx, job->object_key, job->local_path);
-                if (rc == 0) break;
+                if (rc != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload attempt %d/%d failed: %s", attempt + 1,
+                                  TDB_UPLOAD_MAX_RETRIES, job->object_key);
+                }
+                else if (!strstr(job->object_key, TDB_COLUMN_FAMILY_MANIFEST_NAME))
+                {
+                    /* verify the upload landed with the correct size. MANIFEST is skipped --
+                     * it is mutable and may grow between upload and the exists check due to
+                     * concurrent flushes. a verify mismatch now retries the put (rc=-1 below)
+                     * instead of being a permanent failure with no re-upload. */
+                    struct stat local_st;
+                    if (stat(job->local_path, &local_st) == 0)
+                    {
+                        size_t remote_size = 0;
+                        const int verify = db->object_store->exists(db->object_store->ctx,
+                                                                    job->object_key, &remote_size);
+                        if (verify != 1 || remote_size != (size_t)local_st.st_size)
+                        {
+                            TDB_DEBUG_LOG(
+                                TDB_LOG_ERROR,
+                                "Upload verification failed for %s (local=%zu, remote=%zu, "
+                                "exists=%d)",
+                                job->object_key, (size_t)local_st.st_size, remote_size, verify);
+                            rc = -1;
+                        }
+                    }
+                }
 
-                TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload attempt %d/%d failed: %s", attempt + 1,
-                              TDB_UPLOAD_MAX_RETRIES, job->object_key);
+                if (rc == 0) break;
 
                 if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES)
                 {
                     usleep(backoff_us);
                     backoff_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
-                }
-            }
-
-            /* we verify upload landed by checking the object exists with correct size.
-             * skip size verification for MANIFEST files since they are mutable and
-             * may grow between upload and the exists check due to concurrent flushes. */
-            if (rc == 0 && !strstr(job->object_key, TDB_COLUMN_FAMILY_MANIFEST_NAME))
-            {
-                struct stat local_st;
-                if (stat(job->local_path, &local_st) == 0)
-                {
-                    size_t remote_size = 0;
-                    const int verify = db->object_store->exists(db->object_store->ctx,
-                                                                job->object_key, &remote_size);
-                    if (verify != 1 || remote_size != (size_t)local_st.st_size)
-                    {
-                        TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                      "Upload verification failed for %s (local=%zu, remote=%zu, "
-                                      "exists=%d)",
-                                      job->object_key, (size_t)local_st.st_size, remote_size,
-                                      verify);
-                        rc = -1;
-                    }
                 }
             }
 
@@ -5354,9 +5327,14 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
                 memcpy(prefixed + TDB_UNIFIED_CF_PREFIX_SIZE, key, key_size_u64);
 
                 const int is_delete = (flags & TDB_KV_FLAG_TOMBSTONE) ? 1 : 0;
+                /* preserve the single-delete subtype across replay (mirrors per-CF WAL
+                 * replay) so compaction can still pair-cancel put+single-delete */
+                int sl_flags = is_delete ? SKIP_LIST_FLAG_DELETED : 0;
+                if (is_delete && (flags & TDB_KV_FLAG_SINGLE_DELETE))
+                    sl_flags |= SKIP_LIST_FLAG_SINGLE_DELETE;
                 skip_list_put_with_seq(
                     umt->skip_list, prefixed, pk_total, is_delete ? NULL : (uint8_t *)value,
-                    is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, is_delete);
+                    is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, sl_flags);
                 TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack_r);
 
                 if (seq_value > max_seq) max_seq = seq_value;
@@ -5419,10 +5397,31 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
         return;
     }
 
-    /* we list all available WAL objects in the object store */
+    /* we list all available WAL objects in the object store, with retry -- a transient list
+     * failure must not be mistaken for "no WALs" and silently skip WAL recovery (mirrors the
+     * retry in tdb_replica_discover_new_cfs) */
     tdb_wal_discovery_ctx_t discovery = {.count = 0};
-    db->object_store->list(db->object_store->ctx, TDB_UNIFIED_WAL_PREFIX, tdb_wal_discovery_cb,
-                           &discovery);
+    int list_rc = -1;
+    unsigned int backoff_us = TDB_LIST_INITIAL_BACKOFF_US;
+    for (int attempt = 0; attempt < TDB_LIST_MAX_RETRIES; attempt++)
+    {
+        discovery.count = 0;
+        list_rc = db->object_store->list(db->object_store->ctx, TDB_UNIFIED_WAL_PREFIX,
+                                         tdb_wal_discovery_cb, &discovery);
+        if (list_rc >= 0) break;
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica WAL replay: object store list attempt %d/%d failed",
+                      attempt + 1, TDB_LIST_MAX_RETRIES);
+        if (attempt + 1 < TDB_LIST_MAX_RETRIES) usleep(backoff_us);
+        backoff_us *= 2;
+    }
+
+    if (list_rc < 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "Replica WAL replay: object store list failed after %d attempts, skipping",
+                      TDB_LIST_MAX_RETRIES);
+        return;
+    }
 
     if (discovery.count == 0)
     {
@@ -5782,7 +5781,21 @@ static void tdb_objstore_delete_listed_cb(const char *key, const size_t size, vo
 {
     (void)size;
     const tidesdb_objstore_t *store = (tidesdb_objstore_t *)cb_ctx;
-    store->delete_object(store->ctx, key);
+
+    /* retry with backoff and log on exhaustion, mirroring tdb_objstore_delete_file -- a
+     * single ignored delete during CF drop silently leaves orphaned remote objects */
+    unsigned int delay_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
+    for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
+    {
+        if (store->delete_object(store->ctx, key) == 0) return;
+
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store delete attempt %d/%d failed during drop: %s",
+                      attempt + 1, TDB_UPLOAD_MAX_RETRIES, key);
+        if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES) usleep(delay_us);
+        delay_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
+    }
+    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store delete failed after %d attempts during drop: %s",
+                  TDB_UPLOAD_MAX_RETRIES, key);
 }
 
 /**
@@ -8001,9 +8014,16 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
     const int max_cmp =
         comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
 
-    if (min_cmp < 0 || max_cmp > 0)
+    /* mirror the klog get path, a reverse comparator stores min_key/max_key in reverse
+     * user order, so the range gate must invert or a reverse-sorted btree sstable
+     * rejects every in-range key */
+    if (sst->is_reverse)
     {
-        return TDB_ERR_NOT_FOUND;
+        if (min_cmp > 0 || max_cmp < 0) return TDB_ERR_NOT_FOUND;
+    }
+    else
+    {
+        if (min_cmp < 0 || max_cmp > 0) return TDB_ERR_NOT_FOUND;
     }
 
     if (sst->bloom_filter)
@@ -8080,7 +8100,7 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
         uint8_t *vlog_value = NULL;
         size_t vlog_value_size = 0;
         if (tidesdb_btree_read_vlog_value(&vlog_cursor, vlog_offset, sst->config, &vlog_value,
-                                          &vlog_value_size) != 0)
+                                          &vlog_value_size, value_size) != 0)
         {
             return TDB_ERR_IO;
         }
@@ -9725,8 +9745,8 @@ static int tidesdb_level_remove_sstables_batch(const tidesdb_t *db, tidesdb_leve
  * @param cmp resolved comparator
  * @param cmp_ctx resolved comparator context
  */
-static void tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
-                                          skip_list_comparator_fn cmp, void *cmp_ctx)
+static int tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
+                                         skip_list_comparator_fn cmp, void *cmp_ctx)
 {
     while (1)
     {
@@ -9748,14 +9768,14 @@ static void tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
         if (num < 2)
         {
             atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
-            return;
+            return TDB_SUCCESS;
         }
 
         tidesdb_sstable_t **new_arr = calloc(capacity + 1, sizeof(tidesdb_sstable_t *));
         if (!new_arr)
         {
             atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
-            return;
+            return TDB_ERR_MEMORY;
         }
         memcpy(new_arr, old_arr, num * sizeof(tidesdb_sstable_t *));
 
@@ -9789,7 +9809,7 @@ static void tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
             tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
                 &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
             tidesdb_retire_array(db, prev_retired, level);
-            return;
+            return TDB_SUCCESS;
         }
 
         atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
@@ -10409,18 +10429,32 @@ static int tidesdb_iter_skip_tombstone_versions(tidesdb_iter_t *iter, const tide
 {
     uint8_t tombstone_key_stack[TDB_PREFIXED_KEY_STACK_MAX];
     uint8_t *tombstone_key;
+    uint8_t *tombstone_key_heap = NULL; /* set only when we snapshot via malloc */
     const size_t tombstone_key_size = kv->entry.key_size;
 
-    if (tombstone_key_size <= sizeof(tombstone_key_stack))
+    if (direction > 0)
+    {
+        /* forward skip pops via pop_discard, which never rewrites the pop_buf slot backing
+         * kv, so kv->key stays valid for the whole loop -- compare against it directly with
+         * no copy, and thus no allocation that could fail on a >256-byte tombstone key.
+         * (the previous unconditional copy made forward iteration able to OOM here and then
+         * silently surface a stale superseded version.) */
+        tombstone_key = (uint8_t *)kv->key;
+    }
+    else if (tombstone_key_size <= sizeof(tombstone_key_stack))
     {
         memcpy(tombstone_key_stack, kv->key, tombstone_key_size);
         tombstone_key = tombstone_key_stack;
     }
     else
     {
-        tombstone_key = malloc(tombstone_key_size);
-        if (!tombstone_key) return TDB_ERR_MEMORY;
-        memcpy(tombstone_key, kv->key, tombstone_key_size);
+        /* backward skip pops via pop_max, which rewrites the pop_buf slot backing kv, so the
+         * key must be snapshotted first. this malloc can still fail for a >256-byte tombstone
+         * key under memory pressure (rare); callers treat a non-success return as "stop". */
+        tombstone_key_heap = malloc(tombstone_key_size);
+        if (!tombstone_key_heap) return TDB_ERR_MEMORY;
+        memcpy(tombstone_key_heap, kv->key, tombstone_key_size);
+        tombstone_key = tombstone_key_heap;
     }
 
     while (!tidesdb_merge_heap_empty(iter->heap))
@@ -10443,7 +10477,7 @@ static int tidesdb_iter_skip_tombstone_versions(tidesdb_iter_t *iter, const tide
         }
     }
 
-    if (tombstone_key != tombstone_key_stack) free(tombstone_key);
+    free(tombstone_key_heap); /* NULL-safe; only the backward large-key path allocates */
     return TDB_SUCCESS;
 }
 
@@ -10971,7 +11005,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
 static int tidesdb_btree_read_vlog_value(block_manager_cursor_t *vlog_cursor,
                                          const uint64_t vlog_offset,
                                          const tidesdb_column_family_config_t *config,
-                                         uint8_t **value_out, size_t *value_size_out)
+                                         uint8_t **value_out, size_t *value_size_out,
+                                         const size_t expected_value_size)
 {
     block_manager_cursor_goto(vlog_cursor, vlog_offset);
     block_manager_block_t *vlog_block = block_manager_cursor_read(vlog_cursor);
@@ -10989,12 +11024,26 @@ static int tidesdb_btree_read_vlog_value(block_manager_cursor_t *vlog_cursor,
         block_manager_block_free(vlog_block);
         if (!decompressed) return -1;
 
+        /* verify the produced size matches the klog entry's recorded value_size, mirroring
+         * tidesdb_vlog_read_value -- a truncated/corrupt vlog block must not silently return
+         * surviving bytes (expected_value_size == 0 means the caller opts out of the check) */
+        if (expected_value_size != 0 && decompressed_size != expected_value_size)
+        {
+            free(decompressed);
+            return -1;
+        }
+
         *value_out = decompressed;
         *value_size_out = decompressed_size;
         return 0;
     }
 
-    /* uncompressed, we copy raw block data */
+    /* uncompressed, we copy raw block data -- same size verification as the compressed path */
+    if (expected_value_size != 0 && data_size != expected_value_size)
+    {
+        block_manager_block_free(vlog_block);
+        return -1;
+    }
     uint8_t *copy = malloc(data_size);
     if (!copy)
     {
@@ -11128,7 +11177,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
     if (vlog_offset > 0)
     {
         if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
-                                          source->config, &vlog_value, &actual_value_size) == 0)
+                                          source->config, &vlog_value, &actual_value_size,
+                                          value_size) == 0)
         {
             actual_value = vlog_value;
         }
@@ -11425,12 +11475,19 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                 {
                     if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
                                                       source->config, &vlog_value,
-                                                      &actual_value_size) == 0)
+                                                      &actual_value_size, value_size) == 0)
                     {
                         actual_value = vlog_value;
                     }
                     else
                     {
+                        /* surface the silent data-integrity event, a failed vlog read here
+                         * writes an empty value into the merge output. with F6 this also
+                         * fires on a value-size mismatch. */
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "merge: btree vlog read failed (offset=%" PRIu64
+                                      "), value treated as empty in merged output",
+                                      vlog_offset);
                         actual_value = NULL;
                         actual_value_size = 0;
                     }
@@ -12009,12 +12066,19 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 {
                     if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
                                                       source->config, &vlog_value,
-                                                      &actual_value_size) == 0)
+                                                      &actual_value_size, value_size) == 0)
                     {
                         actual_value = vlog_value;
                     }
                     else
                     {
+                        /* surface the silent data-integrity event, a failed vlog read here
+                         * writes an empty value into the merge output. with F6 this also
+                         * fires on a value-size mismatch. */
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "merge: btree vlog read failed (offset=%" PRIu64
+                                      "), value treated as empty in merged output",
+                                      vlog_offset);
                         actual_value = NULL;
                         actual_value_size = 0;
                     }
@@ -12441,14 +12505,26 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
     for (int i = 0; i < num_levels - 1; i++)
     {
         size_t power = num_levels - 1 - i; /* L - 1 - i (adjusted for 0-based indexing) */
+        const size_t ratio = cf->config.level_size_ratio;
         size_t divisor = 1;
-        for (size_t p = 0; p < power; p++)
+        int divisor_overflow = 0;
+        /* ratio <= 1 leaves divisor == 1 (no leveling, and avoids a divide-by-zero when
+         * ratio == 0); otherwise guard the running product against size_t overflow -- with
+         * ratio 10 and a deep tree, T^power exceeds size_t past ~19 levels and would wrap. */
+        for (size_t p = 0; p < power && ratio > 1; p++)
         {
-            divisor *= cf->config.level_size_ratio;
+            if (divisor > SIZE_MAX / ratio)
+            {
+                divisor_overflow = 1;
+                break;
+            }
+            divisor *= ratio;
         }
 
         size_t old_capacity = atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
-        size_t new_capacity = N_L / divisor;
+        /* an overflowed divisor means N_L / divisor underflows toward 0; floor to the write
+         * buffer size, same as the normal small-capacity case below */
+        size_t new_capacity = divisor_overflow ? cf->config.write_buffer_size : N_L / divisor;
 
         if (new_capacity < cf->config.write_buffer_size)
         {
@@ -14572,15 +14648,18 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                            comparator_fn, comparator_ctx);
         }
 
-        /* we branch to btree output if use_btree is enabled
-         * dividing merge never goes to largest level (it adds a level first) */
+        /* we branch to btree output if use_btree is enabled.
+         * is_largest_level mirrors the non-btree branch below, a small-tree
+         * dividing merge whose deeper levels are all empty is the effective
+         * bottom, so regular tombstones must drop here or they accumulate
+         * forever (the same reclamation bug fixed for partitioned merge). */
         if (cf->config.use_btree)
         {
             tidesdb_klog_block_free(klog_block);
             klog_block = NULL;
 
             int btree_result = tidesdb_sstable_write_from_heap_btree(
-                cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, 0);
+                cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, is_largest_level);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -16168,8 +16247,17 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         skip_list_comparator_fn sort_cmp = NULL;
         void *sort_cmp_ctx = NULL;
         tidesdb_resolve_comparator(cf->db, &cf->config, &sort_cmp, &sort_cmp_ctx);
-        if (sort_cmp)
-            tidesdb_level_sort_by_min_key(cf->db, cf->levels[end_idx], sort_cmp, sort_cmp_ctx);
+        if (sort_cmp && tidesdb_level_sort_by_min_key(cf->db, cf->levels[end_idx], sort_cmp,
+                                                      sort_cmp_ctx) != TDB_SUCCESS)
+        {
+            /* the largest level is left unsorted -- the next partitioned merge will derive
+             * boundaries from an out-of-order array. not fatal to this merge (sstables are
+             * already committed), but surface it. */
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' failed to re-sort level %d by min_key after partitioned merge "
+                          "(out of memory); next merge's partition boundaries may be skewed",
+                          cf->name, cf->levels[end_idx]->level_num);
+        }
     }
 
     for (int i = 0; i < num_partitions; i++)
@@ -17324,7 +17412,13 @@ static void *tidesdb_flush_worker_thread(void *arg)
                           "CF '%s' failed to commit manifest for SSTable %" PRIu64 " (error: %d)",
                           cf->name, work->sst_id, manifest_result);
         }
-        tdb_objstore_upload_manifest(db, cf);
+        else
+        {
+            /* only mirror to the object store when the local commit succeeded -- uploading
+             * after a failed commit could push a manifest inconsistent with local on-disk
+             * state that recovery would then have to reconcile */
+            tdb_objstore_upload_manifest(db, cf);
+        }
 
         /* we check file count in addition to size
          * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to
@@ -17555,15 +17649,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     if (to_free_count < TDB_IMM_SNAP_MAX_ITEMS)
                     {
                         to_free[to_free_count++] = queued_imm;
+                        cleaned++;
                     }
                     else
                     {
-                        /* overflow, we free immediately (shouldnt happen with bounded queue) */
-                        if (queued_imm->skip_list) skip_list_free(queued_imm->skip_list);
-                        if (queued_imm->wal) block_manager_close(queued_imm->wal);
-                        free(queued_imm);
+                        /* to_free is full -- re-enqueue rather than free immediately. an
+                         * immediate free here would bypass the publish+drain barrier below
+                         * and could free a memtable a concurrent reader still references via
+                         * the immutable snapshot (UAF). the next cleanup pass reclaims it. */
+                        queue_enqueue(cf->immutable_memtables, queued_imm);
                     }
-                    cleaned++;
                 }
                 else
                 {
@@ -18876,6 +18971,17 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         }
         memcpy(owned, config->object_store_config, sizeof(tidesdb_objstore_config_t));
         (*db)->config.object_store_config = owned;
+
+        /* wal_upload_sync only takes effect when replicate_wal is on -- the WAL-close path
+         * checks replicate_wal first, so the sync flag is silently ignored otherwise. warn
+         * rather than fail so an over-specified config still opens. */
+        if (owned->wal_upload_sync && !owned->replicate_wal)
+        {
+            TDB_DEBUG_LOG(
+                TDB_LOG_WARN,
+                "object store config: wal_upload_sync=1 has no effect because "
+                "replicate_wal=0 (WAL is not replicated); enable replicate_wal to use it");
+        }
     }
 
     /* object store mode requires unified memtable!! */
@@ -20894,6 +21000,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
 
+    /* reject names that would truncate into cf->config.name (TDB_MAX_CF_NAME_LEN)
+     * -- mirrors the guard in tidesdb_rename_column_family so cf->name, the
+     * registry key, and cf->config.name can never disagree */
+    const size_t name_len = strlen(name);
+    if (name_len == 0 || name_len >= TDB_MAX_CF_NAME_LEN) return TDB_ERR_INVALID_ARGS;
+
     if (!atomic_load(&db->is_recovering))
     {
         int wait_result = wait_for_open(db);
@@ -21381,6 +21493,19 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     pthread_rwlock_wrlock(&db->cf_list_lock);
+
+    /* the earlier duplicate scan ran under a read lock; re-check under the write
+     * lock so two concurrent creates of the same name cannot both append */
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
+        {
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            tidesdb_column_family_free(cf);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Column family %s already exists (lost create race)", name);
+            return TDB_ERR_EXISTS;
+        }
+    }
 
     if (db->num_column_families >= db->cf_capacity)
     {
@@ -24638,8 +24763,12 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
         return wait_result;
     }
 
-    /* we remove from SERIALIZABLE active list if the old isolation was SERIALIZABLE */
-    if (txn->isolation_level == TDB_ISOLATION_SERIALIZABLE)
+    /* remove from the active list if the OLD isolation had registered it. registration
+     * happens for any isolation >= REPEATABLE_READ (see txn create / re-register), so the
+     * removal condition must match -- a == SERIALIZABLE guard here leaves a stale entry
+     * for an RR/SNAPSHOT txn that re-registration then duplicates (later a dangling ptr).
+     * tidesdb_txn_remove_from_active_list self-guards on < REPEATABLE_READ. */
+    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
     {
         tidesdb_txn_remove_from_active_list(txn);
     }
@@ -28398,7 +28527,8 @@ static void tidesdb_iter_seek_btree_source_forward(tidesdb_merge_source_t *sourc
     if (vlog_offset > 0)
     {
         if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
-                                          source->config, &vlog_value, &actual_value_size) == 0)
+                                          source->config, &vlog_value, &actual_value_size,
+                                          value_size) == 0)
         {
             actual_value = vlog_value;
         }
@@ -28469,7 +28599,8 @@ static void tidesdb_iter_seek_btree_source_backward(tidesdb_merge_source_t *sour
     if (vlog_offset > 0)
     {
         if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor, vlog_offset,
-                                          source->config, &vlog_value, &actual_value_size) == 0)
+                                          source->config, &vlog_value, &actual_value_size,
+                                          value_size) == 0)
         {
             actual_value = vlog_value;
         }
@@ -29906,7 +30037,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                     {
                         if (tidesdb_btree_read_vlog_value(source->source.btree.vlog_cursor,
                                                           vlog_offset, source->config, &vlog_value,
-                                                          &actual_value_size) == 0)
+                                                          &actual_value_size, value_size) == 0)
                         {
                             actual_value = vlog_value;
                         }
@@ -31167,9 +31298,14 @@ static int tidesdb_unified_wal_replay_into(tidesdb_t *db, block_manager_t *wal, 
                 const size_t pk_size = TDB_UNIFIED_CF_PREFIX_SIZE + key_size_u64;
 
                 const int is_delete = (flags & TDB_KV_FLAG_TOMBSTONE) ? 1 : 0;
+                /* preserve the single-delete subtype across replay (mirrors per-CF WAL
+                 * replay) so compaction can still pair-cancel put+single-delete */
+                int sl_flags = is_delete ? SKIP_LIST_FLAG_DELETED : 0;
+                if (is_delete && (flags & TDB_KV_FLAG_SINGLE_DELETE))
+                    sl_flags |= SKIP_LIST_FLAG_SINGLE_DELETE;
                 skip_list_put_with_seq(
                     target, prefixed, pk_size, is_delete ? NULL : (uint8_t *)value,
-                    is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, is_delete);
+                    is_delete ? 0 : (size_t)value_size_u64, ttl, seq_value, sl_flags);
                 TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack4);
 
                 if (seq_value > *max_seq) *max_seq = seq_value;

@@ -13690,25 +13690,52 @@ static void test_wal_corruption_recovery(void)
         ASSERT_EQ(tidesdb_close(db), 0);
     }
 
-    /* corrupt WAL file (truncate it) */
-    char wal_path[256];
-    snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "wal_cf" PATH_SEPARATOR "wal.log",
-             TEST_DB_PATH);
+    /* corrupt the active WAL by truncating it. real per-CF WAL files are named
+     * wal_<id>.log; the active one (highest id) holds the not-yet-flushed writes. an
+     * earlier version of this test truncated "wal.log", which never exists, so fopen
+     * returned NULL and no corruption was ever applied -- the test passed trivially.
+     * scan for the real highest-id wal_<id>.log and truncate it to half size, leaving a
+     * torn tail that recovery must skip via block_manager_cursor_skip_corrupt while still
+     * recovering the flushed data from the sstable. */
+    char wal_dir[256];
+    snprintf(wal_dir, sizeof(wal_dir), "%s" PATH_SEPARATOR "wal_cf", TEST_DB_PATH);
+
+    const char *wal_prefix = "wal_";
+    const char *wal_suffix = ".log";
+    char wal_path[512];
+    wal_path[0] = '\0';
+    unsigned long long best_wal_id = 0;
+    int found_wal = 0;
+
+    DIR *wal_d = opendir(wal_dir);
+    ASSERT_TRUE(wal_d != NULL);
+    struct dirent *wal_ent;
+    while ((wal_ent = readdir(wal_d)) != NULL)
+    {
+        if (strncmp(wal_ent->d_name, wal_prefix, strlen(wal_prefix)) != 0) continue;
+        if (strstr(wal_ent->d_name, wal_suffix) == NULL) continue;
+        const unsigned long long id = strtoull(wal_ent->d_name + strlen(wal_prefix), NULL, 10);
+        if (!found_wal || id >= best_wal_id)
+        {
+            best_wal_id = id;
+            found_wal = 1;
+            snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "%s", wal_dir,
+                     wal_ent->d_name);
+        }
+    }
+    closedir(wal_d);
+
+    /* the active wal_<id>.log must exist and actually get truncated -- this is what
+     * the test depends on; if it is ever not found, the test must fail, not silently pass */
+    ASSERT_TRUE(found_wal);
 
     FILE *wal_file = fopen(wal_path, "r+b");
-    if (wal_file)
-    {
-        /* truncate WAL to simulate corruption */
-        fseek(wal_file, 0, SEEK_END);
-        long size = ftell(wal_file);
-        if (size > 100)
-        {
-            /* truncate to 50% of original size */
-            int truncate_result = ftruncate(fileno(wal_file), size / 2);
-            (void)truncate_result; /* intentionally ignore for test simulation */
-        }
-        fclose(wal_file);
-    }
+    ASSERT_TRUE(wal_file != NULL);
+    fseek(wal_file, 0, SEEK_END);
+    const long wal_size = ftell(wal_file);
+    ASSERT_TRUE(wal_size > 0);
+    ASSERT_EQ(ftruncate(fileno(wal_file), wal_size / 2), 0);
+    fclose(wal_file);
 
     /* we reopen and verify recovery handles corruption gracefully */
     {
@@ -16777,64 +16804,98 @@ static void test_power_loss_during_sstable_metadata_write(void)
         ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     }
 
-    /* we corrupt the sstable metadata (bloom filter or block index) to simulate power loss */
-    char bloom_path[512];
-    snprintf(bloom_path, sizeof(bloom_path),
-             "%s" PATH_SEPARATOR "powerloss_cf" PATH_SEPARATOR "L1_0.bloom", TEST_DB_PATH);
+    /* corrupt a real sstable footer to simulate an interrupted metadata write. the metadata,
+     * bloom, and block-index live as the trailing blocks INSIDE the klog file -- there is no
+     * separate .bloom file. an earlier version truncated "L1_0.bloom", which never exists, so
+     * fopen returned NULL, no corruption was applied, and the test passed trivially. here we
+     * find a real *.klog and truncate its tail so the metadata block (written last) is torn,
+     * which strict last-block validation must reject on load. */
+    char cf_dir[300];
+    snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "powerloss_cf", TEST_DB_PATH);
 
-    FILE *bloom_file = fopen(bloom_path, "r+b");
-    if (bloom_file)
+    const char *klog_suffix = ".klog";
+    char klog_path[512];
+    klog_path[0] = '\0';
+    int found_klog = 0;
+    DIR *cf_d = opendir(cf_dir);
+    ASSERT_TRUE(cf_d != NULL);
+    struct dirent *cf_ent;
+    while ((cf_ent = readdir(cf_d)) != NULL)
     {
-        /* we truncate bloom filter to simulate incomplete write */
-        fseek(bloom_file, 0, SEEK_END);
-        long size = ftell(bloom_file);
-        if (size > 20)
-        {
-            int truncate_result = ftruncate(fileno(bloom_file), size / 3);
-            (void)truncate_result;
-        }
-        fclose(bloom_file);
+        const size_t nlen = strlen(cf_ent->d_name);
+        const size_t slen = strlen(klog_suffix);
+        if (nlen < slen || strcmp(cf_ent->d_name + nlen - slen, klog_suffix) != 0) continue;
+        found_klog = 1;
+        snprintf(klog_path, sizeof(klog_path), "%s" PATH_SEPARATOR "%s", cf_dir, cf_ent->d_name);
+        break; /* corrupt the first sstable we find */
     }
+    closedir(cf_d);
 
-    /* we reopen and verify system handles corrupted metadata gracefully */
+    /* a flushed sstable must exist; the test depends on actually corrupting it */
+    ASSERT_TRUE(found_klog);
+
+    FILE *klog_file = fopen(klog_path, "r+b");
+    ASSERT_TRUE(klog_file != NULL);
+    fseek(klog_file, 0, SEEK_END);
+    const long klog_size = ftell(klog_file);
+    ASSERT_TRUE(klog_size > 0);
+    /* drop the trailing third so the metadata block (the last block) is torn */
+    ASSERT_EQ(ftruncate(fileno(klog_file), klog_size - (klog_size / 3)), 0);
+    fclose(klog_file);
+
+    /* reopen the corrupted sstable must be handled gracefully -- the DB still opens
+     * (recovery skips the unreadable sstable instead of crashing) and stays usable for new
+     * writes/reads. data in the torn sstable may be unrecoverable (the cost of a torn
+     * metadata write), so we do NOT assert it survives; we assert no crash + usability. */
     {
         tidesdb_config_t config = tidesdb_default_config();
         config.db_path = TEST_DB_PATH;
 
         tidesdb_t *db = NULL;
-        int result = tidesdb_open(&config, &db);
+        ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+        ASSERT_TRUE(db != NULL);
 
-        if (result == TDB_SUCCESS && db != NULL)
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "powerloss_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        /* reads of the possibly-lost keys must not crash, however many survive */
+        tidesdb_txn_t *rtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &rtxn), TDB_SUCCESS);
+        for (int i = 0; i < NUM_KEYS; i++)
         {
-            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "powerloss_cf");
-            if (cf != NULL)
-            {
-                /* we try to read -- data should still be accessible even without bloom filter */
-                tidesdb_txn_t *txn = NULL;
-                if (tidesdb_txn_begin(db, &txn) == TDB_SUCCESS)
-                {
-                    int found = 0;
-                    for (int i = 0; i < NUM_KEYS; i++)
-                    {
-                        char key[32];
-                        snprintf(key, sizeof(key), "power_key_%03d", i);
-
-                        uint8_t *value = NULL;
-                        size_t value_size = 0;
-                        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value,
-                                            &value_size) == TDB_SUCCESS)
-                        {
-                            found++;
-                            free(value);
-                        }
-                    }
-                    /* we expect data to be recoverable even with corrupted bloom filter */
-                    ASSERT_TRUE(found > 0);
-                    tidesdb_txn_free(txn);
-                }
-            }
-            tidesdb_close(db);
+            char key[32];
+            snprintf(key, sizeof(key), "power_key_%03d", i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            if (tidesdb_txn_get(rtxn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size) ==
+                TDB_SUCCESS)
+                free(value);
         }
+        tidesdb_txn_free(rtxn);
+
+        /* the DB must remain usable after recovering past the corruption */
+        tidesdb_txn_t *wtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &wtxn), TDB_SUCCESS);
+        const char *probe_key = "post_recovery_probe";
+        const char *probe_val = "ok";
+        ASSERT_EQ(tidesdb_txn_put(wtxn, cf, (uint8_t *)probe_key, strlen(probe_key) + 1,
+                                  (uint8_t *)probe_val, strlen(probe_val) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(wtxn), TDB_SUCCESS);
+        tidesdb_txn_free(wtxn);
+
+        uint8_t *got = NULL;
+        size_t got_size = 0;
+        tidesdb_txn_t *vtxn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), TDB_SUCCESS);
+        ASSERT_EQ(
+            tidesdb_txn_get(vtxn, cf, (uint8_t *)probe_key, strlen(probe_key) + 1, &got, &got_size),
+            TDB_SUCCESS);
+        ASSERT_TRUE(got != NULL);
+        free(got);
+        tidesdb_txn_free(vtxn);
+
+        tidesdb_close(db);
     }
 
     cleanup_test_dir();
@@ -28478,6 +28539,147 @@ static void crash_recovery_verify(int unified, int num_cfs)
     ASSERT_EQ(tidesdb_close(db), 0);
 }
 
+/* crash + unified-WAL-replay guard for single-delete. a child puts every key and
+ * purges (so the puts are durable in sstables), then single-deletes every key WITHOUT
+ * flushing and _exit()s -- the single-deletes live only in the unified wal, so reopen
+ * must replay them through tidesdb_unified_wal_replay_into (the path that previously
+ * dropped the SINGLE_DELETE subtype, fixed under U-1/U-2). the parent reopens and asserts
+ * every key stays deleted across replay, and that a full compaction keeps them gone and
+ * reclaims the residue.
+ *
+ *** the single-delete *subtype* (vs a plain tombstone) is not uniquely
+ * black-box observable -- both keep the key deleted and both reclaim under a full
+ * compaction -- so this guards the replay path's read-correctness and reclamation, not the
+ * subtype bit itself. a bit-level regression guard would need a white-box assertion on the
+ * replayed skip-list flags. */
+#define CRASH_SD_CHILD_ARG    "__crash_single_delete_child"
+#define CRASH_SD_KEY_COUNT    200
+#define CRASH_SD_WRITE_BUFFER 4096
+#define CRASH_SD_CF_NAME      "sd_crash_cf"
+
+static void crash_single_delete_child_workload(void)
+{
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = (char *)CRASH_RECOVERY_DB_PATH;
+    config.log_level = TDB_LOG_ERROR;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = CRASH_SD_WRITE_BUFFER;
+    config.unified_memtable_sync_mode = TDB_SYNC_FULL;
+
+    tidesdb_t *db = NULL;
+    if (tidesdb_open(&config, &db) != 0) _exit(2);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = CRASH_SD_WRITE_BUFFER;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.sync_mode = TDB_SYNC_FULL;
+    if (tidesdb_create_column_family(db, CRASH_SD_CF_NAME, &cf_config) != 0) _exit(3);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, CRASH_SD_CF_NAME);
+    if (!cf) _exit(4);
+
+    /* put every key, then purge so the puts are durably on disk in sstables and the
+     * unified memtable/wal is clean before the single-deletes */
+    for (int i = 0; i < CRASH_SD_KEY_COUNT; i++)
+    {
+        char key[32];
+        int klen = snprintf(key, sizeof(key), "sd%08d", i);
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(db, &txn) != 0) _exit(5);
+        if (tidesdb_txn_put(txn, cf, (uint8_t *)key, (size_t)klen, (uint8_t *)key, (size_t)klen,
+                            0) != 0)
+            _exit(6);
+        if (tidesdb_txn_commit(txn) != 0) _exit(7);
+        tidesdb_txn_free(txn);
+    }
+    if (tidesdb_purge(db) != 0) _exit(8);
+
+    /* single-delete every key but do NOT flush -- these live only in the unified wal */
+    for (int i = 0; i < CRASH_SD_KEY_COUNT; i++)
+    {
+        char key[32];
+        int klen = snprintf(key, sizeof(key), "sd%08d", i);
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(db, &txn) != 0) _exit(9);
+        if (tidesdb_txn_single_delete(txn, cf, (uint8_t *)key, (size_t)klen) != 0) _exit(10);
+        if (tidesdb_txn_commit(txn) != 0) _exit(11);
+        tidesdb_txn_free(txn);
+    }
+
+    /* crash, no tidesdb_close, no final flush -- single-deletes are wal-only */
+    _exit(0);
+}
+
+static int crash_single_delete_spawn_child(void)
+{
+    char *child_argv[] = {(char *)g_test_argv0, (char *)CRASH_SD_CHILD_ARG, NULL};
+    return tdb_spawn_wait(g_test_argv0, child_argv);
+}
+
+static void test_crash_single_delete_replay(void)
+{
+    (void)remove_directory(CRASH_RECOVERY_DB_PATH);
+
+    ASSERT_EQ(crash_single_delete_spawn_child(), 0);
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = (char *)CRASH_RECOVERY_DB_PATH;
+    config.log_level = TDB_LOG_ERROR;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = CRASH_SD_WRITE_BUFFER;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, CRASH_SD_CF_NAME);
+    ASSERT_TRUE(cf != NULL);
+
+    /* the single-deletes replayed from the unified wal must keep every key deleted -- a
+     * replay that dropped the delete or resurrected the value would fail here */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < CRASH_SD_KEY_COUNT; i++)
+    {
+        char key[32];
+        int klen = snprintf(key, sizeof(key), "sd%08d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int r = tidesdb_txn_get(txn, cf, (uint8_t *)key, (size_t)klen, &value, &value_size);
+        ASSERT_TRUE(r != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* full compaction must keep them gone and reclaim the residue */
+    for (int i = 0; i < 8; i++)
+    {
+        tidesdb_compact(cf);
+        wait_for_compaction_idle(db, cf);
+    }
+
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    for (int i = 0; i < CRASH_SD_KEY_COUNT; i++)
+    {
+        char key[32];
+        int klen = snprintf(key, sizeof(key), "sd%08d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int r = tidesdb_txn_get(txn2, cf, (uint8_t *)key, (size_t)klen, &value, &value_size);
+        ASSERT_TRUE(r != 0 || value == NULL);
+        if (value) free(value);
+    }
+    tidesdb_txn_free(txn2);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
+    ASSERT_TRUE(stats != NULL);
+    ASSERT_TRUE(stats->total_keys < (uint64_t)(2 * CRASH_SD_KEY_COUNT));
+    tidesdb_free_stats(stats);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    (void)remove_directory(CRASH_RECOVERY_DB_PATH);
+}
+
 /* per-cf and unified memtable modes, each with one and several column
  * families. for every scenario a child writes fsynced data and crashes, then
  * the parent reopens and verifies nothing committed was lost. */
@@ -28511,6 +28713,13 @@ int main(int argc, char **argv)
         return 1; /* workload _exit()s, this is unreachable */
     }
 
+    /* the single-delete crash-replay test re-execs this binary as its crash child */
+    if (argc >= 2 && strcmp(argv[1], CRASH_SD_CHILD_ARG) == 0)
+    {
+        crash_single_delete_child_workload();
+        return 1; /* workload _exit()s, this is unreachable */
+    }
+
     INIT_TEST_FILTER(argc, argv);
     cleanup_test_dir();
     RUN_TEST(test_custom_allocator, tests_passed);
@@ -28537,6 +28746,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_multi_cf_transaction_atomicity_recovery, tests_passed);
     RUN_TEST(test_multi_cf_transaction_recovery_comprehensive, tests_passed);
     RUN_TEST(test_crash_recovery_no_clean_close, tests_passed);
+    RUN_TEST(test_crash_single_delete_replay, tests_passed);
     RUN_TEST(test_iterator_basic, tests_passed);
     RUN_TEST(test_stats, tests_passed);
     RUN_TEST(test_stats_comprehensive, tests_passed);

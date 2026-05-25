@@ -402,6 +402,11 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO 0.5 /* 50% of stall threshold */
 #define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       4   /* 4x L1 trigger = high  */
 #define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   3   /* 3x L1 trigger = moderate */
+/* hard write-stop, once the first disk level holds this many x the trigger, compaction has fallen
+ * so far behind that the on-disk file count (and thus open fds + aux memory) would grow without
+ * bound. block writers here until compaction drains it, instead of only delaying. ~2x the HIGH
+ * slowdown band, mirroring the slowdown/stop split of leveled LSMs. */
+#define TDB_BACKPRESSURE_L1_STOP_MULTIPLIER 8
 /* active memtable hard ceiling as a multiple of write_buffer_size. the
  * commit-time threshold check allows up to 1.5x for batching headroom; this
  * leaves a small overshoot margin above that before apply_backpressure
@@ -452,6 +457,17 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_FDS_PER_SSTABLE        2
 #define TDB_FD_RESERVE_NON_SSTABLE 64 /* descriptors reserved for WALs/manifest/objstore/stdio */
 #define TDB_MIN_OPEN_SSTABLES      4  /* never clamp the sstable budget below this */
+
+/* reader fd reservation. point reads and iterators may open NEW sstables only while
+ * num_open_sstables stays under max_open_sstables minus this reserve, which is held for the
+ * flush / compaction / commit-conflict-check paths -- those MUST make progress to relieve fd
+ * pressure, whereas a read can degrade to a retryable error (see the scan / iter open-failure
+ * paths). this bounds reader-induced opens so writes never starve, preventing the fd wedge. */
+#define TDB_FD_READER_RESERVE_DIVISOR 8  /* reserve = max_open_sstables / this ... */
+#define TDB_FD_READER_RESERVE_MIN     16 /* ... but at least this many sstables ... */
+#define TDB_FD_READER_RESERVE_MAX_DIVISOR                                                  \
+    2 /* ... and never more than max_open_sstables / this, so reads keep at least half the \
+       * fd budget even when max_open_sstables is smaller than the reserve floor */
 
 /* sstable reaper eviction sentinel -- set on refcount during block manager close
  * to prevent concurrent try_ref from acquiring a reference on an evicting sstable */
@@ -552,6 +568,43 @@ static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path
         tidesdb_wake_reaper(db);
         usleep(TDB_BM_OPEN_EMFILE_BACKOFF_US);
     }
+}
+
+/**
+ * tidesdb_reader_fd_budget_ok
+ * gate a reader (point-get / iterator) about to open a NOT-yet-open sstable against the reader fd
+ * budget = max_open_sstables - reserve, the reserve being held for flush / compaction /
+ * conflict-check (the priority paths that must progress to relieve fd pressure). an already-open
+ * sstable needs no new descriptor, so re-reads are never blocked. when over budget, wake the reaper
+ * to reclaim idle sstables and recheck; if still over, the caller fails the read with a retryable
+ * error rather than starving the write path or returning wrong data (the scan/iter open-failure
+ * paths surface it). returns 1 if the reader may open, 0 if it must back off.
+ * @param db database instance
+ * @param sst sstable the reader is about to open
+ * @return 1 if ok to open (or already open), 0 if over the reader budget
+ */
+static int tidesdb_reader_fd_budget_ok(tidesdb_t *db, tidesdb_sstable_t *sst)
+{
+    /* already counted -- num_open_sstables is keyed on the klog, so a klog-open sstable
+     * needs no new tracked descriptor and is never blocked (the lazy vlog rides along) */
+    if (atomic_load_explicit(&sst->klog_bm, memory_order_acquire)) return 1;
+
+    const int max_open = (int)db->config.max_open_sstables;
+    int reserve = max_open / TDB_FD_READER_RESERVE_DIVISOR;
+    if (reserve < TDB_FD_READER_RESERVE_MIN) reserve = TDB_FD_READER_RESERVE_MIN;
+    /* cap the reserve so it never starves reads when max_open_sstables is below the floor */
+    const int reserve_cap = max_open / TDB_FD_READER_RESERVE_MAX_DIVISOR;
+    if (reserve > reserve_cap) reserve = reserve_cap;
+    int budget = max_open - reserve;
+    if (budget < 1) budget = 1;
+
+    if (atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < budget) return 1;
+
+    /* over budget for a new open -- give the reaper a chance to reclaim idle sstables, then recheck
+     */
+    tidesdb_wake_reaper(db);
+    usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
+    return atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < budget;
 }
 
 /* empty block index placeholder ( 4 byte LE count (0) followed by 1 byte prefix_len ) */
@@ -1563,6 +1616,8 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, size_t key_
 static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv);
 static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv);
 static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst);
+static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *sst);
+static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *sst);
 static int wait_for_open(tidesdb_t *db);
 
 /**
@@ -4383,6 +4438,14 @@ static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
 {
     if (!db || !sst || !value) return TDB_ERR_INVALID_ARGS;
 
+    /* the vlog is opened lazily on first non-inline value read. the const cast is safe:
+     * opening the vlog mutates sst (not db's logical state) and does not touch
+     * num_open_sstables, which is keyed on the klog. */
+    if (tidesdb_sstable_ensure_vlog_open((tidesdb_t *)db, sst) != 0)
+    {
+        return TDB_ERR_IO;
+    }
+
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
     {
@@ -4467,7 +4530,10 @@ static int tidesdb_sstable_get_block_managers(const tidesdb_t *db, tidesdb_sstab
     bms->klog_bm = sst->klog_bm;
     bms->vlog_bm = sst->vlog_bm;
 
-    if (!bms->klog_bm || !bms->vlog_bm)
+    /* the vlog is opened lazily, so it may legitimately be NULL here; only the klog is
+     * guaranteed open. callers that read values must first call
+     * tidesdb_sstable_ensure_vlog_open (tidesdb_vlog_read_value does so at its top). */
+    if (!bms->klog_bm)
     {
         return TDB_ERR_IO;
     }
@@ -5883,90 +5949,124 @@ static void tdb_objstore_delete_listed_cb(const char *key, const size_t size, vo
 }
 
 /**
- * tidesdb_sstable_ensure_open
- * ensures an sstable's block managers are open, using the cache
+ * tidesdb_sstable_ensure_klog_open
+ * ensures an sstable's klog block manager is open. num_open_sstables is keyed on the
+ * klog, it is incremented here when the klog transitions closed->open and decremented
+ * when the reaper (or a cleanup path) closes the klog. the vlog is opened lazily and is
+ * not separately counted, so a scan that touches only inline values holds one fd per
+ * pinned sstable instead of two.
  * @param db database instance
- * @param sst sstable to ensure is open
+ * @param sst sstable whose klog to ensure open
  * @return 0 on success, -1 on error
  */
-static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
+static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!db || !sst) return -1;
-    if (!sst->config || !sst->klog_path || !sst->vlog_path) return -1;
+    if (!sst->config || !sst->klog_path) return -1;
 
-    /* we only open block managers if not already open */
-    if (sst->klog_bm && sst->vlog_bm)
+    if (sst->klog_bm)
     {
+        atomic_store(&sst->last_access_time, atomic_load(&db->cached_current_time));
         return 0; /* already open */
     }
 
     if (db->object_store)
     {
         if (tdb_objstore_download_if_missing(db, sst->klog_path) != 0) return -1;
-        if (tdb_objstore_download_if_missing(db, sst->vlog_path) != 0) return -1;
     }
 
-    /* we track whether the sstable was fully closed (evicted by reaper) so we can
-     * update num_open_sstables after reopening */
-    const int was_fully_closed = (!sst->klog_bm && !sst->vlog_bm);
-
-    /* we open block managers if needed, using CAS to prevent race conditions
-     * where two threads both try to open the same sstable simultaneously */
-    if (!sst->klog_bm)
+    block_manager_t *new_klog_bm = NULL;
+    if (tidesdb_bm_open(db, &new_klog_bm, sst->klog_path,
+                        convert_sync_mode(sst->config->sync_mode == TDB_SYNC_INTERVAL
+                                              ? TDB_SYNC_FULL
+                                              : sst->config->sync_mode)) != 0)
     {
-        block_manager_t *new_klog_bm = NULL;
-        if (tidesdb_bm_open(db, &new_klog_bm, sst->klog_path,
-                            convert_sync_mode(sst->config->sync_mode == TDB_SYNC_INTERVAL
-                                                  ? TDB_SYNC_FULL
-                                                  : sst->config->sync_mode)) != 0)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open klog '%s': %s", sst->klog_path,
-                          strerror(errno));
-            return -1;
-        }
-        /* CAS to set klog_bm -- if another thread already set it, close ours */
-        block_manager_t *expected = NULL;
-        if (!atomic_compare_exchange_strong(&sst->klog_bm, &expected, new_klog_bm))
-        {
-            /* another thread already opened it,we  close our duplicate */
-            block_manager_close(new_klog_bm);
-        }
+        if (tdb_log_throttle(db, &db->last_open_fail_log_sec,
+                             TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open sstable klog '%s': %s%s", sst->klog_path,
+                          strerror(errno),
+                          (errno == EMFILE || errno == ENFILE)
+                              ? " -- open-file limit reached; raise ulimit -n"
+                              : "");
+        return -1;
     }
 
-    if (!sst->vlog_bm)
+    /* CAS to set klog_bm -- if another thread already set it, close ours and let that
+     * thread's CAS win own the num_open_sstables increment (exactly one inc per open) */
+    block_manager_t *expected = NULL;
+    if (!atomic_compare_exchange_strong(&sst->klog_bm, &expected, new_klog_bm))
     {
-        block_manager_t *new_vlog_bm = NULL;
-        if (tidesdb_bm_open(db, &new_vlog_bm, sst->vlog_path,
-                            convert_sync_mode(sst->config->sync_mode)) != 0)
-        {
-            /* we dont close klog_bm here -- it may be used by another thread */
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open vlog '%s': %s", sst->vlog_path,
-                          strerror(errno));
-            return -1;
-        }
-
-        /* we hint that vlog access is random (point lookups by offset)
-         * this disables read-ahead which would waste I/O for random access */
-        set_file_random_hint(new_vlog_bm->fd);
-
-        /* CAS to set vlog_bm -- if another thread already set it, we close ours */
-        block_manager_t *expected = NULL;
-        if (!atomic_compare_exchange_strong(&sst->vlog_bm, &expected, new_vlog_bm))
-        {
-            /* another thread already opened it, we close our duplicate */
-            block_manager_close(new_vlog_bm);
-        }
+        block_manager_close(new_klog_bm);
+        return 0;
     }
 
     atomic_store(&sst->last_access_time, atomic_load(&db->cached_current_time));
+    atomic_fetch_add(&db->num_open_sstables, 1);
+    return 0;
+}
 
-    /* if we transitioned from fully-closed to fully-open, track it
-     * this balances the reaper's decrement when it evicts the sstable */
-    if (was_fully_closed && sst->klog_bm && sst->vlog_bm)
+/**
+ * tidesdb_sstable_ensure_vlog_open
+ * ensures an sstable's vlog block manager is open. the vlog is opened lazily on the first
+ * value read that misses the inline klog payload; it is not counted in num_open_sstables
+ * (see tidesdb_sstable_ensure_klog_open) and is closed alongside the klog by the reaper.
+ * @param db database instance
+ * @param sst sstable whose vlog to ensure open
+ * @return 0 on success, -1 on error
+ */
+static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *sst)
+{
+    if (!db || !sst) return -1;
+    if (!sst->config || !sst->vlog_path) return -1;
+
+    if (sst->vlog_bm) return 0; /* already open */
+
+    if (db->object_store)
     {
-        atomic_fetch_add(&db->num_open_sstables, 1);
+        if (tdb_objstore_download_if_missing(db, sst->vlog_path) != 0) return -1;
     }
 
+    block_manager_t *new_vlog_bm = NULL;
+    if (tidesdb_bm_open(db, &new_vlog_bm, sst->vlog_path,
+                        convert_sync_mode(sst->config->sync_mode)) != 0)
+    {
+        if (tdb_log_throttle(db, &db->last_open_fail_log_sec,
+                             TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "failed to open sstable vlog '%s': %s%s", sst->vlog_path,
+                          strerror(errno),
+                          (errno == EMFILE || errno == ENFILE)
+                              ? " -- open-file limit reached; raise ulimit -n"
+                              : "");
+        return -1;
+    }
+
+    /* we hint that vlog access is random (point lookups by offset)
+     * this disables read-ahead which would waste I/O for random access */
+    set_file_random_hint(new_vlog_bm->fd);
+
+    /* CAS to set vlog_bm -- if another thread already set it, we close ours */
+    block_manager_t *expected = NULL;
+    if (!atomic_compare_exchange_strong(&sst->vlog_bm, &expected, new_vlog_bm))
+    {
+        block_manager_close(new_vlog_bm);
+    }
+
+    return 0;
+}
+
+/**
+ * tidesdb_sstable_ensure_open
+ * ensures both block managers are open. used by write/flush/compaction/btree paths that
+ * need the vlog eagerly; scan sources open the klog only (tidesdb_sstable_ensure_klog_open)
+ * and let tidesdb_vlog_read_value open the vlog on demand.
+ * @param db database instance
+ * @param sst sstable to ensure is open
+ * @return 0 on success, -1 on error
+ */
+static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
+{
+    if (tidesdb_sstable_ensure_klog_open(db, sst) != 0) return -1;
+    if (tidesdb_sstable_ensure_vlog_open(db, sst) != 0) return -1;
     return 0;
 }
 
@@ -6127,7 +6227,9 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
     }
 
     {
-        const int had_open_bms = (sst->klog_bm != NULL || sst->vlog_bm != NULL);
+        /* num_open_sstables is keyed on the klog (the vlog is opened lazily and not
+         * separately counted), so the decrement fires iff the klog was open */
+        const int had_open_bms = (sst->klog_bm != NULL);
         if (sst->klog_bm)
         {
             block_manager_close(sst->klog_bm);
@@ -10947,7 +11049,9 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
 
     tidesdb_sstable_ref(sst);
 
-    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    /* scan sources open the klog only; the vlog is opened on demand by
+     * tidesdb_vlog_read_value when a value misses the inline klog payload */
+    if (tidesdb_sstable_ensure_klog_open(db, sst) != 0)
     {
         tidesdb_sstable_unref(db, sst);
         free(source);
@@ -10969,18 +11073,13 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
         return NULL;
     }
 
-    if (block_manager_cursor_init(&source->source.sstable.vlog_cursor, bms.vlog_bm) != 0)
-    {
-        tidesdb_sstable_unref(db, sst);
-        block_manager_cursor_free(source->source.sstable.klog_cursor);
-        free(source);
-        return NULL;
-    }
+    /* the klog source reads values via tidesdb_vlog_read_value (sst->vlog_bm), never via a
+     * source-held vlog cursor; leave it NULL so cleanup's cursor_free is a no-op */
+    source->source.sstable.vlog_cursor = NULL;
 
     /* we hint to OS that this is streaming read (data will be accessed only once)
      * this helps prevent cache pollution during compaction * * */
     set_file_noreuse_hint(bms.klog_bm->fd, 0, 0);
-    set_file_noreuse_hint(bms.vlog_bm->fd, 0, 0);
 
     source->source.sstable.current_block_data = NULL; /* no block data yet */
     source->source.sstable.current_rc_block = NULL;   /* no ref-counted block yet */
@@ -11358,7 +11457,9 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_lazy(tidesdb_t 
 
     tidesdb_sstable_ref(sst);
 
-    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    /* scan sources open the klog only; the vlog is opened on demand by
+     * tidesdb_vlog_read_value when a value misses the inline klog payload */
+    if (tidesdb_sstable_ensure_klog_open(db, sst) != 0)
     {
         tidesdb_sstable_unref(db, sst);
         free(source);
@@ -11380,13 +11481,9 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_lazy(tidesdb_t 
         return NULL;
     }
 
-    if (block_manager_cursor_init(&source->source.sstable.vlog_cursor, bms.vlog_bm) != 0)
-    {
-        tidesdb_sstable_unref(db, sst);
-        block_manager_cursor_free(source->source.sstable.klog_cursor);
-        free(source);
-        return NULL;
-    }
+    /* the klog source reads values via tidesdb_vlog_read_value (sst->vlog_bm), never via a
+     * source-held vlog cursor; leave it NULL so cleanup's cursor_free is a no-op */
+    source->source.sstable.vlog_cursor = NULL;
 
     source->source.sstable.current_block_data = NULL;
     source->source.sstable.current_rc_block = NULL;
@@ -17497,7 +17594,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * this prevents file locking issues where readers cannot open files
          * that are still held open by the flush worker */
         {
-            const int had_open_bms = (sst->klog_bm != NULL || sst->vlog_bm != NULL);
+            /* num_open_sstables is keyed on the klog (the vlog is opened lazily and not
+             * separately counted), so the decrement fires iff the klog was open */
+            const int had_open_bms = (sst->klog_bm != NULL);
             if (sst->klog_bm)
             {
                 block_manager_close(sst->klog_bm);
@@ -18851,8 +18950,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     /* we only consider ssts that are open and not in use
                      * we use try_ref to safely acquire reference -- if it fails, sstable is being
                      * freed after acquiring ref, check if refcount is now 2 (level ref + our ref)
-                     */
-                    if (sst->klog_bm && sst->vlog_bm)
+                     * num_open_sstables is keyed on the klog, so a klog-open sstable is
+                     * reclaimable even when its vlog was never lazily opened */
+                    if (sst->klog_bm)
                     {
                         if (!tidesdb_sstable_try_ref(sst))
                         {
@@ -18919,13 +19019,17 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
              *** between refcount check and close. the baseline matches the drain path's
              *** "1 original + 1 work ref" semantic, so we reuse the same constant. */
             int expected = TDB_REFCOUNT_DRAIN_BASELINE;
-            if (sst->klog_bm && sst->vlog_bm &&
+            if (sst->klog_bm &&
                 atomic_compare_exchange_strong(&sst->refcount, &expected, TDB_REFCOUNT_EVICTING))
             {
                 block_manager_close(sst->klog_bm);
-                block_manager_close(sst->vlog_bm);
                 sst->klog_bm = NULL;
-                sst->vlog_bm = NULL;
+                /* the vlog is opened lazily, so it may not be open; close it if it is */
+                if (sst->vlog_bm)
+                {
+                    block_manager_close(sst->vlog_bm);
+                    sst->vlog_bm = NULL;
+                }
                 atomic_fetch_sub(&db->num_open_sstables, 1);
                 closed_count++;
 
@@ -23353,6 +23457,63 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         l0_delayed = 1;
     }
 
+    /* L1 (first disk level) hard write-stop. the graduated delays below only *slow* writes when L1
+     * exceeds a few x the trigger; under sustained ingest that compaction cannot match, the file
+     * count would still grow without bound -- the on-disk working set readers pin, and thus open
+     * fds and per-sstable aux memory, with it (the fd-exhaustion wedge). stop writers once L1
+     * reaches a high multiple of the trigger and hold until compaction drains it. like the L0 queue
+     * stall, we pace while compaction makes progress (file count shrinks or the sstable layout
+     * version advances) and only return BUSY if compaction is genuinely wedged. */
+    const int l1_stop_watermark = effective_l1_trigger * TDB_BACKPRESSURE_L1_STOP_MULTIPLIER;
+    if (l1_file_count >= l1_stop_watermark)
+    {
+        if (tdb_log_throttle(cf->db, &cf->last_l1_stop_log_sec,
+                             TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' L1 file-count stall: %d >= %d (%dx trigger) -- blocking until "
+                          "compaction drains",
+                          cf->name, l1_file_count, l1_stop_watermark,
+                          TDB_BACKPRESSURE_L1_STOP_MULTIPLIER);
+
+        /* ensure compaction is actually working the backlog down */
+        if (!atomic_load_explicit(&cf->is_compacting, memory_order_relaxed))
+            tidesdb_enqueue_compaction(cf, 0);
+
+        int total_iterations = 0;
+        int no_progress = 0;
+        int best_count = l1_file_count;
+        uint64_t last_layout =
+            atomic_load_explicit(&cf->sstable_layout_version, memory_order_relaxed);
+        while (atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire) >=
+               l1_stop_watermark)
+        {
+            usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
+            total_iterations++;
+            const int cur =
+                atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+            const uint64_t cur_layout =
+                atomic_load_explicit(&cf->sstable_layout_version, memory_order_relaxed);
+            if (cur < best_count || cur_layout != last_layout)
+            {
+                best_count = cur;
+                last_layout = cur_layout;
+                no_progress = 0;
+            }
+            else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "CF '%s' L1 file-count stall: no compaction progress for %dms -- "
+                              "compaction appears wedged",
+                              cf->name,
+                              no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+                return TDB_ERR_BUSY;
+            }
+        }
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' L1 file-count stall resolved after %dms", cf->name,
+                      total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+        l0_delayed = 1;
+    }
+
     /* per-cf active memtable ceiling. tidesdb_flush_memtable_internal silently
      * defers the rotate when the active_flushes slot cap is reached, so the L0
      * queue stall and L1 file-count delays above are not enough to bound the
@@ -24627,6 +24788,7 @@ unified_sst_search:;
         size_t best_value_size = 0;
         int best_is_dead = 0;
         int best_found = 0;
+        int scan_error = 0; /* set if an sstable could not be opened/read (incomplete scan) */
 
         const int scan_start = num_ssts - 1;
         const int scan_end = 0;
@@ -24705,6 +24867,16 @@ unified_sst_search:;
                 continue;
             }
 
+            /* reader fd budget, don't open a new sstable for this read if doing so would eat into
+             * the flush/compaction reserve. back off with a retryable error rather than starving
+             * the write path; an already-open sstable is never blocked (see helper). */
+            if (!tidesdb_reader_fd_budget_ok(cf->db, sst))
+            {
+                tidesdb_sstable_unref(cf->db, sst);
+                scan_error = TDB_ERR_BUSY;
+                break;
+            }
+
             tidesdb_kv_pair_t *candidate_kv = NULL;
             int get_result =
                 tidesdb_sstable_get(cf->db, sst, key, key_size, snapshot_seq, &candidate_kv, 0);
@@ -24747,9 +24919,26 @@ unified_sst_search:;
             }
 
             tidesdb_sstable_unref(cf->db, sst);
+
+            /* a non-found, non-success return means this sstable could not be opened or read
+             * (e.g. EMFILE under fd pressure, or an IO error). the scan is therefore incomplete --
+             * a newer version of the key may live in the sstable we just failed on -- so we must
+             * NOT fall through and treat it as "not present" (which would return a stale version or
+             * a false not-found). surface the error and let the caller retry once fds free. */
+            if (get_result != TDB_SUCCESS && get_result != TDB_ERR_NOT_FOUND)
+            {
+                scan_error = get_result;
+                break;
+            }
         }
 
         atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+
+        if (scan_error)
+        {
+            if (best_value) free(best_value);
+            return scan_error;
+        }
 
         if (best_found)
         {
@@ -28136,23 +28325,44 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_sstable_t *sst = ssts_array[i];
 
+            /* reader fd budget--a full-scan iterator opens every source; refuse to exceed the
+             * reader budget (reserve held for flush/compaction). fail creation with a retryable
+             * error rather than starving the write path -- the caller retries once fds free. */
+            if (!tidesdb_reader_fd_budget_ok(cf->db, sst))
+            {
+                for (int k = i; k < sst_count; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                free(ssts_array);
+                tidesdb_iter_free(*iter);
+                *iter = NULL;
+                return TDB_ERR_BUSY;
+            }
+
             tidesdb_merge_source_t *sst_source =
                 tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
-            if (sst_source)
+            if (!sst_source)
             {
-                /* we mark as cached so it wont be freed when popped from heap */
-                sst_source->is_cached = 1;
+                /* could not open/build a source for this sstable (e.g. EMFILE under fd pressure).
+                 * an iterator that silently omits an sstable returns wrong/incomplete results, so
+                 * fail creation and let the caller retry once descriptors free. */
+                for (int k = i; k < sst_count; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                free(ssts_array);
+                tidesdb_iter_free(*iter);
+                *iter = NULL;
+                return TDB_ERR_IO;
+            }
 
-                /* we cache the source for reuse */
-                (*iter)->cached_sources[(*iter)->num_cached_sources++] = sst_source;
+            /* we mark as cached so it wont be freed when popped from heap */
+            sst_source->is_cached = 1;
 
-                /* we add to heap if it has initial data */
-                if (sst_source->current_kv != NULL)
+            /* we cache the source for reuse */
+            (*iter)->cached_sources[(*iter)->num_cached_sources++] = sst_source;
+
+            /* we add to heap if it has initial data */
+            if (sst_source->current_kv != NULL)
+            {
+                if (tidesdb_merge_heap_add_source((*iter)->heap, sst_source) != TDB_SUCCESS)
                 {
-                    if (tidesdb_merge_heap_add_source((*iter)->heap, sst_source) != TDB_SUCCESS)
-                    {
-                        /* source is still cached, just not in heap initially */
-                    }
+                    /* source is still cached, just not in heap initially */
                 }
             }
 
@@ -28342,12 +28552,26 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
     for (int i = 0; i < sst_count; i++)
     {
         tidesdb_sstable_t *sst = ssts_array[i];
-        tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
-        if (sst_source)
+
+        /* reader fd budget (see helper) -- back off rather than starving flush/compaction */
+        if (!tidesdb_reader_fd_budget_ok(cf->db, sst))
         {
-            sst_source->is_cached = 1;
-            iter->cached_sources[iter->num_cached_sources++] = sst_source;
+            for (int k = i; k < sst_count; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);
+            free(ssts_array);
+            return TDB_ERR_BUSY;
         }
+
+        tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable_lazy(cf->db, sst);
+        if (!sst_source)
+        {
+            /* could not open/build a source (e.g. EMFILE) -- a rebuilt cache that omits an sstable
+             * would silently drop data from the scan. surface the failure; the caller retries. */
+            for (int k = i; k < sst_count; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);
+            free(ssts_array);
+            return TDB_ERR_IO;
+        }
+        sst_source->is_cached = 1;
+        iter->cached_sources[iter->num_cached_sources++] = sst_source;
         tidesdb_sstable_unref(cf->db, sst);
     }
     free(ssts_array);

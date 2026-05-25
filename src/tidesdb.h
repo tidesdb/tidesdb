@@ -593,6 +593,7 @@ struct tidesdb_column_family_t
      * zero-initialized by calloc, so the first event in each category logs immediately. */
     _Atomic(time_t) last_ceiling_stall_log_sec;
     _Atomic(time_t) last_imm_critical_log_sec;
+    _Atomic(time_t) last_l1_stop_log_sec;
 };
 
 /**
@@ -818,6 +819,9 @@ struct tidesdb_t
     pthread_mutex_t btree_cache_lock;
     size_t resolved_block_cache_size;
     _Atomic(int) num_open_sstables;
+    /* last-emit timestamp (seconds) for the throttled open-failure (EMFILE) diagnostic, so a
+     * descriptor-exhaustion storm logs one legible line per second instead of flooding */
+    _Atomic(time_t) last_open_fail_log_sec;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;

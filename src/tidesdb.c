@@ -438,7 +438,7 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 
 /* file-open descriptor-pressure handling. block_manager_open can fail with EMFILE/ENFILE when the
  * process is momentarily at its open-fd ceiling (many sstables open under heavy flush+compaction).
- * tidesdb_bm_open treats that as transient backpressure: it wakes the reaper to close idle sstables
+ * tidesdb_bm_open treats that as transient backpressure, it wakes the reaper to close idle sstables
  * and retries a bounded number of times before failing, so an fd spike does not permanently wedge
  * flush or compaction. all other errors (and success) return immediately. */
 #define TDB_BM_OPEN_EMFILE_MAX_RETRIES 5
@@ -531,11 +531,11 @@ static void tidesdb_wake_reaper(tidesdb_t *db)
 /**
  * tidesdb_bm_open
  * open a block manager, treating file-descriptor exhaustion (EMFILE/ENFILE) as transient
- * backpressure rather than a hard failure: wake the reaper to close idle sstables and retry a
+ * backpressure rather than a hard failure, wake the reaper to close idle sstables and retry a
  * bounded number of times. every other errno (and success) returns immediately. errno is preserved
  * by block_manager_open across its own cleanup, so the EMFILE/ENFILE check sees the real cause.
  * @param db database instance (for waking the reaper)
- * @param bm out: opened block manager
+ * @param bm out-- opened block manager
  * @param path file path
  * @param sync_mode block-manager sync mode (already converted)
  * @return 0 on success, -1 on failure (errno set)
@@ -15817,14 +15817,31 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             block_manager_t *klog_bm = NULL;
             block_manager_t *vlog_bm = NULL;
 
-            block_manager_open(&klog_bm, new_sst->klog_path,
-                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                     ? TDB_SYNC_FULL
-                                                     : cf->config.sync_mode));
-            block_manager_open(&vlog_bm, new_sst->vlog_path,
-                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                     ? TDB_SYNC_FULL
-                                                     : cf->config.sync_mode));
+            /* open the partition's output sstable. on failure (e.g. EMFILE under fd pressure) we
+             * MUST NOT proceed -- the merge loop below writes through klog_bm/vlog_bm and would
+             * dereference a NULL block manager. abort the merge instead; the aborted path preserves
+             * the source sstables, so no data is lost and compaction retries later. routed through
+             * tidesdb_bm_open so a transient fd spike gets a reaper-assisted retry first. */
+            if (tidesdb_bm_open(cf->db, &klog_bm, new_sst->klog_path,
+                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                      ? TDB_SYNC_FULL
+                                                      : cf->config.sync_mode)) != 0 ||
+                tidesdb_bm_open(cf->db, &vlog_bm, new_sst->vlog_path,
+                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                      ? TDB_SYNC_FULL
+                                                      : cf->config.sync_mode)) != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "CF '%s' partitioned merge: failed to open output sstable for "
+                              "partition %d: %s -- aborting (sources preserved)",
+                              cf->name, partition, strerror(errno));
+                if (klog_bm) block_manager_close(klog_bm);
+                if (vlog_bm) block_manager_close(vlog_bm);
+                tidesdb_sstable_unref(cf->db, new_sst);
+                tidesdb_merge_heap_free(heap);
+                aborted = 1;
+                break;
+            }
 
             bloom_filter_t *bloom = NULL;
             tidesdb_block_index_t *block_indexes = NULL;
@@ -16193,21 +16210,54 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                                     else
                                         break;
                                 }
+                                /* the prior split was already finalized (it consumed klog_bm,
+                                 * vlog_bm, bloom, block_indexes), so NULL them before the post-loop
+                                 * finalize guard runs -- otherwise it would double-free/close them.
+                                 * abort so the sources are preserved (no data loss; retried). */
+                                klog_bm = NULL;
+                                vlog_bm = NULL;
+                                bloom = NULL;
+                                block_indexes = NULL;
+                                aborted = 1;
                                 break;
                             }
 
                             klog_bm = NULL;
                             vlog_bm = NULL;
-                            block_manager_open(
-                                &klog_bm, new_sst->klog_path,
-                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                      ? TDB_SYNC_FULL
-                                                      : cf->config.sync_mode));
-                            block_manager_open(
-                                &vlog_bm, new_sst->vlog_path,
-                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                      ? TDB_SYNC_FULL
-                                                      : cf->config.sync_mode));
+                            /* open the split (continuation) output. same hazard as the partition's
+                             * first output, on failure we must not write through a NULL block
+                             * manager. abort cleanly -- the previous split was already finalized,
+                             * and the aborted path preserves the sources, so reads still find every
+                             * key (dedup by seq) and compaction retries. the post-loop finalize is
+                             * guarded on new_sst/klog_bm so the NULL'd state below is never used.
+                             */
+                            if (tidesdb_bm_open(
+                                    cf->db, &klog_bm, new_sst->klog_path,
+                                    convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                          ? TDB_SYNC_FULL
+                                                          : cf->config.sync_mode)) != 0 ||
+                                tidesdb_bm_open(
+                                    cf->db, &vlog_bm, new_sst->vlog_path,
+                                    convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                          ? TDB_SYNC_FULL
+                                                          : cf->config.sync_mode)) != 0)
+                            {
+                                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                              "CF '%s' partitioned merge: failed to open split "
+                                              "output for partition %d: %s -- aborting",
+                                              cf->name, partition, strerror(errno));
+                                if (klog_bm) block_manager_close(klog_bm);
+                                if (vlog_bm) block_manager_close(vlog_bm);
+                                tidesdb_sstable_unref(cf->db, new_sst);
+                                new_sst = NULL;
+                                klog_bm = NULL;
+                                vlog_bm = NULL;
+                                bloom =
+                                    NULL; /* consumed by the prior finalize -- don't reuse/free */
+                                block_indexes = NULL;
+                                aborted = 1;
+                                break;
+                            }
 
                             bloom = NULL;
                             block_indexes = NULL;
@@ -16255,8 +16305,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* we clean up duplicate detection tracking */
             free(last_seen_key);
 
-            /* we write remaining block */
-            if (klog_block->num_entries > 0)
+            /* we write remaining block -- skipped when an output open aborted the merge (new_sst or
+             * klog_bm NULL), since writing through a NULL block manager would crash and the sources
+             * are being preserved anyway */
+            if (klog_block->num_entries > 0 && new_sst && klog_bm)
             {
                 uint8_t *klog_data;
                 size_t klog_size;
@@ -16306,18 +16358,36 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             free(block_first_key);
             free(block_last_key);
 
-            /* we assign min/max keys and finalize via helper */
-            new_sst->min_key = first_key;
-            new_sst->min_key_size = first_key_size;
-            new_sst->max_key = last_key;
-            new_sst->max_key_size = last_key_size;
+            /* we assign min/max keys and finalize via helper -- unless an output open aborted the
+             * merge, in which case we must not finalize through a NULL block manager. release this
+             * partition's still-owned resources and leave the sources intact (aborted path below).
+             */
+            if (new_sst && klog_bm && vlog_bm)
+            {
+                new_sst->min_key = first_key;
+                new_sst->min_key_size = first_key_size;
+                new_sst->max_key = last_key;
+                new_sst->max_key_size = last_key_size;
 
-            tdb_partitioned_merge_finalize_sst(cf, new_sst, klog_bm, vlog_bm, bloom, block_indexes,
-                                               entry_count, tombstone_count, klog_block_num,
-                                               vlog_block_num, max_seq, end_level, partition);
+                tdb_partitioned_merge_finalize_sst(
+                    cf, new_sst, klog_bm, vlog_bm, bloom, block_indexes, entry_count,
+                    tombstone_count, klog_block_num, vlog_block_num, max_seq, end_level, partition);
+            }
+            else
+            {
+                free(first_key);
+                free(last_key);
+                if (bloom) bloom_filter_free(bloom);
+                if (block_indexes) compact_block_index_free(block_indexes);
+                if (klog_bm) block_manager_close(klog_bm);
+                if (vlog_bm) block_manager_close(vlog_bm);
+                if (new_sst) tidesdb_sstable_unref(cf->db, new_sst);
+                aborted = 1;
+            }
         }
 
         tidesdb_merge_heap_free(heap);
+        if (aborted) break;
     }
 
     if (aborted)
@@ -17470,7 +17540,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         }
 
         /* out-of-order L0 insertion check. concurrent flush threads finish out of id order, so a
-         * lower-max_seq sstable can land after a higher one. this is benign: both point reads and
+         * lower-max_seq sstable can land after a higher one. this is benign, both point reads and
          * the merge-heap iterators resolve versions by per-entry seq, never by L0 array position
          * (the array is append-only and unsorted). logged at DEBUG as a flush-concurrency signal
          * only -- it is not a correctness violation. one line per out-of-order add (not per pair)
@@ -17719,9 +17789,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     /* we try to claim the last reference atomically. this is a single,
                      * NON-BLOCKING attempt -- it succeeds only when refcount==1 (no reader holds a
                      * merge-source ref). a pinned immutable is left in the queue and reclaimed on a
-                     * later pass once its readers drain. we must NOT spin-wait here: a flushed
+                     * later pass once its readers drain. we must not spin-wait here, a flushed
                      * immutable is now excluded from the reader snapshot (see
-                     * tidesdb_imm_snap_publish_locked), so no NEW reader can pin it and its
+                     * tidesdb_imm_snap_publish_locked), so no new reader can pin it and its
                      * refcount will fall to 1 on its own -- blocking the flush worker to wait for
                      * that is what collapsed flush throughput and wedged writes under reader load.
                      */

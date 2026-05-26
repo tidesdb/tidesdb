@@ -205,12 +205,15 @@ typedef enum
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       1
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
-#define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES      4
-#define TDB_DEFAULT_BLOOM_FPR                   0.01
-#define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        512
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
-#define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN      16
-#define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
+/* pinned to the flush pool size tidesdb_open clamps max_concurrent_flushes to
+ * num_flush_threads and warns when they differ, so the canonical default open
+ * (default_config + open) must already agree or it warns on every startup */
+#define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE
+#define TDB_DEFAULT_BLOOM_FPR              0.01
+#define TDB_DEFAULT_KLOG_VALUE_THRESHOLD   512
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO     1
+#define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN 16
+#define TDB_DEFAULT_MIN_DISK_SPACE         (100 * 1024 * 1024)
 #if defined(__OpenBSD__)
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES 64 /* x2 OpenBSD has lower default fd limits */
 #else
@@ -342,9 +345,10 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  *                              lower compaction write-amp. higher offsets push
  *                              X further up the tree, reducing write-amp again
  *                              but multiplying the number of open files per
- *                              spooky equation 12. default 0 favors ingest
- *                              throughput; set to 1 for write-amp-sensitive
- *                              workloads.
+ *                              spooky equation 12. default is 1 (X=L-2, the paper's
+ *                              generalized tuning, per TDB_DEFAULT_DIVIDING_LEVEL_OFFSET);
+ *                              set to 0 (X=L-1) to favor ingest throughput at higher
+ *                              write-amp.
  * @param klog_value_threshold threshold for klog value
  * @param compression_algorithm compression algorithm
  * @param enable_bloom_filter enable bloom filter
@@ -573,6 +577,12 @@ struct tidesdb_column_family_t
      * cleanup vs compaction-triggered flush) must serialize on this lock */
     pthread_mutex_t imm_snap_publish_lock;
 
+    /* a single compaction round (serialized per CF by is_compacting) may run its
+     * partition sub-merges across multiple sub-compaction threads; this serializes the
+     * per-partition commit section (level add + manifest commit + layout bump) so the
+     * heavy merge work parallelizes while shared-state mutation stays single-threaded */
+    pthread_mutex_t compaction_commit_lock;
+
     /* read-side epoch for the active_memtable slot. a reader bumps this before
      * loading active_memtable + try_ref'ing the loaded pointer, drops it once
      * try_ref has finished (success means refcount is now pinned, failure means
@@ -584,6 +594,11 @@ struct tidesdb_column_family_t
 
     /* unified memtable mode -- 4-byte big-endian CF prefix for keys in the shared skip list */
     uint32_t unified_cf_index;
+
+    /* last-emit timestamps (seconds) for throttled backpressure warnings -- see tdb_log_throttle.
+     * zero-initialized by calloc, so the first event in each category logs immediately. */
+    _Atomic(time_t) last_ceiling_stall_log_sec;
+    _Atomic(time_t) last_imm_critical_log_sec;
 };
 
 /**
@@ -794,6 +809,10 @@ struct tidesdb_t
     queue_t *flush_queue;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
+    /* budget of ephemeral sub-compaction helper threads a compaction round may spawn,
+     * initialized to num_compaction_threads at open. bounds total concurrent sub-merge
+     * threads across all CFs so parallel compaction never oversubscribes the pool. */
+    _Atomic(int) compaction_helper_budget;
     pthread_t sync_thread;
     _Atomic(int) sync_thread_active;
     pthread_mutex_t sync_thread_mutex;
@@ -809,6 +828,9 @@ struct tidesdb_t
     pthread_mutex_t btree_cache_lock;
     size_t resolved_block_cache_size;
     _Atomic(int) num_open_sstables;
+    /* last-emit timestamp (seconds) for the throttled open-failure (EMFILE) diagnostic, so a
+     * descriptor-exhaustion storm logs one legible line per second instead of flooding */
+    _Atomic(time_t) last_open_fail_log_sec;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;
@@ -860,6 +882,8 @@ struct tidesdb_t
         pthread_mutex_t cf_index_map_lock;
         pthread_mutex_t wal_group_sync_lock; /* coordinates group-commit fsync on the unified WAL */
         pthread_cond_t wal_group_sync_cond;
+        /* last-emit timestamp (seconds) for the throttled unified ceiling-stall warning */
+        _Atomic(time_t) last_ceiling_stall_log_sec;
     } unified_mt;
 
     /* object store mode runtime state */
@@ -1414,6 +1438,15 @@ int tidesdb_txn_rollback(tidesdb_txn_t *txn);
 /**
  * tidesdb_txn_commit
  * commits a transaction to the database
+ *
+ * multi-CF atomicity at runtime a transaction is all-or-nothing across all its column
+ * families -- a single commit sequence gates visibility, so nothing is visible until the one
+ * commit point. crash/failure atomicity differs by memtable mode, UNIFIED mode is crash-atomic
+ * across CFs (the whole transaction is one atomic WAL batch), whereas per-CF mode writes a
+ * separate WAL per CF, so a crash or IO/OOM failure mid-commit can leave a partially-applied
+ * prefix (the CFs written before the failure) that recovery treats as committed. use unified
+ * memtable mode when you need crash-atomic multi-CF transactions.
+ *
  * @param txn transaction handle
  * @return 0 on success, -n on failure
  */

@@ -26,9 +26,13 @@
 #define CLOCK_CACHE_READER_INC               2u
 #define CLOCK_CACHE_REF_MASK                 ((uint8_t)(~1u & 0xFFu))
 #define CLOCK_CACHE_HAS_READERS(ref)         (((ref)&CLOCK_CACHE_REF_MASK) != 0)
-#define CLOCK_CACHE_PAYLOAD_ALIGN            8 /* align payload for safe typed access */
-#define CLOCK_CACHE_ALIGN_UP(x, a)           (((x) + ((a)-1)) & ~((size_t)(a)-1))
-#define CLOCK_CACHE_MAX_CPUS                 1024
+/* reader field (bits 1-7) is saturated, all reader bits set == 127 concurrent readers.
+ * one more READER_INC would carry out of the byte and wrap the field to 0, which would make
+ * HAS_READERS read false while readers are live -- free_entry would then free under them. */
+#define CLOCK_CACHE_READERS_SATURATED(ref) (((ref)&CLOCK_CACHE_REF_MASK) == CLOCK_CACHE_REF_MASK)
+#define CLOCK_CACHE_PAYLOAD_ALIGN          8 /* align payload for safe typed access */
+#define CLOCK_CACHE_ALIGN_UP(x, a)         (((x) + ((a)-1)) & ~((size_t)(a)-1))
+#define CLOCK_CACHE_MAX_CPUS               1024
 
 /* upper bound on the number of distinct L3 groups detect_l3_groups will track and the
  * sysfs path buffer used to read each cpu's shared-cache id */
@@ -319,8 +323,24 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
     size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
     if (entry_key_len != key_len) return NULL;
 
-    /* acquire reader ref -- prevents free_entry from freeing key/payload while we memcmp */
-    atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
+    /* acquire reader ref -- prevents free_entry from freeing key/payload while we memcmp.
+     * saturating CAS rather than an unconditional fetch_add the reader field is 7 bits, so the
+     * 128th concurrent pin would wrap it to 0 and let free_entry reclaim the entry under live
+     * readers (use-after-free). at saturation we refuse the pin and report a miss instead -- the
+     * caller falls back to a fresh read, which is correct for a single entry held by 127 readers.
+     */
+    {
+        uint8_t cur = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
+        for (;;)
+        {
+            if (CLOCK_CACHE_READERS_SATURATED(cur)) return NULL;
+            const uint8_t desired = (uint8_t)(cur + CLOCK_CACHE_READER_INC);
+            if (atomic_compare_exchange_weak_explicit(&entry->ref_bit, &cur, desired,
+                                                      memory_order_acq_rel, memory_order_relaxed))
+                break;
+            /* cur was reloaded with the current value on CAS failure -- retry */
+        }
+    }
 
     /* we re-validate state after acquiring ref (entry may have been evicted between
      * our pre-checks and the ref acquisition) */

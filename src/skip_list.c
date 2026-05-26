@@ -298,6 +298,10 @@ static inline uint64_t SKIP_LIST_BSWAP64(uint64_t x)
 #define SKIP_LIST_IS_BIG_ENDIAN 0
 #endif
 
+/* stack-allocated update array size for the batch/put paths; lists taller than this
+ * fall back to a heap update array. file-scope so it is defined exactly once. */
+#define SKIP_LIST_STACK_UPDATE_SIZE 64
+
 /**
  * skip_list_compare_keys_4_inline
  * fast inline lexicographic comparison for 4-byte keys
@@ -638,11 +642,17 @@ int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uin
 int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                 size_t key2_size, void *ctx)
 {
-    (void)key1_size;
-    (void)key2_size;
     (void)ctx;
-    int cmp = strcmp((const char *)key1, (const char *)key2);
-    return cmp == 0 ? 0 : (cmp < 0 ? -1 : 1);
+    /* length-bounded compare keys are byte buffers, not guaranteed NUL-terminated.
+     * strcmp here would read past the buffer on a non-terminated key. memcmp over the
+     * shorter length plus a length tie-break gives the same order as strcmp for
+     * well-formed C-string keys while staying in bounds. */
+    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+    const int cmp = memcmp(key1, key2, min_size);
+    if (cmp != 0) return cmp < 0 ? -1 : 1;
+    if (key1_size < key2_size) return -1;
+    if (key1_size > key2_size) return 1;
+    return 0;
 }
 
 int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
@@ -1863,8 +1873,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
     const skip_list_cmp_type_t cmp_type = list->cmp_type;
 
-    /* we use stack allocation for update array */
-#define SKIP_LIST_STACK_UPDATE_SIZE 64
+    /* we use stack allocation for update array (SKIP_LIST_STACK_UPDATE_SIZE is file-scope) */
     skip_list_node_t *stack_update[SKIP_LIST_STACK_UPDATE_SIZE];
     skip_list_node_t **update;
     const int use_stack = (list->max_level < SKIP_LIST_STACK_UPDATE_SIZE);
@@ -2190,7 +2199,6 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
      * this avoids repeated allocation/deallocation per entry */
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
 
-#define SKIP_LIST_STACK_UPDATE_SIZE 64
     skip_list_node_t *stack_update[SKIP_LIST_STACK_UPDATE_SIZE];
     skip_list_node_t **update;
     const int use_stack = (list->max_level < SKIP_LIST_STACK_UPDATE_SIZE);

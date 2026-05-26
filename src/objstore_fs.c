@@ -34,6 +34,8 @@
 #define TDB_FS_MAX_PATH 4096
 #define TDB_FS_COPY_BUF 65536
 #define TDB_FS_DIR_MODE 0755
+/* extra bytes reserved for the ".tmp.<pid>.<tid>" suffix on the atomic-put temp path */
+#define TDB_FS_TMP_SUFFIX_MAX 64
 
 /* default object store config values */
 #define TDB_OBJSTORE_DEFAULT_CACHE_ON_READ         1
@@ -175,7 +177,22 @@ static int fs_put(void *ctx, const char *key, const char *local_path)
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
     char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
-    return fs_copy_file(local_path, full);
+
+    /* copy to a unique temp file then atomically rename into place, so a concurrent
+     * reader/list never observes a partially-written object -- the objstore put contract
+     * (objstore.h) is "atomic object". the temp lives in the same directory as the target
+     * so the rename stays within one filesystem. */
+    char tmp[TDB_FS_MAX_PATH * 2 + TDB_FS_TMP_SUFFIX_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%lu", full, (long)TDB_GETPID(), TDB_THREAD_ID());
+
+    if (fs_copy_file(local_path, tmp) != 0) return -1;
+
+    if (atomic_rename_file(tmp, full) != 0)
+    {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 /**
@@ -401,7 +418,7 @@ static int fs_list_walk(const char *abs_dir, const char *rel_dir, size_t rel_dir
 /**
  * fs_list
  * enumerate all objects whose key starts with prefix. matches S3
- * ListObjectsV2(prefix=...) semantics: the prefix is matched byte-wise
+ * ListObjectsV2(prefix=...) semantics, the prefix is matched byte-wise
  * against the key and need not align to a directory boundary.
  * @param ctx opaque connector context
  * @param prefix key prefix to list (e.g. "cf_name/" or "uwal_")

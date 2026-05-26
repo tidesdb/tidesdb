@@ -518,7 +518,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #if defined(__GNUC__) || defined(__clang__)
 /* __builtin_prefetch(addr, rw, locality)
  * rw -- 0 = read, 1 = write
- * locality: 0 = no temporal locality, 3 = high temporal locality */
+ * locality-- 0 = no temporal locality, 3 = high temporal locality */
 #define PREFETCH_READ(addr)  __builtin_prefetch((addr), 0, 3)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 #elif defined(_MSC_VER)
@@ -550,7 +550,7 @@ static inline int tdb_ctz64_msvc(uint64_t x)
         return (int)index;
     }
 #else
-    /* 32-bit MSVC: check low and high 32-bit halves */
+    /* 32-bit MSVC-- check low and high 32-bit halves */
     if (_BitScanForward(&index, (unsigned long)x))
     {
         return (int)index;
@@ -644,7 +644,7 @@ static inline int tdb_spawn_wait(const char *cmd, char *const argv[])
 #if defined(_MSC_VER)
 #pragma warning(disable : 4996) /* disable deprecated warning for windows */
 #pragma warning(disable : 4029) /* declared formal parameter list different from definition */
-#pragma warning(disable : 4211) /* nonstandard extension used: redefined extern to static */
+#pragma warning(disable : 4211) /* nonstandard extension used-- redefined extern to static */
 #endif
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
@@ -769,6 +769,12 @@ typedef volatile LONGLONG atomic_uint64_t;
         {                                                                                 \
             InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)); \
         }                                                                                 \
+        else if (sizeof(*(ptr)) == 8)                                                     \
+        {                                                                                 \
+            /* 64-bit value on a 32-bit target cast straight to LONGLONG, NOT via         \
+             * uintptr_t (4 bytes here) which would truncate the input */                 \
+            InterlockedExchange64((LONGLONG volatile *)(ptr), (LONGLONG)(val));           \
+        }                                                                                 \
         else if (sizeof(*(ptr)) == 4)                                                     \
         {                                                                                 \
             InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val));          \
@@ -791,8 +797,8 @@ static inline void *_atomic_load_ptr(volatile void *const *ptr)
     return (void *)InterlockedCompareExchangePointer((PVOID volatile *)ptr, NULL, NULL);
 }
 
-#ifdef _WIN64
-/* atomic load */
+/* atomic load -- available on both _WIN64 and 32-bit (InterlockedCompareExchange64
+ * is provided on 32-bit Windows too, so 64-bit atomics work on a 32-bit target) */
 /*
  * _atomic_load_i64
  * @param ptr the pointer to load the value from
@@ -802,7 +808,6 @@ static inline LONGLONG _atomic_load_i64(volatile LONGLONG *ptr)
 {
     return InterlockedCompareExchange64((LONGLONG volatile *)ptr, 0, 0);
 }
-#endif
 
 /* atomic load */
 /*
@@ -847,10 +852,19 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
  * @param order the memory order (unused)
  * @return the value loaded from the pointer
  */
-#define atomic_load_explicit(ptr, order)                                                            \
-    (sizeof(*(ptr)) == sizeof(void *) ? _atomic_load_ptr((volatile void *const *)(ptr))             \
-     : sizeof(*(ptr)) == 4            ? (void *)(uintptr_t)_atomic_load_i32((volatile LONG *)(ptr)) \
-                           : (void *)(uintptr_t)_atomic_load_u8((volatile unsigned char *)(ptr)))
+/* NOTE (32-bit MSVC < 2022) this path returns unsigned long long, not void*, so a
+ * 64-bit atomic (sizeof==8, e.g. atomic_uint64_t / atomic_size_t) is loaded at full
+ * width -- routing it through (void*)(uintptr_t) as the _WIN64 path does would truncate
+ * to 32 bits here. Pointer and 32-bit values widen losslessly. A caller assigning the
+ * result to a pointer gets an integer->pointer conversion (cast as needed).
+ * This whole 32-bit MSVC<2022 atomics path MUST be compiled and tested on the target. */
+#define atomic_load_explicit(ptr, order)                                                      \
+    (sizeof(*(ptr)) == sizeof(void *)                                                         \
+         ? (unsigned long long)(uintptr_t)_atomic_load_ptr((volatile void *const *)(ptr))     \
+     : sizeof(*(ptr)) == 8 ? (unsigned long long)_atomic_load_i64((volatile LONGLONG *)(ptr)) \
+     : sizeof(*(ptr)) == 4                                                                    \
+         ? (unsigned long long)(uintptr_t)_atomic_load_i32((volatile LONG *)(ptr))            \
+         : (unsigned long long)_atomic_load_u8((volatile unsigned char *)(ptr)))
 #endif
 
 /* atomic exchange */
@@ -879,10 +893,15 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
  * @param order the memory order (unused)
  * @return the value exchanged from the pointer
  */
-#define atomic_exchange_explicit(ptr, val, order)                                       \
-    (sizeof(*(ptr)) == sizeof(void *)                                                   \
-         ? InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)) \
-         : (void *)(uintptr_t)InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val)))
+/* NOTE (32-bit MSVC < 2022) returns unsigned long long for the same reason as
+ * atomic_load_explicit above -- the 8-byte arm must not truncate. Verify on target. */
+#define atomic_exchange_explicit(ptr, val, order)                                                  \
+    (sizeof(*(ptr)) == sizeof(void *) ? (unsigned long long)(uintptr_t)InterlockedExchangePointer( \
+                                            (PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val))      \
+     : sizeof(*(ptr)) == 8                                                                         \
+         ? (unsigned long long)InterlockedExchange64((LONGLONG volatile *)(ptr), (LONGLONG)(val))  \
+         : (unsigned long long)(uintptr_t)InterlockedExchange((LONG volatile *)(ptr),              \
+                                                              (LONG)(uintptr_t)(val)))
 #endif
 
 #ifdef _WIN64
@@ -903,7 +922,13 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
  * @param val the value to add
  * @return the value before the addition
  */
-#define atomic_fetch_add(ptr, val) InterlockedExchangeAdd((LONG volatile *)(ptr), (LONG)(val))
+/* 32-bit dispatch on width so an 8-byte counter (atomic_uint64_t / atomic_size_t)
+ * uses the 64-bit intrinsic instead of truncating to LONG. Returns unsigned long long. */
+#define atomic_fetch_add(ptr, val)                                                    \
+    (sizeof(*(ptr)) == 8 ? (unsigned long long)InterlockedExchangeAdd64(              \
+                               (LONGLONG volatile *)(ptr), (LONGLONG)(val))           \
+                         : (unsigned long long)(unsigned long)InterlockedExchangeAdd( \
+                               (LONG volatile *)(ptr), (LONG)(val)))
 #endif
 
 /* atomic store */
@@ -1733,7 +1758,7 @@ static inline int sem_post(sem_t *sem)
 }
 #else
 /* for macOS < 10.6 (e.g., 10.5 PPC64), use POSIX semaphores
- * note: POSIX semaphores are deprecated on modern macOS but work on older versions */
+ * note-- POSIX semaphores are deprecated on modern macOS but work on older versions */
 /* sem_t, sem_init, sem_destroy, sem_wait, sem_post are provided by semaphore.h */
 #endif
 
@@ -2466,7 +2491,7 @@ static inline const uint8_t *decode_varint64(const uint8_t *ptr, uint64_t *value
 /*
  * serialize_kv_varint
  * serialize key-value pair with varint length prefixes
- * format: varint(key_size) + key + varint(value_size) + value
+ * format-- varint(key_size) + key + varint(value_size) + value
  * @param ptr output buffer (must have enough space)
  * @param key key data
  * @param key_size key size
@@ -2535,7 +2560,7 @@ static inline uint8_t *serialize_kv_varint_ex(uint8_t *ptr, uint8_t flags, const
 /*
  * serialize_kv_varint_full
  * serialize key-value pair with all metadata (for WAL)
- * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl) +
+ * format-- flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl) +
  * varint(seq)
  * @param ptr output buffer (must have enough space)
  * @param flags flags byte
@@ -2723,7 +2748,7 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
  * avoids the per-inode i_rwsem write lock; equivalent locks exist on macOS APFS
  * (vnode write lock) and Windows NTFS (file-extension lock).
  *
- * critical detail: the logical EOF (i_size) MUST advance, not just the on-disk
+ * critical detail the logical EOF (i_size) MUST advance, not just the on-disk
  * extent allocation. on Linux, fallocate(KEEP_SIZE) reserves blocks but leaves
  * i_size unchanged, and the kernel still treats writes past i_size as extending
  * writes -- delivering no speedup. mode 0 advances i_size and initializes the
@@ -2735,12 +2760,12 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
  * tail (size_field == 0 marks the boundary between data and preallocated region).
  *
  * platform behavior:
- *   linux:   fallocate(fd, 0, off, len) -- advances i_size, initializes extents
- *   macos:   fcntl(F_PREALLOCATE) reserves, then ftruncate advances logical EOF
- *   windows: SetFileInformationByHandle(FileAllocationInfo) reserves, then
- *            FileEndOfFileInfo advances EOF
- *   other posix: posix_fallocate -- already advances EOF
- *   fallback: returns -1, caller falls back to extending writes
+ *   linux           fallocate(fd, 0, off, len) -- advances i_size, initializes extents
+ *   macos           fcntl(F_PREALLOCATE) reserves, then ftruncate advances logical EOF
+ *   windows         SetFileInformationByHandle(FileAllocationInfo) reserves, then
+ *                   FileEndOfFileInfo advances EOF
+ *   other posix     posix_fallocate -- already advances EOF
+ *   fallback        returns -1, caller falls back to extending writes
  *
  * @param fd the file descriptor
  * @param offset start of the region to preallocate (typically current EOF)
@@ -3472,6 +3497,39 @@ static inline FILE *tdb_fmemopen(void *buf, size_t size, const char *mode)
     return fp;
 #else
     return fmemopen(buf, size, mode);
+#endif
+}
+
+#ifndef _WIN32
+#include <sys/resource.h> /* getrlimit / RLIMIT_NOFILE for tdb_max_open_files */
+#endif
+
+/* fallback open-file ceilings used when the OS limit cannot be queried */
+#define TDB_FALLBACK_MAX_OPEN_FILES_POSIX 1024 /* POSIX-typical default RLIMIT_NOFILE soft cap */
+#define TDB_FALLBACK_MAX_OPEN_FILES_WIN \
+    2048 /* conservative floor for the Windows CRT low-IO layer */
+
+/**
+ * tdb_max_open_files
+ * report the process's maximum number of simultaneously open file descriptors, so callers can
+ * size their fd budgets (e.g. max_open_sstables) to fit the OS limit. returns a conservative
+ * fallback when the limit cannot be determined or is unlimited.
+ * @return the open-file ceiling as a long
+ */
+static inline long tdb_max_open_files(void)
+{
+#if defined(_WIN32)
+    /* windows has no RLIMIT_NOFILE. the CRT low-IO layer permits a large but not directly
+     * queryable number of _open handles; _getmaxstdio reports the (smaller) stdio stream cap.
+     * use the larger of that and a conservative floor so we neither over- nor under-budget. */
+    const int stdio_cap = _getmaxstdio();
+    const long win_floor = TDB_FALLBACK_MAX_OPEN_FILES_WIN;
+    return (stdio_cap > win_floor) ? (long)stdio_cap : win_floor;
+#else
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0)
+        return (long)rl.rlim_cur;
+    return TDB_FALLBACK_MAX_OPEN_FILES_POSIX;
 #endif
 }
 

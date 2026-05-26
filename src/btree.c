@@ -395,11 +395,17 @@ int btree_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t
 int btree_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                             size_t key2_size, void *ctx)
 {
-    (void)key1_size;
-    (void)key2_size;
     (void)ctx;
-    int cmp = strcmp((const char *)key1, (const char *)key2);
-    return cmp == 0 ? 0 : (cmp < 0 ? -1 : 1);
+    /* length-bounded compare, keys are byte buffers, not guaranteed NUL-terminated.
+     * strcmp here would read past the buffer on a non-terminated key. memcmp over the
+     * shorter length plus a length tie-break gives the same order as strcmp for
+     * well-formed C-string keys while staying in bounds. */
+    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+    const int cmp = memcmp(key1, key2, min_size);
+    if (cmp != 0) return cmp < 0 ? -1 : 1;
+    if (key1_size < key2_size) return -1;
+    if (key1_size > key2_size) return 1;
+    return 0;
 }
 
 int btree_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,

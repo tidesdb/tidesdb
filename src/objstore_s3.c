@@ -47,9 +47,10 @@
 #define TDB_S3_REGION_MAX   64
 
 /* HTTP status codes */
-#define TDB_S3_HTTP_OK       200
-#define TDB_S3_HTTP_PARTIAL  206
-#define TDB_S3_HTTP_REDIRECT 300
+#define TDB_S3_HTTP_OK        200
+#define TDB_S3_HTTP_PARTIAL   206
+#define TDB_S3_HTTP_REDIRECT  300
+#define TDB_S3_HTTP_NOT_FOUND 404
 
 /* signing and response buffers. host and key_date buffers must be large
  * enough for concatenated bucket+endpoint or "AWS4"+secret_key strings. */
@@ -76,9 +77,13 @@
 /* multipart upload -- objects at or above the threshold are uploaded in
  * parts so the connector never buffers a whole large file in memory and is
  * not bound by S3's 5 GiB single-PUT limit. S3 requires parts of at least
- * 5 MiB (the final part may be smaller) and at most 10000 parts. */
+ * 5 MiB (the final part may be smaller) and at most 10000 parts.
+ * these match the documented objstore_config defaults (threshold 64 MiB,
+ * part size 8 MiB); honoring per-config overrides at runtime additionally
+ * requires plumbing multipart_threshold / multipart_part_size through the
+ * public tidesdb_objstore_s3_create signature (deferred -- API change). */
 #define TDB_S3_MULTIPART_THRESHOLD ((size_t)64 * 1024 * 1024)
-#define TDB_S3_MULTIPART_PART_SIZE ((size_t)16 * 1024 * 1024)
+#define TDB_S3_MULTIPART_PART_SIZE ((size_t)8 * 1024 * 1024)
 #define TDB_S3_MAX_PARTS           10000
 #define TDB_S3_ETAG_MAX            128
 #define TDB_S3_UPLOAD_ID_MAX       512
@@ -113,26 +118,42 @@ static void s3_uri_encode(const char *src, char *dst, size_t dst_size)
 }
 
 /**
- * s3_curl_new
- * create a curl easy handle with the connector's common options applied --
- * a connection timeout and a stalled-transfer timeout so a dead endpoint
- * cannot hang a worker, and NOSIGNAL for safe use from multiple threads.
- * @return a configured handle, or NULL on allocation failure
+ * s3_uri_encode_path
+ * URI-encode an object key for use as a request path / SigV4 canonical URI. like
+ * s3_uri_encode but leaves '/' unencoded so path segments are preserved. the request
+ * URL (s3_build_url) and the canonical URI (s3_sign_request) MUST apply the exact same
+ * encoding or the SigV4 signature will not match the request. for keys made only of
+ * unreserved characters and '/' (which is what tidesdb cf/sstable keys are) this is a
+ * passthrough, so normal operation is unchanged; it only matters for keys containing
+ * spaces, '+', '?', '#', '&', etc.
+ * @param src input key
+ * @param dst output buffer
+ * @param dst_size size of output buffer
  */
-static CURL *s3_curl_new(void)
+static void s3_uri_encode_path(const char *src, char *dst, size_t dst_size)
 {
-    CURL *curl = curl_easy_init();
-    if (!curl) return NULL;
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)TDB_S3_CONNECT_TIMEOUT_S);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, (long)TDB_S3_LOW_SPEED_LIMIT);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)TDB_S3_LOW_SPEED_TIME_S);
-    return curl;
+    static const char *unreserved =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/";
+    size_t pos = 0;
+    for (; *src && pos + 3 < dst_size; src++)
+    {
+        if (strchr(unreserved, *src))
+        {
+            dst[pos++] = *src;
+        }
+        else
+        {
+            snprintf(dst + pos, dst_size - pos, "%%%02X", (unsigned char)*src);
+            pos += 3;
+        }
+    }
+    dst[pos] = '\0';
 }
 
 /**
  * s3_ctx_t
- * internal context for the S3 connector, holding credentials and endpoint config
+ * internal context for the S3 connector, credentials, endpoint, TLS, and multipart config.
+ * defined before s3_curl_new so that helper can apply the per-connector TLS options.
  * @param endpoint S3 endpoint hostname
  * @param bucket S3 bucket name
  * @param prefix key prefix prepended to all object keys
@@ -141,6 +162,10 @@ static CURL *s3_curl_new(void)
  * @param region AWS region string
  * @param use_ssl 1 for HTTPS, 0 for HTTP
  * @param use_path_style 1 for path-style URLs, 0 for virtual-hosted
+ * @param tls_ca_path custom CA bundle file path (empty = libcurl default bundle)
+ * @param tls_insecure_skip_verify 1 disables peer+host verification (test endpoints only)
+ * @param multipart_threshold object size at/above which multipart upload is used
+ * @param multipart_part_size multipart chunk size
  */
 typedef struct
 {
@@ -152,7 +177,43 @@ typedef struct
     char region[TDB_S3_REGION_MAX];
     int use_ssl;
     int use_path_style;
+    char tls_ca_path[TDB_S3_MAX_PATH];
+    int tls_insecure_skip_verify;
+    size_t multipart_threshold;
+    size_t multipart_part_size;
 } s3_ctx_t;
+
+/**
+ * s3_curl_new
+ * create a curl easy handle with the connector's common options applied -- a connection
+ * timeout and a stalled-transfer timeout so a dead endpoint cannot hang a worker, NOSIGNAL
+ * for safe use from multiple threads, and (over https) the connector's TLS settings, a custom
+ * CA bundle when configured, and an opt-in insecure skip-verify for test endpoints.
+ * @param s3 connector context (for TLS settings)
+ * @return a configured handle, or NULL on allocation failure
+ */
+static CURL *s3_curl_new(const s3_ctx_t *s3)
+{
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)TDB_S3_CONNECT_TIMEOUT_S);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, (long)TDB_S3_LOW_SPEED_LIMIT);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)TDB_S3_LOW_SPEED_TIME_S);
+
+    /* TLS only matters over https. leaving both branches untouched keeps libcurl's secure
+     * defaults (verify peer + host against the system CA bundle). */
+    if (s3 && s3->use_ssl)
+    {
+        if (s3->tls_ca_path[0]) curl_easy_setopt(curl, CURLOPT_CAINFO, s3->tls_ca_path);
+        if (s3->tls_insecure_skip_verify)
+        {
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        }
+    }
+    return curl;
+}
 
 /**
  * sha256_hex
@@ -206,7 +267,7 @@ static void s3_get_timestamp(char *date8, char *timestamp16)
 
 /**
  * s3_signing_key
- * derive the SigV4 signing key via HMAC chain: date -> region -> service -> request
+ * derive the SigV4 signing key via HMAC chain date -> region -> service -> request
  * @param secret_key AWS secret access key
  * @param date8 date string YYYYMMDD
  * @param region AWS region
@@ -248,10 +309,14 @@ static void s3_build_url(const s3_ctx_t *ctx, const char *key, char *url, size_t
     else
         snprintf(full_key, sizeof(full_key), "%s", key);
 
+    /* must match the canonical-URI encoding in s3_sign_request exactly */
+    char enc_key[TDB_S3_MAX_PATH * 3];
+    s3_uri_encode_path(full_key, enc_key, sizeof(enc_key));
+
     if (ctx->use_path_style)
-        snprintf(url, url_size, "%s://%s/%s/%s", scheme, ctx->endpoint, ctx->bucket, full_key);
+        snprintf(url, url_size, "%s://%s/%s/%s", scheme, ctx->endpoint, ctx->bucket, enc_key);
     else
-        snprintf(url, url_size, "%s://%s.%s/%s", scheme, ctx->bucket, ctx->endpoint, full_key);
+        snprintf(url, url_size, "%s://%s.%s/%s", scheme, ctx->bucket, ctx->endpoint, enc_key);
 }
 #ifndef _MSC_VER
 #pragma GCC diagnostic pop
@@ -389,11 +454,16 @@ static struct curl_slist *s3_sign_request(const s3_ctx_t *ctx, const char *metho
     else
         snprintf(full_key, sizeof(full_key), "%s", key);
 
-    char canonical_uri[TDB_S3_MAX_PATH + 256];
+    /* URI-encode the key path exactly as s3_build_url does, or the signature will not
+     * match the request for keys containing characters outside [A-Za-z0-9-._~/] */
+    char enc_key[TDB_S3_MAX_PATH * 3];
+    s3_uri_encode_path(full_key, enc_key, sizeof(enc_key));
+
+    char canonical_uri[TDB_S3_MAX_PATH * 3 + 256];
     if (ctx->use_path_style)
-        snprintf(canonical_uri, sizeof(canonical_uri), "/%s/%s", ctx->bucket, full_key);
+        snprintf(canonical_uri, sizeof(canonical_uri), "/%s/%s", ctx->bucket, enc_key);
     else
-        snprintf(canonical_uri, sizeof(canonical_uri), "/%s", full_key);
+        snprintf(canonical_uri, sizeof(canonical_uri), "/%s", enc_key);
 
     return s3_sign_raw(ctx, method, canonical_uri, "", content_sha256, extra_headers_canonical,
                        extra_signed_headers);
@@ -518,7 +588,7 @@ static int s3_get(void *ctx, const char *key, const char *local_path)
 
     s3_write_ctx_t wctx = {.fp = fp};
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         fclose(fp);
@@ -577,7 +647,7 @@ static ssize_t s3_range_get(void *ctx, const char *key, uint64_t offset, void *b
 
     s3_write_ctx_t wctx = {.buf = (char *)buf, .buf_size = size, .written = 0};
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -619,7 +689,7 @@ static int s3_delete_object(void *ctx, const char *key)
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -632,11 +702,20 @@ static int s3_delete_object(void *ctx, const char *key)
 
     CURLcode res = curl_easy_perform(curl);
 
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    /* 204 No Content or 404 Not Found are both success for delete */
-    return (res == CURLE_OK) ? 0 : -1;
+    if (res != CURLE_OK) return -1;
+    /* 2xx (200/204 No Content) = deleted, 404 Not Found = already absent; both are success.
+     * any other status (403, 5xx, ...) is a real failure that must NOT be masked, or the
+     * integration layer's retry/cleanup is silently defeated. */
+    if ((http_code >= TDB_S3_HTTP_OK && http_code < TDB_S3_HTTP_REDIRECT) ||
+        http_code == TDB_S3_HTTP_NOT_FOUND)
+        return 0;
+    return -1;
 }
 
 /**
@@ -659,7 +738,7 @@ static int s3_exists(void *ctx, const char *key, size_t *size_out)
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -880,7 +959,7 @@ static int s3_multipart_create(s3_ctx_t *s3, const char *key, char *upload_id_ou
         return -1;
     }
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         free(resp.data);
@@ -965,7 +1044,7 @@ static int s3_upload_part(s3_ctx_t *s3, const char *key, const char *upload_id, 
     }
 
     s3_header_ctx_t hctx = {.found = 0};
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         fclose(mem_fp);
@@ -1053,7 +1132,7 @@ static int s3_multipart_complete(s3_ctx_t *s3, const char *key, const char *uplo
         return -1;
     }
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         free(body);
@@ -1121,7 +1200,7 @@ static int s3_multipart_abort(s3_ctx_t *s3, const char *key, const char *upload_
     char full_url[TDB_S3_MAX_PATH + TDB_S3_UPLOAD_ID_MAX * 4 + 32];
     snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url, enc_id);
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -1158,7 +1237,7 @@ static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new();
+    CURL *curl = s3_curl_new(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -1196,15 +1275,16 @@ static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size
  */
 static int s3_put_multipart(s3_ctx_t *s3, const char *key, FILE *fp, long file_size)
 {
-    long parts_needed =
-        (long)(((size_t)file_size + TDB_S3_MULTIPART_PART_SIZE - 1) / TDB_S3_MULTIPART_PART_SIZE);
+    const size_t part_size = s3->multipart_part_size; /* resolved to a default at create time */
+
+    long parts_needed = (long)(((size_t)file_size + part_size - 1) / part_size);
     if (parts_needed < 1) parts_needed = 1;
     if (parts_needed > TDB_S3_MAX_PARTS) return -1; /* file too large for the part size */
 
     char upload_id[TDB_S3_UPLOAD_ID_MAX];
     if (s3_multipart_create(s3, key, upload_id, sizeof(upload_id)) != 0) return -1;
 
-    char *part_buf = malloc(TDB_S3_MULTIPART_PART_SIZE);
+    char *part_buf = malloc(part_size);
     char *etags = malloc((size_t)parts_needed * TDB_S3_ETAG_MAX);
     if (!part_buf || !etags)
     {
@@ -1218,7 +1298,7 @@ static int s3_put_multipart(s3_ctx_t *s3, const char *key, FILE *fp, long file_s
     int failed = 0;
     for (;;)
     {
-        size_t got = fread(part_buf, 1, TDB_S3_MULTIPART_PART_SIZE, fp);
+        size_t got = fread(part_buf, 1, part_size, fp);
         if (got == 0)
         {
             if (ferror(fp)) failed = 1;
@@ -1236,7 +1316,7 @@ static int s3_put_multipart(s3_ctx_t *s3, const char *key, FILE *fp, long file_s
             break;
         }
         part_count++;
-        if (got < TDB_S3_MULTIPART_PART_SIZE) break; /* short read -- last part */
+        if (got < part_size) break; /* short read -- last part */
     }
 
     int rc = -1;
@@ -1283,7 +1363,7 @@ static int s3_put(void *ctx, const char *key, const char *local_path)
     rewind(fp);
 
     int rc;
-    if ((size_t)file_size >= TDB_S3_MULTIPART_THRESHOLD)
+    if ((size_t)file_size >= s3->multipart_threshold)
         rc = s3_put_multipart(s3, key, fp, file_size);
     else
         rc = s3_put_single(s3, key, fp, file_size);
@@ -1380,7 +1460,7 @@ static int s3_list(void *ctx, const char *prefix,
             return count > 0 ? count : -1;
         }
 
-        CURL *curl = s3_curl_new();
+        CURL *curl = s3_curl_new(s3);
         if (!curl)
         {
             free(resp.data);
@@ -1484,26 +1564,38 @@ static void s3_destroy(void *ctx)
     free(ctx);
 }
 
-tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char *bucket,
-                                               const char *prefix, const char *access_key,
-                                               const char *secret_key, const char *region,
-                                               int use_ssl, int use_path_style)
+tidesdb_objstore_t *tidesdb_objstore_s3_create_config(const tidesdb_objstore_s3_config_t *config)
 {
-    if (!endpoint || !bucket || !access_key || !secret_key) return NULL;
+    if (!config || !config->endpoint || !config->bucket || !config->access_key ||
+        !config->secret_key)
+        return NULL;
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     s3_ctx_t *s3 = calloc(1, sizeof(s3_ctx_t));
     if (!s3) return NULL;
 
-    snprintf(s3->endpoint, sizeof(s3->endpoint), "%s", endpoint);
-    snprintf(s3->bucket, sizeof(s3->bucket), "%s", bucket);
-    if (prefix) snprintf(s3->prefix, sizeof(s3->prefix), "%s", prefix);
-    snprintf(s3->access_key, sizeof(s3->access_key), "%s", access_key);
-    snprintf(s3->secret_key, sizeof(s3->secret_key), "%s", secret_key);
-    snprintf(s3->region, sizeof(s3->region), "%s", region ? region : TDB_S3_DEFAULT_REGION);
-    s3->use_ssl = use_ssl;
-    s3->use_path_style = use_path_style;
+    snprintf(s3->endpoint, sizeof(s3->endpoint), "%s", config->endpoint);
+    snprintf(s3->bucket, sizeof(s3->bucket), "%s", config->bucket);
+    if (config->prefix) snprintf(s3->prefix, sizeof(s3->prefix), "%s", config->prefix);
+    snprintf(s3->access_key, sizeof(s3->access_key), "%s", config->access_key);
+    snprintf(s3->secret_key, sizeof(s3->secret_key), "%s", config->secret_key);
+    snprintf(s3->region, sizeof(s3->region), "%s",
+             config->region ? config->region : TDB_S3_DEFAULT_REGION);
+    s3->use_ssl = config->use_ssl;
+    s3->use_path_style = config->use_path_style;
+
+    /* TLS copy a custom CA bundle path if given; the secure default (empty path +
+     * skip_verify 0) leaves libcurl verifying peer+host against the system CA bundle. */
+    if (config->tls_ca_path)
+        snprintf(s3->tls_ca_path, sizeof(s3->tls_ca_path), "%s", config->tls_ca_path);
+    s3->tls_insecure_skip_verify = config->tls_insecure_skip_verify;
+
+    /* multipart honor the caller's tuning, falling back to the documented defaults */
+    s3->multipart_threshold =
+        config->multipart_threshold ? config->multipart_threshold : TDB_S3_MULTIPART_THRESHOLD;
+    s3->multipart_part_size =
+        config->multipart_part_size ? config->multipart_part_size : TDB_S3_MULTIPART_PART_SIZE;
 
     tidesdb_objstore_t *store = calloc(1, sizeof(tidesdb_objstore_t));
     if (!store)
@@ -1523,6 +1615,29 @@ tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char 
     store->ctx = s3;
 
     return store;
+}
+
+tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char *bucket,
+                                               const char *prefix, const char *access_key,
+                                               const char *secret_key, const char *region,
+                                               int use_ssl, int use_path_style)
+{
+    /* thin wrapper preserving the original signature, secure TLS defaults (verify peer+host
+     * against the system CA bundle) and default multipart tuning -- identical behavior to
+     * before this entry point existed. */
+    const tidesdb_objstore_s3_config_t config = {.endpoint = endpoint,
+                                                 .bucket = bucket,
+                                                 .prefix = prefix,
+                                                 .access_key = access_key,
+                                                 .secret_key = secret_key,
+                                                 .region = region,
+                                                 .use_ssl = use_ssl,
+                                                 .use_path_style = use_path_style,
+                                                 .tls_ca_path = NULL,
+                                                 .tls_insecure_skip_verify = 0,
+                                                 .multipart_threshold = 0,
+                                                 .multipart_part_size = 0};
+    return tidesdb_objstore_s3_create_config(&config);
 }
 
 #endif /* TIDESDB_WITH_S3 */

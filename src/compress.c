@@ -19,6 +19,21 @@
 
 #include "compress.h"
 
+/* the compression_algorithm enum values are an on-disk + ABI contract, they are written into
+ * sstable/vlog metadata, so they must never change, and the duplicate enum in db.h (the
+ * standalone FFI header, which cannot include this header) MUST hold identical values. pin them
+ * at compile time so any drift in compress.h fails the build; db.h carries the matching contract
+ * comment. guarded on C11 so older/non-conforming C front-ends still compile. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(TDB_COMPRESS_NONE == 0, "compression_algorithm wire drift: NONE must be 0");
+#ifndef __sun
+_Static_assert(TDB_COMPRESS_SNAPPY == 1, "compression_algorithm wire drift: SNAPPY must be 1");
+#endif
+_Static_assert(TDB_COMPRESS_LZ4 == 2, "compression_algorithm wire drift: LZ4 must be 2");
+_Static_assert(TDB_COMPRESS_ZSTD == 3, "compression_algorithm wire drift: ZSTD must be 3");
+_Static_assert(TDB_COMPRESS_LZ4_FAST == 4, "compression_algorithm wire drift: LZ4_FAST must be 4");
+#endif
+
 uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *compressed_size,
                        const compression_algorithm type)
 {
@@ -65,7 +80,7 @@ uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *comp
 
             encode_uint64_le_compat(compressed_data, data_size);
 
-            /* unified LZ4 path: acceleration=1 for default, acceleration=2 for fast */
+            /* unified LZ4 path-- acceleration=1 for default, acceleration=2 for fast */
             const int acceleration = (type == TDB_COMPRESS_LZ4_FAST) ? 2 : 1;
             const int lz4_result =
                 LZ4_compress_fast((const char *)data, (char *)(compressed_data + sizeof(uint64_t)),
@@ -152,6 +167,14 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
                                                data_size - sizeof(uint64_t),
                                                (char *)decompressed_data,
                                                decompressed_size) != SNAPPY_OK))
+            {
+                free(decompressed_data);
+                return NULL;
+            }
+            /* verify produced length matches the size prefix, mirroring the LZ4/ZSTD branches.
+             * snappy_uncompress can succeed with a shorter output that still fits the buffer,
+             * which would otherwise pass silently. */
+            if (TDB_UNLIKELY(*decompressed_size != (size_t)original_size))
             {
                 free(decompressed_data);
                 return NULL;

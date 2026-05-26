@@ -50,7 +50,7 @@
 #define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
 #define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
 
-/* number of iovecs we emit per block in pwritev: header, payload, footer */
+/* number of iovecs we emit per block in pwritev ( header, payload, footer ) */
 #define BLOCK_MANAGER_IOVECS_PER_BLOCK 3
 
 /* default file permissions (rw-r--r--) */
@@ -470,6 +470,17 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
  */
 int block_manager_validate_last_block(block_manager_t *bm,
                                       tidesdb_block_validation_mode_t validation);
+
+/**
+ * block_manager_set_max_safe_block_bytes
+ * sets a process-wide upper bound (bytes) on the size of a single block the
+ * reader will allocate. a block whose claimed size exceeds this budget is
+ * refused with a warning instead of allocating (graceful degradation, not OOM).
+ * pushed down from the tidesdb layer (derived from resolved_memory_limit) so the
+ * read path never makes a memory syscall. 0 disables the memory-based refusal.
+ * @param bytes the budget in bytes, or 0 to disable
+ */
+void block_manager_set_max_safe_block_bytes(uint64_t bytes);
 
 /**
  * convert_sync_mode

@@ -684,6 +684,17 @@ struct tidesdb_sstable_t
     void *cached_comparator_ctx;
     int is_reverse;
     uint64_t cache_key_prefix;
+    /* chunked footer aux blobs -- when a bloom filter or block index footer blob
+     * exceeds the single-block chunk size it is written as multiple consecutive
+     * blocks and located by explicit offset+size instead of trailing-block
+     * navigation. aux_chunked is set (and the offsets persisted in metadata) only
+     * for such sstables; legacy/small sstables leave it 0 and use the original
+     * trailing-block read path. */
+    int aux_chunked;
+    uint64_t bloom_blob_offset;
+    uint64_t bloom_blob_size;
+    uint64_t index_blob_offset;
+    uint64_t index_blob_size;
 };
 
 /**

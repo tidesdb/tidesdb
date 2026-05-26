@@ -27,9 +27,24 @@
 /* thread-local reusable pread buffer to avoid page faults on every block read. */
 #define BM_READ_BUF_INITIAL_SIZE (128 * 1024)
 
-/* DIAGNOSTIC -- a real block never approaches this. a larger size read from a
- * block header means the bytes at that offset are not a real header. */
-#define BM_DIAG_MAX_SANE_BLOCK_SIZE (256u * 1024u * 1024u)
+/* a block at or below this size is read without consulting the memory budget --
+ * covers every data block and the common small footer block, so the hot read
+ * path is just integer compares. blocks larger than this (e.g. a multi-hundred-
+ * MB bloom filter on a huge bottom-level sstable) are rare and only there do we
+ * test the budget. the test itself is a relaxed atomic load, never a syscall. */
+#define BM_LARGE_BLOCK_BUDGET_CHECK_THRESHOLD (256u * 1024u * 1024u)
+
+/* memory-safety budget for a single block read, in bytes, pushed down from the
+ * tidesdb layer (resolved_memory_limit-derived) via
+ * block_manager_set_max_safe_block_bytes and refreshed by the reaper. 0 means
+ * "no budget configured" -- the size-vs-EOF check still applies, but no
+ * memory-based refusal happens (e.g. block_manager unit tests with no db). */
+static _Atomic(uint64_t) bm_max_safe_block_bytes = 0;
+
+void block_manager_set_max_safe_block_bytes(uint64_t bytes)
+{
+    atomic_store_explicit(&bm_max_safe_block_bytes, bytes, memory_order_relaxed);
+}
 
 static pthread_key_t bm_tls_key;
 static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
@@ -1012,12 +1027,12 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     }
 
     const uint32_t block_size = decode_uint32_le_compat(size_buf);
-    if (block_size == 0) return -1; /* zero-filled hole: extent unknown, cannot advance */
+    if (block_size == 0) return -1; /* zero-filled hole extent unknown, cannot advance */
 
     /* read footer magic to distinguish partial write from genuine corruption.
      * footer layout:
      * [footer_size(BLOCK_MANAGER_CHECKSUM_LENGTH)][footer_magic(BLOCK_MANAGER_CHECKSUM_LENGTH)].
-     * footer_magic sits at: current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE */
+     * footer_magic sits at (current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE)*/
     const off_t footer_magic_offset = (off_t)cursor->current_pos + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
                                       (off_t)block_size + BLOCK_MANAGER_SIZE_FIELD_SIZE;
     unsigned char magic_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
@@ -1071,22 +1086,45 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     const uint32_t block_size = decode_uint32_le_compat(header_buf);
     if (BM_UNLIKELY(block_size == 0)) return NULL;
 
-    /* an absurd size means the bytes at this offset are not a real block
-     * header. we log the full context (the offset against the file extents and
-     * the raw header bytes) and fail the read gracefully instead of trying to
-     * allocate gigabytes of trash. */
-    if (BM_UNLIKELY(block_size > BM_DIAG_MAX_SANE_BLOCK_SIZE))
+    /* a block that claims to extend past the file's data extent is not a real
+     * block -- the bytes at this offset are garbage (off-boundary read, torn
+     * write, or corruption). reject gracefully rather than reading/allocating
+     * trash. this replaces a fixed size cap that wrongly rejected legitimately
+     * large footer blocks (e.g. a 600MB bloom filter) on huge sstables. */
+    const uint64_t file_size = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+    const uint64_t block_extent =
+        offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
+    if (BM_UNLIKELY(file_size > 0 && block_extent > file_size))
     {
         fprintf(stderr,
-                "BMDIAG absurd block_size=%u (0x%08x) at offset=%llu file='%s' fd=%d "
-                "file_size=%llu prealloc=%llu header=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                block_size, block_size, (unsigned long long)offset, bm->file_path, fd,
-                (unsigned long long)atomic_load(&bm->current_file_size),
-                (unsigned long long)atomic_load(&bm->preallocated_size), header_buf[0],
-                header_buf[1], header_buf[2], header_buf[3], header_buf[4], header_buf[5],
-                header_buf[6], header_buf[7]);
+                "BMDIAG block_size=%u (0x%08x) at offset=%llu extends past EOF (extent=%llu "
+                "file_size=%llu) file='%s' fd=%d header=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                block_size, block_size, (unsigned long long)offset,
+                (unsigned long long)block_extent, (unsigned long long)file_size, bm->file_path, fd,
+                header_buf[0], header_buf[1], header_buf[2], header_buf[3], header_buf[4],
+                header_buf[5], header_buf[6], header_buf[7]);
         fflush(stderr);
         return NULL;
+    }
+
+    /* memory safety -- only large blocks consult the budget (a relaxed atomic
+     * load, no syscall). a block bigger than the configured budget is skipped
+     * with a warning (caller sees NULL and degrades, e.g. bloom filter not
+     * loaded) rather than driving the process toward OOM. */
+    if (BM_UNLIKELY(block_size > BM_LARGE_BLOCK_BUDGET_CHECK_THRESHOLD))
+    {
+        const uint64_t budget =
+            atomic_load_explicit(&bm_max_safe_block_bytes, memory_order_relaxed);
+        if (budget > 0 && (uint64_t)block_size > budget)
+        {
+            fprintf(stderr,
+                    "BMDIAG block_size=%u (0x%08x) at offset=%llu exceeds memory-safety budget "
+                    "(%llu bytes) file='%s' fd=%d -- skipping read\n",
+                    block_size, block_size, (unsigned long long)offset, (unsigned long long)budget,
+                    bm->file_path, fd);
+            fflush(stderr);
+            return NULL;
+        }
     }
 
     const uint32_t stored_checksum =

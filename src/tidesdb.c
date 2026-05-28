@@ -32924,8 +32924,13 @@ int tidesdb_cancel_background_work(tidesdb_t *db)
     atomic_store_explicit(&db->cancel_compaction, 1, memory_order_release);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "tidesdb_cancel_background_work: cancelling compaction");
 
-    /* wait until the compaction queue is empty and no CF is mid-merge, bounded so a
-     * merge stuck outside a checkpoint cannot hang the caller forever */
+    /* wait until the compaction queue is empty, no CF is mid-merge, AND no CF has a
+     * pending count outstanding -- pending_count is incremented before queue_enqueue
+     * and decremented after the worker's skip/finish, so there are windows where
+     * queue=0 and is_compacting=0 but the work item is still in flight. tidesdb_is_compacting
+     * factors pending_count in, so a caller that reads it right after cancel returns must
+     * see all three drained. bounded so a merge stuck outside a checkpoint cannot hang
+     * the caller forever. */
     int waited_ms = 0;
     while (waited_ms < TDB_CANCEL_BG_MAX_WAIT_MS)
     {
@@ -32938,7 +32943,9 @@ int tidesdb_cancel_background_work(tidesdb_t *db)
             for (int i = 0; i < n; i++)
             {
                 tidesdb_column_family_t *cf = db->column_families[i];
-                if (cf && atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
+                if (cf &&
+                    (atomic_load_explicit(&cf->is_compacting, memory_order_acquire) ||
+                     atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) > 0))
                 {
                     busy = 1;
                     break;

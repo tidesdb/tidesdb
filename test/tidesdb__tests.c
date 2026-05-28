@@ -23427,7 +23427,10 @@ static void test_multi_cf_iterator_during_level_mutation(void)
         ASSERT_TRUE(cfs[i] != NULL);
     }
 
-    /* seed data */
+    /* seed data. see tdb_test_commit_with_retry -- the tiny write buffer makes every commit
+     * a flush, and on a slow CI box (qemu OmniOS/DragonFlyBSD) the 10s no-rotate-progress
+     * backpressure budget can fire and return retryable TDB_ERR_BUSY before the engine
+     * finishes catching up; the bounded retry rides through it without weakening the watchdog */
     for (int c = 0; c < NUM_CFS; c++)
     {
         for (int i = 0; i < 200; i++)
@@ -23439,7 +23442,7 @@ static void test_multi_cf_iterator_during_level_mutation(void)
             snprintf(val, sizeof(val), "seed_cf%d_%06d_pad%0*d", c, i, 60, 0);
             tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
                             strlen(val) + 1, 0);
-            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
             tidesdb_txn_free(txn);
         }
     }

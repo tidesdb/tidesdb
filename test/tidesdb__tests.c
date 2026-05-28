@@ -25100,7 +25100,11 @@ static void *unified_concurrent_writer(void *arg)
             tidesdb_txn_delete(txn, cf, (uint8_t *)del_key, strlen(del_key) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) == 0)
+        /* see tdb_test_commit_with_retry -- on a slow runner (qemu DragonFlyBSD/OmniOS) the
+         * unified ceiling-stall watchdog can fire and return retryable TDB_ERR_BUSY before
+         * the flush engine catches up, even though no real failure occurred; the bounded
+         * retry rides through it without weakening the watchdog */
+        if (tdb_test_commit_with_retry(txn, 20) == 0)
             atomic_fetch_add(d->commits_ok, 1);
         else
             atomic_fetch_add(d->commits_fail, 1);

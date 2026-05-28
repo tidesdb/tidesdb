@@ -16410,7 +16410,11 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
 
         uint8_t *value = NULL;
         size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        /* under the deliberately tiny fd budget here, a reader that needs to open an
+         * evicted sstable can hit the retryable TDB_ERR_BUSY; the reaper frees idle fds
+         * between attempts, so the bounded retry succeeds and the key is recovered */
+        int result =
+            tdb_test_get_with_retry(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
 
         if (result == TDB_SUCCESS && value != NULL)
         {
@@ -16851,7 +16855,9 @@ static void test_power_loss_during_sstable_metadata_write(void)
     snprintf(cf_dir, sizeof(cf_dir), "%s" PATH_SEPARATOR "powerloss_cf", TEST_DB_PATH);
 
     const char *klog_suffix = ".klog";
-    char klog_path[512];
+    /* cf_dir (300) + sep + d_name (up to NAME_MAX=255) + nul can exceed 512;
+     * MAX_FILE_PATH_LENGTH is the path-buffer size used elsewhere in the codebase. */
+    char klog_path[MAX_FILE_PATH_LENGTH];
     klog_path[0] = '\0';
     int found_klog = 0;
     DIR *cf_d = opendir(cf_dir);
@@ -20550,7 +20556,8 @@ static void test_concurrent_txn_commit_sequence_race(void)
         snprintf(key, sizeof(key), "shared_key_%06d", k);
         uint8_t *val = NULL;
         size_t val_size = 0;
-        if (tidesdb_txn_get(verify_txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+        if (tdb_test_get_with_retry(verify_txn, cf, (uint8_t *)key, strlen(key) + 1, &val,
+                                    &val_size) == 0)
         {
             found++;
             free(val);
@@ -20711,7 +20718,8 @@ static void *unified_reader_thread(void *arg)
 
             uint8_t *val = NULL;
             size_t val_size = 0;
-            if (tidesdb_txn_get(txn, d->cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+            if (tdb_test_get_with_retry(txn, d->cf, (uint8_t *)key, strlen(key) + 1, &val,
+                                        &val_size) == 0)
             {
                 atomic_fetch_add(d->reads_ok, 1);
                 free(val);
@@ -20901,7 +20909,8 @@ static void test_stress_unified_read_races(void)
         snprintf(key, sizeof(key), "shared_%06d", k);
         uint8_t *val = NULL;
         size_t val_size = 0;
-        if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+        if (tdb_test_get_with_retry(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) ==
+            0)
         {
             found_shared++;
             free(val);
@@ -20915,7 +20924,8 @@ static void test_stress_unified_read_races(void)
             snprintf(key, sizeof(key), "uniq_t%d_%06d", t, k);
             uint8_t *val = NULL;
             size_t val_size = 0;
-            if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+            if (tdb_test_get_with_retry(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val,
+                                        &val_size) == 0)
             {
                 found_unique++;
                 free(val);
@@ -22660,7 +22670,7 @@ static void test_concurrent_savepoint_rollback_under_load(void)
         size_t vs = 0;
 
         snprintf(key, sizeof(key), "sp_round_%04d_s1", round);
-        if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+        if (tdb_test_get_with_retry(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
         {
             found_s1++;
             free(val);
@@ -22668,7 +22678,7 @@ static void test_concurrent_savepoint_rollback_under_load(void)
 
         snprintf(key, sizeof(key), "sp_round_%04d_s3", round);
         val = NULL;
-        if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+        if (tdb_test_get_with_retry(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
         {
             found_s3++;
             free(val);
@@ -22676,7 +22686,7 @@ static void test_concurrent_savepoint_rollback_under_load(void)
 
         snprintf(key, sizeof(key), "sp_round_%04d_SHOULD_NOT_EXIST", round);
         val = NULL;
-        if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+        if (tdb_test_get_with_retry(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
         {
             found_bad++;
             free(val);
@@ -22818,7 +22828,7 @@ static void test_concurrent_iter_seek_directions_deep_sst(void)
         snprintf(key, sizeof(key), "ddir_key_%06d", i);
         uint8_t *val = NULL;
         size_t vs = 0;
-        if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+        if (tdb_test_get_with_retry(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
         {
             found++;
             free(val);
@@ -22983,7 +22993,7 @@ static void test_concurrent_multi_cf_deep_sst_mixed_ops(void)
         snprintf(pk, sizeof(pk), "\x01dpk_%06d", i);
         uint8_t *val = NULL;
         size_t vs = 0;
-        if (tidesdb_txn_get(vtxn, data_cf, (uint8_t *)pk, strlen(pk) + 1, &val, &vs) == 0)
+        if (tdb_test_get_with_retry(vtxn, data_cf, (uint8_t *)pk, strlen(pk) + 1, &val, &vs) == 0)
         {
             found++;
             free(val);
@@ -23096,7 +23106,8 @@ static void test_multi_cf_flush_queue_saturation(void)
                 snprintf(key, sizeof(key), "sat_t%d_%06d", tid, i);
                 uint8_t *val = NULL;
                 size_t vs = 0;
-                if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+                if (tdb_test_get_with_retry(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val,
+                                            &vs) == 0)
                 {
                     found++;
                     free(val);
@@ -23241,10 +23252,13 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
 
             uint8_t *va = NULL, *vb = NULL;
             size_t sa = 0, sb = 0;
-            int got_a =
-                tidesdb_txn_get(vtxn, cf_a, (uint8_t *)key_a, strlen(key_a) + 1, &va, &sa) == 0;
-            int got_b =
-                tidesdb_txn_get(vtxn, cf_b, (uint8_t *)key_b, strlen(key_b) + 1, &vb, &sb) == 0;
+            /* compaction running alongside this verify can hold the fd reserve, so a
+             * read of an unopened sstable returns the retryable TDB_ERR_BUSY -- treating
+             * that as a missing key would falsely flag committed cross-CF data as lost */
+            int got_a = tdb_test_get_with_retry(vtxn, cf_a, (uint8_t *)key_a, strlen(key_a) + 1,
+                                                &va, &sa) == 0;
+            int got_b = tdb_test_get_with_retry(vtxn, cf_b, (uint8_t *)key_b, strlen(key_b) + 1,
+                                                &vb, &sb) == 0;
             if (va) free(va);
             if (vb) free(vb);
 
@@ -23543,7 +23557,8 @@ static void test_multi_cf_cascading_memory_pressure(void)
             snprintf(key, sizeof(key), "sat_t%d_%06d", c, i);
             uint8_t *val = NULL;
             size_t vs = 0;
-            if (tidesdb_txn_get(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) == 0)
+            if (tdb_test_get_with_retry(vtxn, cfs[c], (uint8_t *)key, strlen(key) + 1, &val, &vs) ==
+                0)
             {
                 found++;
                 free(val);
@@ -23697,12 +23712,14 @@ static void test_multi_cf_create_drop_churn_under_load(void)
             snprintf(kb, sizeof(kb), "churn_b_t%d_%06d", t, i);
             uint8_t *va = NULL, *vb = NULL;
             size_t sa = 0, sb = 0;
-            if (tidesdb_txn_get(vtxn, stable_a, (uint8_t *)ka, strlen(ka) + 1, &va, &sa) == 0)
+            if (tdb_test_get_with_retry(vtxn, stable_a, (uint8_t *)ka, strlen(ka) + 1, &va, &sa) ==
+                0)
             {
                 found_a++;
                 free(va);
             }
-            if (tidesdb_txn_get(vtxn, stable_b, (uint8_t *)kb, strlen(kb) + 1, &vb, &sb) == 0)
+            if (tdb_test_get_with_retry(vtxn, stable_b, (uint8_t *)kb, strlen(kb) + 1, &vb, &sb) ==
+                0)
             {
                 found_b++;
                 free(vb);
@@ -23915,8 +23932,10 @@ static void test_multi_cf_mixed_isolation_cross_txn(void)
             snprintf(ky, sizeof(ky), "iso_y_t%d_%06d", t, i);
             uint8_t *vx = NULL, *vy = NULL;
             size_t sx = 0, sy = 0;
-            int gx = tidesdb_txn_get(vtxn, cf_x, (uint8_t *)kx, strlen(kx) + 1, &vx, &sx) == 0;
-            int gy = tidesdb_txn_get(vtxn, cf_y, (uint8_t *)ky, strlen(ky) + 1, &vy, &sy) == 0;
+            int gx =
+                tdb_test_get_with_retry(vtxn, cf_x, (uint8_t *)kx, strlen(kx) + 1, &vx, &sx) == 0;
+            int gy =
+                tdb_test_get_with_retry(vtxn, cf_y, (uint8_t *)ky, strlen(ky) + 1, &vy, &sy) == 0;
             if (vx) free(vx);
             if (vy) free(vy);
             if (gx) found_x++;
@@ -24192,6 +24211,86 @@ void test_purge_all(void)
 
     /* invalid args */
     ASSERT_NE(tidesdb_purge(NULL), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_cancel_background_work(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_NE(db, NULL);
+
+    /* tiny write buffer -> frequent flushes -> L1 fills -> compaction triggers,
+     * giving cancel something in-flight/queued to actually cancel */
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "cancel_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cancel_cf");
+    ASSERT_NE(cf, NULL);
+
+    const int N = 2000;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], val[160];
+        snprintf(key, sizeof(key), "ckey_%06d", i);
+        snprintf(val, sizeof(val), "cval_%06d_padding_to_push_past_the_write_buffer_threshold", i);
+        int rc = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                 strlen(val) + 1, -1);
+        if (rc == 0) rc = tidesdb_txn_commit(txn);
+        while (rc == TDB_ERR_BUSY) /* transient backpressure -- retry */
+        {
+            usleep(1000);
+            rc = tidesdb_txn_commit(txn);
+        }
+        ASSERT_EQ(rc, 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* cancel background compaction -- returns once compaction is idle */
+    ASSERT_EQ(tidesdb_cancel_background_work(db), 0);
+
+    /* compaction must be idle and the queue drained */
+    ASSERT_FALSE(tidesdb_is_compacting(cf));
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
+    ASSERT_EQ((int)stats.compaction_queue_size, 0);
+    printf("  after cancel: sstables=%d compactq=%zu\n", stats.total_sstable_count,
+           stats.compaction_queue_size);
+
+    /* no data loss -- cancel only discards uncommitted compaction output, inputs intact */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < N; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "ckey_%06d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    /* db stays usable after cancel (flushes/writes/reads still work) */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)"postkey", 8, (uint8_t *)"postval", 8, -1), 0);
+    int rc = tidesdb_txn_commit(txn);
+    while (rc == TDB_ERR_BUSY)
+    {
+        usleep(1000);
+        rc = tidesdb_txn_commit(txn);
+    }
+    ASSERT_EQ(rc, 0);
+    tidesdb_txn_free(txn);
+
+    /* invalid args */
+    ASSERT_NE(tidesdb_cancel_background_work(NULL), 0);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -29124,6 +29223,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_cache_invalidation_on_sstable_free, tests_passed);
     RUN_TEST(test_purge_cf_basic, tests_passed);
     RUN_TEST(test_purge_all, tests_passed);
+    RUN_TEST(test_cancel_background_work, tests_passed);
     RUN_TEST(test_sync_wal, tests_passed);
     RUN_TEST(test_perf_multi_cf_commit_throughput, tests_passed);
     RUN_TEST(test_perf_savepoint_throughput, tests_passed);

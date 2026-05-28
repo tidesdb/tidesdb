@@ -813,6 +813,11 @@ struct tidesdb_t
     int cf_capacity;
     _Atomic(int) is_open;
     _Atomic(int) is_recovering;
+    /* set by tidesdb_cancel_background_work -- when non-zero, in-flight compactions
+     * bail at their next checkpoint and queued compaction work items are skipped.
+     * compaction-only: flushes are unaffected so durability is preserved. sticky for
+     * the db session, reset to 0 on open. */
+    _Atomic(int) cancel_compaction;
     _Atomic(tidesdb_comparator_entry_t *) comparators;
     _Atomic(int) num_comparators;
     _Atomic(int) comparators_capacity;
@@ -1908,6 +1913,20 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf);
  * @return 0 on success, first non-zero error code on failure (continues processing remaining CFs)
  */
 int tidesdb_purge(tidesdb_t *db);
+
+/**
+ * tidesdb_cancel_background_work
+ * cancels background compaction db-wide: in-flight merges bail at their next
+ * checkpoint (uncommitted output is discarded, inputs left intact -- recovery-safe)
+ * and queued compaction work is skipped. flushes are unaffected so durability is
+ * preserved. blocks (bounded) until compaction is idle. the cancel is sticky for
+ * this database session and is reset on the next tidesdb_open, so it is intended to
+ * be called immediately before tidesdb_close for a fast shutdown when a large
+ * compaction backlog would otherwise make close wait minutes to seconds.
+ * @param db database handle
+ * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS if db is NULL
+ */
+int tidesdb_cancel_background_work(tidesdb_t *db);
 
 /**
  * tidesdb_range_cost

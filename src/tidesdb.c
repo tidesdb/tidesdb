@@ -339,6 +339,8 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_CLOSE_FLUSH_WAIT_SLEEP_US               10000
 #define TDB_CLOSE_TXN_WAIT_SLEEP_US                 1000
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US          10000
+#define TDB_CANCEL_BG_POLL_US                       5000  /* 5ms poll while draining cancel */
+#define TDB_CANCEL_BG_MAX_WAIT_MS                   30000 /* cap so a stuck merge can't hang */
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS      100
 #define TDB_CHECKPOINT_COMPACTION_WAIT_MAX_ATTEMPTS 200
 #define TDB_CHECKPOINT_COMPACTION_WAIT_SLEEP_US     50000
@@ -1660,16 +1662,22 @@ static int wait_for_open(tidesdb_t *db);
 
 /**
  * tidesdb_cf_abort_requested
- * compactions and flushes in flight call this at per-key (or per-partition) checkpoints
- * so drop_column_family does not wait for the merge or flush to complete. workers
- * release their local resources and return at the next iteration. acquire pairs with
- * the release store in tidesdb_drop_column_family_internal.
+ * in-flight COMPACTIONS call this at per-key (or per-partition) checkpoints so they
+ * bail without finishing the merge -- used by both drop_column_family (CF going away)
+ * and tidesdb_cancel_background_work (db-wide compaction cancel for a fast shutdown).
+ * either way the merge discards its uncommitted output and leaves inputs intact, so
+ * abort is safe. acquire pairs with the release stores in
+ * tidesdb_drop_column_family_internal and tidesdb_cancel_background_work.
+ * NOTE: flush checkpoints deliberately do NOT use this -- they check
+ * marked_for_deletion directly so a cancel never aborts an in-flight flush (flushes
+ * are the durability path and always complete).
  * @param cf column family
- * @return non-zero if the CF is marked for deletion
+ * @return non-zero if this CF's compaction should abort
  */
 static inline int tidesdb_cf_abort_requested(const tidesdb_column_family_t *cf)
 {
-    return atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire) != 0;
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire) != 0) return 1;
+    return (cf->db && atomic_load_explicit(&cf->db->cancel_compaction, memory_order_acquire) != 0);
 }
 
 /**
@@ -7570,7 +7578,9 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_colu
         /* flush progress heartbeat -- lets backpressure tell a slow flush from a wedged one */
         atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
 
-        if (tidesdb_cf_abort_requested(cf))
+        /* flushes only abort on a real CF drop, never on cancel_background_work --
+         * a flush is the durability path and must complete */
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
         {
             aborted = 1;
             break;
@@ -8141,7 +8151,9 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_column_fam
             /* flush progress heartbeat -- lets backpressure tell a slow flush from a wedged one */
             atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
 
-            if (tidesdb_cf_abort_requested(cf))
+            /* flushes only abort on a real CF drop, never on cancel_background_work --
+             * a flush is the durability path and must complete */
+            if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting flush write for SSTable %" PRIu64,
                               cf->name, sst->id);
@@ -18477,10 +18489,13 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             continue;
         }
 
-        /* we check if CF is marked for deletion -- if so, skip processing */
-        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+        /* skip queued compaction if the CF is being dropped OR background compaction
+         * has been cancelled (tidesdb_cancel_background_work) -- in both cases we do
+         * not want to start new merge work */
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire) ||
+            atomic_load_explicit(&db->cancel_compaction, memory_order_acquire))
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is marked for deletion, skipping compaction",
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' skipping queued compaction (drop/cancel)",
                           cf->name);
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
@@ -19842,6 +19857,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->num_column_families = 0;
 
     atomic_init(&(*db)->is_open, 0);
+    atomic_init(&(*db)->cancel_compaction, 0);
     atomic_init(&(*db)->is_recovering, 1);
 
     if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
@@ -32892,6 +32908,57 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf)
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' purge complete", cf->name);
+    return TDB_SUCCESS;
+}
+
+int tidesdb_cancel_background_work(tidesdb_t *db)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+
+    /* suppress compaction db-wide: in-flight merges bail at their next checkpoint
+     * (uncommitted output discarded, inputs intact -- safe), and queued compaction
+     * work items are skipped at dequeue. flushes are deliberately unaffected so
+     * durability is preserved. the flag is sticky for this db session and is reset
+     * on the next tidesdb_open; intended to be called right before tidesdb_close for
+     * a fast shutdown when a large compaction backlog would otherwise stall close. */
+    atomic_store_explicit(&db->cancel_compaction, 1, memory_order_release);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "tidesdb_cancel_background_work: cancelling compaction");
+
+    /* wait until the compaction queue is empty and no CF is mid-merge, bounded so a
+     * merge stuck outside a checkpoint cannot hang the caller forever */
+    int waited_ms = 0;
+    while (waited_ms < TDB_CANCEL_BG_MAX_WAIT_MS)
+    {
+        int busy = 0;
+        if (db->compaction_queue && queue_size(db->compaction_queue) > 0) busy = 1;
+        if (!busy)
+        {
+            pthread_rwlock_rdlock(&db->cf_list_lock);
+            const int n = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
+            for (int i = 0; i < n; i++)
+            {
+                tidesdb_column_family_t *cf = db->column_families[i];
+                if (cf && atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
+                {
+                    busy = 1;
+                    break;
+                }
+            }
+            pthread_rwlock_unlock(&db->cf_list_lock);
+        }
+        if (!busy) break;
+        usleep(TDB_CANCEL_BG_POLL_US);
+        waited_ms += TDB_CANCEL_BG_POLL_US / 1000;
+    }
+
+    if (waited_ms >= TDB_CANCEL_BG_MAX_WAIT_MS)
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "tidesdb_cancel_background_work: timed out after %d ms with compaction still "
+                      "in flight",
+                      waited_ms);
+    else
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "tidesdb_cancel_background_work: compaction quiesced after %d ms", waited_ms);
     return TDB_SUCCESS;
 }
 

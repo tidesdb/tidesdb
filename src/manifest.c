@@ -236,7 +236,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     if (skipped_lines > 0)
     {
         fprintf(stderr, "tidesdb manifest: skipped %d malformed entry line(s) while loading %s\n",
-                skipped_lines, manifest->path ? manifest->path : "(unknown)");
+                skipped_lines, manifest->path[0] ? manifest->path : "(unknown)");
     }
 
     /* we keep file open for future use */

@@ -215,12 +215,27 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_SSTABLE_METADATA_HEADER_SIZE    84
 #define TDB_SSTABLE_METADATA_CHECKSUM_SIZE  8
 #define TDB_SSTABLE_METADATA_TOMBSTONE_SIZE 8
-/* btree-only metadata appended after max_key when SSTABLE_FLAG_BTREE is set:
+/* btree-only metadata appended after max_key when SSTABLE_FLAG_BTREE is set
  * btree_root_offset(8) + btree_first_leaf(8) + btree_last_leaf(8) +
  * btree_node_count(8) + btree_height(4) */
 #define TDB_SSTABLE_METADATA_BTREE_SIZE 36
+/* chunked-aux descriptor appended after tombstone_count when SSTABLE_FLAG_CHUNKED_AUX
+ * is set, bloom_blob_offset(8) + bloom_blob_size(8) + index_blob_offset(8) +
+ * index_blob_size(8) */
+#define TDB_SSTABLE_METADATA_CHUNKED_AUX_SIZE 32
 #define TDB_SSTABLE_METADATA_FIXED_SIZE \
     (TDB_SSTABLE_METADATA_HEADER_SIZE + TDB_SSTABLE_METADATA_CHECKSUM_SIZE)
+/* the largest payload a single block can frame -- the block manager's on-disk
+ * size field is a uint32, so block_manager_block_create rejects anything larger.
+ * a bloom-filter or block-index footer blob at or below this is written as ONE
+ * block, no chunking, SSTABLE_FLAG_CHUNKED_AUX stays clear, and the footer is
+ * byte-identical to (and readable by) older binaries. every bloom that can exist
+ * (m <= UINT32_MAX, ~900MB serialized) and every block index is well under this,
+ * so chunking is dormant for all real data today -- it only splits a blob that
+ * genuinely cannot fit one block, reachable only if bloom m is ever widened past
+ * 32-bit. chunking at any smaller size would needlessly fragment real footers and
+ * flip those sstables to the forward-incompatible chunked format for no benefit. */
+#define TDB_AUX_BLOCK_CHUNK_MAX ((uint64_t)UINT32_MAX)
 /* sentinel for tidesdb_sstable_t.tombstone_count when the footer was written before
  * SSTABLE_FLAG_TOMBSTONE_COUNT existed. trigger and stats code skip such sstables. */
 #define TDB_TOMBSTONE_COUNT_UNKNOWN UINT64_MAX
@@ -324,6 +339,8 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_CLOSE_FLUSH_WAIT_SLEEP_US               10000
 #define TDB_CLOSE_TXN_WAIT_SLEEP_US                 1000
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US          10000
+#define TDB_CANCEL_BG_POLL_US                       5000  /* 5ms poll while draining cancel */
+#define TDB_CANCEL_BG_MAX_WAIT_MS                   30000 /* cap so a stuck merge can't hang */
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS      100
 #define TDB_CHECKPOINT_COMPACTION_WAIT_MAX_ATTEMPTS 200
 #define TDB_CHECKPOINT_COMPACTION_WAIT_SLEEP_US     50000
@@ -427,6 +444,12 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_MEMORY_MIN_LIMIT_RATIO         0.05 /* minimum limit = 5% of total memory */
 #define TDB_MEMORY_OS_CHECK_INTERVAL       50
 #define TDB_MEMORY_OS_CRITICAL_RATIO       0.05 /* OS critically low if < N% free */
+
+/* a single block read (e.g. a bloom-filter footer block) is refused if its
+ * payload would exceed this fraction of resolved_memory_limit -- one block must
+ * never claim half the database's whole memory budget. pushed into the block
+ * manager via block_manager_set_max_safe_block_bytes. */
+#define TDB_MEMORY_MAX_BLOCK_FRACTION_DENOM 2
 
 /* lock-free immutable snapshot configuration */
 #define TDB_IMM_SNAP_ACQUIRE_SPIN_LIMIT 4 /* spins before yielding in snapshot acquire */
@@ -1639,16 +1662,22 @@ static int wait_for_open(tidesdb_t *db);
 
 /**
  * tidesdb_cf_abort_requested
- * compactions and flushes in flight call this at per-key (or per-partition) checkpoints
- * so drop_column_family does not wait for the merge or flush to complete. workers
- * release their local resources and return at the next iteration. acquire pairs with
- * the release store in tidesdb_drop_column_family_internal.
+ * in-flight COMPACTIONS call this at per-key (or per-partition) checkpoints so they
+ * bail without finishing the merge -- used by both drop_column_family (CF going away)
+ * and tidesdb_cancel_background_work (db-wide compaction cancel for a fast shutdown).
+ * either way the merge discards its uncommitted output and leaves inputs intact, so
+ * abort is safe. acquire pairs with the release stores in
+ * tidesdb_drop_column_family_internal and tidesdb_cancel_background_work.
+ * NOTE: flush checkpoints deliberately do NOT use this -- they check
+ * marked_for_deletion directly so a cancel never aborts an in-flight flush (flushes
+ * are the durability path and always complete).
  * @param cf column family
- * @return non-zero if the CF is marked for deletion
+ * @return non-zero if this CF's compaction should abort
  */
 static inline int tidesdb_cf_abort_requested(const tidesdb_column_family_t *cf)
 {
-    return atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire) != 0;
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire) != 0) return 1;
+    return (cf->db && atomic_load_explicit(&cf->db->cancel_compaction, memory_order_acquire) != 0);
 }
 
 /**
@@ -2232,6 +2261,11 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, const size_t key_size, const 
     0x02 /* footer carries an 8-byte tombstone_count after the \
           * btree section (or after max_key when use_btree=0)  \
           * and before the trailing checksum */
+#define SSTABLE_FLAG_CHUNKED_AUX                                          \
+    0x04 /* footer carries a 32-byte chunked-aux descriptor (bloom blob   \
+          * offset+size, index blob offset+size) after tombstone_count.   \
+          * present when a bloom/index blob spans multiple blocks; absent \
+          * sstables locate bloom/index by trailing-block navigation */
 
 /**
  * sstable_metadata_serialize
@@ -2257,8 +2291,11 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 
     const size_t tombstone_meta_size = TDB_SSTABLE_METADATA_TOMBSTONE_SIZE;
 
+    const size_t chunked_aux_size = sst->aux_chunked ? TDB_SSTABLE_METADATA_CHUNKED_AUX_SIZE : 0;
+
     const size_t total_size = header_size + sst->min_key_size + sst->max_key_size +
-                              btree_meta_size + tombstone_meta_size + checksum_size;
+                              btree_meta_size + tombstone_meta_size + chunked_aux_size +
+                              checksum_size;
 
     uint8_t *data = malloc(total_size);
     if (!data) return -1;
@@ -2296,6 +2333,10 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     {
         flags |= SSTABLE_FLAG_BTREE;
     }
+    if (sst->aux_chunked)
+    {
+        flags |= SSTABLE_FLAG_CHUNKED_AUX;
+    }
     encode_uint32_le_compat(ptr, flags);
     ptr += 4;
 
@@ -2327,6 +2368,19 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 
     encode_uint64_le_compat(ptr, sst->tombstone_count);
     ptr += 8;
+
+    /* chunked-aux descriptor (only when SSTABLE_FLAG_CHUNKED_AUX is set) */
+    if (sst->aux_chunked)
+    {
+        encode_uint64_le_compat(ptr, sst->bloom_blob_offset);
+        ptr += 8;
+        encode_uint64_le_compat(ptr, sst->bloom_blob_size);
+        ptr += 8;
+        encode_uint64_le_compat(ptr, sst->index_blob_offset);
+        ptr += 8;
+        encode_uint64_le_compat(ptr, sst->index_blob_size);
+        ptr += 8;
+    }
 
     /* we compute and append checksum over everything except the checksum field itself */
     const size_t checksum_data_size = total_size - checksum_size;
@@ -2392,6 +2446,7 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
 
     const int use_btree = (flags & SSTABLE_FLAG_BTREE) ? 1 : 0;
     const int has_tombstone_count = (flags & SSTABLE_FLAG_TOMBSTONE_COUNT) ? 1 : 0;
+    const int has_chunked_aux = (flags & SSTABLE_FLAG_CHUNKED_AUX) ? 1 : 0;
 
     /* we calculate expected size based on which optional sections the flags promise */
     size_t btree_meta_size = 0;
@@ -2404,8 +2459,10 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     const size_t tombstone_meta_size =
         has_tombstone_count ? TDB_SSTABLE_METADATA_TOMBSTONE_SIZE : 0;
 
+    const size_t chunked_aux_size = has_chunked_aux ? TDB_SSTABLE_METADATA_CHUNKED_AUX_SIZE : 0;
+
     const size_t expected_size = TDB_SSTABLE_METADATA_FIXED_SIZE + min_key_size + max_key_size +
-                                 btree_meta_size + tombstone_meta_size;
+                                 btree_meta_size + tombstone_meta_size + chunked_aux_size;
     if (data_size != expected_size)
     {
         TDB_DEBUG_LOG(TDB_LOG_FATAL, "SSTable metadata size mismatch (expected: %zu, got: %zu)",
@@ -2506,6 +2563,23 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     else
     {
         sst->tombstone_count = TDB_TOMBSTONE_COUNT_UNKNOWN;
+    }
+
+    if (has_chunked_aux)
+    {
+        sst->aux_chunked = 1;
+        sst->bloom_blob_offset = decode_uint64_le_compat(ptr);
+        ptr += 8;
+        sst->bloom_blob_size = decode_uint64_le_compat(ptr);
+        ptr += 8;
+        sst->index_blob_offset = decode_uint64_le_compat(ptr);
+        ptr += 8;
+        sst->index_blob_size = decode_uint64_le_compat(ptr);
+        ptr += 8;
+    }
+    else
+    {
+        sst->aux_chunked = 0;
     }
 
     return 0;
@@ -7164,6 +7238,191 @@ static int tidesdb_flush_klog_block(const tidesdb_sstable_t *sst, block_manager_
 }
 
 /**
+ * tidesdb_sstable_write_aux_blob
+ * writes a footer aux blob (serialized bloom filter or block index) as one or
+ * more consecutive blocks, each at most TDB_AUX_BLOCK_CHUNK_MAX bytes, so no
+ * single block exceeds the block manager's framing/read limits regardless of
+ * total blob size. a blob at or below the chunk size is written as exactly one
+ * block (identical on-disk layout to the pre-chunking single-block writes).
+ * @param bm klog block manager
+ * @param data blob bytes (size > 0)
+ * @param size blob size in bytes
+ * @param out_offset receives the offset of the first chunk
+ * @return TDB_SUCCESS, or TDB_ERR_IO on a write failure
+ */
+static int tidesdb_sstable_write_aux_blob(block_manager_t *bm, const uint8_t *data, uint64_t size,
+                                          uint64_t *out_offset)
+{
+    if (!bm || !data || size == 0 || !out_offset) return TDB_ERR_INVALID_ARGS;
+
+    int64_t start = -1;
+    uint64_t written = 0;
+    while (written < size)
+    {
+        const uint64_t remaining = size - written;
+        const uint64_t chunk =
+            (remaining > TDB_AUX_BLOCK_CHUNK_MAX) ? TDB_AUX_BLOCK_CHUNK_MAX : remaining;
+        block_manager_block_t *blk = block_manager_block_create(chunk, data + written);
+        if (!blk) return TDB_ERR_IO;
+        const int64_t off = block_manager_block_write(bm, blk);
+        block_manager_block_release(blk);
+        if (off < 0) return TDB_ERR_IO;
+        if (start < 0) start = off;
+        written += chunk;
+    }
+
+    *out_offset = (uint64_t)start;
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_sstable_read_aux_blob
+ * reassembles a chunked footer aux blob into a single buffer by reading
+ * consecutive blocks starting at offset until total bytes are gathered. refuses
+ * (NULL + warning, not a crash) if total exceeds the database memory-safety
+ * budget so a corrupt or pathological size cannot drive the process into OOM.
+ * @param db database (for the memory budget)
+ * @param bm klog block manager
+ * @param offset offset of the first chunk
+ * @param total total logical blob size in bytes
+ * @return malloc'd buffer of `total` bytes (caller frees), or NULL
+ */
+static uint8_t *tidesdb_sstable_read_aux_blob(tidesdb_t *db, block_manager_t *bm, uint64_t offset,
+                                              uint64_t total)
+{
+    if (!bm || total == 0) return NULL;
+
+    const size_t budget =
+        db ? atomic_load_explicit(&db->resolved_memory_limit, memory_order_relaxed) : 0;
+    if (budget > 0 && total > (uint64_t)budget / TDB_MEMORY_MAX_BLOCK_FRACTION_DENOM)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "aux blob of %" PRIu64
+                      " bytes exceeds memory-safety budget (%zu) -- skipping",
+                      total, budget);
+        return NULL;
+    }
+    if (total > SIZE_MAX) return NULL; /* 32-bit host guard */
+
+    uint8_t *buf = malloc((size_t)total);
+    if (!buf) return NULL;
+
+    block_manager_cursor_t *cur = NULL;
+    if (block_manager_cursor_init(&cur, bm) != 0 || block_manager_cursor_goto(cur, offset) != 0)
+    {
+        if (cur) block_manager_cursor_free(cur);
+        free(buf);
+        return NULL;
+    }
+
+    uint64_t got = 0;
+    while (got < total)
+    {
+        block_manager_block_t *blk = block_manager_cursor_read(cur);
+        if (!blk || got + blk->size > total)
+        {
+            if (blk) block_manager_block_release(blk);
+            block_manager_cursor_free(cur);
+            free(buf);
+            return NULL;
+        }
+        memcpy(buf + got, blk->data, blk->size);
+        got += blk->size;
+        block_manager_block_release(blk);
+        if (got < total && block_manager_cursor_next(cur) != 0)
+        {
+            block_manager_cursor_free(cur);
+            free(buf);
+            return NULL;
+        }
+    }
+
+    block_manager_cursor_free(cur);
+    return buf;
+}
+
+/**
+ * tidesdb_sstable_write_footer_aux
+ * writes the block index (optional) and bloom filter footer blobs for sst,
+ * chunk-aware in that a blob larger than TDB_AUX_BLOCK_CHUNK_MAX is split across
+ * consecutive blocks and the chunked-aux descriptor (offset+size) is recorded on
+ * sst, so a bloom/index of any size (incl. >4GB) round-trips; a small blob is
+ * written as a single block (byte-identical to the legacy footer). ownership of
+ * block_indexes and bloom transfers to sst. callers write the metadata block
+ * afterward -- metadata serialize reads sst->aux_chunked and the offsets. shared
+ * by every flush and merge writer so they all get chunking uniformly.
+ * @param sst sstable being written
+ * @param klog_bm klog block manager
+ * @param block_indexes block index (NULL -> empty placeholder); used iff write_index
+ * @param bloom bloom filter (NULL -> empty placeholder)
+ * @param write_index 1 to emit an index block (block format), 0 for btree (bloom only)
+ */
+static void tidesdb_sstable_write_footer_aux(tidesdb_sstable_t *sst, block_manager_t *klog_bm,
+                                             tidesdb_block_index_t *block_indexes,
+                                             bloom_filter_t *bloom, int write_index)
+{
+    uint64_t index_off = 0;
+    uint64_t bloom_off = 0;
+    size_t index_size = 0;
+    size_t bloom_size = 0;
+    int index_chunked = 0;
+
+    /* index first, then bloom -- matches the legacy trailing-block order
+     * (index, bloom, metadata) used by the non-chunked read path */
+    if (write_index)
+    {
+        uint8_t index_placeholder[TDB_EMPTY_BLOCK_INDEX_SIZE];
+        uint8_t *index_data = NULL;
+        uint8_t *index_owned = NULL;
+        if (block_indexes)
+        {
+            sst->block_indexes = block_indexes;
+            index_data = compact_block_index_serialize(block_indexes, &index_size);
+            index_owned = index_data;
+        }
+        if (!index_data)
+        {
+            encode_uint32_le_compat(index_placeholder, 0);
+            index_placeholder[sizeof(uint32_t)] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN;
+            index_data = index_placeholder;
+            index_size = TDB_EMPTY_BLOCK_INDEX_SIZE;
+        }
+        tidesdb_sstable_write_aux_blob(klog_bm, index_data, index_size, &index_off);
+        index_chunked = (index_size > TDB_AUX_BLOCK_CHUNK_MAX);
+        free(index_owned);
+    }
+
+    uint8_t bloom_placeholder[1] = {0};
+    uint8_t *bloom_data = NULL;
+    uint8_t *bloom_owned = NULL;
+    if (bloom)
+    {
+        bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+        bloom_owned = bloom_data;
+        sst->bloom_filter = bloom;
+    }
+    if (!bloom_data)
+    {
+        bloom_data = bloom_placeholder;
+        bloom_size = 1;
+    }
+    tidesdb_sstable_write_aux_blob(klog_bm, bloom_data, bloom_size, &bloom_off);
+    free(bloom_owned);
+
+    if (index_chunked || bloom_size > TDB_AUX_BLOCK_CHUNK_MAX)
+    {
+        sst->aux_chunked = 1;
+        sst->index_blob_offset = write_index ? index_off : 0;
+        sst->index_blob_size = write_index ? index_size : 0;
+        sst->bloom_blob_offset = bloom_off;
+        sst->bloom_blob_size = bloom_size;
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "SSTable %" PRIu64 " footer aux chunked (index %zu B, bloom %zu B)", sst->id,
+                      write_index ? index_size : (size_t)0, bloom_size);
+    }
+}
+
+/**
  * tidesdb_sstable_write_footer
  * write index, bloom filter, and metadata blocks to klog
  * @param sst sstable (block_indexes and bloom_filter assigned here)
@@ -7183,72 +7442,15 @@ static int tidesdb_sstable_write_footer(tidesdb_sstable_t *sst, block_manager_t 
     /* we write index block */
     if (block_indexes)
     {
-        sst->block_indexes = block_indexes;
-
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "SSTable " TDB_U64_FMT " block indexes built - %" PRIu32
                       " samples, " TDB_U64_FMT " total blocks",
-                      TDB_U64_CAST(sst->id), sst->block_indexes->count,
+                      TDB_U64_CAST(sst->id), block_indexes->count,
                       TDB_U64_CAST(sst->num_klog_blocks));
-
-        size_t index_size;
-        uint8_t *index_data = compact_block_index_serialize(sst->block_indexes, &index_size);
-        if (index_data)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable %" PRIu64 " block indexes serialized to %zu bytes",
-                          sst->id, index_size);
-            block_manager_block_t *index_block = block_manager_block_create(index_size, index_data);
-            if (index_block)
-            {
-                block_manager_block_write(klog_bm, index_block);
-                block_manager_block_release(index_block);
-            }
-            free(index_data);
-        }
-    }
-    else
-    {
-        /* we write empty index block as placeholder */
-        uint8_t empty_index_data[TDB_EMPTY_BLOCK_INDEX_SIZE];
-        encode_uint32_le_compat(empty_index_data, 0);
-        empty_index_data[sizeof(uint32_t)] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN;
-        block_manager_block_t *empty_index =
-            block_manager_block_create(TDB_EMPTY_BLOCK_INDEX_SIZE, empty_index_data);
-        if (empty_index)
-        {
-            block_manager_block_write(klog_bm, empty_index);
-            block_manager_block_release(empty_index);
-        }
     }
 
-    /* we write bloom filter block */
-    if (bloom)
-    {
-        size_t bloom_size;
-        uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-        if (bloom_data)
-        {
-            block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
-            if (bloom_block)
-            {
-                block_manager_block_write(klog_bm, bloom_block);
-                block_manager_block_release(bloom_block);
-            }
-            free(bloom_data);
-        }
-        sst->bloom_filter = bloom;
-    }
-    else
-    {
-        /* we write empty bloom block as placeholder */
-        const uint8_t empty_bloom_data[1] = {0};
-        block_manager_block_t *empty_bloom = block_manager_block_create(1, empty_bloom_data);
-        if (empty_bloom)
-        {
-            block_manager_block_write(klog_bm, empty_bloom);
-            block_manager_block_release(empty_bloom);
-        }
-    }
+    /* write the index + bloom footer blobs (chunk-aware, shared with the merge writers) */
+    tidesdb_sstable_write_footer_aux(sst, klog_bm, block_indexes, bloom, 1);
 
     /* we write metadata block */
     uint64_t klog_size_before_metadata;
@@ -7376,7 +7578,9 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_colu
         /* flush progress heartbeat -- lets backpressure tell a slow flush from a wedged one */
         atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
 
-        if (tidesdb_cf_abort_requested(cf))
+        /* flushes only abort on a real CF drop, never on cancel_background_work --
+         * a flush is the durability path and must complete */
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
         {
             aborted = 1;
             break;
@@ -7525,33 +7729,8 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_colu
     btree_free(tree);
     btree_builder_free(builder);
 
-    /* we write bloom filter block */
-    if (bloom)
-    {
-        size_t bloom_size = 0;
-        uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-        if (bloom_data)
-        {
-            block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
-            if (bloom_block)
-            {
-                block_manager_block_write(klog_bm, bloom_block);
-                block_manager_block_release(bloom_block);
-            }
-            free(bloom_data);
-        }
-        sst->bloom_filter = bloom;
-    }
-    else
-    {
-        const uint8_t empty_bloom_data[1] = {0};
-        block_manager_block_t *empty_bloom = block_manager_block_create(1, empty_bloom_data);
-        if (empty_bloom)
-        {
-            block_manager_block_write(klog_bm, empty_bloom);
-            block_manager_block_release(empty_bloom);
-        }
-    }
+    /* write the bloom footer blob (chunk-aware, no index block in btree format) */
+    tidesdb_sstable_write_footer_aux(sst, klog_bm, NULL, bloom, 0);
 
     uint64_t klog_size_before_metadata;
     uint64_t vlog_size_before_metadata;
@@ -7820,22 +7999,8 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
     block_manager_get_size(klog_bm, &sst->klog_size);
     block_manager_get_size(vlog_bm, &sst->vlog_size);
 
-    if (bloom)
-    {
-        size_t bloom_size;
-        uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-        if (bloom_data)
-        {
-            block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
-            if (bloom_block)
-            {
-                block_manager_block_write(klog_bm, bloom_block);
-                block_manager_block_release(bloom_block);
-            }
-            free(bloom_data);
-        }
-        sst->bloom_filter = bloom;
-    }
+    /* write the bloom footer blob (chunk-aware, no index block in btree format) */
+    tidesdb_sstable_write_footer_aux(sst, klog_bm, NULL, bloom, 0);
 
     uint8_t *metadata = NULL;
     size_t metadata_size = 0;
@@ -7986,7 +8151,9 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_column_fam
             /* flush progress heartbeat -- lets backpressure tell a slow flush from a wedged one */
             atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);
 
-            if (tidesdb_cf_abort_requested(cf))
+            /* flushes only abort on a real CF drop, never on cancel_background_work --
+             * a flush is the durability path and must complete */
+            if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' aborting flush write for SSTable %" PRIu64,
                               cf->name, sst->id);
@@ -9047,61 +9214,109 @@ load_bloom_and_index:; /* empty statement for C89/C90 compatibility */
     /* load bloom filter and index from last blocks */
     /* [klog blocks...] [index block] [bloom filter block] [metadata block] */
 
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, klog_bm) != 0)
+    if (sst->aux_chunked)
     {
-        block_manager_close(klog_bm);
-        block_manager_close(vlog_bm);
-        return TDB_ERR_IO;
-    }
-
-    /* we go to last block (metadata) and skip it */
-    if (block_manager_cursor_goto_last(cursor) == 0)
-    {
-        /* we skip metadata block, go to bloom filter */
-        if (block_manager_cursor_prev(cursor) == 0)
+        /* chunked footer -- bloom and index are located by explicit offset+size
+         * and may span multiple blocks. reassemble each via read_aux_blob, which
+         * refuses (NULL) an oversized blob rather than risking OOM. an unreadable
+         * blob degrades gracefully (no bloom -> full block scan; no index ->
+         * sequential scan). */
+        if (sst->config && sst->config->enable_bloom_filter && sst->bloom_blob_size > 0)
         {
-            block_manager_block_t *bloom_block = block_manager_cursor_read(cursor);
-            if (bloom_block)
+            uint8_t *bloom_buf = tidesdb_sstable_read_aux_blob(db, klog_bm, sst->bloom_blob_offset,
+                                                               sst->bloom_blob_size);
+            if (bloom_buf)
             {
-                if (bloom_block->size > 0 && sst->config && sst->config->enable_bloom_filter)
-                {
-                    sst->bloom_filter = bloom_filter_deserialize(bloom_block->data);
-                }
-                else
-                {
-                    sst->bloom_filter = NULL;
-                }
-                block_manager_block_release(bloom_block);
+                sst->bloom_filter = bloom_filter_deserialize(bloom_buf);
+                free(bloom_buf);
             }
-
-            /* go to index block -- skip for btree mode which uses its own
-             * B+tree traversal and does not need block indexes */
-            if (block_manager_cursor_prev(cursor) == 0)
+            else
             {
-                block_manager_block_t *index_block = block_manager_cursor_read(cursor);
-                if (index_block)
-                {
-                    if (index_block->size > 0 && !sst->config->use_btree)
-                    {
-                        sst->block_indexes =
-                            compact_block_index_deserialize(index_block->data, index_block->size);
+                sst->bloom_filter = NULL;
+            }
+        }
+        else
+        {
+            sst->bloom_filter = NULL;
+        }
 
-                        /* we use cached comparator from config (already resolved during CF
-                         * creation) this avoids hash table lookup for every sst during recovery */
-                        if (sst->block_indexes)
-                        {
-                            sst->block_indexes->comparator = sst->config->comparator_fn_cached;
-                            sst->block_indexes->comparator_ctx = sst->config->comparator_ctx_cached;
-                        }
-                    }
-                    block_manager_block_release(index_block);
+        if (sst->config && !sst->config->use_btree && sst->index_blob_size > 0)
+        {
+            uint8_t *index_buf = tidesdb_sstable_read_aux_blob(db, klog_bm, sst->index_blob_offset,
+                                                               sst->index_blob_size);
+            if (index_buf)
+            {
+                sst->block_indexes =
+                    compact_block_index_deserialize(index_buf, sst->index_blob_size);
+                if (sst->block_indexes)
+                {
+                    sst->block_indexes->comparator = sst->config->comparator_fn_cached;
+                    sst->block_indexes->comparator_ctx = sst->config->comparator_ctx_cached;
                 }
+                free(index_buf);
             }
         }
     }
+    else
+    {
+        block_manager_cursor_t *cursor;
+        if (block_manager_cursor_init(&cursor, klog_bm) != 0)
+        {
+            block_manager_close(klog_bm);
+            block_manager_close(vlog_bm);
+            return TDB_ERR_IO;
+        }
 
-    block_manager_cursor_free(cursor);
+        /* we go to last block (metadata) and skip it */
+        if (block_manager_cursor_goto_last(cursor) == 0)
+        {
+            /* we skip metadata block, go to bloom filter */
+            if (block_manager_cursor_prev(cursor) == 0)
+            {
+                block_manager_block_t *bloom_block = block_manager_cursor_read(cursor);
+                if (bloom_block)
+                {
+                    if (bloom_block->size > 0 && sst->config && sst->config->enable_bloom_filter)
+                    {
+                        sst->bloom_filter = bloom_filter_deserialize(bloom_block->data);
+                    }
+                    else
+                    {
+                        sst->bloom_filter = NULL;
+                    }
+                    block_manager_block_release(bloom_block);
+                }
+
+                /* go to index block -- skip for btree mode which uses its own
+                 * B+tree traversal and does not need block indexes */
+                if (block_manager_cursor_prev(cursor) == 0)
+                {
+                    block_manager_block_t *index_block = block_manager_cursor_read(cursor);
+                    if (index_block)
+                    {
+                        if (index_block->size > 0 && !sst->config->use_btree)
+                        {
+                            sst->block_indexes = compact_block_index_deserialize(index_block->data,
+                                                                                 index_block->size);
+
+                            /* we use cached comparator from config (already resolved during CF
+                             * creation) this avoids hash table lookup for every sst during
+                             * recovery */
+                            if (sst->block_indexes)
+                            {
+                                sst->block_indexes->comparator = sst->config->comparator_fn_cached;
+                                sst->block_indexes->comparator_ctx =
+                                    sst->config->comparator_ctx_cached;
+                            }
+                        }
+                        block_manager_block_release(index_block);
+                    }
+                }
+            }
+        }
+
+        block_manager_cursor_free(cursor);
+    }
 
     /* we keep block managers open and store them in the sstable
      * they will be managed by the cache and closed when the sstable is evicted or freed */
@@ -13938,75 +14153,10 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
          * structure) */
         if (new_sst->num_entries > 0)
         {
-            /* write index block */
-            if (block_indexes)
-            {
-                /* we assign the built index to the sstable */
-                new_sst->block_indexes = block_indexes;
-                block_indexes =
-                    NULL; /* ownership transferred; local must not double-free on abort */
-
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "Block index built with %u samples",
-                              new_sst->block_indexes->count);
-                size_t index_size;
-                uint8_t *index_data =
-                    compact_block_index_serialize(new_sst->block_indexes, &index_size);
-                if (index_data)
-                {
-                    block_manager_block_t *index_block =
-                        block_manager_block_create(index_size, index_data);
-                    if (index_block)
-                    {
-                        block_manager_block_write(klog_bm, index_block);
-                        block_manager_block_release(index_block);
-                    }
-                    free(index_data);
-                }
-            }
-            else
-            {
-                /* we write empty index block as placeholder */
-                block_manager_block_t *empty_index = block_manager_block_create(0, NULL);
-                if (empty_index)
-                {
-                    block_manager_block_write(klog_bm, empty_index);
-                    block_manager_block_release(empty_index);
-                }
-            }
-
-            if (bloom)
-            {
-                size_t bloom_size;
-                uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-                if (bloom_data)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_INFO, "Bloom filter serialized to %zu bytes", bloom_size);
-                    block_manager_block_t *bloom_block =
-                        block_manager_block_create(bloom_size, bloom_data);
-                    if (bloom_block)
-                    {
-                        block_manager_block_write(klog_bm, bloom_block);
-                        block_manager_block_release(bloom_block);
-                    }
-                    free(bloom_data);
-                }
-                else
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Bloom filter serialization failed");
-                }
-                new_sst->bloom_filter = bloom;
-                bloom = NULL; /* ownership transferred; local must not double-free on abort */
-            }
-            else
-            {
-                /* we write empty bloom block as placeholder */
-                block_manager_block_t *empty_bloom = block_manager_block_create(0, NULL);
-                if (empty_bloom)
-                {
-                    block_manager_block_write(klog_bm, empty_bloom);
-                    block_manager_block_release(empty_bloom);
-                }
-            }
+            /* write index + bloom footer blobs (chunk-aware, shared helper) */
+            tidesdb_sstable_write_footer_aux(new_sst, klog_bm, block_indexes, bloom, 1);
+            block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
+            bloom = NULL;         /* ownership transferred; local must not double-free on abort */
         }
 
         /* we get file sizes before metadata write for serialization */
@@ -14610,62 +14760,10 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
 
     if (new_sst->num_entries > 0)
     {
-        if (block_indexes)
-        {
-            new_sst->block_indexes = block_indexes;
-            block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
-            size_t index_size;
-            uint8_t *index_data =
-                compact_block_index_serialize(new_sst->block_indexes, &index_size);
-            if (index_data)
-            {
-                block_manager_block_t *index_block =
-                    block_manager_block_create(index_size, index_data);
-                if (index_block)
-                {
-                    block_manager_block_write(klog_bm, index_block);
-                    block_manager_block_release(index_block);
-                }
-                free(index_data);
-            }
-        }
-        else
-        {
-            block_manager_block_t *empty_index = block_manager_block_create(0, NULL);
-            if (empty_index)
-            {
-                block_manager_block_write(klog_bm, empty_index);
-                block_manager_block_release(empty_index);
-            }
-        }
-
-        if (bloom)
-        {
-            size_t bloom_size;
-            uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-            if (bloom_data)
-            {
-                block_manager_block_t *bloom_block =
-                    block_manager_block_create(bloom_size, bloom_data);
-                if (bloom_block)
-                {
-                    block_manager_block_write(klog_bm, bloom_block);
-                    block_manager_block_release(bloom_block);
-                }
-                free(bloom_data);
-            }
-            new_sst->bloom_filter = bloom;
-            bloom = NULL; /* ownership transferred; local must not double-free on abort */
-        }
-        else
-        {
-            block_manager_block_t *empty_bloom = block_manager_block_create(0, NULL);
-            if (empty_bloom)
-            {
-                block_manager_block_write(klog_bm, empty_bloom);
-                block_manager_block_release(empty_bloom);
-            }
-        }
+        /* write index + bloom footer blobs (chunk-aware, shared helper) */
+        tidesdb_sstable_write_footer_aux(new_sst, klog_bm, block_indexes, bloom, 1);
+        block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
+        bloom = NULL;         /* ownership transferred; local must not double-free on abort */
     }
 
     uint64_t klog_size_before_metadata;
@@ -15604,74 +15702,10 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
          * structure) */
         if (entry_count > 0)
         {
-            if (block_indexes)
-            {
-                new_sst->block_indexes = block_indexes;
-                block_indexes =
-                    NULL; /* ownership transferred; local must not double-free on abort */
-
-                size_t index_size;
-                uint8_t *index_data =
-                    compact_block_index_serialize(new_sst->block_indexes, &index_size);
-                if (index_data)
-                {
-                    block_manager_block_t *index_block =
-                        block_manager_block_create(index_size, index_data);
-                    if (index_block)
-                    {
-                        block_manager_block_write(klog_bm, index_block);
-                        block_manager_block_release(index_block);
-                    }
-                    free(index_data);
-                }
-            }
-            else
-            {
-                /* we write empty index block as placeholder (count=0 + prefix_len) */
-                uint8_t empty_index_data[TDB_EMPTY_BLOCK_INDEX_SIZE];
-                encode_uint32_le_compat(empty_index_data, 0); /* count = 0 */
-                empty_index_data[sizeof(uint32_t)] =
-                    TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN; /* prefix_len */
-                block_manager_block_t *empty_index =
-                    block_manager_block_create(TDB_EMPTY_BLOCK_INDEX_SIZE, empty_index_data);
-                if (empty_index)
-                {
-                    block_manager_block_write(klog_bm, empty_index);
-                    block_manager_block_release(empty_index);
-                }
-            }
-
-            if (bloom)
-            {
-                new_sst->bloom_filter = bloom;
-
-                size_t bloom_size;
-                uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-                if (bloom_data)
-                {
-                    block_manager_block_t *bloom_block =
-                        block_manager_block_create(bloom_size, bloom_data);
-                    if (bloom_block)
-                    {
-                        block_manager_block_write(klog_bm, bloom_block);
-                        block_manager_block_release(bloom_block);
-                    }
-                    free(bloom_data);
-                }
-                bloom = NULL; /* ownership transferred; local must not double-free on abort */
-            }
-            else
-            {
-                /* we write empty bloom block as placeholder (1 byte -- size=0) */
-                uint8_t empty_bloom_data[1] = {0};
-                block_manager_block_t *empty_bloom =
-                    block_manager_block_create(1, empty_bloom_data);
-                if (empty_bloom)
-                {
-                    block_manager_block_write(klog_bm, empty_bloom);
-                    block_manager_block_release(empty_bloom);
-                }
-            }
+            /* write index + bloom footer blobs (chunk-aware, shared helper) */
+            tidesdb_sstable_write_footer_aux(new_sst, klog_bm, block_indexes, bloom, 1);
+            block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
+            bloom = NULL;         /* ownership transferred; local must not double-free on abort */
         }
 
         /* we get file sizes before metadata write for serialization */
@@ -15843,63 +15877,9 @@ static int tdb_partitioned_merge_finalize_sst(
 
     if (entry_count > 0)
     {
-        if (block_indexes)
-        {
-            sst->block_indexes = block_indexes;
-            size_t index_size;
-            uint8_t *index_data = compact_block_index_serialize(sst->block_indexes, &index_size);
-            if (index_data)
-            {
-                block_manager_block_t *index_block =
-                    block_manager_block_create(index_size, index_data);
-                if (index_block)
-                {
-                    block_manager_block_write(klog_bm, index_block);
-                    block_manager_block_release(index_block);
-                }
-                free(index_data);
-            }
-        }
-        else
-        {
-            uint8_t empty_index_data[TDB_EMPTY_BLOCK_INDEX_SIZE];
-            encode_uint32_le_compat(empty_index_data, 0);
-            empty_index_data[sizeof(uint32_t)] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN;
-            block_manager_block_t *empty_index =
-                block_manager_block_create(TDB_EMPTY_BLOCK_INDEX_SIZE, empty_index_data);
-            if (empty_index)
-            {
-                block_manager_block_write(klog_bm, empty_index);
-                block_manager_block_release(empty_index);
-            }
-        }
-        if (bloom)
-        {
-            sst->bloom_filter = bloom;
-            size_t bloom_size;
-            uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-            if (bloom_data)
-            {
-                block_manager_block_t *bloom_block =
-                    block_manager_block_create(bloom_size, bloom_data);
-                if (bloom_block)
-                {
-                    block_manager_block_write(klog_bm, bloom_block);
-                    block_manager_block_release(bloom_block);
-                }
-                free(bloom_data);
-            }
-        }
-        else
-        {
-            const uint8_t empty_bloom_data[1] = {0};
-            block_manager_block_t *empty_bloom = block_manager_block_create(1, empty_bloom_data);
-            if (empty_bloom)
-            {
-                block_manager_block_write(klog_bm, empty_bloom);
-                block_manager_block_release(empty_bloom);
-            }
-        }
+        /* write index + bloom footer blobs (chunk-aware, shared helper). ownership
+         * of block_indexes/bloom transfers to sst inside the helper. */
+        tidesdb_sstable_write_footer_aux(sst, klog_bm, block_indexes, bloom, 1);
     }
 
     uint64_t klog_size_before_metadata;
@@ -18509,10 +18489,13 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             continue;
         }
 
-        /* we check if CF is marked for deletion -- if so, skip processing */
-        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+        /* skip queued compaction if the CF is being dropped OR background compaction
+         * has been cancelled (tidesdb_cancel_background_work) -- in both cases we do
+         * not want to start new merge work */
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire) ||
+            atomic_load_explicit(&db->cancel_compaction, memory_order_acquire))
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is marked for deletion, skipping compaction",
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' skipping queued compaction (drop/cancel)",
                           cf->name);
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
@@ -19874,6 +19857,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->num_column_families = 0;
 
     atomic_init(&(*db)->is_open, 0);
+    atomic_init(&(*db)->cancel_compaction, 0);
     atomic_init(&(*db)->is_recovering, 1);
 
     if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
@@ -20045,6 +20029,11 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Resolved memory limit: %zu bytes (%.2f MB)",
                       (*db)->resolved_memory_limit,
                       (double)(*db)->resolved_memory_limit / (1024.0 * 1024.0));
+
+        /* push the single-block memory-safety budget down to the block manager so
+         * the read path can refuse an oversized block via a pure atomic load */
+        block_manager_set_max_safe_block_bytes((*db)->resolved_memory_limit /
+                                               TDB_MEMORY_MAX_BLOCK_FRACTION_DENOM);
 
         atomic_init(&(*db)->cached_memtable_bytes, 0);
         atomic_init(&(*db)->txn_memory_bytes, 0);
@@ -32919,6 +32908,64 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf)
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' purge complete", cf->name);
+    return TDB_SUCCESS;
+}
+
+int tidesdb_cancel_background_work(tidesdb_t *db)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+
+    /* suppress compaction db-wide: in-flight merges bail at their next checkpoint
+     * (uncommitted output discarded, inputs intact -- safe), and queued compaction
+     * work items are skipped at dequeue. flushes are deliberately unaffected so
+     * durability is preserved. the flag is sticky for this db session and is reset
+     * on the next tidesdb_open; intended to be called right before tidesdb_close for
+     * a fast shutdown when a large compaction backlog would otherwise stall close. */
+    atomic_store_explicit(&db->cancel_compaction, 1, memory_order_release);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "tidesdb_cancel_background_work: cancelling compaction");
+
+    /* wait until the compaction queue is empty, no CF is mid-merge, AND no CF has a
+     * pending count outstanding -- pending_count is incremented before queue_enqueue
+     * and decremented after the worker's skip/finish, so there are windows where
+     * queue=0 and is_compacting=0 but the work item is still in flight. tidesdb_is_compacting
+     * factors pending_count in, so a caller that reads it right after cancel returns must
+     * see all three drained. bounded so a merge stuck outside a checkpoint cannot hang
+     * the caller forever. */
+    int waited_ms = 0;
+    while (waited_ms < TDB_CANCEL_BG_MAX_WAIT_MS)
+    {
+        int busy = 0;
+        if (db->compaction_queue && queue_size(db->compaction_queue) > 0) busy = 1;
+        if (!busy)
+        {
+            pthread_rwlock_rdlock(&db->cf_list_lock);
+            const int n = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
+            for (int i = 0; i < n; i++)
+            {
+                tidesdb_column_family_t *cf = db->column_families[i];
+                if (cf &&
+                    (atomic_load_explicit(&cf->is_compacting, memory_order_acquire) ||
+                     atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) > 0))
+                {
+                    busy = 1;
+                    break;
+                }
+            }
+            pthread_rwlock_unlock(&db->cf_list_lock);
+        }
+        if (!busy) break;
+        usleep(TDB_CANCEL_BG_POLL_US);
+        waited_ms += TDB_CANCEL_BG_POLL_US / 1000;
+    }
+
+    if (waited_ms >= TDB_CANCEL_BG_MAX_WAIT_MS)
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "tidesdb_cancel_background_work: timed out after %d ms with compaction still "
+                      "in flight",
+                      waited_ms);
+    else
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "tidesdb_cancel_background_work: compaction quiesced after %d ms", waited_ms);
     return TDB_SUCCESS;
 }
 

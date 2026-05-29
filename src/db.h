@@ -703,6 +703,17 @@ int tidesdb_purge_cf(tidesdb_column_family_t *cf);
  */
 int tidesdb_purge(tidesdb_t *db);
 
+/**
+ * tidesdb_cancel_background_work
+ * cancels background compaction db-wide (in-flight merges bail safely, queued
+ * compaction is skipped); flushes are unaffected so durability is preserved. blocks
+ * (bounded) until compaction is idle. sticky for the session, reset on next open --
+ * intended to be called right before tidesdb_close for a fast shutdown.
+ * @param db database handle
+ * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS if db is NULL
+ */
+int tidesdb_cancel_background_work(tidesdb_t *db);
+
 /**** configuration operations */
 int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_name,
                                     tidesdb_column_family_config_t *config);

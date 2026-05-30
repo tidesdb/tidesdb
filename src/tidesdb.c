@@ -5713,9 +5713,15 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
         total_replayed += n;
     }
 
-    if (max_seq > atomic_load_explicit(&db->global_seq, memory_order_acquire))
+    /* max_seq is the highest seq applied; global_seq is the next seq to assign, so it
+     * must reach max_seq + 1. comparing max_seq directly leaves a replica that is one
+     * step behind stuck: global_seq never advances, the read snapshot (global_seq - 1)
+     * stays below the newest entry, and just-replayed rows stay invisible while the
+     * replay re-applies the same tail every tick. */
+    const uint64_t next_seq = max_seq + 1;
+    if (next_seq > atomic_load_explicit(&db->global_seq, memory_order_acquire))
     {
-        atomic_store_explicit(&db->global_seq, max_seq + 1, memory_order_release);
+        atomic_store_explicit(&db->global_seq, next_seq, memory_order_release);
     }
 
     if (total_replayed > 0)
@@ -9768,11 +9774,18 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 {
     /* we upload sstable files synchronously before tracking in the local cache.
      * this ensures the object store has a copy before cache eviction can delete
-     * the local file (the eviction path unlinks cold files from disk). */
+     * the local file (the eviction path unlinks cold files from disk).
+     * a replica never creates sstables -- its adds come from sync/cold-start and
+     * already exist remotely, so re-uploading wastes bandwidth and, on an incomplete
+     * local copy, could clobber good remote data. it can also always re-fetch on
+     * eviction, so only primaries push to the store. */
     if (sst->db && sst->db->object_store)
     {
-        tdb_objstore_upload_file_sync(sst->db, sst->klog_path);
-        tdb_objstore_upload_file_sync(sst->db, sst->vlog_path);
+        if (!atomic_load_explicit(&sst->db->replica_mode, memory_order_acquire))
+        {
+            tdb_objstore_upload_file_sync(sst->db, sst->klog_path);
+            tdb_objstore_upload_file_sync(sst->db, sst->vlog_path);
+        }
         if (sst->db->local_cache)
         {
             tdb_local_cache_track(sst->db->local_cache, sst->klog_path);

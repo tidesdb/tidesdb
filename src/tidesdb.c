@@ -18911,7 +18911,7 @@ static int compare_sstable_candidates(const void *a, const void *b)
  * tidesdb_reaper_thread
  * background maintenance thread that wakes on a timer (TDB_SSTABLE_REAPER_SLEEP_US,
  * via cond_timedwait so close can wake it early) and runs a fixed sequence of
- * housekeeping duties each cycle until sstable_reaper_active clears. timer signals
+ * housekeeping duties each cycle until reaper_active clears. timer signals
  * (SIGALRM/SIGVTALRM/SIGPROF) are blocked so the timed wait is not restarted by the
  * host process; crash and termination signals stay deliverable.
  *
@@ -18962,7 +18962,7 @@ static void *tidesdb_reaper_thread(void *arg)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Reaper thread started");
 
-    while (atomic_load(&db->sstable_reaper_active))
+    while (atomic_load(&db->reaper_active))
     {
         time_t now = tdb_get_current_time();
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
@@ -18984,13 +18984,13 @@ static void *tidesdb_reaper_thread(void *arg)
 
         pthread_mutex_lock(&db->reaper_thread_mutex);
 
-        if (atomic_load(&db->sstable_reaper_active))
+        if (atomic_load(&db->reaper_active))
         {
             /* return value intentionally ignored -- a timeout and a spurious
              * wakeup are handled identically by re-checking the active flag */
             (void)pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
         }
-        int should_exit = !atomic_load(&db->sstable_reaper_active);
+        int should_exit = !atomic_load(&db->reaper_active);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
 
         if (should_exit)
@@ -19432,7 +19432,7 @@ static void *tidesdb_reaper_thread(void *arg)
          * at this capacity and pick up any remainder on the next reaper cycle */
         const int candidate_capacity = use_stack ? TDB_REAPER_STACK_CANDIDATES : current_open;
 
-        if (!atomic_load(&db->sstable_reaper_active))
+        if (!atomic_load(&db->reaper_active))
         {
             if (!use_stack) free(candidates);
             break;
@@ -19451,7 +19451,7 @@ static void *tidesdb_reaper_thread(void *arg)
             if (!cf) continue;
 
             /* we check shutdown inside loop to exit promptly */
-            if (!atomic_load(&db->sstable_reaper_active))
+            if (!atomic_load(&db->reaper_active))
             {
                 shutdown_requested = 1;
                 break;
@@ -19537,7 +19537,7 @@ static void *tidesdb_reaper_thread(void *arg)
             break;
         }
 
-        if (!atomic_load(&db->sstable_reaper_active))
+        if (!atomic_load(&db->reaper_active))
         {
             if (!use_stack) free(candidates);
             break;
@@ -20725,11 +20725,11 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 #endif
     atomic_init(&(*db)->deferred_free_list, NULL);
 
-    atomic_store(&(*db)->sstable_reaper_active, 1);
+    atomic_store(&(*db)->reaper_active, 1);
     if (pthread_create(&(*db)->reaper_thread, NULL, tidesdb_reaper_thread, *db) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create SSTable reaper thread");
-        atomic_store(&(*db)->sstable_reaper_active, 0);
+        atomic_store(&(*db)->reaper_active, 0);
         pthread_mutex_destroy(&(*db)->reaper_thread_mutex);
         pthread_cond_destroy(&(*db)->reaper_thread_cond);
         /* non-fatal, continue without reaper thread */
@@ -21149,14 +21149,14 @@ int tidesdb_close(tidesdb_t *db)
     pthread_mutex_destroy(&db->btree_cache_lock);
     pthread_mutex_destroy(&db->compaction_gate_lock);
 
-    if (atomic_load(&db->sstable_reaper_active))
+    if (atomic_load(&db->reaper_active))
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping reaper thread");
 
         /** we set shutdown flag inside mutex to ensure proper synchronization
          *  with the worker's while loop predicate check (NetBSD PR #56275) */
         pthread_mutex_lock(&db->reaper_thread_mutex);
-        atomic_store(&db->sstable_reaper_active, 0);
+        atomic_store(&db->reaper_active, 0);
         pthread_cond_signal(&db->reaper_thread_cond);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
 
@@ -21169,8 +21169,8 @@ int tidesdb_close(tidesdb_t *db)
             usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
         }
 
-        pthread_join(db->sstable_reaper_thread, NULL);
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread stopped");
+        pthread_join(db->reaper_thread, NULL);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Reaper thread stopped");
 
         pthread_mutex_destroy(&db->reaper_thread_mutex);
         pthread_cond_destroy(&db->reaper_thread_cond);
@@ -26567,7 +26567,7 @@ static uint8_t *tidesdb_txn_serialize_wal(const tidesdb_txn_t *txn,
 
 /**
  * tidesdb_txn_serialize_wal_unified
- * serialize ALL transaction ops into a single unified WAL batch
+ * serialize all transaction ops into a single unified WAL batch
  * format per entry -- cf_index(4 BE) + flags(1) + varint(key_size) + varint(value_size)
  *                   + varint(seq) + [ttl(8)] + key + value
  * the batch is prefixed with a 2-byte magic (TDB_UNIFIED_WAL_MAGIC) for identification

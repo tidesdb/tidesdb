@@ -753,7 +753,7 @@ struct tidesdb_level_t
  * @param sync_thread_mutex mutex for sync thread
  * @param sync_thread_cond condition variable for sync thread
  * @param reaper_thread background thread for housekeeping
- * @param sstable_reaper_active atomic flag indicating if reaper thread is active
+ * @param reaper_active atomic flag indicating if reaper thread is active
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
@@ -838,7 +838,7 @@ struct tidesdb_t
     pthread_mutex_t sync_thread_mutex;
     pthread_cond_t sync_thread_cond;
     pthread_t reaper_thread;
-    _Atomic(int) sstable_reaper_active;
+    _Atomic(int) reaper_active;
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;

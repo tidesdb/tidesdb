@@ -51,71 +51,6 @@ char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 /* mutex to protect log file access during truncation */
 static pthread_mutex_t tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/**
- * tidesdb_log_write
- * writes a log message to the log file or stderr
- * handles truncation if configured
- * @param level log level
- * @param file source file name
- * @param line source line number
- * @param fmt format string
- * @param ... format arguments
- */
-void tidesdb_log_write(const int level, const char *file, const int line, const char *fmt, ...)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-
-    const time_t sec = ts.tv_sec;
-    struct tm tm_info;
-    tdb_gmtime_r(&sec, &tm_info);
-
-    const char *level_str = (level == TDB_LOG_DEBUG)   ? "DEBUG"
-                            : (level == TDB_LOG_INFO)  ? "INFO"
-                            : (level == TDB_LOG_WARN)  ? "WARN"
-                            : (level == TDB_LOG_ERROR) ? "ERROR"
-                                                       : "FATAL";
-
-    pthread_mutex_lock(&tidesdb_log_mutex);
-
-    FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
-
-    fprintf(log_out, "[%04d-%02d-%02dT%02d:%02d:%02d.%03dZ] [%s] %s:%d: ", tm_info.tm_year + 1900,
-            tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
-            (int)(ts.tv_nsec / 1000000), level_str, file, line);
-
-    va_list args;
-    va_start(args, fmt);
-    if (fmt) vfprintf(log_out, fmt, args);
-    va_end(args);
-
-    fprintf(log_out, "\n");
-
-    if (_tidesdb_log_file)
-    {
-        fflush(_tidesdb_log_file);
-
-        if (_tidesdb_log_truncate > 0 && _tidesdb_log_path[0] != '\0')
-        {
-            const long current_pos = ftell(_tidesdb_log_file);
-            if (current_pos > 0 && (size_t)current_pos >= _tidesdb_log_truncate)
-            {
-                fclose(_tidesdb_log_file);
-                _tidesdb_log_file = fopen(_tidesdb_log_path, "w");
-                if (_tidesdb_log_file)
-                {
-                    tdb_setlinebuf(_tidesdb_log_file);
-                    fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
-                            _tidesdb_log_truncate);
-                    fflush(_tidesdb_log_file);
-                }
-            }
-        }
-    }
-
-    pthread_mutex_unlock(&tidesdb_log_mutex);
-}
-
 typedef struct tidesdb_flush_work_t tidesdb_flush_work_t;
 typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
 typedef struct tidesdb_unified_flush_barrier_t tidesdb_unified_flush_barrier_t;
@@ -160,6 +95,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_REPLICA_MANIFEST_TMP             "MANIFEST.replica_tmp"
 #define TDB_PREFIXED_KEY_STACK_MAX           256
 
+#define TDB_CNF_FILE_MODE "w"
+
 /* stack-with-heap-fallback for prefixed keys */
 #define TDB_PREFIXED_KEY_ALLOC(name, total_size, stack_buf) \
     uint8_t stack_buf[TDB_PREFIXED_KEY_STACK_MAX];          \
@@ -172,26 +109,6 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
         if ((name) != (stack_buf)) free(name); \
     } while (0)
 
-static inline void tdb_encode_be32(const uint32_t val, uint8_t *out)
-{
-    out[0] = (uint8_t)(val >> 24);
-    out[1] = (uint8_t)(val >> 16);
-    out[2] = (uint8_t)(val >> 8);
-    out[3] = (uint8_t)(val);
-}
-
-static inline uint32_t tdb_decode_be32(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
-static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8_t *key,
-                                            const size_t key_size, uint8_t *out)
-{
-    tdb_encode_be32(cf_index, out);
-    memcpy(out + TDB_UNIFIED_CF_PREFIX_SIZE, key, key_size);
-    return TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
-}
 #define TDB_COLUMN_FAMILY_CONFIG_NAME   "config"
 #define TDB_COLUMN_FAMILY_MANIFEST_NAME "MANIFEST"
 #define TDB_COLUMN_FAMILY_CONFIG_EXT    ".ini"
@@ -206,12 +123,12 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BLOCK_INDEX_HDR_BASE        12         /* magic(4) + header_size(4) + num_entries(4) */
 #define TDB_BLOCK_INDEX_ENTRY_STRIDE \
     20 /* entry_off(4) + key_off(4) + key_size(4) + seq_lo(4) + seq_hi(4) */
-#define TDB_BLOCK_IDX_ENTRY_OFF             0  /* offset of entry_off within index entry */
-#define TDB_BLOCK_IDX_KEY_OFF               4  /* offset of key_off within index entry */
-#define TDB_BLOCK_IDX_KEY_SIZE              8  /* offset of key_size within index entry */
-#define TDB_BLOCK_IDX_SEQ_LO                12 /* offset of abs_seq low 32 bits */
-#define TDB_BLOCK_IDX_SEQ_HI                16 /* offset of abs_seq high 32 bits */
-#define TDB_SSTABLE_METADATA_MAGIC          0x5353544D
+#define TDB_BLOCK_IDX_ENTRY_OFF             0          /* offset of entry_off within index entry */
+#define TDB_BLOCK_IDX_KEY_OFF               4          /* offset of key_off within index entry */
+#define TDB_BLOCK_IDX_KEY_SIZE              8          /* offset of key_size within index entry */
+#define TDB_BLOCK_IDX_SEQ_LO                12         /* offset of abs_seq low 32 bits */
+#define TDB_BLOCK_IDX_SEQ_HI                16         /* offset of abs_seq high 32 bits */
+#define TDB_SSTABLE_METADATA_MAGIC          0x5353544D /* "SSTM" */
 #define TDB_SSTABLE_METADATA_HEADER_SIZE    84
 #define TDB_SSTABLE_METADATA_CHECKSUM_SIZE  8
 #define TDB_SSTABLE_METADATA_TOMBSTONE_SIZE 8
@@ -389,10 +306,10 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
  * threshold raises the cap in lockstep instead of being silently clamped. the
  * lock-free snapshot array grows to match, so there is no hidden ceiling. */
 #define TDB_IMM_QUEUE_HEADROOM 6
-#define TDB_IMMUTABLE_HARD_CAP_WAIT_US                                                           \
-    10000                                   /* 10ms poll, matches the backpressure stall cadence \
-                                             */
-#define TDB_IMMUTABLE_HARD_CAP_MAX_WAIT 500 /* max 5s wait (500 iterations * 10ms) */
+#define TDB_IMMUTABLE_HARD_CAP_WAIT_US                                                            \
+    1000                                     /* 1ms poll -- resume the blocked freeze promptly so \
+                                              * the flush pipeline does not stall under load */
+#define TDB_IMMUTABLE_HARD_CAP_MAX_WAIT 5000 /* max 5s wait (5000 iterations * 1ms) */
 
 /* refcount drain configuration for flush worker
  * used when waiting for in-flight writers to finish before flushing memtable */
@@ -532,128 +449,6 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
 #define TDB_BLOCK_INDEX_PREFIX_MIN 4
 #define TDB_BLOCK_INDEX_PREFIX_MAX 256
 #define TDB_BLOCK_INDEX_MAX_COUNT  INT_MAX
-
-/**
- * tdb_log_throttle
- * rate-limit a hot-path log line. returns 1 at most once per interval_sec for a given
- * last_log_sec slot, 0 otherwise. a CAS picks a single winner among concurrent callers so the
- * line is emitted once per window even under many simultaneous writers/flushers.
- * uses db->cached_current_time (maintained by the reaper) to avoid a clock syscall on the hot path.
- * @param db database (source of cached time)
- * @param last_log_sec per-CF / per-mode atomic holding the last emit time in seconds
- * @param interval_sec minimum seconds between emissions
- * @return 1 if the caller should emit now, 0 to suppress
- */
-static int tdb_log_throttle(tidesdb_t *db, _Atomic(time_t) *last_log_sec, int interval_sec)
-{
-    const time_t now = atomic_load_explicit(&db->cached_current_time, memory_order_relaxed);
-    time_t last = atomic_load_explicit(last_log_sec, memory_order_relaxed);
-    if (now - last < interval_sec) return 0;
-    return atomic_compare_exchange_strong_explicit(last_log_sec, &last, now, memory_order_relaxed,
-                                                   memory_order_relaxed);
-}
-
-/**
- * tidesdb_wake_reaper
- * nudge the sstable reaper to run its eviction pass now so it closes idle (unreferenced) sstable
- * block managers and reclaims their file descriptors. uses trylock -- if the reaper mutex is held
- * (reaper mid-cycle, or we are on the reaper thread itself) the signal is skipped, which is safe:
- * the reaper runs on its own 100ms timer regardless. never blocks the caller.
- * @param db database instance
- */
-static void tidesdb_wake_reaper(tidesdb_t *db)
-{
-    if (pthread_mutex_trylock(&db->reaper_thread_mutex) == 0)
-    {
-        pthread_cond_signal(&db->reaper_thread_cond);
-        pthread_mutex_unlock(&db->reaper_thread_mutex);
-    }
-}
-
-/**
- * tidesdb_bm_open
- * open a block manager, treating file-descriptor exhaustion (EMFILE/ENFILE) as transient
- * backpressure rather than a hard failure, wake the reaper to close idle sstables and retry a
- * bounded number of times. every other errno (and success) returns immediately. errno is preserved
- * by block_manager_open across its own cleanup, so the EMFILE/ENFILE check sees the real cause.
- * @param db database instance (for waking the reaper)
- * @param bm out-- opened block manager
- * @param path file path
- * @param sync_mode block-manager sync mode (already converted)
- * @return 0 on success, -1 on failure (errno set)
- */
-static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path, int sync_mode)
-{
-    for (int attempt = 0;; attempt++)
-    {
-        if (block_manager_open(bm, path, sync_mode) == 0) return 0;
-        if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)
-            return -1;
-        /* fd table is full but idle sstables can usually be closed -- wake the reaper and give it
-         * a moment to reclaim descriptors before retrying. */
-        tidesdb_wake_reaper(db);
-        usleep(TDB_BM_OPEN_EMFILE_BACKOFF_US);
-    }
-}
-
-/**
- * tidesdb_reader_fd_budget_ok
- * gate a reader (point-get / iterator) about to open a NOT-yet-open sstable against the reader fd
- * budget = max_open_sstables - reserve, the reserve being held for flush / compaction /
- * conflict-check (the priority paths that must progress to relieve fd pressure). an already-open
- * sstable needs no new descriptor, so re-reads are never blocked. when over budget, wake the reaper
- * to reclaim idle sstables and recheck; if still over, the caller fails the read with a retryable
- * error rather than starving the write path or returning wrong data (the scan/iter open-failure
- * paths surface it). returns 1 if the reader may open, 0 if it must back off.
- * @param db database instance
- * @param sst sstable the reader is about to open
- * @return 1 if ok to open (or already open), 0 if over the reader budget
- */
-/**
- * tidesdb_sstable_open_budget
- * the descriptor budget for resident open sstables, max_open_sstables minus the reserve held for
- * flush/compaction. both the reader admission check and the reaper's eviction trigger use this, so
- * the reaper keeps num_open_sstables at or below the budget the readers stop at -- otherwise reads
- * would back off in the [budget, max_open) gap while the reaper (triggering only at max_open) frees
- * nothing, starving reads with no relief on fd-constrained hosts.
- */
-static int tidesdb_sstable_open_budget(const tidesdb_t *db)
-{
-    const int max_open = (int)db->config.max_open_sstables;
-    int reserve = max_open / TDB_FD_READER_RESERVE_DIVISOR;
-    if (reserve < TDB_FD_READER_RESERVE_MIN) reserve = TDB_FD_READER_RESERVE_MIN;
-    /* cap the reserve so it never starves reads when max_open_sstables is below the floor */
-    const int reserve_cap = max_open / TDB_FD_READER_RESERVE_MAX_DIVISOR;
-    if (reserve > reserve_cap) reserve = reserve_cap;
-    int budget = max_open - reserve;
-    if (budget < 1) budget = 1;
-    return budget;
-}
-
-static int tidesdb_reader_fd_budget_ok(tidesdb_t *db, tidesdb_sstable_t *sst)
-{
-    /* already counted -- num_open_sstables is keyed on the klog, so a klog-open sstable
-     * needs no new tracked descriptor and is never blocked (the lazy vlog rides along) */
-    if (atomic_load_explicit(&sst->klog_bm, memory_order_acquire)) return 1;
-
-    /* reads may open up to max_open_sstables -- the open-file clamp keeps that descriptor-safe, and
-     * respecting it (rather than opening every source unbounded) is what prevents the original
-     * full-scan fd-exhaustion wedge. the reaper evicts IDLE sstables down to the smaller
-     * open-budget (max_open - reserve), so [open_budget, max_open) is burst headroom for active
-     * reads and compaction; a read only backs off with a retryable error at the hard cap. a
-     * k-way-merge iterator needs its whole source set open at once, so it must use this full cap
-     * too -- a smaller per-read reserve would make any scan over more than (budget) sstables
-     * impossible. */
-    const int max_open = (int)db->config.max_open_sstables;
-
-    if (atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open) return 1;
-
-    /* over budget for a new open -- give the reaper a chance to reclaim idle sstables, then recheck
-     */
-    tidesdb_wake_reaper(db);
-    usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
-    return atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open;
-}
 
 /* empty block index placeholder ( 4 byte LE count (0) followed by 1 byte prefix_len ) */
 #define TDB_EMPTY_BLOCK_INDEX_SIZE 5
@@ -1003,48 +798,6 @@ struct tidesdb_txn_op_t
     tidesdb_column_family_t *cf;
 };
 
-/**
- * tidesdb_txn_op_sl_flags
- * compute the skip-list version flag bitmask for a txn op.
- * a live put is 0, a regular delete is SKIP_LIST_FLAG_DELETED, and a
- * single-delete is both bits together so SKIP_LIST_FLAG_DELETED checks
- * keep treating it as a tombstone.
- */
-static inline uint8_t tidesdb_txn_op_sl_flags(const tidesdb_txn_op_t *op)
-{
-    if (op->is_single_delete) return SKIP_LIST_FLAG_DELETED | SKIP_LIST_FLAG_SINGLE_DELETE;
-    if (op->is_delete) return SKIP_LIST_FLAG_DELETED;
-    return 0;
-}
-
-/**
- * tidesdb_sl_flags_to_kv_flags
- * translate skip-list version flag bits into tidesdb kv_pair entry flags.
- * the two namespaces overlap on the tombstone bit (both are 0x01) but the
- * single-delete bit sits in different positions (0x02 on the skip list,
- * 0x10 in the kv_pair flag byte) because kv_pair flags are persisted on
- * disk and share the byte with serialization-time markers.
- */
-static inline uint8_t tidesdb_sl_flags_to_kv_flags(uint8_t sl_flags)
-{
-    uint8_t kv = 0;
-    if (sl_flags & SKIP_LIST_FLAG_DELETED) kv |= TDB_KV_FLAG_TOMBSTONE;
-    if (sl_flags & SKIP_LIST_FLAG_SINGLE_DELETE) kv |= TDB_KV_FLAG_SINGLE_DELETE;
-    return kv;
-}
-
-/**
- * tidesdb_txn_op_kv_flags
- * compute the tidesdb kv_pair tombstone flag bits for a txn op.
- * used when materialising a txn op as a kv_pair for a merge source.
- */
-static inline uint8_t tidesdb_txn_op_kv_flags(const tidesdb_txn_op_t *op)
-{
-    if (op->is_single_delete) return TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE;
-    if (op->is_delete) return TDB_KV_FLAG_TOMBSTONE;
-    return 0;
-}
-
 /* forward declaration for ref-counted block type */
 typedef struct tidesdb_ref_counted_block_t tidesdb_ref_counted_block_t;
 
@@ -1177,6 +930,235 @@ struct tidesdb_merge_heap_t
     size_t pop_buf_cap[2];
     int pop_buf_slot; /* active slot (toggled by iterator between next/prev calls) */
 };
+
+/**
+ * tidesdb_log_write
+ * writes a log message to the log file or stderr
+ * handles truncation if configured
+ * @param level log level
+ * @param file source file name
+ * @param line source line number
+ * @param fmt format string
+ * @param ... format arguments
+ */
+void tidesdb_log_write(const int level, const char *file, const int line, const char *fmt, ...)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    const time_t sec = ts.tv_sec;
+    struct tm tm_info;
+    tdb_gmtime_r(&sec, &tm_info);
+
+    const char *level_str = (level == TDB_LOG_DEBUG)   ? "DEBUG"
+                            : (level == TDB_LOG_INFO)  ? "INFO"
+                            : (level == TDB_LOG_WARN)  ? "WARN"
+                            : (level == TDB_LOG_ERROR) ? "ERROR"
+                                                       : "FATAL";
+
+    pthread_mutex_lock(&tidesdb_log_mutex);
+
+    FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
+
+    fprintf(log_out, "[%04d-%02d-%02dT%02d:%02d:%02d.%03dZ] [%s] %s:%d: ", tm_info.tm_year + 1900,
+            tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+            (int)(ts.tv_nsec / 1000000), level_str, file, line);
+
+    va_list args;
+    va_start(args, fmt);
+    if (fmt) vfprintf(log_out, fmt, args);
+    va_end(args);
+
+    fprintf(log_out, "\n");
+
+    if (_tidesdb_log_file)
+    {
+        fflush(_tidesdb_log_file);
+
+        if (_tidesdb_log_truncate > 0 && _tidesdb_log_path[0] != '\0')
+        {
+            const long current_pos = ftell(_tidesdb_log_file);
+            if (current_pos > 0 && (size_t)current_pos >= _tidesdb_log_truncate)
+            {
+                fclose(_tidesdb_log_file);
+                _tidesdb_log_file = fopen(_tidesdb_log_path, TDB_CNF_FILE_MODE);
+                if (_tidesdb_log_file)
+                {
+                    tdb_setlinebuf(_tidesdb_log_file);
+                    fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
+                            _tidesdb_log_truncate);
+                    fflush(_tidesdb_log_file);
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&tidesdb_log_mutex);
+}
+
+/**
+ * tdb_log_throttle
+ * rate-limit a hot-path log line. returns 1 at most once per interval_sec for a given
+ * last_log_sec slot, 0 otherwise. a CAS picks a single winner among concurrent callers so the
+ * line is emitted once per window even under many simultaneous writers/flushers.
+ * uses db->cached_current_time (maintained by the reaper) to avoid a clock syscall on the hot path.
+ * @param db database (source of cached time)
+ * @param last_log_sec per-CF / per-mode atomic holding the last emit time in seconds
+ * @param interval_sec minimum seconds between emissions
+ * @return 1 if the caller should emit now, 0 to suppress
+ */
+static int tdb_log_throttle(tidesdb_t *db, _Atomic(time_t) *last_log_sec, int interval_sec)
+{
+    const time_t now = atomic_load_explicit(&db->cached_current_time, memory_order_relaxed);
+    time_t last = atomic_load_explicit(last_log_sec, memory_order_relaxed);
+    if (now - last < interval_sec) return 0;
+    return atomic_compare_exchange_strong_explicit(last_log_sec, &last, now, memory_order_relaxed,
+                                                   memory_order_relaxed);
+}
+
+/**
+ * tidesdb_wake_reaper
+ * nudge the sstable reaper to run its eviction pass now so it closes idle (unreferenced) sstable
+ * block managers and reclaims their file descriptors. uses trylock -- if the reaper mutex is held
+ * (reaper mid-cycle, or we are on the reaper thread itself) the signal is skipped, which is safe:
+ * the reaper runs on its own 100ms timer regardless. never blocks the caller.
+ * @param db database instance
+ */
+static void tidesdb_wake_reaper(tidesdb_t *db)
+{
+    if (pthread_mutex_trylock(&db->reaper_thread_mutex) == 0)
+    {
+        pthread_cond_signal(&db->reaper_thread_cond);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
+    }
+}
+
+/**
+ * tidesdb_bm_open
+ * open a block manager, treating file-descriptor exhaustion (EMFILE/ENFILE) as transient
+ * backpressure rather than a hard failure, wake the reaper to close idle sstables and retry a
+ * bounded number of times. every other errno (and success) returns immediately. errno is preserved
+ * by block_manager_open across its own cleanup, so the EMFILE/ENFILE check sees the real cause.
+ * @param db database instance (for waking the reaper)
+ * @param bm out-- opened block manager
+ * @param path file path
+ * @param sync_mode block-manager sync mode (already converted)
+ * @return 0 on success, -1 on failure (errno set)
+ */
+static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path, int sync_mode)
+{
+    for (int attempt = 0;; attempt++)
+    {
+        if (block_manager_open(bm, path, sync_mode) == 0) return 0;
+        if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)
+            return -1;
+        /* fd table is full but idle sstables can usually be closed -- wake the reaper and give it
+         * a moment to reclaim descriptors before retrying. */
+        tidesdb_wake_reaper(db);
+        usleep(TDB_BM_OPEN_EMFILE_BACKOFF_US);
+    }
+}
+
+/**
+ * tidesdb_sstable_open_budget
+ * the descriptor budget for resident open sstables, max_open_sstables minus the reserve held for
+ * flush/compaction. both the reader admission check and the reaper's eviction trigger use this, so
+ * the reaper keeps num_open_sstables at or below the budget the readers stop at -- otherwise reads
+ * would back off in the [budget, max_open) gap while the reaper (triggering only at max_open) frees
+ * nothing, starving reads with no relief on fd-constrained hosts.
+ */
+static int tidesdb_sstable_open_budget(const tidesdb_t *db)
+{
+    const int max_open = (int)db->config.max_open_sstables;
+    int reserve = max_open / TDB_FD_READER_RESERVE_DIVISOR;
+    if (reserve < TDB_FD_READER_RESERVE_MIN) reserve = TDB_FD_READER_RESERVE_MIN;
+    /* cap the reserve so it never starves reads when max_open_sstables is below the floor */
+    const int reserve_cap = max_open / TDB_FD_READER_RESERVE_MAX_DIVISOR;
+    if (reserve > reserve_cap) reserve = reserve_cap;
+    int budget = max_open - reserve;
+    if (budget < 1) budget = 1;
+    return budget;
+}
+
+/**
+ * tidesdb_reader_fd_budget_ok
+ * gate a reader (point-get / iterator) about to open a NOT-yet-open sstable against the reader fd
+ * budget = max_open_sstables - reserve, the reserve being held for flush / compaction /
+ * conflict-check (the priority paths that must progress to relieve fd pressure). an already-open
+ * sstable needs no new descriptor, so re-reads are never blocked. when over budget, wake the reaper
+ * to reclaim idle sstables and recheck; if still over, the caller fails the read with a retryable
+ * error rather than starving the write path or returning wrong data (the scan/iter open-failure
+ * paths surface it). returns 1 if the reader may open, 0 if it must back off.
+ * @param db database instance
+ * @param sst sstable the reader is about to open
+ * @return 1 if ok to open (or already open), 0 if over the reader budget
+ */
+static int tidesdb_reader_fd_budget_ok(tidesdb_t *db, tidesdb_sstable_t *sst)
+{
+    /* already counted -- num_open_sstables is keyed on the klog, so a klog-open sstable
+     * needs no new tracked descriptor and is never blocked (the lazy vlog rides along) */
+    if (atomic_load_explicit(&sst->klog_bm, memory_order_acquire)) return 1;
+
+    /* reads may open up to max_open_sstables -- the open-file clamp keeps that descriptor-safe, and
+     * respecting it (rather than opening every source unbounded) is what prevents the original
+     * full-scan fd-exhaustion wedge. the reaper evicts IDLE sstables down to the smaller
+     * open-budget (max_open - reserve), so [open_budget, max_open) is burst headroom for active
+     * reads and compaction; a read only backs off with a retryable error at the hard cap. a
+     * k-way-merge iterator needs its whole source set open at once, so it must use this full cap
+     * too -- a smaller per-read reserve would make any scan over more than (budget) sstables
+     * impossible. */
+    const int max_open = (int)db->config.max_open_sstables;
+
+    if (atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open) return 1;
+
+    /* over budget for a new open -- give the reaper a chance to reclaim idle sstables, then recheck
+     */
+    tidesdb_wake_reaper(db);
+    usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
+    return atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open;
+}
+
+/**
+ * tidesdb_txn_op_sl_flags
+ * compute the skip-list version flag bitmask for a txn op.
+ * a live put is 0, a regular delete is SKIP_LIST_FLAG_DELETED, and a
+ * single-delete is both bits together so SKIP_LIST_FLAG_DELETED checks
+ * keep treating it as a tombstone.
+ */
+static inline uint8_t tidesdb_txn_op_sl_flags(const tidesdb_txn_op_t *op)
+{
+    if (op->is_single_delete) return SKIP_LIST_FLAG_DELETED | SKIP_LIST_FLAG_SINGLE_DELETE;
+    if (op->is_delete) return SKIP_LIST_FLAG_DELETED;
+    return 0;
+}
+
+/**
+ * tidesdb_sl_flags_to_kv_flags
+ * translate skip-list version flag bits into tidesdb kv_pair entry flags.
+ * the two namespaces overlap on the tombstone bit (both are 0x01) but the
+ * single-delete bit sits in different positions (0x02 on the skip list,
+ * 0x10 in the kv_pair flag byte) because kv_pair flags are persisted on
+ * disk and share the byte with serialization-time markers.
+ */
+static inline uint8_t tidesdb_sl_flags_to_kv_flags(uint8_t sl_flags)
+{
+    uint8_t kv = 0;
+    if (sl_flags & SKIP_LIST_FLAG_DELETED) kv |= TDB_KV_FLAG_TOMBSTONE;
+    if (sl_flags & SKIP_LIST_FLAG_SINGLE_DELETE) kv |= TDB_KV_FLAG_SINGLE_DELETE;
+    return kv;
+}
+
+/**
+ * tidesdb_txn_op_kv_flags
+ * compute the tidesdb kv_pair tombstone flag bits for a txn op.
+ * used when materialising a txn op as a kv_pair for a merge source.
+ */
+static inline uint8_t tidesdb_txn_op_kv_flags(const tidesdb_txn_op_t *op)
+{
+    if (op->is_single_delete) return TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE;
+    if (op->is_delete) return TDB_KV_FLAG_TOMBSTONE;
+    return 0;
+}
 
 /**
  * tidesdb_commit_status_create
@@ -1329,6 +1311,27 @@ static inline int decode_varint(const uint8_t *buf, uint64_t *value, const int m
     }
 
     return -1; /* incomplete varint */
+}
+
+static inline void tdb_encode_be32(const uint32_t val, uint8_t *out)
+{
+    out[0] = (uint8_t)(val >> 24);
+    out[1] = (uint8_t)(val >> 16);
+    out[2] = (uint8_t)(val >> 8);
+    out[3] = (uint8_t)(val);
+}
+
+static inline uint32_t tdb_decode_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8_t *key,
+                                            const size_t key_size, uint8_t *out)
+{
+    tdb_encode_be32(cf_index, out);
+    memcpy(out + TDB_UNIFIED_CF_PREFIX_SIZE, key, key_size);
+    return TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
 }
 
 /**
@@ -7004,7 +7007,7 @@ static void tidesdb_imm_snap_publish_locked(tidesdb_column_family_t *cf)
     size_t raw = queue_snapshot(cf->immutable_memtables, (void **)next->items, next->cap);
 
     /* drop already-flushed immutables from the READER snapshot. once an immutable is flushed its
-     * data is durable in an L1 sstable that was added to the level (with release) BEFORE `flushed`
+     * data is durable in an L1 sstable that was added to the level (with release) before `flushed`
      * was set (also release), so any reader that observes this republished slot -- via the
      * release/acquire pair on imm_snap_active below -- is guaranteed to also observe that sstable.
      * excluding flushed immutables stops new iterators from taking a long-lived merge-source ref on
@@ -21536,7 +21539,7 @@ static int tidesdb_unimap_persist(tidesdb_t *db)
     snprintf(final_path, sizeof(final_path), "%s" PATH_SEPARATOR TDB_UNIFIED_CF_INDEX_MAP_FILE,
              db->db_path);
 
-    FILE *fp = fopen(tmp_path, "w");
+    FILE *fp = fopen(tmp_path, TDB_CNF_FILE_MODE);
     if (!fp)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to open %s for write", tmp_path);
@@ -34581,7 +34584,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
 {
     if (!ini_file || !section_name || !config) return TDB_ERR_INVALID_ARGS;
 
-    FILE *fp = fopen(ini_file, "w");
+    FILE *fp = fopen(ini_file, TDB_CNF_FILE_MODE);
     if (!fp) return TDB_ERR_IO;
 
     fprintf(fp, "[%s]\n", section_name);
@@ -34650,8 +34653,6 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     }
     fclose(fp);
 
-    /** we have to sync parent directory to ensure file entry is persisted
-     *  we cross-platform tdb_sync_directory (no-op on Windows (already syncs), fsync on POSIX) */
     const char *last_sep = strrchr(ini_file, PATH_SEPARATOR[0]);
     if (last_sep)
     {
@@ -34976,7 +34977,6 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
         index->capacity = new_capacity;
     }
 
-    /* we copy prefixes (pad with zeros if key is shorter than prefix_len) */
     const size_t min_copy_len = (min_key_len < index->prefix_len) ? min_key_len : index->prefix_len;
     const size_t max_copy_len = (max_key_len < index->prefix_len) ? max_key_len : index->prefix_len;
 
@@ -35005,7 +35005,7 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
  * compact_block_index_find_slot
  * finds the leftmost block that could contain the given key using binary search
  *
- * the block index is lossy -- it stores only the first prefix_len bytes of each
+ * the block index is lossy, it stores only the first prefix_len bytes of each
  * block's min/max key. when several keys share a prefix longer than prefix_len
  * they can span multiple klog blocks that all have identical min/max prefixes.
  * returning the rightmost prefix match would overshoot the block that actually

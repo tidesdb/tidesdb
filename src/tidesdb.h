@@ -279,9 +279,8 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
                                       uint64_t commit_seq, void *ctx);
 
 /* forward declarations for internal types */
-#define TDB_MAX_LEVELS         32
-#define TDB_IMM_SNAP_MAX_ITEMS 16 /* max immutables in lock-free snapshot array */
-#define TDB_IMM_SNAP_SLOTS     2  /* double-buffered snapshot slots */
+#define TDB_MAX_LEVELS     32
+#define TDB_IMM_SNAP_SLOTS 2 /* double-buffered RCU snapshot slots (one read, one rebuilt) */
 
 typedef struct tidesdb_txn_op_t tidesdb_txn_op_t;
 typedef struct tidesdb_merge_heap_t tidesdb_merge_heap_t;
@@ -297,14 +296,19 @@ typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 
 /* lock-free immutable memtable snapshot slot
  * part of a double-buffered RCU scheme; writers build in inactive slot,
- * swap the active index, then wait for old-slot readers to drain
- * @param items array of immutable memtables
- * @param count number of items in the array
+ * swap the active index, then wait for old-slot readers to drain.
+ * items is heap-allocated and grown lazily by the publisher to fit the queue
+ * depth, so the snapshot never silently truncates -- the immutable queue is
+ * bounded only by the configured l0_queue_stall_threshold, never by this array.
+ * @param items heap array of immutable memtables (capacity = cap)
+ * @param cap allocated capacity of items, in slots
+ * @param count number of valid items in the array
  * @param readers number of active readers on this slot
  */
 typedef struct
 {
-    tidesdb_memtable_t *items[TDB_IMM_SNAP_MAX_ITEMS];
+    tidesdb_memtable_t **items;
+    size_t cap;
     _Atomic(size_t) count;
     _Atomic(int32_t) readers;
 } tidesdb_imm_snap_t;
@@ -748,7 +752,7 @@ struct tidesdb_level_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param sync_thread_mutex mutex for sync thread
  * @param sync_thread_cond condition variable for sync thread
- * @param sstable_reaper_thread background thread for evicting most un-accessed sstables
+ * @param reaper_thread background thread for housekeeping
  * @param sstable_reaper_active atomic flag indicating if reaper thread is active
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
@@ -833,7 +837,7 @@ struct tidesdb_t
     _Atomic(int) sync_thread_active;
     pthread_mutex_t sync_thread_mutex;
     pthread_cond_t sync_thread_cond;
-    pthread_t sstable_reaper_thread;
+    pthread_t reaper_thread;
     _Atomic(int) sstable_reaper_active;
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
@@ -885,8 +889,6 @@ struct tidesdb_t
          * cf->active_mt_readers field for the protocol */
         _Atomic(int) active_mt_readers;
         queue_t *immutables;
-        tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
-        _Atomic(int) imm_snap_active;
         _Atomic(int) is_flushing;
         _Atomic(int) immutable_cleanup_counter;
         size_t write_buffer_size;

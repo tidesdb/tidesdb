@@ -486,6 +486,18 @@ typedef struct tidesdb_db_stats_t
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 tidesdb_config_t tidesdb_default_config(void);
 
+/**
+ * tidesdb_raise_open_file_limit
+ * raise this process's open-file ceiling toward `desired` descriptors so a database can keep more
+ * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it BEFORE
+ * tidesdb_open. an explicit, opt-in operator action: tidesdb never raises the limit itself. POSIX
+ * (Linux, macOS, the BSDs, illumos) raises the RLIMIT_NOFILE soft limit toward the hard limit;
+ * Windows raises the CRT stdio cap (max 8192). a failed or partial raise is non-fatal.
+ * @param desired target descriptor count; <= 0 just reports the current ceiling
+ * @return the open-file ceiling in effect after the attempt
+ */
+long tidesdb_raise_open_file_limit(long desired);
+
 /**** initialization and custom allocator support */
 
 /**

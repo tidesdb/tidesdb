@@ -3533,4 +3533,47 @@ static inline long tdb_max_open_files(void)
 #endif
 }
 
+/**
+ * tdb_raise_max_open_files
+ * raise THIS process's open-file ceiling toward `desired` descriptors and return the ceiling in
+ * effect afterwards. POSIX raises the RLIMIT_NOFILE soft limit toward the hard limit (never
+ * lowering it, clamped to the hard limit); Windows raises the CRT stdio cap via _setmaxstdio
+ * (clamped to its 8192 maximum). an explicit, opt-in action -- tidesdb never raises the limit on
+ * its own. a partial or failed raise is non-fatal: the prior ceiling simply stands.
+ * @param desired target descriptor count; <= 0 just reports the current ceiling without raising
+ * @return the open-file ceiling after the attempt
+ */
+static inline long tdb_raise_max_open_files(long desired)
+{
+    if (desired <= 0) return tdb_max_open_files();
+#if defined(_WIN32)
+    if (desired > 8192) desired = 8192; /* _setmaxstdio hard maximum */
+    if (desired > _getmaxstdio()) _setmaxstdio((int)desired);
+#else
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
+    {
+        rlim_t target = (rlim_t)desired;
+        if (rl.rlim_max != RLIM_INFINITY && target > rl.rlim_max) target = rl.rlim_max;
+        /* macOS (and some BSDs) reject a soft limit above a kernel per-process cap even when the
+         * hard limit reads higher/unlimited, so back off and retry rather than giving up -- this
+         * lands the soft limit near the real ceiling instead of leaving it at the low default. */
+        const rlim_t floor = rl.rlim_cur;
+        while (target > rl.rlim_cur)
+        {
+            struct rlimit attempt = rl;
+            attempt.rlim_cur = target;
+            if (setrlimit(RLIMIT_NOFILE, &attempt) == 0)
+            {
+                rl.rlim_cur = target;
+                break;
+            }
+            if (target <= floor + 1) break; /* even the smallest raise was refused */
+            target = floor + (target - floor) / 2;
+        }
+    }
+#endif
+    return tdb_max_open_files();
+}
+
 #endif /* __COMPAT_H__ */

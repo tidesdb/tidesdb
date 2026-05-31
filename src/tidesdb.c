@@ -19723,6 +19723,11 @@ static void tidesdb_ensure_btree_node_cache(tidesdb_t *db)
     pthread_mutex_unlock(&db->btree_cache_lock);
 }
 
+long tidesdb_raise_open_file_limit(long desired)
+{
+    return tdb_raise_max_open_files(desired);
+}
+
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 {
     /* we auto-initialize with system allocator if not already initialized */

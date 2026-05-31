@@ -23191,7 +23191,17 @@ static void *mcf_atom_compactor_thread(void *arg)
 static void test_multi_cf_cross_txn_compaction_atomicity(void)
 {
     cleanup_test_dir();
-    tidesdb_t *db = create_test_db();
+    /* the tiny 1KB write buffers below churn out hundreds of small sstables, and two compactor
+     * threads keep many open at once -- so give the reader fd budget real headroom rather than the
+     * default cap. note the engine clamps this to what ulimit -n can honor, so on fd-constrained
+     * runners it has no effect and the post-run quiesce (before verify) is what actually keeps a
+     * point-get from backing off with TDB_ERR_BUSY. */
+    tidesdb_config_t db_config = tidesdb_default_config();
+    db_config.db_path = TEST_DB_PATH;
+    db_config.max_open_sstables = 1024;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&db_config, &db), 0);
+    ASSERT_TRUE(db != NULL);
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 1024;
@@ -23237,6 +23247,17 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     int final_errors = atomic_load(&errors);
     printf("  cross-CF atomicity: committed=%d errors=%d\n", final_committed, final_errors);
     ASSERT_EQ(final_errors, 0);
+
+    /* drain background flush + compaction so the verify runs against a quiescent store. the
+     * compactor threads joined above, but the engine's own background flush/compaction is still in
+     * flight, and an in-flight compaction holds open sstable descriptors -- a read of a cold
+     * sstable then backs off with the retryable TDB_ERR_BUSY at the fd cap, which the verify cannot
+     * tell apart from a genuinely missing key. flush first (so every immutable lands as an sstable,
+     * which may in turn trigger a compaction), then wait that compaction out. */
+    wait_for_cf_flush_idle(db, cf_a);
+    wait_for_cf_flush_idle(db, cf_b);
+    wait_for_compaction_idle(db, cf_a);
+    wait_for_compaction_idle(db, cf_b);
 
     /* we verify atomicity, essentially every committed pair must be fully present in both CFs */
     tidesdb_txn_t *vtxn = NULL;
@@ -28872,6 +28893,13 @@ static void test_crash_recovery_no_clean_close(void)
 int main(int argc, char **argv)
 {
     g_test_argv0 = argv[0];
+
+    /* raise this process's fd ceiling up front so the fd-budget-bound tests (heavy sstable churn at
+     * tiny write buffers) have descriptors to spare. one portable call covers every OS -- POSIX
+     * (Linux/macOS/BSD/illumos) bumps RLIMIT_NOFILE, Windows bumps the CRT stdio cap -- which
+     * avoids per-runner ulimit wrangling in CI and lets the engine size max_open_sstables higher at
+     * open. */
+    tidesdb_raise_open_file_limit(65536);
 
     /* the crash recovery test re-execs this binary as its own crash child */
     if (argc >= 4 && strcmp(argv[1], CRASH_RECOVERY_CHILD_ARG) == 0)

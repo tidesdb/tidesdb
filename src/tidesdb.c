@@ -118,6 +118,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_REPLICA_WAL_TMP                  "replica_wal_tmp.log"
 #define TDB_REPLICA_MANIFEST_TMP             "MANIFEST.replica_tmp"
 #define TDB_PREFIXED_KEY_STACK_MAX           256
+#define TDB_BUP_CPY_FILE_SRC_MODE            "rb"
+#define TDB_BUP_CPY_FILE_SRC_MODE            "wb"
 
 #define TDB_CNF_FILE_MODE "w"
 

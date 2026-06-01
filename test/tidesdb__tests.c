@@ -24800,6 +24800,97 @@ static void test_unified_flush_to_sstable(void)
     cleanup_test_dir();
 }
 
+/* unified flush of B+tree-format CFs. the unified flush streams each CF's prefix run straight from
+ * the shared unified skip list into its sstable; btree CFs take the btree writer path, so this
+ * pins that demux + stream across two CFs, with deletes, through a flush. */
+static void test_unified_btree_flush_and_read(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 4096; /* tiny buffer to force a flush */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.use_btree = 1;
+    ASSERT_EQ(tidesdb_create_column_family(db, "ubt_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ubt_b", &cf_config), 0);
+    tidesdb_column_family_t *cf_a = tidesdb_get_column_family(db, "ubt_a");
+    tidesdb_column_family_t *cf_b = tidesdb_get_column_family(db, "ubt_b");
+    ASSERT_TRUE(cf_a != NULL && cf_b != NULL);
+
+    const int N = 300;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], va[128], vb[128];
+        snprintf(key, sizeof(key), "btk_%05d", i);
+        snprintf(va, sizeof(va), "a_val_%05d_padding_for_realistic_row_size", i);
+        snprintf(vb, sizeof(vb), "b_val_%05d_padding_for_realistic_row_size", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_a, (uint8_t *)key, strlen(key) + 1, (uint8_t *)va,
+                                  strlen(va) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_b, (uint8_t *)key, strlen(key) + 1, (uint8_t *)vb,
+                                  strlen(vb) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* delete every 5th key from cf_a only -- exercises tombstone streaming + per-CF divergence */
+    for (int i = 0; i < N; i += 5)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64];
+        snprintf(key, sizeof(key), "btk_%05d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf_a, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    wait_for_cf_flush_idle(db, cf_a);
+    wait_for_cf_flush_idle(db, cf_b);
+
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[64], va[128], vb[128];
+        snprintf(key, sizeof(key), "btk_%05d", i);
+        snprintf(va, sizeof(va), "a_val_%05d_padding_for_realistic_row_size", i);
+        snprintf(vb, sizeof(vb), "b_val_%05d_padding_for_realistic_row_size", i);
+
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+        int rc_a = tidesdb_txn_get(txn, cf_a, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+        if (i % 5 == 0)
+            ASSERT_EQ(rc_a, TDB_ERR_NOT_FOUND); /* deleted in cf_a */
+        else
+        {
+            ASSERT_EQ(rc_a, 0);
+            ASSERT_TRUE(rv && rs == strlen(va) + 1 && memcmp(rv, va, rs) == 0);
+        }
+        free(rv);
+
+        rv = NULL;
+        rs = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf_b, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_TRUE(rv && rs == strlen(vb) + 1 && memcmp(rv, vb, rs) == 0); /* untouched in cf_b */
+        free(rv);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_unified_recovery_after_reopen(void)
 {
     tidesdb_t *db = create_unified_test_db();
@@ -29297,6 +29388,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_multi_cf_isolation, tests_passed);
     RUN_TEST(test_unified_delete, tests_passed);
     RUN_TEST(test_unified_flush_to_sstable, tests_passed);
+    RUN_TEST(test_unified_btree_flush_and_read, tests_passed);
     RUN_TEST(test_unified_recovery_after_reopen, tests_passed);
     RUN_TEST(test_unified_multi_cf_many_keys, tests_passed);
     RUN_TEST(test_unified_multi_cf_flush_and_recovery, tests_passed);

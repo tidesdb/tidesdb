@@ -603,6 +603,7 @@ struct tidesdb_column_family_t
      * zero-initialized by calloc, so the first event in each category logs immediately. */
     _Atomic(time_t) last_ceiling_stall_log_sec;
     _Atomic(time_t) last_imm_critical_log_sec;
+    _Atomic(time_t) last_backpressure_log_sec;
 };
 
 /**

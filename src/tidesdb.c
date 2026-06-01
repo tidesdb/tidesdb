@@ -1617,7 +1617,8 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source);
 static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_level,
                                          int target_level, int output_level);
 static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level);
-static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level);
+static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int start_level,
+                                     const int end_level);
 static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t **inputs,
                                   int input_count, int min_input_level, int max_input_level,
                                   int target_level);
@@ -14254,8 +14255,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
         {
             /* write index + bloom footer blobs (chunk-aware, shared helper) */
             tidesdb_sstable_write_footer_aux(new_sst, klog_bm, block_indexes, bloom, 1);
-            block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
-            bloom = NULL;         /* ownership transferred; local must not double-free on abort */
+            block_indexes = NULL;
+            bloom = NULL;
         }
 
         /* we get file sizes before metadata write for serialization */
@@ -14862,7 +14863,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         /* write index + bloom footer blobs (chunk-aware, shared helper) */
         tidesdb_sstable_write_footer_aux(new_sst, klog_bm, block_indexes, bloom, 1);
         block_indexes = NULL; /* ownership transferred; local must not double-free on abort */
-        bloom = NULL;         /* ownership transferred; local must not double-free on abort */
+        bloom = NULL;         /* same as block_indexes */
     }
 
     uint64_t klog_size_before_metadata;
@@ -15051,7 +15052,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /*** we ensure there's a level to merge into */
         if (target_level + 1 >= num_levels)
         {
-            int add_result = tidesdb_add_level(cf);
+            const int add_result = tidesdb_add_level(cf);
             if (add_result != TDB_SUCCESS)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to add level before merge, error: %d",
@@ -15108,7 +15109,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Collecting SSTables from levels 1-%d", target_level + 1);
     tidesdb_sstable_t **ssts_array = NULL;
     int sst_count = 0;
-    int collect_result = tidesdb_collect_ssts_from_snapshot(
+    const int collect_result = tidesdb_collect_ssts_from_snapshot(
         cf, 0, target_level, sstable_ids_snapshot, &ssts_array, &sst_count);
     if (collect_result != TDB_SUCCESS)
     {
@@ -15953,6 +15954,7 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
  * @param bloom bloom filter (ownership transferred to sst)
  * @param block_indexes block index (ownership transferred to sst)
  * @param entry_count number of entries written
+ * @param tombstone_count number of tombstones
  * @param klog_block_num number of klog blocks written
  * @param vlog_block_num number of vlog blocks written
  * @param max_seq maximum sequence number seen
@@ -16108,7 +16110,8 @@ typedef struct
 
 static int tidesdb_partitioned_merge_partition(void *vctx, int partition);
 
-static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level)
+static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int start_level,
+                                     const int end_level)
 {
     if (tidesdb_cf_abort_requested(cf)) return TDB_SUCCESS;
 

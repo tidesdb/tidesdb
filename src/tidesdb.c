@@ -9411,7 +9411,7 @@ load_bloom_and_index:; /* empty statement for C89/C90 compatibility */
                                                                sst->bloom_blob_size);
             if (bloom_buf)
             {
-                sst->bloom_filter = bloom_filter_deserialize(bloom_buf);
+                sst->bloom_filter = bloom_filter_deserialize(bloom_buf, sst->bloom_blob_size);
                 free(bloom_buf);
             }
             else
@@ -9462,7 +9462,8 @@ load_bloom_and_index:; /* empty statement for C89/C90 compatibility */
                 {
                     if (bloom_block->size > 0 && sst->config && sst->config->enable_bloom_filter)
                     {
-                        sst->bloom_filter = bloom_filter_deserialize(bloom_block->data);
+                        sst->bloom_filter =
+                            bloom_filter_deserialize(bloom_block->data, bloom_block->size);
                     }
                     else
                     {

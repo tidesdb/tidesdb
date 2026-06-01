@@ -31,6 +31,11 @@
  *                     (better avalanche / lower FPR on short keys). carried with the
  *                     filter and honored by add/contains so on-disk filters built with
  *                     an older hash keep querying with that same hash (no false negatives).
+ *
+ * a filter is single-writer during build (add) and immutable after.
+ * once frozen it may be queried (contains) concurrently by any number of threads --
+ * the query path is pure-read. add() concurrent with add()/contains() is a data race
+ * (the bitset words are non-atomic read-modify-write) and is not supported.
  */
 typedef struct
 {
@@ -102,11 +107,13 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size);
 
 /**
  * bloom_filter_deserialize
- * deserializes a bloom filter
+ * deserializes a bloom filter. every field read is bounded by len, so a
+ * truncated or corrupt buffer is rejected (NULL) rather than over-read.
  * @param data the serialized bloom filter
- * @return the deserialized bloom filter
+ * @param len the length in bytes of the serialized buffer
+ * @return the deserialized bloom filter, or NULL on malformed/truncated input
  */
-bloom_filter_t *bloom_filter_deserialize(const uint8_t *data);
+bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, size_t len);
 
 /**
  * bloom_filter_free

@@ -24288,6 +24288,13 @@ static void test_cancel_background_work(void)
         tidesdb_txn_free(txn);
     }
 
+    /* drain in-flight flushes first. cancel deliberately leaves flushes running (durability), but a
+     * flush that completes after cancel adds an L1 sstable and re-triggers compaction -- which
+     * would race the idle assertion below. once flushes are idle the only compaction left is the
+     * backlog cancel drains, with nothing to re-trigger it (no writes in flight, active memtable
+     * not flushing). */
+    wait_for_cf_flush_idle(db, cf);
+
     /* cancel background compaction -- returns once compaction is idle */
     ASSERT_EQ(tidesdb_cancel_background_work(db), 0);
 

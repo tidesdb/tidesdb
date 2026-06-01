@@ -56,11 +56,17 @@ typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
 typedef struct tidesdb_unified_flush_barrier_t tidesdb_unified_flush_barrier_t;
 typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 
-/* kv pair flags */
+/* kv pair flags -- one uint8_t carrying two disjoint groups.
+ *
+ * PERSISTENT (0x01..0x10) describe the entry's data and are the ONLY bits that
+ * may reach disk; the klog serializer masks the byte with
+ * TDB_KV_FLAG_PERSISTENT_MASK so the transient group below can never leak. */
 #define TDB_KV_FLAG_TOMBSTONE 0x01
 #define TDB_KV_FLAG_HAS_TTL   0x02
 #define TDB_KV_FLAG_HAS_VLOG  0x04
-#define TDB_KV_FLAG_DELTA_SEQ 0x08
+#define TDB_KV_FLAG_DELTA_SEQ                                          \
+    0x08 /* serialization-only: seq is delta-encoded, stripped on read \
+          */
 #define TDB_KV_FLAG_SINGLE_DELETE                                \
     0x10 /* tombstone subtype -- caller promises the key was put \
           * at most once since the last single-delete or start,  \
@@ -68,9 +74,14 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
           * compaction that sees both in the same merge input.   \
           * always set alongside TDB_KV_FLAG_TOMBSTONE so every  \
           * existing tombstone check keeps working unchanged. */
-#define TDB_KV_FLAG_BORROWED 0x40
-#define TDB_KV_FLAG_ARENA    0x80
+
+/* TRANSIENT (0x20..0x80) -- in-memory memory-ownership bookkeeping for
+ * tidesdb_kv_pair_free, never written to disk. kv_pair_create sets ARENA on
+ * every kv it builds (including compaction output), so these MUST be masked off
+ * before serialization. */
 #define TDB_KV_FLAG_POP_BUF  0x20 /* lives in reusable pop buffer, do not free */
+#define TDB_KV_FLAG_BORROWED 0x40 /* points into block data, do not free */
+#define TDB_KV_FLAG_ARENA    0x80 /* single struct+key+value allocation */
 
 /* the kv entry-flag bits that describe tombstone-ness and must flow through
  * every copy / materialisation path (pop_buf, inline_kv for sstable and
@@ -78,6 +89,19 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
  * single mask prevents forgetting the single-delete bit at a site that only
  * remembered the plain tombstone bit. */
 #define TDB_KV_TOMBSTONE_FLAG_MASK (TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE)
+
+/* the persistent bits -- the only flags permitted onto disk. the klog serializer
+ * masks each entry's flag byte with this so the transient (in-memory) bits above
+ * cannot leak into the on-disk format (notably ARENA, which kv_pair_create sets
+ * on every compaction-written kv). */
+#define TDB_KV_FLAG_PERSISTENT_MASK                                                               \
+    (TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_HAS_TTL | TDB_KV_FLAG_HAS_VLOG | TDB_KV_FLAG_DELTA_SEQ | \
+     TDB_KV_FLAG_SINGLE_DELETE)
+
+/* the in-memory-only group as a mask. the deserialize path strips these (along
+ * with DELTA_SEQ) so a stray transient bit serialized by an OLDER build -- before
+ * the write path masked them -- cannot survive into an in-memory entry. */
+#define TDB_KV_FLAG_TRANSIENT_MASK (TDB_KV_FLAG_POP_BUF | TDB_KV_FLAG_BORROWED | TDB_KV_FLAG_ARENA)
 
 #define TDB_LOG_FILE                         "LOG"
 #define TDB_WAL_PREFIX                       "wal_"
@@ -3273,6 +3297,10 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
         if (entry->ttl != 0) flags |= TDB_KV_FLAG_HAS_TTL;
         if (entry->vlog_offset != 0) flags |= TDB_KV_FLAG_HAS_VLOG;
 
+        /* strip the in-memory-only bits (ARENA/BORROWED/POP_BUF) so they never reach disk --
+         * kv_pair_create sets ARENA on every compaction-written kv. the HAS_TTL/HAS_VLOG checks
+         * below still see their bits since those are persistent. */
+        flags &= TDB_KV_FLAG_PERSISTENT_MASK;
         *ptr++ = flags;
 
         ptr += encode_varint(ptr, entry->key_size);
@@ -3595,7 +3623,7 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
 
         uint8_t flags = *eptr++;
         erem--;
-        out_entry->flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
+        out_entry->flags = flags & ~(TDB_KV_FLAG_DELTA_SEQ | TDB_KV_FLAG_TRANSIENT_MASK);
 
         uint64_t ks, vs;
         int br = decode_varint(eptr, &ks, (int)erem);
@@ -3836,7 +3864,7 @@ static int tidesdb_klog_block_search_raw(const uint8_t *data, const size_t data_
 
     uint8_t flags = *eptr++;
     erem--;
-    out_entry->flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
+    out_entry->flags = flags & ~(TDB_KV_FLAG_DELTA_SEQ | TDB_KV_FLAG_TRANSIENT_MASK);
 
     uint64_t ks;
     int br = decode_varint(eptr, &ks, (int)erem);
@@ -4009,7 +4037,7 @@ static int tidesdb_klog_block_seek_raw(const uint8_t *data, const size_t data_si
 
         uint8_t flags = *eptr++;
         erem--;
-        out_entry->flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
+        out_entry->flags = flags & ~(TDB_KV_FLAG_DELTA_SEQ | TDB_KV_FLAG_TRANSIENT_MASK);
 
         uint64_t ks, vs;
         int br = decode_varint(eptr, &ks, (int)erem);
@@ -4201,7 +4229,7 @@ static int tidesdb_klog_block_seek_raw(const uint8_t *data, const size_t data_si
 
     uint8_t flags = *eptr++;
     erem--;
-    out_entry->flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
+    out_entry->flags = flags & ~(TDB_KV_FLAG_DELTA_SEQ | TDB_KV_FLAG_TRANSIENT_MASK);
 
     uint64_t ks;
     int br = decode_varint(eptr, &ks, (int)erem);
@@ -4377,7 +4405,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, const size_t data
 
         uint8_t flags = *ptr++;
         remaining--;
-        (*block)->entries[i].flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
+        (*block)->entries[i].flags = flags & ~(TDB_KV_FLAG_DELTA_SEQ | TDB_KV_FLAG_TRANSIENT_MASK);
 
         uint64_t key_size_u64;
         int bytes_read = decode_varint(ptr, &key_size_u64, (int)remaining);
@@ -27474,7 +27502,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
         int rc = phase1_result;
         for (int i = 0; i < split_count; i++)
         {
-            int wr = tidesdb_unified_write_cf_sstable(db, splits[i].cf, splits[i].temp_sl);
+            const int wr = tidesdb_unified_write_cf_sstable(db, splits[i].cf, splits[i].temp_sl);
             if (wr != TDB_SUCCESS) rc = wr;
             skip_list_free(splits[i].temp_sl);
         }
@@ -27727,11 +27755,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     /* with the unified path, we do single WAL + single skip list */
     if (txn->db->unified_mt.enabled)
     {
-        /* apply backpressure before acquiring the unified memtable reference. a
-         * writer that stalls in apply_backpressure must not be holding
-         * umt->refcount -- tidesdb_unified_flush_immutable drains that refcount
-         * before flushing, so a stalled writer would block the flush, the flush
-         * would never drain the immutable queue, and the stall would never end */
         for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
         {
             result = tidesdb_apply_backpressure(txn->cfs[cf_idx]);
@@ -27928,7 +27951,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
     }
 
-    /* apply backpressure before acquiring any memtable reference. a writer that
+    /* we apply backpressure before acquiring any memtable reference. a writer that
      * stalls in apply_backpressure must not hold a memtable writers/refcount --
      * the flush worker drains an immutable's writers before flushing it, so a
      * stalled writer holding a rotated memtable would block the flush, the flush
@@ -29226,7 +29249,7 @@ static void tidesdb_iter_clear_lazy(tidesdb_merge_source_t *source)
  * evicts the oldest entry if both slots are full.
  */
 static void tidesdb_iter_stash_block(tidesdb_merge_source_t *source, tidesdb_klog_block_t *block,
-                                     clock_cache_entry_t *pin, uint64_t position)
+                                     clock_cache_entry_t *pin, const uint64_t position)
 {
     /* we find an empty slot, or evict slot 0 (shift slot 1 down) */
     int slot = -1;
@@ -30459,8 +30482,6 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
  */
 static int tidesdb_iter_find_visible_entry(tidesdb_iter_t *iter, const int direction)
 {
-    /** we rebuild heap -- optimized for small source counts (common after compaction).
-     *  with 1-2 sources a simple comparison is O(1) vs O(N) full heapify. */
     const int ns = iter->heap->num_sources;
     if (ns <= 1)
     {
@@ -31145,7 +31166,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
         return TDB_ERR_NOT_FOUND;
     }
 
-    tidesdb_kv_pair_t *max_kv = iter->heap->sources[0]->current_kv;
+    const tidesdb_kv_pair_t *max_kv = iter->heap->sources[0]->current_kv;
     const size_t max_key_size = max_kv->entry.key_size;
 
     /*** we copy the max key to a local buffer before calling seek_for_prev.
@@ -31528,7 +31549,7 @@ static void tidesdb_recover_single_wal(tidesdb_column_family_t *cf, char *wal_pa
     if (queue_enqueue(cf->immutable_memtables, imm) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to enqueue recovered memtable", cf->name);
-        tidesdb_immutable_memtable_unref(imm);
+        (void)tidesdb_immutable_memtable_unref(imm);
         free(wal_path);
         return;
     }
@@ -31842,9 +31863,7 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
             /*** the freshly created CF only has its initial levels, but the
              **  MANIFEST can reference deeper ones produced by compaction. we
              *   materialise every level up to the deepest the MANIFEST names
-             **  before adding sstables -- otherwise L2+ entries fail the
-             *** level_idx < num_active_levels check below and are silently
-             **  dropped, losing all data that compaction had pushed down. */
+             **  before adding sstables */
             int max_manifest_level = 1;
             for (int i = 0; i < manifest_count; i++)
             {
@@ -31854,7 +31873,7 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
             for (int lvl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
                  lvl < max_manifest_level && lvl < TDB_MAX_LEVELS; lvl++)
             {
-                size_t lvl_capacity = tidesdb_calculate_level_capacity(
+                const size_t lvl_capacity = tidesdb_calculate_level_capacity(
                     lvl + 1, cf->config.write_buffer_size, cf->config.level_size_ratio);
                 cf->levels[lvl] = tidesdb_level_create(lvl + 1, lvl_capacity);
                 if (!cf->levels[lvl]) break;
@@ -32184,7 +32203,7 @@ static int tidesdb_unified_wal_replay_into(tidesdb_t *db, block_manager_t *wal, 
             /* we check and skip the unified magic prefix */
             if (remaining >= TDB_UNIFIED_WAL_MAGIC_SIZE)
             {
-                uint16_t magic = ((uint16_t)ptr[0] << 8) | ptr[1];
+                const uint16_t magic = ((uint16_t)ptr[0] << 8) | ptr[1];
                 if (magic == TDB_UNIFIED_WAL_MAGIC)
                 {
                     ptr += TDB_UNIFIED_WAL_MAGIC_SIZE;
@@ -33473,7 +33492,7 @@ static int tidesdb_backup_sstable_in_manifest(const tidesdb_column_family_t *cf,
  */
 static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
 {
-    FILE *src = tdb_fopen(src_path, "rb");
+    FILE *src = tdb_fopen(src_path, TDB_BUP_CPY_FILE_SRC_MODE);
     if (!src)
     {
         /*** ENOENT      file was deleted between readdir/stat and fopen
@@ -33483,7 +33502,7 @@ static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
         return TDB_ERR_IO;
     }
 
-    FILE *dst = tdb_fopen(dst_path, "wb");
+    FILE *dst = tdb_fopen(dst_path, TDB_BUP_CPY_FILE_DST_MODE);
     if (!dst)
     {
         fclose(src);
@@ -33915,9 +33934,10 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
              * worker draining a just-rotated immutable cannot free the struct
              * between our load and the skip_list deref */
             tidesdb_memtable_t *mt = NULL;
-            int mt_pinned =
+            const int mt_pinned =
                 tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt);
-            int empty = !mt_pinned || !mt->skip_list || skip_list_count_entries(mt->skip_list) == 0;
+            const int empty =
+                !mt_pinned || !mt->skip_list || skip_list_count_entries(mt->skip_list) == 0;
             if (mt_pinned) tidesdb_immutable_memtable_unref(mt);
             if (empty) break;
 

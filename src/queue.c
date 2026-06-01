@@ -189,20 +189,28 @@ int queue_enqueue(queue_t *queue, void *data)
     /* we only lock tail for enqueue -- the head operations are independent */
     pthread_mutex_lock(&queue->tail_lock);
 
+    /* bump size BEFORE publishing the node. if we published first, a concurrent
+     * dequeue could observe the node and decrement size before this increment,
+     * transiently underflowing the unsigned counter to SIZE_MAX. incrementing
+     * first means size can only briefly over-count (node not yet visible), which
+     * is the safe direction for an approximate counter. */
+    atomic_fetch_add_explicit(&queue->size, 1, memory_order_release);
+
     /* release publish -- node->data and node->next above must be visible to
      * any consumer that acquire-loads this next pointer under head_lock */
     atomic_store_explicit(&queue->tail->next, node, memory_order_release);
     queue->tail = node;
 
-    /* we check if we need to signal before releasing lock */
-    const size_t old_size = atomic_fetch_add_explicit(&queue->size, 1, memory_order_release);
     const int has_waiters = atomic_load_explicit(&queue->waiter_count, memory_order_acquire) > 0;
 
     pthread_mutex_unlock(&queue->tail_lock);
 
-    /* we signal outside lock to reduce lock hold time
-     * only signal if queue was empty and there are waiters */
-    if (old_size == 0 && has_waiters)
+    /* signal one waiter per enqueued item whenever any thread is blocked. signaling
+     * only on the empty->non-empty transition loses wakeups under multiple waiters:
+     * a burst of items past the first leaves later waiters asleep until the 100ms
+     * poll, serializing what should be a parallel wakeup. we signal outside the
+     * tail_lock to keep its hold time short. */
+    if (has_waiters)
     {
         pthread_mutex_lock(&queue->head_lock);
         pthread_cond_signal(&queue->not_empty);
@@ -540,9 +548,12 @@ void *queue_peek_at(queue_t *queue, const size_t index)
     return data;
 }
 
-size_t queue_snapshot(queue_t *queue, void **out, size_t max_items)
+size_t queue_snapshot(queue_t *queue, void **out, const size_t max_items)
 {
-    if (QUEUE_UNLIKELY(!queue || !out || max_items == 0)) return 0;
+    if (QUEUE_UNLIKELY(!queue || max_items == 0)) return 0;
+    /* out is indexed below; keep its null-check as its own plain statement so
+     * static analysis carries the non-null fact into the loop */
+    if (out == NULL) return 0;
 
     pthread_rwlock_rdlock(&queue->read_lock);
 

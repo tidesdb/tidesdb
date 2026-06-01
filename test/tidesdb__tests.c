@@ -11379,7 +11379,16 @@ static void test_cf_rename_during_active_compaction(void)
             ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                       strlen(value) + 1, -1),
                       TDB_SUCCESS);
-            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            /* on a slow runner the flush can fall behind, so commit returns the retryable
+             * TDB_ERR_BUSY (active-memtable ceiling backpressure) -- retry until it lands rather
+             * than treating intentional backpressure as a failure */
+            int rc = tidesdb_txn_commit(txn);
+            while (rc == TDB_ERR_BUSY)
+            {
+                usleep(1000);
+                rc = tidesdb_txn_commit(txn);
+            }
+            ASSERT_EQ(rc, TDB_SUCCESS);
             tidesdb_txn_free(txn);
         }
 

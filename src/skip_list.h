@@ -646,7 +646,7 @@ int skip_list_cursor_at_start(skip_list_cursor_t *cursor);
  * @param cursor cursor
  * @return 1 if at end, 0 if not, -1 on error
  */
-int skip_list_cursor_at_end(skip_list_cursor_t *cursor);
+int skip_list_cursor_at_end(const skip_list_cursor_t *cursor);
 
 /**
  * skip_list_cursor_has_next
@@ -724,7 +724,7 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
  * @param cursor cursor
  * @return 1 if valid, 0 if not, -1 on error
  */
-int skip_list_cursor_valid(skip_list_cursor_t *cursor);
+int skip_list_cursor_valid(const skip_list_cursor_t *cursor);
 
 /**
  * skip_list_clear

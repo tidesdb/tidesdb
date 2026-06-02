@@ -22368,7 +22368,11 @@ static void *multi_cf_writer_thread(void *arg)
             tidesdb_txn_delete(txn, d->idx_cf, (uint8_t *)old_idx, strlen(old_idx) + 1);
         }
 
-        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
+        /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
+         * flushers/compaction), not a failure -- the txn simply did not commit. only real
+         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+        const int crc = tidesdb_txn_commit(txn);
+        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -23411,7 +23415,11 @@ static void *mcf_iter_mut_writer_thread(void *arg)
         tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val, strlen(val) + 1,
                         0);
 
-        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
+        /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
+         * flushers/compaction), not a failure -- the txn simply did not commit. only real
+         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+        const int crc = tidesdb_txn_commit(txn);
+        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -23654,7 +23662,11 @@ static void *mcf_churn_writer_thread(void *arg)
         tidesdb_txn_put(txn, d->stable_b, (uint8_t *)key_b, strlen(key_b) + 1, (uint8_t *)val,
                         strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
+        /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
+         * flushers/compaction), not a failure -- the txn simply did not commit. only real
+         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+        const int crc = tidesdb_txn_commit(txn);
+        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -23818,7 +23830,11 @@ static void *mcf_iso_writer_thread(void *arg)
         tidesdb_txn_put(txn, d->cf_y, (uint8_t *)key_y, strlen(key_y) + 1, (uint8_t *)val,
                         strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) != 0) atomic_fetch_add(d->errors, 1);
+        /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
+         * flushers/compaction), not a failure -- the txn simply did not commit. only real
+         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+        const int crc = tidesdb_txn_commit(txn);
+        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;

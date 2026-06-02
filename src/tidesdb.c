@@ -442,7 +442,12 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 /* sstable reaper eviction sentinel -- set on refcount during block manager close
  * to prevent concurrent try_ref from acquiring a reference on an evicting sstable */
 #define TDB_REFCOUNT_EVICTING (-1)
-#define TDB_EVICT_SPIN_MAX    1024 /* max cpu_pause spins waiting for eviction to finish */
+#define TDB_EVICT_WAIT_MAX                                                \
+    8192 /* max escalating-backoff iters waiting out a transient reaper   \
+          * eviction before giving up. a normal block_manager_close       \
+          * clears in microseconds; the >YIELD_THRESHOLD tail sleeps      \
+          * ~10us each, capping the wait near 70ms -- far longer than any \
+          * close, so a live evicting sstable is always waited out. */
 
 /* time conversion constants for pthread_cond_timedwait */
 #define TDB_MICROSECONDS_PER_SECOND     1000000
@@ -1712,7 +1717,7 @@ static int wait_for_open(tidesdb_t *db);
  * either way the merge discards its uncommitted output and leaves inputs intact, so
  * abort is safe. acquire pairs with the release stores in
  * tidesdb_drop_column_family_internal and tidesdb_cancel_background_work.
- * NOTE: flush checkpoints deliberately do NOT use this -- they check
+ * NOTE: flush checkpoints deliberately do not use this -- they check
  * marked_for_deletion directly so a cancel never aborts an in-flight flush (flushes
  * are the durability path and always complete).
  * @param cf column family
@@ -5723,8 +5728,9 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
  * current generation from the highest discovered WAL. sequence numbers ensure
  * idempotent replay -- entries already covered by recovered sstables are skipped.
  * @param db database instance with an object store and a unified memtable
+ * @param cold_start 1 when called from cold-start recovery, 0 from the sync thread (log prefix)
  */
-static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
+static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start)
 {
     if (!db->unified_mt.enabled || !db->object_store)
     {
@@ -5801,6 +5807,7 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
      * seq already applied, so derive it by subtracting one (clamped at 0) */
     uint64_t cur_global = atomic_load_explicit(&db->global_seq, memory_order_acquire);
     uint64_t max_seq = cur_global > 0 ? cur_global - 1 : 0;
+    const uint64_t start_max_seq = max_seq;
     int total_replayed = 0;
 
     for (int wi = 0; wi < discovery.count; wi++)
@@ -5817,7 +5824,7 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
 
     /* max_seq is the highest seq applied; global_seq is the next seq to assign, so it
      * must reach max_seq + 1. comparing max_seq directly leaves a replica that is one
-     * step behind stuck: global_seq never advances, the read snapshot (global_seq - 1)
+     * step behind stuck, global_seq never advances, the read snapshot (global_seq - 1)
      * stays below the newest entry, and just-replayed rows stay invisible while the
      * replay re-applies the same tail every tick. */
     const uint64_t next_seq = max_seq + 1;
@@ -5826,11 +5833,14 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db)
         atomic_store_explicit(&db->global_seq, next_seq, memory_order_release);
     }
 
-    if (total_replayed > 0)
+    /* the boundary entry at seq == start_max_seq is re-applied every tick (idempotent), so
+     * total_replayed alone is not progress -- log only when max_seq actually advanced. */
+    if (max_seq > start_max_seq)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "Replica WAL replay %d new entries across %d WALs (max_seq=%" PRIu64 ")",
-                      total_replayed, discovery.count, max_seq);
+                      "%s Replica WAL replay advanced to max_seq=%" PRIu64 " (%d entries, %d WALs)",
+                      cold_start ? "[cold-start]" : "[sync]", max_seq, total_replayed,
+                      discovery.count);
     }
 }
 
@@ -6540,10 +6550,18 @@ static int tidesdb_sstable_try_ref(tidesdb_sstable_t *sst)
         }
         else
         {
-            /* negative refcount means reaper is evicting block managers
-             * spin briefly -- the reaper will restore refcount after close */
-            if (++evict_spins > TDB_EVICT_SPIN_MAX) return 0;
-            cpu_pause();
+            /* reaper is closing a still-live sstable's block managers
+             * and restores the refcount when done. wait it out with escalating backoff --
+             * returning 0 here is indistinguishable from a freed sstable and would make a
+             * reader skip a present sstable (false NOT_FOUND). bounded close is microseconds. */
+            if (++evict_spins < TDB_REFCOUNT_DRAIN_SPIN_THRESHOLD)
+                cpu_pause();
+            else if (evict_spins < TDB_REFCOUNT_DRAIN_YIELD_THRESHOLD)
+                cpu_yield();
+            else if (evict_spins < TDB_EVICT_WAIT_MAX)
+                usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
+            else
+                return 0; /* reaper stuck far past any close -- caller backs off and retries */
             old_refcount = atomic_load_explicit(&sst->refcount, memory_order_acquire);
         }
     }
@@ -19059,7 +19077,7 @@ static void *tidesdb_replica_sync_thread(void *arg)
         tdb_replica_sync_manifests(db);
         if (db->config.object_store_config && db->config.object_store_config->replica_replay_wal)
         {
-            tdb_objstore_replay_remote_wals(db);
+            tdb_objstore_replay_remote_wals(db, 0);
         }
     }
 
@@ -21743,7 +21761,7 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
         if (db->unified_mt.enabled && db->config.object_store_config &&
             db->config.object_store_config->replica_replay_wal)
         {
-            tdb_objstore_replay_remote_wals(db);
+            tdb_objstore_replay_remote_wals(db, 0);
         }
     }
 
@@ -21881,6 +21899,8 @@ static int tidesdb_unimap_load(tidesdb_t *db)
 
     pthread_mutex_lock(&db->unified_mt.cf_index_map_lock);
 
+    const int prev_count = db->unified_mt.cf_index_map_count;
+
     /* a reload (replica re-sync) starts from a clean map */
     free(db->unified_mt.cf_index_map);
     db->unified_mt.cf_index_map = NULL;
@@ -21952,8 +21972,10 @@ static int tidesdb_unimap_load(tidesdb_t *db)
         atomic_store_explicit(&db->unified_mt.next_cf_index, max_index + 1, memory_order_relaxed);
     }
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Loaded UNIMAP with %d column family index entries",
-                  db->unified_mt.cf_index_map_count);
+    /* steady-state replica re-syncs reload an unchanged map every tick -- log only on a change */
+    if (db->unified_mt.cf_index_map_count != prev_count)
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Loaded UNIMAP with %d column family index entries",
+                      db->unified_mt.cf_index_map_count);
     pthread_mutex_unlock(&db->unified_mt.cf_index_map_lock);
     return TDB_SUCCESS;
 }
@@ -25628,10 +25650,12 @@ unified_sst_search:;
                     goto retry_level;
                 }
 
-                /*** array unchanged, thus we skip dead sstable
-                 **  this prevents livelock under heavy compaction
-                 *   the merged result is accessible at this or deeper levels */
-                continue;
+                /* array unchanged but try_ref failed -- the sstable is still live in this level
+                 * (a removal swaps the array first, caught above), so this is a transient reaper
+                 * eviction. it may hold the sole copy of the key; back off retryably, never skip.
+                 */
+                scan_error = TDB_ERR_BUSY;
+                break;
             }
 
             /** we use per-sstable max_seq as upper bound, essentially if the highest seq in this
@@ -32828,7 +32852,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Cold start replaying remote WALs from object store for CF recovery");
-        tdb_objstore_replay_remote_wals(db);
+        tdb_objstore_replay_remote_wals(db, 1);
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Database recovery completed successfully");

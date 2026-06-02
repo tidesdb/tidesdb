@@ -359,10 +359,13 @@ void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t seq
     if (!manifest) return;
 
     /* monotonic guard, the sequence seeds next_sstable_id on recovery, so it must never
-     * regress or recovery would re-hand-out live sstable ids and collide. only advance.
-     * (best-effort under concurrency; this API is not on a hot path.) */
-    const uint64_t cur = atomic_load(&manifest->sequence);
-    if (sequence > cur) atomic_store(&manifest->sequence, sequence);
+     * regress or recovery would re-hand-out live sstable ids and collide. cas loop so a
+     * concurrent larger store is never clobbered by a smaller one. */
+    uint64_t cur = atomic_load(&manifest->sequence);
+    while (sequence > cur && !atomic_compare_exchange_weak(&manifest->sequence, &cur, sequence))
+    {
+        /* cur reloaded with the live value on failure; loop re-checks sequence > cur */
+    }
 }
 
 int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)

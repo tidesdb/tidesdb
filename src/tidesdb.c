@@ -3999,11 +3999,20 @@ static int tidesdb_klog_block_seek_raw(const uint8_t *data, const size_t data_si
         const uint32_t hdr_size = decode_uint32_le_compat(data + 4);
         const uint32_t idx_count = decode_uint32_le_compat(data + 8);
 
-        if (idx_count == 0 || hdr_size >= data_size) return -1;
+        /* the index header + entry offsets are on-disk values. a malformed (but checksum
+         * valid) block must not drive an out-of-bounds read on this hot indexed path, so
+         * validate the header geometry once and each entry's key offset before use. */
+        if (idx_count == 0 || hdr_size >= data_size || hdr_size < TDB_BLOCK_INDEX_HDR_BASE)
+            return -1;
 
         const uint8_t *idx_base = data + TDB_BLOCK_INDEX_HDR_BASE;
         const uint8_t *bdata = data + hdr_size;
         const size_t bdata_size = data_size - hdr_size;
+
+        /* the idx_count entries must fit in the header region [HDR_BASE, hdr_size) */
+        if ((uint64_t)idx_count * TDB_BLOCK_INDEX_ENTRY_STRIDE >
+            (uint64_t)(hdr_size - TDB_BLOCK_INDEX_HDR_BASE))
+            return -1;
 
         if (out_num_entries) *out_num_entries = idx_count;
 
@@ -4015,6 +4024,7 @@ static int tidesdb_klog_block_seek_raw(const uint8_t *data, const size_t data_si
             const uint8_t *ie = idx_base + mid * TDB_BLOCK_INDEX_ENTRY_STRIDE;
             const uint32_t k_off = decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_OFF);
             const uint32_t k_sz = decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_SIZE);
+            if (k_off > bdata_size || k_sz > bdata_size - k_off) return -1;
             const int cmp =
                 comparator_fn(bdata + k_off, k_sz, target_key, target_key_size, comparator_ctx);
             if (cmp >= 0)
@@ -4040,6 +4050,7 @@ static int tidesdb_klog_block_seek_raw(const uint8_t *data, const size_t data_si
         const uint32_t sq_hi = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_HI);
 
         /* we parse flags, key_size, value_size from the entry data */
+        if (e_off >= bdata_size) return -2; /* else bdata_size - e_off wraps below */
         const uint8_t *eptr = bdata + e_off;
         size_t erem = bdata_size - e_off;
         if (erem < 1) return -2;
@@ -4086,11 +4097,14 @@ static int tidesdb_klog_block_seek_raw(const uint8_t *data, const size_t data_si
             out_entry->vlog_offset = vlog_off;
         }
 
+        /* validate the matched key/value offsets before forming pointers into the block */
+        if (mk_off > bdata_size || mk_sz > bdata_size - mk_off) return -2;
+        const int inline_val = !(flags & TDB_KV_FLAG_HAS_VLOG) && vs > 0;
+        if (inline_val && vs > bdata_size - mk_off - mk_sz) return -2;
         *out_key = bdata + mk_off;
         if (out_value)
         {
-            *out_value =
-                (!(flags & TDB_KV_FLAG_HAS_VLOG) && vs > 0) ? bdata + mk_off + mk_sz : NULL;
+            *out_value = inline_val ? bdata + mk_off + mk_sz : NULL;
         }
         return 0;
     }
@@ -12183,7 +12197,9 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                     const uint32_t sq_lo = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_LO);
                     const uint32_t sq_hi = decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_HI);
 
-                    if (e_off < bdata_size)
+                    /* validate the index-sourced offsets against the block before use; a
+                     * malformed entry falls through to clear-lazy + advance (skips the block) */
+                    if (e_off < bdata_size && mk_off <= bdata_size && mk_sz <= bdata_size - mk_off)
                     {
                         const uint8_t *eptr = bdata + e_off;
                         size_t erem = bdata_size - e_off;
@@ -12239,16 +12255,20 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                         }
                         else
                         {
+                            /* the inline value sits at [mk_off+mk_sz, +vs); if vs runs past the
+                             * block (malformed) treat it as empty rather than over-read */
+                            const int val_ok = vs <= bdata_size - mk_off - mk_sz;
                             tidesdb_kv_pair_t *ikv = &source->inline_kv;
                             ikv->entry.flags =
                                 (flags & TDB_KV_TOMBSTONE_FLAG_MASK) | TDB_KV_FLAG_BORROWED;
                             ikv->entry.key_size = mk_sz;
-                            ikv->entry.value_size = (uint32_t)vs;
+                            ikv->entry.value_size = val_ok ? (uint32_t)vs : 0;
                             ikv->entry.seq = abs_seq;
                             ikv->entry.ttl = ttl;
                             ikv->entry.vlog_offset = 0;
                             ikv->key = (uint8_t *)key_ptr;
-                            ikv->value = (vs > 0) ? (uint8_t *)(bdata + mk_off + mk_sz) : NULL;
+                            ikv->value =
+                                (vs > 0 && val_ok) ? (uint8_t *)(bdata + mk_off + mk_sz) : NULL;
                             source->current_kv = ikv;
                         }
 
@@ -12439,7 +12459,8 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                 const uint32_t sq_hi =
                                     decode_uint32_le_compat(fie + TDB_BLOCK_IDX_SEQ_HI);
 
-                                if (e_off < bdata_size)
+                                if (e_off < bdata_size && mk_off <= bdata_size &&
+                                    mk_sz <= bdata_size - mk_off)
                                 {
                                     const uint8_t *eptr = bdata + e_off;
                                     size_t erem = bdata_size - e_off;
@@ -12492,17 +12513,19 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                                     }
                                     else
                                     {
+                                        const int val_ok = vs <= bdata_size - mk_off - mk_sz;
                                         tidesdb_kv_pair_t *ikv = &source->inline_kv;
                                         ikv->entry.flags = (flags & TDB_KV_TOMBSTONE_FLAG_MASK) |
                                                            TDB_KV_FLAG_BORROWED;
                                         ikv->entry.key_size = mk_sz;
-                                        ikv->entry.value_size = (uint32_t)vs;
+                                        ikv->entry.value_size = val_ok ? (uint32_t)vs : 0;
                                         ikv->entry.seq = abs_seq;
                                         ikv->entry.ttl = ttl;
                                         ikv->entry.vlog_offset = 0;
                                         ikv->key = (uint8_t *)key_ptr;
-                                        ikv->value =
-                                            (vs > 0) ? (uint8_t *)(bdata + mk_off + mk_sz) : NULL;
+                                        ikv->value = (vs > 0 && val_ok)
+                                                         ? (uint8_t *)(bdata + mk_off + mk_sz)
+                                                         : NULL;
                                         source->current_kv = ikv;
                                     }
 
@@ -29844,6 +29867,7 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
         const uint8_t *idx_base = source->source.sstable.lazy.idx_base;
         const uint32_t idx_count = source->source.sstable.lazy.idx_count;
         const uint8_t *bdata = source->source.sstable.lazy.block_data;
+        const size_t bdata_size = source->source.sstable.lazy.block_data_size;
 
         const uint8_t *first_ie = idx_base;
         const uint32_t fk_off = decode_uint32_le_compat(first_ie + TDB_BLOCK_IDX_KEY_OFF);
@@ -29852,10 +29876,15 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
         const uint32_t lk_off = decode_uint32_le_compat(last_ie + TDB_BLOCK_IDX_KEY_OFF);
         const uint32_t lk_sz = decode_uint32_le_compat(last_ie + TDB_BLOCK_IDX_KEY_SIZE);
 
-        const int cmp_first = comparator_fn(bdata + fk_off, fk_sz, key, key_size, comparator_ctx);
-        const int cmp_last = comparator_fn(bdata + lk_off, lk_sz, key, key_size, comparator_ctx);
+        /* validate the first/last key offsets before comparing into the block */
+        const int range_ok = fk_off <= bdata_size && fk_sz <= bdata_size - fk_off &&
+                             lk_off <= bdata_size && lk_sz <= bdata_size - lk_off;
+        const int cmp_first =
+            range_ok ? comparator_fn(bdata + fk_off, fk_sz, key, key_size, comparator_ctx) : 1;
+        const int cmp_last =
+            range_ok ? comparator_fn(bdata + lk_off, lk_sz, key, key_size, comparator_ctx) : -1;
 
-        if (cmp_first <= 0 && cmp_last >= 0)
+        if (range_ok && cmp_first <= 0 && cmp_last >= 0)
         {
             /* target is within this lazy block, thus we utilize binary search via block index */
             int32_t left = 0, right = (int32_t)idx_count - 1, found = -1;
@@ -29865,6 +29894,7 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
                 const uint8_t *ie = idx_base + mid * TDB_BLOCK_INDEX_ENTRY_STRIDE;
                 const uint32_t k_off = decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_OFF);
                 const uint32_t k_sz = decode_uint32_le_compat(ie + TDB_BLOCK_IDX_KEY_SIZE);
+                if (k_off > bdata_size || k_sz > bdata_size - k_off) break;
                 const int cmp = comparator_fn(bdata + k_off, k_sz, key, key_size, comparator_ctx);
                 if (cmp >= 0)
                 {

@@ -149,10 +149,13 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
 
         if (SKIP_LIST_LIKELY(block != NULL))
         {
-            size_t used = block->used;
+            /* a thread-local block is owned by exactly one thread (this slot) and its
+             * `used` is never read by arena destroy, so relaxed is sufficient -- this
+             * drops two seq_cst fences from the hottest allocation path */
+            size_t used = atomic_load_explicit(&block->used, memory_order_relaxed);
             if (SKIP_LIST_LIKELY(used + size <= block->capacity))
             {
-                block->used = used + size;
+                atomic_store_explicit(&block->used, used + size, memory_order_relaxed);
                 return block->data + used;
             }
         }
@@ -165,7 +168,7 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
         skip_list_arena_block_t *new_block = skip_list_arena_create_block(new_cap);
         if (new_block == NULL) return NULL;
 
-        new_block->used = size;
+        atomic_store_explicit(&new_block->used, size, memory_order_relaxed);
         atomic_store_explicit(&arena->tl_blocks[slot], new_block, memory_order_relaxed);
         skip_list_arena_register_block(arena, new_block);
 
@@ -927,7 +930,7 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int 
 
 int skip_list_new_with_arena(skip_list_t **list, const int max_level, const float probability,
                              skip_list_comparator_fn comparator, void *comparator_ctx,
-                             _Atomic(time_t) *cached_time, size_t arena_initial_capacity)
+                             _Atomic(time_t) *cached_time, const size_t arena_initial_capacity)
 {
     if (arena_initial_capacity == 0)
     {
@@ -980,15 +983,21 @@ int skip_list_random_level(const skip_list_t *list)
         if (rng_state == 0) rng_state = 1; /* ensure non-zero */
     }
 
-    const uint64_t rnd = skip_list_xorshift64star(&rng_state);
+    /* geometric level distribution for the configured probability where we promote a level
+     * while a fresh uniform draw stays below p. averages ~1/(1-p) draws (~1.33 at
+     * p=0.25), each a cheap xorshift + compare. */
+    const double p = (double)list->probability;
+    int level = 0;
+    while (level < list->max_level)
+    {
+        const uint64_t rnd = skip_list_xorshift64star(&rng_state);
+        /* top 53 bits -> uniform double in [0, 1) */
+        const double u = (double)(rnd >> 11) * (1.0 / 9007199254740992.0);
+        if (u >= p) break;
+        level++;
+    }
 
-    /* geometric distribution via trailing zeros
-     * for p=0.25, we need ~2 bits per level on average
-     ** TDB_CTZ64 counts trailing zeros, giving geometric distribution
-     *** we divide by 2 to approximate p=0.25 (each level requires ~2 zero bits) */
-    const int level = TDB_CTZ64(rnd | (1ULL << 62)) >> 1;
-
-    return level < list->max_level ? level : list->max_level;
+    return level;
 }
 
 int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t key1_size,
@@ -1397,35 +1406,33 @@ int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size)
     return 0;
 }
 
+static skip_list_node_t *skip_list_predecessor(const skip_list_t *list, skip_list_node_t *header,
+                                               const uint8_t *key, size_t key_size);
+
 int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
 {
     if (list == NULL || key == NULL || key_size == NULL) return -1;
 
-    /* O(1) access to last node using backward pointer from tail */
-    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
-    skip_list_node_t *current =
-        atomic_load_explicit(&BACKWARD_PTR(tail, 0, tail->level), memory_order_acquire);
-
-    if (current == NULL || NODE_IS_SENTINEL(current)) return -1;
-
-    /* we scan backwards to find last valid (non-deleted, non-expired) entry */
-    const int64_t current_time = skip_list_get_current_time(list);
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    while (current != NULL && current != header)
+
+    /* forward-reseek the last node, then step back via forward search (not the
+     * stale-prone backward pointers) until a valid (non-deleted, non-expired)
+     * entry or the header */
+    const int64_t current_time = skip_list_get_current_time(list);
+    skip_list_node_t *current = skip_list_predecessor(list, header, NULL, 0);
+    while (current != header && !NODE_IS_SENTINEL(current))
     {
         skip_list_version_t *version =
             atomic_load_explicit(&current->versions, memory_order_acquire);
         if (!skip_list_version_is_invalid_with_time(version, current_time))
         {
-            /* we found valid entry */
             *key = (uint8_t *)malloc(current->key_size);
             if (*key == NULL) return -1;
             memcpy(*key, current->key, current->key_size);
             *key_size = current->key_size;
             return 0;
         }
-        current =
-            atomic_load_explicit(&BACKWARD_PTR(current, 0, current->level), memory_order_acquire);
+        current = skip_list_predecessor(list, header, current->key, current->key_size);
     }
 
     return -1;
@@ -1452,7 +1459,7 @@ void skip_list_cursor_free(skip_list_cursor_t *cursor)
     if (cursor != NULL) free(cursor);
 }
 
-int skip_list_cursor_valid(skip_list_cursor_t *cursor)
+int skip_list_cursor_valid(const skip_list_cursor_t *cursor)
 {
     if (cursor == NULL || cursor->current == NULL) return -1;
     return (cursor->current != cursor->cached_header && cursor->current != cursor->cached_tail) ? 1
@@ -1484,28 +1491,70 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor)
     return 0;
 }
 
+/**
+ * skip_list_predecessor
+ * forward-searches for the last node whose key is strictly less than `key`, or for
+ * the last node in the list when key == NULL. used for reverse navigation unlike
+ * the per-node backward pointers (which are maintained best-effort and can be left
+ * stale by concurrent inserts, so a backward walk may skip nodes), forward[0] is the
+ * linearizable structure, so this is always complete.
+ * @return the predecessor node, or the header sentinel when none exists
+ */
+static skip_list_node_t *skip_list_predecessor(const skip_list_t *list, skip_list_node_t *header,
+                                               const uint8_t *key, const size_t key_size)
+{
+    const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
+    const skip_list_cmp_type_t cmp_type = list->cmp_type;
+    skip_list_node_t *pred = header;
+    for (int i = max_level; i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&pred->forward[i], memory_order_acquire);
+        while (next != NULL && !NODE_IS_SENTINEL(next) &&
+               (key == NULL || skip_list_compare_keys_with_type(cmp_type, list, next->key,
+                                                                next->key_size, key, key_size) < 0))
+        {
+            pred = next;
+            next = atomic_load_explicit(&pred->forward[i], memory_order_acquire);
+        }
+    }
+    return pred;
+}
+
 int skip_list_cursor_prev(skip_list_cursor_t *cursor)
 {
     if (cursor == NULL || cursor->current == NULL) return -1;
     if (cursor->current == cursor->cached_header) return -1;
 
-    cursor->current = atomic_load_explicit(
-        &BACKWARD_PTR(cursor->current, 0, cursor->current->level), memory_order_acquire);
-    cursor->current_version = NULL;
-    if (cursor->current == NULL || cursor->current == cursor->cached_header) return -1;
+    skip_list_node_t *cur = cursor->current;
 
-    /* we prefetch backward neighbor and version for the current node.
-     * acquire (not relaxed) -- prev is dereferenced below so it must
-     * synchronize with the release store that published it */
-    skip_list_node_t *prev = atomic_load_explicit(
-        &BACKWARD_PTR(cursor->current, 0, cursor->current->level), memory_order_acquire);
-    if (prev && !NODE_IS_SENTINEL(prev))
+    /* the backward pointer is a HINT, trusted only when the forward
+     * list confirms it -- H is cur's true predecessor iff H->forward[0] == cur, and
+     * forward[0] is the linearizable source of truth. this keeps reverse steps O(1)
+     * when the hint is fresh (the common case) while a stale/NULL backward pointer,
+     * which a concurrent insert can leave behind, falls through to the reseek. */
+    skip_list_node_t *hint =
+        atomic_load_explicit(&BACKWARD_PTR(cur, 0, cur->level), memory_order_acquire);
+    if (hint != NULL && atomic_load_explicit(&hint->forward[0], memory_order_acquire) == cur)
     {
-        PREFETCH_READ(prev);
-        PREFETCH_READ(prev->key);
+        cursor->current = hint;
+        cursor->current_version = NULL;
+        if (hint == cursor->cached_header) return -1;
+        PREFETCH_READ(&hint->versions);
+        return 0;
     }
-    PREFETCH_READ(&cursor->current->versions);
 
+    /* slow path -- forward-reseek the predecessor (always complete). when cur is the
+     * tail, the predecessor of "+infinity" is the last node (key == NULL). */
+    skip_list_node_t *pred =
+        (cur == cursor->cached_tail)
+            ? skip_list_predecessor(cursor->list, cursor->cached_header, NULL, 0)
+            : skip_list_predecessor(cursor->list, cursor->cached_header, cur->key, cur->key_size);
+
+    cursor->current = pred;
+    cursor->current_version = NULL;
+    if (pred == cursor->cached_header) return -1;
+
+    PREFETCH_READ(&pred->versions);
     return 0;
 }
 
@@ -1662,7 +1711,7 @@ int skip_list_cursor_at_start(skip_list_cursor_t *cursor)
     return (cursor->current == first) ? 1 : 0;
 }
 
-int skip_list_cursor_at_end(skip_list_cursor_t *cursor)
+int skip_list_cursor_at_end(const skip_list_cursor_t *cursor)
 {
     if (cursor == NULL) return -1;
     return (cursor->current == cursor->cached_tail) ? 1 : 0;
@@ -1690,11 +1739,19 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor)
 {
     if (cursor == NULL) return -1;
 
-    /* O(1) using backward pointer from tail */
-    skip_list_node_t *last = atomic_load_explicit(
-        &BACKWARD_PTR(cursor->cached_tail, 0, cursor->cached_tail->level), memory_order_acquire);
+    /* fast verified hint where the last node L satisfies L->forward[0] == tail.
+     * we trust the tail's backward pointer only when forward confirms it; otherwise
+     * forward-reseek the last node (predecessor of "+infinity"). */
+    skip_list_node_t *tail = cursor->cached_tail;
+    skip_list_node_t *last =
+        atomic_load_explicit(&BACKWARD_PTR(tail, 0, tail->level), memory_order_acquire);
+    if (last == NULL || last == cursor->cached_header ||
+        atomic_load_explicit(&last->forward[0], memory_order_acquire) != tail)
+    {
+        last = skip_list_predecessor(cursor->list, cursor->cached_header, NULL, 0);
+    }
 
-    if (last == NULL || NODE_IS_SENTINEL(last)) return -1;
+    if (last == cursor->cached_header || NODE_IS_SENTINEL(last)) return -1;
 
     cursor->current = last;
     cursor->current_version = NULL;
@@ -1724,7 +1781,7 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
  * callers must call skip_list_cursor_next() or similar to access the actual target key.
  * this behavior allows efficient insertion and supports both exact matches and range queries.
  */
-int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
+int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, const size_t key_size)
 {
     if (cursor == NULL || key == NULL || key_size == 0) return -1;
 
@@ -2250,7 +2307,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         skip_list_node_t *current;
         if (!use_hint)
         {
-            /* unsorted or first entry -- reset to header */
+            /* unsorted or first entry -- we reset to header */
             for (int i = 0; i <= list->max_level; i++)
             {
                 update[i] = header;
@@ -2555,7 +2612,8 @@ int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, const size_t ke
 int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t key_size,
                            uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted,
                            uint64_t *seq, uint64_t snapshot_seq,
-                           skip_list_visibility_check_fn visibility_check, void *visibility_ctx)
+                           const skip_list_visibility_check_fn visibility_check,
+                           void *visibility_ctx)
 {
     if (list == NULL || key == NULL || key_size == 0 || value == NULL || value_size == NULL)
         return -1;
@@ -2681,7 +2739,8 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
 int skip_list_get_with_seq_ref(skip_list_t *list, const uint8_t *key, const size_t key_size,
                                const uint8_t **value, size_t *value_size, int64_t *ttl,
                                uint8_t *deleted, uint64_t *seq, uint64_t snapshot_seq,
-                               skip_list_visibility_check_fn visibility_check, void *visibility_ctx)
+                               const skip_list_visibility_check_fn visibility_check,
+                               void *visibility_ctx)
 {
     if (list == NULL || key == NULL || key_size == 0 || value == NULL || value_size == NULL)
         return -1;

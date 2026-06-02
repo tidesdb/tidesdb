@@ -150,6 +150,39 @@ static inline size_t btree_signed_varint_decode(const uint8_t *buf, int64_t *val
     return n;
 }
 
+/* bounded LEB128 decode for parsing on-disk (untrusted) node bytes in which reads at most
+ * the bytes remaining before `end` and at most 10. returns bytes consumed, or 0 on
+ * truncation / overlong encoding so the caller can reject a malformed node. */
+static inline size_t btree_varint_decode_bounded(const uint8_t *buf, const uint8_t *end,
+                                                 uint64_t *val)
+{
+    uint64_t result = 0;
+    size_t shift = 0;
+    for (size_t i = 0; i < 10; i++)
+    {
+        if (buf + i >= end) return 0;
+        const uint8_t b = buf[i];
+        result |= (uint64_t)(b & 0x7F) << shift;
+        if (!(b & 0x80))
+        {
+            *val = result;
+            return i + 1;
+        }
+        shift += 7;
+    }
+    return 0;
+}
+
+static inline size_t btree_signed_varint_decode_bounded(const uint8_t *buf, const uint8_t *end,
+                                                        int64_t *val)
+{
+    uint64_t uval;
+    const size_t n = btree_varint_decode_bounded(buf, end, &uval);
+    if (n == 0) return 0;
+    *val = (int64_t)((uval >> 1) ^ (~(uval & 1) + 1));
+    return n;
+}
+
 /**
  * btree_compute_prefix_len
  * computes the common prefix length between two keys
@@ -342,6 +375,40 @@ static inline int btree_compare_keys_numeric_inline(const uint8_t *key1, const u
     return (v1 < v2) ? -1 : (v1 > v2);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define BTREE_BSWAP64(x) __builtin_bswap64(x)
+#elif defined(_MSC_VER)
+#define BTREE_BSWAP64(x) _byteswap_uint64(x)
+#else
+static inline uint64_t BTREE_BSWAP64(uint64_t x)
+{
+    return ((x & 0xFF00000000000000ULL) >> 56) | ((x & 0x00FF000000000000ULL) >> 40) |
+           ((x & 0x0000FF0000000000ULL) >> 24) | ((x & 0x000000FF00000000ULL) >> 8) |
+           ((x & 0x00000000FF000000ULL) << 8) | ((x & 0x0000000000FF0000ULL) << 24) |
+           ((x & 0x000000000000FF00ULL) << 40) | ((x & 0x00000000000000FFULL) << 56);
+}
+#endif
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define BTREE_IS_BIG_ENDIAN 1
+#else
+#define BTREE_IS_BIG_ENDIAN 0
+#endif
+
+/* lexicographic (memcmp-order) compare of two 8-byte keys via byte-swapped integer
+ * compare -- matches memcmp and the skip_list 8-byte path. distinct from
+ * btree_compare_keys_numeric_inline, which is native-endian for CMP_NUMERIC. */
+static inline int btree_compare_keys_8_memcmp_inline(const uint8_t *key1, const uint8_t *key2)
+{
+    uint64_t a, b;
+    memcpy(&a, key1, sizeof(uint64_t));
+    memcpy(&b, key2, sizeof(uint64_t));
+#if !BTREE_IS_BIG_ENDIAN
+    a = BTREE_BSWAP64(a);
+    b = BTREE_BSWAP64(b);
+#endif
+    return (a < b) ? -1 : (a > b);
+}
+
 /**
  * btree_compare_keys_inline
  * inline comparator for hot paths
@@ -362,7 +429,7 @@ static inline int btree_compare_keys_inline(const btree_config_t *config, const 
         {
             if (key1_size == 8)
             {
-                return btree_compare_keys_numeric_inline(key1, key2);
+                return btree_compare_keys_8_memcmp_inline(key1, key2);
             }
             const int cmp = memcmp(key1, key2, key1_size);
             return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
@@ -787,20 +854,47 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
 {
     if (!data || data_size < 2 || !node || !arena) return -1;
 
+    const uint8_t *const end = data + data_size;
+
     btree_node_t *n = btree_arena_alloc(arena, sizeof(btree_node_t));
     if (!n) return -1;
     memset(n, 0, sizeof(btree_node_t));
     n->arena = arena;
 
     size_t off = 0;
-    n->type = data[off++];
+    n->type = data[off++]; /* data_size >= 2 guarantees this byte */
+
+    /* every read below is bounds-checked against data_size -- on-disk node bytes are
+     * untrusted (a malformed/truncated node must be rejected, never over-read). on a
+     * violation the caller destroys the arena, so we just return -1. */
+#define BT_NEED(want)                                                       \
+    do                                                                      \
+    {                                                                       \
+        if (off > data_size || (size_t)(want) > data_size - off) return -1; \
+    } while (0)
+#define BT_VARINT(dst)                                                           \
+    do                                                                           \
+    {                                                                            \
+        const size_t _vn = btree_varint_decode_bounded(data + off, end, &(dst)); \
+        if (_vn == 0) return -1;                                                 \
+        off += _vn;                                                              \
+    } while (0)
+#define BT_SVARINT(dst)                                                                 \
+    do                                                                                  \
+    {                                                                                   \
+        const size_t _vn = btree_signed_varint_decode_bounded(data + off, end, &(dst)); \
+        if (_vn == 0) return -1;                                                        \
+        off += _vn;                                                                     \
+    } while (0)
 
     uint64_t num_entries_u64;
-    off += btree_varint_decode(data + off, &num_entries_u64);
+    BT_VARINT(num_entries_u64);
+    if (num_entries_u64 > UINT32_MAX) return -1;
     n->num_entries = (uint32_t)num_entries_u64;
 
     if (n->type == BTREE_NODE_LEAF)
     {
+        BT_NEED(16);
         n->prev_offset = decode_int64_le_compat(data + off);
         off += 8;
         n->next_offset = decode_int64_le_compat(data + off);
@@ -809,6 +903,10 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
         if (n->num_entries > 0)
         {
             const uint32_t ne = n->num_entries;
+
+            /* the indirection table alone needs ne*2 bytes -- reject an ne that can't
+             * fit before allocating ne-sized arrays */
+            BT_NEED((size_t)ne * 2);
 
             /* single arena alloc for all 4 metadata arrays */
             const size_t entries_sz = ne * sizeof(btree_entry_t);
@@ -839,7 +937,8 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             size_t *prefix_lens = (size_t *)(temp_buf + offsets_sz);
             size_t *suffix_lens = (size_t *)(temp_buf + offsets_sz + lens_sz);
 
-            /* we read key indirection table (stored as little-endian uint16) */
+            /* we read key indirection table (stored as little-endian uint16) -- bounded
+             * by the BT_NEED(ne*2) above */
             for (uint32_t i = 0; i < ne; i++)
             {
                 key_offsets[i] = (uint16_t)(data[off] | (data[off + 1] << 8));
@@ -848,7 +947,7 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
 
             /* we read base sequence number */
             uint64_t base_seq;
-            off += btree_varint_decode(data + off, &base_seq);
+            BT_VARINT(base_seq);
 
             /* we read entry metadata */
             for (uint32_t i = 0; i < ne; i++)
@@ -856,16 +955,24 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
                 uint64_t prefix_len, suffix_len, value_size, vlog_offset;
                 int64_t seq_delta, ttl;
 
-                off += btree_varint_decode(data + off, &prefix_len);
-                off += btree_varint_decode(data + off, &suffix_len);
-                off += btree_varint_decode(data + off, &value_size);
-                off += btree_varint_decode(data + off, &vlog_offset);
-                off += btree_signed_varint_decode(data + off, &seq_delta);
-                off += btree_signed_varint_decode(data + off, &ttl);
+                BT_VARINT(prefix_len);
+                BT_VARINT(suffix_len);
+                BT_VARINT(value_size);
+                BT_VARINT(vlog_offset);
+                BT_SVARINT(seq_delta);
+                BT_SVARINT(ttl);
+                BT_NEED(1); /* flags byte */
+
+                /* key_size must fit uint32; prefix can't exceed the previous key's
+                 * length (the prefix is copied from it during reconstruction) */
+                const uint64_t key_size = prefix_len + suffix_len;
+                if (key_size > UINT32_MAX) return -1;
+                if (i == 0 ? (prefix_len != 0) : (prefix_len > n->entries[i - 1].key_size))
+                    return -1;
 
                 prefix_lens[i] = (size_t)prefix_len;
                 suffix_lens[i] = (size_t)suffix_len;
-                n->entries[i].key_size = (uint32_t)(prefix_len + suffix_len);
+                n->entries[i].key_size = (uint32_t)key_size;
                 n->entries[i].value_size = (uint32_t)value_size;
                 n->entries[i].vlog_offset = vlog_offset;
                 n->entries[i].seq = base_seq + (uint64_t)seq_delta;
@@ -891,14 +998,16 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             {
                 n->keys[i] = key_buf + key_buf_off;
 
-                /* we copy prefix from previous key */
+                /* we copy prefix from previous key (prefix_len validated <= prev key_size) */
                 if (i > 0 && prefix_lens[i] > 0)
                 {
                     memcpy(n->keys[i], n->keys[i - 1], prefix_lens[i]);
                 }
 
-                /* we copy suffix from serialized data */
+                /* we copy suffix from serialized data -- the suffix region must lie
+                 * entirely within the node */
                 const size_t suffix_pos = keys_start + key_offsets[i];
+                if (suffix_pos > data_size || suffix_lens[i] > data_size - suffix_pos) return -1;
                 memcpy(n->keys[i] + prefix_lens[i], data + suffix_pos, suffix_lens[i]);
 
                 key_buf_off += ((size_t)n->entries[i].key_size + 7) & ~(size_t)7;
@@ -909,17 +1018,22 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             {
                 off += suffix_lens[i];
             }
+            if (off > data_size) return -1; /* keys section overran the node */
 
             /* single arena alloc for all inline values, then point each into it */
             size_t total_inline_bytes = 0;
             for (uint32_t i = 0; i < ne; i++)
             {
                 if (n->entries[i].vlog_offset == 0 && n->entries[i].value_size > 0)
+                {
                     total_inline_bytes += n->entries[i].value_size;
+                    if (total_inline_bytes > data_size) return -1; /* cap + overflow guard */
+                }
             }
 
             if (total_inline_bytes > 0)
             {
+                BT_NEED(total_inline_bytes);
                 uint8_t *val_buf = btree_arena_alloc(arena, total_inline_bytes);
                 if (!val_buf) return -1;
                 memcpy(val_buf, data + off, total_inline_bytes);
@@ -954,6 +1068,7 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
         n->keys = (num_keys > 0) ? (uint8_t **)(ibuf + child_sz) : NULL;
         n->key_sizes = (num_keys > 0) ? (size_t *)(ibuf + child_sz + ikeys_ptr_sz) : NULL;
 
+        BT_NEED(8);
         int64_t base_offset = decode_int64_le_compat(data + off);
         off += 8;
 
@@ -962,7 +1077,7 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
         for (uint32_t i = 0; i < num_children; i++)
         {
             int64_t delta;
-            off += btree_signed_varint_decode(data + off, &delta);
+            BT_SVARINT(delta);
             n->child_offsets[i] = prev_offset + delta;
             prev_offset = n->child_offsets[i];
         }
@@ -971,7 +1086,8 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
         for (uint32_t i = 0; i < num_keys; i++)
         {
             uint64_t key_size;
-            off += btree_varint_decode(data + off, &key_size);
+            BT_VARINT(key_size);
+            if (key_size > UINT32_MAX) return -1;
             n->key_sizes[i] = (size_t)key_size;
         }
 
@@ -991,12 +1107,17 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             for (uint32_t i = 0; i < num_keys; i++)
             {
                 n->keys[i] = ikey_buf + ikey_off;
+                BT_NEED(n->key_sizes[i]);
                 memcpy(n->keys[i], data + off, n->key_sizes[i]);
                 off += n->key_sizes[i];
                 ikey_off += (n->key_sizes[i] + 7) & ~(size_t)7;
             }
         }
     }
+
+#undef BT_NEED
+#undef BT_VARINT
+#undef BT_SVARINT
 
     *node = n;
     return 0;
@@ -1114,9 +1235,9 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
     {
         const uint8_t *block_data = (const uint8_t *)block->data;
         const uint32_t original_size = decode_uint32_le_compat(block_data);
-        int64_t header_prev_offset =
+        const int64_t header_prev_offset =
             decode_int64_le_compat(block_data + BTREE_COMPRESSED_NODE_PREV_OFF);
-        int64_t header_next_offset =
+        const int64_t header_next_offset =
             decode_int64_le_compat(block_data + BTREE_COMPRESSED_NODE_NEXT_OFF);
         const uint8_t *compressed_data = block_data + BTREE_COMPRESSED_NODE_HEADER_SIZE;
         const size_t compressed_size = block->size - BTREE_COMPRESSED_NODE_HEADER_SIZE;
@@ -1142,11 +1263,6 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
         }
         else
         {
-            fprintf(stderr,
-                    "btree: node decompression failed at offset %" PRId64
-                    " (expected_size=%u, got=%zu, compressed=%zu, algo=%d)\n",
-                    offset, original_size, decompressed ? decompressed_size : 0, compressed_size,
-                    compression_algo);
             free(decompressed);
             block_manager_block_free(block);
             return -1;
@@ -1209,7 +1325,7 @@ static inline int btree_u64_to_hex(uint64_t val, char *buf)
     return len;
 }
 
-int btree_format_cache_key_prefix(uint64_t cache_key_prefix, char *out)
+int btree_format_cache_key_prefix(const uint64_t cache_key_prefix, char *out)
 {
     if (!out) return 0;
     int len = btree_u64_to_hex(cache_key_prefix, out);
@@ -1307,11 +1423,6 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
         }
         else
         {
-            fprintf(stderr,
-                    "btree: cached node decompression failed at offset %" PRId64
-                    " (expected_size=%u, got=%zu, compressed=%zu, algo=%d)\n",
-                    offset, original_size, decompressed ? decompressed_size : 0, compressed_size,
-                    tree->config.compression_algo);
             free(decompressed);
             block_manager_block_free(block);
             return -1;
@@ -2013,7 +2124,7 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
                 return -1;
             }
 
-            int64_t new_offset = block_manager_block_write(builder->bm, new_block);
+            const int64_t new_offset = block_manager_block_write(builder->bm, new_block);
             block_manager_block_free(new_block);
 
             if (new_offset < 0)
@@ -2417,8 +2528,7 @@ void btree_set_node_cache(btree_t *tree, clock_cache_t *cache)
  */
 clock_cache_t *btree_create_node_cache(const size_t max_bytes)
 {
-    cache_config_t config;
-    memset(&config, 0, sizeof(config));
+    cache_config_t config = {0};
     config.avg_entry_size = BTREE_DEFAULT_NODE_SIZE;
     clock_cache_compute_config(max_bytes, &config);
     config.evict_callback = btree_node_cache_evict_callback;

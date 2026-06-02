@@ -27,6 +27,12 @@
 /* thread-local reusable pread buffer to avoid page faults on every block read. */
 #define BM_READ_BUF_INITIAL_SIZE (128 * 1024)
 
+/* payload bytes fetched together with the 8-byte block header in the first pread.
+ * a block whose payload fits within this hint is read in a single syscall; larger
+ * blocks pay one extra pread for the remainder. sized to cover the common data /
+ * index / footer block without over-reading huge bloom blocks. */
+#define BM_READ_HINT_BYTES (4u * 1024u)
+
 /* a block at or below this size is read without consulting the memory budget --
  * covers every data block and the common small footer block, so the hot read
  * path is just integer compares. blocks larger than this (e.g. a multi-hundred-
@@ -199,9 +205,11 @@ static int is_trailing_zero(const int fd, const uint64_t start, const uint64_t e
 {
     if (start >= end) return 1;
 
+    /* small on-stack chunk -- the loop re-reads, so a big buffer buys nothing and
+     * 64 KB on the stack is risky on platforms with small thread stacks */
     enum
     {
-        SCAN_CHUNK = 64 * 1024
+        SCAN_CHUNK = 8 * 1024
     };
     unsigned char buf[SCAN_CHUNK];
 
@@ -276,7 +284,8 @@ static int write_header(const int fd)
     unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
     const uint32_t padding = 0;
 
-    /* header format, [3-byte magic][1-byte version][4-byte padding] = 8 bytes */
+    /* header format
+     * [3-byte magic][1-byte version][4-byte padding] = 8 bytes */
     encode_uint32_le_compat(header, BLOCK_MANAGER_MAGIC);
     header[BLOCK_MANAGER_MAGIC_SIZE] = BLOCK_MANAGER_VERSION;
     encode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
@@ -329,7 +338,10 @@ static int get_file_size(const int fd, uint64_t *size)
 
 /**
  * reopen_fd
- * closes and reopens the block manager file descriptor with the same flags
+ * closes and reopens the block manager file descriptor with the same flags.
+ * NOT safe against concurrent readers: a reader that already captured bm->fd will
+ * pread on a closed (possibly recycled) descriptor. callers (truncate, permissive
+ * validation) must hold the bm exclusively / quiesce readers first.
  * @param bm the block manager
  * @return 0 if successful, -1 if not
  */
@@ -394,7 +406,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     atomic_init(&new_bm->current_file_size, 0);
     atomic_init(&new_bm->preallocated_size, 0);
     atomic_init(&new_bm->group_durable_size, 0);
-    new_bm->group_sync_active = 0;
+    atomic_init(&new_bm->group_sync_active, 0);
 
     new_bm->sync_mode = sync_mode;
     new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
@@ -576,79 +588,22 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
     return block;
 }
 
-int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
+/**
+ * bm_append_block
+ * append one framed block [size][checksum][data][size][magic] at the atomically
+ * reserved tail offset via a single pwritev. shared by block_write and write_raw
+ * so the on-disk encoding lives in one place. data must be non-NULL and size
+ * non-zero -- the caller validates (a zero size_field reads back as EOF).
+ * @return the offset written at, or -1 on failure
+ */
+static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint32_t size)
 {
-    if (BM_UNLIKELY(!bm || !block)) return -1;
-
-    /* block size is stored as uint32_t, thus enforced 4GB limit */
-    if (BM_UNLIKELY(block->size > UINT32_MAX))
-    {
-        return -1;
-    }
-
-    /* block format, [size][checksum][data][size][magic] */
-    if (block->size > SIZE_MAX - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
-    {
-        return -1;
-    }
     const size_t total_size =
-        BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
-
-    const uint32_t checksum = compute_checksum(block->data, block->size);
-
-    /* we atomically allocate space in file */
-    const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
-
-    /* we extend on-disk preallocation ahead of writes so pwrite stays in-place */
-    (void)maybe_extend_allocation(bm, (uint64_t)offset + total_size);
-
-    /*** block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
-     **  we use pwritev scatter-gather I/O to write header, data, and footer
-     *   in a single syscall while avoiding copying block data into an intermediate buffer */
-    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    encode_uint32_le_compat(header, (uint32_t)block->size);
-    encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
-
-    unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
-    encode_uint32_le_compat(footer, (uint32_t)block->size);
-    encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
-
-    /* we write header + data + footer in a single pwritev call -- zero copy from block->data */
-    struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
-    iov[0].iov_base = header;
-    iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    iov[1].iov_base = block->data;
-    iov[1].iov_len = block->size;
-    iov[2].iov_base = footer;
-    iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
-
-    if (BM_UNLIKELY(tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)offset) !=
-                    (ssize_t)total_size))
-        return -1;
-
-    /** if O_DSYNC is available and was used at open time, pwrite already synced
-     *  otherwise we fall back to explicit fdatasync for durability */
-    if (is_sync_full(bm) && !odsync_available())
-    {
-        if (fdatasync(bm->fd) != 0)
-        {
-            return -1;
-        }
-    }
-
-    return offset;
-}
-
-int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uint32_t size)
-{
-    if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
-
-    const size_t total_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size + BLOCK_MANAGER_FOOTER_SIZE;
-
+        BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)size + BLOCK_MANAGER_FOOTER_SIZE;
     const uint32_t checksum = compute_checksum(data, size);
 
+    /* atomically reserve space, then extend preallocation so the pwrite stays in-place */
     const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
-
     (void)maybe_extend_allocation(bm, (uint64_t)offset + total_size);
 
     unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
@@ -659,6 +614,7 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
     encode_uint32_le_compat(footer, size);
     encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
 
+    /* header + data + footer in a single pwritev -- zero copy from data */
     struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
     iov[0].iov_base = header;
     iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
@@ -671,12 +627,37 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uin
                     (ssize_t)total_size))
         return -1;
 
+    /* with O_DSYNC the pwrite already synced; otherwise fall back to fdatasync */
     if (is_sync_full(bm) && !odsync_available())
     {
         if (fdatasync(bm->fd) != 0) return -1;
     }
 
     return offset;
+}
+
+int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
+{
+    if (BM_UNLIKELY(!bm || !block)) return -1;
+
+    /* block size is stored as uint32_t, thus enforced 4GB limit */
+    if (BM_UNLIKELY(block->size > UINT32_MAX)) return -1;
+
+    /* a zero-size block encodes size_field == 0, which every reader treats as EOF;
+     * reject it so it can never truncate iteration (matches write_raw) */
+    if (BM_UNLIKELY(block->size == 0)) return -1;
+
+    /* guard size_t overflow of the framed total on 32-bit platforms */
+    if (block->size > SIZE_MAX - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
+        return -1;
+
+    return bm_append_block(bm, block->data, (uint32_t)block->size);
+}
+
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uint32_t size)
+{
+    if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
+    return bm_append_block(bm, data, size);
 }
 
 /* maximum iovecs per pwritev call, POSIX minimum is 16, Linux uses 1024 */
@@ -803,6 +784,10 @@ int block_manager_write_at(block_manager_t *bm, const int64_t offset, const uint
 {
     if (!bm || !data || size == 0 || offset < 0) return -1;
 
+    /* this only patches existing data -- a write past the tracked extent would
+     * grow the file without advancing current_file_size, desyncing the two */
+    if ((uint64_t)offset + size > atomic_load(&bm->current_file_size)) return -1;
+
     const ssize_t written = pwrite(bm->fd, data, size, offset);
     if (written != (ssize_t)size)
     {
@@ -845,7 +830,6 @@ int block_manager_update_checksum(block_manager_t *bm, const int64_t block_offse
         return -1;
     }
 
-    /* we compute new checksum */
     const uint32_t new_checksum = compute_checksum(data, block_size);
 
     unsigned char checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
@@ -1018,7 +1002,7 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* read the size field from the current position */
+    /* we read the size field from the current position */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
               (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
@@ -1030,9 +1014,8 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     if (block_size == 0) return -1; /* zero-filled hole extent unknown, cannot advance */
 
     /* read footer magic to distinguish partial write from genuine corruption.
-     * footer layout:
-     * [footer_size(BLOCK_MANAGER_CHECKSUM_LENGTH)][footer_magic(BLOCK_MANAGER_CHECKSUM_LENGTH)].
-     * footer_magic sits at (current_pos + HEADER_SIZE + block_size + SIZE_FIELD_SIZE)*/
+     * footer layout [footer_size(4)][footer_magic(4)]; footer_magic sits at
+     * (current_pos + BLOCK_HEADER_SIZE + block_size + SIZE_FIELD_SIZE) */
     const off_t footer_magic_offset = (off_t)cursor->current_pos + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
                                       (off_t)block_size + BLOCK_MANAGER_SIZE_FIELD_SIZE;
     unsigned char magic_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
@@ -1064,6 +1047,77 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
 }
 
 /**
+ * bm_read_block_tls
+ * reads a full block (header + payload) at `offset` into the thread-local buffer.
+ * the first pread grabs the header plus BM_READ_HINT_BYTES of payload, so a block
+ * within the hint costs a single syscall; a larger block pays one more pread for
+ * the remainder. the checksum is verified before returning.
+ * @param fd the file descriptor
+ * @param offset the file offset of the block (start of header)
+ * @param extent_limit if non-zero, reject a block whose frame extends past this
+ *                     byte offset (guards against garbage sizes); 0 skips the check
+ * @param check_budget if non-zero, refuse a payload larger than the memory budget
+ * @param out_size set to the payload size on success
+ * @return pointer to the verified payload inside the TLS buffer, or NULL on failure
+ */
+static uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t extent_limit,
+                                  const int check_budget, uint32_t *out_size)
+{
+    /* first pread -- header + a hint of payload in one syscall */
+    uint8_t *buf = bm_get_read_buf(BLOCK_MANAGER_BLOCK_HEADER_SIZE + BM_READ_HINT_BYTES);
+    if (BM_UNLIKELY(!buf)) return NULL;
+
+    const ssize_t got =
+        pread(fd, buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE + BM_READ_HINT_BYTES, (off_t)offset);
+    if (BM_UNLIKELY(got < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE)) return NULL;
+
+    const uint32_t size = decode_uint32_le_compat(buf);
+    if (BM_UNLIKELY(size == 0)) return NULL;
+    const uint32_t checksum = decode_uint32_le_compat(buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
+
+    /* a block claiming to extend past the data extent is garbage (off-boundary
+     * read, torn write, corruption) -- reject before reading/allocating trash */
+    if (extent_limit)
+    {
+        const uint64_t frame_end =
+            offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)size + BLOCK_MANAGER_FOOTER_SIZE;
+        if (BM_UNLIKELY(frame_end > extent_limit)) return NULL;
+    }
+
+    /* only large blocks consult the budget (relaxed atomic load, no syscall); a
+     * block over budget is skipped so the caller degrades instead of OOMing */
+    if (check_budget && BM_UNLIKELY(size > BM_LARGE_BLOCK_BUDGET_CHECK_THRESHOLD))
+    {
+        const uint64_t budget =
+            atomic_load_explicit(&bm_max_safe_block_bytes, memory_order_relaxed);
+        if (budget > 0 && (uint64_t)size > budget) return NULL;
+    }
+
+    /* payload bytes already in buf (the first read may also have pulled the footer
+     * and into the next block -- clamp to the real payload length) */
+    uint32_t have = (uint32_t)got - BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    if (have > size) have = size;
+
+    if (size > have)
+    {
+        /* grow the TLS buffer if needed -- realloc preserves the bytes already read */
+        buf = bm_get_read_buf(BLOCK_MANAGER_BLOCK_HEADER_SIZE + size);
+        if (BM_UNLIKELY(!buf)) return NULL;
+
+        const off_t rem_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have;
+        if (BM_UNLIKELY(pread(fd, buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have, size - have,
+                              rem_offset) != (ssize_t)(size - have)))
+            return NULL;
+    }
+
+    uint8_t *payload = buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    if (BM_UNLIKELY(verify_checksum(payload, size, checksum) != 0)) return NULL;
+
+    *out_size = size;
+    return payload;
+}
+
+/**
  * block_manager_read_block_at_offset
  * reads a block at a specific offset
  * @param bm the block manager
@@ -1075,69 +1129,13 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (BM_UNLIKELY(!bm)) return NULL;
 
-    const int fd = bm->fd;
-
-    /* we read header (size + checksum) first */
-    unsigned char header_buf[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    if (BM_UNLIKELY(pread(fd, header_buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE, (off_t)offset) !=
-                    (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE))
-        return NULL;
-
-    const uint32_t block_size = decode_uint32_le_compat(header_buf);
-    if (BM_UNLIKELY(block_size == 0)) return NULL;
-
-    /* a block that claims to extend past the file's data extent is not a real
-     * block -- the bytes at this offset are garbage (off-boundary read, torn
-     * write, or corruption). reject gracefully rather than reading/allocating
-     * trash. this replaces a fixed size cap that wrongly rejected legitimately
-     * large footer blocks (e.g. a 600MB bloom filter) on huge sstables. */
+    /* enforce the data extent so a garbage size can't drive a read/alloc past EOF;
+     * file_size 0 means "size not yet known" -- skip the check as before */
     const uint64_t file_size = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
-    const uint64_t block_extent =
-        offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
-    if (BM_UNLIKELY(file_size > 0 && block_extent > file_size))
-    {
-        fprintf(stderr,
-                "BMDIAG block_size=%u (0x%08x) at offset=%llu extends past EOF (extent=%llu "
-                "file_size=%llu) file='%s' fd=%d header=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                block_size, block_size, (unsigned long long)offset,
-                (unsigned long long)block_extent, (unsigned long long)file_size, bm->file_path, fd,
-                header_buf[0], header_buf[1], header_buf[2], header_buf[3], header_buf[4],
-                header_buf[5], header_buf[6], header_buf[7]);
-        fflush(stderr);
-        return NULL;
-    }
 
-    /* memory safety -- only large blocks consult the budget (a relaxed atomic
-     * load, no syscall). a block bigger than the configured budget is skipped
-     * with a warning (caller sees NULL and degrades, e.g. bloom filter not
-     * loaded) rather than driving the process toward OOM. */
-    if (BM_UNLIKELY(block_size > BM_LARGE_BLOCK_BUDGET_CHECK_THRESHOLD))
-    {
-        const uint64_t budget =
-            atomic_load_explicit(&bm_max_safe_block_bytes, memory_order_relaxed);
-        if (budget > 0 && (uint64_t)block_size > budget)
-        {
-            fprintf(stderr,
-                    "BMDIAG block_size=%u (0x%08x) at offset=%llu exceeds memory-safety budget "
-                    "(%llu bytes) file='%s' fd=%d -- skipping read\n",
-                    block_size, block_size, (unsigned long long)offset, (unsigned long long)budget,
-                    bm->file_path, fd);
-            fflush(stderr);
-            return NULL;
-        }
-    }
-
-    const uint32_t stored_checksum =
-        decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
-
-    uint8_t *read_buf = bm_get_read_buf(block_size);
-    if (BM_UNLIKELY(!read_buf)) return NULL;
-
-    const off_t data_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (BM_UNLIKELY(pread(fd, read_buf, block_size, data_offset) != (ssize_t)block_size))
-        return NULL;
-
-    if (BM_UNLIKELY(verify_checksum(read_buf, block_size, stored_checksum) != 0)) return NULL;
+    uint32_t block_size = 0;
+    uint8_t *payload = bm_read_block_tls(bm->fd, offset, file_size, 1, &block_size);
+    if (BM_UNLIKELY(!payload)) return NULL;
 
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t) + block_size);
     if (!block) return NULL;
@@ -1147,7 +1145,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     block->inline_data = 1;
     atomic_init(&block->ref_count, 1);
 
-    memcpy(block->data, read_buf, block_size);
+    memcpy(block->data, payload, block_size);
     return block;
 }
 
@@ -1319,7 +1317,6 @@ int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, const 
 {
     if (!cursor) return -1;
 
-    /* empty file or only header */
     if (end_offset <= BLOCK_MANAGER_HEADER_SIZE)
     {
         return -1;
@@ -1377,7 +1374,8 @@ int block_manager_truncate(block_manager_t *bm)
     /* we truncate to header-only (preserves valid header, single sync) */
     if (truncate_to_header(bm) != 0) return -1;
 
-    /* we reopen fd to clear kernel page cache state after truncation */
+    /* reopen the fd so any stale O_APPEND/seek state is reset and the descriptor
+     * reflects the freshly truncated file (caller must have quiesced readers) */
     if (reopen_fd(bm) != 0) return -1;
 
     return 0;
@@ -1455,6 +1453,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos
 
     cursor->current_pos = pos;
     cursor->block_size_valid = 0; /* we invalidate cache when jumping to arbitrary position */
+    cursor->block_index = -1;     /* index is unknown after an arbitrary jump */
     return 0;
 }
 
@@ -1795,41 +1794,16 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
 {
     if (!bm || !data || !data_size) return -1;
 
-    const int fd = bm->fd;
+    /* offset points at a known-good block (vlog lookup), so no extent/budget check;
+     * the single optimistic pread + checksum verify happen inside the helper */
+    uint32_t block_size = 0;
+    uint8_t *payload = bm_read_block_tls(bm->fd, offset, 0, 0, &block_size);
+    if (BM_UNLIKELY(!payload)) return -1;
 
-    /* we read header (size + checksum) first */
-    unsigned char header_buf[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    if (BM_UNLIKELY(pread(fd, header_buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE, (off_t)offset) !=
-                    (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE))
-        return -1;
-
-    const uint32_t block_size = decode_uint32_le_compat(header_buf);
-    const uint32_t expected_checksum =
-        decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
-
-    if (BM_UNLIKELY(block_size == 0)) return -1; /* invalid block */
-
-    /** we pread into thread-local buffer to avoid page faults on fresh anonymous pages.
-     *  we verify checksum before allocating the caller's output buffer. */
-    uint8_t *read_buf = bm_get_read_buf(block_size);
-    if (BM_UNLIKELY(!read_buf)) return -1;
-
-    const off_t data_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (BM_UNLIKELY(pread(fd, read_buf, block_size, data_offset) != (ssize_t)block_size))
-    {
-        return -1;
-    }
-
-    if (verify_checksum(read_buf, block_size, expected_checksum) != 0)
-    {
-        return -1; /* checksum mismatch */
-    }
-
-    /* checksum was ok, we allocate output buffer and copy from warm TLS buffer */
     uint8_t *block_data = malloc(block_size);
     if (BM_UNLIKELY(!block_data)) return -1;
 
-    memcpy(block_data, read_buf, block_size);
+    memcpy(block_data, payload, block_size);
     *data = block_data;
     *data_size = block_size;
     return 0;

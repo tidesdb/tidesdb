@@ -149,7 +149,7 @@ static inline uint32_t bf_fmix32(uint32_t h)
     return h;
 }
 
-/* v2 index hash: base hash plus the fmix32 finalizer */
+/* v2 index hash base hash plus the fmix32 finalizer */
 static inline uint32_t bf_hash_v2_inline(const uint8_t *entry, const size_t size,
                                          const uint32_t seed)
 {
@@ -175,7 +175,9 @@ static inline void bf_derive_hashes(const bloom_filter_t *bf, const uint8_t *ent
 
 int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 {
-    if (p <= 0.0 || p >= 1.0 || n <= 0)
+    /* reject non-finite p explicitly -- a NaN slips past the range comparisons
+     * (all false for NaN) and would reach an undefined (unsigned)NaN cast below */
+    if (!isfinite(p) || p <= 0.0 || p >= 1.0 || n <= 0)
     {
         return -1;
     }
@@ -360,10 +362,11 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
 
     uint8_t *ptr = buffer;
 
-    /* v2+ filters lead with a 0x00 sentinel (impossible for a v1 filter, whose
-     * first byte is varint32(m) with m >= 1) followed by the hash version byte,
-     * so deserialize can route the filter back to the hash that built it */
-    if (bf->hash_version >= BF_HASH_VERSION_CURRENT)
+    /* any non-legacy filter leads with a 0x00 sentinel (impossible for a v1 filter,
+     * whose first byte is varint32(m) with m >= 1) followed by the hash version
+     * byte, so deserialize routes the filter back to the hash that built it. keyed
+     * off "> LEGACY" rather than a specific version so a future bump stays recorded. */
+    if (bf->hash_version > BF_HASH_VERSION_LEGACY)
     {
         *ptr++ = BF_SERIALIZE_VERSION_SENTINEL;
         *ptr++ = (uint8_t)bf->hash_version;
@@ -390,14 +393,61 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     return buffer;
 }
 
-bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
+/* bounded varint decoders -- read at most the bytes a 32/64-bit value can occupy
+ * and never past `end`. return 0 and advance *pp on success, -1 on truncation or a
+ * malformed (unterminated) varint. these replace the unbounded compat decoders on
+ * the parse-untrusted-bytes path so a corrupt buffer cannot drive an over-read. */
+static int bf_get_varint32(const uint8_t **pp, const uint8_t *end, uint32_t *out)
 {
-    if (data == NULL)
+    uint32_t result = 0;
+    int shift = 0;
+    const uint8_t *p = *pp;
+    for (int i = 0; i < BF_VARINT32_MAX_BYTES; i++)
+    {
+        if (p >= end) return -1;
+        const uint8_t b = *p++;
+        result |= (uint32_t)(b & 0x7Fu) << shift;
+        if (!(b & 0x80u))
+        {
+            *pp = p;
+            *out = result;
+            return 0;
+        }
+        shift += 7;
+    }
+    return -1; /* no terminator within the max byte budget */
+}
+
+static int bf_get_varint64(const uint8_t **pp, const uint8_t *end, uint64_t *out)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    const uint8_t *p = *pp;
+    for (int i = 0; i < BF_VARINT64_MAX_BYTES; i++)
+    {
+        if (p >= end) return -1;
+        const uint8_t b = *p++;
+        result |= (uint64_t)(b & 0x7Fu) << shift;
+        if (!(b & 0x80u))
+        {
+            *pp = p;
+            *out = result;
+            return 0;
+        }
+        shift += 7;
+    }
+    return -1;
+}
+
+bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
+{
+    if (data == NULL || len == 0)
     {
         return NULL;
     }
 
     const uint8_t *ptr = data;
+    const uint8_t *const end = data + len;
 
     /* a leading 0x00 marks the versioned format (v1 can never start with 0x00,
      * its first field is varint32(m) with m >= 1). absent it, this is a legacy
@@ -405,15 +455,22 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     unsigned int hash_version = BF_HASH_VERSION_LEGACY;
     if (ptr[0] == BF_SERIALIZE_VERSION_SENTINEL)
     {
-        ptr++;                               /* skip sentinel */
-        hash_version = (unsigned int)*ptr++; /* read hash version */
+        if (end - ptr < BF_SERIALIZE_VERSION_BYTES) return NULL; /* sentinel + version */
+        ptr++;                                                   /* skip sentinel */
+        hash_version = (unsigned int)*ptr++;                     /* read hash version */
+        /* reject an unknown version -- querying with an undefined scheme would
+         * silently produce false negatives on an otherwise valid filter */
+        if (hash_version < BF_HASH_VERSION_LEGACY || hash_version > BF_HASH_VERSION_CURRENT)
+        {
+            return NULL;
+        }
     }
 
-    /* we read header with varint decoding */
+    /* we read header with bounded varint decoding */
     uint32_t m_u32, h_u32, non_zero_count;
-    ptr = decode_varint32(ptr, &m_u32);
-    ptr = decode_varint32(ptr, &h_u32);
-    ptr = decode_varint32(ptr, &non_zero_count);
+    if (bf_get_varint32(&ptr, end, &m_u32) != 0) return NULL;
+    if (bf_get_varint32(&ptr, end, &h_u32) != 0) return NULL;
+    if (bf_get_varint32(&ptr, end, &non_zero_count) != 0) return NULL;
 
     const unsigned int m = m_u32;
     const unsigned int h = h_u32;
@@ -432,6 +489,13 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 
     const unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
 
+    /* a valid filter never has more non-zero words than total words; reject a
+     * corrupt count up front so the loop below can't be driven past the buffer */
+    if (non_zero_count > size_in_words)
+    {
+        return NULL;
+    }
+
     /* we allocate and zero-initialize bitset */
     uint64_t *bitset = calloc((size_t)size_in_words, sizeof(uint64_t));
     if (bitset == NULL)
@@ -444,8 +508,11 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     {
         uint32_t index;
         uint64_t value;
-        ptr = decode_varint32(ptr, &index);
-        ptr = decode_varint64(ptr, &value);
+        if (bf_get_varint32(&ptr, end, &index) != 0 || bf_get_varint64(&ptr, end, &value) != 0)
+        {
+            free(bitset);
+            return NULL;
+        }
 
         /* we validate index is within bounds */
         if (index >= (uint32_t)size_in_words)

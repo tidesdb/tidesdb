@@ -23,7 +23,6 @@
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "btree.h"
-#include "buffer.h"
 #include "clock_cache.h"
 #include "compat.h"
 #include "compress.h"
@@ -219,10 +218,9 @@ typedef enum
 #else
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES 256 /* x2 each sstable has 2 fds, so really 512 */
 #endif
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE (1024 * 64)
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)
-#define TDB_DEFAULT_SYNC_INTERVAL_US       128000
-#define TDB_DEFAULT_LOG_FILE_TRUNCATION    24 * (1024 * 1024)
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE    (64 * 1024 * 1024)
+#define TDB_DEFAULT_SYNC_INTERVAL_US    128000
+#define TDB_DEFAULT_LOG_FILE_TRUNCATION 24 * (1024 * 1024)
 
 #define TDB_SKIP_LIST_MAX_LEVEL   12
 #define TDB_SKIP_LIST_PROBABILITY 0.25f
@@ -279,9 +277,8 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
                                       uint64_t commit_seq, void *ctx);
 
 /* forward declarations for internal types */
-#define TDB_MAX_LEVELS         32
-#define TDB_IMM_SNAP_MAX_ITEMS 16 /* max immutables in lock-free snapshot array */
-#define TDB_IMM_SNAP_SLOTS     2  /* double-buffered snapshot slots */
+#define TDB_MAX_LEVELS     32
+#define TDB_IMM_SNAP_SLOTS 2 /* double-buffered RCU snapshot slots (one read, one rebuilt) */
 
 typedef struct tidesdb_txn_op_t tidesdb_txn_op_t;
 typedef struct tidesdb_merge_heap_t tidesdb_merge_heap_t;
@@ -297,14 +294,19 @@ typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 
 /* lock-free immutable memtable snapshot slot
  * part of a double-buffered RCU scheme; writers build in inactive slot,
- * swap the active index, then wait for old-slot readers to drain
- * @param items array of immutable memtables
- * @param count number of items in the array
+ * swap the active index, then wait for old-slot readers to drain.
+ * items is heap-allocated and grown lazily by the publisher to fit the queue
+ * depth, so the snapshot never silently truncates -- the immutable queue is
+ * bounded only by the configured l0_queue_stall_threshold, never by this array.
+ * @param items heap array of immutable memtables (capacity = cap)
+ * @param cap allocated capacity of items, in slots
+ * @param count number of valid items in the array
  * @param readers number of active readers on this slot
  */
 typedef struct
 {
-    tidesdb_memtable_t *items[TDB_IMM_SNAP_MAX_ITEMS];
+    tidesdb_memtable_t **items;
+    size_t cap;
     _Atomic(size_t) count;
     _Atomic(int32_t) readers;
 } tidesdb_imm_snap_t;
@@ -521,7 +523,6 @@ struct tidesdb_memtable_t
  * @param active_memtable active memtable (paired skip list and WAL)
  * @param immutable_memtables queue of immutable memtables being flushed
  * @param pending_commits count of in-flight commits
- * @param active_txn_buffer buffer of active transactions for SSI conflict detection
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id
@@ -550,7 +551,6 @@ struct tidesdb_column_family_t
     _Atomic(tidesdb_memtable_t *) active_memtable;
     queue_t *immutable_memtables;
     _Atomic(uint64_t) pending_commits;
-    buffer_t *active_txn_buffer;
     tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
@@ -599,6 +599,7 @@ struct tidesdb_column_family_t
      * zero-initialized by calloc, so the first event in each category logs immediately. */
     _Atomic(time_t) last_ceiling_stall_log_sec;
     _Atomic(time_t) last_imm_critical_log_sec;
+    _Atomic(time_t) last_backpressure_log_sec;
 };
 
 /**
@@ -748,8 +749,8 @@ struct tidesdb_level_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param sync_thread_mutex mutex for sync thread
  * @param sync_thread_cond condition variable for sync thread
- * @param sstable_reaper_thread background thread for evicting most un-accessed sstables
- * @param sstable_reaper_active atomic flag indicating if reaper thread is active
+ * @param reaper_thread background thread for housekeeping
+ * @param reaper_active atomic flag indicating if reaper thread is active
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
@@ -833,8 +834,8 @@ struct tidesdb_t
     _Atomic(int) sync_thread_active;
     pthread_mutex_t sync_thread_mutex;
     pthread_cond_t sync_thread_cond;
-    pthread_t sstable_reaper_thread;
-    _Atomic(int) sstable_reaper_active;
+    pthread_t reaper_thread;
+    _Atomic(int) reaper_active;
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;
@@ -885,8 +886,6 @@ struct tidesdb_t
          * cf->active_mt_readers field for the protocol */
         _Atomic(int) active_mt_readers;
         queue_t *immutables;
-        tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
-        _Atomic(int) imm_snap_active;
         _Atomic(int) is_flushing;
         _Atomic(int) immutable_cleanup_counter;
         size_t write_buffer_size;
@@ -1038,7 +1037,6 @@ struct tidesdb_txn_t
  * @param cached_sources cached sst sources for reuse across seeks
  * @param num_cached_sources number of cached sources
  * @param cached_sources_capacity capacity of cached sources array
- * @param cached_layout_version sstable layout version when sources were cached
  * @param cached_mt_sources cached memtable sources for reuse across seeks
  * @param num_cached_mt_sources number of cached memtable sources
  * @param temp_sources pre-allocated temporary source array for seek operations
@@ -1057,7 +1055,6 @@ struct tidesdb_iter_t
     void **cached_sources;
     int num_cached_sources;
     int cached_sources_capacity;
-    uint64_t cached_layout_version;
     void **cached_mt_sources;
     int num_cached_mt_sources;
     void **temp_sources;
@@ -1229,6 +1226,18 @@ tidesdb_config_t tidesdb_default_config(void);
  * @return 0 on success, -n on failure
  */
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
+
+/**
+ * tidesdb_raise_open_file_limit
+ * raise this process's open-file ceiling toward `desired` descriptors so a database can keep more
+ * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it BEFORE
+ * tidesdb_open. an explicit, opt-in operator action: tidesdb never raises the limit itself. POSIX
+ * raises the RLIMIT_NOFILE soft limit toward the hard limit; Windows raises the CRT stdio cap
+ * (max 8192). a failed or partial raise is non-fatal -- the prior ceiling stands.
+ * @param desired target descriptor count; <= 0 just reports the current ceiling
+ * @return the open-file ceiling in effect after the attempt
+ */
+long tidesdb_raise_open_file_limit(long desired);
 
 /**
  * tidesdb_register_comparator

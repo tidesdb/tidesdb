@@ -82,7 +82,7 @@ void test_bloom_filter_serialize_deserialize()
     uint8_t *serialized_data = bloom_filter_serialize(bf, &serialized_size);
     ASSERT_TRUE(serialized_data != NULL);
 
-    bloom_filter_t *deserialized_bf = bloom_filter_deserialize(serialized_data);
+    bloom_filter_t *deserialized_bf = bloom_filter_deserialize(serialized_data, serialized_size);
     ASSERT_TRUE(deserialized_bf != NULL);
 
     ASSERT_EQ(deserialized_bf->m, bf->m);
@@ -212,7 +212,7 @@ void test_bloom_filter_serialize_empty()
     ASSERT_TRUE(data != NULL);
 
     /* deserialize and verify it's still empty */
-    bloom_filter_t *bf2 = bloom_filter_deserialize(data);
+    bloom_filter_t *bf2 = bloom_filter_deserialize(data, size);
     ASSERT_TRUE(bf2 != NULL);
     ASSERT_EQ(bloom_filter_contains(bf2, (uint8_t *)"anything", 8), 0);
 
@@ -291,7 +291,7 @@ void test_bloom_filter_deserialize_corrupted()
     data[2] = 0xFF;
     data[3] = 0xFF;
 
-    bloom_filter_t *bf2 = bloom_filter_deserialize(data);
+    bloom_filter_t *bf2 = bloom_filter_deserialize(data, size);
 
     free(data);
     bloom_filter_free(bf);
@@ -436,7 +436,7 @@ void test_bloom_filter_large_capacity_random_keys()
     printf("Serialized size: %.2f MB\n", (double)serialized_size / (1024 * 1024));
 
     printf("Testing deserialization...\n");
-    bloom_filter_t *bf2 = bloom_filter_deserialize(serialized);
+    bloom_filter_t *bf2 = bloom_filter_deserialize(serialized, serialized_size);
     ASSERT_TRUE(bf2 != NULL);
     ASSERT_EQ(bf2->m, bf->m);
     ASSERT_EQ(bf2->h, bf->h);
@@ -569,7 +569,7 @@ void test_bloom_filter_null_safety(void)
     ASSERT_TRUE(bloom_filter_serialize(NULL, &out_size) == NULL);
 
     /* bloom_filter_deserialize with NULL */
-    ASSERT_TRUE(bloom_filter_deserialize(NULL) == NULL);
+    ASSERT_TRUE(bloom_filter_deserialize(NULL, 0) == NULL);
 }
 
 void test_bloom_filter_deserialize_oob_index(void)
@@ -597,7 +597,7 @@ void test_bloom_filter_deserialize_oob_index(void)
     ptr = encode_varint32(ptr, 9999); /* index = 9999 (OOB) */
     ptr = encode_varint64(ptr, 0xFF); /* value */
 
-    bloom_filter_t *bad_bf = bloom_filter_deserialize(crafted);
+    bloom_filter_t *bad_bf = bloom_filter_deserialize(crafted, (size_t)(ptr - crafted));
     ASSERT_TRUE(bad_bf == NULL); /* should fail due to OOB index */
 
     free(data);
@@ -619,7 +619,7 @@ void test_bloom_filter_serialize_roundtrip_size_in_words(void)
     uint8_t *data = bloom_filter_serialize(bf, &size);
     ASSERT_TRUE(data != NULL);
 
-    bloom_filter_t *bf2 = bloom_filter_deserialize(data);
+    bloom_filter_t *bf2 = bloom_filter_deserialize(data, size);
     ASSERT_TRUE(bf2 != NULL);
 
     /* we verify all fields match, including size_in_words */
@@ -646,7 +646,7 @@ void test_bloom_filter_deserialize_corrupted_assertions(void)
     ptr = encode_varint32(ptr, 0); /* m = 0 */
     ptr = encode_varint32(ptr, 1); /* h = 1 */
     ptr = encode_varint32(ptr, 0); /* non_zero_count = 0 */
-    ASSERT_TRUE(bloom_filter_deserialize(crafted_m0) == NULL);
+    ASSERT_TRUE(bloom_filter_deserialize(crafted_m0, (size_t)(ptr - crafted_m0)) == NULL);
 
     /* we test that h=0 in header causes deserialize to return NULL */
     uint8_t crafted_h0[16];
@@ -654,7 +654,7 @@ void test_bloom_filter_deserialize_corrupted_assertions(void)
     ptr = encode_varint32(ptr, 64); /* m = 64 */
     ptr = encode_varint32(ptr, 0);  /* h = 0 */
     ptr = encode_varint32(ptr, 0);  /* non_zero_count = 0 */
-    ASSERT_TRUE(bloom_filter_deserialize(crafted_h0) == NULL);
+    ASSERT_TRUE(bloom_filter_deserialize(crafted_h0, (size_t)(ptr - crafted_h0)) == NULL);
 }
 
 void test_bloom_filter_null_entry(void)
@@ -741,7 +741,7 @@ void test_bloom_filter_deserialize_overflow_m(void)
     ptr = encode_varint32(ptr, 1);          /* h = 1 */
     ptr = encode_varint32(ptr, 0);          /* non_zero_count = 0 */
 
-    bloom_filter_t *bf = bloom_filter_deserialize(crafted);
+    bloom_filter_t *bf = bloom_filter_deserialize(crafted, (size_t)(ptr - crafted));
     ASSERT_TRUE(bf == NULL);
 
     /* also test m = UINT32_MAX - 63 (exactly at the boundary) */
@@ -750,7 +750,7 @@ void test_bloom_filter_deserialize_overflow_m(void)
     ptr = encode_varint32(ptr, 1);
     ptr = encode_varint32(ptr, 0);
 
-    bf = bloom_filter_deserialize(crafted);
+    bf = bloom_filter_deserialize(crafted, (size_t)(ptr - crafted));
     ASSERT_TRUE(bf == NULL);
 }
 
@@ -774,7 +774,7 @@ void test_bloom_filter_hash_versioning()
     ASSERT_TRUE(v2_blob != NULL);
     ASSERT_EQ(v2_blob[0], 0x00); /* v2 leads with the version sentinel */
 
-    bloom_filter_t *v2_rt = bloom_filter_deserialize(v2_blob);
+    bloom_filter_t *v2_rt = bloom_filter_deserialize(v2_blob, v2_size);
     ASSERT_TRUE(v2_rt != NULL);
     ASSERT_EQ(v2_rt->hash_version, 2);
     ASSERT_EQ(v2_rt->m, v2->m);
@@ -797,7 +797,7 @@ void test_bloom_filter_hash_versioning()
 
     /* the legacy blob must come back as v1 and still find every key -- a
      * regression that queried v1 bits with the v2 hash would false-negative here */
-    bloom_filter_t *v1_rt = bloom_filter_deserialize(v1_blob);
+    bloom_filter_t *v1_rt = bloom_filter_deserialize(v1_blob, v1_size);
     ASSERT_TRUE(v1_rt != NULL);
     ASSERT_EQ(v1_rt->hash_version, 1);
     for (int i = 0; i < 5; i++)

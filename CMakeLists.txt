@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.3.2
+	VERSION 9.3.3
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -115,7 +115,7 @@ include_directories(external) # for external libraries linking internally
 # users can override with -DBUILD_SHARED_LIBS=ON/OFF
 set(TIDESDB_SOURCES
     src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c
-    src/manifest.c src/clock_cache.c src/queue.c src/buffer.c src/btree.c src/alloc.c
+    src/manifest.c src/clock_cache.c src/queue.c src/btree.c src/alloc.c
     src/objstore_fs.c src/local_cache.c external/xxhash.c external/ini.c)
 
 if(TIDESDB_WITH_S3)
@@ -609,7 +609,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(clock_cache_tests test/clock_cache__tests.c)
     add_executable(manifest_tests test/manifest__tests.c)
     add_executable(queue_tests test/queue__tests.c)
-    add_executable(buffer_tests test/buffer__tests.c)
     add_executable(btree_tests test/btree__tests.c)
     add_executable(local_cache_tests test/local_cache__tests.c)
     add_executable(objstore_tests test/objstore__tests.c)
@@ -669,7 +668,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests buffer_tests btree_tests local_cache_tests objstore_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -681,7 +680,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME manifest_tests COMMAND manifest_tests)
     add_test(NAME clock_cache_tests COMMAND clock_cache_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
-    add_test(NAME buffer_tests COMMAND buffer_tests)
     add_test(NAME btree_tests COMMAND btree_tests)
     add_test(NAME local_cache_tests COMMAND local_cache_tests)
     add_test(NAME objstore_tests COMMAND objstore_tests)

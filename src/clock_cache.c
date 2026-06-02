@@ -311,6 +311,22 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
  * @param target_hash the target hash
  * @return the entry or NULL if not found
  */
+/* acquire a reader ref, refusing at saturation (see CLOCK_CACHE_READERS_SATURATED).
+ * returns 1 with a ref held, 0 if already at max readers */
+static inline int cc_try_pin_reader(clock_cache_entry_t *entry)
+{
+    uint8_t cur = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
+    for (;;)
+    {
+        if (CLOCK_CACHE_READERS_SATURATED(cur)) return 0;
+        const uint8_t desired = (uint8_t)(cur + CLOCK_CACHE_READER_INC);
+        if (atomic_compare_exchange_weak_explicit(&entry->ref_bit, &cur, desired,
+                                                  memory_order_acq_rel, memory_order_relaxed))
+            return 1;
+        /* cur was reloaded with the current value on CAS failure -- retry */
+    }
+}
+
 static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const char *key,
                                             size_t key_len, uint64_t target_hash)
 {
@@ -323,24 +339,7 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
     size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
     if (entry_key_len != key_len) return NULL;
 
-    /* acquire reader ref -- prevents free_entry from freeing key/payload while we memcmp.
-     * saturating CAS rather than an unconditional fetch_add the reader field is 7 bits, so the
-     * 128th concurrent pin would wrap it to 0 and let free_entry reclaim the entry under live
-     * readers (use-after-free). at saturation we refuse the pin and report a miss instead -- the
-     * caller falls back to a fresh read, which is correct for a single entry held by 127 readers.
-     */
-    {
-        uint8_t cur = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
-        for (;;)
-        {
-            if (CLOCK_CACHE_READERS_SATURATED(cur)) return NULL;
-            const uint8_t desired = (uint8_t)(cur + CLOCK_CACHE_READER_INC);
-            if (atomic_compare_exchange_weak_explicit(&entry->ref_bit, &cur, desired,
-                                                      memory_order_acq_rel, memory_order_relaxed))
-                break;
-            /* cur was reloaded with the current value on CAS failure -- retry */
-        }
-    }
+    if (!cc_try_pin_reader(entry)) return NULL;
 
     /* we re-validate state after acquiring ref (entry may have been evicted between
      * our pre-checks and the ref acquisition) */
@@ -882,13 +881,6 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
             atomic_store_explicit(&partition->slots[j].ref_bit, 0, memory_order_relaxed);
             atomic_store_explicit(&partition->slots[j].cached_hash, 0, memory_order_relaxed);
         }
-
-        /* we link partitions */
-        if (i > 0)
-        {
-            cache->partitions[i - 1].next = partition;
-        }
-        partition->next = NULL;
     }
 
     return cache;
@@ -1307,9 +1299,7 @@ size_t clock_cache_delete_by_prefix(clock_cache_t *cache, const char *prefix,
             uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
             if (state != ENTRY_VALID) continue;
 
-            /* we acquire reader ref to safely read key */
-            atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC,
-                                      memory_order_acq_rel);
+            if (!cc_try_pin_reader(entry)) continue;
 
             state = atomic_load_explicit(&entry->state, memory_order_acquire);
             if (state != ENTRY_VALID)
@@ -1360,9 +1350,7 @@ size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size
             uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
             if (state != ENTRY_VALID) continue;
 
-            /* we increment ref_bit to protect entry during access */
-            atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC,
-                                      memory_order_acq_rel);
+            if (!cc_try_pin_reader(entry)) continue;
 
             /* we re-verify state after incrementing ref_bit */
             state = atomic_load_explicit(&entry->state, memory_order_acquire);

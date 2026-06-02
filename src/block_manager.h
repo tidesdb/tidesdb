@@ -104,7 +104,8 @@ typedef struct
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t group_durable_size;
-    int group_sync_active;
+    /* atomic so concurrent group-commit leaders don't race on this flag */
+    _Atomic int group_sync_active;
 } block_manager_t;
 
 /**

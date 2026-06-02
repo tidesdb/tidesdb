@@ -5448,21 +5448,33 @@ static void tdb_replica_sync_manifests(tidesdb_t *db)
             if (level_idx >= 0 && level_idx < atomic_load(&cf->num_active_levels) &&
                 cf->levels[level_idx])
             {
+                /* hold array_readers while scanning the (lock-free, retire-able) sstables
+                 * array and try_ref the match before touching it -- without this the array
+                 * could be retired and freed, or the sstable unref'd to 0, under our raw
+                 * pointer. the extra ref pins the sstable across level_remove_sstable (which
+                 * drops the array's base ref) and is released right after. mirrors every
+                 * other array reader; this replica-sync path was the lone exception. */
+                tidesdb_level_t *lvl = cf->levels[level_idx];
+                atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
                 tidesdb_sstable_t **ssts =
-                    atomic_load_explicit(&cf->levels[level_idx]->sstables, memory_order_acquire);
-                int num = atomic_load_explicit(&cf->levels[level_idx]->num_sstables,
-                                               memory_order_acquire);
-                for (int s = 0; s < num; s++)
+                    atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+                tidesdb_sstable_t *target = NULL;
+                for (int s = 0; ssts[s] != NULL; s++)
                 {
-                    if (ssts[s] && ssts[s]->id == lme->id)
+                    if (ssts[s]->id == lme->id && tidesdb_sstable_try_ref(ssts[s]))
                     {
-                        atomic_store(&ssts[s]->marked_for_deletion, 1);
-                        tidesdb_level_remove_sstable(db, cf->levels[level_idx], ssts[s]);
-                        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                                      "Replica sync removed SSTable %d (L%d) for CF '%s'",
-                                      (int)lme->id, lme->level, cf->name);
+                        target = ssts[s];
                         break;
                     }
+                }
+                atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
+                if (target)
+                {
+                    atomic_store(&target->marked_for_deletion, 1);
+                    tidesdb_level_remove_sstable(db, lvl, target);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "Replica sync removed SSTable %d (L%d) for CF '%s'",
+                                  (int)lme->id, lme->level, cf->name);
+                    tidesdb_sstable_unref(db, target);
                 }
             }
             tidesdb_manifest_remove_sstable(cf->manifest, lme->level, lme->id);
@@ -8011,8 +8023,8 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
         if (pending)
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
-            const int tombstone_drop =
-                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level;
+            const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                                       is_largest_level && pending->entry.seq <= min_snapshot_seq;
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -14091,8 +14103,9 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
             if (pending)
             {
                 const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
-                const int tombstone_drop =
-                    (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level;
+                const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                                           is_largest_level &&
+                                           pending->entry.seq <= min_snapshot_seq;
                 const int ttl_drop =
                     pending->entry.ttl > 0 &&
                     pending->entry.ttl <
@@ -14709,8 +14722,8 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         if (pending)
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
-            const int tombstone_drop =
-                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level;
+            const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                                       is_largest_level && pending->entry.seq <= min_snapshot_seq;
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -15641,8 +15654,9 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
                 const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
                 /* reap a plain tombstone only when this merge reaches the
                  * effective bottom of the tree (no deeper level holds data) */
-                const int tombstone_drop =
-                    (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level;
+                const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                                           is_largest_level &&
+                                           pending->entry.seq <= min_snapshot_seq;
                 const int ttl_drop =
                     pending->entry.ttl > 0 &&
                     pending->entry.ttl <
@@ -18436,14 +18450,21 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* we release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
 
-        /* safe to delete WAL -- sstable is committed to manifest */
+        /* delete the WAL only once the sstable is durably recorded in the manifest.
+         * a failed commit leaves the sstable in-memory only (and not in the persisted
+         * manifest), so recovery would orphan-delete it -- retain the WAL in that case
+         * so recovery can replay these entries instead of losing them. the fd is closed
+         * either way to release the handle. */
         if (wal)
         {
             char *wal_path_to_delete = tdb_strdup(wal->file_path);
             block_manager_close(wal);
             imm->wal = NULL;
-            tdb_unlink(wal_path_to_delete);
-            tdb_sync_directory(cf->directory);
+            if (manifest_result == 0)
+            {
+                tdb_unlink(wal_path_to_delete);
+                tdb_sync_directory(cf->directory);
+            }
             free(wal_path_to_delete);
         }
 
@@ -27124,7 +27145,7 @@ typedef struct
  * close, optionally upload, and unlink the unified wal backing umt_imm. respects
  * the object store replicate_wal and wal_upload_sync config.
  */
-static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm)
+static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm, int persisted)
 {
     if (!umt_imm->wal) return;
 
@@ -27133,6 +27154,15 @@ static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm
     block_manager_close(umt_imm->wal);
     umt_imm->wal = NULL;
     if (!wal_path) return;
+
+    /* a per-cf sstable write or manifest commit in this flush failed, so some cf's data
+     * is not durably recorded; retain the shared wal (fd already closed) so recovery can
+     * replay it instead of losing those entries. a later flush re-persists and cleans it. */
+    if (!persisted)
+    {
+        free(wal_path);
+        return;
+    }
 
     if (db->object_store && db->config.object_store_config &&
         db->config.object_store_config->replicate_wal)
@@ -27253,8 +27283,14 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     tidesdb_manifest_add_sstable(cf->manifest, 1, sst_id, sst->num_entries,
                                  sst->klog_size + sst->vlog_size);
     atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-    tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
-    tdb_objstore_upload_manifest(db, cf);
+    const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+    if (manifest_result != 0)
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "Unified flush CF '%s' failed to commit manifest for SSTable %" PRIu64
+                      " (error: %d)",
+                      cf->name, sst_id, manifest_result);
+    else
+        tdb_objstore_upload_manifest(db, cf);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified flush for CF '%s' SSTable %" PRIu64 " written", cf->name,
                   sst_id);
@@ -27297,7 +27333,9 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     free(density_max_key);
 
     tidesdb_sstable_unref(db, sst);
-    return TDB_SUCCESS;
+    /* propagate a failed manifest commit so the barrier retains the shared wal -- the
+     * sstable is in-memory only and recovery would otherwise orphan-delete it */
+    return manifest_result == 0 ? TDB_SUCCESS : TDB_ERR_IO;
 }
 
 /**
@@ -27311,7 +27349,9 @@ static void tidesdb_unified_flush_barrier_finish(tidesdb_unified_flush_barrier_t
     if (!barrier) return;
     if (atomic_fetch_sub_explicit(&barrier->remaining, 1, memory_order_acq_rel) != 1) return;
 
-    tidesdb_unified_close_wal(barrier->db, barrier->umt_imm);
+    tidesdb_unified_close_wal(
+        barrier->db, barrier->umt_imm,
+        atomic_load_explicit(&barrier->overall_result, memory_order_acquire) == TDB_SUCCESS);
     atomic_store_explicit(&barrier->umt_imm->flushed, 1, memory_order_release);
     free(barrier);
 }
@@ -27377,7 +27417,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
     if (skip_list_cursor_goto_first(cursor) != 0)
     {
         skip_list_cursor_free(cursor);
-        tidesdb_unified_close_wal(db, umt_imm);
+        tidesdb_unified_close_wal(db, umt_imm, 1);
         atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -27506,7 +27546,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
     if (split_count == 0)
     {
         free(splits);
-        tidesdb_unified_close_wal(db, umt_imm);
+        tidesdb_unified_close_wal(db, umt_imm, 1);
         atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
         return phase1_result;
     }
@@ -27525,7 +27565,7 @@ static int tidesdb_unified_flush_immutable(tidesdb_t *db, tidesdb_memtable_t *um
             if (wr != TDB_SUCCESS) rc = wr;
         }
         free(splits);
-        tidesdb_unified_close_wal(db, umt_imm);
+        tidesdb_unified_close_wal(db, umt_imm, rc == TDB_SUCCESS);
         atomic_store_explicit(&umt_imm->flushed, 1, memory_order_release);
         return rc;
     }
@@ -28335,6 +28375,13 @@ int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name)
     txn->num_ops = saved_num_ops;
     txn->num_cfs = saved_num_cfs;
 
+    /* the last-cf cache may point at a cf that the truncation just dropped from
+     * cfs[0..num_cfs); clearing it forces add_cf_internal to rescan and re-register
+     * that cf on the next op instead of fast-pathing to an out-of-range index whose
+     * ops commit never iterates */
+    txn->last_cf = NULL;
+    txn->last_cf_index = 0;
+
     /* we invalidate the write set hash since indices may now be stale */
     if (txn->write_set_hash)
     {
@@ -28442,8 +28489,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     (*iter)->cached_sources = NULL;
     (*iter)->num_cached_sources = 0;
     (*iter)->cached_sources_capacity = 0;
-    (*iter)->cached_layout_version =
-        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
 
     /* we create merge heap for this CF */
     skip_list_comparator_fn comparator_fn = NULL;
@@ -28986,8 +29031,6 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
         tidesdb_merge_source_free(iter->cached_sources[i]);
     }
     iter->num_cached_sources = 0;
-    iter->cached_layout_version =
-        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
 
     /* we collect all sstables with references */
     tidesdb_sstable_t **ssts_array = NULL;

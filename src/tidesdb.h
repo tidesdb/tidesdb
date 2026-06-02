@@ -1037,7 +1037,6 @@ struct tidesdb_txn_t
  * @param cached_sources cached sst sources for reuse across seeks
  * @param num_cached_sources number of cached sources
  * @param cached_sources_capacity capacity of cached sources array
- * @param cached_layout_version sstable layout version when sources were cached
  * @param cached_mt_sources cached memtable sources for reuse across seeks
  * @param num_cached_mt_sources number of cached memtable sources
  * @param temp_sources pre-allocated temporary source array for seek operations
@@ -1056,7 +1055,6 @@ struct tidesdb_iter_t
     void **cached_sources;
     int num_cached_sources;
     int cached_sources_capacity;
-    uint64_t cached_layout_version;
     void **cached_mt_sources;
     int num_cached_mt_sources;
     void **temp_sources;

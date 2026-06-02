@@ -19998,6 +19998,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         fprintf(stderr, "Failed to create database directory %s: %s\n", (*db)->db_path,
                 strerror(errno));
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_IO;
@@ -20061,6 +20062,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to open lock file: %s", lock_path);
         }
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return (lock_result == TDB_LOCK_HELD) ? TDB_ERR_LOCKED : TDB_ERR_IO;
@@ -20082,6 +20084,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         }
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return (lock_result == TDB_LOCK_HELD) ? TDB_ERR_LOCKED : TDB_ERR_IO;
@@ -20096,6 +20099,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20113,6 +20117,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20135,6 +20140,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20167,6 +20173,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20187,6 +20194,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20203,6 +20211,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20222,6 +20231,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20304,6 +20314,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20353,6 +20364,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             tdb_file_unlock((*db)->lock_fd);
             close((*db)->lock_fd);
             free((*db)->db_path);
+            free((void *)(*db)->config.object_store_config);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20406,6 +20418,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free((*db)->db_path);
             if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
             if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
+            free((void *)(*db)->config.object_store_config);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20447,6 +20460,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free((*db)->db_path);
             if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
             if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
+            free((void *)(*db)->config.object_store_config);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20515,6 +20529,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free((*db)->db_path);
             if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
             if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
+            free((void *)(*db)->config.object_store_config);
             free(*db);
             *db = NULL;
             return TDB_ERR_IO;
@@ -20539,6 +20554,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free((*db)->db_path);
             if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
             if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
+            free((void *)(*db)->config.object_store_config);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20611,6 +20627,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free((*db)->db_path);
         if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
         if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
+        free((void *)(*db)->config.object_store_config);
+        if ((*db)->unified_mt.enabled)
+        {
+            pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+            pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+            pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+        }
         free(*db);
         *db = NULL;
         return rc;
@@ -20632,6 +20655,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
+        if ((*db)->unified_mt.enabled)
+        {
+            pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+            pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+            pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+        }
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20658,6 +20688,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             tdb_file_unlock((*db)->lock_fd);
             close((*db)->lock_fd);
             free((*db)->db_path);
+            free((void *)(*db)->config.object_store_config);
+            if ((*db)->unified_mt.enabled)
+            {
+                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+            }
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20687,6 +20724,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             tdb_file_unlock((*db)->lock_fd);
             close((*db)->lock_fd);
             free((*db)->db_path);
+            free((void *)(*db)->config.object_store_config);
+            if ((*db)->unified_mt.enabled)
+            {
+                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+            }
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20715,6 +20759,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tdb_file_unlock((*db)->lock_fd);
         close((*db)->lock_fd);
         free((*db)->db_path);
+        free((void *)(*db)->config.object_store_config);
+        if ((*db)->unified_mt.enabled)
+        {
+            pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+            pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+            pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+        }
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -20745,6 +20796,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             tdb_file_unlock((*db)->lock_fd);
             close((*db)->lock_fd);
             free((*db)->db_path);
+            free((void *)(*db)->config.object_store_config);
+            if ((*db)->unified_mt.enabled)
+            {
+                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+            }
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20781,6 +20839,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             tdb_file_unlock((*db)->lock_fd);
             close((*db)->lock_fd);
             free((*db)->db_path);
+            free((void *)(*db)->config.object_store_config);
+            if ((*db)->unified_mt.enabled)
+            {
+                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
+                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
+                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
+            }
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -20926,13 +20991,24 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
         if ((*db)->upload_queue)
         {
-            (*db)->num_upload_threads = num_upload_threads;
             (*db)->upload_threads = calloc(num_upload_threads, sizeof(pthread_t));
             if ((*db)->upload_threads)
             {
+                /* count only the threads that actually start -- close joins
+                 * num_upload_threads of them, and joining a never-created (zeroed)
+                 * pthread_t is undefined behaviour */
+                int created = 0;
                 for (int i = 0; i < num_upload_threads; i++)
                 {
-                    pthread_create(&(*db)->upload_threads[i], NULL, tdb_upload_worker_thread, *db);
+                    if (pthread_create(&(*db)->upload_threads[created], NULL,
+                                       tdb_upload_worker_thread, *db) == 0)
+                        created++;
+                }
+                (*db)->num_upload_threads = created;
+                if (created == 0)
+                {
+                    free((*db)->upload_threads);
+                    (*db)->upload_threads = NULL;
                 }
             }
         }
@@ -22308,6 +22384,17 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->active_memtable, initial_mt);
 
     int min_levels = cf->config.min_levels;
+
+    /* the engine assumes at least one disk level exists -- apply_backpressure, flush, and the
+     * read path all dereference cf->levels[0]. clamp a misconfigured 0/negative min_levels up
+     * to 1 so a bad config value cannot null-deref on the first write. */
+    if (min_levels < 1)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' min_levels %d below floor clamped to 1", cf->name,
+                      min_levels);
+        min_levels = 1;
+        cf->config.min_levels = 1;
+    }
 
     /* we check if directory already has existing levels from disk */
     DIR *existing_dir = opendir(cf->directory);

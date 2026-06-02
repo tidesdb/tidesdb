@@ -881,13 +881,6 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
             atomic_store_explicit(&partition->slots[j].ref_bit, 0, memory_order_relaxed);
             atomic_store_explicit(&partition->slots[j].cached_hash, 0, memory_order_relaxed);
         }
-
-        /* we link partitions */
-        if (i > 0)
-        {
-            cache->partitions[i - 1].next = partition;
-        }
-        partition->next = NULL;
     }
 
     return cache;

@@ -102,7 +102,6 @@ typedef struct
  * @param num_slots current number of slots (immutable after init)
  * @param hash_index_size hash index size (2x num_slots for low collisions)
  * @param hash_mask mask for fast modulo (immutable)
- * @param next atomic next pointer for lock-free chain
  * @param slots_mask mask for fast modulo (num_slots - 1, power of 2)
  * @param evict_threshold precomputed -- num_slots * 85 / 100
  * @param clock_hand atomic CLOCK hand position
@@ -113,23 +112,23 @@ typedef struct
  */
 struct clock_cache_partition_t
 {
-    /* --- cache line 0 -- cold, read-only after init --- */
+    /* cache line 0 -- cold, read-only after init */
     clock_cache_entry_t *slots;
     _Atomic(int32_t) *hash_index;
     size_t num_slots;
     size_t hash_index_size;
     size_t hash_mask;
-    _Atomic(clock_cache_partition_t *) next;
     size_t slots_mask;
     size_t evict_threshold;
+    char _pad_cold[8]; /* pad to 64 bytes (keeps the hot atomics off this line) */
 
-    /* --- cache line 1 -- eviction path (writers/evictors only) --- */
+    /* cache line 1 -- eviction path (writers/evictors only) */
     atomic_size_t clock_hand;
     atomic_size_t occupied_count;
     atomic_size_t bytes_used;
     char _pad_evict[40]; /* pad to 64 bytes */
 
-    /* --- cache line 2 -- read-path stats (readers only) --- */
+    /* cache line 2 -- read-path stats (readers only) */
     atomic_uint64_t hits;
     atomic_uint64_t misses;
     char _pad_stats[48]; /* pad to 64 bytes */

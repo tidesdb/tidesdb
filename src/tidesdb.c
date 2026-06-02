@@ -219,9 +219,10 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_INITIAL_TXN_SAVEPOINT_CAPACITY 4
 
 /* stack buffer sizes for hot-path allocations */
-#define TDB_STACK_IMM_SNAPSHOT    16 /* stack slots for unified immutable snapshot */
-#define TDB_STACK_COMMIT_HOOK_OPS 16 /* stack slots for commit hook operations */
-#define TDB_STACK_ITER_SOURCES    16 /* stack slots for iterator temp_sources */
+#define TDB_STACK_IMM_SNAPSHOT     16 /* stack slots for unified immutable snapshot */
+#define TDB_RECOVER_IMM_SCAN_STACK 64 /* stack slots for the recovery max-seq immutable scan */
+#define TDB_STACK_COMMIT_HOOK_OPS  16 /* stack slots for commit hook operations */
+#define TDB_STACK_ITER_SOURCES     16 /* stack slots for iterator temp_sources */
 
 /* default column family config values */
 #define TDB_INITIAL_BLOCK_INDEX_CAPACITY 16
@@ -13465,6 +13466,7 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
 
     /* drop_column_family will sweep the cf directory shortly; skip the level/manifest work
      * when the CF is on its way out, but still release our queue references below */
+    int cleanup_commit_ok = 1;
     if (!tidesdb_cf_abort_requested(cf))
     {
         uint8_t *removed = calloc((size_t)n, 1);
@@ -13510,13 +13512,25 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
                 if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path) != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to commit manifest after merge cleanup");
+                    cleanup_commit_ok = 0;
                 }
-                tdb_objstore_upload_manifest(cf->db, cf);
+                else
+                {
+                    tdb_objstore_upload_manifest(cf->db, cf);
+                }
             }
         }
         free(removed);
         free(removed_level);
     }
+
+    /* if the cleanup commit failed the inputs are still in the persisted manifest, so keep
+     * their files on disk (clear the deletion mark before the final unref frees them) --
+     * recovery loads them instead of finding the manifest reference an orphaned file. the
+     * merged output already covers the data; this only matters under sustained commit failure. */
+    if (!cleanup_commit_ok)
+        for (int i = 0; i < n; i++)
+            atomic_store_explicit(&ssts[i]->marked_for_deletion, 0, memory_order_release);
 
     for (int i = 0; i < n; i++) tidesdb_sstable_unref(cf->db, ssts[i]);
     free(ssts);
@@ -32196,14 +32210,25 @@ static uint64_t tidesdb_scan_max_sequence(tidesdb_column_family_t *cf)
     if (cf->immutable_memtables)
     {
         const size_t imm_count = queue_size(cf->immutable_memtables);
+        /* a stack buffer covers the realistic recovery case (a handful of immutables) so the
+         * max-seq scan never depends on a heap alloc; only an unusually deep queue mallocs. */
+        void *imm_stack[TDB_RECOVER_IMM_SCAN_STACK];
         void **imm_snap = NULL;
         size_t imm_snap_count = 0;
 
         if (imm_count > 0)
         {
-            imm_snap = malloc(imm_count * sizeof(void *));
+            imm_snap = (imm_count <= TDB_RECOVER_IMM_SCAN_STACK)
+                           ? imm_stack
+                           : malloc(imm_count * sizeof(void *));
             if (imm_snap)
                 imm_snap_count = queue_snapshot(cf->immutable_memtables, imm_snap, imm_count);
+            else
+                /* could not snapshot a deep immutable queue under memory pressure -- surface it,
+                 * since skipping immutables here could under-seed global_seq on recovery */
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "CF '%s' max-seq scan skipped %zu immutables (snapshot alloc failed)",
+                              cf->name, imm_count);
         }
 
         for (size_t i = 0; i < imm_snap_count; i++)
@@ -32237,7 +32262,7 @@ static uint64_t tidesdb_scan_max_sequence(tidesdb_column_family_t *cf)
             skip_list_cursor_free(cursor);
         }
 
-        free(imm_snap);
+        if (imm_snap != imm_stack) free(imm_snap);
     }
 
     /* we scan the active memtable -- crash recovery replays the adopted active

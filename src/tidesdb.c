@@ -5237,6 +5237,11 @@ static int tidesdb_vlog_range_get_value(const tidesdb_t *db, const tidesdb_sstab
 static void tdb_objstore_upload_manifest(tidesdb_t *db, tidesdb_column_family_t *cf)
 {
     if (!db->object_store || !cf || !cf->manifest || cf->manifest->path[0] == '\0') return;
+    /* a replica must never push to the bucket -- its manifest is a local mirror that a
+     * close-time flush/compaction can diverge from the primary's authoritative one. uploading
+     * it would obsolete the primary's real-data sstables. mirrors the sstable-upload gate in
+     * tidesdb_level_add_sstable; promotion clears replica_mode before any primary write. */
+    if (atomic_load_explicit(&db->replica_mode, memory_order_acquire)) return;
     /* MANIFEST is uploaded via the async pipeline to avoid blocking flush workers.
      * the local MANIFEST is always up to date for same-node readers. remote readers
      * doing cold start will see it after the upload completes. the async queue
@@ -21089,7 +21094,12 @@ int tidesdb_close(tidesdb_t *db)
     {
         tidesdb_memtable_t *umt =
             atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
-        if (umt && umt->skip_list && skip_list_count_entries(umt->skip_list) > 0)
+        /* never flush on a replica close. the active memtable holds only remote-WAL-replay
+         * entries (transient, re-replayed on next open); flushing them creates an sstable +
+         * compaction that diverges from the primary's manifest. the upload gate already blocks
+         * the push, but skipping the flush also avoids the pointless local churn. */
+        if (!atomic_load_explicit(&db->replica_mode, memory_order_acquire) && umt &&
+            umt->skip_list && skip_list_count_entries(umt->skip_list) > 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Flushing unified active memtable before close");
             tidesdb_unified_flush_immutable(db, umt);

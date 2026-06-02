@@ -17918,12 +17918,6 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
         }
     }
 
-    if (cf->active_txn_buffer)
-    {
-        buffer_free(cf->active_txn_buffer);
-        cf->active_txn_buffer = NULL;
-    }
-
     if (cf->manifest)
     {
         tidesdb_manifest_close(cf->manifest);
@@ -21643,16 +21637,6 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
 }
 
 /**
- * txn_entry_evict
- * eviction callback for active transaction buffer
- */
-static void txn_entry_evict(void *data, void *ctx)
-{
-    (void)ctx;
-    if (data) free(data);
-}
-
-/**
  * tidesdb_unimap_persist
  * atomically rewrites the UNIMAP file from the in-memory cf index map.
  * the caller must hold unified_mt.cf_index_map_lock.
@@ -22428,32 +22412,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             if (mt_cleanup4->skip_list) skip_list_free(mt_cleanup4->skip_list);
             if (mt_cleanup4->wal) block_manager_close(mt_cleanup4->wal);
             free(mt_cleanup4);
-        }
-        queue_free(cf->immutable_memtables);
-        free(cf->directory);
-        free(cf->name);
-        free(cf);
-        return TDB_ERR_MEMORY;
-    }
-
-    if (buffer_new_with_eviction(&cf->active_txn_buffer, TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE,
-                                 txn_entry_evict, NULL) != 0)
-    {
-        for (int cleanup_idx = 0; cleanup_idx < min_levels; cleanup_idx++)
-        {
-            if (cf->levels[cleanup_idx])
-            {
-                tidesdb_level_free(db, cf->levels[cleanup_idx]);
-            }
-        }
-        tidesdb_manifest_close(cf->manifest);
-
-        tidesdb_memtable_t *mt_cleanup5 = atomic_load(&cf->active_memtable);
-        if (mt_cleanup5)
-        {
-            if (mt_cleanup5->skip_list) skip_list_free(mt_cleanup5->skip_list);
-            if (mt_cleanup5->wal) block_manager_close(mt_cleanup5->wal);
-            free(mt_cleanup5);
         }
         queue_free(cf->immutable_memtables);
         free(cf->directory);
@@ -24472,11 +24430,9 @@ static void tidesdb_txn_remove_from_active_list(tidesdb_txn_t *txn)
     {
         if (txn->db->active_txns[i] == txn)
         {
-            /* we shift remaining transactions down */
-            for (int j = i; j < txn->db->num_active_txns - 1; j++)
-            {
-                txn->db->active_txns[j] = txn->db->active_txns[j + 1];
-            }
+            /* the list is scanned as an unordered set, so swap the last entry into
+             * this slot for O(1) removal instead of shifting the tail down */
+            txn->db->active_txns[i] = txn->db->active_txns[txn->db->num_active_txns - 1];
             txn->db->num_active_txns--;
             break;
         }

@@ -23,7 +23,6 @@
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "btree.h"
-#include "buffer.h"
 #include "clock_cache.h"
 #include "compat.h"
 #include "compress.h"
@@ -219,10 +218,9 @@ typedef enum
 #else
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES 256 /* x2 each sstable has 2 fds, so really 512 */
 #endif
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE (1024 * 64)
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)
-#define TDB_DEFAULT_SYNC_INTERVAL_US       128000
-#define TDB_DEFAULT_LOG_FILE_TRUNCATION    24 * (1024 * 1024)
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE    (64 * 1024 * 1024)
+#define TDB_DEFAULT_SYNC_INTERVAL_US    128000
+#define TDB_DEFAULT_LOG_FILE_TRUNCATION 24 * (1024 * 1024)
 
 #define TDB_SKIP_LIST_MAX_LEVEL   12
 #define TDB_SKIP_LIST_PROBABILITY 0.25f
@@ -525,7 +523,6 @@ struct tidesdb_memtable_t
  * @param active_memtable active memtable (paired skip list and WAL)
  * @param immutable_memtables queue of immutable memtables being flushed
  * @param pending_commits count of in-flight commits
- * @param active_txn_buffer buffer of active transactions for SSI conflict detection
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id
@@ -554,7 +551,6 @@ struct tidesdb_column_family_t
     _Atomic(tidesdb_memtable_t *) active_memtable;
     queue_t *immutable_memtables;
     _Atomic(uint64_t) pending_commits;
-    buffer_t *active_txn_buffer;
     tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;

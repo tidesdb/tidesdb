@@ -428,6 +428,16 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
 int block_manager_get_size(block_manager_t *bm, uint64_t *size);
 
 /**
+ * block_manager_framed_size
+ * on-disk footprint of a payload once framed (header + payload + footer), i.e. the bytes a
+ * block_manager_write_raw/block_write of this payload appends to the file. lets callers count
+ * framed write volume without depending on the framing layout.
+ * @param payload_size size of the payload in bytes
+ * @return framed size in bytes
+ */
+uint64_t block_manager_framed_size(uint32_t payload_size);
+
+/**
  * block_manager_escalate_fsync
  * escalates an fsync syscall to the underlying block manager file
  * @param bm the block manager to fsync

@@ -1638,6 +1638,382 @@ static void test_stats_comprehensive(void)
     cleanup_test_dir();
 }
 
+static void test_amplification_counters_classic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db(); /* classic per-cf WAL, unified off */
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096; /* small so flushes and compaction happen */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "amp_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "amp_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* commit unique rows -- drives the wal and user-bytes counters */
+    uint64_t logical_bytes = 0;
+    for (int i = 0; i < 400; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        int klen = snprintf(key, sizeof(key), "amp_key_%05d", i) + 1;
+        int vlen = snprintf(value, sizeof(value), "amp_value_%05d_padding_padding_padding", i) + 1;
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, klen, (uint8_t *)value, vlen, 0), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+        logical_bytes += (uint64_t)(klen + vlen);
+    }
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    /* classic mode -- the per-cf WAL carries every commit, user bytes equal logical ingest
+     * (unique keys, no in-txn supersession) and the framed WAL total exceeds it */
+    ASSERT_TRUE(stats->wal_bytes_written > 0);
+    ASSERT_EQ(stats->user_bytes_written, logical_bytes);
+    ASSERT_TRUE(stats->wal_bytes_written > stats->user_bytes_written);
+    tidesdb_free_stats(stats);
+    stats = NULL;
+
+    /* flush -- drives the flush byte and count counters */
+    ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+    int wait = 0;
+    while (tidesdb_is_flushing(cf) && wait < 200)
+    {
+        usleep(10000);
+        wait++;
+    }
+    for (int i = 0; i < 200; i++)
+    {
+        if (queue_size(db->flush_queue) == 0) break;
+        usleep(50000);
+    }
+
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    ASSERT_TRUE(stats->flush_bytes_written > 0);
+    ASSERT_TRUE(stats->flush_count > 0);
+    tidesdb_free_stats(stats);
+    stats = NULL;
+
+    /* full compaction -- drives the compaction write/read byte and count counters */
+    tidesdb_compact(cf);
+    for (int i = 0; i < 200; i++)
+    {
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        {
+            usleep(100000);
+            break;
+        }
+        usleep(50000);
+    }
+
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    ASSERT_TRUE(stats->compaction_bytes_written > 0);
+    ASSERT_TRUE(stats->compaction_bytes_read > 0);
+    ASSERT_TRUE(stats->compaction_count > 0);
+    tidesdb_free_stats(stats);
+    stats = NULL;
+
+    /* db-level sums fold the single cf; uwal stays zero when unified mode is off */
+    tidesdb_db_stats_t dbs;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &dbs), TDB_SUCCESS);
+    ASSERT_EQ(dbs.uwal_bytes_written, (uint64_t)0);
+    ASSERT_TRUE(dbs.wal_bytes_written > 0);
+    ASSERT_TRUE(dbs.flush_bytes_written > 0);
+    ASSERT_TRUE(dbs.compaction_bytes_written > 0);
+    ASSERT_EQ(dbs.user_bytes_written, logical_bytes);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_amplification_counters_unified(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 8192; /* small to force unified flushes */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    const char *cf_names[] = {"u1", "u2"};
+    tidesdb_column_family_t *cfs[2];
+    for (int c = 0; c < 2; c++)
+    {
+        ASSERT_EQ(tidesdb_create_column_family(db, cf_names[c], &cf_config), 0);
+        cfs[c] = tidesdb_get_column_family(db, cf_names[c]);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    /* spread commits across both CFs in the shared unified memtable */
+    for (int i = 0; i < 400; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        int klen = snprintf(key, sizeof(key), "u_key_%05d", i) + 1;
+        int vlen = snprintf(value, sizeof(value), "u_value_%05d_padding_padding", i) + 1;
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cfs[i % 2], (uint8_t *)key, klen, (uint8_t *)value, vlen, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* the unified WAL is shared and db-scoped -- it carries the write volume while the
+     * per-cf WAL counters stay zero */
+    tidesdb_db_stats_t dbs;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &dbs), TDB_SUCCESS);
+    ASSERT_TRUE(dbs.uwal_bytes_written > 0);
+    ASSERT_TRUE(dbs.user_bytes_written > 0);
+    ASSERT_EQ(dbs.wal_bytes_written, (uint64_t)0);
+
+    tidesdb_stats_t *s0 = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cfs[0], &s0), TDB_SUCCESS);
+    ASSERT_EQ(s0->wal_bytes_written, (uint64_t)0);
+    ASSERT_TRUE(s0->user_bytes_written > 0);
+    tidesdb_free_stats(s0);
+
+    /* drain any pending unified flushes, then confirm flush volume landed per-cf */
+    for (int i = 0; i < 200; i++)
+    {
+        if (queue_size(db->flush_queue) == 0) break;
+        usleep(50000);
+    }
+    usleep(200000);
+
+    ASSERT_EQ(tidesdb_get_db_stats(db, &dbs), TDB_SUCCESS);
+    ASSERT_TRUE(dbs.flush_bytes_written > 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* helper -- bulk-load unique rows into a cf and force a flush to L0, draining the queue */
+static void amp_fill_and_flush(tidesdb_t *db, tidesdb_column_family_t *cf, int start, int count)
+{
+    for (int i = start; i < start + count; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        int klen = snprintf(key, sizeof(key), "amp_key_%06d", i) + 1;
+        int vlen = snprintf(value, sizeof(value), "amp_value_%06d_padding_padding_padding", i) + 1;
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, klen, (uint8_t *)value, vlen, 0), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+    int wait = 0;
+    while (tidesdb_is_flushing(cf) && wait < 200)
+    {
+        usleep(10000);
+        wait++;
+    }
+    for (int i = 0; i < 200; i++)
+    {
+        if (queue_size(db->flush_queue) == 0) break;
+        usleep(50000);
+    }
+}
+
+/* helper -- block until the cf's compaction queue drains and no merge is in flight */
+static void amp_wait_compaction(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    for (int i = 0; i < 300; i++)
+    {
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        {
+            usleep(100000);
+            break;
+        }
+        usleep(50000);
+    }
+}
+
+static void test_amplification_compaction_btree(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.use_btree = 1; /* exercise the btree merge-output accounting path */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "amp_btree_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "amp_btree_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* two flushed runs give the full merge overlapping inputs to read and rewrite */
+    amp_fill_and_flush(db, cf, 0, 300);
+    amp_fill_and_flush(db, cf, 300, 300);
+
+    tidesdb_compact(cf);
+    amp_wait_compaction(db, cf);
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    ASSERT_TRUE(stats->use_btree == 1);
+    ASSERT_TRUE(stats->compaction_bytes_written > 0);
+    ASSERT_TRUE(stats->compaction_bytes_read > 0);
+    ASSERT_TRUE(stats->compaction_count > 0);
+    tidesdb_free_stats(stats);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_amplification_compact_range(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "amp_range_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "amp_range_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* two overlapping flushed runs so a range merge has inputs to read and rewrite */
+    amp_fill_and_flush(db, cf, 0, 300);
+    amp_fill_and_flush(db, cf, 0, 300);
+
+    tidesdb_stats_t *before = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &before), TDB_SUCCESS);
+    uint64_t written_before = before->compaction_bytes_written;
+    uint64_t read_before = before->compaction_bytes_read;
+    uint64_t count_before = before->compaction_count;
+    tidesdb_free_stats(before);
+
+    /* targeted range compaction over the whole key span -- drives tidesdb_targeted_merge */
+    const char *start_key = "amp_key_000000";
+    const char *end_key = "amp_key_999999";
+    ASSERT_EQ(tidesdb_compact_range(cf, (const uint8_t *)start_key, strlen(start_key) + 1,
+                                    (const uint8_t *)end_key, strlen(end_key) + 1),
+              TDB_SUCCESS);
+    amp_wait_compaction(db, cf);
+
+    tidesdb_stats_t *after = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &after), TDB_SUCCESS);
+    ASSERT_TRUE(after->compaction_bytes_written > written_before);
+    ASSERT_TRUE(after->compaction_bytes_read > read_before);
+    ASSERT_TRUE(after->compaction_count > count_before);
+    tidesdb_free_stats(after);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_amplification_spooky_merges(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    /* dividing merge -- geometry mirrors test_dividing_merge_strategy */
+    {
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 256;
+        cf_config.level_size_ratio = 4;
+        cf_config.dividing_level_offset = 1;
+        cf_config.min_levels = 3;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "amp_div_cf", &cf_config), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "amp_div_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        for (int i = 0; i < 64; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[128];
+            int klen = snprintf(key, sizeof(key), "div_key_%04d", i) + 1;
+            int vlen = snprintf(value, sizeof(value), "dividing_value_%04d_with_padding", i) + 1;
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, klen, (uint8_t *)value, vlen, 0), 0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+            if (i % 4 == 3)
+            {
+                tidesdb_flush_memtable(cf);
+                usleep(10000);
+            }
+        }
+        for (int i = 0; i < 100; i++)
+        {
+            if (queue_size(db->flush_queue) == 0) break;
+            usleep(10000);
+        }
+
+        tidesdb_compact(cf);
+        amp_wait_compaction(db, cf);
+
+        tidesdb_stats_t *stats = NULL;
+        ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+        ASSERT_TRUE(stats->compaction_bytes_written > 0);
+        ASSERT_TRUE(stats->compaction_bytes_read > 0);
+        ASSERT_TRUE(stats->compaction_count > 0);
+        tidesdb_free_stats(stats);
+    }
+
+    /* partitioned merge -- geometry mirrors test_partitioned_merge_strategy */
+    {
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 150 * 8;
+        cf_config.level_size_ratio = 2;
+        cf_config.dividing_level_offset = 1;
+        cf_config.min_levels = 4;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "amp_part_cf", &cf_config), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "amp_part_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        for (int i = 0; i < 150; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[128];
+            int klen = snprintf(key, sizeof(key), "part_key_%04d", i) + 1;
+            int vlen = snprintf(value, sizeof(value), "partitioned_value_%04d_with_padding", i) + 1;
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, klen, (uint8_t *)value, vlen, 0), 0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+            if (i % 5 == 4)
+            {
+                tidesdb_flush_memtable(cf);
+                usleep(10000);
+            }
+        }
+        for (int i = 0; i < 100; i++)
+        {
+            if (queue_size(db->flush_queue) == 0) break;
+            usleep(10000);
+        }
+
+        tidesdb_compact(cf);
+        amp_wait_compaction(db, cf);
+
+        tidesdb_stats_t *stats = NULL;
+        ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+        ASSERT_TRUE(stats->compaction_bytes_written > 0);
+        ASSERT_TRUE(stats->compaction_bytes_read > 0);
+        ASSERT_TRUE(stats->compaction_count > 0);
+        tidesdb_free_stats(stats);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_cache_stats(void)
 {
     cleanup_test_dir();
@@ -2206,7 +2582,7 @@ static void wait_for_flush_queue_drain(tidesdb_t *db)
     }
 }
 
-/* wait until a CF is fully flush-idle. an empty flush_queue is NOT sufficient: a flush deferred by
+/* wait until a CF is fully flush-idle. an empty flush_queue is NOT sufficient, a flush deferred by
  * global-cap backpressure leaves the queue empty with flush_deferred set for the reaper to retry,
  * and a dequeued flush is still in flight until the sstable is added to its level.
  * flush_pending_count is incremented at enqueue and decremented only after that level-add, so it
@@ -8088,7 +8464,7 @@ static void test_portability_workflow(void)
 
             if (result != 0 || value == NULL)
             {
-                printf("FAILED: Key not found: %s\n", key);
+                printf("FAILED: Key not found (%s)\n", key);
                 ASSERT_EQ(result, 0);
             }
 
@@ -23272,8 +23648,8 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     wait_for_compaction_idle(db, cf_a);
     wait_for_compaction_idle(db, cf_b);
 
-    /* we verify atomicity: every committed pair must be present in BOTH CFs. classify on the exact
-     * return code, not just found-vs-not: a read can return the retryable TDB_ERR_BUSY when
+    /* we verify atomicity every committed pair must be present in BOTH CFs. classify on the exact
+     * return code, not just found-vs-not, a read can return the retryable TDB_ERR_BUSY when
      * background compaction holds the reader fd reserve (common on fd-constrained runners), and
      * BUSY means the key is durably present but momentarily unopenable -- NOT missing. only a
      * definitive TDB_ERR_NOT_FOUND on one side while the other is present is a real cross-CF
@@ -23317,7 +23693,7 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     tidesdb_txn_free(vtxn);
     printf("  atomicity check: both=%d only_a=%d only_b=%d both_absent=%d busy=%d\n", both_present,
            only_a, only_b, both_absent, busy);
-    /* the real invariants: no one-sided loss and no fully-lost committed pair. BUSY pairs are
+    /* the real invariants, no one-sided loss and no fully-lost committed pair. BUSY pairs are
      * present-but-transient, so they count toward the committed total rather than failing. */
     ASSERT_EQ(only_a, 0);
     ASSERT_EQ(only_b, 0);
@@ -25083,7 +25459,7 @@ static void test_unified_multi_cf_flush_and_recovery(void)
     }
 
     /* wait for background flushes AND the parallel compaction to settle before verifying. a fixed
-     * sleep is not enough on a slow / fd-constrained runner: while compaction is still churning,
+     * sleep is not enough on a slow / fd-constrained runner, while compaction is still churning,
      * num_open is elevated and a read that must open another sstable is correctly rejected with
      * TDB_ERR_BUSY by the reader fd reserve, so the get returns non-zero through no fault of the
      * data. waiting for idle drops num_open below the reserve so reads always proceed. */
@@ -25417,7 +25793,7 @@ static void test_unified_concurrent_multi_cf_read_write(void)
     for (int c = 0; c < NUM_CFS; c++) wait_for_cf_flush_idle(db, cfs[c]);
     for (int c = 0; c < NUM_CFS; c++) wait_for_compaction_idle(db, cfs[c]);
 
-    /* verify CF isolation -- each CF should have its own data. one txn per get: a long-lived read
+    /* verify CF isolation -- each CF should have its own data. one txn per get,a long-lived read
      * txn pins every sstable it touches for its lifetime, so reading all 50 keys in a single txn
      * would accumulate open sstables past max_open on an fd-constrained host and the rest would
      * fail with TDB_ERR_BUSY. independent point lookups release each pin, keeping num_open bounded.
@@ -29082,6 +29458,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_iterator_basic, tests_passed);
     RUN_TEST(test_stats, tests_passed);
     RUN_TEST(test_stats_comprehensive, tests_passed);
+    RUN_TEST(test_amplification_counters_classic, tests_passed);
+    RUN_TEST(test_amplification_counters_unified, tests_passed);
+    RUN_TEST(test_amplification_compaction_btree, tests_passed);
+    RUN_TEST(test_amplification_compact_range, tests_passed);
+    RUN_TEST(test_amplification_spooky_merges, tests_passed);
     RUN_TEST(test_cache_stats, tests_passed);
     RUN_TEST(test_cache_stats_disabled, tests_passed);
     RUN_TEST(test_cache_stats_invalid_args, tests_passed);

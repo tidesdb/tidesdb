@@ -363,6 +363,13 @@ typedef struct tidesdb_config_t
  * @param level_tombstone_counts tombstone count per level (parallels level_key_counts)
  * @param max_sst_density worst per-sstable tombstone density observed in the cf
  * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
+ * @param wal_bytes_written framed bytes appended to this cf's WAL (0 in unified mode)
+ * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L0 sstables
+ * @param compaction_bytes_written on-disk bytes this cf's compactions wrote
+ * @param compaction_bytes_read on-disk bytes this cf's compactions read as input
+ * @param user_bytes_written logical key+value bytes committed to this cf (WA denominator)
+ * @param flush_count flushed sstables produced by this cf
+ * @param compaction_count compaction output sstables produced by this cf
  */
 typedef struct tidesdb_stats_t
 {
@@ -387,6 +394,17 @@ typedef struct tidesdb_stats_t
     uint64_t *level_tombstone_counts;
     double max_sst_density;
     int max_sst_density_level;
+    /* write-amplification counters (lifetime since open, on-disk framed bytes). divide the
+     * write totals by user_bytes_written for this cf's write amplification. wal_bytes_written
+     * is zero in unified mode -- the shared WAL volume is reported db-wide in
+     * tidesdb_db_stats_t.uwal_bytes_written. the *_count fields count output sstables. */
+    uint64_t wal_bytes_written;
+    uint64_t flush_bytes_written;
+    uint64_t compaction_bytes_written;
+    uint64_t compaction_bytes_read;
+    uint64_t user_bytes_written;
+    uint64_t flush_count;
+    uint64_t compaction_count;
 } tidesdb_stats_t;
 
 /**
@@ -446,6 +464,14 @@ typedef struct tidesdb_cache_stats_t
  * @param total_uploads lifetime count of objects uploaded to object store
  * @param total_upload_failures lifetime count of permanently failed uploads (after all retries)
  * @param replica_mode whether running in read-only replica mode
+ * @param uwal_bytes_written framed bytes appended to the shared unified WAL (0 if unified off)
+ * @param wal_bytes_written per-cf WAL bytes summed across all column families
+ * @param flush_bytes_written flush output bytes summed across all column families
+ * @param compaction_bytes_written compaction output bytes summed across all column families
+ * @param compaction_bytes_read compaction input bytes summed across all column families
+ * @param user_bytes_written logical committed bytes summed across all column families
+ * @param flush_count flushed sstables summed across all column families
+ * @param compaction_count compaction output sstables summed across all column families
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -480,6 +506,18 @@ typedef struct tidesdb_db_stats_t
     uint64_t total_uploads;
     uint64_t total_upload_failures;
     int replica_mode;
+    /* write-amplification counters (lifetime since open, on-disk framed bytes). uwal is the
+     * shared unified WAL volume (zero when unified mode is off); the remaining fields are
+     * summed across all column families. db-wide WA = (uwal + wal + flush + compaction) /
+     * user bytes. the *_count fields count output sstables, not logical runs. */
+    uint64_t uwal_bytes_written;
+    uint64_t wal_bytes_written;
+    uint64_t flush_bytes_written;
+    uint64_t compaction_bytes_written;
+    uint64_t compaction_bytes_read;
+    uint64_t user_bytes_written;
+    uint64_t flush_count;
+    uint64_t compaction_count;
 } tidesdb_db_stats_t;
 
 /**** system default configuration functions */
@@ -490,7 +528,7 @@ tidesdb_config_t tidesdb_default_config(void);
  * tidesdb_raise_open_file_limit
  * raise this process's open-file ceiling toward `desired` descriptors so a database can keep more
  * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it BEFORE
- * tidesdb_open. an explicit, opt-in operator action: tidesdb never raises the limit itself. POSIX
+ * tidesdb_open. an explicit, opt-in operator action, tidesdb never raises the limit itself. POSIX
  * (Linux, macOS, the BSDs, illumos) raises the RLIMIT_NOFILE soft limit toward the hard limit;
  * Windows raises the CRT stdio cap (max 8192). a failed or partial raise is non-fatal.
  * @param desired target descriptor count; <= 0 just reports the current ceiling

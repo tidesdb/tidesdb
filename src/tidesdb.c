@@ -65,7 +65,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KV_FLAG_HAS_TTL   0x02
 #define TDB_KV_FLAG_HAS_VLOG  0x04
 #define TDB_KV_FLAG_DELTA_SEQ                                          \
-    0x08 /* serialization-only: seq is delta-encoded, stripped on read \
+    0x08 /* serialization-only, seq is delta-encoded, stripped on read \
           */
 #define TDB_KV_FLAG_SINGLE_DELETE                                \
     0x10 /* tombstone subtype -- caller promises the key was put \
@@ -8210,6 +8210,17 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
     if (klog_bm) block_manager_escalate_fsync(klog_bm);
     if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
 
+    /* write-amplification -- on-disk bytes this merge output produced. read the managers
+     * directly, the metadata block above lands after sst->klog_size was snapshotted, so a
+     * fresh size also counts framing, bloom and metadata. covers the btree output of every
+     * merge method (full preemptive, targeted, dividing, partitioned) */
+    uint64_t klog_final = 0, vlog_final = 0;
+    block_manager_get_size(klog_bm, &klog_final);
+    block_manager_get_size(vlog_bm, &vlog_final);
+    atomic_fetch_add_explicit(&cf->compaction_bytes_written, klog_final + vlog_final,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&cf->compaction_count, 1, memory_order_relaxed);
+
     return TDB_SUCCESS;
 }
 
@@ -13412,6 +13423,13 @@ static void tidesdb_add_ssts_to_merge_heap(tidesdb_t *db, tidesdb_column_family_
                                   sst->id);
                     tidesdb_merge_source_free(source);
                 }
+                else if (cf)
+                {
+                    /* write-amplification -- on-disk bytes this merge reads as input */
+                    atomic_fetch_add_explicit(&cf->compaction_bytes_read,
+                                              sst->klog_size + sst->vlog_size,
+                                              memory_order_relaxed);
+                }
             }
             else
             {
@@ -13965,7 +13983,13 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
                 {
                     if (source->current_kv &&
                         tidesdb_merge_heap_add_source(heap, source) == TDB_SUCCESS)
+                    {
                         estimated_entries += sst->num_entries;
+                        /* write-amplification -- on-disk bytes this merge reads as input */
+                        atomic_fetch_add_explicit(&cf->compaction_bytes_read,
+                                                  sst->klog_size + sst->vlog_size,
+                                                  memory_order_relaxed);
+                    }
                     else
                         tidesdb_merge_source_free(source);
                 }
@@ -14451,6 +14475,11 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
 
         block_manager_get_size(klog_bm, &new_sst->klog_size);
         block_manager_get_size(vlog_bm, &new_sst->vlog_size);
+
+        /* write-amplification -- on-disk bytes this preemptive-merge output produced */
+        atomic_fetch_add_explicit(&cf->compaction_bytes_written,
+                                  new_sst->klog_size + new_sst->vlog_size, memory_order_relaxed);
+        atomic_fetch_add_explicit(&cf->compaction_count, 1, memory_order_relaxed);
 
         tidesdb_merge_heap_free(heap);
 
@@ -15057,6 +15086,11 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     block_manager_get_size(klog_bm, &new_sst->klog_size);
     block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
+    /* write-amplification -- on-disk bytes this targeted-merge output produced */
+    atomic_fetch_add_explicit(&cf->compaction_bytes_written,
+                              new_sst->klog_size + new_sst->vlog_size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cf->compaction_count, 1, memory_order_relaxed);
+
     tidesdb_merge_heap_free(heap);
 
     block_manager_escalate_fsync(klog_bm);
@@ -15504,6 +15538,10 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
                         if (tidesdb_merge_heap_add_source(partition_heap, source) == TDB_SUCCESS)
                         {
                             partition_entries += sst->num_entries;
+                            /* write-amplification -- on-disk bytes this merge reads as input */
+                            atomic_fetch_add_explicit(&cf->compaction_bytes_read,
+                                                      sst->klog_size + sst->vlog_size,
+                                                      memory_order_relaxed);
                         }
                         else
                         {
@@ -16004,6 +16042,11 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
         block_manager_get_size(klog_bm, &new_sst->klog_size);
         block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
+        /* write-amplification -- on-disk bytes this dividing-merge partition output produced */
+        atomic_fetch_add_explicit(&cf->compaction_bytes_written,
+                                  new_sst->klog_size + new_sst->vlog_size, memory_order_relaxed);
+        atomic_fetch_add_explicit(&cf->compaction_count, 1, memory_order_relaxed);
+
         /* we keep block managers open for immediate reads, reaper will close if needed once it's
          * evicted */
         new_sst->klog_bm = klog_bm;
@@ -16172,6 +16215,11 @@ static int tdb_partitioned_merge_finalize_sst(
 
     block_manager_get_size(klog_bm, &sst->klog_size);
     block_manager_get_size(vlog_bm, &sst->vlog_size);
+
+    /* write-amplification -- on-disk bytes this partitioned-merge output produced */
+    atomic_fetch_add_explicit(&cf->compaction_bytes_written, sst->klog_size + sst->vlog_size,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&cf->compaction_count, 1, memory_order_relaxed);
 
     block_manager_close(klog_bm);
     block_manager_close(vlog_bm);
@@ -16640,6 +16688,10 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
                         if (tidesdb_merge_heap_add_source(heap, source) == TDB_SUCCESS)
                         {
                             estimated_entries += sst->num_entries;
+                            /* write-amplification -- on-disk bytes this merge reads as input */
+                            atomic_fetch_add_explicit(&cf->compaction_bytes_read,
+                                                      sst->klog_size + sst->vlog_size,
+                                                      memory_order_relaxed);
                         }
                         else
                         {
@@ -17930,6 +17982,12 @@ static int tidesdb_wal_replay_into(tidesdb_column_family_t *cf, block_manager_t 
                     skip_list_put_with_seq(target, key, entry.key_size, value, entry.value_size,
                                            entry.ttl, entry.seq, 0);
                 }
+
+                /* replayed entries re-enter the memtable, so they count toward the
+                 * write-amplification denominator the same as a live commit -- otherwise a
+                 * post-restart flush of recovered data would have no matching ingest bytes */
+                atomic_fetch_add_explicit(&cf->user_bytes_written,
+                                          entry.key_size + entry.value_size, memory_order_relaxed);
             }
 
             block_manager_block_release(block);
@@ -18279,6 +18337,13 @@ static void *tidesdb_flush_worker_thread(void *arg)
              * flush_pending counter in place, the retry will release them */
             continue;
         }
+
+        /* write-amplification -- on-disk bytes this flush produced (klog + vlog, framing,
+         * index and bloom blobs included). klog_size/vlog_size are finalized by the footer
+         * write inside the writer above. one flushed L0 sstable per flush on the per-cf path */
+        atomic_fetch_add_explicit(&cf->flush_bytes_written, sst->klog_size + sst->vlog_size,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&cf->flush_count, 1, memory_order_relaxed);
 
         /* we must always sync sstable files regardless of sync_mode
          * sstable durability is required before we can delete WAL */
@@ -27435,6 +27500,13 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
         return TDB_SUCCESS;
     }
 
+    /* write-amplification -- this unified split produced one L0 sstable for this CF.
+     * count its on-disk bytes against the CF the segment belongs to (not db-wide) so
+     * per-cf flush volume stays correct in unified mode */
+    atomic_fetch_add_explicit(&cf->flush_bytes_written, sst->klog_size + sst->vlog_size,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&cf->flush_count, 1, memory_order_relaxed);
+
     tidesdb_level_add_sstable(cf->levels[0], sst);
     tidesdb_bump_sstable_layout_version(cf);
 
@@ -28029,6 +28101,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
                 return TDB_ERR_IO;
             }
+            atomic_fetch_add_explicit(&txn->db->uwal_bytes_written,
+                                      block_manager_framed_size((uint32_t)uwal_size),
+                                      memory_order_relaxed);
         }
 
         if (uwal_batch && uwal_batch != uwal_stack_buf) free(uwal_batch);
@@ -28092,6 +28167,17 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 }
                 atomic_store_explicit(&txn->db->unified_mt.is_flushing, 0, memory_order_release);
             }
+        }
+
+        /* write-amplification denominator -- logical key+value bytes this commit ingested,
+         * attributed per op to its own CF (unified batches span CFs). counted on the unified
+         * success path; the per-cf path below has its own matching accounting */
+        for (int op_idx = 0; op_idx < txn->num_ops; op_idx++)
+        {
+            const tidesdb_txn_op_t *op = &txn->ops[op_idx];
+            if (!op->cf) continue;
+            atomic_fetch_add_explicit(&op->cf->user_bytes_written, op->key_size + op->value_size,
+                                      memory_order_relaxed);
         }
 
         txn->is_committed = 1;
@@ -28269,6 +28355,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 if (wal_is_heap) free(wal_batch);
                 goto cleanup_error_io;
             }
+            atomic_fetch_add_explicit(&cf->wal_bytes_written,
+                                      block_manager_framed_size((uint32_t)wal_size),
+                                      memory_order_relaxed);
         }
 
         if (wal_is_heap) free(wal_batch);
@@ -28344,6 +28433,18 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     {
         free(cf_memtables);
         free(cf_skiplists);
+    }
+
+    /* write-amplification denominator -- logical key+value bytes this commit ingested,
+     * attributed per op to its own CF. this is the per-cf commit path; the unified path
+     * above has its own matching accounting. WAL replay accounts the same way so the ratio
+     * survives restart */
+    for (int op_idx = 0; op_idx < txn->num_ops; op_idx++)
+    {
+        const tidesdb_txn_op_t *op = &txn->ops[op_idx];
+        if (!op->cf) continue;
+        atomic_fetch_add_explicit(&op->cf->user_bytes_written, op->key_size + op->value_size,
+                                  memory_order_relaxed);
     }
 
     txn->is_committed = 1;
@@ -33059,6 +33160,20 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
         }
     }
 
+    /* write-amplification counters -- relaxed snapshot, observe-only */
+    (*stats)->wal_bytes_written =
+        atomic_load_explicit(&cf->wal_bytes_written, memory_order_relaxed);
+    (*stats)->flush_bytes_written =
+        atomic_load_explicit(&cf->flush_bytes_written, memory_order_relaxed);
+    (*stats)->compaction_bytes_written =
+        atomic_load_explicit(&cf->compaction_bytes_written, memory_order_relaxed);
+    (*stats)->compaction_bytes_read =
+        atomic_load_explicit(&cf->compaction_bytes_read, memory_order_relaxed);
+    (*stats)->user_bytes_written =
+        atomic_load_explicit(&cf->user_bytes_written, memory_order_relaxed);
+    (*stats)->flush_count = atomic_load_explicit(&cf->flush_count, memory_order_relaxed);
+    (*stats)->compaction_count = atomic_load_explicit(&cf->compaction_count, memory_order_relaxed);
+
     return TDB_SUCCESS;
 }
 
@@ -33142,8 +33257,25 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
             stats->total_data_size_bytes +=
                 (int64_t)atomic_load_explicit(&lvl->current_size, memory_order_relaxed);
         }
+
+        /* write-amplification counters fold across CFs -- uwal is read once below */
+        stats->wal_bytes_written +=
+            atomic_load_explicit(&cf->wal_bytes_written, memory_order_relaxed);
+        stats->flush_bytes_written +=
+            atomic_load_explicit(&cf->flush_bytes_written, memory_order_relaxed);
+        stats->compaction_bytes_written +=
+            atomic_load_explicit(&cf->compaction_bytes_written, memory_order_relaxed);
+        stats->compaction_bytes_read +=
+            atomic_load_explicit(&cf->compaction_bytes_read, memory_order_relaxed);
+        stats->user_bytes_written +=
+            atomic_load_explicit(&cf->user_bytes_written, memory_order_relaxed);
+        stats->flush_count += atomic_load_explicit(&cf->flush_count, memory_order_relaxed);
+        stats->compaction_count +=
+            atomic_load_explicit(&cf->compaction_count, memory_order_relaxed);
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
+
+    stats->uwal_bytes_written = atomic_load_explicit(&db->uwal_bytes_written, memory_order_relaxed);
 
     /* unified memtable stats */
     stats->unified_memtable_enabled = db->unified_mt.enabled;

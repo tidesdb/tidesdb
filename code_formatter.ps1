@@ -1,4 +1,7 @@
 # Before submitting a PR, run this script to format the source code.
+# Usage: .\code_formatter.ps1
+
+$ErrorActionPreference = 'Stop'
 
 $EXCLUDE_DIRS = @('external', 'cmake-build-debug', '.idea', 'build', 'cmake', 'vcpkg_installed')
 

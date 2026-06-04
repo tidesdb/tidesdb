@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Before submitting a PR, run this script to format the source code.
+# Usage: ./code_formatter.sh
 
 find . \
   \( -path "./external" \

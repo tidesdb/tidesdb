@@ -43,6 +43,19 @@ For building and benchmarking instructions [Building & Benchmarking TidesDB](htt
 
 For C usage documentation, see the [TidesDB C Reference](https://tidesdb.com/reference/c/)
 
+### Build options
+
+The following CMake variables can be passed via `-D<NAME>=<VALUE>` to configure the build. LZ4 and Zstd compression are required and discovered via pkg-config; Snappy is bundled. See `CMakeLists.txt` for the authoritative list.
+
+- `CMAKE_BUILD_TYPE` — Optimization/debug profile. Use `Release` for production, `Debug` for development, `RelWithDebInfo` for profiling.
+- `TIDESDB_BUILD_TESTS` — Build the unit/integration test binaries (default `ON`). Set to `OFF` for a library-only build.
+- `TIDESDB_WITH_MIMALLOC` — Link against the mimalloc allocator instead of the system allocator (default `OFF`).
+- `TIDESDB_WITH_TCMALLOC` — Link against Google tcmalloc for high-throughput allocation (default `OFF`).
+- `TIDESDB_WITH_JEMALLOC` — Link against jemalloc, useful for reducing fragmentation under heavy writes (default `OFF`).
+- `TIDESDB_WITH_SANITIZER` — Build with AddressSanitizer/UBSan instrumentation to catch memory and undefined-behavior bugs (default `OFF`).
+- `TIDESDB_WITH_S3` — Enable the S3-compatible object store connector; requires libcurl and OpenSSL (default `OFF`).
+- `ENABLE_READ_PROFILING` — Add `TDB_ENABLE_READ_PROFILING` instrumentation for benchmarking read paths (default `OFF`).
+
 ## Discord Community
 Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.
 

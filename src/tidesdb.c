@@ -34904,10 +34904,8 @@ static int ini_config_handler(void *user, const char *section, const char *name,
             ctx->config->compression_algorithm = TDB_COMPRESS_LZ4_FAST;
         else if (strcmp(value, TDB_INI_VAL_COMPRESS_ZSTD) == 0)
             ctx->config->compression_algorithm = TDB_COMPRESS_ZSTD;
-#ifndef __sun
         else if (strcmp(value, TDB_INI_VAL_COMPRESS_SNAPPY) == 0)
             ctx->config->compression_algorithm = TDB_COMPRESS_SNAPPY;
-#endif
     }
     else if (strcmp(name, TDB_INI_KEY_ENABLE_BLOOM_FILTER) == 0)
     {
@@ -35052,11 +35050,9 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
         case TDB_COMPRESS_ZSTD:
             compression_str = TDB_INI_VAL_COMPRESS_ZSTD;
             break;
-#ifndef __sun
         case TDB_COMPRESS_SNAPPY:
             compression_str = TDB_INI_VAL_COMPRESS_SNAPPY;
             break;
-#endif
     }
     fprintf(fp, TDB_INI_KEY_COMPRESSION_ALGORITHM " = %s\n", compression_str);
 

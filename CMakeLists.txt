@@ -29,7 +29,16 @@ option(TIDESDB_WITH_S3 "build S3-compatible object store connector (requires lib
 
 # compression backends -- optional, default ON. drop any with -DTIDESDB_WITH_<X>=OFF; a build with
 # all three off has no compression dependencies and supports TDB_COMPRESS_NONE only.
-option(TIDESDB_WITH_SNAPPY "build with Snappy compression support" ON)
+# Snappy has no OmniOS/Illumos package, so its default is OFF on SunOS (still overridable with
+# -DTIDESDB_WITH_SNAPPY=ON). the platform default must be chosen here, before option() creates the
+# cache entry -- option() always seeds the variable, so a post-option "is it set?" test cannot tell
+# a user override from the default and would never disable Snappy on SunOS.
+if(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+    set(TIDESDB_SNAPPY_DEFAULT OFF)
+else()
+    set(TIDESDB_SNAPPY_DEFAULT ON)
+endif()
+option(TIDESDB_WITH_SNAPPY "build with Snappy compression support" ${TIDESDB_SNAPPY_DEFAULT})
 option(TIDESDB_WITH_LZ4 "build with LZ4 compression support" ON)
 option(TIDESDB_WITH_ZSTD "build with Zstd compression support" ON)
 
@@ -40,11 +49,6 @@ option(TIDESDB_WITH_ZSTD "build with Zstd compression support" ON)
 set(TIDESDB_SNAPPY_TARGET "" CACHE STRING "external Snappy link target/item (empty = autodetect)")
 set(TIDESDB_LZ4_TARGET "" CACHE STRING "external LZ4 link target/item (empty = autodetect)")
 set(TIDESDB_ZSTD_TARGET "" CACHE STRING "external Zstd link target/item (empty = autodetect)")
-
-# Snappy has no OmniOS/Illumos package, so a stock SunOS build drops it by default
-if(CMAKE_SYSTEM_NAME STREQUAL "SunOS" AND NOT DEFINED CACHE{TIDESDB_WITH_SNAPPY})
-    set(TIDESDB_WITH_SNAPPY OFF CACHE BOOL "build with Snappy compression support" FORCE)
-endif()
 
 # mirror TIDESDB_WITH_S3 into TIDESDB_HAS_S3 so configure_file emits the consumer-visible define
 if(TIDESDB_WITH_S3)

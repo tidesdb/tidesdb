@@ -2571,16 +2571,14 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     /* we restore compression algorithm from metadata */
     if (sst->config)
     {
-        /* we validate compression algorithm value */
-        if (compression_algorithm != TDB_COMPRESS_NONE &&
-#ifndef __sun
-            compression_algorithm != TDB_COMPRESS_SNAPPY &&
-#endif
-            compression_algorithm != TDB_COMPRESS_LZ4 &&
-            compression_algorithm != TDB_COMPRESS_LZ4_FAST &&
-            compression_algorithm != TDB_COMPRESS_ZSTD)
+        /* reject an algorithm this build cannot use -- catches both an invalid id and a valid one
+         * whose backend was compiled out (e.g. reading zstd data in a build without zstd). failing
+         * here is honest, the compressed blocks could not be decoded anyway */
+        if (!tidesdb_compression_available(compression_algorithm))
         {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable metadata has invalid compression_algorithm: %u",
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "SSTable metadata compression_algorithm %u is invalid or not available "
+                          "in this build",
                           compression_algorithm);
             return -1;
         }
@@ -2800,13 +2798,14 @@ int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, c
 
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
 {
-    return (tidesdb_column_family_config_t){
+    tidesdb_column_family_config_t config = (tidesdb_column_family_config_t){
         .write_buffer_size = TDB_DEFAULT_WRITE_BUFFER_SIZE,
         .level_size_ratio = TDB_DEFAULT_LEVEL_SIZE_RATIO,
         .min_levels = TDB_DEFAULT_MIN_LEVELS,
         .dividing_level_offset = TDB_DEFAULT_DIVIDING_LEVEL_OFFSET,
         .klog_value_threshold = TDB_DEFAULT_KLOG_VALUE_THRESHOLD,
-        .compression_algorithm = TDB_COMPRESS_LZ4,
+        .compression_algorithm =
+            TDB_COMPRESS_NONE, /* replaced below by the best available backend */
         .enable_bloom_filter = 1,
         .bloom_fpr = TDB_DEFAULT_BLOOM_FPR,
         .enable_block_indexes = 1,
@@ -2830,6 +2829,18 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .object_target_file_size = 0, /* reserved, not used */
         .object_lazy_compaction = 0,
         .object_prefetch_compaction = 1};
+
+    /* pick the best compression backend this build actually has, preferring LZ4 for speed, then
+     * ZSTD, then Snappy, falling back to NONE so a dependency-free build still yields a usable
+     * default config rather than one that fails at the first flush */
+    if (tidesdb_compression_available(TDB_COMPRESS_LZ4))
+        config.compression_algorithm = TDB_COMPRESS_LZ4;
+    else if (tidesdb_compression_available(TDB_COMPRESS_ZSTD))
+        config.compression_algorithm = TDB_COMPRESS_ZSTD;
+    else if (tidesdb_compression_available(TDB_COMPRESS_SNAPPY))
+        config.compression_algorithm = TDB_COMPRESS_SNAPPY;
+
+    return config;
 }
 
 tidesdb_config_t tidesdb_default_config(void)
@@ -22202,6 +22213,17 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_INVALID_ARGS;
     }
 
+    /* reject a compression backend this build does not have, up front, so the caller learns
+     * immediately instead of hitting a flush failure later. NONE is always available */
+    if (!tidesdb_compression_available(config->compression_algorithm))
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "CF '%s' requests compression_algorithm %u which is not available in this "
+                      "build (rebuild with the matching -DTIDESDB_WITH_* option)",
+                      name, (unsigned int)config->compression_algorithm);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
     /** unified memtable mode requires all CFs to use memcmp comparator
      *  because the single shared skip list uses a single comparator.. */
     if (db->unified_mt.enabled)
@@ -25215,6 +25237,15 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     const int cf_index = tidesdb_txn_add_cf_internal(txn, cf);
     if (cf_index < 0) return TDB_ERR_MEMORY;
 
+    /* sstable scan layout guard -- the per-level scan below is not atomic across levels, so a
+     * compaction can relocate a key from a level we already passed into one we have not reached
+     * and a present key falls through as a false NOT_FOUND. snapshot the layout version before
+     * scanning, re-check before concluding NOT_FOUND, retry the scan while it differs, then surface
+     * a retryable BUSY. declared before the goto unified_sst_search so the jump cannot skip init.
+     */
+    int sst_scan_restarts = 0;
+    uint64_t sst_scan_layout_v = 0;
+
     /* we check write set first (read your own writes)
      * transaction must see its own uncommitted changes before checking cache/memtable
      * we use search strategy based on transaction size:
@@ -25603,6 +25634,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
 
 unified_sst_search:;
+    sst_scan_layout_v = atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     for (int level_num = 0; level_num < num_levels; level_num++)
@@ -25820,6 +25852,21 @@ unified_sst_search:;
             if (best_value) free(best_value);
             return (!best_is_dead) ? TDB_ERR_MEMORY : TDB_ERR_NOT_FOUND;
         }
+    }
+
+    /* nothing matched in any level. if the layout moved while we scanned, a compaction may have
+     * carried the key past our cursor -- retry the whole scan rather than report a false miss, and
+     * once the restart budget is spent return a retryable BUSY instead of a definitive NOT_FOUND.
+     */
+    if (atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire) !=
+        sst_scan_layout_v)
+    {
+        if (sst_scan_restarts < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+        {
+            sst_scan_restarts++;
+            goto unified_sst_search;
+        }
+        return TDB_ERR_BUSY;
     }
 
     return TDB_ERR_NOT_FOUND;

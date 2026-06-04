@@ -240,7 +240,7 @@ typedef enum
  * @param key2 second key to compare
  * @param key2_size size of second key in bytes
  * @param ctx user-provided context pointer
- * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
+ * @return < 0 if key1 < key2, 0 if equal, >0 if key1 > key2
  */
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                      size_t key2_size, void *ctx);
@@ -900,21 +900,21 @@ struct tidesdb_t
     /* unified memtable mode -- single skip_list + single WAL for all CFs */
     struct
     {
-        int enabled;
-        _Atomic(tidesdb_memtable_t *) active;
+        int enabled;                          /* 1 when unified memtable mode is active */
+        _Atomic(tidesdb_memtable_t *) active; /* current active unified memtable */
         /* read-side epoch for the unified active slot. see the analogous
          * cf->active_mt_readers field for the protocol */
         _Atomic(int) active_mt_readers;
-        queue_t *immutables;
-        _Atomic(int) is_flushing;
-        _Atomic(int) immutable_cleanup_counter;
-        size_t write_buffer_size;
-        _Atomic(uint32_t) next_cf_index;
-        _Atomic(uint64_t) wal_generation;
+        queue_t *immutables;                    /* rotated unified memtables awaiting flush */
+        _Atomic(int) is_flushing;               /* 1 while a rotation/flush is in progress */
+        _Atomic(int) immutable_cleanup_counter; /* batched immutable cleanup counter */
+        size_t write_buffer_size;               /* rotation threshold for the unified memtable */
+        _Atomic(uint32_t) next_cf_index;        /* next CF prefix index to assign */
+        _Atomic(uint64_t) wal_generation;       /* current unified WAL generation */
         tidesdb_unified_cf_index_entry_t *cf_index_map; /* name -> index, mirrors UNIMAP file */
-        int cf_index_map_count;
-        int cf_index_map_capacity;
-        pthread_mutex_t cf_index_map_lock;
+        int cf_index_map_count;                         /* live entries in cf_index_map */
+        int cf_index_map_capacity;                      /* allocated capacity of cf_index_map */
+        pthread_mutex_t cf_index_map_lock;              /* guards cf_index_map mutation */
         pthread_mutex_t wal_group_sync_lock; /* coordinates group-commit fsync on the unified WAL */
         pthread_cond_t wal_group_sync_cond;
         /* last-emit timestamp (seconds) for the throttled unified ceiling-stall warning */
@@ -988,7 +988,10 @@ struct tidesdb_t
  * @param cf_capacity capacity of column families array
  * @param last_cf cached last-used column family for O(1) single-CF lookup
  * @param last_cf_index cached index of last-used column family
- * @param savepoints array of savepoint transaction states
+ * @param savepoint_op_counts per-savepoint snapshot of num_ops -- the op-array length to truncate
+ * back to on rollback to that savepoint
+ * @param savepoint_cf_counts per-savepoint snapshot of num_cfs -- the cf-array length to truncate
+ * back to on rollback to that savepoint
  * @param savepoint_names array of savepoint names
  * @param num_savepoints number of savepoints
  * @param savepoints_capacity capacity of savepoints array

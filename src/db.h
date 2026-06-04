@@ -129,13 +129,13 @@ typedef enum
 /** compression algorithms */
 /* ABI/on-disk contract, these numeric values are persisted in sstable/vlog metadata and are
  * duplicated in compress.h. the two copies MUST stay identical -- compress.c _Static_asserts the
- * compress.h copy; keep this copy in lockstep. */
+ * compress.h copy; keep this copy in lockstep. every enumerator is always defined; whether a
+ * backend can actually be used is a build-time choice (the -DTIDESDB_WITH_* options), queryable at
+ * runtime via tidesdb_compression_available. */
 typedef enum
 {
     TDB_COMPRESS_NONE = 0,
-#ifndef __sun
     TDB_COMPRESS_SNAPPY = 1,
-#endif
     TDB_COMPRESS_LZ4 = 2,
     TDB_COMPRESS_ZSTD = 3,
     TDB_COMPRESS_LZ4_FAST = 4
@@ -171,7 +171,11 @@ typedef enum
 #define TDB_MAX_COMPARATOR_CTX  256
 #define TDB_MAX_CF_NAME_LEN     128
 
-/** comparator function type */
+/** comparator function type.
+ * ABI contract -- this MUST stay structurally identical to skip_list_comparator_fn in
+ * skip_list.h. tidesdb_register_comparator / tidesdb_get_comparator are declared with this
+ * type in the FFI header and with skip_list_comparator_fn internally, so the two function
+ * pointer signatures have to match exactly or an FFI caller passes an incompatible callback. */
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                      size_t key2_size, void *ctx);
 

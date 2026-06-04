@@ -65,8 +65,8 @@
 
 typedef enum
 {
-    BLOCK_MANAGER_SYNC_NONE,
-    BLOCK_MANAGER_SYNC_FULL,
+    BLOCK_MANAGER_SYNC_NONE, /* no per-write fsync; durability left to the caller/group-commit */
+    BLOCK_MANAGER_SYNC_FULL, /* fdatasync each write, unless O_DSYNC already made it durable */
 } block_manager_sync_mode_t;
 
 typedef enum
@@ -109,7 +109,7 @@ typedef struct
 } block_manager_t;
 
 /**
- * block_t
+ * block_manager_block_t
  * block struct
  * used for blocks in TidesDB
  * @param size the size of the data in the block
@@ -126,7 +126,7 @@ typedef struct
 } block_manager_block_t;
 
 /**
- * block_cursor_t
+ * block_manager_cursor_t
  * block cursor struct
  * used for block cursors in TidesDB
  * @param bm the block manager

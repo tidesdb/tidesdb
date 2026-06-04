@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.3.3
+	VERSION 9.3.4
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -27,9 +27,39 @@ option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
 option(TIDESDB_WITH_S3 "build S3-compatible object store connector (requires libcurl + openssl)" OFF)
 
+# compression backends -- optional, default ON. drop any with -DTIDESDB_WITH_<X>=OFF; a build with
+# all three off has no compression dependencies and supports TDB_COMPRESS_NONE only.
+option(TIDESDB_WITH_SNAPPY "build with Snappy compression support" ON)
+option(TIDESDB_WITH_LZ4 "build with LZ4 compression support" ON)
+option(TIDESDB_WITH_ZSTD "build with Zstd compression support" ON)
+
+# explicit link override per backend, for consumers who vendor a compression lib (FetchContent /
+# add_subdirectory) under a target name the auto-probe cannot guess. set to a CMake target or a raw
+# link item, e.g. -DTIDESDB_ZSTD_TARGET=zstd::libzstd_static or -DTIDESDB_ZSTD_TARGET=zstd-neon.
+# empty (default) = probe known target names, then fall back to -l<name>. 
+set(TIDESDB_SNAPPY_TARGET "" CACHE STRING "external Snappy link target/item (empty = autodetect)")
+set(TIDESDB_LZ4_TARGET "" CACHE STRING "external LZ4 link target/item (empty = autodetect)")
+set(TIDESDB_ZSTD_TARGET "" CACHE STRING "external Zstd link target/item (empty = autodetect)")
+
+# Snappy has no OmniOS/Illumos package, so a stock SunOS build drops it by default
+if(CMAKE_SYSTEM_NAME STREQUAL "SunOS" AND NOT DEFINED CACHE{TIDESDB_WITH_SNAPPY})
+    set(TIDESDB_WITH_SNAPPY OFF CACHE BOOL "build with Snappy compression support" FORCE)
+endif()
+
 # mirror TIDESDB_WITH_S3 into TIDESDB_HAS_S3 so configure_file emits the consumer-visible define
 if(TIDESDB_WITH_S3)
     set(TIDESDB_HAS_S3 ON)
+endif()
+
+# mirror the compression options into TIDESDB_HAVE_* for configure_file (consumer-visible defines)
+if(TIDESDB_WITH_SNAPPY)
+    set(TIDESDB_HAVE_SNAPPY ON)
+endif()
+if(TIDESDB_WITH_LZ4)
+    set(TIDESDB_HAVE_LZ4 ON)
+endif()
+if(TIDESDB_WITH_ZSTD)
+    set(TIDESDB_HAVE_ZSTD ON)
 endif()
 
 configure_file(
@@ -130,6 +160,67 @@ set_target_properties(tidesdb PROPERTIES
 
 target_include_directories(tidesdb PRIVATE src)
 
+# private build-time signal that drives the per-backend guards in compress.c
+if(TIDESDB_WITH_SNAPPY)
+    target_compile_definitions(tidesdb PRIVATE TIDESDB_HAVE_SNAPPY)
+endif()
+if(TIDESDB_WITH_LZ4)
+    target_compile_definitions(tidesdb PRIVATE TIDESDB_HAVE_LZ4)
+endif()
+if(TIDESDB_WITH_ZSTD)
+    target_compile_definitions(tidesdb PRIVATE TIDESDB_HAVE_ZSTD)
+endif()
+
+# link one compression backend, resolving its name in three steps so a vendored or system-provided
+# library both work. resolution order:
+#   1. an explicit override in TIDESDB_<X>_TARGET -- a CMake target or raw link item the consumer
+#      passes in. this is the escape hatch for a dependency built under a non-standard target name
+#      (e.g. a FetchContent build named zstd-neon-enabled) where name-probing cannot guess it.
+#   2. a known CMake target already defined in the build (find_package / FetchContent /
+#      add_subdirectory). linking the target carries its include dirs and the in-tree artifact,
+#      which a bare -l<name> cannot -- this is what issue #618 hit on Ubuntu.
+#   3. a bare -l<name> against a system/installed library (the historical fallback).
+# used by every POSIX platform branch below so the behavior is uniform, not Linux-only.
+function(_tidesdb_link_compression libname)
+    string(TOUPPER ${libname} _up)
+    if(TIDESDB_${_up}_TARGET)
+        target_link_libraries(tidesdb PUBLIC ${TIDESDB_${_up}_TARGET})
+        message(STATUS "tidesdb: linking ${libname} via TIDESDB_${_up}_TARGET=${TIDESDB_${_up}_TARGET}")
+        return()
+    endif()
+    set(candidates "")
+    if(libname STREQUAL "zstd")
+        list(APPEND candidates
+                zstd::libzstd_shared zstd::libzstd_static zstd::libzstd
+                libzstd_shared libzstd_static libzstd zstd)
+    elseif(libname STREQUAL "snappy")
+        list(APPEND candidates Snappy::snappy snappy)
+    elseif(libname STREQUAL "lz4")
+        list(APPEND candidates lz4::lz4 LZ4::lz4 lz4)
+    endif()
+    foreach(tgt IN LISTS candidates)
+        if(TARGET ${tgt})
+            target_link_libraries(tidesdb PUBLIC ${tgt})
+            message(STATUS "tidesdb: linking ${libname} via existing target ${tgt}")
+            return()
+        endif()
+    endforeach()
+    target_link_libraries(tidesdb PUBLIC -l${libname})
+endfunction()
+
+# link every compression backend enabled by the -DTIDESDB_WITH_* options through the resolver above
+macro(_tidesdb_link_enabled_compression)
+    if(TIDESDB_WITH_LZ4)
+        _tidesdb_link_compression(lz4)
+    endif()
+    if(TIDESDB_WITH_ZSTD)
+        _tidesdb_link_compression(zstd)
+    endif()
+    if(TIDESDB_WITH_SNAPPY)
+        _tidesdb_link_compression(snappy)
+    endif()
+endmacro()
+
 # find compression libraries.
 # MSVC builds rely on vcpkg, which ships full CMake config packages.
 # MinGW (MSYS2) zstd and lz4 ship only pkg-config (.pc) files, no CMake
@@ -141,13 +232,25 @@ target_include_directories(tidesdb PRIVATE src)
 if(WIN32)
     if(MINGW)
         find_package(PkgConfig REQUIRED)
-        pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
-        pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
-        find_package(Snappy CONFIG REQUIRED)
+        if(TIDESDB_WITH_ZSTD)
+            pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+        endif()
+        if(TIDESDB_WITH_LZ4)
+            pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+        endif()
+        if(TIDESDB_WITH_SNAPPY)
+            find_package(Snappy CONFIG REQUIRED)
+        endif()
     else()
-        find_package(zstd CONFIG REQUIRED)
-        find_package(Snappy CONFIG REQUIRED)
-        find_package(lz4 CONFIG REQUIRED)
+        if(TIDESDB_WITH_ZSTD)
+            find_package(zstd CONFIG REQUIRED)
+        endif()
+        if(TIDESDB_WITH_SNAPPY)
+            find_package(Snappy CONFIG REQUIRED)
+        endif()
+        if(TIDESDB_WITH_LZ4)
+            find_package(lz4 CONFIG REQUIRED)
+        endif()
         find_package(PThreads4W REQUIRED)
     endif()
 endif()
@@ -223,11 +326,10 @@ if(APPLE)
     # Link against compression libraries for macOS
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
             pthread     # pthread library
     )
+    # resolve compression backends via override -> known target -> -l fallback (issue #618)
+    _tidesdb_link_enabled_compression()
 
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_libraries(tidesdb PUBLIC atomic)
@@ -248,21 +350,30 @@ if(APPLE)
     endif()
 
 elseif(WIN32)
-    # for windows, link against compression libraries and pthreads
+    # for windows, link against the enabled compression libraries and pthreads
     if(MINGW)
-        target_link_libraries(tidesdb PUBLIC
-                PkgConfig::ZSTD
-                PkgConfig::LZ4
-                Snappy::snappy
-                pthread
-        )
+        if(TIDESDB_WITH_ZSTD)
+            target_link_libraries(tidesdb PUBLIC PkgConfig::ZSTD)
+        endif()
+        if(TIDESDB_WITH_LZ4)
+            target_link_libraries(tidesdb PUBLIC PkgConfig::LZ4)
+        endif()
+        if(TIDESDB_WITH_SNAPPY)
+            target_link_libraries(tidesdb PUBLIC Snappy::snappy)
+        endif()
+        target_link_libraries(tidesdb PUBLIC pthread)
     else()
-        target_link_libraries(tidesdb PUBLIC
-                $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
-                Snappy::snappy
-                lz4::lz4
-                PThreads4W::PThreads4W
-        )
+        if(TIDESDB_WITH_ZSTD)
+            target_link_libraries(tidesdb PUBLIC
+                    $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>)
+        endif()
+        if(TIDESDB_WITH_SNAPPY)
+            target_link_libraries(tidesdb PUBLIC Snappy::snappy)
+        endif()
+        if(TIDESDB_WITH_LZ4)
+            target_link_libraries(tidesdb PUBLIC lz4::lz4)
+        endif()
+        target_link_libraries(tidesdb PUBLIC PThreads4W::PThreads4W)
     endif()
 
     if(TIDESDB_WITH_MIMALLOC)
@@ -277,11 +388,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
             pthread     # pthread library
     )
+    # resolve compression backends via override -> known target -> -l fallback (issue #618)
+    _tidesdb_link_enabled_compression()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
@@ -302,11 +412,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
             pthread     # pthread library
     )
+    # resolve compression backends via override -> known target -> -l fallback (issue #618)
+    _tidesdb_link_enabled_compression()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
@@ -327,11 +436,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
     target_link_directories(tidesdb PUBLIC /usr/pkg/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
             pthread     # pthread library
     )
+    # resolve compression backends via override -> known target -> -l fallback (issue #618)
+    _tidesdb_link_enabled_compression()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
@@ -352,11 +460,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
             pthread     # pthread library
     )
+    # resolve compression backends via override -> known target -> -l fallback (issue #618)
+    _tidesdb_link_enabled_compression()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
@@ -373,15 +480,16 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
-    # Note that snappy is not available in OmniOS repos, using only lz4 and zstd
+    # snappy is not packaged for OmniOS, so TIDESDB_WITH_SNAPPY defaults OFF here and the
+    # compression list carries only the backends actually available (lz4/zstd by default)
     target_include_directories(tidesdb PUBLIC /opt/ooce/include /usr/include)
     target_link_directories(tidesdb PUBLIC /opt/ooce/lib/amd64 /usr/lib/amd64)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
             pthread     # pthread library
     )
+    # resolve compression backends via override -> known target -> -l fallback (snappy off here)
+    _tidesdb_link_enabled_compression()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
@@ -392,46 +500,24 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
         target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
     endif()
 else()
-    # for linux and other unix systems
-    # prefer a CMake target if a parent project (FetchContent / add_subdirectory)
-    # has already created one for the compression lib; otherwise fall back to a
-    # bare -l<name> linker flag. the -l fallback exists because some distros
-    # (e.g. Oracle Linux 8, RHEL 8) ship zstd-devel CMake configs that define
-    # zstd::libzstd as a MODULE target and break find_package(zstd CONFIG) for
-    # plain linking. the if(TARGET ...) probe is safe as it only matches when the
-    # parent build has already produced the target, so stand-alone builds on
-    # those distros still take the -l path exactly like before.
-    function(_tidesdb_link_compression libname)
-        set(candidates "")
-        if(libname STREQUAL "zstd")
-            list(APPEND candidates
-                    zstd::libzstd_shared zstd::libzstd_static zstd::libzstd
-                    libzstd_shared libzstd_static libzstd zstd)
-        elseif(libname STREQUAL "snappy")
-            list(APPEND candidates Snappy::snappy snappy)
-        elseif(libname STREQUAL "lz4")
-            list(APPEND candidates lz4::lz4 LZ4::lz4 lz4)
-        endif()
-        foreach(tgt IN LISTS candidates)
-            if(TARGET ${tgt})
-                target_link_libraries(tidesdb PUBLIC ${tgt})
-                message(STATUS "tidesdb: linking ${libname} via existing target ${tgt}")
-                return()
-            endif()
-        endforeach()
-        target_link_libraries(tidesdb PUBLIC -l${libname})
-    endfunction()
-
-    _tidesdb_link_compression(zstd)
-    _tidesdb_link_compression(snappy)
-    _tidesdb_link_compression(lz4)
+    # for linux and other unix systems -- resolve each enabled backend through the shared helper
+    # (override -> known target -> -l fallback). the target probe matters because some distros
+    # (e.g. Oracle Linux 8, RHEL 8) ship zstd-devel CMake configs that define zstd::libzstd as a
+    # MODULE target and break find_package(zstd CONFIG) for plain linking, and a parent build doing
+    # FetchContent / add_subdirectory provides the lib only as a target, never as a system -l.
+    _tidesdb_link_enabled_compression()
 
     target_link_libraries(tidesdb PUBLIC
             pthread
             m           # math library
-            stdc++      # C++ standard library (required by Snappy)
             atomic      # atomic operations library (required for 32-bit architectures like PowerPC)
     )
+
+    # libstdc++ is only pulled in by Snappy's C++ implementation; skip it when Snappy is off so a
+    # no-Snappy build does not acquire a C++ runtime dependency
+    if(TIDESDB_WITH_SNAPPY)
+        target_link_libraries(tidesdb PUBLIC stdc++)
+    endif()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)

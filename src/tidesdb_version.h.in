@@ -8,4 +8,12 @@
  * without having to re-pass the build flag. */
 #cmakedefine TIDESDB_HAS_S3
 
+/* defined per compression backend that was compiled into libtidesdb (mirrors the
+ * -DTIDESDB_WITH_{SNAPPY,LZ4,ZSTD} build options). TDB_COMPRESS_NONE is always available;
+ * for the rest, consumers can compile-time detect support here or query it at runtime via
+ * tidesdb_compression_available(). */
+#cmakedefine TIDESDB_HAVE_SNAPPY
+#cmakedefine TIDESDB_HAVE_LZ4
+#cmakedefine TIDESDB_HAVE_ZSTD
+
 #endif

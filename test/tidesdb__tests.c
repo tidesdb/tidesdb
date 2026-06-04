@@ -23287,7 +23287,10 @@ static void test_concurrent_multi_cf_deep_sst_mixed_ops(void)
             ASSERT_EQ(tidesdb_txn_put(txn, idx_cf, (uint8_t *)idx_key, strlen(idx_key) + 1,
                                       (uint8_t *)"\x00", 1, 0),
                       0);
-            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            /* see tdb_test_commit_with_retry -- the 512 byte write buffer rotates the active
+             * memtable on nearly every commit, so this seed commit can hit the retryable
+             * TDB_ERR_BUSY backpressure stall on a slow runner (qemu DragonFlyBSD); retry it */
+            ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
             tidesdb_txn_free(txn);
         }
 

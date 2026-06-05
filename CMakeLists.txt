@@ -101,6 +101,14 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     endif()
 endif()
 
+# optional -Wmaybe-uninitialized for development. GCC only (the flag is GCC-specific), and it is a
+# no-op at -O0 because the analysis runs only under optimization, so pair it with an optimized
+# build, e.g. -DTIDESDB_WARN_MAYBE_UNINIT=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo.
+option(TIDESDB_WARN_MAYBE_UNINIT "enable -Wmaybe-uninitialized (GCC; requires an optimized build)" OFF)
+if(TIDESDB_WARN_MAYBE_UNINIT AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-Wmaybe-uninitialized)
+endif()
+
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
     if(MSVC)

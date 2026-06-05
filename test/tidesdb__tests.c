@@ -23555,7 +23555,7 @@ static void *mcf_atom_writer_thread(void *arg)
         tidesdb_txn_put(txn, d->cf_b, (uint8_t *)key_b, strlen(key_b) + 1, (uint8_t *)val,
                         strlen(val) + 1, 0);
 
-        if (tidesdb_txn_commit(txn) == 0)
+        if (tdb_test_commit_with_retry(txn, 20) == 0)
             atomic_fetch_add(d->committed, 1);
         else
             atomic_fetch_add(d->errors, 1);

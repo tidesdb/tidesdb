@@ -658,7 +658,9 @@ static inline int tdb_spawn_wait(const char *cmd, char *const argv[])
 #define mkdir(path, mode) _mkdir(path)
 #else
 /* msvc uses the native Win32 threading backend defined further below (search for "native Win32
- * threading backend"), so it needs no pthreads-win32 library */
+ * threading backend"), so it needs no pthreads-win32 library. time.h provides struct timespec and
+ * struct tm, which the removed pthreads-win32 header used to pull in transitively. */
+#include <time.h>
 #endif
 
 #if defined(_MSC_VER)

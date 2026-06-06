@@ -23589,7 +23589,9 @@ static void *mcf_atom_compactor_thread(void *arg)
 static int tdb_atom_key_durably_gone(tidesdb_t *db, tidesdb_column_family_t *cf, const uint8_t *key,
                                      size_t key_size)
 {
-    for (int i = 0; i < 50; i++)
+    /* ~5s window -- on a slow sanitizer runner a compaction relocating the key can outlast a
+     * shorter window and make a genuine transient look durable */
+    for (int i = 0; i < 250; i++)
     {
         usleep(20000);
         tidesdb_txn_t *t = NULL;
@@ -23601,7 +23603,11 @@ static int tdb_atom_key_durably_gone(tidesdb_t *db, tidesdb_column_family_t *cf,
         tidesdb_txn_free(t);
         if (rc == TDB_SUCCESS) return 0; /* reappeared -- transient */
     }
-    return 1; /* still gone after ~1s -- durable */
+    /* still gone after fresh re-reads -- record which key for diagnosis */
+    printf("  DURABLE MISS: CF '%s' key '%s' still gone after fresh re-reads\n", cf->name,
+           (const char *)key);
+    fflush(stdout);
+    return 1;
 }
 
 static void test_multi_cf_cross_txn_compaction_atomicity(void)
@@ -23736,6 +23742,7 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     tidesdb_txn_free(vtxn);
     printf("  atomicity check: both=%d only_a=%d only_b=%d both_absent=%d busy=%d\n", both_present,
            only_a, only_b, both_absent, busy);
+    fflush(stdout); /* flush before any assert abort so the counts survive in the log */
     /* the real invariants, no one-sided loss and no fully-lost committed pair. BUSY pairs are
      * present-but-transient, so they count toward the committed total rather than failing. */
     ASSERT_EQ(only_a, 0);

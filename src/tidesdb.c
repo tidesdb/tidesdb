@@ -8478,8 +8478,17 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
 
                 /* we track first key of block */
                 const int is_first_entry_in_block = (current_klog_block->num_entries == 0);
-                tidesdb_klog_block_add_entry(current_klog_block, &kv_stack, sst->config,
-                                             comparator_fn, comparator_ctx);
+                result = tidesdb_klog_block_add_entry(current_klog_block, &kv_stack, sst->config,
+                                                      comparator_fn, comparator_ctx);
+                if (result != TDB_SUCCESS)
+                {
+                    /* an allocation failed adding the entry -- fail the whole sstable write so the
+                     * flush retries and the WAL is retained, rather than committing a block that
+                     * silently dropped a committed key while the bloom still claims it present */
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " klog add_entry failed",
+                                  sst->id);
+                    goto cleanup;
+                }
 
                 /* we reuse block_first_key buffer with capacity tracking */
                 if (is_first_entry_in_block)

@@ -7870,8 +7870,13 @@ static int tidesdb_sstable_write_from_memtable_btree_ex(tidesdb_t *db, tidesdb_c
             if (btree_builder_add(builder, key, key_size, value_to_store, value_size_to_store,
                                   vlog_offset, seq, ttl, entry_flags) != 0)
             {
+                /* allocation failed adding the entry -- fail the write so the flush retries and the
+                 * wal is retained, rather than committing a btree with a dropped committed key */
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to add entry to btree",
                               sst->id);
+                if (bloom) bloom_filter_free(bloom);
+                btree_builder_free(builder);
+                return TDB_ERR_MEMORY;
             }
 
             /* we add to bloom filter */
@@ -14288,8 +14293,14 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
                     /* we check if this is the first entry in a new block */
                     int is_first_entry_in_block = (current_klog_block->num_entries == 0);
 
-                    tidesdb_klog_block_add_entry(current_klog_block, pending, &cf->config,
-                                                 comparator_fn, comparator_ctx);
+                    if (tidesdb_klog_block_add_entry(current_klog_block, pending, &cf->config,
+                                                     comparator_fn, comparator_ctx) != TDB_SUCCESS)
+                    {
+                        /* allocation failed adding the entry -- abort, preserving the sources so no
+                         * key is lost and compaction retries */
+                        aborted = 1;
+                        break;
+                    }
 
                     /* we track first key of block */
                     if (is_first_entry_in_block)
@@ -14908,8 +14919,14 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
 
                 int is_first_entry_in_block = (current_klog_block->num_entries == 0);
 
-                tidesdb_klog_block_add_entry(current_klog_block, pending, &cf->config,
-                                             comparator_fn, comparator_ctx);
+                if (tidesdb_klog_block_add_entry(current_klog_block, pending, &cf->config,
+                                                 comparator_fn, comparator_ctx) != TDB_SUCCESS)
+                {
+                    /* allocation failed adding the entry -- abort, preserving the sources so no key
+                     * is lost and compaction retries */
+                    aborted = 1;
+                    break;
+                }
 
                 if (is_first_entry_in_block)
                 {
@@ -15879,8 +15896,14 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
                     /* we check if this is the first entry in a new block */
                     int is_first_entry_in_block = (klog_block->num_entries == 0);
 
-                    tidesdb_klog_block_add_entry(klog_block, pending, &cf->config, comparator_fn,
-                                                 comparator_ctx);
+                    if (tidesdb_klog_block_add_entry(klog_block, pending, &cf->config,
+                                                     comparator_fn, comparator_ctx) != TDB_SUCCESS)
+                    {
+                        /* allocation failed adding the entry -- abort, preserving the sources so no
+                         * key is lost and compaction retries */
+                        aborted = 1;
+                        break;
+                    }
 
                     /* we track first key of block */
                     if (is_first_entry_in_block)
@@ -17030,8 +17053,14 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
                 /* we check if this is first entry in a new block (before adding) */
                 int is_first_entry_in_block = (klog_block->num_entries == 0);
 
-                tidesdb_klog_block_add_entry(klog_block, kv, &cf->config, comparator_fn,
-                                             comparator_ctx);
+                if (tidesdb_klog_block_add_entry(klog_block, kv, &cf->config, comparator_fn,
+                                                 comparator_ctx) != TDB_SUCCESS)
+                {
+                    /* an allocation failed adding the entry -- abort cleanly. the aborted path
+                     * preserves the source sstables so no key is lost and compaction retries. */
+                    aborted = 1;
+                    break;
+                }
 
                 /* we track first key of block */
                 if (is_first_entry_in_block)
@@ -18471,12 +18500,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * (the array is append-only and unsorted). logged at DEBUG as a flush-concurrency signal
          * only -- it is not a correctness violation. one line per out-of-order add (not per pair)
          * to avoid an O(n) burst when an old sstable lands behind many newer ones. */
-        int num_existing = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-        if (num_existing > 0)
+        if (atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire) > 0)
         {
+            /* hold array_readers while scanning the lock-free sstable array so a concurrent
+             * level_add_sstable (flush or compaction) cannot retire and free it under us */
+            atomic_fetch_add_explicit(&cf->levels[0]->array_readers, 1, memory_order_acq_rel);
+            int num_existing =
+                atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
             tidesdb_sstable_t **existing_ssts =
                 atomic_load_explicit(&cf->levels[0]->sstables, memory_order_acquire);
-            for (int i = 0; i < num_existing; i++)
+            for (int i = 0; existing_ssts && i < num_existing; i++)
             {
                 if (existing_ssts[i] && existing_ssts[i]->max_seq >= sst->max_seq)
                 {
@@ -18489,6 +18522,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     break;
                 }
             }
+            atomic_fetch_sub_explicit(&cf->levels[0]->array_readers, 1, memory_order_release);
         }
 
         /* we add sstable to level 1 (array index 0) -- load levels atomically */
@@ -34572,11 +34606,17 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
             tidesdb_level_t *lvl = cf->levels[level];
             if (!lvl) continue;
 
+            /* hold array_readers across the scan so a concurrent flush or compaction cannot
+             * retire and free the sstable array (or its entries) while we read their paths.
+             * is_compacting excludes other compactions but not the flush worker, which adds to
+             * L0 off the commit lock. retire defers to the reaper while a reader is held, so the
+             * link I/O below does not block writers. */
+            atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&lvl->sstables, memory_order_acquire);
             const int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
 
-            for (int s = 0; s < num_ssts && result == TDB_SUCCESS; s++)
+            for (int s = 0; sstables && s < num_ssts && result == TDB_SUCCESS; s++)
             {
                 tidesdb_sstable_t *sst = sstables[s];
                 if (!sst) continue;
@@ -34621,6 +34661,8 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                 TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Checkpoint linked SSTable %" PRIu64 " on L%d",
                               sst->id, level + 1);
             }
+
+            atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
         }
 
         /* we copy manifest file (small) */
@@ -34930,11 +34972,14 @@ int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char 
             tidesdb_level_t *level = dst_cf->levels[level_idx];
             if (!level) continue;
 
+            /* dst_cf is already registered, so the background compaction scheduler can pick it
+             * and retire/free this level's array mid-scan -- hold array_readers across the deref */
+            atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
             const int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-            for (int sst_idx = 0; sst_idx < num_ssts; sst_idx++)
+            for (int sst_idx = 0; sstables && sst_idx < num_ssts; sst_idx++)
             {
                 tidesdb_sstable_t *sst = sstables[sst_idx];
                 if (sst && sst->id >= max_sst_id)
@@ -34942,6 +34987,7 @@ int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char 
                     max_sst_id = sst->id + 1;
                 }
             }
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
         }
 
         if (max_sst_id > atomic_load(&dst_cf->next_sstable_id))

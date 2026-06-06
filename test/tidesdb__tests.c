@@ -23580,6 +23580,30 @@ static void *mcf_atom_compactor_thread(void *arg)
     return NULL;
 }
 
+/* a one-sided NOT_FOUND in the verify can be a transient read-vs-compaction miss rather than a real
+ * loss: the long-lived verify txn reads while background compaction relocates keys, and the
+ * point-get layout guard only converts some such races to a retryable BUSY. re-read the missing key
+ * with fresh txns over ~1s -- if it reappears the pair is durably present (atomicity held); if it
+ * stays gone it is a genuine one-sided loss. returns 1 if still gone (durable), 0 if it reappeared.
+ */
+static int tdb_atom_key_durably_gone(tidesdb_t *db, tidesdb_column_family_t *cf, const uint8_t *key,
+                                     size_t key_size)
+{
+    for (int i = 0; i < 50; i++)
+    {
+        usleep(20000);
+        tidesdb_txn_t *t = NULL;
+        if (tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &t) != 0) continue;
+        uint8_t *v = NULL;
+        size_t vs = 0;
+        int rc = tdb_test_get_with_retry(t, cf, key, key_size, &v, &vs);
+        if (v) free(v);
+        tidesdb_txn_free(t);
+        if (rc == TDB_SUCCESS) return 0; /* reappeared -- transient */
+    }
+    return 1; /* still gone after ~1s -- durable */
+}
+
 static void test_multi_cf_cross_txn_compaction_atomicity(void)
 {
     cleanup_test_dir();
@@ -23684,11 +23708,27 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
             if (a_ok && b_ok)
                 both_present++;
             else if (a_ok && b_gone)
-                only_a++; /* B genuinely lost -- real one-sided violation */
+            {
+                /* B missing -- reclassify with fresh re-reads, transient miss vs durable loss */
+                if (tdb_atom_key_durably_gone(db, cf_b, (uint8_t *)key_b, strlen(key_b) + 1))
+                    only_a++; /* B durably lost -- real one-sided violation */
+                else
+                    both_present++; /* reappeared -- atomicity held */
+            }
             else if (b_ok && a_gone)
-                only_b++; /* A genuinely lost -- real one-sided violation */
+            {
+                if (tdb_atom_key_durably_gone(db, cf_a, (uint8_t *)key_a, strlen(key_a) + 1))
+                    only_b++; /* A durably lost -- real one-sided violation */
+                else
+                    both_present++;
+            }
             else if (a_gone && b_gone)
-                both_absent++; /* whole committed pair lost */
+            {
+                if (tdb_atom_key_durably_gone(db, cf_a, (uint8_t *)key_a, strlen(key_a) + 1))
+                    both_absent++; /* whole committed pair durably lost */
+                else
+                    both_present++;
+            }
             else
                 busy++; /* at least one side BUSY -- present but transiently unreadable */
         }

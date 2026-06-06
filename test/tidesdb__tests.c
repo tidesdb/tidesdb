@@ -26077,6 +26077,9 @@ static void test_unified_four_cf_single_txn(void)
     tidesdb_t *db = create_unified_test_db();
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    /* this exercises cross-CF txn semantics, not memtable sizing; a small buffer keeps the per-CF
+     * arenas modest so several CFs fit under a constrained 32-bit sanitizer runner */
+    cf_config.write_buffer_size = 1024 * 1024;
 
     /* create 4 column families (matches sysbench pattern with t1..t4) */
     const char *cf_names[] = {"t1", "t2", "t3", "t4"};

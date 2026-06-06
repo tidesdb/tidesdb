@@ -321,6 +321,10 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 
 #define TDB_MEMTABLE_ARENA_SIZE_FACTOR \
     2 /* memtable arena over-provisions to 2x write_buffer_size */
+/* unified mode routes all writes to the shared unified memtable, so a CF's own active memtable is
+ * never the write target -- a minimal arena instead of 2x write_buffer_size avoids wasting hundreds
+ * of MB across many CFs. */
+#define TDB_UNIFIED_PER_CF_ARENA_INIT          (64 * 1024)
 #define TDB_DEFAULT_MAX_CONC_UPLOADS_OBJ_STORE 4
 
 /* default interval for unified WAL fsync escalation when the unified memtable
@@ -22469,10 +22473,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     cf->config.comparator_fn_cached = comparator_fn;
     cf->config.comparator_ctx_cached = comparator_ctx;
 
+    const size_t cf_arena_init = db->unified_mt.enabled
+                                     ? TDB_UNIFIED_PER_CF_ARENA_INIT
+                                     : config->write_buffer_size * TDB_MEMTABLE_ARENA_SIZE_FACTOR;
     if (skip_list_new_with_arena(&new_memtable, config->skip_list_max_level,
                                  config->skip_list_probability, comparator_fn, comparator_ctx,
-                                 &db->cached_current_time,
-                                 config->write_buffer_size * TDB_MEMTABLE_ARENA_SIZE_FACTOR) != 0)
+                                 &db->cached_current_time, cf_arena_init) != 0)
     {
         free(cf->directory);
         free(cf->name);
@@ -24496,7 +24502,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         if (active_size > ramp_lo && active_size < ceiling)
         {
             const double f = (double)(active_size - ramp_lo) / (double)(ceiling - ramp_lo);
-            const useconds_t d = (useconds_t)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
+            const unsigned int d = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
             if (d > 0)
             {
                 usleep(d);
@@ -24588,7 +24594,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         if (u_size > u_ramp_lo && u_size < u_ceiling)
         {
             const double f = (double)(u_size - u_ramp_lo) / (double)(u_ceiling - u_ramp_lo);
-            const useconds_t d = (useconds_t)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
+            const unsigned int d = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
             if (d > 0)
             {
                 usleep(d);

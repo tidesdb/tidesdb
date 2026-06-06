@@ -10631,6 +10631,65 @@ static void test_btree_compaction_basic(void)
     cleanup_test_dir();
 }
 
+/* CI diagnostic: dump the cf's on-disk layout (levels, sstable ids, entry/tombstone counts, seqs)
+ * so a runner-only failure such as a deleted key resurfacing on mingw reports the actual state
+ * instead of a bare assertion. holds array_readers around each scan like the engine does. */
+static void tdb_diag_dump_layout(tidesdb_column_family_t *cf)
+{
+    int nlev = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    fprintf(stderr, "  DIAG layout: num_active_levels=%d\n", nlev);
+    for (int lv = 0; lv < nlev; lv++)
+    {
+        tidesdb_level_t *level = cf->levels[lv];
+        if (!level) continue;
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
+        int n = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **ssts = atomic_load_explicit(&level->sstables, memory_order_acquire);
+        fprintf(stderr, "  DIAG L%d: %d sstables\n", lv + 1, n);
+        for (int s = 0; ssts && s < n; s++)
+        {
+            tidesdb_sstable_t *sst = ssts[s];
+            if (!sst) continue;
+            fprintf(stderr, "    DIAG sstable id=%llu entries=%llu tombstones=%llu max_seq=%llu\n",
+                    (unsigned long long)sst->id, (unsigned long long)sst->num_entries,
+                    (unsigned long long)sst->tombstone_count, (unsigned long long)sst->max_seq);
+        }
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+    }
+    fflush(stderr);
+}
+
+/* CI diagnostic: when a key is durably missing from one CF via point-get, probe the same key
+ * through an iterator (a different read path). if the iterator finds it the data is present and it
+ * is a point-get read miss; if not it is a genuine write/compaction loss. dumps the layout either
+ * way. lets a runner-only atomicity failure say which half of the problem space it is. */
+static void tdb_diag_probe_missing(tidesdb_t *db, tidesdb_column_family_t *cf, const char *cfname,
+                                   const uint8_t *key, size_t key_size)
+{
+    tidesdb_txn_t *t = NULL;
+    if (tidesdb_txn_begin(db, &t) != 0) return;
+    tidesdb_iter_t *it = NULL;
+    int found_via_iter = 0;
+    if (tidesdb_iter_new(t, cf, &it) == 0 && it)
+    {
+        if (tidesdb_iter_seek(it, key, key_size) == 0 && tidesdb_iter_valid(it))
+        {
+            uint8_t *ik = NULL;
+            size_t iks = 0;
+            if (tidesdb_iter_key(it, &ik, &iks) == 0 && ik && iks == key_size &&
+                memcmp(ik, key, key_size) == 0)
+                found_via_iter = 1;
+        }
+        tidesdb_iter_free(it);
+    }
+    tidesdb_txn_free(t);
+    fprintf(stderr, "  DIAG: CF '%s' key '%s' iterator-scan %s -- %s\n", cfname, (const char *)key,
+            found_via_iter ? "FOUND" : "MISSING",
+            found_via_iter ? "point-get READ miss (data present on disk)"
+                           : "genuine write/compaction LOSS (absent from all read paths)");
+    tdb_diag_dump_layout(cf);
+}
+
 static void test_btree_compaction_with_deletes(void)
 {
     cleanup_test_dir();
@@ -10691,6 +10750,7 @@ static void test_btree_compaction_with_deletes(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
+    int resurfaced = 0;
     for (int i = 0; i < 100; i++)
     {
         char key[32];
@@ -10701,7 +10761,40 @@ static void test_btree_compaction_with_deletes(void)
 
         if (i % 2 == 0)
         {
-            ASSERT_TRUE(result != 0); /* deleted keys should not be found */
+            /* deleted keys should not be found -- if one is, capture ground truth before failing */
+            if (result == 0)
+            {
+                resurfaced++;
+                if (resurfaced <= 3)
+                {
+                    fprintf(stderr,
+                            "DIAG: deleted key '%s' FOUND value='%.*s' (vsize=%zu) "
+                            "is_compacting=%d flush_q=%zu compact_q=%zu\n",
+                            key, value ? (int)value_size : 0, value ? (char *)value : "",
+                            value_size, tidesdb_is_compacting(cf), queue_size(db->flush_queue),
+                            queue_size(db->compaction_queue));
+
+                    /* transient (a race) or persistent (a logic loss)? re-read with fresh txns */
+                    int still = 0;
+                    for (int r = 0; r < 30; r++)
+                    {
+                        usleep(50000);
+                        tidesdb_txn_t *rt = NULL;
+                        if (tidesdb_txn_begin(db, &rt) != 0) continue;
+                        uint8_t *rv = NULL;
+                        size_t rs = 0;
+                        int rr = tidesdb_txn_get(rt, cf, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+                        if (rv) free(rv);
+                        tidesdb_txn_free(rt);
+                        if (rr == 0) still++;
+                    }
+                    fprintf(
+                        stderr, "DIAG: re-read '%s' still-found %d/30 (%s)\n", key, still,
+                        still >= 28 ? "PERSISTENT" : (still == 0 ? "TRANSIENT" : "INTERMITTENT"));
+                    tdb_diag_dump_layout(cf);
+                }
+            }
+            if (value) free(value);
         }
         else
         {
@@ -10710,6 +10803,8 @@ static void test_btree_compaction_with_deletes(void)
             free(value);
         }
     }
+
+    ASSERT_EQ(resurfaced, 0); /* deleted keys must not be found */
 
     tidesdb_txn_free(txn);
     tidesdb_close(db);
@@ -23781,6 +23876,7 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     tidesdb_txn_t *vtxn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
     int both_present = 0, only_a = 0, only_b = 0, both_absent = 0, busy = 0;
+    int diag_emitted = 0;
     for (int t = 0; t < NUM_WRITERS; t++)
     {
         for (int i = 0; i < W_OPS; i++)
@@ -23807,21 +23903,36 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
             {
                 /* B missing -- reclassify with fresh re-reads, transient miss vs durable loss */
                 if (tdb_atom_key_durably_gone(db, cf_b, (uint8_t *)key_b, strlen(key_b) + 1))
+                {
                     only_a++; /* B durably lost -- real one-sided violation */
+                    if (diag_emitted++ < 3)
+                        tdb_diag_probe_missing(db, cf_b, "atom_cf_b", (uint8_t *)key_b,
+                                               strlen(key_b) + 1);
+                }
                 else
                     both_present++; /* reappeared -- atomicity held */
             }
             else if (b_ok && a_gone)
             {
                 if (tdb_atom_key_durably_gone(db, cf_a, (uint8_t *)key_a, strlen(key_a) + 1))
+                {
                     only_b++; /* A durably lost -- real one-sided violation */
+                    if (diag_emitted++ < 3)
+                        tdb_diag_probe_missing(db, cf_a, "atom_cf_a", (uint8_t *)key_a,
+                                               strlen(key_a) + 1);
+                }
                 else
                     both_present++;
             }
             else if (a_gone && b_gone)
             {
                 if (tdb_atom_key_durably_gone(db, cf_a, (uint8_t *)key_a, strlen(key_a) + 1))
+                {
                     both_absent++; /* whole committed pair durably lost */
+                    if (diag_emitted++ < 3)
+                        tdb_diag_probe_missing(db, cf_a, "atom_cf_a", (uint8_t *)key_a,
+                                               strlen(key_a) + 1);
+                }
                 else
                     both_present++;
             }

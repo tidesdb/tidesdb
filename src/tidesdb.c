@@ -15345,6 +15345,20 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
      * we use boundaries from target_level+1 (the level we're merging into) */
     tidesdb_level_t *next_level = cf->levels[target_level + 1];
 
+    /* the boundaries come from next_level's per-sstable min_keys and the merge assumes they ascend
+     * so the partition ranges tile the key space. parallel sub-compaction commits can leave the
+     * level out of ascending order, which makes the boundaries non-monotonic, opens gaps between
+     * partitions, and silently drops every key in a gap. sort first; if the sort cannot run, fall
+     * back to the full merge, which does not partition by these boundaries. */
+    {
+        skip_list_comparator_fn dm_cmp = NULL;
+        void *dm_cmp_ctx = NULL;
+        tidesdb_resolve_comparator(cf->db, &cf->config, &dm_cmp, &dm_cmp_ctx);
+        if (!dm_cmp ||
+            tidesdb_level_sort_by_min_key(cf->db, next_level, dm_cmp, dm_cmp_ctx) != TDB_SUCCESS)
+            return tidesdb_full_preemptive_merge(cf, 0, target_level, target_level);
+    }
+
     tidesdb_level_update_boundaries(target, next_level);
 
     int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
@@ -16425,7 +16439,28 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
 
     tidesdb_level_t *largest = cf->levels[num_levels - 1];
 
-    /* we get file boundaries from largest level */
+    /* the partition boundaries below are the largest level's per-sstable min_keys, and the merge
+     * assumes they ascend so the ranges [b[p], b[p+1]) tile the whole key space with no gaps. but
+     * the largest level can be left out of ascending min_key order -- parallel sub-compactions
+     * append their outputs in completion order, and the skew optimization keeps skipped files in
+     * their old slots. an out-of-order level yields non-monotonic boundaries, which leave gaps
+     * between partitions, and every key that falls in a gap is dropped from the merge while its
+     * input sstable is deleted -- a silent durable loss. sort the level first so the boundaries
+     * tile the key space; if the sort cannot run, fall back to the full merge, which does not
+     * partition by these boundaries and so cannot open a gap. */
+    {
+        skip_list_comparator_fn sort_cmp = NULL;
+        void *sort_cmp_ctx = NULL;
+        tidesdb_resolve_comparator(cf->db, &cf->config, &sort_cmp, &sort_cmp_ctx);
+        if (!sort_cmp ||
+            tidesdb_level_sort_by_min_key(cf->db, largest, sort_cmp, sort_cmp_ctx) != TDB_SUCCESS)
+        {
+            /* nothing has been allocated yet, so the full merge takes over cleanly */
+            return tidesdb_full_preemptive_merge(cf, start_idx, end_idx, end_idx);
+        }
+    }
+
+    /* we get file boundaries from largest level (now in ascending min_key order) */
     tidesdb_sstable_t **largest_sstables =
         atomic_load_explicit(&largest->sstables, memory_order_acquire);
     int num_partitions = atomic_load_explicit(&largest->num_sstables, memory_order_acquire);

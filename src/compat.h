@@ -1458,47 +1458,53 @@ static inline int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
     return (GetLastError() == ERROR_TIMEOUT) ? ETIMEDOUT : 0;
 }
 
-/* threads -- _beginthreadex with a trampoline. every join passes NULL, so the void* return is
- * discarded. */
-typedef HANDLE pthread_t;
-
+/* threads -- _beginthreadex with a trampoline. pthread_t is a heap control block holding the thread
+ * handle and the function's void* return, so pthread_join can hand it back (callers that pass a
+ * non-NULL retval, such as the queue tests, rely on it). join frees the block, so every created
+ * thread must be joined (the engine has no detached threads). */
 typedef struct
 {
+    HANDLE handle;
     void *(*fn)(void *);
     void *arg;
-} tdb_win_thread_arg_t;
+    void *retval;
+} tdb_win_thread_t;
+typedef tdb_win_thread_t *pthread_t;
 
 static inline unsigned __stdcall tdb_win_thread_trampoline(void *p)
 {
-    tdb_win_thread_arg_t a = *(tdb_win_thread_arg_t *)p;
-    free(p);
-    a.fn(a.arg);
+    tdb_win_thread_t *t = (tdb_win_thread_t *)p;
+    t->retval = t->fn(t->arg);
     return 0;
 }
 static inline int pthread_create(pthread_t *th, const void *attr, void *(*fn)(void *), void *arg)
 {
-    tdb_win_thread_arg_t *a;
+    tdb_win_thread_t *t;
     uintptr_t h;
 
     (void)attr;
-    a = (tdb_win_thread_arg_t *)malloc(sizeof(*a));
-    if (!a) return EAGAIN;
-    a->fn = fn;
-    a->arg = arg;
-    h = _beginthreadex(NULL, 0, tdb_win_thread_trampoline, a, 0, NULL);
+    t = (tdb_win_thread_t *)malloc(sizeof(*t));
+    if (!t) return EAGAIN;
+    t->fn = fn;
+    t->arg = arg;
+    t->retval = NULL;
+    h = _beginthreadex(NULL, 0, tdb_win_thread_trampoline, t, 0, NULL);
     if (h == 0)
     {
-        free(a);
+        free(t);
         return EAGAIN;
     }
-    *th = (HANDLE)h;
+    t->handle = (HANDLE)h;
+    *th = t;
     return 0;
 }
 static inline int pthread_join(pthread_t th, void **retval)
 {
-    (void)retval;
-    WaitForSingleObject(th, INFINITE);
-    CloseHandle(th);
+    if (!th) return EINVAL;
+    WaitForSingleObject(th->handle, INFINITE);
+    if (retval) *retval = th->retval; /* the trampoline stored it before the thread exited */
+    CloseHandle(th->handle);
+    free(th);
     return 0;
 }
 

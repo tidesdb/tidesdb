@@ -1502,6 +1502,14 @@ static inline int pthread_join(pthread_t th, void **retval)
     return 0;
 }
 
+/* sched_yield -- pthreads-win32 used to provide this; the engine itself yields via cpu_yield, but
+ * direct POSIX callers (e.g. tests) still expect the symbol */
+static inline int sched_yield(void)
+{
+    SwitchToThread();
+    return 0;
+}
+
 /* thread-local storage -- fiber-local storage runs its callback on thread exit (TlsAlloc does not),
  * giving pthread_key destructor semantics. the key carries its destructor so the value can be
  * wrapped and one NTAPI callback can invoke the per-key cdecl destructor; this also keeps the key

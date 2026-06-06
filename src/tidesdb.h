@@ -203,7 +203,12 @@ typedef enum
  * X = num_active_levels - 1 - offset that means offset = 1 */
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       1
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
-#define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
+/* fallback flush pool size when cpu detection fails at open */
+#define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE 2
+/* default config leaves num_flush_threads at 0 (auto); open resolves it to
+ * min(cpu_count, TDB_FLUSH_THREADS_AUTO_CAP). a single shared flush pool feeds every CF, so a few
+ * threads keeps multi-CF flushes from serializing without oversubscribing on large core counts */
+#define TDB_FLUSH_THREADS_AUTO_CAP 4
 /* pinned to the flush pool size tidesdb_open clamps max_concurrent_flushes to
  * num_flush_threads and warns when they differ, so the canonical default open
  * (default_config + open) must already agree or it warns on every startup */
@@ -522,6 +527,8 @@ struct tidesdb_memtable_t
  * @param config column family configuration
  * @param active_memtable active memtable (paired skip list and WAL)
  * @param immutable_memtables queue of immutable memtables being flushed
+ * @param immutable_bytes sum of actual immutable skip-list sizes, refreshed on each snapshot
+ * publish, read by the reaper for memory-pressure accounting
  * @param pending_commits count of in-flight commits
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
@@ -550,6 +557,7 @@ struct tidesdb_column_family_t
     tidesdb_column_family_config_t config;
     _Atomic(tidesdb_memtable_t *) active_memtable;
     queue_t *immutable_memtables;
+    _Atomic(int64_t) immutable_bytes;
     _Atomic(uint64_t) pending_commits;
     tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;

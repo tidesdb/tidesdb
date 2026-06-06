@@ -10,6 +10,7 @@ find . \
      -o -path "./cmake-build-release" \
      -o -path "./.idea" \
      -o -path "./build" \
+     -o -path "./build-*" \
      -o -path "./cmake" \) -prune \
   -o -type f \( -name "*.c" -o -name "*.h" \) -print0 \
 | xargs -0 clang-format -i

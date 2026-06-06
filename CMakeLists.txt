@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.3.4
+	VERSION 9.3.5
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -99,6 +99,14 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     if(NOT CMAKE_C_COMPILER_VERSION VERSION_LESS 11.0)
         add_compile_options(-Wno-psabi)
     endif()
+endif()
+
+# optional -Wmaybe-uninitialized for development. GCC only (the flag is GCC-specific), and it is a
+# no-op at -O0 because the analysis runs only under optimization, so pair it with an optimized
+# build, e.g. -DTIDESDB_WARN_MAYBE_UNINIT=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo.
+option(TIDESDB_WARN_MAYBE_UNINIT "enable -Wmaybe-uninitialized (GCC; requires an optimized build)" OFF)
+if(TIDESDB_WARN_MAYBE_UNINIT AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-Wmaybe-uninitialized)
 endif()
 
 # for development, we want to enable all warnings and sanitizers

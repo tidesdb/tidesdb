@@ -283,6 +283,24 @@ jobs:
         shell: bash
         run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=ON
 
+      - name: Lint -Wmaybe-uninitialized (Linux x64 GCC, optimized)
+        if: runner.os == 'Linux' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          # -Wmaybe-uninitialized only fires under optimization, so use a dedicated
+          # RelWithDebInfo build with the TIDESDB_WARN_MAYBE_UNINIT cmake option (the main
+          # sanitizer build above is -O0, where the analysis is a no-op). this build is
+          # isolated in build-wmu and does not affect the sanitizer build. the gate fails
+          # only on warnings in our own src/; third-party external/ is build-only.
+          cmake -S . -B build-wmu -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WARN_MAYBE_UNINIT=ON
+          cmake --build build-wmu -j"$(nproc)" 2>&1 | tee build-wmu.log
+          if grep -E '\[-Wmaybe-uninitialized\]' build-wmu.log | grep '/src/'; then
+            echo "::error::-Wmaybe-uninitialized reported a warning in src/"
+            exit 1
+          fi
+          echo "no -Wmaybe-uninitialized warnings in src/"
+
       - name: Configure CMake (Linux x86)
         if: runner.os == 'Linux' && matrix.arch == 'x86'
         shell: bash

@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.3.5
+	VERSION 9.3.6
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -263,7 +263,7 @@ if(WIN32)
         if(TIDESDB_WITH_LZ4)
             find_package(lz4 CONFIG REQUIRED)
         endif()
-        find_package(PThreads4W REQUIRED)
+        # MSVC uses the native Win32 threading backend in compat.h, so no pthreads-win32 package
     endif()
 endif()
 
@@ -385,7 +385,7 @@ elseif(WIN32)
         if(TIDESDB_WITH_LZ4)
             target_link_libraries(tidesdb PUBLIC lz4::lz4)
         endif()
-        target_link_libraries(tidesdb PUBLIC PThreads4W::PThreads4W)
+        # MSVC threading is the native Win32 backend in compat.h -- nothing to link
     endif()
 
     if(TIDESDB_WITH_MIMALLOC)

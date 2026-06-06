@@ -1133,6 +1133,9 @@ static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path
 static int tidesdb_sstable_open_budget(const tidesdb_t *db)
 {
     const int max_open = (int)db->config.max_open_sstables;
+    /* 0 = unlimited -- no soft cap, so the reaper never evicts for budget and readers never back
+     * off; resident sstables are bounded only by the OS open-file limit */
+    if (max_open == 0) return INT_MAX;
     int reserve = max_open / TDB_FD_READER_RESERVE_DIVISOR;
     if (reserve < TDB_FD_READER_RESERVE_MIN) reserve = TDB_FD_READER_RESERVE_MIN;
     /* cap the reserve so it never starves reads when max_open_sstables is below the floor */
@@ -1171,6 +1174,7 @@ static int tidesdb_reader_fd_budget_ok(tidesdb_t *db, tidesdb_sstable_t *sst)
      * too -- a smaller per-read reserve would make any scan over more than (budget) sstables
      * impossible. */
     const int max_open = (int)db->config.max_open_sstables;
+    if (max_open == 0) return 1; /* unlimited -- never gate a reader open */
 
     if (atomic_load_explicit(&db->num_open_sstables, memory_order_relaxed) < max_open) return 1;
 
@@ -20164,22 +20168,35 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
      * the reserve leaves headroom for WALs, the manifest, object-store handles, and stdio. */
     {
         const long fd_limit = tdb_max_open_files();
-        long fd_budget_ssts = (fd_limit - TDB_FD_RESERVE_NON_SSTABLE) / TDB_FDS_PER_SSTABLE;
-        if (fd_budget_ssts < TDB_MIN_OPEN_SSTABLES) fd_budget_ssts = TDB_MIN_OPEN_SSTABLES;
-        if ((long)(*db)->config.max_open_sstables > fd_budget_ssts)
+        if ((*db)->config.max_open_sstables == 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "max_open_sstables (%zu) exceeds what the open-file limit can honor "
-                          "(%ld sstables for fd limit %ld) -- clamping. raise the process fd "
-                          "limit (ulimit -n) to keep more sstables open",
-                          (*db)->config.max_open_sstables, fd_budget_ssts, fd_limit);
-            (*db)->config.max_open_sstables = (size_t)fd_budget_ssts;
+            /* 0 = unlimited -- do not impose or clamp a soft cap; resident sstables are bounded
+             * only by the OS open-file limit. the operator owns keeping ulimit -n high enough. */
+            TDB_DEBUG_LOG(
+                TDB_LOG_INFO,
+                "max_open_sstables=0 (unlimited) -- resident sstables bounded only by the "
+                "process open-file limit (%ld)",
+                fd_limit);
         }
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "sstable fd budget set to max_open_sstables=%zu (up to %ld fds), process fd "
-                      "limit=%ld",
-                      (*db)->config.max_open_sstables,
-                      (long)(*db)->config.max_open_sstables * TDB_FDS_PER_SSTABLE, fd_limit);
+        else
+        {
+            long fd_budget_ssts = (fd_limit - TDB_FD_RESERVE_NON_SSTABLE) / TDB_FDS_PER_SSTABLE;
+            if (fd_budget_ssts < TDB_MIN_OPEN_SSTABLES) fd_budget_ssts = TDB_MIN_OPEN_SSTABLES;
+            if ((long)(*db)->config.max_open_sstables > fd_budget_ssts)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "max_open_sstables (%zu) exceeds what the open-file limit can honor "
+                              "(%ld sstables for fd limit %ld) -- clamping. raise the process fd "
+                              "limit (ulimit -n) to keep more sstables open",
+                              (*db)->config.max_open_sstables, fd_budget_ssts, fd_limit);
+                (*db)->config.max_open_sstables = (size_t)fd_budget_ssts;
+            }
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "sstable fd budget set to max_open_sstables=%zu (up to %ld fds), process "
+                          "fd limit=%ld",
+                          (*db)->config.max_open_sstables,
+                          (long)(*db)->config.max_open_sstables * TDB_FDS_PER_SSTABLE, fd_limit);
+        }
     }
 
     /* subsequent reads in tidesdb_open should see the normalized values, so

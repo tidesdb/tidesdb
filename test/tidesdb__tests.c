@@ -16879,6 +16879,96 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
     cleanup_test_dir();
 }
 
+static void test_unlimited_max_open_no_eviction(void)
+{
+    cleanup_test_dir();
+
+    /* max_open_sstables = 0 means unlimited: the reaper must never evict for budget and a reader
+     * must never back off with TDB_ERR_BUSY. this also guards the sentinel itself -- if 0 were
+     * treated as a literal budget of zero the reader gate would reject every open and every read
+     * would return BUSY. */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.max_open_sstables = 0;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048; /* small buffer so each batch flushes its own sstable */
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.l1_file_count_trigger = 100000; /* keep compaction from merging the sstables away */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "unlimited_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "unlimited_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_sstables = 20;
+    const int keys_per_sstable = 30;
+    const int total_keys = num_sstables * keys_per_sstable;
+
+    for (int i = 0; i < total_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "u_key_%06d", i);
+        snprintf(value, sizeof(value), "u_value_%06d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % keys_per_sstable == 0) tidesdb_flush_memtable(cf);
+    }
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(20000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(200000); /* give the reaper ample time -- under unlimited it must NOT evict */
+
+    /* every read uses a plain get (no retry): unlimited means no fd-budget backoff, so each read
+     * resolves directly with no TDB_ERR_BUSY */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int success = 0, busy = 0;
+    for (int i = 0; i < total_keys; i++)
+    {
+        char key[32], expected[64];
+        snprintf(key, sizeof(key), "u_key_%06d", i);
+        snprintf(expected, sizeof(expected), "u_value_%06d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (rc == TDB_ERR_BUSY)
+        {
+            busy++;
+        }
+        else if (rc == TDB_SUCCESS && value != NULL)
+        {
+            ASSERT_EQ(strcmp((char *)value, expected), 0);
+            success++;
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(busy, 0); /* unlimited never backs a reader off */
+    ASSERT_EQ(success, total_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_partial_write_mid_block_corruption(void)
 {
     cleanup_test_dir();
@@ -29921,6 +30011,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_ttl_expiration_with_deletes_after_reopen, tests_passed);
     RUN_TEST(test_ttl_expiration_range_delete_after_reopen, tests_passed);
     RUN_TEST(test_many_sstables_low_max_open_reaper_eviction, tests_passed);
+    RUN_TEST(test_unlimited_max_open_no_eviction, tests_passed);
     RUN_TEST(test_partial_write_mid_block_corruption, tests_passed);
     RUN_TEST(test_clock_skew_time_travel_ttl, tests_passed);
     RUN_TEST(test_filesystem_full_during_compaction, tests_passed);

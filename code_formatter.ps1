@@ -12,6 +12,11 @@ Get-ChildItem -Path . -Recurse -Include *.c,*.h |
                 break
             }
         }
+        # exclude any build-* directory (build-rel, build-wmu, ...); handle both path separators
+        if (-not $shouldExclude -and
+            ($file.FullName -like "*\build-*\*" -or $file.FullName -like "*/build-*/*")) {
+            $shouldExclude = $true
+        }
         -not $shouldExclude
     } | 
     ForEach-Object { 

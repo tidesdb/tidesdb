@@ -128,7 +128,24 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake
+            # NetBSD 10.1's default pkg path (10.1/All) is only a redirect stub pointing at the
+            # current quarterly (10.0_2026Q1/All), and pkg_add's fetcher does not follow it -- so the
+            # default install fails identically on every rerun. pin PKG_PATH straight at the resolved
+            # quarterly dir (verified to hold every dep), trying the Fastly CDN first and the master
+            # mirror as a fallback in case an edge returns 503, with a short retry for transient
+            # blips. bump the quarterly when 10.0_2026Q1 is eventually pruned.
+            ok=0
+            for base in \
+              "https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/x86_64/10.0_2026Q1/All/" \
+              "https://ftp.netbsd.org/pub/pkgsrc/packages/NetBSD/x86_64/10.0_2026Q1/All/"; do
+              export PKG_PATH="$base"
+              for i in 1 2 3; do
+                if /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake; then ok=1; break; fi
+                echo "pkg_add from $base attempt $i failed, retrying in $((i*10))s"; sleep $((i*10))
+              done
+              [ "$ok" = 1 ] && break
+            done
+            [ "$ok" = 1 ] || { echo "all mirrors failed to provide packages"; exit 1; }
           run: |
             echo "*=====================================*"
             echo " System Information"

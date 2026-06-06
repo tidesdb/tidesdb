@@ -17,10 +17,13 @@
 *.exe
 *.out
 *.app
+build-*
 cmake-build-debug
 cmake-build-release
 .idea
 build
+build-wmu
+build-wmu.log
 .vscode
 vcpkg_installed
 .vs

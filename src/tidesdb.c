@@ -306,6 +306,14 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 /* how many cfs the reaper retries deferred flushes for in a single cycle */
 #define TDB_REAPER_DEFERRED_FLUSH_BATCH 64
 #define TDB_SSTABLE_REAPER_EVICT_RATIO  0.25
+/* the per-CF memory-pressure scan (cf_list_lock + a try_ref on every active memtable) runs every
+ * reaper cycle. when the last scan's total was comfortably below the limit there is no pressure to
+ * react to, so gate the full scan on a cheap proxy (the cached last-scan total): skip it while the
+ * proxy is under PRESSURE_SCAN_GATE_RATIO of the limit, but force one at least every
+ * PRESSURE_SCAN_MAX_SKIP cycles so a climb is never missed by more than that. above the ratio the
+ * scan runs every cycle for full resolution as pressure approaches the ELEVATED threshold. */
+#define TDB_REAPER_PRESSURE_SCAN_GATE_RATIO 0.50
+#define TDB_REAPER_PRESSURE_SCAN_MAX_SKIP   10
 
 /* replica sync thread configuration */
 #define TDB_REPLICA_SYNC_DEFAULT_INTERVAL_US 5000000
@@ -383,6 +391,12 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
  * leaves a small overshoot margin above that before apply_backpressure
  * stalls the writer until rotation completes */
 #define TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT 2
+/* proportional pre-throttle on the active-memtable ceiling. instead of a binary wall (no delay
+ * below the ceiling, then a multi-second block at it) the writer is paced by a convex ramp once the
+ * active passes RAMP_LO_RATIO of the ceiling, reaching RAMP_MAX_DELAY_US right at the ceiling. this
+ * lets flush catch up before the hard stall, turning the latency cliff into a gentle rise. */
+#define TDB_BACKPRESSURE_RAMP_LO_RATIO     0.75
+#define TDB_BACKPRESSURE_RAMP_MAX_DELAY_US 4000
 
 /* backpressure stall warnings (ceiling stall, immutable-queue-critical) are emitted from the
  * write/flush hot paths -- a per-event log floods under sustained backpressure (every stalling
@@ -399,7 +413,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_MEMORY_PRESSURE_ELEVATED_RATIO 0.60 /* ratio threshold for elevated */
 #define TDB_MEMORY_PRESSURE_HIGH_RATIO     0.75 /* ratio threshold for high */
 #define TDB_MEMORY_PRESSURE_CRITICAL_RATIO 0.95 /* ratio threshold for critical */
-#define TDB_MEMORY_AUTO_LIMIT_RATIO        0.50 /* auto limit = 50% of total memory */
+#define TDB_MEMORY_AUTO_LIMIT_RATIO        0.75 /* auto limit = 75% of total memory */
 #define TDB_MEMORY_MIN_LIMIT_RATIO         0.05 /* minimum limit = 5% of total memory */
 #define TDB_MEMORY_OS_CHECK_INTERVAL       50
 #define TDB_MEMORY_OS_CRITICAL_RATIO       0.05 /* OS critically low if < N% free */
@@ -1661,6 +1675,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  int is_largest_level);
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction);
+static int tidesdb_enqueue_compaction_force(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_compact_internal(tidesdb_column_family_t *cf, int full_compaction, int blocking);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable);
@@ -2854,24 +2869,25 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
 
 tidesdb_config_t tidesdb_default_config(void)
 {
-    return (tidesdb_config_t){.db_path = "./tidesdb",
-                              .log_level = TDB_LOG_INFO,
-                              .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
-                              .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
-                              .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
-                              .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES,
-                              .log_to_file = 0,
-                              .log_truncation_at = TDB_DEFAULT_LOG_FILE_TRUNCATION,
-                              .max_memory_usage = 0,
-                              .unified_memtable = 0,
-                              .unified_memtable_write_buffer_size = 0,
-                              .unified_memtable_skip_list_max_level = 0,
-                              .unified_memtable_skip_list_probability = 0,
-                              .unified_memtable_sync_mode = 0,
-                              .unified_memtable_sync_interval_us = 0,
-                              .object_store = NULL,
-                              .object_store_config = NULL,
-                              .max_concurrent_flushes = TDB_DEFAULT_MAX_CONCURRENT_FLUSHES};
+    return (tidesdb_config_t){
+        .db_path = "./tidesdb",
+        .log_level = TDB_LOG_INFO,
+        .num_flush_threads = 0, /* 0 = auto, resolved at open from cpu count */
+        .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
+        .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
+        .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES,
+        .log_to_file = 0,
+        .log_truncation_at = TDB_DEFAULT_LOG_FILE_TRUNCATION,
+        .max_memory_usage = 0,
+        .unified_memtable = 0,
+        .unified_memtable_write_buffer_size = 0,
+        .unified_memtable_skip_list_max_level = 0,
+        .unified_memtable_skip_list_probability = 0,
+        .unified_memtable_sync_mode = 0,
+        .unified_memtable_sync_interval_us = 0,
+        .object_store = NULL,
+        .object_store_config = NULL,
+        .max_concurrent_flushes = 0}; /* 0 = pin to resolved num_flush_threads */
 }
 
 /**
@@ -7122,12 +7138,15 @@ static void tidesdb_imm_snap_publish_locked(tidesdb_column_family_t *cf)
      * flush worker wedges. the immutable stays in the queue until reclaimed -- only the snapshot
      * drops it early. */
     size_t count = 0;
+    int64_t imm_bytes = 0;
     for (size_t i = 0; i < raw; i++)
     {
         tidesdb_memtable_t *m = next->items[i];
+        if (m && m->skip_list) imm_bytes += (int64_t)skip_list_get_size(m->skip_list);
         if (m && atomic_load_explicit(&m->flushed, memory_order_acquire)) continue;
         next->items[count++] = m;
     }
+    atomic_store_explicit(&cf->immutable_bytes, imm_bytes, memory_order_relaxed);
     atomic_store_explicit(&next->count, count, memory_order_release);
 
     /* we ensure the new slot contents are visible before swapping active index */
@@ -17475,20 +17494,27 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
      */
     atomic_store(&cf->db->cached_current_time, tdb_get_current_time());
 
-    /* we force flush memtable before compaction to ensure all data is in ssts
-     * this prevents data loss where keys in memtable are not included in compaction */
+    /* we force flush the memtable before compaction. the kick is unconditional, but only a full
+     * manual compaction waits for it to land. a full merge must see every prior write so it can
+     * reclaim tombstones/single-deletes that span levels. the geometry-driven path snapshots its
+     * input sstable ids (tidesdb_snapshot_sst_ids, under the level array_readers guard) and never
+     * reads the memtable, so a concurrent flush appending a new L1 sstable is simply absent from
+     * the snapshot and picked up next round -- no wait needed, which removes up to a second of
+     * latency from the common geometry-driven case. */
     tidesdb_flush_memtable_internal(cf, 0, 1);
 
-    /* wait for the forced flush to fully complete before compaction reads the
-     * levels. flush_pending_count is decremented only after the worker finishes
-     * writing the sstable, whereas the flush queue empties as soon as a work
-     * item is dequeued -- and it is db-global, so it also reflects unrelated
-     * CFs' flushes */
-    for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS; i++)
+    /* wait for the forced flush to fully complete before a full compaction reads the levels.
+     * flush_pending_count is decremented only after the worker finishes writing the sstable,
+     * whereas the flush queue empties as soon as a work item is dequeued -- and it is db-global, so
+     * it also reflects unrelated CFs' flushes */
+    if (full_compaction)
     {
-        if (!tidesdb_is_flushing(cf)) break;
-        if (tidesdb_cf_abort_requested(cf)) break;
-        usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS; i++)
+        {
+            if (!tidesdb_is_flushing(cf)) break;
+            if (tidesdb_cf_abort_requested(cf)) break;
+            usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        }
     }
 
     if (tidesdb_cf_abort_requested(cf))
@@ -18951,9 +18977,11 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
         /* drain any auto-trigger that arrived while is_compacting was held.
          * exchange-to-zero so a re-arm after this point queues another
-         * follow-up rather than being swallowed here */
+         * follow-up rather than being swallowed here. force-enqueue so this
+         * genuine follow-up is not coalesced away by the pending-count check --
+         * this cf's just-finished work item is still counted below */
         if (atomic_exchange_explicit(&cf->compaction_armed, 0, memory_order_acq_rel))
-            tidesdb_enqueue_compaction(cf, 0);
+            tidesdb_enqueue_compaction_force(cf, 0);
 
         atomic_fetch_sub_explicit(&cf->compaction_pending_count, 1, memory_order_release);
         atomic_fetch_sub_explicit(&db->active_compactions, 1, memory_order_acq_rel);
@@ -19249,6 +19277,10 @@ static void *tidesdb_reaper_thread(void *arg)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Reaper thread started");
 
+    /* consecutive cycles the full memory-pressure scan has been gated out; start at the max so the
+     * first cycle always scans (the cached proxy is 0 until the first real scan runs) */
+    int reaper_scan_skips = TDB_REAPER_PRESSURE_SCAN_MAX_SKIP;
+
     while (atomic_load(&db->reaper_active))
     {
         time_t now = tdb_get_current_time();
@@ -19362,7 +19394,21 @@ static void *tidesdb_reaper_thread(void *arg)
          * of test overrides and runtime changes on all compilers (MSVC, MinGW) */
         const size_t mem_limit =
             atomic_load_explicit(&db->resolved_memory_limit, memory_order_acquire);
+
+        /* gate the full per-CF scan on the cheap cached proxy (see PRESSURE_SCAN constants) */
+        int do_full_scan = 1;
         if (mem_limit > 0)
+        {
+            const int64_t proxy =
+                atomic_load_explicit(&db->cached_memtable_bytes, memory_order_relaxed);
+            if (proxy < (int64_t)((double)mem_limit * TDB_REAPER_PRESSURE_SCAN_GATE_RATIO) &&
+                ++reaper_scan_skips < TDB_REAPER_PRESSURE_SCAN_MAX_SKIP)
+                do_full_scan = 0;
+            else
+                reaper_scan_skips = 0;
+        }
+
+        if (mem_limit > 0 && do_full_scan)
         {
             int64_t total_mem_bytes = 0;
 
@@ -19400,18 +19446,13 @@ static void *tidesdb_reaper_thread(void *arg)
                     tidesdb_immutable_memtable_unref(mt);
                 }
 
-                /* immutable queue -- conservative estimate using write_buffer_size.
-                 * each immutable's data is bounded by write_buffer_size (flush threshold).
-                 * while arena allocates TDB_MEMTABLE_ARENA_SIZE_FACTOR x write_buffer_size, the
-                 * unused arena capacity is not meaningful for pressure accounting. skipped in
-                 * unified mode, per-CF immutable queues there hold only empty rotated memtables
-                 * (all data is in the unified memtable, summed separately below), so charging each
-                 * write_buffer_size is phantom memory that inflates the pressure ratio and triggers
-                 * spurious force-flushes. */
+                /* immutable queue -- actual resident skip-list bytes, maintained by the snapshot
+                 * publish. skipped in unified mode, where per-CF immutable queues hold only empty
+                 * rotated wrappers and the unified immutable queue is summed separately below. */
                 if (!db->unified_mt.enabled)
                 {
-                    size_t imm_count = queue_size(cf->immutable_memtables);
-                    total_mem_bytes += (int64_t)(imm_count * cf->config.write_buffer_size);
+                    total_mem_bytes +=
+                        atomic_load_explicit(&cf->immutable_bytes, memory_order_relaxed);
                 }
 
                 /* count sstables per cf for the compaction victim heuristic. bloom
@@ -19567,8 +19608,10 @@ static void *tidesdb_reaper_thread(void *arg)
                 }
                 else if (level >= TDB_MEMORY_PRESSURE_CRITICAL)
                 {
-                    /* nuclear flush -- at critical pressure we flush every non-flushing CF
-                     * to shed memory as fast as possible across all column families */
+                    /* critical -- force-flush every CF that holds data. flushing an empty active
+                     * sheds nothing and only churns an immutable + a post-flush compaction, so skip
+                     * those; any CF with data is flushed so memory still drains across all of them.
+                     */
                     pthread_rwlock_rdlock(&db->cf_list_lock);
                     for (int i = 0; i < db->num_column_families; i++)
                     {
@@ -19577,15 +19620,26 @@ static void *tidesdb_reaper_thread(void *arg)
                         if (atomic_load_explicit(&victim->is_flushing, memory_order_relaxed))
                             continue;
 
+                        size_t vsize = 0;
+                        tidesdb_memtable_t *vmt = NULL;
+                        if (tidesdb_active_memtable_try_ref(&victim->active_mt_readers,
+                                                            &victim->active_memtable, &vmt))
+                        {
+                            if (vmt->skip_list) vsize = skip_list_get_size(vmt->skip_list);
+                            tidesdb_immutable_memtable_unref(vmt);
+                        }
+                        if (vsize == 0) continue;
+
                         TDB_DEBUG_LOG(TDB_LOG_WARN,
-                                      "Memory pressure CRITICAL nuclear flush CF '%s' "
-                                      "(global %" PRId64 "/%zu bytes, %.1f%%)",
-                                      victim->name, total_mem_bytes, mem_limit, ratio * 100.0);
+                                      "Memory pressure CRITICAL flushing CF '%s' (%zu bytes, "
+                                      "global %" PRId64 "/%zu bytes, %.1f%%)",
+                                      victim->name, vsize, total_mem_bytes, mem_limit,
+                                      ratio * 100.0);
                         tidesdb_flush_memtable_internal(victim, 0, 1);
                     }
                     pthread_rwlock_unlock(&db->cf_list_lock);
                 }
-                else if (flush_victim)
+                else if (flush_victim && flush_victim_size > 0)
                 {
                     /* high pressure -- force-flush the largest non-flushing memtable */
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
@@ -20040,7 +20094,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
      * workers idle, so any deviation gets a warning and is corrected.
      * subsequent code reads from the owned copy via the rebind below */
     if ((*db)->config.num_flush_threads <= 0)
-        (*db)->config.num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE;
+    {
+        int cpus = tdb_get_cpu_count();
+        if (cpus <= 0) cpus = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE;
+        (*db)->config.num_flush_threads =
+            cpus < TDB_FLUSH_THREADS_AUTO_CAP ? cpus : TDB_FLUSH_THREADS_AUTO_CAP;
+    }
     if ((*db)->config.max_concurrent_flushes <= 0)
         (*db)->config.max_concurrent_flushes = (*db)->config.num_flush_threads;
     else if ((*db)->config.max_concurrent_flushes != (*db)->config.num_flush_threads)
@@ -22662,6 +22721,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->compaction_pending_count, 0);
     atomic_init(&cf->compaction_armed, 0);
     atomic_init(&cf->immutable_cleanup_counter, 0);
+    atomic_init(&cf->immutable_bytes, 0);
     atomic_init(&cf->pending_commits, 0);
 
     char manifest_path[TDB_MAX_PATH_LEN];
@@ -23962,21 +24022,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     return TDB_SUCCESS;
 }
 
-static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction)
+/* enqueue a compaction work item unconditionally, no coalescing. the worker's armed-drain
+ * follow-up uses this -- it represents a genuine follow-up after a completed compaction and must
+ * queue even though this cf's just-finished item is still counted in compaction_pending_count. */
+static int tidesdb_enqueue_compaction_force(tidesdb_column_family_t *cf, int full_compaction)
 {
-    if (!cf) return TDB_ERR_INVALID_ARGS;
-
-    if (atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
-    {
-        /* compaction already running. arm a follow-up so the worker
-         * re-enqueues once it finishes this round, otherwise a trigger that
-         * arrived mid-compaction is silently coalesced into nothing */
-        atomic_store_explicit(&cf->compaction_armed, 1, memory_order_release);
-        return TDB_SUCCESS;
-    }
-
-    /* we enqueue compaction work -- calloc so the steer fields default to zero
-     * (no tombstone steering) */
+    /* calloc so the steer fields default to zero (no tombstone steering) */
     tidesdb_compaction_work_t *work = calloc(1, sizeof(tidesdb_compaction_work_t));
     if (!work)
     {
@@ -23994,6 +24045,26 @@ static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_comp
     }
 
     return TDB_SUCCESS;
+}
+
+static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction)
+{
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+
+    /* coalesce against an in-flight OR already-pending compaction. a queued compaction recomputes
+     * its geometry from current level state when it runs, so a second copy is pure redundancy that
+     * piles up the compaction queue and thrashes the worker pool on TDB_ERR_LOCKED requeues. arm a
+     * follow-up instead -- the worker re-enqueues once it finishes (and the reaper drains the armed
+     * flag as a backstop), so no trigger is lost. checking pending_count (not just is_compacting)
+     * closes the window between a work item being queued and the worker setting is_compacting. */
+    if (atomic_load_explicit(&cf->is_compacting, memory_order_acquire) ||
+        atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) > 0)
+    {
+        atomic_store_explicit(&cf->compaction_armed, 1, memory_order_release);
+        return TDB_SUCCESS;
+    }
+
+    return tidesdb_enqueue_compaction_force(cf, full_compaction);
 }
 
 /**
@@ -24421,6 +24492,17 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
             if (amt->skip_list) active_size = (size_t)skip_list_get_size(amt->skip_list);
             tidesdb_immutable_memtable_unref(amt);
         }
+        const size_t ramp_lo = (size_t)((double)ceiling * TDB_BACKPRESSURE_RAMP_LO_RATIO);
+        if (active_size > ramp_lo && active_size < ceiling)
+        {
+            const double f = (double)(active_size - ramp_lo) / (double)(ceiling - ramp_lo);
+            const useconds_t d = (useconds_t)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
+            if (d > 0)
+            {
+                usleep(d);
+                l0_delayed = 1;
+            }
+        }
         if (active_size >= ceiling)
         {
             if (tdb_log_throttle(cf->db, &cf->last_ceiling_stall_log_sec,
@@ -24501,6 +24583,17 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         {
             if (umt->skip_list) u_size = (size_t)skip_list_get_size(umt->skip_list);
             tidesdb_immutable_memtable_unref(umt);
+        }
+        const size_t u_ramp_lo = (size_t)((double)u_ceiling * TDB_BACKPRESSURE_RAMP_LO_RATIO);
+        if (u_size > u_ramp_lo && u_size < u_ceiling)
+        {
+            const double f = (double)(u_size - u_ramp_lo) / (double)(u_ceiling - u_ramp_lo);
+            const useconds_t d = (useconds_t)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
+            if (d > 0)
+            {
+                usleep(d);
+                l0_delayed = 1;
+            }
         }
         if (u_size >= u_ceiling)
         {
@@ -27975,6 +28068,16 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
 {
     tidesdb_memtable_t *old_mt = atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
     if (!old_mt) return TDB_ERR_UNKNOWN;
+
+    /* skip rotating an empty active -- some callers (the reaper's memory-pressure rotate, the
+     * apply_backpressure ceiling path) invoke this without first checking that the active holds
+     * data. when writes are blocked under sustained pressure the active is empty, and rotating it
+     * anyway churns empty immutables onto the unbounded unified immutable queue, allocates a fresh
+     * arena and a new WAL file with a directory sync, and enqueues an empty flush -- all of which
+     * sheds nothing. the caller holds the single-rotator is_flushing CAS, so old_mt cannot be
+     * swapped/freed here; a concurrent writer appending one entry at most defers this rotate one
+     * round. */
+    if (!old_mt->skip_list || skip_list_get_size(old_mt->skip_list) == 0) return TDB_SUCCESS;
 
     const uint64_t new_gen =
         atomic_fetch_add_explicit(&db->unified_mt.wal_generation, 1, memory_order_relaxed) + 1;

@@ -22412,7 +22412,7 @@ static void test_memory_pressure_auto_limit(void)
 {
     cleanup_test_dir();
 
-    /* we verify max_memory_usage = 0 auto-resolves to 50% of total memory */
+    /* we verify max_memory_usage = 0 auto-resolves to 75% of total memory */
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.max_memory_usage = 0; /* auto */
@@ -22421,11 +22421,11 @@ static void test_memory_pressure_auto_limit(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
     ASSERT_TRUE(db != NULL);
 
-    /* resolved_memory_limit should be ~50% of total_memory */
+    /* resolved_memory_limit should be ~75% of total_memory (TDB_MEMORY_AUTO_LIMIT_RATIO) */
     ASSERT_TRUE(db->resolved_memory_limit > 0);
     ASSERT_TRUE(db->total_memory > 0);
 
-    size_t expected = (size_t)((double)db->total_memory * 0.50);
+    size_t expected = (size_t)((double)db->total_memory * 0.75);
     /* allow 1% tolerance for floating point */
     size_t diff = db->resolved_memory_limit > expected ? db->resolved_memory_limit - expected
                                                        : expected - db->resolved_memory_limit;
@@ -23834,6 +23834,222 @@ static void *mcf_iter_mut_compactor_thread(void *arg)
         usleep(15000);
     }
     return NULL;
+}
+
+/* a multi-CF flush-heavy workload must not pile the global compaction queue. enqueue coalesces
+ * against a pending (queued-but-not-yet-started) compaction as well as an in-flight one, so
+ * redundant work items -- each recomputing the same geometry -- cannot accumulate and thrash the
+ * worker pool on TDB_ERR_LOCKED requeues. the queue should stay bounded near one pending per CF. */
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t **cfs;
+    int num_cfs;
+    int id;
+    int num_ops;
+    _Atomic(int) *go;
+    _Atomic(int) *stop;
+    _Atomic(int) *errors;
+} cqb_writer_data_t;
+
+static void *cqb_writer_thread(void *arg)
+{
+    cqb_writer_data_t *d = (cqb_writer_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(d->db, &txn) != 0)
+        {
+            atomic_fetch_add(d->errors, 1);
+            continue;
+        }
+        char key[64], val[96];
+        snprintf(key, sizeof(key), "cqb_t%d_%06d", d->id, i);
+        snprintf(val, sizeof(val), "v_%d_%06d_padpadpadpadpadpad", d->id, i);
+        int cf = (d->id + i) % d->num_cfs;
+        tidesdb_txn_put(txn, d->cfs[cf], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                        strlen(val) + 1, 0);
+        if (tdb_test_commit_with_retry(txn, 20) != 0) atomic_fetch_add(d->errors, 1);
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    _Atomic(int) *stop;
+    _Atomic(int) *max_cq;
+} cqb_monitor_data_t;
+
+static void *cqb_monitor_thread(void *arg)
+{
+    cqb_monitor_data_t *d = (cqb_monitor_data_t *)arg;
+    while (!atomic_load(d->stop))
+    {
+        tidesdb_db_stats_t s;
+        memset(&s, 0, sizeof(s));
+        if (tidesdb_get_db_stats(d->db, &s) == 0)
+        {
+            int cq = (int)s.compaction_queue_size;
+            int cur = atomic_load(d->max_cq);
+            while (cq > cur && !atomic_compare_exchange_weak(d->max_cq, &cur, cq))
+            { /* retry */
+            }
+        }
+        usleep(2000);
+    }
+    return NULL;
+}
+
+static void test_compaction_queue_bounded_multi_cf(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t db_config = tidesdb_default_config();
+    db_config.db_path = TEST_DB_PATH;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&db_config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    const int NUM_CFS = 6;
+    const int NUM_WRITERS = 8;
+    const int W_OPS = 4000;
+    tidesdb_column_family_t *cfs[6];
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "cqb_cf_%d", c);
+        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+        /* tiny write buffer -> frequent flush -> frequent post-flush compaction triggers, the
+         * workload that piled the queue before the coalescing fix */
+        cc.write_buffer_size = 4096;
+        cc.compression_algorithm = TDB_COMPRESS_NONE;
+        ASSERT_EQ(tidesdb_create_column_family(db, nm, &cc), 0);
+        cfs[c] = tidesdb_get_column_family(db, nm);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    _Atomic(int) go = 0, stop = 0, errors = 0, max_cq = 0;
+    pthread_t wt[8], mt;
+    cqb_writer_data_t wd[8];
+    cqb_monitor_data_t md = {db, &stop, &max_cq};
+    pthread_create(&mt, NULL, cqb_monitor_thread, &md);
+    for (int i = 0; i < NUM_WRITERS; i++)
+    {
+        wd[i] = (cqb_writer_data_t){db, cfs, NUM_CFS, i, W_OPS, &go, &stop, &errors};
+        pthread_create(&wt[i], NULL, cqb_writer_thread, &wd[i]);
+    }
+    atomic_store(&go, 1);
+    for (int i = 0; i < NUM_WRITERS; i++) pthread_join(wt[i], NULL);
+    atomic_store(&stop, 1);
+    pthread_join(mt, NULL);
+
+    int observed_max = atomic_load(&max_cq);
+    /* coalescing bounds the queue to ~one pending per CF (plus a transient force-enqueued follow-up
+     * each); 4x num_cfs is comfortably above that and far below the unbounded pile-up (50+) the old
+     * code produced on this workload. */
+    const int bound = 4 * NUM_CFS;
+    printf("  compaction queue bounded multi-cf: max observed=%d (bound=%d, cfs=%d) errors=%d\n",
+           observed_max, bound, NUM_CFS, (int)atomic_load(&errors));
+    ASSERT_EQ((int)atomic_load(&errors), 0);
+    ASSERT_TRUE(observed_max <= bound);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* rotating an empty unified active must be a no-op. otherwise the reaper's pressure-rotate churns
+ * empty immutables and advances the WAL generation while writes are blocked, shedding nothing.
+ * flushing an empty unified memtable should enqueue no immutable and not advance the WAL
+ * generation; a non-empty active must still rotate. */
+static void test_unified_empty_rotate_noop(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t cfg = tidesdb_default_config();
+    cfg.db_path = TEST_DB_PATH;
+    cfg.unified_memtable = 1;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
+    ASSERT_TRUE(db != NULL);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "u", &cc), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "u");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_db_stats_t s0;
+    memset(&s0, 0, sizeof(s0));
+    ASSERT_EQ(tidesdb_get_db_stats(db, &s0), 0);
+
+    /* flush the empty unified active several times -- the guard makes each rotate a no-op */
+    for (int i = 0; i < 5; i++) tidesdb_flush_memtable(cf);
+
+    tidesdb_db_stats_t s1;
+    memset(&s1, 0, sizeof(s1));
+    ASSERT_EQ(tidesdb_get_db_stats(db, &s1), 0);
+    printf("  unified empty rotate noop: imm=%d wal_gen %llu->%llu\n", s1.unified_immutable_count,
+           (unsigned long long)s0.unified_wal_generation,
+           (unsigned long long)s1.unified_wal_generation);
+    ASSERT_EQ(s1.unified_immutable_count, 0);
+    ASSERT_EQ((unsigned long long)s1.unified_wal_generation,
+              (unsigned long long)s0.unified_wal_generation);
+
+    /* sanity -- a non-empty active still rotates (WAL generation advances) */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    tidesdb_txn_put(txn, cf, (uint8_t *)"k", 2, (uint8_t *)"v", 2, 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+    tidesdb_flush_memtable(cf);
+    tidesdb_db_stats_t s2;
+    memset(&s2, 0, sizeof(s2));
+    ASSERT_EQ(tidesdb_get_db_stats(db, &s2), 0);
+    ASSERT_TRUE((unsigned long long)s2.unified_wal_generation >
+                (unsigned long long)s0.unified_wal_generation);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* the default config leaves the flush pool at 0 (auto); open resolves it to min(cpu, cap) and pins
+ * max_concurrent_flushes to it with no mismatch warning. an explicit value is honored unchanged. */
+static void test_flush_threads_autoscale_default(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t cfg = tidesdb_default_config();
+    cfg.db_path = TEST_DB_PATH;
+    ASSERT_EQ(cfg.num_flush_threads, 0);
+    ASSERT_EQ(cfg.max_concurrent_flushes, 0);
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    int cpus = tdb_get_cpu_count();
+    if (cpus <= 0) cpus = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE;
+    const int expect = cpus < TDB_FLUSH_THREADS_AUTO_CAP ? cpus : TDB_FLUSH_THREADS_AUTO_CAP;
+    printf("  flush autoscale: cpus=%d -> num_flush_threads=%d (cap=%d)\n", cpus,
+           db->config.num_flush_threads, TDB_FLUSH_THREADS_AUTO_CAP);
+    ASSERT_EQ(db->config.num_flush_threads, expect);
+    ASSERT_EQ(db->config.max_concurrent_flushes, db->config.num_flush_threads);
+    ASSERT_TRUE(db->config.num_flush_threads >= 1 &&
+                db->config.num_flush_threads <= TDB_FLUSH_THREADS_AUTO_CAP);
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    /* an explicit value is left as-is and max_concurrent_flushes pins to it */
+    tidesdb_config_t cfg2 = tidesdb_default_config();
+    cfg2.db_path = TEST_DB_PATH;
+    cfg2.num_flush_threads = 1;
+    tidesdb_t *db2 = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg2, &db2), 0);
+    ASSERT_TRUE(db2 != NULL);
+    ASSERT_EQ(db2->config.num_flush_threads, 1);
+    ASSERT_EQ(db2->config.max_concurrent_flushes, 1);
+    tidesdb_close(db2);
+    cleanup_test_dir();
 }
 
 static void test_multi_cf_iterator_during_level_mutation(void)
@@ -29756,6 +29972,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_concurrent_multi_cf_deep_sst_mixed_ops, tests_passed);
     RUN_TEST(test_multi_cf_flush_queue_saturation, tests_passed);
     RUN_TEST(test_multi_cf_cross_txn_compaction_atomicity, tests_passed);
+    RUN_TEST(test_compaction_queue_bounded_multi_cf, tests_passed);
+    RUN_TEST(test_unified_empty_rotate_noop, tests_passed);
+    RUN_TEST(test_flush_threads_autoscale_default, tests_passed);
     RUN_TEST(test_multi_cf_iterator_during_level_mutation, tests_passed);
     RUN_TEST(test_multi_cf_cascading_memory_pressure, tests_passed);
     RUN_TEST(test_multi_cf_create_drop_churn_under_load, tests_passed);

@@ -27746,15 +27746,18 @@ static void test_objstore_stats(void)
         if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
         usleep(20000);
     }
-    /* wait for async uploads to complete (sstable uploads + MANIFEST) */
-    for (int w = 0; w < 100; w++)
+
+    /* poll the counter itself rather than the upload queue depth -- a job leaves
+     * the queue at dequeue, before the worker finishes the put and bumps the
+     * stat, so an empty queue does not mean the upload has landed. on a heavily
+     * loaded runner the worker can be starved past any fixed grace. */
+    tidesdb_db_stats_t stats;
+    for (int w = 0; w < 400; w++)
     {
-        if (db->upload_queue && queue_size(db->upload_queue) == 0) break;
+        if (tidesdb_get_db_stats(db, &stats) == 0 && stats.total_uploads > 0) break;
         usleep(50000);
     }
-    usleep(200000);
 
-    tidesdb_db_stats_t stats;
     ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
     ASSERT_TRUE(stats.object_store_enabled == 1);
     ASSERT_TRUE(stats.total_uploads > 0);

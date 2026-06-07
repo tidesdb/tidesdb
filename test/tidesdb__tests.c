@@ -954,7 +954,7 @@ static void test_backup_concurrent_writes(void)
 
     ASSERT_EQ(atomic_load(&errors), 0);
 
-    /* DIAG: record which prebackup keys are still present in the SOURCE db before closing it, so a
+    /* we record which prebackup keys are still present in the SOURCE db before closing it, so a
      * later backup miss can be attributed -- gone from the source means an upstream compaction loss
      * (the key never made it into the source's sstables), present in source but absent from the
      * backup means the backup copy dropped a present key. */
@@ -10708,9 +10708,15 @@ static void tdb_diag_dump_layout(tidesdb_column_family_t *cf)
         {
             tidesdb_sstable_t *sst = ssts[s];
             if (!sst) continue;
-            fprintf(stderr, "    DIAG sstable id=%llu entries=%llu tombstones=%llu max_seq=%llu\n",
+            fprintf(stderr,
+                    "    DIAG sstable id=%llu entries=%llu tombstones=%llu max_seq=%llu "
+                    "min_key='%.*s' max_key='%.*s'\n",
                     (unsigned long long)sst->id, (unsigned long long)sst->num_entries,
-                    (unsigned long long)sst->tombstone_count, (unsigned long long)sst->max_seq);
+                    (unsigned long long)sst->tombstone_count, (unsigned long long)sst->max_seq,
+                    sst->min_key ? (int)sst->min_key_size : 0,
+                    sst->min_key ? (char *)sst->min_key : "",
+                    sst->max_key ? (int)sst->max_key_size : 0,
+                    sst->max_key ? (char *)sst->max_key : "");
         }
         atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
     }
@@ -10849,7 +10855,71 @@ static void test_btree_compaction_with_deletes(void)
                     fprintf(
                         stderr, "DIAG: re-read '%s' still-found %d/30 (%s)\n", key, still,
                         still >= 28 ? "PERSISTENT" : (still == 0 ? "TRANSIENT" : "INTERMITTENT"));
+
+                    /* does an iterator (a different read path) also find it? iterator FOUND means
+                     * the key is genuinely in the sstable (a merge/content bug); iterator MISSING
+                     * while point-get finds it means a point-get read bug (e.g. a stale cached
+                     * btree node serving data from a compacted-away sstable). */
+                    {
+                        tidesdb_txn_t *it_txn = NULL;
+                        int iter_found = 0;
+                        if (tidesdb_txn_begin(db, &it_txn) == 0)
+                        {
+                            tidesdb_iter_t *it = NULL;
+                            if (tidesdb_iter_new(it_txn, cf, &it) == 0 && it)
+                            {
+                                if (tidesdb_iter_seek(it, (uint8_t *)key, strlen(key) + 1) == 0 &&
+                                    tidesdb_iter_valid(it))
+                                {
+                                    uint8_t *ik = NULL;
+                                    size_t iks = 0;
+                                    if (tidesdb_iter_key(it, &ik, &iks) == 0 && ik &&
+                                        iks == strlen(key) + 1 && memcmp(ik, key, iks) == 0)
+                                        iter_found = 1;
+                                }
+                                tidesdb_iter_free(it);
+                            }
+                            tidesdb_txn_free(it_txn);
+                        }
+                        fprintf(stderr, "DIAG: '%s' iterator-scan %s -- %s\n", key,
+                                iter_found ? "FOUND" : "MISSING",
+                                iter_found ? "genuinely in the data (merge/content bug)"
+                                           : "point-get only (stale read / cached btree node bug)");
+                    }
                     tdb_diag_dump_layout(cf);
+
+                    /* one-time: dump the FULL key set the cf returns via an iterator, so we see
+                     * exactly which 50 keys the merge kept (which odds dropped, which evens kept)
+                     */
+                    if (resurfaced == 1)
+                    {
+                        tidesdb_txn_t *st = NULL;
+                        if (tidesdb_txn_begin(db, &st) == 0)
+                        {
+                            tidesdb_iter_t *sit = NULL;
+                            if (tidesdb_iter_new(st, cf, &sit) == 0 && sit &&
+                                tidesdb_iter_seek_to_first(sit) == 0)
+                            {
+                                int cnt = 0;
+                                fprintf(stderr, "  DIAG full key set:");
+                                while (tidesdb_iter_valid(sit))
+                                {
+                                    uint8_t *ik = NULL, *iv = NULL;
+                                    size_t iks = 0, ivs = 0;
+                                    if (tidesdb_iter_key(sit, &ik, &iks) == 0 && ik)
+                                        fprintf(stderr, " %.*s", (int)iks, (char *)ik);
+                                    (void)iv;
+                                    (void)ivs;
+                                    cnt++;
+                                    if (tidesdb_iter_next(sit) != 0) break;
+                                }
+                                fprintf(stderr, "\n  DIAG total keys via iterator: %d\n", cnt);
+                            }
+                            if (sit) tidesdb_iter_free(sit);
+                            tidesdb_txn_free(st);
+                        }
+                        fflush(stderr);
+                    }
                 }
             }
             if (value) free(value);

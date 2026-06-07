@@ -1680,7 +1680,9 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
                                                  block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                                  bloom_filter_t *bloom, queue_t *sstables_to_delete,
-                                                 int is_largest_level);
+                                                 int is_largest_level, const uint8_t *range_start,
+                                                 size_t range_start_size, const uint8_t *range_end,
+                                                 size_t range_end_size);
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction_force(tidesdb_column_family_t *cf, int full_compaction);
@@ -8021,11 +8023,11 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_colu
  * @param is_largest_level whether this is the largest level
  * @return 0 on success, error code on failure
  */
-static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
-                                                 tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
-                                                 block_manager_t *klog_bm, block_manager_t *vlog_bm,
-                                                 bloom_filter_t *bloom, queue_t *sstables_to_delete,
-                                                 const int is_largest_level)
+static int tidesdb_sstable_write_from_heap_btree(
+    tidesdb_column_family_t *cf, tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
+    block_manager_t *klog_bm, block_manager_t *vlog_bm, bloom_filter_t *bloom,
+    queue_t *sstables_to_delete, const int is_largest_level, const uint8_t *range_start,
+    size_t range_start_size, const uint8_t *range_end, size_t range_end_size)
 {
     if (!cf || !sst || !heap || !klog_bm || !vlog_bm) return TDB_ERR_INVALID_ARGS;
 
@@ -8091,6 +8093,21 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
             {
                 /* heap is drained -- fall through to flush pending */
             }
+        }
+
+        /* filter to this partition's key range. the heap is built from every sstable that overlaps
+         * the partition, including a wide tombstone sstable spanning many partitions, but each
+         * partition output must contain only keys in [range_start, range_end). without this the
+         * btree partition writer wrote out-of-range keys and, worse, processed (and at the largest
+         * level GC'd) tombstones for keys owned by other partitions whose puts then resurfaced.
+         * all versions of a key share the key, so skipping by key is safe. */
+        if (kv && ((range_start && comparator_fn(kv->key, kv->entry.key_size, range_start,
+                                                 range_start_size, comparator_ctx) < 0) ||
+                   (range_end && comparator_fn(kv->key, kv->entry.key_size, range_end,
+                                               range_end_size, comparator_ctx) >= 0)))
+        {
+            tidesdb_kv_pair_free(kv);
+            continue;
         }
 
         if (kv && pending && pending->entry.key_size == kv->entry.key_size &&
@@ -14144,7 +14161,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
         if (cf->config.use_btree)
         {
             int btree_result = tidesdb_sstable_write_from_heap_btree(
-                cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level);
+                cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level,
+                range_start, range_start_size, range_end, range_end_size);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(heap);
@@ -14813,7 +14831,8 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     if (cf->config.use_btree)
     {
         int btree_result = tidesdb_sstable_write_from_heap_btree(
-            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level);
+            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level, NULL,
+            0, NULL, 0);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         tidesdb_merge_heap_free(heap);
@@ -15756,7 +15775,8 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
             klog_block = NULL;
 
             int btree_result = tidesdb_sstable_write_from_heap_btree(
-                cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, is_largest_level);
+                cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, is_largest_level,
+                range_start, range_start_size, range_end, range_end_size);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -16418,7 +16438,7 @@ typedef struct
     size_t *boundary_sizes;
     int *partition_skipped;
     size_t file_max;
-    int targeting_largest;
+    int reap_tombstones;
     _Atomic(int) aborted;
 } tidesdb_partitioned_merge_ctx_t;
 
@@ -16536,6 +16556,15 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
      **   this bounds transient space-amp to 1/T. when not targeting the largest level,
      *    file_max is 0 which disables splitting. */
     const int targeting_largest = (end_idx == num_levels - 1);
+
+    /* a tombstone may be reaped only when no older version of its key can survive outside this
+     * merge. that needs the output to be the largest level (nothing deeper) and the merge to start
+     * at level 0 (nothing shallower left unmerged) -- a partial merge into the largest level leaves
+     * the upper levels untouched, so reaping here would let an older put there resurface. the skew
+     * and file_max optimizations below stay gated on targeting_largest alone; they are safe at any
+     * start level. mirrors full_preemptive/targeted merge. */
+    const int reap_tombstones = targeting_largest && (start_idx == 0);
+
     size_t file_max = 0;
     if (targeting_largest && start_idx >= 0 && start_idx < num_levels)
     {
@@ -16634,7 +16663,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     pctx.boundary_sizes = boundary_sizes;
     pctx.partition_skipped = partition_skipped;
     pctx.file_max = file_max;
-    pctx.targeting_largest = targeting_largest;
+    pctx.reap_tombstones = reap_tombstones;
     atomic_init(&pctx.aborted, 0);
 
     /* run the partition sub-merges across the sub-compaction helper pool (calling thread works
@@ -16720,7 +16749,7 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
     size_t *boundary_sizes = c->boundary_sizes;
     int *partition_skipped = c->partition_skipped;
     const size_t file_max = c->file_max;
-    const int targeting_largest = c->targeting_largest;
+    const int reap_tombstones = c->reap_tombstones;
     int aborted = 0;
 
     do
@@ -16909,7 +16938,8 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
             if (cf->config.use_btree)
             {
                 int btree_result = tidesdb_sstable_write_from_heap_btree(
-                    cf, new_sst, heap, klog_bm, vlog_bm, bloom, NULL, targeting_largest);
+                    cf, new_sst, heap, klog_bm, vlog_bm, bloom, NULL, reap_tombstones, range_start,
+                    range_start_size, range_end, range_end_size);
                 block_manager_close(klog_bm);
                 block_manager_close(vlog_bm);
                 tidesdb_merge_heap_free(heap);
@@ -17022,10 +17052,11 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
                     }
                 }
 
-                /* reap a plain tombstone only when this partition merges into
-                 * the largest level -- nothing older exists below it then.
-                 * when targeting a shallower level tombstones must survive. */
-                if (targeting_largest && (kv->entry.flags & TDB_KV_FLAG_TOMBSTONE))
+                /* reap a plain tombstone only when this merge starts at level 0 and
+                 * outputs the largest level -- nothing older survives outside it then.
+                 * a partial merge into the largest level must keep tombstones or an
+                 * older put in an unmerged upper level would resurface. */
+                if (reap_tombstones && (kv->entry.flags & TDB_KV_FLAG_TOMBSTONE))
                 {
                     tidesdb_kv_pair_free(kv);
                     continue;

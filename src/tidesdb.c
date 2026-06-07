@@ -13806,10 +13806,13 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return TDB_ERR_INVALID_ARGS;
     }
 
-    /* we determine if we're merging into the largest (bottommost) level
-     * tombstones can only be dropped when merging into the largest level
-     * because there's no lower level that might contain the data being deleted */
-    const int is_largest_level = (target_level == num_levels - 1);
+    /* we determine if we're merging into the largest (bottommost) level. a tombstone may be dropped
+     * only when no older version of its key can survive outside this merge-- the output must be the
+     * largest level (nothing deeper) and the merge must start at level 0 (nothing shallower left
+     * unmerged). a partial merge into the largest level (start_level > 0, e.g. the partitioned
+     * merge fallbacks) leaves the upper levels untouched, so dropping a tombstone here would let an
+     * older put in those levels resurface -- defer the drop to a full merge in that case. */
+    const int is_largest_level = (target_level == num_levels - 1) && (start_level == 0);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting full preemptive merge on CF '%s', levels %d->%d",
                   cf->name, start_level + 1, target_level + 1);
@@ -14700,7 +14703,11 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
     if (target_level >= num_levels) return TDB_ERR_INVALID_ARGS;
 
-    const int is_largest_level = (target_level == num_levels - 1);
+    /* drop tombstones only when no older version can survive outside this merge-- the output is the
+     * largest level (nothing deeper) and the inputs reach level 0 (nothing shallower left). a
+     * targeted merge of a subset that starts below level 0 leaves older puts in the upper levels,
+     * so GC'ing a tombstone here would resurface them -- keep tombstones in that case. */
+    const int is_largest_level = (target_level == num_levels - 1) && (min_input_level == 0);
 
     /* snapshot floor -- see tidesdb_sstable_write_from_heap_btree for rationale */
     const uint64_t min_snapshot_seq = tidesdb_min_active_snapshot_seq(cf->db);
@@ -33724,7 +33731,7 @@ int tidesdb_cancel_background_work(tidesdb_t *db)
     atomic_store_explicit(&db->cancel_compaction, 1, memory_order_release);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Cancelling compaction");
 
-    /* wait until the compaction queue is empty, no CF is mid-merge, AND no CF has a
+    /* wait until the compaction queue is empty, no CF is mid-merge, and no CF has a
      * pending count outstanding -- pending_count is incremented before queue_enqueue
      * and decremented after the worker's skip/finish, so there are windows where
      * queue=0 and is_compacting=0 but the work item is still in flight. tidesdb_is_compacting

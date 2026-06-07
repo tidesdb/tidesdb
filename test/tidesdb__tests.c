@@ -881,6 +881,12 @@ static void *backup_concurrent_writer_thread(void *arg)
     return NULL;
 }
 
+static void tdb_diag_dump_layout(
+    tidesdb_column_family_t *cf); /* defined with the btree diagnostics */
+static int tdb_test_get_with_retry(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
+                                   const uint8_t *k, size_t ksz, uint8_t **v,
+                                   size_t *vs); /* defined below */
+
 static void test_backup_concurrent_writes(void)
 {
     cleanup_test_dir();
@@ -948,6 +954,35 @@ static void test_backup_concurrent_writes(void)
 
     ASSERT_EQ(atomic_load(&errors), 0);
 
+    /* DIAG: record which prebackup keys are still present in the SOURCE db before closing it, so a
+     * later backup miss can be attributed -- gone from the source means an upstream compaction loss
+     * (the key never made it into the source's sstables), present in source but absent from the
+     * backup means the backup copy dropped a present key. */
+    int *src_missing = calloc((size_t)NUM_THREADS * PREBACKUP_KEYS_PER_THREAD, sizeof(int));
+    if (src_missing)
+    {
+        tidesdb_txn_t *stxn = NULL;
+        if (tidesdb_txn_begin(db, &stxn) == 0)
+        {
+            for (int t = 0; t < NUM_THREADS; t++)
+            {
+                int start = t * KEYS_PER_THREAD;
+                for (int j = 0; j < PREBACKUP_KEYS_PER_THREAD; j++)
+                {
+                    char key[64];
+                    snprintf(key, sizeof(key), "concurrent_key_%05d", start + j);
+                    uint8_t *v = NULL;
+                    size_t vs = 0;
+                    int rc =
+                        tdb_test_get_with_retry(stxn, cf, (uint8_t *)key, strlen(key) + 1, &v, &vs);
+                    if (v) free(v);
+                    src_missing[t * PREBACKUP_KEYS_PER_THREAD + j] = (rc != 0);
+                }
+            }
+            tidesdb_txn_free(stxn);
+        }
+    }
+
     ASSERT_EQ(tidesdb_close(db), 0);
 
     tidesdb_config_t config = tidesdb_default_config();
@@ -963,6 +998,7 @@ static void test_backup_concurrent_writes(void)
 
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(backup_db, &txn), 0);
+    int backup_missing = 0;
     for (int t = 0; t < NUM_THREADS; t++)
     {
         int start = t * KEYS_PER_THREAD;
@@ -976,15 +1012,37 @@ static void test_backup_concurrent_writes(void)
 
             uint8_t *value = NULL;
             size_t value_size = 0;
-            ASSERT_EQ(tidesdb_txn_get(txn, backup_cf, (uint8_t *)key, strlen(key) + 1, &value,
-                                      &value_size),
-                      0);
-            ASSERT_TRUE(value != NULL);
-            ASSERT_TRUE(strcmp((char *)value, expected) == 0);
-            free(value);
+            int rc = tidesdb_txn_get(txn, backup_cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                     &value_size);
+            if (rc != 0)
+            {
+                backup_missing++;
+                int sm =
+                    src_missing ? src_missing[t * PREBACKUP_KEYS_PER_THREAD + (i - start)] : -1;
+                if (backup_missing <= 3)
+                {
+                    fprintf(
+                        stderr,
+                        "DIAG backup: key '%s' missing from backup (rc=%d) -- present in source "
+                        "before close: %s\n",
+                        key, rc,
+                        sm == 1   ? "NO (upstream compaction loss in the source db)"
+                        : sm == 0 ? "YES (backup copy dropped a present key)"
+                                  : "unknown");
+                    tdb_diag_dump_layout(backup_cf);
+                }
+            }
+            else
+            {
+                ASSERT_TRUE(value != NULL);
+                ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+                free(value);
+            }
         }
     }
     tidesdb_txn_free(txn);
+    ASSERT_EQ(backup_missing, 0);
+    free(src_missing);
 
     free(thread_data);
     free(threads);

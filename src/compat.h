@@ -661,6 +661,19 @@ static inline int tdb_spawn_wait(const char *cmd, char *const argv[])
  * threading backend"), so it needs no pthreads-win32 library. time.h provides struct timespec and
  * struct tm, which the removed pthreads-win32 header used to pull in transitively. */
 #include <time.h>
+
+/* struct timeval (used by gettimeofday) lives in winsock, which windows.h does not pull in under
+ * WIN32_LEAN_AND_MEAN (e.g. the mariadb build), and which the removed pthreads-win32 header used to
+ * supply. define it under winsock's own _TIMEVAL_DEFINED guard so it stays a single definition
+ * whether or not winsock is also included. */
+#ifndef _TIMEVAL_DEFINED
+#define _TIMEVAL_DEFINED
+struct timeval
+{
+    long tv_sec;
+    long tv_usec;
+};
+#endif
 #endif
 
 #if defined(_MSC_VER)

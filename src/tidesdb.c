@@ -4944,23 +4944,30 @@ static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_p
  * @param db database instance
  * @param local_path local file path to upload
  */
-static void tdb_objstore_upload_file_sync(const tidesdb_t *db, const char *local_path)
+static void tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path)
 {
     if (!db->object_store || !local_path) return;
     char key[TDB_MAX_PATH_LEN];
     tdb_path_to_object_key(db, local_path, key, sizeof(key));
 
-    /* we retry with exponential backoff matching the async upload worker */
+    /* we retry with exponential backoff matching the async upload worker. the upload counters
+     * cover both paths, so the sync sstable/config/wal uploads count alongside the async
+     * manifest/wal ones. */
     unsigned int delay_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
     for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
     {
-        if (db->object_store->put(db->object_store->ctx, key, local_path) == 0) return;
+        if (db->object_store->put(db->object_store->ctx, key, local_path) == 0)
+        {
+            atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
+            return;
+        }
 
         TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync upload attempt %d/%d failed: %s",
                       attempt + 1, TDB_UPLOAD_MAX_RETRIES, key);
         if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES) usleep(delay_us);
         delay_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
     }
+    atomic_fetch_add_explicit(&db->total_upload_failures, 1, memory_order_relaxed);
     TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync upload failed after %d attempts: %s",
                   TDB_UPLOAD_MAX_RETRIES, key);
 }
@@ -4983,13 +4990,8 @@ static void tdb_objstore_upload_file(tidesdb_t *db, const char *local_path)
         return;
     }
 
-    /* we fallback to synchronous upload */
-    char key[TDB_MAX_PATH_LEN];
-    tdb_path_to_object_key(db, local_path, key, sizeof(key));
-    if (db->object_store->put(db->object_store->ctx, key, local_path) != 0)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store upload failed: %s", key);
-    }
+    /* we fallback to synchronous upload (retries and counts via the sync helper) */
+    tdb_objstore_upload_file_sync(db, local_path);
 }
 
 /**

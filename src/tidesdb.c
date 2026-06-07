@@ -34373,11 +34373,11 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
 
     /* drain compactions that were already past the gate when we paused BEFORE the first copy. a
      * compaction running during the immutable copy rewrites the manifest and sstable set under it
-     * (it removes the merged inputs and adds the output), so the copy can capture a manifest that no
-     * longer matches the files on disk -- a committed key then lives in a removed input that is no
-     * longer copied while its merged sstable is not yet present, and it is silently absent from the
-     * backup. with compaction paused no new compaction starts, so once these drain the sstable set
-     * only grows (by flushes) for the rest of the backup. */
+     * (it removes the merged inputs and adds the output), so the copy can capture a manifest that
+     * no longer matches the files on disk -- a committed key then lives in a removed input that is
+     * no longer copied while its merged sstable is not yet present, and it is silently absent from
+     * the backup. with compaction paused no new compaction starts, so once these drain the sstable
+     * set only grows (by flushes) for the rest of the backup. */
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for in-progress compactions before backup copy");
     while (atomic_load_explicit(&db->active_compactions, memory_order_acquire) > 0)
     {
@@ -34455,9 +34455,9 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
 
-    /* in-progress compactions were drained before the first copy and none can start while paused, so
-     * the only change to the sstable set during the backup is flushes adding new files -- the final
-     * manifest and sstable set are consistent for the copy below. */
+    /* in-progress compactions were drained before the first copy and none can start while paused,
+     * so the only change to the sstable set during the backup is flushes adding new files -- the
+     * final manifest and sstable set are consistent for the copy below. */
     result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_FINAL);
     if (result == TDB_SUCCESS)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully in '%s'", dir);

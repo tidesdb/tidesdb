@@ -11036,7 +11036,10 @@ static void test_btree_compaction_with_deletes(void)
         snprintf(key, sizeof(key), "del_key_%03d", i);
         uint8_t *value = NULL;
         size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        /* a point-get racing the post-compact layout now returns a retryable BUSY instead of a
+         * stale put for a deleted key, so retry until it settles before judging resurrection */
+        int result =
+            tdb_test_get_with_retry(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
 
         if (i % 2 == 0)
         {

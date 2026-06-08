@@ -26110,6 +26110,29 @@ unified_sst_search:;
 
         if (best_found)
         {
+            /* a match is not final while the layout is moving. an add swaps the level array, but
+             * the swap can land after our one-time array-swap recheck above, leaving us scanning a
+             * retired snapshot that holds an older put without the newer tombstone a concurrent
+             * compaction just committed into another overlapping first-disk-level sstable -- the
+             * per-level early return would then surface the stale put for a deleted key. if the
+             * layout version moved since we snapshotted it, retry the whole scan, then fall back to
+             * a retryable BUSY. mirrors the not-found guard below. */
+            if (atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire) !=
+                sst_scan_layout_v)
+            {
+                if (best_value)
+                {
+                    free(best_value);
+                    best_value = NULL;
+                }
+                if (sst_scan_restarts < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
+                {
+                    sst_scan_restarts++;
+                    goto unified_sst_search;
+                }
+                return TDB_ERR_BUSY;
+            }
+
             PROFILE_INC(txn->db, sstable_hits);
 
             if (!best_is_dead && best_value)

@@ -16983,7 +16983,9 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
         ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                   strlen(value) + 1, -1),
                   TDB_SUCCESS);
-        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        /* see tdb_test_commit_with_retry -- the tiny fd budget and periodic flushes can stall
+         * a commit into the retryable TDB_ERR_BUSY */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), TDB_SUCCESS);
         tidesdb_txn_free(txn);
 
         /* we flush periodically to create sstables */
@@ -17046,8 +17048,11 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
     tidesdb_txn_t *iter_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), TDB_SUCCESS);
 
+    /* a full-scan iterator opens its whole source set at once, so under the tiny fd budget
+     * iter_new can hit the retryable TDB_ERR_BUSY just like the point-gets above; the reaper
+     * frees idle fds between attempts, so a bounded retry succeeds */
     tidesdb_iter_t *iter = NULL;
-    ASSERT_EQ(tidesdb_iter_new(iter_txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_EQ(tdb_test_iter_new_with_retry(iter_txn, cf, &iter, 100), TDB_SUCCESS);
     ASSERT_TRUE(iter != NULL);
 
     ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);

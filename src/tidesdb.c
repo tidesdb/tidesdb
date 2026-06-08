@@ -11612,7 +11612,14 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
     source->source.sstable.db = db; /* store db for later vlog reads */
     source->is_cached = 0;          /* will be set to 1 if cached by iterator */
 
-    tidesdb_sstable_ref(sst);
+    /* try_ref, not ref -- the sstable may be mid-eviction by the reaper; an unconditional
+     * fetch_add on the EVICTING refcount corrupts the count and frees it under us. see
+     * tidesdb_merge_source_from_btree for the full rationale. */
+    if (!tidesdb_sstable_try_ref(sst))
+    {
+        free(source);
+        return NULL;
+    }
 
     /* scan sources open the klog only; the vlog is opened on demand by
      * tidesdb_vlog_read_value when a value misses the inline klog payload */
@@ -11845,7 +11852,16 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
     source->source.btree.db = db;
     source->is_cached = 0;
 
-    tidesdb_sstable_ref(sst);
+    /* try_ref, not ref -- a merge overlap scan can pick up a freshly committed sstable that this
+     * merge did not collect, so it carries only the level ref and is reaper-eligible. an
+     * unconditional fetch_add on the EVICTING (negative) refcount races the reaper's restore and
+     * corrupts the count, freeing the sstable under the cursor. try_ref spins through the evict
+     * window and fails only if the sstable is genuinely gone, in which case we skip the source. */
+    if (!tidesdb_sstable_try_ref(sst))
+    {
+        free(source);
+        return NULL;
+    }
 
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
@@ -12020,7 +12036,14 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_lazy(tidesdb_t 
     source->source.sstable.db = db;
     source->is_cached = 0;
 
-    tidesdb_sstable_ref(sst);
+    /* try_ref, not ref -- the sstable may be mid-eviction by the reaper; an unconditional
+     * fetch_add on the EVICTING refcount corrupts the count and frees it under us. see
+     * tidesdb_merge_source_from_btree for the full rationale. */
+    if (!tidesdb_sstable_try_ref(sst))
+    {
+        free(source);
+        return NULL;
+    }
 
     /* scan sources open the klog only; the vlog is opened on demand by
      * tidesdb_vlog_read_value when a value misses the inline klog payload */

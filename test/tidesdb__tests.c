@@ -2263,6 +2263,126 @@ static void test_iterator_seek(void)
     cleanup_test_dir();
 }
 
+/* prefix_probe_once
+ * write NKEYS independent 64-byte keys that share a long common prefix (diverging only in the
+ * tail), force them to disk, then (1) seek the bare prefix and forward-scan, and (2) direct-get
+ * each. with correct per-key writes no key may be lost. parameterized over the sstable feature
+ * flags so the sweep below can isolate which combination, if any, drops keys. each build is probed
+ * with a 48-byte partial seek (the reported seek-to-short / found-long geometry) and a shorter
+ * 11-byte seek. mirrors the standalone prefix_probe. */
+static void prefix_probe_once(int block_indexes, int bloom, int use_btree)
+{
+    enum
+    {
+        NKEYS = 1500,
+        KEY_LEN = 64,
+        SHARED_LEN = 48 /* first 48 bytes identical across every key; tail 16 diverge */
+    };
+    static const size_t seek_lens[] = {48, 11};
+
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_block_indexes = block_indexes;
+    cf_config.enable_bloom_filter = bloom;
+    cf_config.use_btree = use_btree;
+    cf_config.write_buffer_size = 4096; /* tiny buffer -> many sstables -> merge + compaction */
+    ASSERT_EQ(tidesdb_create_column_family(db, "prefix_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "prefix_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    static const uint8_t prefix[SHARED_LEN] = {1,  158, 164, 204, 101, 162, 125, 51, 153, 7,  195,
+                                               12, 200, 33,  7,   88,  9,   17,  64, 2,   90, 41};
+
+    uint8_t(*keys)[KEY_LEN] = calloc(NKEYS, KEY_LEN);
+    ASSERT_TRUE(keys != NULL);
+    for (int i = 0; i < NKEYS; i++)
+    {
+        memcpy(keys[i], prefix, SHARED_LEN);
+        for (int b = 0; b < KEY_LEN - SHARED_LEN; b++)
+            keys[i][SHARED_LEN + b] = (uint8_t)((unsigned)(i * 2654435761u) >> (b * 4));
+    }
+
+    for (int i = 0; i < NKEYS; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char val[32];
+        int vlen = snprintf(val, sizeof(val), "value-%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, keys[i], KEY_LEN, (uint8_t *)val, (size_t)vlen, -1), 0);
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* push everything to disk and merge so the probe exercises sstable seek, not the memtable */
+    tidesdb_flush_memtable(cf);
+    tidesdb_compact(cf);
+
+    /* PROBE 1 -- seek the bare prefix, scan forward, count keys still carrying it */
+    for (size_t s = 0; s < sizeof(seek_lens) / sizeof(seek_lens[0]); s++)
+    {
+        const size_t seek_len = seek_lens[s];
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+        int found = 0;
+        if (tidesdb_iter_seek(iter, (uint8_t *)prefix, seek_len) == TDB_SUCCESS)
+        {
+            while (tidesdb_iter_valid(iter))
+            {
+                uint8_t *k = NULL;
+                size_t klen = 0;
+                if (tidesdb_iter_key(iter, &k, &klen) != TDB_SUCCESS) break;
+                if (klen < seek_len || memcmp(k, prefix, seek_len) != 0) break;
+                found++;
+                if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+            }
+        }
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+
+        printf("  [bi=%d bloom=%d btree=%d seek=%zuB] scan=%d/%d\n", block_indexes, bloom,
+               use_btree, seek_len, found, NKEYS);
+        ASSERT_EQ(found, NKEYS); /* a prefix scan must visit every key carrying the prefix */
+    }
+
+    /* PROBE 2 -- direct get every key (catches a present key the scan stepped over) */
+    int present = 0;
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int i = 0; i < NKEYS; i++)
+        {
+            uint8_t *val = NULL;
+            size_t vlen = 0;
+            if (tdb_test_get_with_retry(txn, cf, keys[i], KEY_LEN, &val, &vlen) == TDB_SUCCESS &&
+                val)
+            {
+                present++;
+                free(val);
+            }
+        }
+        tidesdb_txn_free(txn);
+    }
+    ASSERT_EQ(present, NKEYS); /* a stored key must never be unreachable by direct get */
+
+    free(keys);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_shared_prefix_no_key_loss(void)
+{
+    /* sweep the sstable feature matrix -- block index and btree paths each have their own seek
+     * landing logic; any combination that drops a shared-prefix key on a partial-key seek fails
+     * here. bloom kept on (its false-negative path would surface as a missing direct get). */
+    for (int bi = 0; bi <= 1; bi++)
+        for (int btree = 0; btree <= 1; btree++) prefix_probe_once(bi, 1, btree);
+}
+
 static void test_iterator_reverse(void)
 {
     cleanup_test_dir();
@@ -10752,6 +10872,101 @@ static void tdb_diag_probe_missing(tidesdb_t *db, tidesdb_column_family_t *cf, c
             found_via_iter ? "point-get READ miss (data present on disk)"
                            : "genuine write/compaction LOSS (absent from all read paths)");
     tdb_diag_dump_layout(cf);
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int expected;
+    _Atomic(int) *mismatch;
+} cscan_arg_t;
+
+static void *cscan_worker(void *arg)
+{
+    cscan_arg_t *c = (cscan_arg_t *)arg;
+    for (int round = 0; round < 8; round++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(c->db, &txn) != 0) continue;
+        tidesdb_iter_t *it = NULL;
+        if (tidesdb_iter_new(txn, c->cf, &it) == 0 && it)
+        {
+            int n = 0;
+            if (tidesdb_iter_seek_to_first(it) == 0)
+            {
+                while (tidesdb_iter_valid(it))
+                {
+                    n++;
+                    if (tidesdb_iter_next(it) != 0) break;
+                }
+            }
+            tidesdb_iter_free(it);
+            if (n != c->expected) atomic_fetch_add(c->mismatch, 1);
+        }
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+static void test_btree_concurrent_scan_no_skip(void)
+{
+    /* many readers full-scanning the same on-disk btree sstable concurrently must each see every
+     * key. they read the same nodes through the shared btree node cache, so a lock-free cache race
+     * (or any read-side contention) would make a reader skip a contiguous run of entries -- the
+     * same read path a parallel sub-compaction shard uses when it scans a wide shared input. */
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_cscan_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_cscan_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int N = 3000;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "ckey_%06d", i);
+        snprintf(value, sizeof(value), "cval_%06d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
+        tidesdb_txn_free(txn);
+    }
+    tidesdb_flush_memtable(cf);
+    tidesdb_compact(cf); /* consolidate into a multi-leaf btree on disk */
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    enum
+    {
+        NTHREADS = 8
+    };
+    pthread_t th[NTHREADS];
+    cscan_arg_t args[NTHREADS];
+    _Atomic(int) mismatch = 0;
+    for (int t = 0; t < NTHREADS; t++)
+    {
+        args[t] = (cscan_arg_t){.db = db, .cf = cf, .expected = N, .mismatch = &mismatch};
+        ASSERT_EQ(pthread_create(&th[t], NULL, cscan_worker, &args[t]), 0);
+    }
+    for (int t = 0; t < NTHREADS; t++) pthread_join(th[t], NULL);
+
+    printf("  concurrent scan mismatches=%d (threads=%d rounds=8 expected=%d)\n",
+           atomic_load(&mismatch), NTHREADS, N);
+    ASSERT_EQ(atomic_load(&mismatch), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
 }
 
 static void test_btree_compaction_with_deletes(void)
@@ -30075,6 +30290,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_range_cost, tests_passed);
     RUN_TEST(test_range_cost_no_block_indexes, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);
+    RUN_TEST(test_shared_prefix_no_key_loss, tests_passed);
     RUN_TEST(test_iterator_seek_for_prev, tests_passed);
     RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
     RUN_TEST(test_iterator_reverse, tests_passed);
@@ -30315,6 +30531,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_sstable_comparator_lexicographic, tests_passed);
     RUN_TEST(test_btree_sstable_comparator_reverse, tests_passed);
     RUN_TEST(test_btree_compaction_basic, tests_passed);
+    RUN_TEST(test_btree_concurrent_scan_no_skip, tests_passed);
     RUN_TEST(test_btree_compaction_with_deletes, tests_passed);
     RUN_TEST(test_btree_flush_basic, tests_passed);
     RUN_TEST(test_btree_dca_min_levels_constraint, tests_passed);

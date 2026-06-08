@@ -13884,8 +13884,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
      * largest level (nothing deeper) and the merge must start at level 0 (nothing shallower left
      * unmerged). a partial merge into the largest level (start_level > 0, e.g. the partitioned
      * merge fallbacks) leaves the upper levels untouched, so dropping a tombstone here would let an
-     * older put in those levels resurface -- defer the drop to a full merge in that case. */
-    const int is_largest_level = (target_level == num_levels - 1) && (start_level == 0);
+     * older put in those levels resurface -- defer the drop to a full merge in that case.
+     *
+     * the "nothing older outside this merge" guarantee also requires that no unflushed immutable
+     * memtable is pending: flush deferral (global flush cap reached) can hold an OLDER-seq run in
+     * an immutable while a NEWER delete tombstone has already flushed, so the deferred run flushes
+     * into this level AFTER we snapshot inputs -- a sstable this merge never sees. reaping the
+     * tombstone then resurrects the key once that older put lands. only reap when the immutable
+     * queue is drained so every on-disk-or-pending version is in our input snapshot. */
+    const int is_largest_level = (target_level == num_levels - 1) && (start_level == 0) &&
+                                 queue_size(cf->immutable_memtables) == 0;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting full preemptive merge on CF '%s', levels %d->%d",
                   cf->name, start_level + 1, target_level + 1);
@@ -14780,8 +14788,12 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     /* drop tombstones only when no older version can survive outside this merge-- the output is the
      * largest level (nothing deeper) and the inputs reach level 0 (nothing shallower left). a
      * targeted merge of a subset that starts below level 0 leaves older puts in the upper levels,
-     * so GC'ing a tombstone here would resurface them -- keep tombstones in that case. */
-    const int is_largest_level = (target_level == num_levels - 1) && (min_input_level == 0);
+     * so GC'ing a tombstone here would resurface them -- keep tombstones in that case. a pending
+     * immutable memtable can also flush an older-seq run into the level after our input snapshot
+     * (flush deferral inverts flush seq-order), so only reap when the immutable queue is drained --
+     * see tidesdb_full_preemptive_merge for the full rationale. */
+    const int is_largest_level = (target_level == num_levels - 1) && (min_input_level == 0) &&
+                                 queue_size(cf->immutable_memtables) == 0;
 
     /* snapshot floor -- see tidesdb_sstable_write_from_heap_btree for rationale */
     const uint64_t min_snapshot_seq = tidesdb_min_active_snapshot_seq(cf->db);
@@ -15480,6 +15492,12 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     queue_t *sstables_to_delete = queue_new();
     if (!sstables_to_delete) return TDB_ERR_MEMORY;
 
+    /* capture immutable-queue drained state at snapshot time -- a pending immutable can flush an
+     * older-seq run into the level after we snapshot (flush deferral inverts flush seq-order), and
+     * reaping a tombstone without that older run in our inputs resurrects the key. only reap when
+     * drained; see tidesdb_full_preemptive_merge for the full rationale. */
+    const int dm_imm_drained = queue_size(cf->immutable_memtables) == 0;
+
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Snapshotting SSTable IDs from levels 1-%d", target_level + 1);
     queue_t *sstable_ids_snapshot = tidesdb_snapshot_sst_ids(cf, 0, target_level);
     if (!sstable_ids_snapshot)
@@ -15582,6 +15600,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             break;
         }
     }
+    /* unflushed immutables could hold an older version not in our snapshot -- don't reap */
+    if (!dm_imm_drained) is_largest_level = 0;
 
     /* we estimate entries per partition (divide total by number of partitions) */
     uint64_t partition_estimated_entries = total_estimated_entries / num_partitions;
@@ -16583,6 +16603,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     queue_t *sstables_to_delete = queue_new();
     if (!sstables_to_delete) return TDB_ERR_MEMORY;
 
+    /* capture immutable-queue drained state at snapshot time -- gates tombstone reaping below so a
+     * deferred immutable that flushes an older-seq run into the level after this snapshot cannot be
+     * reaped past; see tidesdb_full_preemptive_merge for the full rationale. */
+    const int pm_imm_drained = queue_size(cf->immutable_memtables) == 0;
+
     queue_t *sstable_ids_snapshot = tidesdb_snapshot_sst_ids(cf, start_idx, end_idx);
     if (!sstable_ids_snapshot)
     {
@@ -16637,10 +16662,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     /* a tombstone may be reaped only when no older version of its key can survive outside this
      * merge. that needs the output to be the largest level (nothing deeper) and the merge to start
      * at level 0 (nothing shallower left unmerged) -- a partial merge into the largest level leaves
-     * the upper levels untouched, so reaping here would let an older put there resurface. the skew
-     * and file_max optimizations below stay gated on targeting_largest alone; they are safe at any
+     * the upper levels untouched, so reaping here would let an older put there resurface. it also
+     * needs the immutable queue drained (pm_imm_drained): a deferred flush can land an older-seq
+     * run in the level after our snapshot, and reaping past it resurfaces the key. the skew and
+     * file_max optimizations below stay gated on targeting_largest alone; they are safe at any
      * start level. mirrors full_preemptive/targeted merge. */
-    const int reap_tombstones = targeting_largest && (start_idx == 0);
+    const int reap_tombstones = targeting_largest && (start_idx == 0) && pm_imm_drained;
 
     size_t file_max = 0;
     if (targeting_largest && start_idx >= 0 && start_idx < num_levels)

@@ -992,6 +992,9 @@ struct tidesdb_merge_heap_t
     uint8_t *pop_buf[2]; /* double-buffered arena for borrowed KV materialization */
     size_t pop_buf_cap[2];
     int pop_buf_slot; /* active slot (toggled by iterator between next/prev calls) */
+    int read_error;   /* set when a source advance stopped on a node-load failure, not a real end --
+                       * a btree leaf that could not be reloaded under memory pressure. the merge
+                       * must abort rather than treat the truncated source as fully consumed. */
 };
 
 /**
@@ -8091,6 +8094,18 @@ static int tidesdb_sstable_write_from_heap_btree(
                 queue_enqueue(sstables_to_delete, corrupted_sst);
             }
 
+            /* a source could not load a leaf (transient memory/fd pressure) -- abort the whole
+             * merge rather than emit an output missing every entry past the unread leaf. dropping a
+             * tombstone sstable's tail here resurrects the keys it was meant to delete. the caller
+             * keeps its input sstables and retries the compaction later. */
+            if (heap->read_error)
+            {
+                if (kv) tidesdb_kv_pair_free(kv);
+                if (pending) tidesdb_kv_pair_free(pending);
+                btree_builder_free(builder);
+                return TDB_ERR_IO;
+            }
+
             if (!kv)
             {
                 /* heap is drained -- fall through to flush pending */
@@ -11127,6 +11142,14 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
             tidesdb_sstable_ref(*corrupted_sst);
         }
 
+        /* a btree leaf that could not be reloaded is a transient truncation, not a real end --
+         * flag the heap so the merge aborts and preserves its inputs rather than emitting an
+         * output that is missing every entry past the unread leaf */
+        if (advance_result == TDB_ERR_IO && top->type == MERGE_SOURCE_BTREE)
+        {
+            heap->read_error = 1;
+        }
+
         /* we remove from heap */
         heap->sources[0] = heap->sources[heap->num_sources - 1];
         heap->num_sources--;
@@ -12289,6 +12312,14 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                 free(vlog_value);
                 return TDB_SUCCESS;
             }
+        }
+        else if (btree_cursor_read_failed(source->source.btree.cursor))
+        {
+            /* the cursor stopped because a leaf could not be loaded, not because the tree ended.
+             * report it so the merge aborts instead of silently dropping every remaining entry of
+             * this input -- for a tombstone sstable that would resurrect the keys it should delete.
+             * the merge preserves its inputs and retries once memory frees. */
+            return TDB_ERR_IO;
         }
     }
     else if (source->type == MERGE_SOURCE_TXN_OPS)
@@ -14867,6 +14898,20 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
             /* mark so sstable_free unlinks the partial klog/vlog files */
             atomic_store_explicit(&new_sst->marked_for_deletion, 1, memory_order_release);
             tidesdb_sstable_unref(cf->db, new_sst);
+
+            if (btree_result == TDB_ERR_IO)
+            {
+                /* a leaf could not be loaded mid-merge -- preserve the inputs and retry later
+                 * rather than delete them after an output that dropped a tombstone tail */
+                while (!queue_is_empty(sstables_to_delete))
+                {
+                    tidesdb_sstable_t *s = queue_dequeue(sstables_to_delete);
+                    if (s) tidesdb_sstable_unref(cf->db, s);
+                }
+                queue_free(sstables_to_delete);
+                return TDB_SUCCESS;
+            }
+
             tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, min_input_level,
                                             max_input_level);
             queue_free(sstables_to_delete);
@@ -15808,13 +15853,20 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
 
             bloom = NULL;
 
-            if (btree_result != TDB_SUCCESS || new_sst->num_entries == 0)
+            if (btree_result != TDB_SUCCESS)
             {
-                if (new_sst->num_entries == 0)
-                {
-                    remove(new_sst->klog_path);
-                    remove(new_sst->vlog_path);
-                }
+                /* a leaf could not be loaded mid-merge -- abort and preserve inputs (retried
+                 * later) rather than commit a partition that dropped a tombstone tail and
+                 * resurrected the keys it was meant to delete */
+                tidesdb_sstable_unref(cf->db, new_sst);
+                aborted = 1;
+                break;
+            }
+
+            if (new_sst->num_entries == 0)
+            {
+                remove(new_sst->klog_path);
+                remove(new_sst->vlog_path);
                 tidesdb_sstable_unref(cf->db, new_sst);
                 continue;
             }
@@ -16971,13 +17023,20 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
 
                 bloom = NULL;
 
-                if (btree_result != TDB_SUCCESS || new_sst->num_entries == 0)
+                if (btree_result != TDB_SUCCESS)
                 {
-                    if (new_sst->num_entries == 0)
-                    {
-                        remove(new_sst->klog_path);
-                        remove(new_sst->vlog_path);
-                    }
+                    /* a leaf could not be loaded mid-merge -- abort and preserve inputs (retried
+                     * later) rather than commit a partition that dropped a tombstone tail and
+                     * resurrected the keys it was meant to delete */
+                    tidesdb_sstable_unref(cf->db, new_sst);
+                    aborted = 1;
+                    break;
+                }
+
+                if (new_sst->num_entries == 0)
+                {
+                    remove(new_sst->klog_path);
+                    remove(new_sst->vlog_path);
                     tidesdb_sstable_unref(cf->db, new_sst);
                     continue;
                 }

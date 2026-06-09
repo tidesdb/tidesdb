@@ -13652,13 +13652,15 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
         {
             tidesdb_sstable_t *sst = queue_dequeue(delete_queue);
             if (!sst) continue;
-            atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
             if (!tidesdb_cf_abort_requested(cf))
             {
                 for (int level = start_level; level <= end_level && level < num_levels; level++)
                 {
                     if (tidesdb_level_remove_sstable(cf->db, cf->levels[level], sst) == TDB_SUCCESS)
                     {
+                        /* mark only after the level drop -- an aborted cleanup keeps the file so
+                         * recovery still loads it from the unchanged manifest */
+                        atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
                         tidesdb_bump_sstable_layout_version(cf);
                         break;
                     }
@@ -13676,12 +13678,12 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
         if (sst) ssts[n++] = sst;
     }
 
-    for (int i = 0; i < n; i++)
-        atomic_store_explicit(&ssts[i]->marked_for_deletion, 1, memory_order_release);
-
-    /* drop_column_family will sweep the cf directory shortly; skip the level/manifest work
-     * when the CF is on its way out, but still release our queue references below */
-    int cleanup_commit_ok = 1;
+    /* an input's files may be unlinked only once the persisted manifest no longer references it.
+     * both abort cases reach here before the manifest swap -- a CF drop (the directory is swept
+     * separately) and a background-work cancel / shutdown (the directory stays). deleting an input
+     * while the on-disk manifest still points at it would make recovery load a missing file and
+     * lose the merged data, so marked_for_deletion is set only after the commit that retires the
+     * input succeeds (below), never up front. */
     if (!tidesdb_cf_abort_requested(cf))
     {
         uint8_t *removed = calloc((size_t)n, 1);
@@ -13728,25 +13730,21 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
                 if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path) != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to commit manifest after merge cleanup");
-                    cleanup_commit_ok = 0;
                 }
                 else
                 {
                     tdb_objstore_upload_manifest(cf->db, cf);
+                    /* retired from the persisted manifest -- the files can now be unlinked */
+                    for (int i = 0; i < n; i++)
+                        if (removed[i])
+                            atomic_store_explicit(&ssts[i]->marked_for_deletion, 1,
+                                                  memory_order_release);
                 }
             }
         }
         free(removed);
         free(removed_level);
     }
-
-    /* if the cleanup commit failed the inputs are still in the persisted manifest, so keep
-     * their files on disk (clear the deletion mark before the final unref frees them) --
-     * recovery loads them instead of finding the manifest reference an orphaned file. the
-     * merged output already covers the data; this only matters under sustained commit failure. */
-    if (!cleanup_commit_ok)
-        for (int i = 0; i < n; i++)
-            atomic_store_explicit(&ssts[i]->marked_for_deletion, 0, memory_order_release);
 
     for (int i = 0; i < n; i++) tidesdb_sstable_unref(cf->db, ssts[i]);
     free(ssts);

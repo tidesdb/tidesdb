@@ -3144,9 +3144,17 @@ void test_block_manager_write_raw_signal_safe(void)
         iterations++;
     }
 
-    /* disarm timer and restore original handler before assertions */
+    /* disarm timer, then discard any SIGALRM the timer left pending before restoring the original
+     * disposition. restoring straight to a default-action handler delivers a still-pending alarm
+     * under it and terminates the process -- an intermittent SIGALRM kill, mostly on macOS/BSD
+     * where timer/signal delivery is coarser. setting SIG_IGN discards the pending instance. */
     memset(&itv, 0, sizeof(itv));
     setitimer(ITIMER_REAL, &itv, NULL);
+    struct sigaction ignore_sa;
+    memset(&ignore_sa, 0, sizeof(ignore_sa));
+    ignore_sa.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_sa.sa_mask);
+    sigaction(SIGALRM, &ignore_sa, NULL);
     sigaction(SIGALRM, &old_sa, NULL);
 
     ASSERT_EQ(failures, 0);

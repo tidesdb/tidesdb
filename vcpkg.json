@@ -1,8 +1,8 @@
 {
   "name": "tidesdb",
-  "version-string": "9.3.5",
+  "version-string": "9.3.6",
   "description": "TidesDB is a high-performance durable, transactional embeddable storage engine designed for flash and RAM optimization with optional object storage support for unlimited data scaling.",
-  "dependencies": ["zstd", "snappy", "lz4", "pthreads"],
+  "dependencies": ["zstd", "snappy", "lz4", "pthreads", "curl"],
   "features": {
     "mimalloc": {
       "description": "Use mimalloc as the memory allocator for improved performance",

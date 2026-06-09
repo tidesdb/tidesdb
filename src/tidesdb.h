@@ -452,7 +452,8 @@ typedef struct tidesdb_comparator_entry_t
  * @param log_level minimum log level to display (TDB_LOG_DEBUG, TDB_LOG_INFO, TDB_LOG_WARN,
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
- * @param max_open_sstables maximum number of open sstables
+ * @param max_open_sstables maximum number of resident open sstables (default 256); 0 = unlimited,
+ * bounded only by the process open-file limit
  * @param log_to_file flag to determine if debug logging should be written to a file
  * @param log_truncation_at size in bytes at which to truncate the log file, 0 = no truncation
  * @param max_memory_usage maximum memory usage for the database
@@ -472,6 +473,11 @@ typedef struct tidesdb_comparator_entry_t
  *                               meaningless because the pool size is the upper bound, a lower
  *                               cap leaves workers idle. 0 means "match num_flush_threads",
  *                               any other mismatch is corrected with a warning.
+ * @param finish_compactions_on_close close behavior. 0 (default) cancels in-flight compactions at
+ *                               their next checkpoint for a fast shutdown -- the merge discards its
+ *                               uncommitted output and leaves inputs intact, so no data is lost
+ *                               (recovery handles a mid-merge state the same way). 1 lets in-flight
+ *                               compactions run to completion before close returns.
  */
 typedef struct tidesdb_config_t
 {
@@ -493,6 +499,7 @@ typedef struct tidesdb_config_t
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
     int max_concurrent_flushes;
+    int finish_compactions_on_close;
 } tidesdb_config_t;
 
 /**
@@ -847,8 +854,12 @@ struct tidesdb_t
     _Atomic(int) comparators_capacity;
     pthread_t *flush_threads;
     queue_t *flush_queue;
+    /* number of pool threads still running: incremented at create, decremented when a worker
+     * returns. close re-broadcasts shutdown while the count is non-zero. */
+    _Atomic(int) live_flush_threads;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
+    _Atomic(int) live_compaction_threads;
     /* budget of ephemeral sub-compaction helper threads a compaction round may spawn,
      * initialized to num_compaction_threads at open. bounds total concurrent sub-merge
      * threads across all CFs so parallel compaction never oversubscribes the pool. */

@@ -117,6 +117,31 @@ static inline int tdb_test_commit_with_retry(tidesdb_txn_t *txn, int max_retries
 }
 
 /*
+ * tdb_test_iter_new_with_retry
+ * create an iterator, retrying on TDB_ERR_BUSY. a full-scan iterator opens its whole source set
+ * at once, so under a tight max_open fd budget iter creation can transiently exceed the reader
+ * reserve; the reaper frees idle fds between attempts, so a bounded retry succeeds. caller still
+ * observes any real error as the final return.
+ * @param txn         transaction the iterator reads under
+ * @param cf          column family to iterate
+ * @param iter        out -- created iterator on success
+ * @param max_retries upper bound on retry attempts. 0 disables retry
+ * @return 0 on success, or the last iter_new error code
+ */
+static inline int tdb_test_iter_new_with_retry(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
+                                               tidesdb_iter_t **iter, int max_retries)
+{
+    int rc;
+    for (int attempt = 0; attempt <= max_retries; attempt++)
+    {
+        rc = tidesdb_iter_new(txn, cf, iter);
+        if (rc != TDB_ERR_BUSY) return rc;
+        usleep(10000); /* 10ms backoff between attempts */
+    }
+    return rc;
+}
+
+/*
  * generate_random_key_value
  * @brief generate random key-value pairs for testing
  */

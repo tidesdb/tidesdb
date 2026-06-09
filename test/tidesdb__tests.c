@@ -881,6 +881,12 @@ static void *backup_concurrent_writer_thread(void *arg)
     return NULL;
 }
 
+static void tdb_diag_dump_layout(
+    tidesdb_column_family_t *cf); /* defined with the btree diagnostics */
+static int tdb_test_get_with_retry(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
+                                   const uint8_t *k, size_t ksz, uint8_t **v,
+                                   size_t *vs); /* defined below */
+
 static void test_backup_concurrent_writes(void)
 {
     cleanup_test_dir();
@@ -948,6 +954,35 @@ static void test_backup_concurrent_writes(void)
 
     ASSERT_EQ(atomic_load(&errors), 0);
 
+    /* we record which prebackup keys are still present in the SOURCE db before closing it, so a
+     * later backup miss can be attributed -- gone from the source means an upstream compaction loss
+     * (the key never made it into the source's sstables), present in source but absent from the
+     * backup means the backup copy dropped a present key. */
+    int *src_missing = calloc((size_t)NUM_THREADS * PREBACKUP_KEYS_PER_THREAD, sizeof(int));
+    if (src_missing)
+    {
+        tidesdb_txn_t *stxn = NULL;
+        if (tidesdb_txn_begin(db, &stxn) == 0)
+        {
+            for (int t = 0; t < NUM_THREADS; t++)
+            {
+                int start = t * KEYS_PER_THREAD;
+                for (int j = 0; j < PREBACKUP_KEYS_PER_THREAD; j++)
+                {
+                    char key[64];
+                    snprintf(key, sizeof(key), "concurrent_key_%05d", start + j);
+                    uint8_t *v = NULL;
+                    size_t vs = 0;
+                    int rc =
+                        tdb_test_get_with_retry(stxn, cf, (uint8_t *)key, strlen(key) + 1, &v, &vs);
+                    if (v) free(v);
+                    src_missing[t * PREBACKUP_KEYS_PER_THREAD + j] = (rc != 0);
+                }
+            }
+            tidesdb_txn_free(stxn);
+        }
+    }
+
     ASSERT_EQ(tidesdb_close(db), 0);
 
     tidesdb_config_t config = tidesdb_default_config();
@@ -963,6 +998,7 @@ static void test_backup_concurrent_writes(void)
 
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(backup_db, &txn), 0);
+    int backup_missing = 0;
     for (int t = 0; t < NUM_THREADS; t++)
     {
         int start = t * KEYS_PER_THREAD;
@@ -976,15 +1012,36 @@ static void test_backup_concurrent_writes(void)
 
             uint8_t *value = NULL;
             size_t value_size = 0;
-            ASSERT_EQ(tidesdb_txn_get(txn, backup_cf, (uint8_t *)key, strlen(key) + 1, &value,
-                                      &value_size),
-                      0);
-            ASSERT_TRUE(value != NULL);
-            ASSERT_TRUE(strcmp((char *)value, expected) == 0);
-            free(value);
+            int rc = tidesdb_txn_get(txn, backup_cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                     &value_size);
+            if (rc != 0)
+            {
+                backup_missing++;
+                int sm =
+                    src_missing ? src_missing[t * PREBACKUP_KEYS_PER_THREAD + (i - start)] : -1;
+                if (backup_missing <= 3)
+                {
+                    fprintf(stderr,
+                            "backup: key '%s' missing from backup (rc=%d) -- present in source "
+                            "before close: %s\n",
+                            key, rc,
+                            sm == 1   ? "NO (upstream compaction loss in the source db)"
+                            : sm == 0 ? "YES (backup copy dropped a present key)"
+                                      : "unknown");
+                    tdb_diag_dump_layout(backup_cf);
+                }
+            }
+            else
+            {
+                ASSERT_TRUE(value != NULL);
+                ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+                free(value);
+            }
         }
     }
     tidesdb_txn_free(txn);
+    ASSERT_EQ(backup_missing, 0);
+    free(src_missing);
 
     free(thread_data);
     free(threads);
@@ -2203,6 +2260,126 @@ static void test_iterator_seek(void)
     tidesdb_txn_free(txn);
     tidesdb_close(db);
     cleanup_test_dir();
+}
+
+/* prefix_probe_once
+ * write NKEYS independent 64-byte keys that share a long common prefix (diverging only in the
+ * tail), force them to disk, then (1) seek the bare prefix and forward-scan, and (2) direct-get
+ * each. with correct per-key writes no key may be lost. parameterized over the sstable feature
+ * flags so the sweep below can isolate which combination, if any, drops keys. each build is probed
+ * with a 48-byte partial seek (the reported seek-to-short / found-long geometry) and a shorter
+ * 11-byte seek. mirrors the standalone prefix_probe. */
+static void prefix_probe_once(int block_indexes, int bloom, int use_btree)
+{
+    enum
+    {
+        NKEYS = 1500,
+        KEY_LEN = 64,
+        SHARED_LEN = 48 /* first 48 bytes identical across every key; tail 16 diverge */
+    };
+    static const size_t seek_lens[] = {48, 11};
+
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_block_indexes = block_indexes;
+    cf_config.enable_bloom_filter = bloom;
+    cf_config.use_btree = use_btree;
+    cf_config.write_buffer_size = 4096; /* tiny buffer -> many sstables -> merge + compaction */
+    ASSERT_EQ(tidesdb_create_column_family(db, "prefix_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "prefix_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    static const uint8_t prefix[SHARED_LEN] = {1,  158, 164, 204, 101, 162, 125, 51, 153, 7,  195,
+                                               12, 200, 33,  7,   88,  9,   17,  64, 2,   90, 41};
+
+    uint8_t(*keys)[KEY_LEN] = calloc(NKEYS, KEY_LEN);
+    ASSERT_TRUE(keys != NULL);
+    for (int i = 0; i < NKEYS; i++)
+    {
+        memcpy(keys[i], prefix, SHARED_LEN);
+        for (int b = 0; b < KEY_LEN - SHARED_LEN; b++)
+            keys[i][SHARED_LEN + b] = (uint8_t)((unsigned)(i * 2654435761u) >> (b * 4));
+    }
+
+    for (int i = 0; i < NKEYS; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char val[32];
+        int vlen = snprintf(val, sizeof(val), "value-%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, keys[i], KEY_LEN, (uint8_t *)val, (size_t)vlen, -1), 0);
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* push everything to disk and merge so the probe exercises sstable seek, not the memtable */
+    tidesdb_flush_memtable(cf);
+    tidesdb_compact(cf);
+
+    /* PROBE 1 -- seek the bare prefix, scan forward, count keys still carrying it */
+    for (size_t s = 0; s < sizeof(seek_lens) / sizeof(seek_lens[0]); s++)
+    {
+        const size_t seek_len = seek_lens[s];
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+        int found = 0;
+        if (tidesdb_iter_seek(iter, (uint8_t *)prefix, seek_len) == TDB_SUCCESS)
+        {
+            while (tidesdb_iter_valid(iter))
+            {
+                uint8_t *k = NULL;
+                size_t klen = 0;
+                if (tidesdb_iter_key(iter, &k, &klen) != TDB_SUCCESS) break;
+                if (klen < seek_len || memcmp(k, prefix, seek_len) != 0) break;
+                found++;
+                if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+            }
+        }
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+
+        printf("  [bi=%d bloom=%d btree=%d seek=%zuB] scan=%d/%d\n", block_indexes, bloom,
+               use_btree, seek_len, found, NKEYS);
+        ASSERT_EQ(found, NKEYS); /* a prefix scan must visit every key carrying the prefix */
+    }
+
+    /* PROBE 2 -- direct get every key (catches a present key the scan stepped over) */
+    int present = 0;
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int i = 0; i < NKEYS; i++)
+        {
+            uint8_t *val = NULL;
+            size_t vlen = 0;
+            if (tdb_test_get_with_retry(txn, cf, keys[i], KEY_LEN, &val, &vlen) == TDB_SUCCESS &&
+                val)
+            {
+                present++;
+                free(val);
+            }
+        }
+        tidesdb_txn_free(txn);
+    }
+    ASSERT_EQ(present, NKEYS); /* a stored key must never be unreachable by direct get */
+
+    free(keys);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_shared_prefix_no_key_loss(void)
+{
+    /* sweep the sstable feature matrix -- block index and btree paths each have their own seek
+     * landing logic; any combination that drops a shared-prefix key on a partial-key seek fails
+     * here. bloom kept on (its false-negative path would surface as a missing direct get). */
+    for (int bi = 0; bi <= 1; bi++)
+        for (int btree = 0; btree <= 1; btree++) prefix_probe_once(bi, 1, btree);
 }
 
 static void test_iterator_reverse(void)
@@ -10631,6 +10808,166 @@ static void test_btree_compaction_basic(void)
     cleanup_test_dir();
 }
 
+/* CI diagnostic: dump the cf's on-disk layout (levels, sstable ids, entry/tombstone counts, seqs)
+ * so a runner-only failure such as a deleted key resurfacing on mingw reports the actual state
+ * instead of a bare assertion. holds array_readers around each scan like the engine does. */
+static void tdb_diag_dump_layout(tidesdb_column_family_t *cf)
+{
+    int nlev = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    fprintf(stderr, "  layout: num_active_levels=%d\n", nlev);
+    for (int lv = 0; lv < nlev; lv++)
+    {
+        tidesdb_level_t *level = cf->levels[lv];
+        if (!level) continue;
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
+        int n = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **ssts = atomic_load_explicit(&level->sstables, memory_order_acquire);
+        fprintf(stderr, "  L%d: %d sstables\n", lv + 1, n);
+        for (int s = 0; ssts && s < n; s++)
+        {
+            tidesdb_sstable_t *sst = ssts[s];
+            if (!sst) continue;
+            fprintf(stderr,
+                    "    sstable id=%llu entries=%llu tombstones=%llu max_seq=%llu "
+                    "min_key='%.*s' max_key='%.*s'\n",
+                    (unsigned long long)sst->id, (unsigned long long)sst->num_entries,
+                    (unsigned long long)sst->tombstone_count, (unsigned long long)sst->max_seq,
+                    sst->min_key ? (int)sst->min_key_size : 0,
+                    sst->min_key ? (char *)sst->min_key : "",
+                    sst->max_key ? (int)sst->max_key_size : 0,
+                    sst->max_key ? (char *)sst->max_key : "");
+        }
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+    }
+    fflush(stderr);
+}
+
+/* CI diagnostic: when a key is durably missing from one CF via point-get, probe the same key
+ * through an iterator (a different read path). if the iterator finds it the data is present and it
+ * is a point-get read miss; if not it is a genuine write/compaction loss. dumps the layout either
+ * way. lets a runner-only atomicity failure say which half of the problem space it is. */
+static void tdb_diag_probe_missing(tidesdb_t *db, tidesdb_column_family_t *cf, const char *cfname,
+                                   const uint8_t *key, size_t key_size)
+{
+    tidesdb_txn_t *t = NULL;
+    if (tidesdb_txn_begin(db, &t) != 0) return;
+    tidesdb_iter_t *it = NULL;
+    int found_via_iter = 0;
+    if (tidesdb_iter_new(t, cf, &it) == 0 && it)
+    {
+        if (tidesdb_iter_seek(it, key, key_size) == 0 && tidesdb_iter_valid(it))
+        {
+            uint8_t *ik = NULL;
+            size_t iks = 0;
+            if (tidesdb_iter_key(it, &ik, &iks) == 0 && ik && iks == key_size &&
+                memcmp(ik, key, key_size) == 0)
+                found_via_iter = 1;
+        }
+        tidesdb_iter_free(it);
+    }
+    tidesdb_txn_free(t);
+    fprintf(stderr, "CF '%s' key '%s' iterator-scan %s -- %s\n", cfname, (const char *)key,
+            found_via_iter ? "FOUND" : "MISSING",
+            found_via_iter ? "point-get READ miss (data present on disk)"
+                           : "genuine write/compaction LOSS (absent from all read paths)");
+    tdb_diag_dump_layout(cf);
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int expected;
+    _Atomic(int) *mismatch;
+} cscan_arg_t;
+
+static void *cscan_worker(void *arg)
+{
+    cscan_arg_t *c = (cscan_arg_t *)arg;
+    for (int round = 0; round < 8; round++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(c->db, &txn) != 0) continue;
+        tidesdb_iter_t *it = NULL;
+        if (tidesdb_iter_new(txn, c->cf, &it) == 0 && it)
+        {
+            int n = 0;
+            if (tidesdb_iter_seek_to_first(it) == 0)
+            {
+                while (tidesdb_iter_valid(it))
+                {
+                    n++;
+                    if (tidesdb_iter_next(it) != 0) break;
+                }
+            }
+            tidesdb_iter_free(it);
+            if (n != c->expected) atomic_fetch_add(c->mismatch, 1);
+        }
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+static void test_btree_concurrent_scan_no_skip(void)
+{
+    /* many readers full-scanning the same on-disk btree sstable concurrently must each see every
+     * key. they read the same nodes through the shared btree node cache, so a lock-free cache race
+     * (or any read-side contention) would make a reader skip a contiguous run of entries -- the
+     * same read path a parallel sub-compaction shard uses when it scans a wide shared input. */
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_cscan_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_cscan_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int N = 3000;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "ckey_%06d", i);
+        snprintf(value, sizeof(value), "cval_%06d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
+        tidesdb_txn_free(txn);
+    }
+    tidesdb_flush_memtable(cf);
+    tidesdb_compact(cf); /* consolidate into a multi-leaf btree on disk */
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    enum
+    {
+        NTHREADS = 8
+    };
+    pthread_t th[NTHREADS];
+    cscan_arg_t args[NTHREADS];
+    _Atomic(int) mismatch = 0;
+    for (int t = 0; t < NTHREADS; t++)
+    {
+        args[t] = (cscan_arg_t){.db = db, .cf = cf, .expected = N, .mismatch = &mismatch};
+        ASSERT_EQ(pthread_create(&th[t], NULL, cscan_worker, &args[t]), 0);
+    }
+    for (int t = 0; t < NTHREADS; t++) pthread_join(th[t], NULL);
+
+    printf("  concurrent scan mismatches=%d (threads=%d rounds=8 expected=%d)\n",
+           atomic_load(&mismatch), NTHREADS, N);
+    ASSERT_EQ(atomic_load(&mismatch), 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_btree_compaction_with_deletes(void)
 {
     cleanup_test_dir();
@@ -10691,17 +11028,118 @@ static void test_btree_compaction_with_deletes(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
+    int resurfaced = 0;
     for (int i = 0; i < 100; i++)
     {
         char key[32];
         snprintf(key, sizeof(key), "del_key_%03d", i);
         uint8_t *value = NULL;
         size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        /* a point-get racing the post-compact layout now returns a retryable BUSY instead of a
+         * stale put for a deleted key, so retry until it settles before judging resurrection */
+        int result =
+            tdb_test_get_with_retry(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
 
         if (i % 2 == 0)
         {
-            ASSERT_TRUE(result != 0); /* deleted keys should not be found */
+            /* deleted keys should not be found -- if one is, capture ground truth before failing */
+            if (result == 0)
+            {
+                resurfaced++;
+                if (resurfaced <= 3)
+                {
+                    fprintf(stderr,
+                            "deleted key '%s' FOUND value='%.*s' (vsize=%zu) "
+                            "is_compacting=%d flush_q=%zu compact_q=%zu\n",
+                            key, value ? (int)value_size : 0, value ? (char *)value : "",
+                            value_size, tidesdb_is_compacting(cf), queue_size(db->flush_queue),
+                            queue_size(db->compaction_queue));
+
+                    /* transient (a race) or persistent (a logic loss)? re-read with fresh txns */
+                    int still = 0;
+                    for (int r = 0; r < 30; r++)
+                    {
+                        usleep(50000);
+                        tidesdb_txn_t *rt = NULL;
+                        if (tidesdb_txn_begin(db, &rt) != 0) continue;
+                        uint8_t *rv = NULL;
+                        size_t rs = 0;
+                        int rr = tidesdb_txn_get(rt, cf, (uint8_t *)key, strlen(key) + 1, &rv, &rs);
+                        if (rv) free(rv);
+                        tidesdb_txn_free(rt);
+                        if (rr == 0) still++;
+                    }
+                    fprintf(
+                        stderr, "re-read '%s' still-found %d/30 (%s)\n", key, still,
+                        still >= 28 ? "PERSISTENT" : (still == 0 ? "TRANSIENT" : "INTERMITTENT"));
+
+                    /* does an iterator (a different read path) also find it? iterator FOUND means
+                     * the key is genuinely in the sstable (a merge/content bug); iterator MISSING
+                     * while point-get finds it means a point-get read bug (e.g. a stale cached
+                     * btree node serving data from a compacted-away sstable). */
+                    {
+                        tidesdb_txn_t *it_txn = NULL;
+                        int iter_found = 0;
+                        if (tidesdb_txn_begin(db, &it_txn) == 0)
+                        {
+                            tidesdb_iter_t *it = NULL;
+                            if (tidesdb_iter_new(it_txn, cf, &it) == 0 && it)
+                            {
+                                if (tidesdb_iter_seek(it, (uint8_t *)key, strlen(key) + 1) == 0 &&
+                                    tidesdb_iter_valid(it))
+                                {
+                                    uint8_t *ik = NULL;
+                                    size_t iks = 0;
+                                    if (tidesdb_iter_key(it, &ik, &iks) == 0 && ik &&
+                                        iks == strlen(key) + 1 && memcmp(ik, key, iks) == 0)
+                                        iter_found = 1;
+                                }
+                                tidesdb_iter_free(it);
+                            }
+                            tidesdb_txn_free(it_txn);
+                        }
+                        fprintf(stderr, "'%s' iterator-scan %s -- %s\n", key,
+                                iter_found ? "FOUND" : "MISSING",
+                                iter_found ? "genuinely in the data (merge/content bug)"
+                                           : "point-get only (stale read / cached btree node bug)");
+                    }
+                    tdb_diag_dump_layout(cf);
+
+                    /* one-time: dump the FULL key set the cf returns via an iterator, so we see
+                     * exactly which 50 keys the merge kept (which odds dropped, which evens kept)
+                     */
+                    if (resurfaced == 1)
+                    {
+                        tidesdb_txn_t *st = NULL;
+                        if (tidesdb_txn_begin(db, &st) == 0)
+                        {
+                            tidesdb_iter_t *sit = NULL;
+                            if (tidesdb_iter_new(st, cf, &sit) == 0 && sit &&
+                                tidesdb_iter_seek_to_first(sit) == 0)
+                            {
+                                int cnt = 0;
+                                fprintf(stderr, "  full key set:");
+                                while (tidesdb_iter_valid(sit))
+                                {
+                                    uint8_t *ik = NULL, *iv = NULL;
+                                    size_t iks = 0, ivs = 0;
+                                    if (tidesdb_iter_key(sit, &ik, &iks) == 0 && ik)
+                                        fprintf(stderr, " %.*s", (int)iks, (char *)ik);
+                                    (void)iv;
+                                    (void)ivs;
+                                    cnt++;
+                                    if (tidesdb_iter_next(sit) != 0) break;
+                                }
+                                fprintf(stderr, "\n  total keys via iterator: %d\n", cnt);
+                            }
+                            if (sit) tidesdb_iter_free(sit);
+                            tidesdb_txn_free(st);
+                        }
+                        fflush(stderr);
+                    }
+                }
+            }
+            if (value) free(value);
         }
         else
         {
@@ -10710,6 +11148,156 @@ static void test_btree_compaction_with_deletes(void)
             free(value);
         }
     }
+
+    ASSERT_EQ(resurfaced, 0); /* deleted keys must not be found */
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_block_compaction_with_deletes(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t dbcfg = tidesdb_default_config();
+    dbcfg.db_path = TEST_DB_PATH;
+    dbcfg.block_cache_size = 0;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&dbcfg, &db), 0);
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.level_size_ratio = 10;
+    cf_config.use_btree = 0;
+    cf_config.enable_block_indexes = 0;
+    cf_config.enable_bloom_filter = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "block_del_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "block_del_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        snprintf(value, sizeof(value), "del_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 10 == 9) tidesdb_flush_memtable(cf);
+    }
+
+    for (int i = 0; i < 100; i += 2)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    int resurfaced = 0;
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result =
+            tdb_test_get_with_retry(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (i % 2 == 0)
+        {
+            if (result == 0)
+            {
+                resurfaced++;
+                tidesdb_txn_t *it_txn = NULL;
+                int iter_found = 0;
+                if (tidesdb_txn_begin(db, &it_txn) == 0)
+                {
+                    tidesdb_iter_t *it = NULL;
+                    if (tidesdb_iter_new(it_txn, cf, &it) == 0 && it)
+                    {
+                        if (tidesdb_iter_seek(it, (uint8_t *)key, strlen(key) + 1) == 0 &&
+                            tidesdb_iter_valid(it))
+                        {
+                            uint8_t *ik = NULL;
+                            size_t iks = 0;
+                            if (tidesdb_iter_key(it, &ik, &iks) == 0 && ik &&
+                                iks == strlen(key) + 1 && memcmp(ik, key, iks) == 0)
+                                iter_found = 1;
+                        }
+                        tidesdb_iter_free(it);
+                    }
+                    tidesdb_txn_free(it_txn);
+                }
+                fprintf(stderr, "block '%s' iterator-scan %s\n", key,
+                        iter_found ? "FOUND" : "MISSING");
+                if (iter_found && resurfaced == 1)
+                {
+                    /* dump every live sstable whose key range covers the resurrected key, with its
+                     * tombstone count and marked_for_deletion -- the lingering put-sstable (range
+                     * covers the key, ntomb=0, possibly marked) is the orphan we're hunting. */
+                    for (int L = 0; L < atomic_load(&cf->num_active_levels); L++)
+                    {
+                        tidesdb_level_t *lvl = cf->levels[L];
+                        int ns = atomic_load(&lvl->num_sstables);
+                        tidesdb_sstable_t **arr = atomic_load(&lvl->sstables);
+                        for (int s = 0; s < ns; s++)
+                        {
+                            tidesdb_sstable_t *st = arr[s];
+                            if (!st || !st->min_key || !st->max_key) continue;
+                            if (strcmp((char *)st->min_key, key) <= 0 &&
+                                strcmp((char *)st->max_key, key) >= 0)
+                                fprintf(stderr,
+                                        "  COVERS '%s': sst_id=%llu L%d min=%s max=%s nent=%llu "
+                                        "ntomb=%llu marked=%d klog=%s\n",
+                                        key, (unsigned long long)st->id, L, (char *)st->min_key,
+                                        (char *)st->max_key, (unsigned long long)st->num_entries,
+                                        (unsigned long long)st->tombstone_count,
+                                        (int)st->marked_for_deletion,
+                                        st->klog_path ? (char *)st->klog_path : "?");
+                        }
+                    }
+                    fflush(stderr);
+                }
+            }
+            if (value) free(value);
+        }
+        else
+        {
+            ASSERT_EQ(result, 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    ASSERT_EQ(resurfaced, 0);
 
     tidesdb_txn_free(txn);
     tidesdb_close(db);
@@ -16324,6 +16912,14 @@ static void test_database_lock_released_on_close(void)
 
 static void test_database_lock_multi_process(void)
 {
+    /* forks child processes to contend for the directory lock, which qemu usermode cannot run
+     * reliably */
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
     cleanup_test_dir();
 
     tidesdb_config_t config = tidesdb_default_config();
@@ -16760,7 +17356,9 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
         ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                   strlen(value) + 1, -1),
                   TDB_SUCCESS);
-        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        /* see tdb_test_commit_with_retry -- the tiny fd budget and periodic flushes can stall
+         * a commit into the retryable TDB_ERR_BUSY */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), TDB_SUCCESS);
         tidesdb_txn_free(txn);
 
         /* we flush periodically to create sstables */
@@ -16823,8 +17421,11 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
     tidesdb_txn_t *iter_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), TDB_SUCCESS);
 
+    /* a full-scan iterator opens its whole source set at once, so under the tiny fd budget
+     * iter_new can hit the retryable TDB_ERR_BUSY just like the point-gets above; the reaper
+     * frees idle fds between attempts, so a bounded retry succeeds */
     tidesdb_iter_t *iter = NULL;
-    ASSERT_EQ(tidesdb_iter_new(iter_txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_EQ(tdb_test_iter_new_with_retry(iter_txn, cf, &iter, 100), TDB_SUCCESS);
     ASSERT_TRUE(iter != NULL);
 
     ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
@@ -16874,6 +17475,96 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
 
     tidesdb_txn_free(reopen_txn);
     ASSERT_EQ(reopen_success, total_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_unlimited_max_open_no_eviction(void)
+{
+    cleanup_test_dir();
+
+    /* max_open_sstables = 0 means unlimited: the reaper must never evict for budget and a reader
+     * must never back off with TDB_ERR_BUSY. this also guards the sentinel itself -- if 0 were
+     * treated as a literal budget of zero the reader gate would reject every open and every read
+     * would return BUSY. */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.max_open_sstables = 0;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048; /* small buffer so each batch flushes its own sstable */
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.l1_file_count_trigger = 100000; /* keep compaction from merging the sstables away */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "unlimited_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "unlimited_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_sstables = 20;
+    const int keys_per_sstable = 30;
+    const int total_keys = num_sstables * keys_per_sstable;
+
+    for (int i = 0; i < total_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "u_key_%06d", i);
+        snprintf(value, sizeof(value), "u_value_%06d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % keys_per_sstable == 0) tidesdb_flush_memtable(cf);
+    }
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(20000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(200000); /* give the reaper ample time -- under unlimited it must NOT evict */
+
+    /* every read uses a plain get (no retry): unlimited means no fd-budget backoff, so each read
+     * resolves directly with no TDB_ERR_BUSY */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int success = 0, busy = 0;
+    for (int i = 0; i < total_keys; i++)
+    {
+        char key[32], expected[64];
+        snprintf(key, sizeof(key), "u_key_%06d", i);
+        snprintf(expected, sizeof(expected), "u_value_%06d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int rc = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (rc == TDB_ERR_BUSY)
+        {
+            busy++;
+        }
+        else if (rc == TDB_SUCCESS && value != NULL)
+        {
+            ASSERT_EQ(strcmp((char *)value, expected), 0);
+            success++;
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(busy, 0); /* unlimited never backs a reader off */
+    ASSERT_EQ(success, total_keys);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -23691,6 +24382,7 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     tidesdb_txn_t *vtxn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
     int both_present = 0, only_a = 0, only_b = 0, both_absent = 0, busy = 0;
+    int diag_emitted = 0;
     for (int t = 0; t < NUM_WRITERS; t++)
     {
         for (int i = 0; i < W_OPS; i++)
@@ -23717,21 +24409,36 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
             {
                 /* B missing -- reclassify with fresh re-reads, transient miss vs durable loss */
                 if (tdb_atom_key_durably_gone(db, cf_b, (uint8_t *)key_b, strlen(key_b) + 1))
+                {
                     only_a++; /* B durably lost -- real one-sided violation */
+                    if (diag_emitted++ < 3)
+                        tdb_diag_probe_missing(db, cf_b, "atom_cf_b", (uint8_t *)key_b,
+                                               strlen(key_b) + 1);
+                }
                 else
                     both_present++; /* reappeared -- atomicity held */
             }
             else if (b_ok && a_gone)
             {
                 if (tdb_atom_key_durably_gone(db, cf_a, (uint8_t *)key_a, strlen(key_a) + 1))
+                {
                     only_b++; /* A durably lost -- real one-sided violation */
+                    if (diag_emitted++ < 3)
+                        tdb_diag_probe_missing(db, cf_a, "atom_cf_a", (uint8_t *)key_a,
+                                               strlen(key_a) + 1);
+                }
                 else
                     both_present++;
             }
             else if (a_gone && b_gone)
             {
                 if (tdb_atom_key_durably_gone(db, cf_a, (uint8_t *)key_a, strlen(key_a) + 1))
+                {
                     both_absent++; /* whole committed pair durably lost */
+                    if (diag_emitted++ < 3)
+                        tdb_diag_probe_missing(db, cf_a, "atom_cf_a", (uint8_t *)key_a,
+                                               strlen(key_a) + 1);
+                }
                 else
                     both_present++;
             }
@@ -27417,15 +28124,18 @@ static void test_objstore_stats(void)
         if (queue_size(db->flush_queue) == 0 && !atomic_load(&db->unified_mt.is_flushing)) break;
         usleep(20000);
     }
-    /* wait for async uploads to complete (sstable uploads + MANIFEST) */
-    for (int w = 0; w < 100; w++)
+
+    /* poll the counter itself rather than the upload queue depth -- a job leaves
+     * the queue at dequeue, before the worker finishes the put and bumps the
+     * stat, so an empty queue does not mean the upload has landed. on a heavily
+     * loaded runner the worker can be starved past any fixed grace. */
+    tidesdb_db_stats_t stats;
+    for (int w = 0; w < 400; w++)
     {
-        if (db->upload_queue && queue_size(db->upload_queue) == 0) break;
+        if (tidesdb_get_db_stats(db, &stats) == 0 && stats.total_uploads > 0) break;
         usleep(50000);
     }
-    usleep(200000);
 
-    tidesdb_db_stats_t stats;
     ASSERT_EQ(tidesdb_get_db_stats(db, &stats), 0);
     ASSERT_TRUE(stats.object_store_enabled == 1);
     ASSERT_TRUE(stats.total_uploads > 0);
@@ -29655,6 +30365,13 @@ static void test_crash_single_delete_replay(void)
  * the parent reopens and verifies nothing committed was lost. */
 static void test_crash_recovery_no_clean_close(void)
 {
+    /* spawns child processes via fork/exec, which qemu usermode emulation cannot run reliably */
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
     static const struct
     {
         int unified;
@@ -29738,6 +30455,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_range_cost, tests_passed);
     RUN_TEST(test_range_cost_no_block_indexes, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);
+    RUN_TEST(test_shared_prefix_no_key_loss, tests_passed);
     RUN_TEST(test_iterator_seek_for_prev, tests_passed);
     RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
     RUN_TEST(test_iterator_reverse, tests_passed);
@@ -29921,6 +30639,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_ttl_expiration_with_deletes_after_reopen, tests_passed);
     RUN_TEST(test_ttl_expiration_range_delete_after_reopen, tests_passed);
     RUN_TEST(test_many_sstables_low_max_open_reaper_eviction, tests_passed);
+    RUN_TEST(test_unlimited_max_open_no_eviction, tests_passed);
     RUN_TEST(test_partial_write_mid_block_corruption, tests_passed);
     RUN_TEST(test_clock_skew_time_travel_ttl, tests_passed);
     RUN_TEST(test_filesystem_full_during_compaction, tests_passed);
@@ -29977,7 +30696,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_sstable_comparator_lexicographic, tests_passed);
     RUN_TEST(test_btree_sstable_comparator_reverse, tests_passed);
     RUN_TEST(test_btree_compaction_basic, tests_passed);
+    RUN_TEST(test_btree_concurrent_scan_no_skip, tests_passed);
     RUN_TEST(test_btree_compaction_with_deletes, tests_passed);
+    RUN_TEST(test_block_compaction_with_deletes, tests_passed);
     RUN_TEST(test_btree_flush_basic, tests_passed);
     RUN_TEST(test_btree_dca_min_levels_constraint, tests_passed);
     RUN_TEST(test_btree_merge_heap_source_exhaustion, tests_passed);

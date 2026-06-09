@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.3.5
+	VERSION 9.3.6
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -25,7 +25,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
-option(TIDESDB_WITH_S3 "build S3-compatible object store connector (requires libcurl + openssl)" OFF)
+option(TIDESDB_WITH_S3 "build S3-compatible object store connector (requires libcurl only)" OFF)
 
 # compression backends -- optional, default ON. drop any with -DTIDESDB_WITH_<X>=OFF; a build with
 # all three off has no compression dependencies and supports TDB_COMPRESS_NONE only.
@@ -115,9 +115,10 @@ if(TIDESDB_WITH_SANITIZER)
         # debug flags for MSVC
         # MSVC ASAN can be unstable, so we only enable warnings for CI
         # suppress noisy warnings 4311 (pointer truncation), 4244 (conversion), 4047 (pointer indirection)
-        # 4127 (constant expression in conditional), 4305 (type truncation),
+        # 4267 (size_t to smaller type conversion), 4127 (constant expression in conditional),
+        # 4305 (type truncation),
         # 4702 (unreachable code -- triggered inside uthash macro expansions in the bench)
-        add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305 /wd4702)
+        add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4267 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305 /wd4702)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
@@ -158,7 +159,8 @@ include_directories(external) # for external libraries linking internally
 set(TIDESDB_SOURCES
     src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c
     src/manifest.c src/clock_cache.c src/queue.c src/btree.c src/alloc.c
-    src/objstore_fs.c src/local_cache.c external/xxhash.c external/ini.c)
+    src/objstore_fs.c src/local_cache.c src/sha256.c src/hmac_sha256.c
+    external/xxhash.c external/ini.c)
 
 if(TIDESDB_WITH_S3)
     list(APPEND TIDESDB_SOURCES src/objstore_s3.c)
@@ -263,7 +265,7 @@ if(WIN32)
         if(TIDESDB_WITH_LZ4)
             find_package(lz4 CONFIG REQUIRED)
         endif()
-        find_package(PThreads4W REQUIRED)
+        # MSVC uses the native Win32 threading backend in compat.h, so no pthreads-win32 package
     endif()
 endif()
 
@@ -385,7 +387,7 @@ elseif(WIN32)
         if(TIDESDB_WITH_LZ4)
             target_link_libraries(tidesdb PUBLIC lz4::lz4)
         endif()
-        target_link_libraries(tidesdb PUBLIC PThreads4W::PThreads4W)
+        # MSVC threading is the native Win32 backend in compat.h -- nothing to link
     endif()
 
     if(TIDESDB_WITH_MIMALLOC)
@@ -546,12 +548,11 @@ else()
     endif()
 endif()
 
-# S3 connector (platform-independent, requires libcurl + openssl)
+# S3 connector (platform-independent, requires libcurl only 
 if(TIDESDB_WITH_S3)
     find_package(CURL REQUIRED)
-    find_package(OpenSSL REQUIRED)
     target_compile_definitions(tidesdb PRIVATE TIDESDB_WITH_S3)
-    target_link_libraries(tidesdb PUBLIC CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(tidesdb PUBLIC CURL::libcurl)
     message(STATUS "Building with S3-compatible object store connector")
 endif()
 
@@ -710,6 +711,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(btree_tests test/btree__tests.c)
     add_executable(local_cache_tests test/local_cache__tests.c)
     add_executable(objstore_tests test/objstore__tests.c)
+    add_executable(sha256_tests test/sha256__tests.c)
+    add_executable(hmac_sha256_tests test/hmac_sha256__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     if(TIDESDB_WITH_S3)
         target_compile_definitions(tidesdb_tests PRIVATE TIDESDB_WITH_S3)
@@ -766,7 +769,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests sha256_tests hmac_sha256_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -781,6 +784,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME btree_tests COMMAND btree_tests)
     add_test(NAME local_cache_tests COMMAND local_cache_tests)
     add_test(NAME objstore_tests COMMAND objstore_tests)
+    add_test(NAME sha256_tests COMMAND sha256_tests)
+    add_test(NAME hmac_sha256_tests COMMAND hmac_sha256_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)

@@ -359,6 +359,65 @@ void test_btree_cursor_seek()
     (void)remove(TEST_BTREE_FILE);
 }
 
+void test_btree_cursor_seek_multiversion_lands_newest()
+{
+    /* a seek to a key with several versions must land on the NEWEST version (lowest index in the
+     * (key asc, seq desc) run), not an arbitrary equal entry. landing mid-run on an older put would
+     * let a seeking iterator surface a deleted key's old value. the flanking keys make the leaf
+     * binary search land mid-run for key_b under the old exact-match-break seek. */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                             .value_threshold = 512,
+                             .comparator = NULL,
+                             .comparator_ctx = NULL,
+                             .cmp_type = BTREE_CMP_MEMCMP};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    /* versions added newest-first within each key, keys ascending. key_b's newest version is a
+     * tombstone (seq 40), followed by older puts (30, 20, 10). */
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_a", 6, (uint8_t *)"a", 2, 0, 1, 0, 0) ==
+                0);
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_b", 6, (uint8_t *)"b40", 4, 0, 40, 0,
+                                  BTREE_ENTRY_FLAG_TOMBSTONE) == 0);
+    ASSERT_TRUE(
+        btree_builder_add(builder, (uint8_t *)"key_b", 6, (uint8_t *)"b30", 4, 0, 30, 0, 0) == 0);
+    ASSERT_TRUE(
+        btree_builder_add(builder, (uint8_t *)"key_b", 6, (uint8_t *)"b20", 4, 0, 20, 0, 0) == 0);
+    ASSERT_TRUE(
+        btree_builder_add(builder, (uint8_t *)"key_b", 6, (uint8_t *)"b10", 4, 0, 10, 0, 0) == 0);
+    ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)"key_c", 6, (uint8_t *)"c", 2, 0, 1, 0, 0) ==
+                0);
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+
+    btree_cursor_t *cursor = NULL;
+    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    ASSERT_TRUE(btree_cursor_seek(cursor, (uint8_t *)"key_b", 6) == 0);
+    ASSERT_TRUE(btree_cursor_valid(cursor));
+
+    uint8_t *key = NULL, *value = NULL;
+    size_t key_size = 0, value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_TRUE(btree_cursor_get(cursor, &key, &key_size, &value, &value_size, &vlog_offset, &seq,
+                                 &ttl, &deleted) == 0);
+    ASSERT_EQ(strcmp((char *)key, "key_b"), 0);
+    ASSERT_EQ((int)seq, 40);   /* newest version, not an older put */
+    ASSERT_TRUE(deleted != 0); /* and it is the tombstone */
+
+    btree_cursor_free(cursor);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
 void test_btree_min_max_keys()
 {
     block_manager_t *bm = NULL;
@@ -2520,6 +2579,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_cursor_forward, tests_passed);
     RUN_TEST(test_btree_cursor_backward, tests_passed);
     RUN_TEST(test_btree_cursor_seek, tests_passed);
+    RUN_TEST(test_btree_cursor_seek_multiversion_lands_newest, tests_passed);
     RUN_TEST(test_btree_min_max_keys, tests_passed);
     RUN_TEST(test_btree_max_seq, tests_passed);
     RUN_TEST(test_btree_open_existing, tests_passed);

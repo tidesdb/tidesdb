@@ -292,8 +292,6 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_CHECKPOINT_COMPACTION_WAIT_MAX_ATTEMPTS 200
 #define TDB_CHECKPOINT_COMPACTION_WAIT_SLEEP_US     50000
 #define TDB_OPENING_WAIT_MAX_MS                     100
-#define TDB_MAX_FFLUSH_RETRY_ATTEMPTS               5
-#define TDB_FLUSH_RETRY_BACKOFF_US                  100000
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS             10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
@@ -2901,7 +2899,8 @@ tidesdb_config_t tidesdb_default_config(void)
         .unified_memtable_sync_interval_us = 0,
         .object_store = NULL,
         .object_store_config = NULL,
-        .max_concurrent_flushes = 0}; /* 0 = pin to resolved num_flush_threads */
+        .max_concurrent_flushes = 0,       /* 0 = pin to resolved num_flush_threads */
+        .finish_compactions_on_close = 0}; /* 0 = cancel in-flight compactions for fast shutdown */
 }
 
 /**
@@ -19082,6 +19081,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         atomic_fetch_sub_explicit(&cf->flush_pending_count, 1, memory_order_release);
     }
 
+    atomic_fetch_sub_explicit(&db->live_flush_threads, 1, memory_order_release);
     return NULL;
 }
 
@@ -19265,6 +19265,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction worker thread stopped");
 
+    atomic_fetch_sub_explicit(&db->live_compaction_threads, 1, memory_order_release);
     return NULL;
 }
 
@@ -20602,6 +20603,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     atomic_init(&(*db)->is_open, 0);
     atomic_init(&(*db)->cancel_compaction, 0);
+    atomic_init(&(*db)->live_flush_threads, 0);
+    atomic_init(&(*db)->live_compaction_threads, 0);
     atomic_init(&(*db)->is_recovering, 1);
 
     if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
@@ -21227,6 +21230,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             *db = NULL;
             return TDB_ERR_MEMORY;
         }
+        atomic_fetch_add_explicit(&(*db)->live_flush_threads, 1, memory_order_release);
     }
 
     (*db)->compaction_threads = malloc(config->num_compaction_threads * sizeof(pthread_t));
@@ -21342,6 +21346,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             *db = NULL;
             return TDB_ERR_MEMORY;
         }
+        atomic_fetch_add_explicit(&(*db)->live_compaction_threads, 1, memory_order_release);
     }
 
     /* we check if any CF needs interval syncing and start sync thread if needed */
@@ -21622,40 +21627,15 @@ int tidesdb_close(tidesdb_t *db)
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is flushing %d entries before close", cf->name,
                               entry_count);
 
-                /* we retry flush with backoff to prevent data loss */
-                int flush_result = TDB_ERR_UNKNOWN;
-                int retry_count = 0;
-
-                while (retry_count < TDB_MAX_FFLUSH_RETRY_ATTEMPTS)
-                {
-                    flush_result = tidesdb_flush_memtable_internal(cf, 0, 1); /* force flush */
-                    if (flush_result == TDB_SUCCESS)
-                    {
-                        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' flush before close succeeded",
-                                      cf->name);
-                        break;
-                    }
-
-                    retry_count++;
-                    if (retry_count < TDB_MAX_FFLUSH_RETRY_ATTEMPTS)
-                    {
-                        TDB_DEBUG_LOG(
-                            TDB_LOG_ERROR,
-                            "CF '%s' flush before close failed (attempt %d/%d, error %d), "
-                            "retrying",
-                            cf->name, retry_count, TDB_MAX_FFLUSH_RETRY_ATTEMPTS, flush_result);
-                        usleep(TDB_FLUSH_RETRY_BACKOFF_US *
-                               retry_count); /* linear backoff -- TDB_FLUSH_RETRY_BACKOFF_US * N */
-                    }
-                }
-
+                /* best-effort -- the entries are durable in the WAL, so a failed flush is recovered
+                 * on next open and does not warrant retrying under a teardown backoff */
+                int flush_result = tidesdb_flush_memtable_internal(cf, 0, 1); /* force flush */
                 if (flush_result != TDB_SUCCESS)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                  "CF '%s' flush before close failed after %d attempts (error "
-                                  "%d). "
-                                  "Data is persisted in WAL and will be recovered on next open.",
-                                  cf->name, TDB_MAX_FFLUSH_RETRY_ATTEMPTS, flush_result);
+                                  "CF '%s' flush before close failed (error %d). Data is persisted "
+                                  "in WAL and recovered on next open.",
+                                  cf->name, flush_result);
                 }
             }
         }
@@ -21714,6 +21694,13 @@ int tidesdb_close(tidesdb_t *db)
     pthread_rwlock_unlock(&db->cf_list_lock);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed (queue is empty)");
 
+    /* cancel in-flight compactions so the wait below settles at the next checkpoint instead of
+     * after a full merge. inputs stay intact and the uncommitted output is discarded, so this is
+     * lossless. set only after both flush phases above so the flush demux, which shares the abort
+     * predicate, still resolves every CF. opt out with finish_compactions_on_close. */
+    if (!db->config.finish_compactions_on_close)
+        atomic_store_explicit(&db->cancel_compaction, 1, memory_order_release);
+
     /* we wait for any in-progress compactions to complete before shutdown
      * this prevents data loss from compaction removing old ssts while
      * the new merged sst is not yet fully persisted */
@@ -21766,12 +21753,6 @@ int tidesdb_close(tidesdb_t *db)
         {
             queue_enqueue(db->flush_queue, NULL);
         }
-
-        for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
-        {
-            queue_shutdown(db->flush_queue);
-            usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
-        }
     }
 
     if (db->compaction_queue)
@@ -21784,34 +21765,29 @@ int tidesdb_close(tidesdb_t *db)
         {
             queue_enqueue(db->compaction_queue, NULL);
         }
-
-        /* we keep broadcasting periodically until all threads have exited
-         * this handles the race where a thread might be between the while loop check
-         * and pthread_cond_wait when we set shutdown=1 */
-        for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
-        {
-            queue_shutdown(db->compaction_queue);
-            usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
-        }
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for %d flush threads to finish",
                   db->config.num_flush_threads);
     if (db->flush_threads)
     {
-        for (int i = 0; i < db->config.num_flush_threads; i++)
+        /* re-broadcast shutdown only while workers are still running. on platforms where a condvar
+         * wakeup can be dropped (netbsd) this nudges them out; once the count reaches zero the
+         * joins below return at once. */
+        if (db->flush_queue)
         {
-            if (db->flush_queue)
+            for (int attempt = 0;
+                 attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS &&
+                 atomic_load_explicit(&db->live_flush_threads, memory_order_acquire) > 0;
+                 attempt++)
             {
-                for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
-                {
-                    queue_shutdown(db->flush_queue);
-                    usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
-                }
+                queue_shutdown(db->flush_queue);
+                usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
             }
-
-            pthread_join(db->flush_threads[i], NULL);
         }
+
+        for (int i = 0; i < db->config.num_flush_threads; i++)
+            pthread_join(db->flush_threads[i], NULL);
         free(db->flush_threads);
     }
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush threads finished");
@@ -21820,24 +21796,20 @@ int tidesdb_close(tidesdb_t *db)
                   db->config.num_compaction_threads);
     if (db->compaction_threads)
     {
-        for (int i = 0; i < db->config.num_compaction_threads; i++)
+        if (db->compaction_queue)
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "Joining compaction thread %d", i);
-
-            /** on netbsd, pthread_cond_wait can miss signals, so we keep broadcasting
-             *  while waiting for each thread to exit */
-            if (db->compaction_queue)
+            for (int attempt = 0;
+                 attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS &&
+                 atomic_load_explicit(&db->live_compaction_threads, memory_order_acquire) > 0;
+                 attempt++)
             {
-                for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
-                {
-                    queue_shutdown(db->compaction_queue);
-                    usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
-                }
+                queue_shutdown(db->compaction_queue);
+                usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
             }
-
-            pthread_join(db->compaction_threads[i], NULL);
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction thread %d joined", i);
         }
+
+        for (int i = 0; i < db->config.num_compaction_threads; i++)
+            pthread_join(db->compaction_threads[i], NULL);
         free(db->compaction_threads);
     }
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction threads finished");

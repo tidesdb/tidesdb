@@ -1,0 +1,215 @@
+2026-06-09T08:10:41.4778577Z [0m[33mRunning: test_block_compaction_with_deletes... [0m[2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20422: sstable fd budget set to max_open_sstables=256 (up to 512 fds), process fd limit=65536
+2026-06-09T08:10:41.4778918Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20536: Opening TidesDB with path=./test_tidesdb, log_level=INFO, workers=2
+2026-06-09T08:10:41.4779194Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20586: Acquired exclusive lock on database directory
+2026-06-09T08:10:41.4779467Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20738: Initial available disk space is 95104180224 bytes
+2026-06-09T08:10:41.4779783Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20753: System memory is total=3881517056 bytes, available=1973633024 bytes
+2026-06-09T08:10:41.4780201Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20779: Resolved memory limit 2911137792 bytes (2776.28 MB)
+2026-06-09T08:10:41.4780575Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:20871: Block clock cache disabled (block_cache_size=0)
+2026-06-09T08:10:41.4780909Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:33309: Starting database recovery from './test_tidesdb'
+2026-06-09T08:10:41.4781173Z [2026-06-09T08:10:37.122Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:33465: Database recovery completed successfully
+2026-06-09T08:10:41.4781399Z [2026-06-09T08:10:37.123Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18427: Flush worker thread started
+2026-06-09T08:10:41.4781675Z [2026-06-09T08:10:37.123Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4781887Z [2026-06-09T08:10:37.123Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:21443: Reaper thread created
+2026-06-09T08:10:41.4782204Z [2026-06-09T08:10:37.123Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:21530: Database is now open and ready for operations
+2026-06-09T08:10:41.4782488Z [2026-06-09T08:10:37.123Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:22600: Creating column family block_del_cf
+2026-06-09T08:10:41.4782713Z [2026-06-09T08:10:37.123Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18427: Flush worker thread started
+2026-06-09T08:10:41.4783037Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19130: Compaction worker thread started
+2026-06-09T08:10:41.4783313Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4783593Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18427: Flush worker thread started
+2026-06-09T08:10:41.4783873Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4784082Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19552: Reaper thread started
+2026-06-09T08:10:41.4784304Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18427: Flush worker thread started
+2026-06-09T08:10:41.4784559Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:9733: Creating level 1 with capacity 2048
+2026-06-09T08:10:41.4784798Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:9757: Level 1 created with capacity 2048
+2026-06-09T08:10:41.4785047Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:22996: Creating level 1 with capacity 2048
+2026-06-09T08:10:41.4785317Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4785553Z [2026-06-09T08:10:37.124Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19130: Compaction worker thread started
+2026-06-09T08:10:41.4785800Z [2026-06-09T08:10:37.125Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:23140: Created CF 'block_del_cf' (total: 1)
+2026-06-09T08:10:41.4786216Z [2026-06-09T08:10:37.125Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24036: CF 'block_del_cf' is flushing memtable (entries: 10, size: 260 bytes / 0.00 MB, threshold: 2048 bytes / 0.00 MB)
+2026-06-09T08:10:41.4786548Z [2026-06-09T08:10:37.125Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24241: CF 'block_del_cf' memtable swapped, allocating flush work for SSTable 0
+2026-06-09T08:10:41.4786896Z [2026-06-09T08:10:37.125Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24265: CF 'block_del_cf' is enqueueing flush work for SSTable 0 (queue size before: 0)
+2026-06-09T08:10:41.4787272Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24303: CF 'block_del_cf' has successfully enqueued flush work for SSTable 0 (queue size after: 1)
+2026-06-09T08:10:41.4787544Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18443: Flush worker has received work for SSTable 0
+2026-06-09T08:10:41.4787957Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8365: SSTable 0 writing from memtable (sorted run to disk) (10 entries)
+2026-06-09T08:10:41.4788276Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8413: SSTable 0 bloom filter disabled
+2026-06-09T08:10:41.4788518Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8433: SSTable 0 block indexes disabled
+2026-06-09T08:10:41.4788935Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24036: CF 'block_del_cf' is flushing memtable (entries: 10, size: 260 bytes / 0.00 MB, threshold: 2048 bytes / 0.00 MB)
+2026-06-09T08:10:41.4789334Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24241: CF 'block_del_cf' memtable swapped, allocating flush work for SSTable 1
+2026-06-09T08:10:41.4789729Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24265: CF 'block_del_cf' is enqueueing flush work for SSTable 1 (queue size before: 0)
+2026-06-09T08:10:41.4790111Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24303: CF 'block_del_cf' has successfully enqueued flush work for SSTable 1 (queue size after: 1)
+2026-06-09T08:10:41.4790386Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18443: Flush worker has received work for SSTable 1
+2026-06-09T08:10:41.4790737Z [2026-06-09T08:10:37.126Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8365: SSTable 1 writing from memtable (sorted run to disk) (10 entries)
+2026-06-09T08:10:41.4791109Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8413: SSTable 1 bloom filter disabled
+2026-06-09T08:10:41.4791421Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8433: SSTable 1 block indexes disabled
+2026-06-09T08:10:41.4791840Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24036: CF 'block_del_cf' is flushing memtable (entries: 10, size: 260 bytes / 0.00 MB, threshold: 2048 bytes / 0.00 MB)
+2026-06-09T08:10:41.4792174Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18763: CF 'block_del_cf' flushed SSTable 0 (max_seq=10) to level 1 (array index 0)
+2026-06-09T08:10:41.4792494Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24241: CF 'block_del_cf' memtable swapped, allocating flush work for SSTable 2
+2026-06-09T08:10:41.4792839Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24265: CF 'block_del_cf' is enqueueing flush work for SSTable 2 (queue size before: 0)
+2026-06-09T08:10:41.4793311Z [2026-06-09T08:10:37.127Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24303: CF 'block_del_cf' has successfully enqueued flush work for SSTable 2 (queue size after: 1)
+2026-06-09T08:10:41.4793730Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24036: CF 'block_del_cf' is flushing memtable (entries: 10, size: 260 bytes / 0.00 MB, threshold: 2048 bytes / 0.00 MB)
+2026-06-09T08:10:41.4794063Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18763: CF 'block_del_cf' flushed SSTable 1 (max_seq=20) to level 1 (array index 0)
+2026-06-09T08:10:41.4794327Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18443: Flush worker has received work for SSTable 2
+2026-06-09T08:10:41.4794639Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8365: SSTable 2 writing from memtable (sorted run to disk) (10 entries)
+2026-06-09T08:10:41.4794878Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8413: SSTable 2 bloom filter disabled
+2026-06-09T08:10:41.4795115Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8433: SSTable 2 block indexes disabled
+2026-06-09T08:10:41.4795519Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24241: CF 'block_del_cf' memtable swapped, allocating flush work for SSTable 3
+2026-06-09T08:10:41.4795865Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24265: CF 'block_del_cf' is enqueueing flush work for SSTable 3 (queue size before: 0)
+2026-06-09T08:10:41.4796245Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24303: CF 'block_del_cf' has successfully enqueued flush work for SSTable 3 (queue size after: 1)
+2026-06-09T08:10:41.4796537Z [2026-06-09T08:10:37.128Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:23990: CF 'block_del_cf' deferring flush, global cap 4 reached
+2026-06-09T08:10:41.4796927Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19069: CF 'block_del_cf' cleaned up 1 flushed immutable(s) with no active readers
+2026-06-09T08:10:41.4797259Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 1)
+2026-06-09T08:10:41.4797528Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18443: Flush worker has received work for SSTable 3
+2026-06-09T08:10:41.4797845Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8365: SSTable 3 writing from memtable (sorted run to disk) (10 entries)
+2026-06-09T08:10:41.4798302Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24036: CF 'block_del_cf' is flushing memtable (entries: 30, size: 780 bytes / 0.00 MB, threshold: 2048 bytes / 0.00 MB)
+2026-06-09T08:10:41.4798540Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8413: SSTable 3 bloom filter disabled
+2026-06-09T08:10:41.4798784Z [2026-06-09T08:10:37.129Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8433: SSTable 3 block indexes disabled
+2026-06-09T08:10:41.4799111Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24241: CF 'block_del_cf' memtable swapped, allocating flush work for SSTable 4
+2026-06-09T08:10:41.4799452Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24265: CF 'block_del_cf' is enqueueing flush work for SSTable 4 (queue size before: 0)
+2026-06-09T08:10:41.4799820Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24303: CF 'block_del_cf' has successfully enqueued flush work for SSTable 4 (queue size after: 1)
+2026-06-09T08:10:41.4800082Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18443: Flush worker has received work for SSTable 4
+2026-06-09T08:10:41.4800395Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8365: SSTable 4 writing from memtable (sorted run to disk) (30 entries)
+2026-06-09T08:10:41.4800655Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8413: SSTable 4 bloom filter disabled
+2026-06-09T08:10:41.4800896Z [2026-06-09T08:10:37.139Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8433: SSTable 4 block indexes disabled
+2026-06-09T08:10:41.4801229Z [2026-06-09T08:10:37.140Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18763: CF 'block_del_cf' flushed SSTable 3 (max_seq=40) to level 1 (array index 0)
+2026-06-09T08:10:41.4801499Z [2026-06-09T08:10:37.140Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4801827Z [2026-06-09T08:10:37.140Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18763: CF 'block_del_cf' flushed SSTable 2 (max_seq=30) to level 1 (array index 0)
+2026-06-09T08:10:41.4802149Z [2026-06-09T08:10:37.140Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18763: CF 'block_del_cf' flushed SSTable 4 (max_seq=70) to level 1 (array index 0)
+2026-06-09T08:10:41.4802552Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24036: CF 'block_del_cf' is flushing memtable (entries: 65, size: 990 bytes / 0.00 MB, threshold: 2048 bytes / 0.00 MB)
+2026-06-09T08:10:41.4803010Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24241: CF 'block_del_cf' memtable swapped, allocating flush work for SSTable 5
+2026-06-09T08:10:41.4803350Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24265: CF 'block_del_cf' is enqueueing flush work for SSTable 5 (queue size before: 0)
+2026-06-09T08:10:41.4803722Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24303: CF 'block_del_cf' has successfully enqueued flush work for SSTable 5 (queue size after: 1)
+2026-06-09T08:10:41.4804046Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18443: Flush worker has received work for SSTable 5
+2026-06-09T08:10:41.4804353Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8365: SSTable 5 writing from memtable (sorted run to disk) (65 entries)
+2026-06-09T08:10:41.4804642Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8413: SSTable 5 bloom filter disabled
+2026-06-09T08:10:41.4804882Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:8433: SSTable 5 block indexes disabled
+2026-06-09T08:10:41.4805344Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18861: CF 'block_del_cf' level 1 (first disk level) triggering compaction (file count): files=5 (trigger=4), size=1844 (capacity=2048)
+2026-06-09T08:10:41.4805623Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19225: Compacting CF 'block_del_cf'
+2026-06-09T08:10:41.4805952Z [2026-06-09T08:10:37.141Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17797: Triggering compaction for column family block_del_cf (levels: 1)
+2026-06-09T08:10:41.4806222Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17826: Calculating target compaction level (X=1)
+2026-06-09T08:10:41.4806508Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17856: Target level 1 capacity=2048 >= cumulative_size=1844
+2026-06-09T08:10:41.4806750Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17862: Final target compaction level: 1
+2026-06-09T08:10:41.4806971Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17873: Dividing merge at level 1
+2026-06-09T08:10:41.4807283Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:15467: Starting dividing merge for CF 'block_del_cf', target_level=1
+2026-06-09T08:10:41.4807610Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:15472: Target level 1 is the largest level, need to add new level before merge
+2026-06-09T08:10:41.4807858Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:9733: Creating level 2 with capacity 20480
+2026-06-09T08:10:41.4808106Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:9757: Level 2 created with capacity 20480
+2026-06-09T08:10:41.4808396Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13242: Added empty level 2, old largest level 1 keeps its data
+2026-06-09T08:10:41.4808619Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13249: Published 2 active levels
+2026-06-09T08:10:41.4808859Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13256: Levels[0] level_num=1, 5 SSTables
+2026-06-09T08:10:41.4809095Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13256: Levels[1] level_num=2, 0 SSTables
+2026-06-09T08:10:41.4809336Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13264: Added level 2, now have 2 levels
+2026-06-09T08:10:41.4809630Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:15489: Added level, now have 2 levels
+2026-06-09T08:10:41.4809950Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13933: Starting full preemptive merge on CF 'block_del_cf', levels 1->1
+2026-06-09T08:10:41.4810406Z [2026-06-09T08:10:37.142Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18861: CF 'block_del_cf' level 1 (first disk level) triggering compaction (file count): files=5 (trigger=4), size=1844 (capacity=2048)
+2026-06-09T08:10:41.4810737Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19069: CF 'block_del_cf' cleaned up 2 flushed immutable(s) with no active readers
+2026-06-09T08:10:41.4811018Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4811390Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18763: CF 'block_del_cf' flushed SSTable 5 (max_seq=150) to level 1 (array index 0)
+2026-06-09T08:10:41.4811642Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4811860Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4812071Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4812279Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4812515Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4812726Z [2026-06-09T08:10:37.143Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4813084Z [2026-06-09T08:10:37.144Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4813370Z [2026-06-09T08:10:37.144Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 7 to level 1 (array index 0)
+2026-06-09T08:10:41.4813652Z [2026-06-09T08:10:37.145Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 8 to level 1 (array index 0)
+2026-06-09T08:10:41.4814100Z [2026-06-09T08:10:37.145Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18861: CF 'block_del_cf' level 1 (first disk level) triggering compaction (file count): files=7 (trigger=4), size=2857 (capacity=2048)
+2026-06-09T08:10:41.4814380Z [2026-06-09T08:10:37.145Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 6 to level 1 (array index 0)
+2026-06-09T08:10:41.4814721Z [2026-06-09T08:10:37.145Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19069: CF 'block_del_cf' cleaned up 2 flushed immutable(s) with no active readers
+2026-06-09T08:10:41.4815007Z [2026-06-09T08:10:37.145Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4815469Z [2026-06-09T08:10:37.146Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18861: CF 'block_del_cf' level 1 (first disk level) triggering compaction (file count): files=7 (trigger=4), size=2857 (capacity=2048)
+2026-06-09T08:10:41.4815740Z [2026-06-09T08:10:37.146Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18431: Flush worker is waiting for work (queue size: 0)
+2026-06-09T08:10:41.4815954Z [2026-06-09T08:10:37.147Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4816170Z [2026-06-09T08:10:37.147Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4816448Z [2026-06-09T08:10:37.148Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 9 to level 1 (array index 0)
+2026-06-09T08:10:41.4816804Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14105: Full preemptive merge complete for CF 'block_del_cf'
+2026-06-09T08:10:41.4817122Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17926: Partitioned merge target z=2 capacity=20480 >= cumulative=2267
+2026-06-09T08:10:41.4817430Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17954: Level 1 is full, triggering partitioned preemptive merge
+2026-06-09T08:10:41.4817705Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17955: Partitioned preemptive merge levels 1 to 2
+2026-06-09T08:10:41.4818057Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:16602: Starting partitioned merge CF 'block_del_cf', levels 1->2 (array indices 0->1)
+2026-06-09T08:10:41.4818428Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13933: Starting full preemptive merge on CF 'block_del_cf', levels 1->2
+2026-06-09T08:10:41.4818680Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4818900Z [2026-06-09T08:10:37.151Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4819185Z [2026-06-09T08:10:37.153Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 10 to level 2 (array index 1)
+2026-06-09T08:10:41.4819470Z [2026-06-09T08:10:37.155Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14105: Full preemptive merge complete for CF 'block_del_cf'
+2026-06-09T08:10:41.4819917Z [2026-06-09T08:10:37.155Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18002: CF 'block_del_cf' largest level underfull (size=652 < capacity/T) - collapsing level 2 into level 1
+2026-06-09T08:10:41.4820239Z [2026-06-09T08:10:37.155Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13933: Starting full preemptive merge on CF 'block_del_cf', levels 1->2
+2026-06-09T08:10:41.4820456Z [2026-06-09T08:10:37.155Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4820678Z [2026-06-09T08:10:37.155Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4820962Z [2026-06-09T08:10:37.156Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 11 to level 1 (array index 0)
+2026-06-09T08:10:41.4821254Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14105: Full preemptive merge complete for CF 'block_del_cf'
+2026-06-09T08:10:41.4821533Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13278: Attempting to remove level from CF 'block_del_cf'
+2026-06-09T08:10:41.4821811Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13316: Updated new largest level 1 capacity to 2048
+2026-06-09T08:10:41.4822076Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13325: Parking removed empty level 2 for reuse
+2026-06-09T08:10:41.4822321Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13331: Removed level, now have 1 levels
+2026-06-09T08:10:41.4822555Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19225: Compacting CF 'block_del_cf'
+2026-06-09T08:10:41.4822837Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24019: CF 'block_del_cf' memtable is empty, skipping flush
+2026-06-09T08:10:41.4823244Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17797: Triggering compaction for column family block_del_cf (levels: 1)
+2026-06-09T08:10:41.4823516Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17826: Calculating target compaction level (X=1)
+2026-06-09T08:10:41.4823795Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17856: Target level 1 capacity=2048 >= cumulative_size=652
+2026-06-09T08:10:41.4824138Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17862: Final target compaction level: 1
+2026-06-09T08:10:41.4824362Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17873: Dividing merge at level 1
+2026-06-09T08:10:41.4824673Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:15467: Starting dividing merge for CF 'block_del_cf', target_level=1
+2026-06-09T08:10:41.4825002Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:15472: Target level 1 is the largest level, need to add new level before merge
+2026-06-09T08:10:41.4825304Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13242: Added empty level 2, old largest level 1 keeps its data
+2026-06-09T08:10:41.4825585Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13249: Published 2 active levels
+2026-06-09T08:10:41.4825887Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13256: Levels[0] level_num=1, 1 SSTables
+2026-06-09T08:10:41.4826128Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13256: Levels[1] level_num=2, 0 SSTables
+2026-06-09T08:10:41.4826363Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13264: Added level 2, now have 2 levels
+2026-06-09T08:10:41.4826603Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:15489: Added level, now have 2 levels
+2026-06-09T08:10:41.4826973Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13933: Starting full preemptive merge on CF 'block_del_cf', levels 1->1
+2026-06-09T08:10:41.4827192Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4827408Z [2026-06-09T08:10:37.158Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4827691Z [2026-06-09T08:10:37.159Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 12 to level 1 (array index 0)
+2026-06-09T08:10:41.4827983Z [2026-06-09T08:10:37.166Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14105: Full preemptive merge complete for CF 'block_del_cf'
+2026-06-09T08:10:41.4828393Z [2026-06-09T08:10:37.166Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:18053: Largest level is empty but work pending (flushes: 1, L1 sstables: 1), keeping level for CF 'block_del_cf'
+2026-06-09T08:10:41.4828623Z [2026-06-09T08:10:37.191Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:19225: Compacting CF 'block_del_cf'
+2026-06-09T08:10:41.4828909Z [2026-06-09T08:10:37.191Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:24019: CF 'block_del_cf' memtable is empty, skipping flush
+2026-06-09T08:10:41.4829223Z [2026-06-09T08:10:37.191Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17797: Triggering compaction for column family block_del_cf (levels: 2)
+2026-06-09T08:10:41.4829610Z [2026-06-09T08:10:37.191Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:17810: Full manual compaction for CF 'block_del_cf' -- merging all 2 level(s) into the largest level
+2026-06-09T08:10:41.4829926Z [2026-06-09T08:10:37.191Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:13933: Starting full preemptive merge on CF 'block_del_cf', levels 1->2
+2026-06-09T08:10:41.4830135Z [2026-06-09T08:10:37.192Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14243: Bloom filter disabled
+2026-06-09T08:10:41.4830351Z [2026-06-09T08:10:37.192Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14262: Block indexes disabled
+2026-06-09T08:10:41.4830628Z [2026-06-09T08:10:37.193Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14758: Adding merged SSTable 13 to level 2 (array index 1)
+2026-06-09T08:10:41.4830918Z [2026-06-09T08:10:37.195Z] [INFO] /home/runner/work/tidesdb/tidesdb/src/tidesdb.c:14105: Full preemptive merge complete for CF 'block_del_cf'
+2026-06-09T08:10:41.4831049Z block 'del_key_040' iterator-scan MISSING
+2026-06-09T08:10:41.4831127Z block 'del_key_042' iterator-scan MISSING
+2026-06-09T08:10:41.4831212Z block 'del_key_044' iterator-scan MISSING
+2026-06-09T08:10:41.4831286Z block 'del_key_046' iterator-scan MISSING
+2026-06-09T08:10:41.4831368Z block 'del_key_048' iterator-scan MISSING
+2026-06-09T08:10:41.4831444Z block 'del_key_050' iterator-scan MISSING
+2026-06-09T08:10:41.4831522Z block 'del_key_052' iterator-scan MISSING
+2026-06-09T08:10:41.4831597Z block 'del_key_054' iterator-scan MISSING
+2026-06-09T08:10:41.4831683Z block 'del_key_056' iterator-scan MISSING
+2026-06-09T08:10:41.4831798Z block 'del_key_058' iterator-scan MISSING
+2026-06-09T08:10:41.4831872Z block 'del_key_060' iterator-scan MISSING
+2026-06-09T08:10:41.4831949Z block 'del_key_062' iterator-scan MISSING
+2026-06-09T08:10:41.4832021Z block 'del_key_064' iterator-scan MISSING
+2026-06-09T08:10:41.4832104Z block 'del_key_066' iterator-scan MISSING
+2026-06-09T08:10:41.4832211Z block 'del_key_068' iterator-scan MISSING
+2026-06-09T08:10:41.4832565Z tidesdb_tests: /home/runner/work/tidesdb/tidesdb/test/tidesdb__tests.c:11300: test_block_compaction_with_deletes: Assertion `(resurfaced) == (0)' failed.
+2026-06-09T08:10:41.4832571Z 
+2026-06-09T08:10:41.4832574Z 
+2026-06-09T08:10:41.4832661Z 92% tests passed, 1 tests failed out of 13
+2026-06-09T08:10:41.4832664Z 
+2026-06-09T08:10:41.4832739Z Total Test time (real) = 388.12 sec
+2026-06-09T08:10:41.4832742Z 
+2026-06-09T08:10:41.4832821Z The following tests FAILED:
+2026-06-09T08:10:41.4833029Z 	 13 - tidesdb_tests (Subprocess aborted)
+2026-06-09T08:10:41.4841576Z ##[error]Process completed with exit code 8.
+2026-06-09T08:10:41.4917579Z Post job cleanup.
+2026-06-09T08:10:41.5766108Z [command]/usr/bin/git version
+2026-06-09T08:10:41.5795554Z git version 2.54.0
+2026-06-09T08:10:41.5832379Z Temporarily overriding HOME='/home/runner/work/_temp/b5e1351f-bd3d-4c34-a1aa-dd60546d228b' before making global git config changes
+2026-06-09T08:10:41.5832710Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-09T08:10:41.5836535Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/tidesdb/tidesdb
+2026-06-09T08:10:41.5863969Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-09T08:10:41.5889804Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-09T08:10:41.6078541Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-09T08:10:41.6096331Z http.https://github.com/.extraheader
+2026-06-09T08:10:41.6106583Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-06-09T08:10:41.6130632Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-09T08:10:41.6309984Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-09T08:10:41.6334314Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-09T08:10:41.6616719Z Cleaning up orphan processes
+2026-06-09T08:10:41.6888449Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

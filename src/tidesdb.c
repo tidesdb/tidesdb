@@ -25990,6 +25990,14 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         {
             const tidesdb_immutable_memtable_t *immutable =
                 (const tidesdb_immutable_memtable_t *)imm_snap->items[i];
+            /* skip already-flushed immutables -- their data is durable in an sstable the snapshot
+             * already covers. the publish-time snapshot drops flushed immutables, but flushed is
+             * set without an immediate republish, so a just-flushed immutable lingers in the slot
+             * until the next publish; reading its older put here bypasses a newer tombstone and
+             * resurrects a deleted key (mirrors the iterator snapshot and the unified point-get).
+             */
+            if (immutable && atomic_load_explicit(&immutable->flushed, memory_order_acquire))
+                continue;
             if (immutable && immutable->skip_list)
             {
                 if (skip_list_get_with_seq_ref(
@@ -29447,7 +29455,11 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             for (size_t i = 0; i < imm_count; i++)
             {
                 tidesdb_immutable_memtable_t *imm = imm_snapshot[i];
-                if (imm && imm->skip_list)
+                /* re-check flushed at use, not just at snapshot build -- an immutable can flip
+                 * flushed between the snapshot and here, and reading it would resurrect a key whose
+                 * sstable copy was compacted and reaped (mirrors the unified iterator above) */
+                if (imm && imm->skip_list &&
+                    !atomic_load_explicit(&imm->flushed, memory_order_acquire))
                 {
                     tidesdb_merge_source_t *source =
                         tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
@@ -29463,6 +29475,10 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                         }
                     }
 
+                    tidesdb_immutable_memtable_unref(imm);
+                }
+                else if (imm)
+                {
                     tidesdb_immutable_memtable_unref(imm);
                 }
             }
@@ -29489,7 +29505,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             for (size_t i = 0; i < imm_count; i++)
             {
                 tidesdb_immutable_memtable_t *imm = imm_snapshot[i];
-                if (imm && imm->skip_list)
+                /* re-check flushed at use (see the cached-source loop above) */
+                if (imm && imm->skip_list &&
+                    !atomic_load_explicit(&imm->flushed, memory_order_acquire))
                 {
                     tidesdb_merge_source_t *source =
                         tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
@@ -29500,6 +29518,10 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                     }
                     else if (source)
                         tidesdb_merge_source_free(source);
+                    tidesdb_immutable_memtable_unref(imm);
+                }
+                else if (imm)
+                {
                     tidesdb_immutable_memtable_unref(imm);
                 }
             }

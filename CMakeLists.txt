@@ -548,8 +548,7 @@ else()
     endif()
 endif()
 
-# S3 connector (platform-independent, requires libcurl only -- SigV4 signing uses the bundled
-# SHA-256 + HMAC-SHA-256, so no OpenSSL/wolfSSL dependency)
+# S3 connector (platform-independent, requires libcurl only 
 if(TIDESDB_WITH_S3)
     find_package(CURL REQUIRED)
     target_compile_definitions(tidesdb PRIVATE TIDESDB_WITH_S3)

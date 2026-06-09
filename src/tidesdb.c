@@ -77,7 +77,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 
 /* TRANSIENT (0x20..0x80) -- in-memory memory-ownership bookkeeping for
  * tidesdb_kv_pair_free, never written to disk. kv_pair_create sets ARENA on
- * every kv it builds (including compaction output), so these MUST be masked off
+ * every kv it builds (including compaction output), so these must be masked off
  * before serialization. */
 #define TDB_KV_FLAG_POP_BUF  0x20 /* lives in reusable pop buffer, do not free */
 #define TDB_KV_FLAG_BORROWED 0x40 /* points into block data, do not free */
@@ -99,7 +99,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
      TDB_KV_FLAG_SINGLE_DELETE)
 
 /* the in-memory-only group as a mask. the deserialize path strips these (along
- * with DELTA_SEQ) so a stray transient bit serialized by an OLDER build -- before
+ * with DELTA_SEQ) so a stray transient bit serialized by an older build -- before
  * the write path masked them -- cannot survive into an in-memory entry. */
 #define TDB_KV_FLAG_TRANSIENT_MASK (TDB_KV_FLAG_POP_BUF | TDB_KV_FLAG_BORROWED | TDB_KV_FLAG_ARENA)
 
@@ -170,7 +170,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
     (TDB_SSTABLE_METADATA_HEADER_SIZE + TDB_SSTABLE_METADATA_CHECKSUM_SIZE)
 /* the largest payload a single block can frame -- the block manager's on-disk
  * size field is a uint32, so block_manager_block_create rejects anything larger.
- * a bloom-filter or block-index footer blob at or below this is written as ONE
+ * a bloom-filter or block-index footer blob at or below this is written as one
  * block, no chunking, SSTABLE_FLAG_CHUNKED_AUX stays clear, and the footer is
  * byte-identical to (and readable by) older binaries. every bloom that can exist
  * (m <= UINT32_MAX, ~900MB serialized) and every block index is well under this,
@@ -308,7 +308,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_SSTABLE_REAPER_EVICT_RATIO  0.25
 /* the per-CF memory-pressure scan (cf_list_lock + a try_ref on every active memtable) runs every
  * reaper cycle. when the last scan's total was comfortably below the limit there is no pressure to
- * react to, so gate the full scan on a cheap proxy (the cached last-scan total): skip it while the
+ * react to, so gate the full scan on a cheap proxy (the cached last-scan total)-- skip it while the
  * proxy is under PRESSURE_SCAN_GATE_RATIO of the limit, but force one at least every
  * PRESSURE_SCAN_MAX_SKIP cycles so a climb is never missed by more than that. above the ratio the
  * scan runs every cycle for full resolution as pressure approaches the ELEVATED threshold. */
@@ -453,9 +453,9 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_FD_RESERVE_NON_SSTABLE 64 /* descriptors reserved for WALs/manifest/objstore/stdio */
 #define TDB_MIN_OPEN_SSTABLES      4  /* never clamp the sstable budget below this */
 
-/* reader fd reservation. point reads and iterators may open NEW sstables only while
+/* reader fd reservation. point reads and iterators may open new sstables only while
  * num_open_sstables stays under max_open_sstables minus this reserve, which is held for the
- * flush / compaction / commit-conflict-check paths -- those MUST make progress to relieve fd
+ * flush / compaction / commit-conflict-check paths -- those must make progress to relieve fd
  * pressure, whereas a read can degrade to a retryable error (see the scan / iter open-failure
  * paths). this bounds reader-induced opens so writes never starve, preventing the fd wedge. */
 #define TDB_FD_READER_RESERVE_DIVISOR 8  /* reserve = max_open_sstables / this ... */
@@ -1086,7 +1086,7 @@ static int tdb_log_throttle(tidesdb_t *db, _Atomic(time_t) *last_log_sec, int in
  * tidesdb_wake_reaper
  * nudge the sstable reaper to run its eviction pass now so it closes idle (unreferenced) sstable
  * block managers and reclaims their file descriptors. uses trylock -- if the reaper mutex is held
- * (reaper mid-cycle, or we are on the reaper thread itself) the signal is skipped, which is safe:
+ * (reaper mid-cycle, or we are on the reaper thread itself) the signal is skipped, which is safe--
  * the reaper runs on its own 100ms timer regardless. never blocks the caller.
  * @param db database instance
  */
@@ -1151,7 +1151,7 @@ static int tidesdb_sstable_open_budget(const tidesdb_t *db)
 
 /**
  * tidesdb_reader_fd_budget_ok
- * gate a reader (point-get / iterator) about to open a NOT-yet-open sstable against the reader fd
+ * gate a reader (point-get / iterator) about to open a not-yet-open sstable against the reader fd
  * budget = max_open_sstables - reserve, the reserve being held for flush / compaction /
  * conflict-check (the priority paths that must progress to relieve fd pressure). an already-open
  * sstable needs no new descriptor, so re-reads are never blocked. when over budget, wake the reaper
@@ -1685,7 +1685,8 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  bloom_filter_t *bloom, queue_t *sstables_to_delete,
                                                  int is_largest_level, const uint8_t *range_start,
                                                  size_t range_start_size, const uint8_t *range_end,
-                                                 size_t range_end_size);
+                                                 size_t range_end_size,
+                                                 uint64_t oldest_unflushed_seq);
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction_force(tidesdb_column_family_t *cf, int full_compaction);
@@ -7296,6 +7297,11 @@ static tidesdb_immutable_memtable_t **tidesdb_snapshot_immutable_memtables(
     for (size_t i = 0; i < count; i++)
     {
         tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)snap->items[i];
+        /* skip already-flushed immutables as their data is durably in an sstable (add_sstable is
+         * ordered before flushed=1), so the sstable snapshot covers them. reading a flushed
+         * immutable can resurrect a key whose sstable copy was already compacted and reaped. */
+        if (atomic_load_explicit(&imm->flushed, memory_order_acquire)) continue;
+
         if (tidesdb_immutable_memtable_try_ref(imm))
         {
             result[valid++] = imm;
@@ -8015,6 +8021,24 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_colu
     return tidesdb_sstable_write_from_memtable_btree_ex(db, cf, sst, memtable, NULL, 0, 0);
 }
 
+static uint64_t tidesdb_cf_oldest_unflushed_seq(tidesdb_column_family_t *cf)
+{
+    if (!cf) return UINT64_MAX;
+    tidesdb_imm_snap_t *snap = tidesdb_imm_snap_acquire(cf);
+    if (!snap) return UINT64_MAX;
+    const size_t count = atomic_load_explicit(&snap->count, memory_order_acquire);
+    uint64_t oldest = UINT64_MAX;
+    for (size_t i = 0; i < count; i++)
+    {
+        tidesdb_memtable_t *m = snap->items[i];
+        if (!m || atomic_load_explicit(&m->flushed, memory_order_acquire)) continue;
+        const uint64_t ms = skip_list_get_min_seq(m->skip_list);
+        if (ms < oldest) oldest = ms;
+    }
+    tidesdb_imm_snap_release(snap);
+    return oldest;
+}
+
 /**
  * tidesdb_sstable_write_from_heap_btree
  * write merged entries from a heap to an sstable using B+tree format
@@ -8032,7 +8056,8 @@ static int tidesdb_sstable_write_from_heap_btree(
     tidesdb_column_family_t *cf, tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
     block_manager_t *klog_bm, block_manager_t *vlog_bm, bloom_filter_t *bloom,
     queue_t *sstables_to_delete, const int is_largest_level, const uint8_t *range_start,
-    size_t range_start_size, const uint8_t *range_end, size_t range_end_size)
+    size_t range_start_size, const uint8_t *range_end, size_t range_end_size,
+    uint64_t oldest_unflushed_seq)
 {
     if (!cf || !sst || !heap || !klog_bm || !vlog_bm) return TDB_ERR_INVALID_ARGS;
 
@@ -8147,8 +8172,11 @@ static int tidesdb_sstable_write_from_heap_btree(
         if (pending)
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
+            /* never reap a tombstone newer than the oldest write still unflushed in a memtable --
+             * that older version is off the merge's snapshot and would resurface once it flushes */
             const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
-                                       is_largest_level && pending->entry.seq <= min_snapshot_seq;
+                                       is_largest_level && pending->entry.seq <= min_snapshot_seq &&
+                                       pending->entry.seq < oldest_unflushed_seq;
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -8840,7 +8868,6 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
         value_size = vlog_value_size;
     }
 
-    /* we create kv pair */
     tidesdb_kv_pair_t *pair = malloc(sizeof(tidesdb_kv_pair_t));
     if (!pair)
     {
@@ -13506,7 +13533,21 @@ static int tidesdb_collect_ssts_from_snapshot(const tidesdb_column_family_t *cf,
 
             if (tidesdb_sst_in_snapshot_array(snap_ids, snap_count, sst->id))
             {
-                tidesdb_sstable_ref(sst);
+                /* try_ref, not the unconditional ref, if the reaper is mid-eviction (refcount
+                 * TDB_REFCOUNT_EVICTING) the unconditional fetch_add corrupts the refcount and the
+                 * merge then reads a half-closed sstable, silently dropping a contiguous run of its
+                 * entries -- for a tombstone sstable that resurrects the deleted keys (btree-only,
+                 * its leaf chain is read sequentially). try_ref waits the eviction out and acquires
+                 * cleanly; if the reaper is stuck far past any close it returns 0 and we abort the
+                 * collect so the merge preserves its inputs and retries on a settled layout. */
+                if (!tidesdb_sstable_try_ref(sst))
+                {
+                    atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
+                    for (int k = 0; k < sst_idx; k++) tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    free(ssts_array);
+                    free(snap_ids);
+                    return TDB_ERR_BUSY;
+                }
                 ssts_array[sst_idx++] = sst;
             }
         }
@@ -13672,6 +13713,7 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
                 if (removed[i])
                 {
                     any_removed = 1;
+
                     tidesdb_manifest_remove_sstable(cf->manifest, removed_level[i], ssts[i]->id);
                 }
                 else
@@ -13849,6 +13891,7 @@ typedef struct
     size_t *boundary_sizes;
     int num_boundaries;
     uint64_t min_snapshot_seq;
+    uint64_t oldest_unflushed_seq;
     queue_t *sstables_to_delete;
     _Atomic(int) aborted;
 } tidesdb_full_preemptive_ctx_t;
@@ -13903,6 +13946,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         tidesdb_merge_heap_free(heap);
         return TDB_ERR_MEMORY;
     }
+
+    /* we sample the oldest unflushed write before the input snapshot so the reap gate is race-free:
+     * any immutable is then either counted here (still unflushed) or already on disk and captured
+     * by the snapshot below. see tidesdb_cf_oldest_unflushed_seq. */
+    const uint64_t fp_oldest_unflushed = tidesdb_cf_oldest_unflushed_seq(cf);
 
     queue_t *sstable_ids_snapshot = tidesdb_snapshot_sst_ids(cf, start_level, target_level);
     if (!sstable_ids_snapshot)
@@ -13979,7 +14027,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         if (fp_boundaries && fp_boundary_sizes)
         {
             /* boundaries are the output sstables' min keys, skipping the first so keys below it
-             * land in shard 0 (range_start = NULL). they MUST be strictly increasing to form a
+             * land in shard 0 (range_start = NULL). they must be strictly increasing to form a
              * valid key-range partition -- the first disk level holds overlapping runs added in
              * flush-completion order, not key order, so the array is not sorted. accept a min key
              * only when it exceeds the last accepted boundary; the resulting monotonic subset is a
@@ -14022,6 +14070,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     fctx.boundary_sizes = fp_boundary_sizes;
     fctx.num_boundaries = fp_num_boundaries;
     fctx.min_snapshot_seq = 0;
+    fctx.oldest_unflushed_seq = fp_oldest_unflushed;
     fctx.sstables_to_delete = sstables_to_delete;
     atomic_init(&fctx.aborted, 0);
 
@@ -14218,7 +14267,7 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
         {
             int btree_result = tidesdb_sstable_write_from_heap_btree(
                 cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level,
-                range_start, range_start_size, range_end, range_end_size);
+                range_start, range_start_size, range_end, range_end_size, c->oldest_unflushed_seq);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(heap);
@@ -14313,6 +14362,7 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
                 /* older same-key version -- drop silently.  we record whether the
                  * trailing version is a live put so a pending single-delete can
                  * pair-cancel with it when we resolve pending. */
+
                 if (pending_is_single_delete && !(kv->entry.flags & TDB_KV_FLAG_TOMBSTONE))
                 {
                     pending_sd_paired_with_put = 1;
@@ -14327,7 +14377,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
                 const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
                 const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
                                            is_largest_level &&
-                                           pending->entry.seq <= min_snapshot_seq;
+                                           pending->entry.seq <= min_snapshot_seq &&
+                                           pending->entry.seq < c->oldest_unflushed_seq;
                 const int ttl_drop =
                     pending->entry.ttl > 0 &&
                     pending->entry.ttl <
@@ -14783,6 +14834,9 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
      * so GC'ing a tombstone here would resurface them -- keep tombstones in that case. */
     const int is_largest_level = (target_level == num_levels - 1) && (min_input_level == 0);
 
+    /* oldest unflushed write -- gates tombstone reaping, see tidesdb_cf_oldest_unflushed_seq */
+    const uint64_t oldest_unflushed_seq = tidesdb_cf_oldest_unflushed_seq(cf);
+
     /* snapshot floor -- see tidesdb_sstable_write_from_heap_btree for rationale */
     const uint64_t min_snapshot_seq = tidesdb_min_active_snapshot_seq(cf->db);
 
@@ -14888,7 +14942,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     {
         int btree_result = tidesdb_sstable_write_from_heap_btree(
             cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level, NULL,
-            0, NULL, 0);
+            0, NULL, 0, oldest_unflushed_seq);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         tidesdb_merge_heap_free(heap);
@@ -14975,7 +15029,8 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
             const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
-                                       is_largest_level && pending->entry.seq <= min_snapshot_seq;
+                                       is_largest_level && pending->entry.seq <= min_snapshot_seq &&
+                                       pending->entry.seq < oldest_unflushed_seq;
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -15382,6 +15437,7 @@ typedef struct
     void *comparator_ctx;
     uint64_t partition_estimated_entries;
     uint64_t min_snapshot_seq;
+    uint64_t oldest_unflushed_seq;
     _Atomic(int) aborted;
 } tidesdb_dividing_merge_ctx_t;
 
@@ -15479,6 +15535,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     queue_t *sstables_to_delete = queue_new();
     if (!sstables_to_delete) return TDB_ERR_MEMORY;
+
+    /* oldest unflushed write, sampled before the snapshot -- gates tombstone reaping race-free */
+    const uint64_t dm_oldest_unflushed = tidesdb_cf_oldest_unflushed_seq(cf);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Snapshotting SSTable IDs from levels 1-%d", target_level + 1);
     queue_t *sstable_ids_snapshot = tidesdb_snapshot_sst_ids(cf, 0, target_level);
@@ -15594,6 +15653,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     dctx.cf = cf;
     dctx.target_level = target_level;
     dctx.is_largest_level = is_largest_level;
+    dctx.oldest_unflushed_seq = dm_oldest_unflushed;
     dctx.num_boundaries = num_boundaries;
     dctx.file_boundaries = file_boundaries;
     dctx.boundary_sizes = boundary_sizes;
@@ -15846,7 +15906,7 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
 
             int btree_result = tidesdb_sstable_write_from_heap_btree(
                 cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, is_largest_level,
-                range_start, range_start_size, range_end, range_end_size);
+                range_start, range_start_size, range_end, range_end_size, c->oldest_unflushed_seq);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -15945,7 +16005,8 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
                  * effective bottom of the tree (no deeper level holds data) */
                 const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
                                            is_largest_level &&
-                                           pending->entry.seq <= min_snapshot_seq;
+                                           pending->entry.seq <= min_snapshot_seq &&
+                                           pending->entry.seq < c->oldest_unflushed_seq;
                 const int ttl_drop =
                     pending->entry.ttl > 0 &&
                     pending->entry.ttl <
@@ -16516,6 +16577,7 @@ typedef struct
     int *partition_skipped;
     size_t file_max;
     int reap_tombstones;
+    uint64_t oldest_unflushed_seq;
     _Atomic(int) aborted;
 } tidesdb_partitioned_merge_ctx_t;
 
@@ -16582,6 +16644,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
 
     queue_t *sstables_to_delete = queue_new();
     if (!sstables_to_delete) return TDB_ERR_MEMORY;
+
+    /* oldest unflushed write, sampled before the snapshot -- gates tombstone reaping race-free */
+    const uint64_t pm_oldest_unflushed = tidesdb_cf_oldest_unflushed_seq(cf);
 
     queue_t *sstable_ids_snapshot = tidesdb_snapshot_sst_ids(cf, start_idx, end_idx);
     if (!sstable_ids_snapshot)
@@ -16741,6 +16806,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     pctx.partition_skipped = partition_skipped;
     pctx.file_max = file_max;
     pctx.reap_tombstones = reap_tombstones;
+    pctx.oldest_unflushed_seq = pm_oldest_unflushed;
     atomic_init(&pctx.aborted, 0);
 
     /* run the partition sub-merges across the sub-compaction helper pool (calling thread works
@@ -17016,7 +17082,7 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
             {
                 int btree_result = tidesdb_sstable_write_from_heap_btree(
                     cf, new_sst, heap, klog_bm, vlog_bm, bloom, NULL, reap_tombstones, range_start,
-                    range_start_size, range_end, range_end_size);
+                    range_start_size, range_end, range_end_size, c->oldest_unflushed_seq);
                 block_manager_close(klog_bm);
                 block_manager_close(vlog_bm);
                 tidesdb_merge_heap_free(heap);
@@ -26111,6 +26177,7 @@ unified_sst_search:;
             if (get_result == TDB_SUCCESS && candidate_kv)
             {
                 const uint64_t candidate_seq = candidate_kv->entry.seq;
+
                 const int accept =
                     (snapshot_seq == UINT64_MAX) ? 1 : (candidate_seq <= snapshot_seq);
 
@@ -29245,6 +29312,12 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                 /* we pin each immutable so a concurrent flush-worker eviction
                  * cannot free it before the merge source takes its own ref */
                 tidesdb_memtable_t *uimm = (tidesdb_memtable_t *)cur->data;
+                /* skip already-flushed immutables -- their data is durably in an sstable, so the
+                 * sstable snapshot covers them; reading a flushed immutable can resurrect a key
+                 * whose sstable copy was already compacted and reaped (mirrors the per-cf snapshot
+                 * and the unified point-get path). */
+                if (uimm && atomic_load_explicit(&uimm->flushed, memory_order_acquire)) continue;
+
                 unified_imm_snap[unified_imm_snap_count++] =
                     tidesdb_memtable_try_ref(uimm) ? uimm : NULL;
             }
@@ -34515,7 +34588,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
     db->compaction_paused = 1;
     pthread_mutex_unlock(&db->compaction_gate_lock);
 
-    /* drain compactions that were already past the gate when we paused before the first copy. a
+    /* we drain compactions that were already past the gate when we paused before the first copy. a
      * compaction running during the immutable copy rewrites the manifest and sstable set under it
      * (it removes the merged inputs and adds the output), so the copy can capture a manifest that
      * no longer matches the files on disk -- a committed key then lives in a removed input that is

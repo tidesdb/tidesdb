@@ -117,8 +117,7 @@ static void test_hmac_rfc4231_case7_large_key_and_data(void)
 /* integration -- the two additions (SHA-256 + HMAC-SHA-256) drive AWS SigV4 in the S3 connector.
  * reproduce the SigV4 signing-key chain (date -> region -> service -> aws4_request) and a final
  * signature exactly as src/objstore_s3.c does, and check against reference values computed with an
- * independent HMAC/SHA-256 (Python hmac+hashlib). this proves the modules interoperate correctly
- * for their real use, end to end, with no OpenSSL involved. */
+ * independent HMAC/SHA-256 (Python hmac+hashlib). */
 static void test_sigv4_signing_key_and_signature(void)
 {
     const char *secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";

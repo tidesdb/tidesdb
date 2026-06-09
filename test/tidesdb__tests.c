@@ -1021,14 +1021,13 @@ static void test_backup_concurrent_writes(void)
                     src_missing ? src_missing[t * PREBACKUP_KEYS_PER_THREAD + (i - start)] : -1;
                 if (backup_missing <= 3)
                 {
-                    fprintf(
-                        stderr,
-                        "DIAG backup: key '%s' missing from backup (rc=%d) -- present in source "
-                        "before close: %s\n",
-                        key, rc,
-                        sm == 1   ? "NO (upstream compaction loss in the source db)"
-                        : sm == 0 ? "YES (backup copy dropped a present key)"
-                                  : "unknown");
+                    fprintf(stderr,
+                            "backup: key '%s' missing from backup (rc=%d) -- present in source "
+                            "before close: %s\n",
+                            key, rc,
+                            sm == 1   ? "NO (upstream compaction loss in the source db)"
+                            : sm == 0 ? "YES (backup copy dropped a present key)"
+                                      : "unknown");
                     tdb_diag_dump_layout(backup_cf);
                 }
             }
@@ -10815,7 +10814,7 @@ static void test_btree_compaction_basic(void)
 static void tdb_diag_dump_layout(tidesdb_column_family_t *cf)
 {
     int nlev = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-    fprintf(stderr, "  DIAG layout: num_active_levels=%d\n", nlev);
+    fprintf(stderr, "  layout: num_active_levels=%d\n", nlev);
     for (int lv = 0; lv < nlev; lv++)
     {
         tidesdb_level_t *level = cf->levels[lv];
@@ -10823,13 +10822,13 @@ static void tdb_diag_dump_layout(tidesdb_column_family_t *cf)
         atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_acq_rel);
         int n = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         tidesdb_sstable_t **ssts = atomic_load_explicit(&level->sstables, memory_order_acquire);
-        fprintf(stderr, "  DIAG L%d: %d sstables\n", lv + 1, n);
+        fprintf(stderr, "  L%d: %d sstables\n", lv + 1, n);
         for (int s = 0; ssts && s < n; s++)
         {
             tidesdb_sstable_t *sst = ssts[s];
             if (!sst) continue;
             fprintf(stderr,
-                    "    DIAG sstable id=%llu entries=%llu tombstones=%llu max_seq=%llu "
+                    "    sstable id=%llu entries=%llu tombstones=%llu max_seq=%llu "
                     "min_key='%.*s' max_key='%.*s'\n",
                     (unsigned long long)sst->id, (unsigned long long)sst->num_entries,
                     (unsigned long long)sst->tombstone_count, (unsigned long long)sst->max_seq,
@@ -10867,7 +10866,7 @@ static void tdb_diag_probe_missing(tidesdb_t *db, tidesdb_column_family_t *cf, c
         tidesdb_iter_free(it);
     }
     tidesdb_txn_free(t);
-    fprintf(stderr, "  DIAG: CF '%s' key '%s' iterator-scan %s -- %s\n", cfname, (const char *)key,
+    fprintf(stderr, "CF '%s' key '%s' iterator-scan %s -- %s\n", cfname, (const char *)key,
             found_via_iter ? "FOUND" : "MISSING",
             found_via_iter ? "point-get READ miss (data present on disk)"
                            : "genuine write/compaction LOSS (absent from all read paths)");
@@ -11050,7 +11049,7 @@ static void test_btree_compaction_with_deletes(void)
                 if (resurfaced <= 3)
                 {
                     fprintf(stderr,
-                            "DIAG: deleted key '%s' FOUND value='%.*s' (vsize=%zu) "
+                            "deleted key '%s' FOUND value='%.*s' (vsize=%zu) "
                             "is_compacting=%d flush_q=%zu compact_q=%zu\n",
                             key, value ? (int)value_size : 0, value ? (char *)value : "",
                             value_size, tidesdb_is_compacting(cf), queue_size(db->flush_queue),
@@ -11071,7 +11070,7 @@ static void test_btree_compaction_with_deletes(void)
                         if (rr == 0) still++;
                     }
                     fprintf(
-                        stderr, "DIAG: re-read '%s' still-found %d/30 (%s)\n", key, still,
+                        stderr, "re-read '%s' still-found %d/30 (%s)\n", key, still,
                         still >= 28 ? "PERSISTENT" : (still == 0 ? "TRANSIENT" : "INTERMITTENT"));
 
                     /* does an iterator (a different read path) also find it? iterator FOUND means
@@ -11099,7 +11098,7 @@ static void test_btree_compaction_with_deletes(void)
                             }
                             tidesdb_txn_free(it_txn);
                         }
-                        fprintf(stderr, "DIAG: '%s' iterator-scan %s -- %s\n", key,
+                        fprintf(stderr, "'%s' iterator-scan %s -- %s\n", key,
                                 iter_found ? "FOUND" : "MISSING",
                                 iter_found ? "genuinely in the data (merge/content bug)"
                                            : "point-get only (stale read / cached btree node bug)");
@@ -11119,7 +11118,7 @@ static void test_btree_compaction_with_deletes(void)
                                 tidesdb_iter_seek_to_first(sit) == 0)
                             {
                                 int cnt = 0;
-                                fprintf(stderr, "  DIAG full key set:");
+                                fprintf(stderr, "  full key set:");
                                 while (tidesdb_iter_valid(sit))
                                 {
                                     uint8_t *ik = NULL, *iv = NULL;
@@ -11131,7 +11130,7 @@ static void test_btree_compaction_with_deletes(void)
                                     cnt++;
                                     if (tidesdb_iter_next(sit) != 0) break;
                                 }
-                                fprintf(stderr, "\n  DIAG total keys via iterator: %d\n", cnt);
+                                fprintf(stderr, "\n  total keys via iterator: %d\n", cnt);
                             }
                             if (sit) tidesdb_iter_free(sit);
                             tidesdb_txn_free(st);
@@ -11151,6 +11150,154 @@ static void test_btree_compaction_with_deletes(void)
     }
 
     ASSERT_EQ(resurfaced, 0); /* deleted keys must not be found */
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_block_compaction_with_deletes(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t dbcfg = tidesdb_default_config();
+    dbcfg.db_path = TEST_DB_PATH;
+    dbcfg.block_cache_size = 0;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&dbcfg, &db), 0);
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.level_size_ratio = 10;
+    cf_config.use_btree = 0;
+    cf_config.enable_block_indexes = 0;
+    cf_config.enable_bloom_filter = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "block_del_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "block_del_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        snprintf(value, sizeof(value), "del_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 10 == 9) tidesdb_flush_memtable(cf);
+    }
+
+    for (int i = 0; i < 100; i += 2)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    int resurfaced = 0;
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result =
+            tdb_test_get_with_retry(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (i % 2 == 0)
+        {
+            if (result == 0)
+            {
+                resurfaced++;
+                tidesdb_txn_t *it_txn = NULL;
+                int iter_found = 0;
+                if (tidesdb_txn_begin(db, &it_txn) == 0)
+                {
+                    tidesdb_iter_t *it = NULL;
+                    if (tidesdb_iter_new(it_txn, cf, &it) == 0 && it)
+                    {
+                        if (tidesdb_iter_seek(it, (uint8_t *)key, strlen(key) + 1) == 0 &&
+                            tidesdb_iter_valid(it))
+                        {
+                            uint8_t *ik = NULL;
+                            size_t iks = 0;
+                            if (tidesdb_iter_key(it, &ik, &iks) == 0 && ik &&
+                                iks == strlen(key) + 1 && memcmp(ik, key, iks) == 0)
+                                iter_found = 1;
+                        }
+                        tidesdb_iter_free(it);
+                    }
+                    tidesdb_txn_free(it_txn);
+                }
+                fprintf(stderr, "block '%s' iterator-scan %s\n", key,
+                        iter_found ? "FOUND" : "MISSING");
+                if (iter_found && resurfaced == 1)
+                {
+                    /* dump every live sstable whose key range covers the resurrected key, with its
+                     * tombstone count and marked_for_deletion -- the lingering put-sstable (range
+                     * covers the key, ntomb=0, possibly marked) is the orphan we're hunting. */
+                    for (int L = 0; L < atomic_load(&cf->num_active_levels); L++)
+                    {
+                        tidesdb_level_t *lvl = cf->levels[L];
+                        int ns = atomic_load(&lvl->num_sstables);
+                        tidesdb_sstable_t **arr = atomic_load(&lvl->sstables);
+                        for (int s = 0; s < ns; s++)
+                        {
+                            tidesdb_sstable_t *st = arr[s];
+                            if (!st || !st->min_key || !st->max_key) continue;
+                            if (strcmp((char *)st->min_key, key) <= 0 &&
+                                strcmp((char *)st->max_key, key) >= 0)
+                                fprintf(stderr,
+                                        "  COVERS '%s': sst_id=%llu L%d min=%s max=%s nent=%llu "
+                                        "ntomb=%llu marked=%d klog=%s\n",
+                                        key, (unsigned long long)st->id, L, (char *)st->min_key,
+                                        (char *)st->max_key, (unsigned long long)st->num_entries,
+                                        (unsigned long long)st->tombstone_count,
+                                        (int)st->marked_for_deletion,
+                                        st->klog_path ? (char *)st->klog_path : "?");
+                        }
+                    }
+                    fflush(stderr);
+                }
+            }
+            if (value) free(value);
+        }
+        else
+        {
+            ASSERT_EQ(result, 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    ASSERT_EQ(resurfaced, 0);
 
     tidesdb_txn_free(txn);
     tidesdb_close(db);
@@ -30536,6 +30683,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_compaction_basic, tests_passed);
     RUN_TEST(test_btree_concurrent_scan_no_skip, tests_passed);
     RUN_TEST(test_btree_compaction_with_deletes, tests_passed);
+    RUN_TEST(test_block_compaction_with_deletes, tests_passed);
     RUN_TEST(test_btree_flush_basic, tests_passed);
     RUN_TEST(test_btree_dca_min_levels_constraint, tests_passed);
     RUN_TEST(test_btree_merge_heap_source_exhaustion, tests_passed);

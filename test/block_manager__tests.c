@@ -3144,10 +3144,14 @@ void test_block_manager_write_raw_signal_safe(void)
         iterations++;
     }
 
-    /* disarm timer, then discard any SIGALRM the timer left pending before restoring the original
-     * disposition. restoring straight to a default-action handler delivers a still-pending alarm
-     * under it and terminates the process -- an intermittent SIGALRM kill, mostly on macOS/BSD
-     * where timer/signal delivery is coarser. setting SIG_IGN discards the pending instance. */
+    /* disarm the timer, then set SIGALRM to SIG_IGN -- this discards any pending instance
+     * process-wide (across every thread). ITIMER_REAL is process-directed, so with helper threads
+     * present (e.g. a multi-threaded allocator like mimalloc) a tick can already be selected for
+     * delivery to another thread when we get here. restoring the default (terminate) action would
+     * let that late alarm kill the process -- a ~1-in-50k SIGALRM kill, more likely the more
+     * unblocked threads exist. so leave SIGALRM ignored (the timer is off and this test is its only
+     * user) and only restore old_sa when it was an actual handler rather than the default action.
+     */
     memset(&itv, 0, sizeof(itv));
     setitimer(ITIMER_REAL, &itv, NULL);
     struct sigaction ignore_sa;
@@ -3155,7 +3159,8 @@ void test_block_manager_write_raw_signal_safe(void)
     ignore_sa.sa_handler = SIG_IGN;
     sigemptyset(&ignore_sa.sa_mask);
     sigaction(SIGALRM, &ignore_sa, NULL);
-    sigaction(SIGALRM, &old_sa, NULL);
+    if (old_sa.sa_handler != SIG_DFL || (old_sa.sa_flags & SA_SIGINFO))
+        sigaction(SIGALRM, &old_sa, NULL);
 
     ASSERT_EQ(failures, 0);
     ASSERT_TRUE(g_signal_count > 0);

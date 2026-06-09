@@ -21855,7 +21855,11 @@ static void test_stress_unified_read_races(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    cf_config.write_buffer_size = 4096;
+    /* 64 KiB buffer (not 4 KiB) -- a 4 KiB buffer made each flush ~14-24 entries, so 9000 commits
+     * produced hundreds of tiny SSTables and a constant compaction storm. with ratio 4 + min_levels
+     * 4 the data still spills L1->L4, so the multi-level read/flush/compaction races are preserved
+     * with ~10x less flush/compaction (and allocator) churn. */
+    cf_config.write_buffer_size = 65536;
     cf_config.level_size_ratio = 4;
     cf_config.min_levels = 4;
     cf_config.compression_algorithm = TDB_COMPRESS_LZ4;

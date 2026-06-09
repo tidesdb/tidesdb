@@ -20119,6 +20119,11 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     if (!config || !db) return TDB_ERR_INVALID_ARGS;
 
+    /* apply the configured log level before any open-time logging, otherwise every TDB_DEBUG_LOG
+     * during open (the fd-budget line, thread-pool notes, recovery) is gated on the default DEBUG
+     * level and prints even when the caller asked for a quieter level or TDB_LOG_NONE */
+    _tidesdb_log_level = config->log_level;
+
     *db = calloc(1, sizeof(tidesdb_t));
     if (!*db)
     {
@@ -20230,8 +20235,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         ((*db)->config.object_store_config && (*db)->config.object_store_config->replica_mode) ? 1
                                                                                                : 0);
     atomic_init(&(*db)->replica_sync_thread_active, 0);
-
-    _tidesdb_log_level = config->log_level;
 
     /* we initialize log file to NULL (stderr) by default. the log file globals
      * are read by tidesdb_log_write under tidesdb_log_mutex, so writes here take

@@ -16912,6 +16912,14 @@ static void test_database_lock_released_on_close(void)
 
 static void test_database_lock_multi_process(void)
 {
+    /* forks child processes to contend for the directory lock, which qemu usermode cannot run
+     * reliably */
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
     cleanup_test_dir();
 
     tidesdb_config_t config = tidesdb_default_config();
@@ -30357,6 +30365,13 @@ static void test_crash_single_delete_replay(void)
  * the parent reopens and verifies nothing committed was lost. */
 static void test_crash_recovery_no_clean_close(void)
 {
+    /* spawns child processes via fork/exec, which qemu usermode emulation cannot run reliably */
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
     static const struct
     {
         int unified;

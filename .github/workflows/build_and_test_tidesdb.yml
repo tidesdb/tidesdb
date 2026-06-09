@@ -435,7 +435,11 @@ jobs:
             # logging the segfault for diagnosis. wrap in `timeout` so a hung qemu
             # cannot burn the full ctest budget.
             echo "**Linux PowerPC 32-bit: running tests via qemu-user-static (best effort)"
-            timeout 1800 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests \
+            # TIDESDB_QEMU_SKIP activates the in-test guards for cases qemu usermode cannot emulate
+            # (allocator swap, oom, fork/exec children) -- otherwise the first such test crashes the
+            # whole binary and every later test goes unrun. qemu-user forwards the host env to the
+            # target, so getenv() sees it inside the emulated process.
+            TIDESDB_QEMU_SKIP=1 timeout 1800 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests \
               || echo "**qemu-ppc-static exit non-zero -- see log above; build verification still valid"
           elif [ "${{ matrix.arch }}" == "ppc-macos" ]; then
             # macOS PowerPC (G5): the cross-build emits Mach-O PowerPC binaries
@@ -445,7 +449,10 @@ jobs:
             # 10+ min boot per CI). build verification is the realistic ceiling.
             echo "**macOS PowerPC (G5): build verified, runtime tests not possible on a Linux runner (Mach-O PPC has no Linux execution path)"
           elif [ "${{ matrix.arch }}" == "riscv64" ]; then
-            CTEST_OUTPUT_ON_FAILURE=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
+            # TIDESDB_QEMU_SKIP activates the in-test guards for cases qemu usermode cannot emulate
+            # (allocator swap, oom, fork/exec children) so one such test does not abort the binary
+            # and skip every test after it. qemu-user forwards the host env to the target.
+            CTEST_OUTPUT_ON_FAILURE=1 TIDESDB_QEMU_SKIP=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
             echo "**Linux RISC-V 64-bit tests run via QEMU emulation"
           else
             ctest -V --output-on-failure --timeout 5400 --build-config Release

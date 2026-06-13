@@ -2691,8 +2691,6 @@ void *aba_thread_a(void *arg)
 {
     aba_ctx_t *ctx = (aba_ctx_t *)arg;
 
-    /* Phase 1: Thread A does an insert to initialize its _Thread_local cache.
-     * tl_cached_arena is now set to list1->arena. */
     uint8_t key[] = "A_init";
     uint8_t val[] = "val";
     skip_list_put_with_seq(ctx->list1, key, sizeof(key), val, sizeof(val), -1, 1, 0);
@@ -2705,9 +2703,6 @@ void *aba_thread_a(void *arg)
     {
     }
 
-    /* Phase 2: Insert into list2.
-     * BUG TRIGGER: list2->arena has the exact same memory address that list1->arena had.
-     * Thread A bypasses the slot counter and incorrectly assumes it owns slot 0! */
     for (int i = 0; i < 50000; i++)
     {
         char k[32];

@@ -63,6 +63,11 @@
 #define BLOCK_MANAGER_PREALLOC_CHUNK    (64ull * 1024 * 1024) /* extend by 64 MB at a time */
 #define BLOCK_MANAGER_PREALLOC_LOWWATER (4ull * 1024 * 1024)  /* trigger extend when 4 MB left */
 
+/* sstable-construction writeback pacing: when smoothing is enabled, start async writeback
+ * of the file each time this many bytes accumulate since the last hint, so the final
+ * fdatasync barrier flushes only a small residual rather than the whole sstable */
+#define BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES (1ull * 1024 * 1024)
+
 typedef enum
 {
     BLOCK_MANAGER_SYNC_NONE, /* no per-write fsync; durability left to the caller/group-commit */
@@ -93,6 +98,12 @@ typedef enum
  * @param group_durable_size bytes of the file confirmed fdatasync'd, used by group-commit
  *                           callers to tell whether their write is already durable
  * @param group_sync_active set while a group-commit leader is mid-fdatasync on this file
+ * @param smooth_writeback 1 when this file is a single-writer sstable under construction and
+ *                         block writes should dribble async writeback every
+ *                         BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES. read-only after open.
+ * @param smooth_synced_offset construction-writer cursor, file offset already handed to async
+ *                             writeback. only touched by the single construction thread (never
+ *                             set on concurrently-written files), so it needs no atomicity.
  */
 typedef struct
 {
@@ -100,6 +111,8 @@ typedef struct
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
     int sync_full_cached; /* cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL) */
+    int smooth_writeback; /* read-only after open; see block_manager_enable_smooth_writeback */
+    uint64_t smooth_synced_offset; /* single-writer construction cursor, no atomicity needed */
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;
@@ -444,6 +457,16 @@ uint64_t block_manager_framed_size(uint32_t payload_size);
  * @return 0 if successful, -1 if not
  */
 int block_manager_escalate_fsync(block_manager_t *bm);
+
+/**
+ * block_manager_enable_smooth_writeback
+ * marks this block manager as a single-writer sstable under construction, so each block
+ * write dribbles asynchronous writeback every BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES. this
+ * keeps the closing fdatasync barrier from flushing the whole file in one stalling syscall.
+ * must only be called on a freshly opened, exclusively written file (never the WAL).
+ * @param bm the block manager
+ */
+void block_manager_enable_smooth_writeback(block_manager_t *bm);
 
 /**
  * block_manager_cursor_at_last

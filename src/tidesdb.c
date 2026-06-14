@@ -1124,6 +1124,47 @@ static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path
 }
 
 /**
+ * tidesdb_sstable_sync_barrier
+ * durability barrier for a freshly built sstable -- flushes the klog and vlog so they are on disk
+ * before the manifest commit publishes them. honored only when sync is on FULL and INTERVAL both
+ * fsync here (INTERVAL sstables carry full durability; only their WAL is deferred to the interval
+ * worker). TDB_SYNC_NONE intentionally skips, mirroring InnoDB's O_DIRECT_NO_FSYNC -- a crash may
+ * then leave a manifest referencing a not-yet-durable sstable. smooth-writeback pacing during
+ * construction keeps this barrier from stalling on the whole file in one syscall.
+ * @param sync_mode the column family's sync mode
+ * @param klog_bm klog block manager (may be NULL)
+ * @param vlog_bm vlog block manager (may be NULL)
+ */
+static inline void tidesdb_sstable_sync_barrier(int sync_mode, block_manager_t *klog_bm,
+                                                block_manager_t *vlog_bm)
+{
+    if (sync_mode == TDB_SYNC_NONE) return;
+    if (klog_bm) block_manager_escalate_fsync(klog_bm);
+    if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
+}
+
+/**
+ * tidesdb_bm_open_sstable
+ * opens a block manager over an sstable file (klog or vlog), for construction or reopen. sstables
+ * are immutable once built and reads never sync, so per-write syncing is never needed -- we open
+ * without it (TDB_SYNC_NONE) and enable smooth writeback. on the single-writer construction path
+ * that paces dirty pages out so the closing tidesdb_sstable_sync_barrier flushes only a small
+ * residual instead of the whole file in one stalling syscall; on reopened read-only sstables it
+ * never fires. durability for FULL/INTERVAL is provided by that closing barrier (and the manifest
+ * commit); NONE skips both.
+ * @param db database instance
+ * @param bm receives the opened block manager
+ * @param path the sstable file path
+ * @return 0 on success, non-zero on failure (same as tidesdb_bm_open)
+ */
+static int tidesdb_bm_open_sstable(tidesdb_t *db, block_manager_t **bm, const char *path)
+{
+    const int rc = tidesdb_bm_open(db, bm, path, TDB_SYNC_NONE);
+    if (rc == 0 && *bm) block_manager_enable_smooth_writeback(*bm);
+    return rc;
+}
+
+/**
  * tidesdb_sstable_open_budget
  * the descriptor budget for resident open sstables, max_open_sstables minus the reserve held for
  * flush/compaction. both the reader admission check and the reaper's eviction trigger use this, so
@@ -6234,10 +6275,7 @@ static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *ss
     }
 
     block_manager_t *new_klog_bm = NULL;
-    if (tidesdb_bm_open(db, &new_klog_bm, sst->klog_path,
-                        convert_sync_mode(sst->config->sync_mode == TDB_SYNC_INTERVAL
-                                              ? TDB_SYNC_FULL
-                                              : sst->config->sync_mode)) != 0)
+    if (tidesdb_bm_open_sstable(db, &new_klog_bm, sst->klog_path) != 0)
     {
         if (tdb_log_throttle(db, &db->last_open_fail_log_sec,
                              TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
@@ -6285,8 +6323,7 @@ static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *ss
     }
 
     block_manager_t *new_vlog_bm = NULL;
-    if (tidesdb_bm_open(db, &new_vlog_bm, sst->vlog_path,
-                        convert_sync_mode(sst->config->sync_mode)) != 0)
+    if (tidesdb_bm_open_sstable(db, &new_vlog_bm, sst->vlog_path) != 0)
     {
         if (tdb_log_throttle(db, &db->last_open_fail_log_sec,
                              TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
@@ -7687,8 +7724,7 @@ static int tidesdb_sstable_write_footer(tidesdb_sstable_t *sst, block_manager_t 
     block_manager_get_size(klog_bm, &sst->klog_size);
     block_manager_get_size(vlog_bm, &sst->vlog_size);
 
-    if (klog_bm) block_manager_escalate_fsync(klog_bm);
-    if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
+    tidesdb_sstable_sync_barrier(sst->config->sync_mode, klog_bm, vlog_bm);
 
     return TDB_SUCCESS;
 }
@@ -7996,8 +8032,7 @@ static int tidesdb_sstable_write_from_memtable_btree_ex(tidesdb_t *db, tidesdb_c
     block_manager_get_size(klog_bm, &sst->klog_size);
     block_manager_get_size(vlog_bm, &sst->vlog_size);
 
-    if (klog_bm) block_manager_escalate_fsync(klog_bm);
-    if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
+    tidesdb_sstable_sync_barrier(sst->config->sync_mode, klog_bm, vlog_bm);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO,
                   "SSTable %" PRIu64 " btree flush complete: %" PRIu64 " entries, root=%ld",
@@ -8320,8 +8355,7 @@ static int tidesdb_sstable_write_from_heap_btree(
     btree_free(tree);
     btree_builder_free(builder);
 
-    if (klog_bm) block_manager_escalate_fsync(klog_bm);
-    if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
+    tidesdb_sstable_sync_barrier(sst->config->sync_mode, klog_bm, vlog_bm);
 
     /* write-amplification -- on-disk bytes this merge output produced. read the managers
      * directly, the metadata block above lands after sst->klog_size was snapshotted, so a
@@ -13727,7 +13761,8 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
             if (any_removed)
             {
                 tidesdb_bump_sstable_layout_version(cf);
-                if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path) != 0)
+                if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                            cf->config.sync_mode != TDB_SYNC_NONE) != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to commit manifest after merge cleanup");
                 }
@@ -14202,14 +14237,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
 
         block_manager_t *klog_bm = NULL;
         block_manager_t *vlog_bm = NULL;
-        if (tidesdb_bm_open(cf->db, &klog_bm, new_sst->klog_path,
-                            convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                  ? TDB_SYNC_FULL
-                                                  : cf->config.sync_mode)) != 0 ||
-            tidesdb_bm_open(cf->db, &vlog_bm, new_sst->vlog_path,
-                            convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                  ? TDB_SYNC_FULL
-                                                  : cf->config.sync_mode)) != 0)
+        if (tidesdb_bm_open_sstable(cf->db, &klog_bm, new_sst->klog_path) != 0 ||
+            tidesdb_bm_open_sstable(cf->db, &vlog_bm, new_sst->vlog_path) != 0)
         {
             if (klog_bm) block_manager_close(klog_bm);
             if (vlog_bm) block_manager_close(vlog_bm);
@@ -14675,8 +14704,7 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
 
         tidesdb_merge_heap_free(heap);
 
-        block_manager_escalate_fsync(klog_bm);
-        block_manager_escalate_fsync(vlog_bm);
+        tidesdb_sstable_sync_barrier(cf->config.sync_mode, klog_bm, vlog_bm);
 
         new_sst->klog_bm = klog_bm;
         new_sst->vlog_bm = vlog_bm;
@@ -14764,7 +14792,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
                 atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                int manifest_result = tidesdb_manifest_commit(
+                    cf->manifest, cf->manifest->path, cf->config.sync_mode != TDB_SYNC_NONE);
                 if (manifest_result != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR,
@@ -14879,10 +14908,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     block_manager_t *klog_bm = NULL;
     block_manager_t *vlog_bm = NULL;
 
-    if (block_manager_open(&klog_bm, new_sst->klog_path,
-                           convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                 ? TDB_SYNC_FULL
-                                                 : cf->config.sync_mode)) != 0)
+    if (tidesdb_bm_open_sstable(cf->db, &klog_bm, new_sst->klog_path) != 0)
     {
         /* mark so sstable_free unlinks any klog file the failed open created */
         atomic_store_explicit(&new_sst->marked_for_deletion, 1, memory_order_release);
@@ -14893,10 +14919,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         return TDB_ERR_IO;
     }
 
-    if (block_manager_open(&vlog_bm, new_sst->vlog_path,
-                           convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                 ? TDB_SYNC_FULL
-                                                 : cf->config.sync_mode)) != 0)
+    if (tidesdb_bm_open_sstable(cf->db, &vlog_bm, new_sst->vlog_path) != 0)
     {
         block_manager_close(klog_bm);
         /* mark so sstable_free unlinks the klog file the successful open created */
@@ -15314,8 +15337,7 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
 
     tidesdb_merge_heap_free(heap);
 
-    block_manager_escalate_fsync(klog_bm);
-    block_manager_escalate_fsync(vlog_bm);
+    tidesdb_sstable_sync_barrier(cf->config.sync_mode, klog_bm, vlog_bm);
 
     new_sst->klog_bm = klog_bm;
     new_sst->vlog_bm = vlog_bm;
@@ -15388,7 +15410,8 @@ merge_complete:;
                                          new_sst->id, new_sst->num_entries,
                                          new_sst->klog_size + new_sst->vlog_size);
             atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                    cf->config.sync_mode != TDB_SYNC_NONE);
             tdb_objstore_upload_manifest(cf->db, cf);
 
             tidesdb_sstable_unref(cf->db, new_sst);
@@ -15825,20 +15848,14 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
         block_manager_t *klog_bm = NULL;
         block_manager_t *vlog_bm = NULL;
 
-        if (block_manager_open(&klog_bm, new_sst->klog_path,
-                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                     ? TDB_SYNC_FULL
-                                                     : cf->config.sync_mode)) != 0)
+        if (tidesdb_bm_open_sstable(cf->db, &klog_bm, new_sst->klog_path) != 0)
         {
             tidesdb_merge_heap_free(partition_heap);
             tidesdb_sstable_unref(cf->db, new_sst);
             continue;
         }
 
-        if (block_manager_open(&vlog_bm, new_sst->vlog_path,
-                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                     ? TDB_SYNC_FULL
-                                                     : cf->config.sync_mode)) != 0)
+        if (tidesdb_bm_open_sstable(cf->db, &vlog_bm, new_sst->vlog_path) != 0)
         {
             block_manager_close(klog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -16370,7 +16387,8 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
                 atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                int manifest_result = tidesdb_manifest_commit(
+                    cf->manifest, cf->manifest->path, cf->config.sync_mode != TDB_SYNC_NONE);
                 if (manifest_result != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_ERROR,
@@ -16524,7 +16542,8 @@ static int tdb_partitioned_merge_finalize_sst(
         tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num, sst->id,
                                      sst->num_entries, sst->klog_size + sst->vlog_size);
         atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-        const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+        const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                                            cf->config.sync_mode != TDB_SYNC_NONE);
         if (manifest_result != 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR,
@@ -17022,14 +17041,8 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
              * dereference a NULL block manager. abort the merge instead; the aborted path preserves
              * the source sstables, so no data is lost and compaction retries later. routed through
              * tidesdb_bm_open so a transient fd spike gets a reaper-assisted retry first. */
-            if (tidesdb_bm_open(cf->db, &klog_bm, new_sst->klog_path,
-                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                      ? TDB_SYNC_FULL
-                                                      : cf->config.sync_mode)) != 0 ||
-                tidesdb_bm_open(cf->db, &vlog_bm, new_sst->vlog_path,
-                                convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                      ? TDB_SYNC_FULL
-                                                      : cf->config.sync_mode)) != 0)
+            if (tidesdb_bm_open_sstable(cf->db, &klog_bm, new_sst->klog_path) != 0 ||
+                tidesdb_bm_open_sstable(cf->db, &vlog_bm, new_sst->vlog_path) != 0)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
                               "CF '%s' partitioned merge failed to open output sstable for "
@@ -17448,16 +17461,9 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
                              * key (dedup by seq) and compaction retries. the post-loop finalize is
                              * guarded on new_sst/klog_bm so the NULL'd state below is never used.
                              */
-                            if (tidesdb_bm_open(
-                                    cf->db, &klog_bm, new_sst->klog_path,
-                                    convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                          ? TDB_SYNC_FULL
-                                                          : cf->config.sync_mode)) != 0 ||
-                                tidesdb_bm_open(
-                                    cf->db, &vlog_bm, new_sst->vlog_path,
-                                    convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
-                                                          ? TDB_SYNC_FULL
-                                                          : cf->config.sync_mode)) != 0)
+                            if (tidesdb_bm_open_sstable(cf->db, &klog_bm, new_sst->klog_path) !=
+                                    0 ||
+                                tidesdb_bm_open_sstable(cf->db, &vlog_bm, new_sst->vlog_path) != 0)
                             {
                                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
                                               "CF '%s' partitioned merge failed to open split "
@@ -18657,13 +18663,13 @@ static void *tidesdb_flush_worker_thread(void *arg)
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&cf->flush_count, 1, memory_order_relaxed);
 
-        /* we must always sync sstable files regardless of sync_mode
-         * sstable durability is required before we can delete WAL */
+        /* durability barrier before the WAL is deleted FULL/INTERVAL fsync the sstable here, so
+         * a crash can never lose flushed data that the WAL no longer holds. NONE skips (the WAL is
+         * likewise unsynced under NONE, so the contract is uniform) */
         tidesdb_block_managers_t bms;
         if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
         {
-            if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-            if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+            tidesdb_sstable_sync_barrier(cf->config.sync_mode, bms.klog_bm, bms.vlog_bm);
         }
 
         /* we ensure all writes are visible before making sstable discoverable */
@@ -18769,7 +18775,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
                                      sst->klog_size + sst->vlog_size);
         atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-        int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+        int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                                      cf->config.sync_mode != TDB_SYNC_NONE);
         if (manifest_result != 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR,
@@ -23101,7 +23108,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
         /* commit + upload the empty MANIFEST so replicas can discover this CF
          * before its first flush -- discovery keys off <cf>/MANIFEST */
-        if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path) == 0)
+        if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                    cf->config.sync_mode != TDB_SYNC_NONE) == 0)
         {
             tdb_objstore_upload_file_sync(db, cf->manifest->path);
         }
@@ -23707,7 +23715,8 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
             pthread_rwlock_unlock(&cf->manifest->lock);
 
             /* we commit manifest to new location to ensure it's written */
-            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            tidesdb_manifest_commit(cf->manifest, manifest_path,
+                                    cf->config.sync_mode != TDB_SYNC_NONE);
         }
     }
 
@@ -27913,8 +27922,7 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
     {
-        if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-        if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+        tidesdb_sstable_sync_barrier(cf->config.sync_mode, bms.klog_bm, bms.vlog_bm);
     }
     /* the write opened the klog via tidesdb_sstable_ensure_open, which counted it in
      * num_open_sstables (the count is keyed on the klog). closing it here must drop that count or
@@ -27958,7 +27966,8 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     tidesdb_manifest_add_sstable(cf->manifest, 1, sst_id, sst->num_entries,
                                  sst->klog_size + sst->vlog_size);
     atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
-    const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+    const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                                        cf->config.sync_mode != TDB_SYNC_NONE);
     if (manifest_result != 0)
         TDB_DEBUG_LOG(TDB_LOG_ERROR,
                       "Unified flush CF '%s' failed to commit manifest for SSTable %" PRIu64
@@ -34851,7 +34860,8 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         /* we commit manifest to ensure it reflects current state */
         if (cf->manifest)
         {
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                    cf->config.sync_mode != TDB_SYNC_NONE);
         }
 
         /* we create CF directory in checkpoint */

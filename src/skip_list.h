@@ -72,6 +72,7 @@ struct skip_list_arena_block_t
  * @param tl_blocks thread-local block pointers indexed by thread slot
  * @param tl_slot_counter atomic counter for assigning thread slots
  * @param all_blocks_head atomic linked list of all blocks for destruction
+ * @param arena_id unique generation ID to prevent ABA slot collisions
  */
 struct skip_list_arena_t
 {
@@ -80,6 +81,7 @@ struct skip_list_arena_t
     _Atomic(skip_list_arena_block_t *) tl_blocks[SKIP_LIST_ARENA_MAX_THREADS];
     _Atomic(int) tl_slot_counter;
     _Atomic(skip_list_arena_block_t *) all_blocks_head;
+    uint64_t arena_id;
 };
 
 /* skip_list_version_t flag bits */

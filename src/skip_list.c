@@ -19,10 +19,14 @@
 
 #include "skip_list.h"
 
+/* global counter for generating unique arena IDs */
+static _Atomic(uint64_t) global_arena_id_counter = 0;
+
 /* thread-local cache for arena slot assignment
  * each thread caches its slot for one arena at a time
  * if the arena changes, we must get a new slot from that arena */
 static _Thread_local skip_list_arena_t *tl_cached_arena = NULL;
+static _Thread_local uint64_t tl_cached_arena_id = 0; /* cache the generation ID */
 static _Thread_local int tl_arena_slot = -1;
 
 /**
@@ -95,6 +99,10 @@ static skip_list_arena_t *skip_list_arena_create(const size_t initial_capacity)
         atomic_init(&arena->tl_blocks[i], NULL);
     }
 
+    /* we must assign a globally unique generation ID */
+    arena->arena_id =
+        atomic_fetch_add_explicit(&global_arena_id_counter, 1, memory_order_relaxed) + 1;
+
     return arena;
 }
 
@@ -107,8 +115,11 @@ static skip_list_arena_t *skip_list_arena_create(const size_t initial_capacity)
  */
 static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
 {
-    /* fast path -- cached slot for this arena */
-    if (SKIP_LIST_LIKELY(tl_cached_arena == arena && tl_arena_slot >= 0))
+    /* fast path -- cached slot for this arena.
+     * we check both the memory address AND the unique generation ID to prevent ABA
+     * collisions if the OS recycles the arena's memory address. */
+    if (SKIP_LIST_LIKELY(tl_cached_arena == arena && tl_cached_arena_id == arena->arena_id &&
+                         tl_arena_slot >= 0))
     {
         return tl_arena_slot;
     }
@@ -120,7 +131,9 @@ static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
         return -1;
     }
 
+    /* cache the pointer, the ID, and the slot */
     tl_cached_arena = arena;
+    tl_cached_arena_id = arena->arena_id;
     tl_arena_slot = slot;
     return slot;
 }

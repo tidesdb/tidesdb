@@ -33731,9 +33731,17 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
         /* per-cf active memtable + its immutable queue contribute to the
          * memtable byte total (empty in unified mode, summed below instead).
          * flushed immutables are skipped, their bytes are already on disk */
-        tidesdb_memtable_t *amt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-        if (amt && amt->skip_list)
-            stats->total_memtable_bytes += (int64_t)skip_list_get_size(amt->skip_list);
+        /* pin the active memtable before touching its skip list -- a raw load+deref races a
+         * concurrent rotation that flushes and frees the old active out from under us (the UAF
+         * seen at shutdown, where every CF dumps its memtable at once). try_ref mirrors the
+         * read path and the per-CF memory-pressure scan */
+        tidesdb_memtable_t *amt = NULL;
+        if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &amt))
+        {
+            if (amt->skip_list)
+                stats->total_memtable_bytes += (int64_t)skip_list_get_size(amt->skip_list);
+            tidesdb_immutable_memtable_unref(amt);
+        }
         if (cf->immutable_memtables)
         {
             queue_t *iq = cf->immutable_memtables;
@@ -33787,10 +33795,15 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
     stats->unified_memtable_enabled = db->unified_mt.enabled;
     if (db->unified_mt.enabled)
     {
-        tidesdb_memtable_t *umt =
-            atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
-        if (umt && umt->skip_list)
-            stats->unified_memtable_bytes = (int64_t)skip_list_get_size(umt->skip_list);
+        /* pin before reading -- same rotation/free race as the per-CF active memtable above */
+        tidesdb_memtable_t *umt = NULL;
+        if (tidesdb_active_memtable_try_ref(&db->unified_mt.active_mt_readers,
+                                            &db->unified_mt.active, &umt))
+        {
+            if (umt->skip_list)
+                stats->unified_memtable_bytes = (int64_t)skip_list_get_size(umt->skip_list);
+            tidesdb_immutable_memtable_unref(umt);
+        }
         stats->total_memtable_bytes += stats->unified_memtable_bytes;
 
         if (db->unified_mt.immutables)

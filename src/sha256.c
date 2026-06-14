@@ -105,19 +105,42 @@ void sha256_init(sha256_ctx *ctx)
 
 void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len)
 {
-    for (size_t i = 0; i < len; i++)
+    size_t i = 0;
+
+    /* Process any partial block first */
+    if (ctx->datalen > 0)
     {
-        ctx->data[ctx->datalen] = data[i];
-        ctx->datalen++;
-        if (ctx->datalen == SHA256_BLOCK_SIZE)
+        size_t fill = SHA256_BLOCK_SIZE - ctx->datalen;
+        if (len < fill)
         {
-            sha256_transform(ctx, ctx->data);
-            ctx->bitlen += 512;
-            ctx->datalen = 0;
+            memcpy(ctx->data + ctx->datalen, data, len);
+            ctx->datalen += len;
+            return;
         }
+        memcpy(ctx->data + ctx->datalen, data, fill);
+        sha256_transform(ctx, ctx->data);
+        ctx->bitlen += 512;
+        ctx->datalen = 0;
+        i = fill;
+    }
+
+    /* Process full blocks */
+    while (i + SHA256_BLOCK_SIZE <= len)
+    {
+        sha256_transform(ctx, data + i);
+        ctx->bitlen += 512;
+        i += SHA256_BLOCK_SIZE;
+    }
+
+    /* Remaining bytes */
+    if (i < len)
+    {
+        memcpy(ctx->data, data + i, len - i);
+        ctx->datalen = len - i;
     }
 }
 
+/* final and hash/hex remain the same as original for correctness */
 void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
 {
     uint32_t i = ctx->datalen;
@@ -127,12 +150,12 @@ void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
     if (ctx->datalen < 56)
     {
         ctx->data[i++] = 0x80;
-        while (i < 56) ctx->data[i++] = 0x00;
+        memset(ctx->data + i, 0, 56 - i);
     }
     else
     {
         ctx->data[i++] = 0x80;
-        while (i < SHA256_BLOCK_SIZE) ctx->data[i++] = 0x00;
+        memset(ctx->data + i, 0, SHA256_BLOCK_SIZE - i);
         sha256_transform(ctx, ctx->data);
         memset(ctx->data, 0, 56);
     }
@@ -149,17 +172,22 @@ void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
     ctx->data[56] = (uint8_t)(ctx->bitlen >> 56);
     sha256_transform(ctx, ctx->data);
 
-    /* emit the state as a big-endian digest */
-    for (i = 0; i < 4; i++)
+    /*
+     * Produce the final 32-byte (256-bit) digest from the internal state.
+     * The SHA-256 state consists of eight 32-bit words (state[0]..state[7]).
+     * Each 32-bit word is written out in big-endian order (most-significant
+     * byte first). This converts the internal 8x32-bit state into the
+     * 32-byte digest expected by callers.
+     *
+     * Example: state[i] == 0x11223344 -> bytes: 0x11, 0x22, 0x33, 0x44
+     */
+    for (i = 0; i < 8; ++i)
     {
-        out[i] = (uint8_t)(ctx->state[0] >> (24 - i * 8));
-        out[i + 4] = (uint8_t)(ctx->state[1] >> (24 - i * 8));
-        out[i + 8] = (uint8_t)(ctx->state[2] >> (24 - i * 8));
-        out[i + 12] = (uint8_t)(ctx->state[3] >> (24 - i * 8));
-        out[i + 16] = (uint8_t)(ctx->state[4] >> (24 - i * 8));
-        out[i + 20] = (uint8_t)(ctx->state[5] >> (24 - i * 8));
-        out[i + 24] = (uint8_t)(ctx->state[6] >> (24 - i * 8));
-        out[i + 28] = (uint8_t)(ctx->state[7] >> (24 - i * 8));
+        uint32_t s = ctx->state[i];
+        out[i * 4] = (uint8_t)(s >> 24);
+        out[i * 4 + 1] = (uint8_t)(s >> 16);
+        out[i * 4 + 2] = (uint8_t)(s >> 8);
+        out[i * 4 + 3] = (uint8_t)s;
     }
 }
 

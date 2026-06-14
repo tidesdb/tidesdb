@@ -165,6 +165,22 @@ static inline int is_sync_full(const block_manager_t *bm)
 }
 
 /**
+ * bm_smooth_writeback
+ * single-writer construction pacing once at least BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES have
+ * been appended since the last hint, start async writeback of that range. only ever reached
+ * from the lone thread building this sstable, so smooth_synced_offset needs no atomicity.
+ * @param bm the block manager (smooth_writeback already known set)
+ */
+static inline void bm_smooth_writeback(block_manager_t *bm)
+{
+    const uint64_t size = atomic_load_explicit(&bm->current_file_size, memory_order_relaxed);
+    if (size - bm->smooth_synced_offset < BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES) return;
+    (void)smooth_writeback_region(bm->fd, (off_t)bm->smooth_synced_offset,
+                                  (off_t)(size - bm->smooth_synced_offset));
+    bm->smooth_synced_offset = size;
+}
+
+/**
  * compute_checksum
  * compute xxHash32 checksum
  * @param data the data to compute the checksum for
@@ -410,6 +426,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
     new_bm->sync_mode = sync_mode;
     new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
+    new_bm->smooth_writeback = 0;
+    new_bm->smooth_synced_offset = 0;
 
     const int file_exists = access(file_path, F_OK) == 0;
 
@@ -633,6 +651,11 @@ static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint
         if (fdatasync(bm->fd) != 0) return -1;
     }
 
+    /* sstable construction (single writer, no per-write sync) in which we pace dirty pages out so
+     * the closing fdatasync barrier never stalls on the whole file. predictable not-taken on the
+     * concurrently-written files, which never enables smoothing */
+    if (BM_UNLIKELY(bm->smooth_writeback)) bm_smooth_writeback(bm);
+
     return offset;
 }
 
@@ -775,6 +798,8 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
             return -1;
         }
     }
+
+    if (BM_UNLIKELY(bm->smooth_writeback)) bm_smooth_writeback(bm);
 
     return (int)valid_count;
 }
@@ -1466,6 +1491,13 @@ int block_manager_escalate_fsync(block_manager_t *bm)
 {
     if (!bm) return -1;
     return fdatasync(bm->fd);
+}
+
+void block_manager_enable_smooth_writeback(block_manager_t *bm)
+{
+    if (!bm) return;
+    bm->smooth_writeback = 1;
+    bm->smooth_synced_offset = atomic_load_explicit(&bm->current_file_size, memory_order_relaxed);
 }
 
 time_t block_manager_last_modified(block_manager_t *bm)

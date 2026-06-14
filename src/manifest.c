@@ -368,7 +368,7 @@ void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t seq
     }
 }
 
-int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
+int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, const int durable_sync)
 {
     if (!manifest || !path) return -1;
 
@@ -419,16 +419,19 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         return -1;
     }
 
-    const int fd = tdb_fileno(fp);
-    if (fd >= 0)
+    if (durable_sync)
     {
-        if (tdb_fsync(fd) != 0)
+        const int fd = tdb_fileno(fp);
+        if (fd >= 0)
         {
-            fclose(fp);
-            remove(temp_path);
-            pthread_rwlock_unlock(&manifest->lock);
-            atomic_fetch_sub(&manifest->active_ops, 1);
-            return -1;
+            if (tdb_fsync(fd) != 0)
+            {
+                fclose(fp);
+                remove(temp_path);
+                pthread_rwlock_unlock(&manifest->lock);
+                atomic_fetch_sub(&manifest->active_ops, 1);
+                return -1;
+            }
         }
     }
 
@@ -445,7 +448,9 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
 
     /* we sync the parent directory to ensure the rename is durable.
      * without this, a crash after rename could lose the directory entry
-     * on POSIX systems that don't flush directory metadata automatically. */
+     * on POSIX systems that don't flush directory metadata automatically.
+     * skipped under TDB_SYNC_NONE (durable_sync clear) along with the file fsync above. */
+    if (durable_sync)
     {
         /* sized to the full manifest path length -- a 1024-byte buffer silently truncated
          * paths > 1023 chars and synced the wrong directory */

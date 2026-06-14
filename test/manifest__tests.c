@@ -198,7 +198,7 @@ void test_manifest_commit_and_load()
     tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304);
     tidesdb_manifest_update_sequence(manifest, 54321);
 
-    int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
+    int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1);
     ASSERT_EQ(result, 0);
 
     tidesdb_manifest_close(manifest);
@@ -253,7 +253,7 @@ void test_manifest_atomic_commit()
 
     tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
 
-    int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
+    int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1);
     ASSERT_EQ(result, 0);
 
     tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
@@ -328,7 +328,7 @@ void test_manifest_persistence_cycle()
     tidesdb_manifest_add_sstable(m1, 1, 0, 100, 1024);
     tidesdb_manifest_add_sstable(m1, 1, 1, 200, 2048);
     tidesdb_manifest_update_sequence(m1, 1000);
-    ASSERT_EQ(tidesdb_manifest_commit(m1, TEST_MANIFEST_PATH), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(m1, TEST_MANIFEST_PATH, 1), 0);
     tidesdb_manifest_close(m1);
 
     /* cycle load, modify, commit */
@@ -338,7 +338,7 @@ void test_manifest_persistence_cycle()
     tidesdb_manifest_add_sstable(m2, 2, 0, 300, 4096);
     tidesdb_manifest_remove_sstable(m2, 1, 0);
     tidesdb_manifest_update_sequence(m2, 2000);
-    ASSERT_EQ(tidesdb_manifest_commit(m2, TEST_MANIFEST_PATH), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(m2, TEST_MANIFEST_PATH, 1), 0);
     tidesdb_manifest_close(m2);
 
     /* cycle load and verify */
@@ -374,7 +374,7 @@ void test_manifest_auto_compaction()
 
     /* commit manifest */
     ASSERT_EQ(tidesdb_manifest_commit(
-                  m1, "." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest"),
+                  m1, "." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest", 1),
               0);
     tidesdb_manifest_close(m1);
 
@@ -406,7 +406,7 @@ void test_manifest_crash_recovery()
     tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
     tidesdb_manifest_update_sequence(m1, 5000);
 
-    ASSERT_EQ(tidesdb_manifest_commit(m1, crash_test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(m1, crash_test_path, 1), 0);
     tidesdb_manifest_close(m1);
 
     tidesdb_manifest_t *m2 = tidesdb_manifest_open(crash_test_path);
@@ -437,7 +437,7 @@ void test_manifest_crash_recovery()
 
     tidesdb_manifest_add_sstable(m3, 3, 301, 3500, 200000);
     tidesdb_manifest_update_sequence(m3, 7000);
-    ASSERT_EQ(tidesdb_manifest_commit(m3, crash_test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(m3, crash_test_path, 1), 0);
     tidesdb_manifest_close(m3);
 
     tidesdb_manifest_t *m4 = tidesdb_manifest_open(crash_test_path);
@@ -461,7 +461,7 @@ void test_manifest_orphaned_temp_cleanup()
     ASSERT_TRUE(m1 != NULL);
     tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
     tidesdb_manifest_update_sequence(m1, 1000);
-    ASSERT_EQ(tidesdb_manifest_commit(m1, test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(m1, test_path, 1), 0);
     tidesdb_manifest_close(m1);
 
     char temp1[256], temp2[256], temp3[256];
@@ -582,7 +582,7 @@ void test_manifest_concurrent_operations()
     ASSERT_EQ(manifest->num_entries, num_threads * ops_per_thread);
 
     /* commit and verify persistence */
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
     /* reload and verify */
@@ -689,7 +689,7 @@ void test_manifest_large_stress()
 
     /* we commit large manifest */
     tidesdb_manifest_update_sequence(manifest, 999999);
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
     /* we reload and verify all entries */
@@ -761,7 +761,7 @@ void test_manifest_duplicate_id_handling()
     ASSERT_FALSE(tidesdb_manifest_has_sstable(manifest, 1, 100));
 
     /* we commit and reload to verify persistence */
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
     tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
@@ -793,12 +793,12 @@ void test_manifest_null_safety(void)
     tidesdb_manifest_update_sequence(NULL, 12345);
 
     /* tidesdb_manifest_commit with NULL manifest */
-    ASSERT_EQ(tidesdb_manifest_commit(NULL, "some_path"), -1);
+    ASSERT_EQ(tidesdb_manifest_commit(NULL, "some_path", 1), -1);
 
     /* tidesdb_manifest_commit with NULL path */
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, NULL), -1);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, NULL, 1), -1);
     tidesdb_manifest_close(manifest);
     remove(TEST_MANIFEST_PATH);
 
@@ -818,12 +818,12 @@ void test_manifest_commit_different_path(void)
     tidesdb_manifest_update_sequence(manifest, 5000);
 
     /* we commit to path1 first */
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, path1), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, path1, 1), 0);
 
     /* we add more data and commit to a different path */
     tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
     tidesdb_manifest_update_sequence(manifest, 6000);
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, path2), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, path2, 1), 0);
 
     tidesdb_manifest_close(manifest);
 
@@ -895,7 +895,7 @@ void test_manifest_commit_empty(void)
 
     /* we commit with zero entries */
     tidesdb_manifest_update_sequence(manifest, 42);
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
     /* we reload and verify */
@@ -922,7 +922,7 @@ void test_manifest_large_uint64_roundtrip(void)
     tidesdb_manifest_add_sstable(manifest, 1, large_id, large_entries, large_size);
     tidesdb_manifest_update_sequence(manifest, UINT64_MAX);
 
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
     /* we reload and verify large values survived round-trip */

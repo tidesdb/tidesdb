@@ -117,6 +117,155 @@ static void test_sha256_exact_block(void)
     ASSERT_EQ(strcmp(hex, "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"), 0);
 }
 
+#define BENCH_SHA256_OPS 1000000
+
+/* benchmark one-shot sha256_hash on 1M small messages */
+static void benchmark_sha256_oneshot(void)
+{
+    const size_t msg_size = 64;
+    uint8_t msg[64];
+    uint8_t digest[SHA256_DIGEST_SIZE];
+
+    for (size_t i = 0; i < msg_size; i++) msg[i] = (uint8_t)(i & 0xff);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < BENCH_SHA256_OPS; i++)
+    {
+        msg[0] = (uint8_t)(i & 0xff);
+        msg[1] = (uint8_t)((i >> 8) & 0xff);
+        sha256_hash(msg, msg_size, digest);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double ops_per_sec = BENCH_SHA256_OPS / elapsed;
+    double mb_per_sec = (BENCH_SHA256_OPS * (double)msg_size) / (elapsed * 1024 * 1024);
+
+    printf(CYAN
+           "\n  One-shot %d-byte messages: %.2f M hashes/sec (%.2f MB/s, %.3f seconds)\n" RESET,
+           (int)msg_size, ops_per_sec / 1e6, mb_per_sec, elapsed);
+}
+
+/* benchmark streaming throughput on large contiguous data (256 MB) */
+static void benchmark_sha256_throughput(void)
+{
+    const size_t chunk_size = 4096;
+    const size_t total_size = 256 * 1024 * 1024; /* 256 MB */
+    const size_t num_chunks = total_size / chunk_size;
+
+    uint8_t *chunk = malloc(chunk_size);
+    ASSERT_TRUE(chunk != NULL);
+    for (size_t i = 0; i < chunk_size; i++) chunk[i] = (uint8_t)(i & 0xff);
+
+    sha256_ctx ctx;
+    uint8_t digest[SHA256_DIGEST_SIZE];
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    sha256_init(&ctx);
+    for (size_t i = 0; i < num_chunks; i++)
+    {
+        sha256_update(&ctx, chunk, chunk_size);
+    }
+    sha256_final(&ctx, digest);
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double mb_per_sec = (total_size / (1024.0 * 1024.0)) / elapsed;
+
+    printf(CYAN "  Streaming %zu MB in %zu-byte chunks: %.2f MB/s (%.3f seconds)\n" RESET,
+           total_size / (1024 * 1024), chunk_size, mb_per_sec, elapsed);
+
+    free(chunk);
+}
+
+/* benchmark sha256_hash across a range of message sizes to show how throughput scales */
+static void benchmark_sha256_multisize(void)
+{
+    static const size_t sizes[] = {16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576};
+    static const int num_sizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+
+    printf(CYAN "\n  %-12s  %14s  %12s  %10s\n" RESET, "msg size", "hashes/sec", "MB/s", "seconds");
+    printf("  %-12s  %14s  %12s  %10s\n", "--------", "----------", "----", "-------");
+
+    for (int s = 0; s < num_sizes; s++)
+    {
+        const size_t msg_size = sizes[s];
+
+        /* target ~1 second of work per size so short messages don't finish instantly
+         * and large messages don't take forever */
+        int ops = (int)(256 * 1024 * 1024 / (msg_size > 0 ? msg_size : 1));
+        if (ops < 4) ops = 4;
+        if (ops > 2000000) ops = 2000000;
+
+        uint8_t *msg = malloc(msg_size);
+        ASSERT_TRUE(msg != NULL);
+        for (size_t i = 0; i < msg_size; i++) msg[i] = (uint8_t)(i & 0xff);
+
+        uint8_t digest[SHA256_DIGEST_SIZE];
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        for (int i = 0; i < ops; i++)
+        {
+            /* vary first two bytes so the compiler can't cache the result */
+            msg[0] = (uint8_t)(i & 0xff);
+            if (msg_size > 1) msg[1] = (uint8_t)((i >> 8) & 0xff);
+            sha256_hash(msg, msg_size, digest);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double hashes_per_sec = ops / elapsed;
+        double mb_per_sec = (ops * (double)msg_size) / (elapsed * 1024.0 * 1024.0);
+
+        /* format message size with unit */
+        char size_label[32];
+        if (msg_size >= 1048576)
+            snprintf(size_label, sizeof(size_label), "%zu MB", msg_size / 1048576);
+        else if (msg_size >= 1024)
+            snprintf(size_label, sizeof(size_label), "%zu KB", msg_size / 1024);
+        else
+            snprintf(size_label, sizeof(size_label), "%zu B", msg_size);
+
+        printf("  %-12s  %11.2f K  %9.2f  %10.3f\n", size_label, hashes_per_sec / 1e3, mb_per_sec,
+               elapsed);
+
+        free(msg);
+    }
+}
+
+/* benchmark sha256_hex on 1M small messages */
+static void benchmark_sha256_hex(void)
+{
+    const size_t msg_size = 64;
+    uint8_t msg[64];
+    char hex[SHA256_HEX_SIZE];
+
+    for (size_t i = 0; i < msg_size; i++) msg[i] = (uint8_t)(i & 0xff);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < BENCH_SHA256_OPS; i++)
+    {
+        msg[0] = (uint8_t)(i & 0xff);
+        msg[1] = (uint8_t)((i >> 8) & 0xff);
+        sha256_hex(msg, msg_size, hex);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double ops_per_sec = BENCH_SHA256_OPS / elapsed;
+
+    printf(CYAN "  Hex digest %d-byte messages: %.2f M hashes/sec (%.3f seconds)\n" RESET,
+           (int)msg_size, ops_per_sec / 1e6, elapsed);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -128,6 +277,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_sha256_streaming_matches_oneshot, tests_passed);
     RUN_TEST(test_sha256_hex_matches_hash, tests_passed);
     RUN_TEST(test_sha256_exact_block, tests_passed);
+    RUN_TEST(benchmark_sha256_oneshot, tests_passed);
+    RUN_TEST(benchmark_sha256_throughput, tests_passed);
+    RUN_TEST(benchmark_sha256_multisize, tests_passed);
+    RUN_TEST(benchmark_sha256_hex, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

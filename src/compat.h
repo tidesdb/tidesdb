@@ -3269,7 +3269,9 @@ static inline int evict_file_region(int fd, off_t offset, off_t len)
  */
 static inline int smooth_writeback_region(int fd, off_t offset, off_t len)
 {
-#ifdef __linux__
+    /* sync_file_range + its flags are GNU extensions, declared only when _GNU_SOURCE is set;
+     * guard on the flag macro so a translation unit without _GNU_SOURCE falls back cleanly */
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
     return sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE);
 #else
     /* no async range-writeback primitive elsewhere -- the final fdatasync barrier

@@ -2680,6 +2680,116 @@ void test_skip_list_cursor_advance_in_node()
     skip_list_free(list);
 }
 
+typedef struct
+{
+    skip_list_t *list1;
+    skip_list_t *list2;
+    _Atomic(int) *sync_state;
+} aba_ctx_t;
+
+void *aba_thread_a(void *arg)
+{
+    aba_ctx_t *ctx = (aba_ctx_t *)arg;
+
+    uint8_t key[] = "A_init";
+    uint8_t val[] = "val";
+    skip_list_put_with_seq(ctx->list1, key, sizeof(key), val, sizeof(val), -1, 1, 0);
+
+    /* Signal the Main thread to destroy list1 and create list2 */
+    atomic_store_explicit(ctx->sync_state, 1, memory_order_release);
+
+    /* Wait for the green light (state == 2) from Main */
+    while (atomic_load_explicit(ctx->sync_state, memory_order_acquire) < 2)
+    {
+    }
+
+    for (int i = 0; i < 50000; i++)
+    {
+        char k[32];
+        snprintf(k, sizeof(k), "A_concurrent_%d", i);
+        skip_list_put_with_seq(ctx->list2, (uint8_t *)k, strlen(k) + 1, val, sizeof(val), -1,
+                               10 + i, 0);
+    }
+    return NULL;
+}
+
+void *aba_thread_b(void *arg)
+{
+    aba_ctx_t *ctx = (aba_ctx_t *)arg;
+
+    while (atomic_load_explicit(ctx->sync_state, memory_order_acquire) < 2)
+    {
+    }
+
+    uint8_t val[] = "val";
+    for (int i = 0; i < 50000; i++)
+    {
+        char k[32];
+        snprintf(k, sizeof(k), "B_concurrent_%d", i);
+        skip_list_put_with_seq(ctx->list2, (uint8_t *)k, strlen(k) + 1, val, sizeof(val), -1,
+                               100000 + i, 0);
+    }
+    return NULL;
+}
+
+void test_skip_list_arena_aba()
+{
+    _Atomic(int) sync_state = 0;
+    aba_ctx_t ctx = {0};
+    ctx.sync_state = &sync_state;
+
+    size_t arena_cap = 16 * 1024 * 1024; /* 16MB */
+
+    ASSERT_EQ(skip_list_new_with_arena(&ctx.list1, 12, 0.25f, skip_list_comparator_memcmp, NULL,
+                                       NULL, arena_cap),
+              0);
+    void *arena_1_ptr = ctx.list1->arena;
+
+    pthread_t thread_a;
+    pthread_create(&thread_a, NULL, aba_thread_a, &ctx);
+
+    while (atomic_load_explicit(&sync_state, memory_order_acquire) < 1)
+    {
+    }
+
+    skip_list_free(ctx.list1);
+
+    ASSERT_EQ(skip_list_new_with_arena(&ctx.list2, 12, 0.25f, skip_list_comparator_memcmp, NULL,
+                                       NULL, arena_cap),
+              0);
+    void *arena_2_ptr = ctx.list2->arena;
+
+    if (arena_1_ptr != arena_2_ptr)
+    {
+        printf(YELLOW
+               "  [Warn] malloc did not recycle the arena pointer (%p vs %p). The bug may not "
+               "trigger on this run.\n" RESET,
+               arena_1_ptr, arena_2_ptr);
+    }
+    else
+    {
+        printf(RED
+               "  [Danger] malloc recycled the arena pointer (%p). ABA collision imminent!\n" RESET,
+               arena_2_ptr);
+    }
+
+    pthread_t thread_b;
+    pthread_create(&thread_b, NULL, aba_thread_b, &ctx);
+
+    atomic_store_explicit(&sync_state, 2, memory_order_release);
+
+    pthread_join(thread_a, NULL);
+    pthread_join(thread_b, NULL);
+
+    int expected_count = 100000;
+    int actual_count = skip_list_count_entries(ctx.list2);
+
+    printf(CYAN "  Final list count: %d (Expected: %d)\n" RESET, actual_count, expected_count);
+    ASSERT_EQ(actual_count, expected_count);
+
+    skip_list_free(ctx.list2);
+}
+
 void benchmark_skip_list_read_path()
 {
     printf(BOLDWHITE "\n----------------- Read Path Benchmark -----------------\n" RESET);
@@ -3007,6 +3117,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_get_ref, tests_passed);
     RUN_TEST(test_skip_list_cursor_next_get, tests_passed);
     RUN_TEST(test_skip_list_cursor_advance_in_node, tests_passed);
+    RUN_TEST(test_skip_list_arena_aba, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);

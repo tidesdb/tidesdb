@@ -123,14 +123,18 @@ void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t seq
 
 /**
  * tidesdb_manifest_commit
- * atomically writes the manifest to disk -- writes a temp file, fsyncs it, renames it into
- * place, then syncs the parent directory so the commit survives a crash. if path differs from
- * the manifest's currently stored path, the manifest is re-pointed to path.
+ * atomically writes the manifest to disk -- writes a temp file, renames it into place. when
+ * durable_sync is set it also fsyncs the temp file before the rename and syncs the parent
+ * directory after, so the commit survives a crash. with durable_sync clear (TDB_SYNC_NONE) both
+ * are skipped -- the rename is still atomic, but a crash may leave a manifest whose contents or
+ * directory entry never reached disk, and which can reference a not-yet-durable sstable. if path
+ * differs from the manifest's currently stored path, the manifest is re-pointed to path.
  * @param manifest manifest to write
  * @param path destination path; also becomes the manifest's stored path if it differs
+ * @param durable_sync non-zero to fsync the manifest + parent directory; zero to skip both
  * @return 0 on success, -1 on error
  */
-int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path);
+int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, int durable_sync);
 
 /**
  * tidesdb_manifest_close

@@ -3255,6 +3255,35 @@ static inline int evict_file_region(int fd, off_t offset, off_t len)
 }
 
 /*
+ * smooth_writeback_region
+ * starts asynchronous writeback of a dirty file region without waiting and without
+ * issuing a durability barrier. used to dribble an sstable's dirty pages out to the
+ * device during construction so the final fdatasync barrier flushes only a small
+ * residual instead of the whole file. this is a pacing hint only -- it makes no
+ * durability promise (the caller still fdatasync's at the end) and never orders
+ * against concurrent writers, so it is safe to call on a shared descriptor.
+ * @param fd the file descriptor
+ * @param offset starting offset of the range to write back
+ * @param len number of bytes (must be > 0)
+ * @return 0 on success, -1 on failure (non-critical, can be ignored)
+ */
+static inline int smooth_writeback_region(int fd, off_t offset, off_t len)
+{
+    /* sync_file_range + its flags are GNU extensions, declared only when _GNU_SOURCE is set;
+     * guard on the flag macro so a translation unit without _GNU_SOURCE falls back cleanly */
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+    return sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE);
+#else
+    /* no async range-writeback primitive elsewhere -- the final fdatasync barrier
+     * still bounds durability; we just forgo the incremental pacing */
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#endif
+}
+
+/*
  * set_file_noreuse_hint
  * hints that specified region will be accessed only once (streaming)
  * kernel page replacement can deprioritize these pages

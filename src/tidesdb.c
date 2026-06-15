@@ -19659,14 +19659,19 @@ static void *tidesdb_reaper_thread(void *arg)
              * the memory-pressure level below (read-amp hurts even when memory is plentiful).
              * enqueue_compaction coalesces against an in-flight or pending compaction, so
              * re-checking every cycle cannot pile the queue, and it uses the same effective
-             * trigger as the flush tail so the two never disagree. gated on is_open: close
-             * clears it before its wait-for-in-progress loop, and that loop only waits on
-             * is_compacting -- so arming a fresh compaction during shutdown would keep the
-             * pipeline hot and stretch close until the whole backlog drained. matches the
-             * is_open guard on the memory-pressure compaction below. */
+             * trigger as the flush tail so the two never disagree. gated on is_open and on
+             * cancel_compaction. is_open: close clears it before its wait-for-in-progress
+             * loop, and that loop only waits on is_compacting, so arming a fresh compaction
+             * during shutdown would keep the pipeline hot and stretch close until the whole
+             * backlog drained (matches the is_open guard on the memory-pressure compaction
+             * below). cancel_compaction: tidesdb_cancel_background_work drains the pipeline
+             * and expects it to stay idle, so re-arming here would defeat the cancel and
+             * flicker is_compacting back true via the pending-count bump. */
             tidesdb_column_family_t *readamp_cfs[TDB_REAPER_DEFERRED_FLUSH_BATCH];
             int readamp_count = 0;
-            const int db_open = atomic_load_explicit(&db->is_open, memory_order_acquire);
+            const int readamp_ok =
+                atomic_load_explicit(&db->is_open, memory_order_acquire) &&
+                !atomic_load_explicit(&db->cancel_compaction, memory_order_acquire);
             pthread_rwlock_rdlock(&db->cf_list_lock);
             for (int i = 0; i < db->num_column_families; i++)
             {
@@ -19677,7 +19682,7 @@ static void *tidesdb_reaper_thread(void *arg)
                     if (armed_count < TDB_REAPER_DEFERRED_FLUSH_BATCH)
                         armed_cfs[armed_count++] = cf;
                 }
-                else if (db_open && readamp_count < TDB_REAPER_DEFERRED_FLUSH_BATCH &&
+                else if (readamp_ok && readamp_count < TDB_REAPER_DEFERRED_FLUSH_BATCH &&
                          atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire) >=
                              tdb_cf_effective_l1_trigger(cf))
                     readamp_cfs[readamp_count++] = cf;

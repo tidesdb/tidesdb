@@ -19650,13 +19650,37 @@ static void *tidesdb_reaper_thread(void *arg)
         {
             tidesdb_column_family_t *armed_cfs[TDB_REAPER_DEFERRED_FLUSH_BATCH];
             int armed_count = 0;
+            /* read-amp self-heal -- a CF whose first disk level (overlapping, where flushes
+             * land) has reached the L1 file-count trigger needs compaction, but that trigger
+             * is only evaluated at a flush tail. once writes stop while L1 is over-trigger
+             * (bulk-load-then-read, write-burst-then-serve) nothing re-arms it, so read-amp
+             * and the per-sstable bloom + block-index memory it pins stay high indefinitely.
+             * arm it here from the structural condition, independent of flush activity and of
+             * the memory-pressure level below (read-amp hurts even when memory is plentiful).
+             * enqueue_compaction coalesces against an in-flight or pending compaction, so
+             * re-checking every cycle cannot pile the queue, and it uses the same effective
+             * trigger as the flush tail so the two never disagree. gated on is_open: close
+             * clears it before its wait-for-in-progress loop, and that loop only waits on
+             * is_compacting -- so arming a fresh compaction during shutdown would keep the
+             * pipeline hot and stretch close until the whole backlog drained. matches the
+             * is_open guard on the memory-pressure compaction below. */
+            tidesdb_column_family_t *readamp_cfs[TDB_REAPER_DEFERRED_FLUSH_BATCH];
+            int readamp_count = 0;
+            const int db_open = atomic_load_explicit(&db->is_open, memory_order_acquire);
             pthread_rwlock_rdlock(&db->cf_list_lock);
-            for (int i = 0;
-                 i < db->num_column_families && armed_count < TDB_REAPER_DEFERRED_FLUSH_BATCH; i++)
+            for (int i = 0; i < db->num_column_families; i++)
             {
                 tidesdb_column_family_t *cf = db->column_families[i];
-                if (cf && atomic_load_explicit(&cf->compaction_armed, memory_order_acquire))
-                    armed_cfs[armed_count++] = cf;
+                if (!cf) continue;
+                if (atomic_load_explicit(&cf->compaction_armed, memory_order_acquire))
+                {
+                    if (armed_count < TDB_REAPER_DEFERRED_FLUSH_BATCH)
+                        armed_cfs[armed_count++] = cf;
+                }
+                else if (db_open && readamp_count < TDB_REAPER_DEFERRED_FLUSH_BATCH &&
+                         atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire) >=
+                             tdb_cf_effective_l1_trigger(cf))
+                    readamp_cfs[readamp_count++] = cf;
             }
             pthread_rwlock_unlock(&db->cf_list_lock);
             for (int i = 0; i < armed_count; i++)
@@ -19665,6 +19689,7 @@ static void *tidesdb_reaper_thread(void *arg)
                                              memory_order_acq_rel))
                     tidesdb_enqueue_compaction(armed_cfs[i], 0);
             }
+            for (int i = 0; i < readamp_count; i++) tidesdb_enqueue_compaction(readamp_cfs[i], 0);
         }
 
         /*** global memory pressure computations

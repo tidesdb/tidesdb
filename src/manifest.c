@@ -28,16 +28,7 @@
 #define MANIFEST_TMP_EXT     ".tmp."
 #define MANIFEST_TMP_EXT_LEN (sizeof(MANIFEST_TMP_EXT) - 1)
 
-/**
- * tidesdb_manifest_add_sstable_unlocked
- * adds an sstable to the manifest
- * @param manifest manifest to add sstable to
- * @param level level of sstable
- * @param id id of sstable
- * @param num_entries number of entries in sstable
- * @param size_bytes size of sstable in bytes
- * @return 0 on success, -1 on error
- */
+/* forward declaration; documented at the definition below */
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
                                                  uint64_t id, uint64_t num_entries,
                                                  uint64_t size_bytes);

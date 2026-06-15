@@ -42,7 +42,7 @@
 /* xxHash32 = 4 bytes (sufficient for block-level checksums) */
 #define BLOCK_MANAGER_CHECKSUM_LENGTH 4
 
-/* block header is now just size + checksum */
+/* block header is size + checksum */
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
 

@@ -87,9 +87,9 @@
  * not bound by S3's 5 GiB single-PUT limit. S3 requires parts of at least
  * 5 MiB (the final part may be smaller) and at most 10000 parts.
  * these match the documented objstore_config defaults (threshold 64 MiB,
- * part size 8 MiB); honoring per-config overrides at runtime additionally
- * requires plumbing multipart_threshold / multipart_part_size through the
- * public tidesdb_objstore_s3_create signature (deferred -- API change). */
+ * part size 8 MiB) and serve as the fallback when the caller leaves
+ * multipart_threshold / multipart_part_size unset in the s3 config (the
+ * tidesdb_objstore_s3_create_config entry point honors any override). */
 #define TDB_S3_MULTIPART_THRESHOLD ((size_t)64 * 1024 * 1024)
 #define TDB_S3_MULTIPART_PART_SIZE ((size_t)8 * 1024 * 1024)
 #define TDB_S3_MAX_PARTS           10000
@@ -1597,9 +1597,9 @@ tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char 
                                                const char *secret_key, const char *region,
                                                int use_ssl, int use_path_style)
 {
-    /* thin wrapper preserving the original signature, secure TLS defaults (verify peer+host
-     * against the system CA bundle) and default multipart tuning -- identical behavior to
-     * before this entry point existed. */
+    /* thin wrapper over the config entry point preserving the positional signature, with
+     * secure TLS defaults (verify peer+host against the system CA bundle) and the built-in
+     * multipart tuning (threshold/part-size left 0 so the config path applies its defaults). */
     const tidesdb_objstore_s3_config_t config = {.endpoint = endpoint,
                                                  .bucket = bucket,
                                                  .prefix = prefix,

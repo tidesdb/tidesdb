@@ -218,7 +218,7 @@ int queue_enqueue(queue_t *queue, void *data)
 /**
  * queue_dequeue_internal
  * internal helper for dequeue logic (head_lock must be held)
- * uses dummy node technique for lock-free separation of head and tail
+ * uses the dummy-node technique so head (dequeue) and tail (enqueue) use independent locks
  * @param queue the queue
  * @return pointer to dequeued data, NULL if queue is empty
  */

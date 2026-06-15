@@ -854,7 +854,7 @@ struct tidesdb_t
     _Atomic(int) comparators_capacity;
     pthread_t *flush_threads;
     queue_t *flush_queue;
-    /* number of pool threads still running: incremented at create, decremented when a worker
+    /* number of pool threads still running, incremented at create, decremented when a worker
      * returns. close re-broadcasts shutdown while the count is non-zero. */
     _Atomic(int) live_flush_threads;
     pthread_t *compaction_threads;
@@ -1128,7 +1128,7 @@ struct tidesdb_iter_t
  * @param max_sst_density worst per-sstable tombstone density observed in the cf
  * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
  * @param wal_bytes_written framed bytes appended to this cf's WAL (0 in unified mode)
- * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L0 sstables
+ * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L1 sstables
  * @param compaction_bytes_written on-disk bytes this cf's compactions wrote
  * @param compaction_bytes_read on-disk bytes this cf's compactions read as input
  * @param user_bytes_written logical key+value bytes committed to this cf (WA denominator)

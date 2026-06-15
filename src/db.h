@@ -253,8 +253,7 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param use_btree whether btree is used
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size reserved for API compatibility, not used.. will be retired
- * completely
+ * @param object_target_file_size reserved for API compatibility, not used
  * @param object_lazy_compaction 1 = compact less aggressively in object store mode (default 0)
  * @param object_prefetch_compaction 1 = download all inputs before merge (default 1)
  */
@@ -374,7 +373,7 @@ typedef struct tidesdb_config_t
  * @param max_sst_density worst per-sstable tombstone density observed in the cf
  * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
  * @param wal_bytes_written framed bytes appended to this cf's WAL (0 in unified mode)
- * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L0 sstables
+ * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L1 sstables
  * @param compaction_bytes_written on-disk bytes this cf's compactions wrote
  * @param compaction_bytes_read on-disk bytes this cf's compactions read as input
  * @param user_bytes_written logical key+value bytes committed to this cf (WA denominator)

@@ -139,7 +139,7 @@ void test_block_manager_truncate()
     }
 
     block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block == NULL); /* we expect the block to be NULL */
+    ASSERT_TRUE(block == NULL);
 
     (void)block_manager_cursor_free(cursor);
 
@@ -170,7 +170,6 @@ void test_block_manager_cursor()
         (void)block_manager_block_free(block);
     }
 
-    /* now we create a cursor */
     block_manager_cursor_t *cursor;
 
     if (block_manager_cursor_init(&cursor, bm) != 0)
@@ -228,7 +227,7 @@ void test_block_manager_cursor()
     /* we go back */
     ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
 
-    /* check previous block */
+    /* we check previous block */
     read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
@@ -246,7 +245,7 @@ void test_block_manager_cursor()
     /* we go back */
     ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
 
-    /* check previous block */
+    /* we check previous block */
     read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
@@ -2682,7 +2681,7 @@ void test_block_manager_count_blocks_large_block(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "test_large_count.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    /* write a block larger than the 64KB count buffer to exercise the off==0 path */
+    /* we write a block larger than the 64KB count buffer to exercise the off==0 path */
     const size_t large_size = 128 * 1024;
     uint8_t *large_data = malloc(large_size);
     ASSERT_TRUE(large_data != NULL);
@@ -2693,7 +2692,7 @@ void test_block_manager_count_blocks_large_block(void)
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
     block_manager_block_free(block);
 
-    /* write a small block after it */
+    /* we write a small block after it */
     block = block_manager_block_create(5, "small");
     ASSERT_TRUE(block != NULL);
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
@@ -2701,7 +2700,7 @@ void test_block_manager_count_blocks_large_block(void)
 
     ASSERT_EQ(block_manager_count_blocks(bm), 2);
 
-    /* verify on empty file (header only) */
+    /* we verify on empty file (header only) */
     ASSERT_TRUE(block_manager_close(bm) == 0);
     ASSERT_TRUE(block_manager_open(&bm, "test_empty_count.db", BLOCK_MANAGER_SYNC_NONE) == 0);
     ASSERT_EQ(block_manager_count_blocks(bm), 0);
@@ -2794,7 +2793,7 @@ void test_block_manager_cursor_init_stack_direct(void)
         block_manager_block_free(block);
     }
 
-    /* use stack-allocated cursor */
+    /* we use stack-allocated cursor */
     block_manager_cursor_t cursor;
     ASSERT_EQ(block_manager_cursor_init_stack(&cursor, bm), 0);
 
@@ -2938,7 +2937,7 @@ void test_write_raw_hole_stops_replay(void)
     ASSERT_TRUE(offset_c >= 0);
 
     /*
-     * Simulate pwritev failure on block B by zeroing its entire reserved
+     * simulate pwritev failure on block B by zeroing its entire reserved
      * region.  On Linux the kernel fills unwritten regions with zeros when a
      * file is extended via lseek/ftruncate; pwritev failure after the file
      * counter was advanced leaves the same zero-filled gap.
@@ -2986,9 +2985,9 @@ void test_write_raw_hole_stops_replay(void)
     ASSERT_EQ(block_manager_cursor_next(cursor), -1);
 
     /*
-     * Prove block C is durably on disk despite being unreachable via sequential
+     * prove block C is durably on disk despite being unreachable via sequential
      * scan.  cursor_goto jumps directly to its known offset and reads it fine.
-     * This confirms the data loss is caused entirely by the hole, not by C
+     * this confirms the data loss is caused entirely by the hole, not by C
      * having been corrupted.
      */
     ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset_c) == 0);
@@ -3009,12 +3008,12 @@ void test_write_raw_hole_stops_replay(void)
 /**
  * test_write_raw_multiple_holes_stop_replay
  *
- * Extends the single-hole test: two consecutive failed pwritev calls leave
- * two zero-filled holes.  Replay stops at the first hole, compounding data
+ * extends the single-hole test-- two consecutive failed pwritev calls leave
+ * two zero-filled holes.  replay stops at the first hole, compounding data
  * loss for every block written after it.
  *
- * File layout:  [A (valid)] [hole B] [hole D] [E (valid)]
- * Expected:     cursor reads A, cursor_next returns -1 at hole B, E is lost.
+ * file layout:  [A (valid)] [hole B] [hole D] [E (valid)]
+ * expected:     cursor reads A, cursor_next returns -1 at hole B, E is lost.
  */
 void test_write_raw_multiple_holes_stop_replay(void)
 {
@@ -3217,7 +3216,7 @@ void test_cursor_skip_corrupt_partial_write(void)
 
     ASSERT_EQ(block_manager_cursor_next(cursor), 0);
 
-    /* cursor_read(B) must fail: checksum mismatch on zeroed data */
+    /* cursor_read(B) must fail-- checksum mismatch on zeroed data */
     block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(block == NULL);
 
@@ -3266,11 +3265,11 @@ void test_cursor_skip_corrupt_refuses_data_corruption(void)
     block_manager_cursor_t *cursor = NULL;
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
-    /* cursor_read must fail: checksum mismatch */
+    /* cursor_read must fail-- checksum mismatch */
     block_manager_block_t *block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(block == NULL);
 
-    /* skip must be refused: footer magic is intact -> genuine corruption */
+    /* skip must be refused-- footer magic is intact -> genuine corruption */
     ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), -1);
 
     printf("  [skip-corrupt] correctly refused to skip genuine corruption at offset %" PRId64 "\n",

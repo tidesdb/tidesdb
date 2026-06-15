@@ -542,8 +542,8 @@ int block_manager_close(block_manager_t *bm)
         }
     }
 
-    /* final sync on close -- we really only needed if O_DSYNC wasnt used
-     * with O_DSYNC, all writes are already durable */
+    /* final sync on close -- only needed when O_DSYNC wasn't used;
+     * with O_DSYNC every write is already durable */
     if (is_sync_full(bm) && !odsync_available())
     {
         (void)fdatasync(bm->fd);
@@ -1766,12 +1766,6 @@ int block_manager_validate_last_block(block_manager_t *bm,
     return 0;
 }
 
-/*
- * convert_sync_mode
- * converts tidesdb sync mode to block manager sync mode
- * @param tdb_sync_mode the tidesdb sync mode
- * @return the corresponding block manager sync mode
- */
 block_manager_sync_mode_t convert_sync_mode(const int tdb_sync_mode)
 {
     switch (tdb_sync_mode)

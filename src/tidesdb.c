@@ -20345,6 +20345,52 @@ long tidesdb_raise_open_file_limit(long desired)
     return tdb_raise_max_open_files(desired);
 }
 
+/**
+ * tidesdb_open_post_recovery_abort
+ * frees everything tidesdb_open built once recovery has run -- the recovered column families, the
+ * unified memtable state, the caches, queues, comparators and shared locks -- for the error paths
+ * after tidesdb_recover_database (the worker-thread setup) and the recovery-failure path itself.
+ * the caller frees db and nulls its out-param, and must already have joined any worker threads it
+ * started. tidesdb_unimap_free destroys the unified sync primitives (matching tidesdb_close), so
+ * paths must not also destroy them.
+ * @param db database handle (all post-recovery resources assumed created)
+ */
+static void tidesdb_open_post_recovery_abort(tidesdb_t *db)
+{
+    if (db->unified_mt.enabled)
+    {
+        tidesdb_memtable_t *umt = atomic_load(&db->unified_mt.active);
+        if (umt)
+        {
+            if (umt->skip_list) skip_list_free(umt->skip_list);
+            if (umt->wal) block_manager_close(umt->wal);
+            free(umt);
+        }
+        if (db->unified_mt.immutables) queue_free(db->unified_mt.immutables);
+        tidesdb_unimap_free(db);
+    }
+
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_free(db->column_families[i]);
+    }
+    free(db->column_families);
+
+    if (db->clock_cache) clock_cache_destroy(db->clock_cache);
+    if (db->btree_node_cache) clock_cache_destroy(db->btree_node_cache);
+    free(db->active_txns);
+    pthread_rwlock_destroy(&db->active_txns_lock);
+    tidesdb_commit_status_destroy(db->commit_status);
+    queue_free(db->flush_queue);
+    queue_free(db->compaction_queue);
+    free(atomic_load(&db->comparators));
+    pthread_rwlock_destroy(&db->cf_list_lock);
+    tdb_file_unlock(db->lock_fd);
+    close(db->lock_fd);
+    free(db->db_path);
+    free((void *)db->config.object_store_config);
+}
+
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 {
     /* we auto-initialize with system allocator if not already initialized */
@@ -20668,7 +20714,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         if ((*db)->flush_queue) queue_free((*db)->flush_queue);
         if ((*db)->compaction_queue) queue_free((*db)->compaction_queue);
-        free(initial_comparators);
+        free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
         tdb_file_unlock((*db)->lock_fd);
@@ -21102,38 +21148,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     int rc = tidesdb_recover_database(*db);
     if (rc != TDB_SUCCESS)
     {
-        if ((*db)->unified_mt.enabled)
-        {
-            tidesdb_memtable_t *umt = atomic_load(&(*db)->unified_mt.active);
-            if (umt)
-            {
-                if (umt->skip_list) skip_list_free(umt->skip_list);
-                if (umt->wal) block_manager_close(umt->wal);
-                free(umt);
-            }
-            queue_free((*db)->unified_mt.immutables);
-            tidesdb_unimap_free(*db);
-        }
-        free((*db)->active_txns);
-        pthread_rwlock_destroy(&(*db)->active_txns_lock);
-        tidesdb_commit_status_destroy((*db)->commit_status);
-        queue_free((*db)->flush_queue);
-        queue_free((*db)->compaction_queue);
-        free(atomic_load(&(*db)->comparators));
-        pthread_rwlock_destroy(&(*db)->cf_list_lock);
-        free((*db)->column_families);
-        tdb_file_unlock((*db)->lock_fd);
-        close((*db)->lock_fd);
-        free((*db)->db_path);
-        if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
-        if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-        free((void *)(*db)->config.object_store_config);
-        if ((*db)->unified_mt.enabled)
-        {
-            pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-            pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-            pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-        }
+        tidesdb_open_post_recovery_abort(*db);
         free(*db);
         *db = NULL;
         return rc;
@@ -21142,26 +21157,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->flush_threads = malloc(config->num_flush_threads * sizeof(pthread_t));
     if (!(*db)->flush_threads)
     {
-        clock_cache_destroy((*db)->clock_cache);
-        if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-        free((*db)->active_txns);
-        pthread_rwlock_destroy(&(*db)->active_txns_lock);
-        tidesdb_commit_status_destroy((*db)->commit_status);
-        queue_free((*db)->flush_queue);
-        queue_free((*db)->compaction_queue);
-        free(atomic_load(&(*db)->comparators));
-        pthread_rwlock_destroy(&(*db)->cf_list_lock);
-        free((*db)->column_families);
-        tdb_file_unlock((*db)->lock_fd);
-        close((*db)->lock_fd);
-        free((*db)->db_path);
-        free((void *)(*db)->config.object_store_config);
-        if ((*db)->unified_mt.enabled)
-        {
-            pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-            pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-            pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-        }
+        tidesdb_open_post_recovery_abort(*db);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -21175,26 +21171,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             queue_shutdown((*db)->flush_queue);
             for (int j = 0; j < i; j++) pthread_join((*db)->flush_threads[j], NULL);
             free((*db)->flush_threads);
-            clock_cache_destroy((*db)->clock_cache);
-            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-            free((*db)->active_txns);
-            pthread_rwlock_destroy(&(*db)->active_txns_lock);
-            tidesdb_commit_status_destroy((*db)->commit_status);
-            queue_free((*db)->flush_queue);
-            queue_free((*db)->compaction_queue);
-            free(atomic_load(&(*db)->comparators));
-            pthread_rwlock_destroy(&(*db)->cf_list_lock);
-            free((*db)->column_families);
-            tdb_file_unlock((*db)->lock_fd);
-            close((*db)->lock_fd);
-            free((*db)->db_path);
-            free((void *)(*db)->config.object_store_config);
-            if ((*db)->unified_mt.enabled)
-            {
-                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-            }
+            tidesdb_open_post_recovery_abort(*db);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -21211,26 +21188,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                 pthread_join((*db)->flush_threads[j], NULL);
             }
             free((*db)->flush_threads);
-            clock_cache_destroy((*db)->clock_cache);
-            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-            free((*db)->active_txns);
-            pthread_rwlock_destroy(&(*db)->active_txns_lock);
-            tidesdb_commit_status_destroy((*db)->commit_status);
-            queue_free((*db)->flush_queue);
-            queue_free((*db)->compaction_queue);
-            free(atomic_load(&(*db)->comparators));
-            pthread_rwlock_destroy(&(*db)->cf_list_lock);
-            free((*db)->column_families);
-            tdb_file_unlock((*db)->lock_fd);
-            close((*db)->lock_fd);
-            free((*db)->db_path);
-            free((void *)(*db)->config.object_store_config);
-            if ((*db)->unified_mt.enabled)
-            {
-                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-            }
+            tidesdb_open_post_recovery_abort(*db);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -21247,26 +21205,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             pthread_join((*db)->flush_threads[i], NULL);
         }
         free((*db)->flush_threads);
-        clock_cache_destroy((*db)->clock_cache);
-        if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-        free((*db)->active_txns);
-        pthread_rwlock_destroy(&(*db)->active_txns_lock);
-        tidesdb_commit_status_destroy((*db)->commit_status);
-        queue_free((*db)->flush_queue);
-        queue_free((*db)->compaction_queue);
-        free(atomic_load(&(*db)->comparators));
-        pthread_rwlock_destroy(&(*db)->cf_list_lock);
-        free((*db)->column_families);
-        tdb_file_unlock((*db)->lock_fd);
-        close((*db)->lock_fd);
-        free((*db)->db_path);
-        free((void *)(*db)->config.object_store_config);
-        if ((*db)->unified_mt.enabled)
-        {
-            pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-            pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-            pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-        }
+        tidesdb_open_post_recovery_abort(*db);
         free(*db);
         *db = NULL;
         return TDB_ERR_MEMORY;
@@ -21284,26 +21223,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             for (int k = 0; k < config->num_flush_threads; k++)
                 pthread_join((*db)->flush_threads[k], NULL);
             free((*db)->flush_threads);
-            clock_cache_destroy((*db)->clock_cache);
-            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-            free((*db)->active_txns);
-            pthread_rwlock_destroy(&(*db)->active_txns_lock);
-            tidesdb_commit_status_destroy((*db)->commit_status);
-            queue_free((*db)->flush_queue);
-            queue_free((*db)->compaction_queue);
-            free(atomic_load(&(*db)->comparators));
-            pthread_rwlock_destroy(&(*db)->cf_list_lock);
-            free((*db)->column_families);
-            tdb_file_unlock((*db)->lock_fd);
-            close((*db)->lock_fd);
-            free((*db)->db_path);
-            free((void *)(*db)->config.object_store_config);
-            if ((*db)->unified_mt.enabled)
-            {
-                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-            }
+            tidesdb_open_post_recovery_abort(*db);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -21327,26 +21247,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                 pthread_join((*db)->flush_threads[k], NULL);
             }
             free((*db)->flush_threads);
-            clock_cache_destroy((*db)->clock_cache);
-            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
-            free((*db)->active_txns);
-            pthread_rwlock_destroy(&(*db)->active_txns_lock);
-            tidesdb_commit_status_destroy((*db)->commit_status);
-            queue_free((*db)->flush_queue);
-            queue_free((*db)->compaction_queue);
-            free(atomic_load(&(*db)->comparators));
-            pthread_rwlock_destroy(&(*db)->cf_list_lock);
-            free((*db)->column_families);
-            tdb_file_unlock((*db)->lock_fd);
-            close((*db)->lock_fd);
-            free((*db)->db_path);
-            free((void *)(*db)->config.object_store_config);
-            if ((*db)->unified_mt.enabled)
-            {
-                pthread_mutex_destroy(&(*db)->unified_mt.cf_index_map_lock);
-                pthread_mutex_destroy(&(*db)->unified_mt.wal_group_sync_lock);
-                pthread_cond_destroy(&(*db)->unified_mt.wal_group_sync_cond);
-            }
+            tidesdb_open_post_recovery_abort(*db);
             free(*db);
             *db = NULL;
             return TDB_ERR_MEMORY;
@@ -21419,10 +21320,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread created");
         }
-    }
-    else if (!needs_sync_thread && !atomic_load(&(*db)->sync_thread_active))
-    {
-        atomic_store(&(*db)->sync_thread_active, 0);
     }
 
     pthread_mutex_init(&(*db)->reaper_thread_mutex, NULL);
@@ -22137,8 +22034,6 @@ int tidesdb_close(tidesdb_t *db)
     pthread_mutex_unlock(&tidesdb_log_mutex);
 
     free(db);
-
-    db = NULL;
 
     return TDB_SUCCESS;
 }
@@ -25384,26 +25279,8 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, const tidesdb_isolation_leve
         return TDB_ERR_MEMORY;
     }
 
-    (*txn)->savepoints_capacity = TDB_INITIAL_TXN_SAVEPOINT_CAPACITY;
-    (*txn)->savepoint_op_counts = calloc((*txn)->savepoints_capacity, sizeof(int));
-    (*txn)->savepoint_cf_counts = calloc((*txn)->savepoints_capacity, sizeof(int));
-    (*txn)->savepoint_names = calloc((*txn)->savepoints_capacity, sizeof(char *));
-
-    if (!(*txn)->savepoint_op_counts || !(*txn)->savepoint_cf_counts || !(*txn)->savepoint_names)
-    {
-        free((*txn)->savepoint_op_counts);
-        free((*txn)->savepoint_cf_counts);
-        free((*txn)->savepoint_names);
-        free((*txn)->cfs);
-        free((*txn)->read_keys);
-        free((*txn)->read_key_sizes);
-        free((*txn)->read_seqs);
-        free((*txn)->read_cfs);
-        free((*txn)->ops);
-        free(*txn);
-        *txn = NULL;
-        return TDB_ERR_MEMORY;
-    }
+    /* savepoint arrays are allocated lazily on the first tidesdb_txn_savepoint -- the struct is
+     * zero-initialised above, so capacity stays 0 and the create path self-allocates from NULL */
 
     (*txn)->num_cfs = 0;
 
@@ -25548,13 +25425,13 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     /*** we coalesce key+value into a single allocation to halve malloc pressure
      **  op->value points into the same buffer at offset key_size
      *   only op->key should be freed (it owns the entire buffer) */
-    const size_t kv_alloc_size = key_size + ((value && value_size > 0) ? value_size : 0);
+    const size_t kv_alloc_size = key_size + (value_size > 0 ? value_size : 0);
     op->key = malloc(kv_alloc_size);
     if (!op->key) return TDB_ERR_MEMORY;
     memcpy(op->key, key, key_size);
     op->key_size = key_size;
 
-    if (value && value_size > 0)
+    if (value_size > 0)
     {
         op->value = op->key + key_size;
         memcpy(op->value, value, value_size);
@@ -25755,7 +25632,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         size_t pk_size = tdb_build_prefixed_key(cf->unified_cf_index, key, key_size, prefixed_key);
 
         int unified_rc = TDB_ERR_NOT_FOUND;
-        const int64_t now_u = (int64_t)atomic_load(&txn->db->cached_current_time);
         const uint8_t *temp_val;
         size_t temp_val_size;
         int64_t ttl_u;
@@ -25780,7 +25656,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     unified_rc = TDB_ERR_NOT_FOUND;
                     goto unified_memtable_done;
                 }
-                if (ttl_u <= 0 || ttl_u > now_u)
+                if (ttl_u <= 0 || ttl_u > now)
                 {
                     *value = malloc(temp_val_size);
                     if (!*value)
@@ -25857,7 +25733,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     {
                         unified_rc = TDB_ERR_NOT_FOUND;
                     }
-                    else if (ttl_u <= 0 || ttl_u > now_u)
+                    else if (ttl_u <= 0 || ttl_u > now)
                     {
                         *value = malloc(temp_val_size);
                         if (!*value)
@@ -26654,12 +26530,8 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
 {
     if (!db || !cf) return 0;
 
-    /*** we track highest sequence found across all ssts
-     **  in L1 (levels[0]), ssts can overlap and newer ones are appended at the end
-     *   we must check all ssts to find the true highest sequence for this key */
-    uint64_t max_found_seq = 0;
-    int found_any = 0;
-
+    /* in L1 (levels[0]) ssts can overlap, so we scan every sst for this key and conflict on
+     * the first version whose seq exceeds the threshold */
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
     for (int level_idx = 0; level_idx < num_levels; level_idx++)
     {
@@ -26708,11 +26580,6 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
             uint64_t found_seq = 0;
             if (tidesdb_sstable_get_seq(db, sst, key, key_size, &found_seq) == TDB_SUCCESS)
             {
-                found_any = 1;
-                if (found_seq > max_found_seq)
-                {
-                    max_found_seq = found_seq;
-                }
                 if (found_seq > threshold_seq)
                 {
                     tidesdb_sstable_unref(db, sst);
@@ -26727,8 +26594,8 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
         atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
     }
 
-    /** conflict if we found any version with seq > threshold.. */
-    return (found_any && max_found_seq > threshold_seq) ? 1 : 0;
+    /* no version exceeded the threshold -- the early return above is the only conflict path */
+    return 0;
 }
 
 /**
@@ -26750,28 +26617,36 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
                                           tidesdb_immutable_memtable_t ***imm_refs,
                                           size_t *imm_count, tidesdb_column_family_t **last_cf)
 {
-    /* we refresh imm snapshot only when CF changes */
-    if (cf != *last_cf)
-    {
-        if (*imm_refs) tidesdb_txn_cleanup_imm_snapshot(*imm_refs, *imm_count);
-        *imm_refs = tidesdb_txn_get_imm_snapshot(cf, imm_count);
-        *last_cf = cf;
-    }
+    /* in unified mode the per-CF active memtable and its immutables hold no committed data
+     * (commit applies to the unified memtable, never cf->active_memtable), so we skip their
+     * snapshot, try_ref and seq scan -- the unified memtable check below covers the live data */
+    const int unified = txn->db->unified_mt.enabled;
 
-    /* we check per-CF active memtable */
-    tidesdb_memtable_t *mt = NULL;
-    int mt_refed =
-        tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt);
-
-    if (mt_refed && tidesdb_txn_check_seq_conflict(mt->skip_list, key, key_size, threshold_seq))
+    if (!unified)
     {
-        tidesdb_immutable_memtable_unref(mt);
-        return TDB_ERR_CONFLICT;
+        /* we refresh imm snapshot only when CF changes */
+        if (cf != *last_cf)
+        {
+            if (*imm_refs) tidesdb_txn_cleanup_imm_snapshot(*imm_refs, *imm_count);
+            *imm_refs = tidesdb_txn_get_imm_snapshot(cf, imm_count);
+            *last_cf = cf;
+        }
+
+        /* we check per-CF active memtable */
+        tidesdb_memtable_t *mt = NULL;
+        int mt_refed =
+            tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &mt);
+
+        if (mt_refed && tidesdb_txn_check_seq_conflict(mt->skip_list, key, key_size, threshold_seq))
+        {
+            tidesdb_immutable_memtable_unref(mt);
+            return TDB_ERR_CONFLICT;
+        }
+        if (mt_refed) tidesdb_immutable_memtable_unref(mt);
     }
-    if (mt_refed) tidesdb_immutable_memtable_unref(mt);
 
     /* we check unified memtable if enabled (data lives there, not in per-CF memtable) */
-    if (txn->db->unified_mt.enabled)
+    if (unified)
     {
         tidesdb_memtable_t *umt = NULL;
         const int umt_refed = tidesdb_active_memtable_try_ref(
@@ -26908,8 +26783,9 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
 
     /* we detect rw-conflicts. the active list now also holds REPEATABLE_READ and SNAPSHOT
      * txns for the compaction snapshot floor, but SSI conflicts only involve other
-     * SERIALIZABLE peers so we skip the rest */
-    for (int i = 0; i < count; i++)
+     * SERIALIZABLE peers so we skip the rest. an empty read set has no outgoing rw edge, so
+     * this pass cannot fire -- the guard skips the active-txn scan entirely */
+    for (int i = 0; txn->read_set_count > 0 && i < count; i++)
     {
         tidesdb_txn_t *other = active[i];
         if (other == txn || other->is_committed || other->is_aborted) continue;
@@ -27610,22 +27486,10 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
 
-        /* the hash includes CF index to distinguish same-key across different CFs */
-        uint8_t hash_buf[TDB_UNIFIED_CF_PREFIX_SIZE + TDB_PREFIXED_KEY_STACK_MAX];
-        uint8_t *hash_key;
-        size_t hash_key_size = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
-        if (hash_key_size <= sizeof(hash_buf))
-        {
-            hash_key = hash_buf;
-        }
-        else
-        {
-            hash_key = malloc(hash_key_size);
-            if (!hash_key) continue;
-        }
-        tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, hash_key);
-
-        const uint32_t hash = XXH32(hash_key, hash_key_size, TDB_TXN_HASH_SEED);
+        /* we hash the raw key and fold the cf index into the seed -- dedup equality below
+         * compares cf + key bytes directly, so the hash only has to distribute (cf,key) pairs */
+        const uint32_t hash =
+            XXH32(op->key, op->key_size, TDB_TXN_HASH_SEED ^ (uint32_t)op->cf->unified_cf_index);
         int slot = (int)(hash & dedup_hash_mask);
 
         int inserted = 0;
@@ -27651,8 +27515,6 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
             }
             slot = (slot + 1) & (int)dedup_hash_mask;
         }
-
-        if (hash_key != hash_buf) free(hash_key);
 
         if (!inserted && !is_duplicate)
         {
@@ -32636,6 +32498,18 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
     {
         tidesdb_level_add_sstable(cf->levels[level_num - 1], sst);
         tidesdb_bump_sstable_layout_version(cf);
+    }
+    else
+    {
+        /* the level could not be materialized (tidesdb_add_level failed, e.g. allocation) -- the
+         * sstable is valid and manifest referenced, but its keys are absent from this open until
+         * the level can be created. surface the gap rather than dropping it silently, mirroring
+         * the loud skip on a load failure above */
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "CF '%s' SSTable %" PRIu64
+                      " at level %d could not be placed (level "
+                      "allocation failed) -- its keys are absent from this open",
+                      cf->name, sst_id, level_num);
     }
 
     tidesdb_sstable_unref(cf->db, sst);

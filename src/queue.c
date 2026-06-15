@@ -189,7 +189,7 @@ int queue_enqueue(queue_t *queue, void *data)
     /* we only lock tail for enqueue -- the head operations are independent */
     pthread_mutex_lock(&queue->tail_lock);
 
-    /* bump size BEFORE publishing the node. if we published first, a concurrent
+    /* bump size before publishing the node. if we published first, a concurrent
      * dequeue could observe the node and decrement size before this increment,
      * transiently underflowing the unsigned counter to SIZE_MAX. incrementing
      * first means size can only briefly over-count (node not yet visible), which
@@ -205,11 +205,6 @@ int queue_enqueue(queue_t *queue, void *data)
 
     pthread_mutex_unlock(&queue->tail_lock);
 
-    /* signal one waiter per enqueued item whenever any thread is blocked. signaling
-     * only on the empty->non-empty transition loses wakeups under multiple waiters:
-     * a burst of items past the first leaves later waiters asleep until the 100ms
-     * poll, serializing what should be a parallel wakeup. we signal outside the
-     * tail_lock to keep its hold time short. */
     if (has_waiters)
     {
         pthread_mutex_lock(&queue->head_lock);

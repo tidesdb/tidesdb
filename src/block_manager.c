@@ -355,7 +355,7 @@ static int get_file_size(const int fd, uint64_t *size)
 /**
  * reopen_fd
  * closes and reopens the block manager file descriptor with the same flags.
- * NOT safe against concurrent readers, a reader that already captured bm->fd will
+ * not safe against concurrent readers, a reader that already captured bm->fd will
  * pread on a closed (possibly recycled) descriptor. callers (truncate, permissive
  * validation) must hold the bm exclusively / quiesce readers first.
  * @param bm the block manager

@@ -787,7 +787,7 @@ typedef volatile LONGLONG atomic_uint64_t;
         }                                                                                 \
         else if (sizeof(*(ptr)) == 8)                                                     \
         {                                                                                 \
-            /* 64-bit value on a 32-bit target cast straight to LONGLONG, NOT via         \
+            /* 64-bit value on a 32-bit target cast straight to LONGLONG, not via         \
              * uintptr_t (4 bytes here) which would truncate the input */                 \
             InterlockedExchange64((LONGLONG volatile *)(ptr), (LONGLONG)(val));           \
         }                                                                                 \

@@ -1412,8 +1412,8 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     {
         const uint8_t *block_data = (const uint8_t *)block->data;
         const uint32_t original_size = decode_uint32_le_compat(block_data);
-        int64_t header_prev_offset = decode_int64_le_compat(block_data + 4);
-        int64_t header_next_offset = decode_int64_le_compat(block_data + 12);
+        const int64_t header_prev_offset = decode_int64_le_compat(block_data + 4);
+        const int64_t header_next_offset = decode_int64_le_compat(block_data + 12);
         const uint8_t *compressed_data = block_data + 20;
         const size_t compressed_size = block->size - 20;
 
@@ -2043,8 +2043,8 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
  * patches next_offset in each leaf to point to the next leaf
  * this enables O(1) forward iteration through leaves
  *
- * block format -- [size(4)][checksum(4)][data][size(4)][magic(4)]
- * leaf data format -- [type:1][num_entries:varint][prev_offset:8][next_offset:8]...
+ * block format        [size(4)][checksum(4)][data][size(4)][magic(4)]
+ * leaf data format    [type:1][num_entries:varint][prev_offset:8][next_offset:8]...
  *
  * @param builder the builder instance
  * @return 0 on success, -1 on failure

@@ -537,7 +537,7 @@ tidesdb_config_t tidesdb_default_config(void);
 /**
  * tidesdb_raise_open_file_limit
  * raise this process's open-file ceiling toward `desired` descriptors so a database can keep more
- * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it BEFORE
+ * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it before
  * tidesdb_open. an explicit, opt-in operator action, tidesdb never raises the limit itself. POSIX
  * (Linux, macOS, the BSDs, illumos) raises the RLIMIT_NOFILE soft limit toward the hard limit;
  * Windows raises the CRT stdio cap (max 8192). a failed or partial raise is non-fatal.

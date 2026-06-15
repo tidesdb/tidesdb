@@ -685,7 +685,7 @@ static int s3_delete_object(void *ctx, const char *key)
 
     if (res != CURLE_OK) return -1;
     /* 2xx (200/204 No Content) = deleted, 404 Not Found = already absent; both are success.
-     * any other status (403, 5xx, ...) is a real failure that must NOT be masked, or the
+     * any other status (403, 5xx, ...) is a real failure that must not be masked, or the
      * integration layer's retry/cleanup is silently defeated. */
     if ((http_code >= TDB_S3_HTTP_OK && http_code < TDB_S3_HTTP_REDIRECT) ||
         http_code == TDB_S3_HTTP_NOT_FOUND)

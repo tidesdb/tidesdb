@@ -2759,7 +2759,7 @@ static void wait_for_flush_queue_drain(tidesdb_t *db)
     }
 }
 
-/* wait until a CF is fully flush-idle. an empty flush_queue is NOT sufficient, a flush deferred by
+/* wait until a CF is fully flush-idle. an empty flush_queue is not sufficient, a flush deferred by
  * global-cap backpressure leaves the queue empty with flush_deferred set for the reaper to retry,
  * and a dequeued flush is still in flight until the sstable is added to its level.
  * flush_pending_count is incremented at enqueue and decremented only after that level-add, so it
@@ -17532,7 +17532,7 @@ static void test_unlimited_max_open_no_eviction(void)
         usleep(20000);
         if (queue_size(db->flush_queue) == 0) break;
     }
-    usleep(200000); /* give the reaper ample time -- under unlimited it must NOT evict */
+    usleep(200000); /* give the reaper ample time -- under unlimited it must not evict */
 
     /* every read uses a plain get (no retry): unlimited means no fd-budget backoff, so each read
      * resolves directly with no TDB_ERR_BUSY */
@@ -17965,7 +17965,7 @@ static void test_power_loss_during_sstable_metadata_write(void)
     /* reopen the corrupted sstable must be handled gracefully -- the DB still opens
      * (recovery skips the unreadable sstable instead of crashing) and stays usable for new
      * writes/reads. data in the torn sstable may be unrecoverable (the cost of a torn
-     * metadata write), so we do NOT assert it survives; we assert no crash + usability. */
+     * metadata write), so we do not assert it survives; we assert no crash + usability. */
     {
         tidesdb_config_t config = tidesdb_default_config();
         config.db_path = TEST_DB_PATH;
@@ -21915,21 +21915,22 @@ static void test_stress_unified_read_races(void)
                                             &reads_ok,
                                             &reads_miss,
                                             &go,
-                                            &stop};
+                                            &stop,
+                                            &commit_busy};
         pthread_create(&readers[i], NULL, unified_reader_thread, &r_data[i]);
     }
     for (int i = 0; i < NUM_COMPACTORS; i++)
     {
         c_data[i] = (unified_stress_data_t){
             db,          cf,  90 + i, OPS_PER_COMPACTOR, &commit_errors, &commits_ok, &reads_ok,
-            &reads_miss, &go, &stop};
+            &reads_miss, &go, &stop,  &commit_busy};
         pthread_create(&compactors[i], NULL, unified_compactor_thread, &c_data[i]);
     }
     for (int i = 0; i < NUM_FLUSHERS; i++)
     {
         f_data[i] = (unified_stress_data_t){
-            db,          cf,  95 + i, OPS_PER_FLUSHER, &commit_errors, &commits_ok, &reads_ok,
-            &reads_miss, &go, &stop};
+            db,        cf,          95 + i, OPS_PER_FLUSHER, &commit_errors, &commits_ok,
+            &reads_ok, &reads_miss, &go,    &stop,           &commit_busy};
         pthread_create(&flushers[i], NULL, unified_flusher_thread, &f_data[i]);
     }
 
@@ -24390,7 +24391,7 @@ static void test_multi_cf_cross_txn_compaction_atomicity(void)
     /* we verify atomicity every committed pair must be present in BOTH CFs. classify on the exact
      * return code, not just found-vs-not, a read can return the retryable TDB_ERR_BUSY when
      * background compaction holds the reader fd reserve (common on fd-constrained runners), and
-     * BUSY means the key is durably present but momentarily unopenable -- NOT missing. only a
+     * BUSY means the key is durably present but momentarily unopenable -- not missing. only a
      * definitive TDB_ERR_NOT_FOUND on one side while the other is present is a real cross-CF
      * atomicity violation. BUSY pairs are counted separately so a transient fd backoff cannot fail
      * the test. */
@@ -30288,7 +30289,7 @@ static void crash_single_delete_child_workload(void)
     }
     if (tidesdb_purge(db) != 0) _exit(8);
 
-    /* single-delete every key but do NOT flush -- these live only in the unified wal */
+    /* single-delete every key but do not flush -- these live only in the unified wal */
     for (int i = 0; i < CRASH_SD_KEY_COUNT; i++)
     {
         char key[32];

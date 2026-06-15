@@ -48,7 +48,7 @@ static const uint32_t SHA256_K[64] = {
  */
 static void sha256_transform(sha256_ctx *ctx, const uint8_t data[SHA256_BLOCK_SIZE])
 {
-    uint32_t a, b, c, d, e, f, g, h, t1, t2, m[64];
+    uint32_t m[64];
 
     for (uint32_t i = 0, j = 0; i < 16; i++, j += 4)
         m[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j + 1] << 16) |
@@ -56,19 +56,19 @@ static void sha256_transform(sha256_ctx *ctx, const uint8_t data[SHA256_BLOCK_SI
     for (uint32_t i = 16; i < 64; i++)
         m[i] = SHA256_SIG1(m[i - 2]) + m[i - 7] + SHA256_SIG0(m[i - 15]) + m[i - 16];
 
-    a = ctx->state[0];
-    b = ctx->state[1];
-    c = ctx->state[2];
-    d = ctx->state[3];
-    e = ctx->state[4];
-    f = ctx->state[5];
-    g = ctx->state[6];
-    h = ctx->state[7];
+    uint32_t a = ctx->state[0];
+    uint32_t b = ctx->state[1];
+    uint32_t c = ctx->state[2];
+    uint32_t d = ctx->state[3];
+    uint32_t e = ctx->state[4];
+    uint32_t f = ctx->state[5];
+    uint32_t g = ctx->state[6];
+    uint32_t h = ctx->state[7];
 
     for (uint32_t i = 0; i < 64; i++)
     {
-        t1 = h + SHA256_EP1(e) + SHA256_CH(e, f, g) + SHA256_K[i] + m[i];
-        t2 = SHA256_EP0(a) + SHA256_MAJ(a, b, c);
+        const uint32_t t1 = h + SHA256_EP1(e) + SHA256_CH(e, f, g) + SHA256_K[i] + m[i];
+        const uint32_t t2 = SHA256_EP0(a) + SHA256_MAJ(a, b, c);
         h = g;
         g = f;
         f = e;
@@ -103,14 +103,14 @@ void sha256_init(sha256_ctx *ctx)
     ctx->state[7] = 0x5be0cd19;
 }
 
-void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len)
+void sha256_update(sha256_ctx *ctx, const uint8_t *data, const size_t len)
 {
     size_t i = 0;
 
-    /* Process any partial block first */
+    /* process any partial block first */
     if (ctx->datalen > 0)
     {
-        size_t fill = SHA256_BLOCK_SIZE - ctx->datalen;
+        const size_t fill = SHA256_BLOCK_SIZE - ctx->datalen;
         if (len < fill)
         {
             memcpy(ctx->data + ctx->datalen, data, len);
@@ -124,7 +124,7 @@ void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len)
         i = fill;
     }
 
-    /* Process full blocks */
+    /* process full blocks */
     while (i + SHA256_BLOCK_SIZE <= len)
     {
         sha256_transform(ctx, data + i);
@@ -132,7 +132,7 @@ void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len)
         i += SHA256_BLOCK_SIZE;
     }
 
-    /* Remaining bytes */
+    /* remaining bytes */
     if (i < len)
     {
         memcpy(ctx->data, data + i, len - i);
@@ -140,7 +140,6 @@ void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len)
     }
 }
 
-/* final and hash/hex remain the same as original for correctness */
 void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
 {
     uint32_t i = ctx->datalen;
@@ -173,17 +172,17 @@ void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
     sha256_transform(ctx, ctx->data);
 
     /*
-     * Produce the final 32-byte (256-bit) digest from the internal state.
+     * produce the final 32-byte (256-bit) digest from the internal state.
      * The SHA-256 state consists of eight 32-bit words (state[0]..state[7]).
      * Each 32-bit word is written out in big-endian order (most-significant
      * byte first). This converts the internal 8x32-bit state into the
      * 32-byte digest expected by callers.
      *
-     * Example: state[i] == 0x11223344 -> bytes: 0x11, 0x22, 0x33, 0x44
+     * state[i] == 0x11223344 -> bytes: 0x11, 0x22, 0x33, 0x44
      */
     for (i = 0; i < 8; ++i)
     {
-        uint32_t s = ctx->state[i];
+        const uint32_t s = ctx->state[i];
         out[i * 4] = (uint8_t)(s >> 24);
         out[i * 4 + 1] = (uint8_t)(s >> 16);
         out[i * 4 + 2] = (uint8_t)(s >> 8);
@@ -191,7 +190,7 @@ void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
     }
 }
 
-void sha256_hash(const void *data, size_t len, uint8_t out[SHA256_DIGEST_SIZE])
+void sha256_hash(const void *data, const size_t len, uint8_t out[SHA256_DIGEST_SIZE])
 {
     sha256_ctx ctx;
     sha256_init(&ctx);
@@ -199,7 +198,7 @@ void sha256_hash(const void *data, size_t len, uint8_t out[SHA256_DIGEST_SIZE])
     sha256_final(&ctx, out);
 }
 
-void sha256_hex(const void *data, size_t len, char *hex_out)
+void sha256_hex(const void *data, const size_t len, char *hex_out)
 {
     static const char hexd[] = "0123456789abcdef";
     uint8_t digest[SHA256_DIGEST_SIZE];

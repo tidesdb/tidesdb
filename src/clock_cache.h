@@ -141,11 +141,11 @@ struct clock_cache_partition_t
  *
  * * PERFORMANCE NOTES *****
  * -- uses hybrid design -- hash table for O(1) lookup + circular array for CLOCK eviction
- * -- hash table provides O(1) average-case lookups (with chaining for collisions)
+ * -- hash table provides O(1) average-case lookups (with linear probing for collisions)
  * -- CLOCK array enables efficient second-chance eviction without reordering
  * -- for high-performance workloads
  *    -- use 128-512 partitions for 16+ threads to minimize lock contention
- *    -- hash table size auto-scales to next power-of-2 >= slots_per_partition
+ *    -- hash table size auto-scales to next power-of-2 >= 2x slots_per_partition
  * @param partitions array of partitions
  * @param num_partitions number of partitions
  * @param partition_mask mask for fast modulo (num_partitions - 1)
@@ -202,7 +202,7 @@ typedef struct
 /**
  * clock_cache_compute_config
  * compute optimal cache configuration based on max_bytes and CPU count
- * uses heuristics -- 1 partition per CPU core (up to 128), ~512 slots per partition
+ * uses heuristics -- 4 partitions per CPU core (up to 512), ~512 slots per partition
  * @param max_bytes maximum total bytes for cache
  * @param config output parameter for computed configuration
  */

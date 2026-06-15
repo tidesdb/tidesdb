@@ -21,7 +21,9 @@
 
 /* we use thin wrappers instead of taking addresses of stdlib functions directly
  * on MSVC, malloc/calloc/realloc/free are __declspec(dllimport) and their
- * address is not guaranteed to be static (warning C4232) */
+ * address is not guaranteed to be static (warning C4232). these are defined
+ * before alloc.h is included so they bind to the real stdlib functions rather
+ * than the malloc->tdb_malloc macros that header installs */
 static void *real_malloc(size_t size)
 {
     return malloc(size);
@@ -65,8 +67,8 @@ int tidesdb_init(tidesdb_malloc_fn malloc_fn, tidesdb_calloc_fn calloc_fn,
     tidesdb_allocator.realloc_fn = realloc_fn ? realloc_fn : real_realloc;
     tidesdb_allocator.free_fn = free_fn ? free_fn : real_free;
 
-    /* we release fence ensures all function pointer writes are visible before
-     * any thread sees initialized=1 and starts calling through them */
+    /* we use a release store here so all function pointer writes above are
+     * visible before any thread sees initialized=1 and starts calling through them */
     atomic_store_explicit(&tidesdb_initialized, 1, memory_order_release);
 
     return 0;

@@ -45,7 +45,7 @@ tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char 
  * tidesdb_objstore_s3_config_t
  * full configuration for an S3 connector, including TLS and multipart tuning that the
  * positional tidesdb_objstore_s3_create cannot express. zero-initialize and set the fields
- * you need the all-zero defaults are secure (TLS verify on, no custom CA) and use the
+ * you need -- the all-zero defaults are secure (TLS verify on, no custom CA) and use the
  * built-in multipart sizes.
  * @param endpoint S3 endpoint (required)
  * @param bucket bucket name (required)

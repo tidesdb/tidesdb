@@ -149,7 +149,7 @@ static inline uint32_t bf_fmix32(uint32_t h)
     return h;
 }
 
-/* v2 index hash base hash plus the fmix32 finalizer */
+/* v2 index hash -- base hash plus the fmix32 finalizer */
 static inline uint32_t bf_hash_v2_inline(const uint8_t *entry, const size_t size,
                                          const uint32_t seed)
 {
@@ -278,7 +278,7 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
     const unsigned int m = bf->m;
     const uint64_t *const bitset = bf->bitset;
 
-    /* k-mitzenmacher + fast range reduction
+    /* Kirsch-Mitzenmacher double hashing + fast range reduction
      * 2 hashes + h cheap probes instead of h full hashes + h divisions */
     uint32_t h1, h2;
     bf_derive_hashes(bf, entry, size, &h1, &h2);

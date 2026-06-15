@@ -398,16 +398,17 @@ static inline int skip_list_compare_keys_32_inline(const uint8_t *key1, const ui
     return 0;
 }
 
-/**
- * skip_list_get_latest_valid_version
- * fast path for accessing the latest valid version
- * @param version version to check
- * @param current_time current time for TTL validation
- * @return latest valid version, or NULL if none
- */
+/* forward declaration; defined below */
 static inline int skip_list_version_is_invalid_with_time(skip_list_version_t *version,
                                                          int64_t current_time);
 
+/**
+ * skip_list_get_latest_valid_version
+ * fast path for accessing the latest valid version
+ * @param node node whose version chain to scan
+ * @param current_time current time for TTL validation
+ * @return latest valid version, or NULL if none
+ */
 static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_node_t *node,
                                                                       const int64_t current_time)
 {
@@ -507,9 +508,8 @@ static inline int skip_list_compare_keys_with_type(const skip_list_cmp_type_t cm
 static inline time_t skip_list_get_current_time(const skip_list_t *list)
 {
 #if defined(__MINGW32__) && !defined(__MINGW64__)
-    /* on MinGW x86, cached time has visibility issues across threads, it seems to be a compiler bug
-     ********
-     */
+    /* on MinGW x86 the cached time has cross-thread visibility issues (suspected compiler bug),
+     * so read the clock directly */
     (void)list;
     return time(NULL);
 #else
@@ -885,7 +885,7 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int 
     new_list->max_level = max_level;
     new_list->probability = probability;
 
-    /* we determine comparator typen */
+    /* we determine comparator type */
     if (comparator == skip_list_comparator_memcmp)
     {
         new_list->cmp_type = SKIP_LIST_CMP_MEMCMP;

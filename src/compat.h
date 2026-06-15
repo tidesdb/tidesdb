@@ -76,7 +76,6 @@
 #if defined(_MSC_VER)
 #define tdb_fabs(x) fabs(x)
 #elif defined(__APPLE__)
-/* macOS may require explicit declaration in some contexts */
 #define tdb_fabs(x) fabs(x)
 #else
 /* POSIX systems */
@@ -659,14 +658,14 @@ static inline int tdb_spawn_wait(const char *cmd, char *const argv[])
 #else
 /* msvc uses the native Win32 threading backend defined further below (search for "native Win32
  * threading backend"), so it needs no pthreads-win32 library. time.h provides struct timespec and
- * struct tm, which the removed pthreads-win32 header used to pull in transitively. */
+ * struct tm. */
 #include <time.h>
 
 /* struct timeval (used by gettimeofday) lives in winsock. windows.h pulls winsock in normally but
- * not under WIN32_LEAN_AND_MEAN (e.g. the mariadb build), and the removed pthreads-win32 header
- * used to supply it. only define it ourselves when winsock is not in the translation unit: newer
- * SDK winsock.h guards the file with _WINSOCKAPI_ and no longer sets the inner _TIMEVAL_DEFINED, so
- * a bare _TIMEVAL_DEFINED check would redefine it when winsock is present. */
+ * not under WIN32_LEAN_AND_MEAN (e.g. the mariadb build). only define it ourselves when winsock is
+ * not in the translation unit: newer SDK winsock.h guards the file with _WINSOCKAPI_ and does not
+ * set the inner _TIMEVAL_DEFINED, so a bare _TIMEVAL_DEFINED check would redefine it when winsock
+ * is present. */
 #if !defined(_TIMEVAL_DEFINED) && !defined(_WINSOCKAPI_) && !defined(_WINSOCK2API_)
 #define _TIMEVAL_DEFINED
 struct timeval
@@ -787,7 +786,7 @@ typedef volatile LONGLONG atomic_uint64_t;
         }                                                                                 \
         else if (sizeof(*(ptr)) == 8)                                                     \
         {                                                                                 \
-            /* 64-bit value on a 32-bit target cast straight to LONGLONG, NOT via         \
+            /* 64-bit value on a 32-bit target cast straight to LONGLONG, not via         \
              * uintptr_t (4 bytes here) which would truncate the input */                 \
             InterlockedExchange64((LONGLONG volatile *)(ptr), (LONGLONG)(val));           \
         }                                                                                 \
@@ -1522,8 +1521,8 @@ static inline int pthread_join(pthread_t th, void **retval)
     return 0;
 }
 
-/* sched_yield -- pthreads-win32 used to provide this; the engine itself yields via cpu_yield, but
- * direct POSIX callers (e.g. tests) still expect the symbol */
+/* sched_yield -- the engine itself yields via cpu_yield, but direct POSIX callers (e.g. tests)
+ * still expect this symbol on MSVC, so shim it onto SwitchToThread */
 static inline int sched_yield(void)
 {
     SwitchToThread();

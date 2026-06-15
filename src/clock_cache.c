@@ -119,7 +119,7 @@ static int detect_l3_groups(int num_cpus, uint8_t *cpu_to_group)
  * within seconds under normal access rates. */
 #define CLOCK_CACHE_GROUP_REPROBE_INTERVAL 4096
 
-static inline size_t get_local_partition(const clock_cache_t *cache, uint64_t hash)
+static inline size_t get_local_partition(const clock_cache_t *cache, const uint64_t hash)
 {
     if (cache->num_groups <= 1)
     {
@@ -303,14 +303,6 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
     atomic_store_explicit(&partition->hash_index[empty], -1, memory_order_release);
 }
 
-/**
- * try_match_entry
- * @param entry the entry
- * @param key the key
- * @param key_len the key length
- * @param target_hash the target hash
- * @return the entry or NULL if not found
- */
 /* acquire a reader ref, refusing at saturation (see CLOCK_CACHE_READERS_SATURATED).
  * returns 1 with a ref held, 0 if already at max readers */
 static inline int cc_try_pin_reader(clock_cache_entry_t *entry)
@@ -327,6 +319,14 @@ static inline int cc_try_pin_reader(clock_cache_entry_t *entry)
     }
 }
 
+/**
+ * try_match_entry
+ * @param entry the entry
+ * @param key the key
+ * @param key_len the key length
+ * @param target_hash the target hash
+ * @return the entry or NULL if not found
+ */
 static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const char *key,
                                             size_t key_len, uint64_t target_hash)
 {
@@ -422,7 +422,7 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
  * @param partition the partition
  * @param entry the entry
  */
-static void free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
+static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *partition,
                        clock_cache_entry_t *entry)
 {
     /* we try to claim entry for deletion using CAS */
@@ -1138,7 +1138,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     /* we release reader ref and conditionally mark as recently used
      * combining two atomic RMWs into one when ref bit is already set (hot entries) */
-    uint8_t old_ref =
+    const uint8_t old_ref =
         atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
     if (!(old_ref & CLOCK_CACHE_REF_BIT))
     {

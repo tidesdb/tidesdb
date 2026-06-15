@@ -18,7 +18,7 @@
  */
 #include "hmac_sha256.h"
 
-void hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
+void hmac_sha256(const void *key, const size_t key_len, const void *data, const size_t data_len,
                  uint8_t out[HMAC_SHA256_DIGEST_SIZE])
 {
     uint8_t k_block[SHA256_BLOCK_SIZE];

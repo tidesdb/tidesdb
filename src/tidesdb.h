@@ -854,7 +854,7 @@ struct tidesdb_t
     _Atomic(int) comparators_capacity;
     pthread_t *flush_threads;
     queue_t *flush_queue;
-    /* number of pool threads still running: incremented at create, decremented when a worker
+    /* number of pool threads still running, incremented at create, decremented when a worker
      * returns. close re-broadcasts shutdown while the count is non-zero. */
     _Atomic(int) live_flush_threads;
     pthread_t *compaction_threads;
@@ -1128,7 +1128,7 @@ struct tidesdb_iter_t
  * @param max_sst_density worst per-sstable tombstone density observed in the cf
  * @param max_sst_density_level 1-based level where max_sst_density was observed (0 if none)
  * @param wal_bytes_written framed bytes appended to this cf's WAL (0 in unified mode)
- * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L0 sstables
+ * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L1 sstables
  * @param compaction_bytes_written on-disk bytes this cf's compactions wrote
  * @param compaction_bytes_read on-disk bytes this cf's compactions read as input
  * @param user_bytes_written logical key+value bytes committed to this cf (WA denominator)
@@ -1310,7 +1310,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
 /**
  * tidesdb_raise_open_file_limit
  * raise this process's open-file ceiling toward `desired` descriptors so a database can keep more
- * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it BEFORE
+ * sstables open -- the engine sizes max_open_sstables to fit this at open time, so call it before
  * tidesdb_open. an explicit, opt-in operator action, tidesdb never raises the limit itself. POSIX
  * raises the RLIMIT_NOFILE soft limit toward the hard limit; Windows raises the CRT stdio cap
  * (max 8192). a failed or partial raise is non-fatal -- the prior ceiling stands.

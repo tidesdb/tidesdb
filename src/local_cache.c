@@ -155,7 +155,7 @@ static void hash_insert(tdb_local_cache_t *cache, tdb_cache_entry_t *entry)
  */
 static void hash_remove(tdb_local_cache_t *cache, tdb_cache_entry_t *entry)
 {
-    uint32_t idx = cache_bucket(entry->hash);
+    const uint32_t idx = cache_bucket(entry->hash);
     tdb_cache_entry_t **pp = &cache->buckets[idx];
     while (*pp)
     {
@@ -178,9 +178,10 @@ static void hash_remove(tdb_local_cache_t *cache, tdb_cache_entry_t *entry)
  * @return the entry if found, NULL otherwise
  * caller must hold cache->lock
  */
-static tdb_cache_entry_t *hash_find(tdb_local_cache_t *cache, const char *path, uint32_t h)
+static tdb_cache_entry_t *hash_find(const tdb_local_cache_t *cache, const char *path,
+                                    const uint32_t h)
 {
-    uint32_t idx = cache_bucket(h);
+    const uint32_t idx = cache_bucket(h);
     tdb_cache_entry_t *cur = cache->buckets[idx];
     while (cur)
     {
@@ -201,7 +202,7 @@ static tdb_cache_entry_t *hash_find(tdb_local_cache_t *cache, const char *path, 
  * caller must hold cache->lock
  */
 static void cache_remove_entry(tdb_local_cache_t *cache, tdb_cache_entry_t *entry, size_t *current,
-                               int delete_file)
+                               const int delete_file)
 {
     lru_unlink(cache, entry);
     hash_remove(cache, entry);
@@ -238,7 +239,7 @@ static void cache_remove_entry(tdb_local_cache_t *cache, tdb_cache_entry_t *entr
 static void cache_evict_partner(tdb_local_cache_t *cache, const tdb_cache_entry_t *victim,
                                 size_t *current)
 {
-    size_t vlen = strlen(victim->path);
+    const size_t vlen = strlen(victim->path);
     if (vlen < TDB_LOCAL_CACHE_EXT_LEN) return;
 
     const char *ext = victim->path + vlen - TDB_LOCAL_CACHE_EXT_LEN;
@@ -256,7 +257,7 @@ static void cache_evict_partner(tdb_local_cache_t *cache, const tdb_cache_entry_
     memcpy(partner_path + vlen - TDB_LOCAL_CACHE_EXT_LEN, partner_ext, TDB_LOCAL_CACHE_EXT_LEN);
     partner_path[vlen] = '\0';
 
-    uint32_t ph = cache_hash(partner_path);
+    const uint32_t ph = cache_hash(partner_path);
     tdb_cache_entry_t *partner = hash_find(cache, partner_path, ph);
     if (!partner) return;
 
@@ -296,7 +297,7 @@ int tdb_local_cache_track(tdb_local_cache_t *cache, const char *local_path)
     if (stat(local_path, &st) != 0) return -1;
 
     size_t file_size = (size_t)st.st_size;
-    uint32_t h = cache_hash(local_path);
+    const uint32_t h = cache_hash(local_path);
 
     pthread_mutex_lock(&cache->lock);
 
@@ -355,7 +356,7 @@ void tdb_local_cache_remove(tdb_local_cache_t *cache, const char *local_path)
 {
     if (!cache || !local_path) return;
 
-    uint32_t h = cache_hash(local_path);
+    const uint32_t h = cache_hash(local_path);
 
     pthread_mutex_lock(&cache->lock);
 

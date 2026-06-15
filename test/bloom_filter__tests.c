@@ -783,7 +783,7 @@ void test_bloom_filter_hash_versioning()
         ASSERT_EQ(bloom_filter_contains(v2_rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
 
     /* legacy v1: simulate an on-disk filter built with the old hash. force the
-     * version to 1 BEFORE adding so the bits are set with the v1 hash. */
+     * version to 1 before adding so the bits are set with the v1 hash. */
     bloom_filter_t *v1;
     (void)bloom_filter_new(&v1, 0.01, 1000);
     v1->hash_version = 1;

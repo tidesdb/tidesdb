@@ -1525,7 +1525,7 @@ void test_reader_saturation_refuses_pin(void)
         ASSERT_TRUE(over == NULL);
     }
 
-    /* delete while all readers are held -- free_entry must NOT reclaim the entry (it reverts to
+    /* delete while all readers are held -- free_entry must not reclaim the entry (it reverts to
      * VALID and aborts), so the held payload stays valid and readable; a use-after-free here
      * would trip ASan, and a wrapped reader field would have let the free through. */
     clock_cache_delete(cache, key, strlen(key));

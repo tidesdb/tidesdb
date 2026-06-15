@@ -221,13 +221,14 @@ static int fs_get(void *ctx, const char *key, const char *local_path)
  * @param size number of bytes to read
  * @return bytes read on success, -1 on error
  */
-static ssize_t fs_range_get(void *ctx, const char *key, uint64_t offset, void *buf, size_t size)
+static ssize_t fs_range_get(void *ctx, const char *key, const uint64_t offset, void *buf,
+                            const size_t size)
 {
-    fs_ctx_t *fs = (fs_ctx_t *)ctx;
+    const fs_ctx_t *fs = (fs_ctx_t *)ctx;
     char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
 
-    int fd = open(full, O_RDONLY, 0);
+    const int fd = open(full, O_RDONLY, 0);
     if (fd < 0) return -1;
 
     ssize_t nread = pread(fd, buf, size, (off_t)offset);

@@ -98,19 +98,14 @@ typedef enum
  * @param group_durable_size bytes of the file confirmed fdatasync'd, used by group-commit
  *                           callers to tell whether their write is already durable
  * @param group_sync_active set while a group-commit leader is mid-fdatasync on this file
- * @param smooth_writeback 1 when this file is a single-writer sstable under construction and
- *                         block writes should dribble async writeback every
- *                         BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES. read-only after open.
- * @param smooth_synced_offset construction-writer cursor, file offset already handed to async
- *                             writeback. only touched by the single construction thread (never
- *                             set on concurrently-written files), so it needs no atomicity.
  */
 typedef struct
 {
     int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
-    int sync_full_cached; /* cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL) */
+    /* atomic so a runtime sync-mode change can't race the read on the write path */
+    _Atomic int sync_full_cached;
     int smooth_writeback; /* read-only after open; see block_manager_enable_smooth_writeback */
     uint64_t smooth_synced_offset; /* single-writer construction cursor, no atomicity needed */
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
@@ -145,7 +140,6 @@ typedef struct
  * @param bm the block manager
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
- * @param block_index current index in shared position cache (-1 if before first block)
  * @param block_size_valid 1 if current_block_size is cached and valid, 0 otherwise
  */
 typedef struct
@@ -153,7 +147,6 @@ typedef struct
     block_manager_t *bm;
     uint64_t current_pos;
     uint64_t current_block_size;
-    int block_index;
     int block_size_valid;
 } block_manager_cursor_t;
 
@@ -499,8 +492,8 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
  * @param validation the type of validation to apply, either strict or permissive
  * @return 0 if valid or successfully recovered, -1 if validation fails
  *
- * In strict mode -- any corruption returns -1, file is not modified
- * In permissive mode -- truncates to last valid block on corruption
+ * In strict mode           -- any corruption returns -1, file is not modified
+ * In permissive mode       -- truncates to last valid block on corruption
  */
 int block_manager_validate_last_block(block_manager_t *bm,
                                       tidesdb_block_validation_mode_t validation);

@@ -161,7 +161,7 @@ static inline int odsync_available(void)
  */
 static inline int is_sync_full(const block_manager_t *bm)
 {
-    return bm->sync_full_cached;
+    return atomic_load_explicit(&bm->sync_full_cached, memory_order_relaxed);
 }
 
 /**
@@ -425,7 +425,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     atomic_init(&new_bm->group_sync_active, 0);
 
     new_bm->sync_mode = sync_mode;
-    new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
+    atomic_init(&new_bm->sync_full_cached, sync_mode == BLOCK_MANAGER_SYNC_FULL);
     new_bm->smooth_writeback = 0;
     new_bm->smooth_synced_offset = 0;
 
@@ -705,8 +705,11 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         }
         if (blocks[i]->size > UINT32_MAX) return -1;
 
-        total_batch_size +=
+        const size_t framed =
             BLOCK_MANAGER_BLOCK_HEADER_SIZE + blocks[i]->size + BLOCK_MANAGER_FOOTER_SIZE;
+        /* guard size_t overflow of the running total on 32-bit platforms */
+        if (framed > SIZE_MAX - total_batch_size) return -1;
+        total_batch_size += framed;
         valid_count++;
     }
 
@@ -921,7 +924,6 @@ int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manage
     /* we initialize to position before first block */
     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     cursor->current_block_size = 0;
-    cursor->block_index = -1; /* -1 means before first block */
     cursor->block_size_valid = 0;
 
     /* we position at first block so cursor_read works immediately */
@@ -977,7 +979,6 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_size_valid = 0; /* we invalidate cache after moving */
-    cursor->block_index++;
 
     return 0;
 }
@@ -1053,7 +1054,6 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
             BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
         cursor->current_block_size = 0;
         cursor->block_size_valid = 0;
-        cursor->block_index++;
         return 0;
     }
 
@@ -1067,7 +1067,6 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_size_valid = 0;
-    cursor->block_index++;
     return 0;
 }
 
@@ -1259,7 +1258,6 @@ block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_curso
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_size_valid = 0; /* invalidate cache -- we moved to a new position */
-    cursor->block_index++;
 
     return block;
 }
@@ -1321,7 +1319,6 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     cursor->current_pos = prev_block_start;
     cursor->current_block_size = prev_block_size;
     cursor->block_size_valid = 1; /* we know the size from footer */
-    cursor->block_index--;
 
     return 0;
 }
@@ -1332,7 +1329,6 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
 
     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     cursor->current_block_size = 0;
-    cursor->block_index = -1;
     cursor->block_size_valid = 0;
 
     return 0;
@@ -1378,7 +1374,6 @@ int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, const 
     cursor->current_pos = end_offset - total_block_size;
     cursor->current_block_size = block_size;
     cursor->block_size_valid = 1; /* we know the size from footer */
-    cursor->block_index = -1;     /* unknown index */
 
     return 0;
 }
@@ -1483,7 +1478,6 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos
 
     cursor->current_pos = pos;
     cursor->block_size_valid = 0; /* we invalidate cache when jumping to arbitrary position */
-    cursor->block_index = -1;     /* index is unknown after an arbitrary jump */
     return 0;
 }
 
@@ -1699,20 +1693,20 @@ int block_manager_validate_last_block(block_manager_t *bm,
             scan_pos += total_block_size;
         }
 
-        /* if we stopped without explicit corruption, verify the trailing region is
-         * all zeros -- that confirms it's preallocation tail, not a partial write. */
-        const int trailing_zero =
-            hit_corruption ? 0 : is_trailing_zero(bm->fd, valid_size, file_size);
-
         if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
+            /* the trailing region must be all zeros to confirm it's preallocation tail
+             * rather than a partial write; permissive mode truncates either way and so
+             * never needs this scan */
+            const int trailing_zero =
+                hit_corruption ? 0 : is_trailing_zero(bm->fd, valid_size, file_size);
             if (hit_corruption || trailing_zero != 1) return -1;
             /* preallocation tail is legitimate; don't truncate, just record true extent */
             atomic_store(&bm->current_file_size, valid_size);
             return 0;
         }
 
-        /* permissive mode -- truncate trailing garbage OR preallocation tail so
+        /* permissive mode -- truncate trailing garbage or preallocation tail so
          * the file is always self-describing on next open */
         if (valid_size != file_size)
         {
@@ -1783,7 +1777,8 @@ void block_manager_set_sync_mode(block_manager_t *bm, const int sync_mode)
 {
     if (!bm) return;
     bm->sync_mode = convert_sync_mode(sync_mode);
-    bm->sync_full_cached = (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL);
+    atomic_store_explicit(&bm->sync_full_cached, bm->sync_mode == BLOCK_MANAGER_SYNC_FULL,
+                          memory_order_relaxed);
 }
 
 int block_manager_get_block_size_at_offset(block_manager_t *bm, const uint64_t offset,

@@ -47,14 +47,6 @@
  * memory-based refusal happens (e.g. block_manager unit tests with no db). */
 static _Atomic(uint64_t) bm_max_safe_block_bytes = 0;
 
-void block_manager_set_max_safe_block_bytes(uint64_t bytes)
-{
-    atomic_store_explicit(&bm_max_safe_block_bytes, bytes, memory_order_relaxed);
-}
-
-static pthread_key_t bm_tls_key;
-static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
-
 /**
  *
  *  * * * * * * * * * *
@@ -97,12 +89,31 @@ static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
  * global block cache in tidesdb.c uses these functions for safe sharing
  */
 
+static pthread_key_t bm_tls_key;
+static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
+
+/**
+ * bm_tls_read_buf_t
+ * per-thread reusable read buffer (see bm_get_read_buf)
+ * @param buf the buffer, grown on demand and freed on thread exit
+ * @param capacity allocated size of buf in bytes
+ */
 typedef struct
 {
     uint8_t *buf;
     size_t capacity;
 } bm_tls_read_buf_t;
 
+void block_manager_set_max_safe_block_bytes(uint64_t bytes)
+{
+    atomic_store_explicit(&bm_max_safe_block_bytes, bytes, memory_order_relaxed);
+}
+
+/**
+ * bm_tls_destructor
+ * frees a thread's read buffer when the thread exits
+ * @param ptr the thread-local bm_tls_read_buf_t
+ */
 static void bm_tls_destructor(void *ptr)
 {
     if (ptr)
@@ -113,11 +124,24 @@ static void bm_tls_destructor(void *ptr)
     }
 }
 
+/**
+ * bm_tls_init_key
+ * one-time creation of the thread-local read-buffer key
+ */
 static void bm_tls_init_key(void)
 {
     pthread_key_create(&bm_tls_key, bm_tls_destructor);
 }
 
+/**
+ * bm_get_read_buf
+ * returns the calling thread's reusable read buffer, growing it (capacity doubling)
+ * to hold at least needed bytes. avoids a fresh malloc and its page faults on every
+ * read. the grow uses realloc, so bytes already in the buffer are preserved -- callers
+ * rely on this to keep an already-read header across a grow for the payload remainder.
+ * @param needed minimum buffer size in bytes
+ * @return the buffer, or NULL on allocation failure
+ */
 static uint8_t *bm_get_read_buf(const size_t needed)
 {
     pthread_once(&bm_tls_once, bm_tls_init_key);
@@ -156,7 +180,7 @@ static inline int odsync_available(void)
 /**
  * is_sync_full
  * is a block manager in sync full mode?
- * @param bm
+ * @param bm the block manager
  * @return 1 if sync mode is full, 0 otherwise
  */
 static inline int is_sync_full(const block_manager_t *bm)
@@ -379,7 +403,9 @@ static int reopen_fd(block_manager_t *bm)
 
 /**
  * truncate_to_header
- * truncates a block manager file to just the header and syncs
+ * truncates a block manager file back to just the header, resetting the tracked file
+ * size and preallocation extent. syncs in full-sync mode (ftruncate is not covered by
+ * O_DSYNC).
  * @param bm the block manager
  * @return 0 if successful, -1 if not
  */
@@ -402,10 +428,12 @@ static int truncate_to_header(block_manager_t *bm)
 
 /**
  * block_manager_open_internal
- * opens a block manager (no cache)
- * @param bm the block manager to open
+ * allocates the block manager, opens or creates the file, then writes a fresh header
+ * (new file) or validates the existing one. on failure the errno of the failing syscall
+ * is preserved for the caller.
+ * @param bm output, set to the opened block manager (NULL on failure)
  * @param file_path the path of the file
- * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
+ * @param sync_mode the sync mode (BLOCK_MANAGER_SYNC_NONE, BLOCK_MANAGER_SYNC_FULL)
  * @return 0 if successful, -1 if not
  */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
@@ -612,6 +640,9 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
  * reserved tail offset via a single pwritev. shared by block_write and write_raw
  * so the on-disk encoding lives in one place. data must be non-NULL and size
  * non-zero -- the caller validates (a zero size_field reads back as EOF).
+ * @param bm the block manager
+ * @param data the payload to frame and append
+ * @param size the payload size in bytes
  * @return the offset written at, or -1 on failure
  */
 static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint32_t size)

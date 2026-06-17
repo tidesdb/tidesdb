@@ -22,12 +22,20 @@
 /* global counter for generating unique arena IDs */
 static _Atomic(uint64_t) global_arena_id_counter = 0;
 
-/* thread-local cache for arena slot assignment
- * each thread caches its slot for one arena at a time
- * if the arena changes, we must get a new slot from that arena */
-static _Thread_local skip_list_arena_t *tl_cached_arena = NULL;
-static _Thread_local uint64_t tl_cached_arena_id = 0; /* cache the generation ID */
-static _Thread_local int tl_arena_slot = -1;
+/* per-thread cache of arena slot assignments. caching a small set rather than a single
+ * arena keeps the fast path when a thread interleaves writes across several arenas (e.g. a
+ * base column family and its index families) instead of re-fetching a slot on every switch. */
+#define SKIP_LIST_ARENA_TL_CACHE_SIZE 8
+
+typedef struct
+{
+    skip_list_arena_t *arena;
+    uint64_t arena_id;
+    int slot;
+} skip_list_arena_tl_slot_t;
+
+static _Thread_local skip_list_arena_tl_slot_t tl_slot_cache[SKIP_LIST_ARENA_TL_CACHE_SIZE];
+static _Thread_local unsigned tl_slot_cache_next = 0;
 
 /**
  * skip_list_arena_create_block
@@ -109,32 +117,29 @@ static skip_list_arena_t *skip_list_arena_create(const size_t initial_capacity)
 /**
  * skip_list_arena_get_slot
  * gets or assigns a thread-local slot for this thread and arena
- * the slot is cached per-thread but invalidated when switching arenas
+ * slots are cached in a small per-thread set so interleaving a few arenas stays on the fast
+ * path; the arena_id generation guards against the OS recycling a freed arena's address
  * @param arena the arena
  * @return slot index (0 to SKIP_LIST_ARENA_MAX_THREADS-1), or -1 if slots exhausted
  */
 static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
 {
-    /* fast path -- cached slot for this arena.
-     * we check both the memory address AND the unique generation ID to prevent ABA
-     * collisions if the OS recycles the arena's memory address. */
-    if (SKIP_LIST_LIKELY(tl_cached_arena == arena && tl_cached_arena_id == arena->arena_id &&
-                         tl_arena_slot >= 0))
+    const uint64_t arena_id = arena->arena_id;
+
+    for (int i = 0; i < SKIP_LIST_ARENA_TL_CACHE_SIZE; i++)
     {
-        return tl_arena_slot;
+        const skip_list_arena_tl_slot_t *e = &tl_slot_cache[i];
+        if (SKIP_LIST_LIKELY(e->arena == arena && e->arena_id == arena_id)) return e->slot;
     }
 
-    /* different arena or first allocation -- get a new slot */
+    /* miss -- claim a fresh slot from the arena and remember it, evicting round-robin */
     int slot = atomic_fetch_add_explicit(&arena->tl_slot_counter, 1, memory_order_relaxed);
-    if (slot >= SKIP_LIST_ARENA_MAX_THREADS)
-    {
-        return -1;
-    }
+    if (slot >= SKIP_LIST_ARENA_MAX_THREADS) return -1;
 
-    /* cache the pointer, the ID, and the slot */
-    tl_cached_arena = arena;
-    tl_cached_arena_id = arena->arena_id;
-    tl_arena_slot = slot;
+    const unsigned idx = tl_slot_cache_next++ % SKIP_LIST_ARENA_TL_CACHE_SIZE;
+    tl_slot_cache[idx].arena = arena;
+    tl_slot_cache[idx].arena_id = arena_id;
+    tl_slot_cache[idx].slot = slot;
     return slot;
 }
 
@@ -1307,6 +1312,14 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, const size_t key_siz
     {
         return -1;
     }
+
+    /* a tombstone is an inserted version too -- floor min_seq so compaction never reaps it as
+     * older than data still held unflushed, matching skip_list_put_with_seq */
+    uint64_t cur = atomic_load_explicit(&list->min_seq, memory_order_relaxed);
+    while (seq < cur && !atomic_compare_exchange_weak_explicit(
+                            &list->min_seq, &cur, seq, memory_order_relaxed, memory_order_relaxed))
+    {
+    }
     return 0;
 }
 
@@ -1341,6 +1354,7 @@ int skip_list_clear(skip_list_t *list)
     atomic_store_explicit(&list->level, 0, memory_order_release);
     atomic_store_explicit(&list->total_size, 0, memory_order_release);
     atomic_store_explicit(&list->entry_count, 0, memory_order_release);
+    atomic_store_explicit(&list->min_seq, UINT64_MAX, memory_order_release);
 
     return 0;
 }

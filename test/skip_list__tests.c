@@ -3073,6 +3073,351 @@ void benchmark_skip_list_rw_contention()
     run_rw_contention_suite(total_threads, ops_per_thread, num_unique_keys, 1);
 }
 
+static int vis_seq_le(void *ctx, uint64_t seq)
+{
+    return seq <= *(uint64_t *)ctx;
+}
+
+void test_skip_list_get_with_seq_ref()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    uint8_t key[] = "mvcc_key";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v1", 3, -1, 1, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v5", 3, -1, 5, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v9", 3, -1, 9, 0), 0);
+
+    const uint8_t *val = NULL;
+    size_t vs = 0;
+    int64_t ttl;
+    uint8_t deleted;
+    uint64_t seq;
+
+    /* UINT64_MAX reads the latest version with no snapshot filtering */
+    ASSERT_EQ(skip_list_get_with_seq_ref(list, key, sizeof(key), &val, &vs, &ttl, &deleted, &seq,
+                                         UINT64_MAX, NULL, NULL),
+              0);
+    ASSERT_EQ(seq, 9);
+    ASSERT_EQ(memcmp(val, "v9", 3), 0);
+
+    /* snapshot reads the newest version with seq <= snapshot_seq */
+    ASSERT_EQ(skip_list_get_with_seq_ref(list, key, sizeof(key), &val, &vs, &ttl, &deleted, &seq, 5,
+                                         NULL, NULL),
+              0);
+    ASSERT_EQ(seq, 5);
+    ASSERT_EQ(memcmp(val, "v5", 3), 0);
+
+    ASSERT_EQ(skip_list_get_with_seq_ref(list, key, sizeof(key), &val, &vs, &ttl, &deleted, &seq, 4,
+                                         NULL, NULL),
+              0);
+    ASSERT_EQ(seq, 1);
+    ASSERT_EQ(memcmp(val, "v1", 3), 0);
+
+    /* seq 0 matches nothing because sequence numbers start at 1 */
+    ASSERT_EQ(skip_list_get_with_seq_ref(list, key, sizeof(key), &val, &vs, &ttl, &deleted, &seq, 0,
+                                         NULL, NULL),
+              -1);
+
+    /* visibility check skips a version newer than the committed threshold */
+    uint64_t committed = 5;
+    ASSERT_EQ(skip_list_get_with_seq_ref(list, key, sizeof(key), &val, &vs, &ttl, &deleted, &seq, 9,
+                                         vis_seq_le, &committed),
+              0);
+    ASSERT_EQ(seq, 5);
+    ASSERT_EQ(memcmp(val, "v5", 3), 0);
+
+    uint8_t bad[] = "absent";
+    ASSERT_EQ(skip_list_get_with_seq_ref(list, bad, sizeof(bad), &val, &vs, &ttl, &deleted, &seq,
+                                         UINT64_MAX, NULL, NULL),
+              -1);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_out_of_order_versions()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    uint8_t key[] = "ooo";
+    /* versions arrive out of seq order -- the chain must stay descending: 10 -> 6 -> 2 */
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v10", 4, -1, 10, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v2", 3, -1, 2, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v6", 3, -1, 6, 0), 0);
+
+    /* a duplicate seq is rejected */
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"dup", 4, -1, 6, 0), -1);
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+    ASSERT_EQ(skip_list_cursor_goto_first(cursor), 0);
+
+    uint8_t *k, *v;
+    size_t ks, vsz;
+    int64_t ttl;
+    uint8_t deleted;
+    uint64_t seq;
+
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(seq, 10);
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(seq, 6);
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(seq, 2);
+    ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), -1);
+
+    /* a snapshot resolves to the right version across the reordered chain */
+    uint8_t *val = NULL;
+    size_t val_size = 0;
+    ASSERT_EQ(skip_list_get_with_seq(list, key, sizeof(key), &val, &val_size, &ttl, &deleted, &seq,
+                                     5, NULL, NULL),
+              0);
+    ASSERT_EQ(seq, 2);
+    ASSERT_EQ(memcmp(val, "v2", 3), 0);
+    free(val);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
+void test_skip_list_min_max_seq()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    ASSERT_EQ(skip_list_get_min_seq(list), UINT64_MAX);
+
+    uint64_t out = 123;
+    uint8_t miss[] = "miss";
+    ASSERT_EQ(skip_list_get_max_seq(list, miss, sizeof(miss), &out), -1);
+    ASSERT_EQ(out, 0);
+
+    uint8_t key[] = "k";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"a", 2, -1, 5, 0), 0);
+    ASSERT_EQ(skip_list_get_min_seq(list), 5);
+
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"b", 2, -1, 9, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"c", 2, -1, 3, 0), 0);
+
+    /* max seq is the newest version, min seq is the smallest ever inserted */
+    ASSERT_EQ(skip_list_get_max_seq(list, key, sizeof(key), &out), 0);
+    ASSERT_EQ(out, 9);
+    ASSERT_EQ(skip_list_get_min_seq(list), 3);
+
+    /* clear resets the min seq floor */
+    ASSERT_EQ(skip_list_clear(list), 0);
+    ASSERT_EQ(skip_list_get_min_seq(list), UINT64_MAX);
+
+    /* a tombstone is tracked by min seq too */
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"d", 2, -1, 20, 0), 0);
+    ASSERT_EQ(skip_list_get_min_seq(list), 20);
+    ASSERT_EQ(skip_list_delete(list, key, sizeof(key), 4), 0);
+    ASSERT_EQ(skip_list_get_min_seq(list), 4);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_single_delete_flag()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    uint8_t key[] = "sd";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v", 2, -1, 1, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), NULL, 0, -1, 2,
+                                     SKIP_LIST_FLAG_DELETED | SKIP_LIST_FLAG_SINGLE_DELETE),
+              0);
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+    ASSERT_EQ(skip_list_cursor_goto_first(cursor), 0);
+
+    uint8_t *k, *v;
+    size_t ks, vs;
+    int64_t ttl;
+    uint8_t deleted;
+    uint64_t seq;
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vs, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(seq, 2);
+    ASSERT_TRUE(deleted & SKIP_LIST_FLAG_DELETED);
+    ASSERT_TRUE(deleted & SKIP_LIST_FLAG_SINGLE_DELETE);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
+void test_skip_list_put_batch_partial()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    /* entries[1] duplicates the (key, seq) of entries[0] and is skipped */
+    skip_list_batch_entry_t entries[3];
+    entries[0].key = (const uint8_t *)"K";
+    entries[0].key_size = 2;
+    entries[0].value = (const uint8_t *)"a";
+    entries[0].value_size = 2;
+    entries[0].seq = 1;
+    entries[0].ttl = -1;
+    entries[0].flags = 0;
+    entries[1] = entries[0];
+    entries[1].value = (const uint8_t *)"b";
+    entries[2].key = (const uint8_t *)"L";
+    entries[2].key_size = 2;
+    entries[2].value = (const uint8_t *)"c";
+    entries[2].value_size = 2;
+    entries[2].seq = 2;
+    entries[2].ttl = -1;
+    entries[2].flags = 0;
+
+    ASSERT_EQ(skip_list_put_batch(list, entries, 3), 2);
+    ASSERT_EQ(skip_list_count_entries(list), 2);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_tall_heap_update()
+{
+    /* max_level == SKIP_LIST_STACK_UPDATE_SIZE (64) forces the heap update[] path in put/batch */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 64, 0.5f), 0);
+
+    skip_list_batch_entry_t entries[64];
+    char keys[64][16];
+    for (int i = 0; i < 64; i++)
+    {
+        snprintf(keys[i], sizeof(keys[i]), "tall_%03d", i);
+        entries[i].key = (const uint8_t *)keys[i];
+        entries[i].key_size = strlen(keys[i]) + 1;
+        entries[i].value = (const uint8_t *)keys[i];
+        entries[i].value_size = strlen(keys[i]) + 1;
+        entries[i].seq = (uint64_t)(i + 1);
+        entries[i].ttl = -1;
+        entries[i].flags = 0;
+    }
+    ASSERT_EQ(skip_list_put_batch(list, entries, 64), 64);
+
+    uint8_t k[] = "tall_single";
+    uint8_t v[] = "x";
+    ASSERT_EQ(skip_list_put_with_seq(list, k, sizeof(k), v, sizeof(v), -1, 100, 0), 0);
+    ASSERT_EQ(skip_list_count_entries(list), 65);
+
+    for (int i = 0; i < 64; i++)
+    {
+        uint8_t *rv = NULL;
+        size_t rvs = 0;
+        int64_t ttl;
+        uint8_t del;
+        ASSERT_EQ(
+            skip_list_get(list, (uint8_t *)keys[i], strlen(keys[i]) + 1, &rv, &rvs, &ttl, &del), 0);
+        ASSERT_EQ(strcmp((char *)rv, keys[i]), 0);
+        free(rv);
+    }
+
+    skip_list_free(list);
+}
+
+void test_skip_list_cached_time_ttl()
+{
+    _Atomic(time_t) clock_val;
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_comparator_and_cached_time(
+                  &list, 12, 0.24f, skip_list_comparator_memcmp, NULL, &clock_val),
+              0);
+
+    time_t base = atomic_load_explicit(&clock_val, memory_order_relaxed);
+
+    uint8_t key[] = "ttlk";
+    uint8_t value[] = "v";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), base + 10, 1, 0),
+              0);
+
+    uint8_t *rv = NULL;
+    size_t rvs = 0;
+    int64_t ttl;
+    uint8_t deleted = 0;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &rv, &rvs, &ttl, &deleted), 0);
+    ASSERT_EQ(deleted, 0);
+    free(rv);
+
+#if defined(__MINGW32__) && !defined(__MINGW64__)
+    /* cached time is not honored on MinGW x86 -- the lib reads the clock directly there */
+    (void)base;
+#else
+    /* advance the injected clock past the ttl without sleeping */
+    atomic_store_explicit(&clock_val, base + 20, memory_order_relaxed);
+    rv = NULL;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &rv, &rvs, &ttl, &deleted), 0);
+    ASSERT_EQ(deleted, 1);
+    free(rv);
+#endif
+
+    skip_list_free(list);
+}
+
+void test_skip_list_cursor_seek_ge()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    for (int i = 0; i <= 90; i += 10)
+    {
+        char key[16], value[16];
+        snprintf(key, sizeof(key), "key_%02d", i);
+        snprintf(value, sizeof(value), "val_%02d", i);
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                         strlen(value), -1, (i / 10) + 1, 0),
+                  0);
+    }
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    /* exact match lands directly on the key, no separate next */
+    ASSERT_EQ(skip_list_cursor_seek_ge(cursor, (uint8_t *)"key_50", 6), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_50", 6), 0);
+
+    /* a missing key lands on the next greater key */
+    ASSERT_EQ(skip_list_cursor_seek_ge(cursor, (uint8_t *)"key_55", 6), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_60", 6), 0);
+
+    /* a key before all keys lands on the first */
+    ASSERT_EQ(skip_list_cursor_seek_ge(cursor, (uint8_t *)"key_", 4), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_00", 6), 0);
+
+    /* a key past all keys returns -1 with the cursor at end */
+    ASSERT_EQ(skip_list_cursor_seek_ge(cursor, (uint8_t *)"key_99", 6), -1);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
+void test_skip_list_new_validation()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 0, 0.25f), -1);
+    ASSERT_EQ(skip_list_new(&list, -1, 0.25f), -1);
+    ASSERT_EQ(skip_list_new(&list, 12, 0.0f), -1);
+    ASSERT_EQ(skip_list_new(&list, 12, 1.0f), -1);
+    ASSERT_EQ(skip_list_new(&list, 12, 1.5f), -1);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -3118,6 +3463,15 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_cursor_next_get, tests_passed);
     RUN_TEST(test_skip_list_cursor_advance_in_node, tests_passed);
     RUN_TEST(test_skip_list_arena_aba, tests_passed);
+    RUN_TEST(test_skip_list_get_with_seq_ref, tests_passed);
+    RUN_TEST(test_skip_list_out_of_order_versions, tests_passed);
+    RUN_TEST(test_skip_list_min_max_seq, tests_passed);
+    RUN_TEST(test_skip_list_single_delete_flag, tests_passed);
+    RUN_TEST(test_skip_list_put_batch_partial, tests_passed);
+    RUN_TEST(test_skip_list_tall_heap_update, tests_passed);
+    RUN_TEST(test_skip_list_cached_time_ttl, tests_passed);
+    RUN_TEST(test_skip_list_cursor_seek_ge, tests_passed);
+    RUN_TEST(test_skip_list_new_validation, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);

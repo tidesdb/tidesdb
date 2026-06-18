@@ -160,23 +160,21 @@ static uint8_t *bm_get_read_buf(const size_t needed)
  * @param nbyte number of bytes that "must" be written for the call to be successful
  * @return 0 on success (all bytes written), -1 on failure with errno set appropriately.
  */
-static inline int pwrite_all(
-    int fd,
-    const void *buf,
-    size_t nbyte,
-    off_t offset
-){
+static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset)
+{
     size_t total = 0;
-    while(total < nbyte){
-        ssize_t written = pwrite(fd, (const uint8_t*)buf + total,
-                                nbyte - total, offset + total);
+    while (total < nbyte)
+    {
+        ssize_t written = pwrite(fd, (const uint8_t *)buf + total, nbyte - total, offset + total);
 
-        if (BM_UNLIKELY(written < 0)){
+        if (BM_UNLIKELY(written == -1))
+        {
             if (errno == EINTR) continue;
             return -1;
         }
 
-        if(BM_UNLIKELY(written == 0)){
+        if (BM_UNLIKELY(written == 0))
+        {
             errno = EIO;
             return -1;
         }
@@ -855,7 +853,7 @@ int block_manager_write_at(block_manager_t *bm, const int64_t offset, const uint
      * grow the file without advancing current_file_size, desyncing the two */
     if ((uint64_t)offset + size > atomic_load(&bm->current_file_size)) return -1;
 
-    if(pwrite_all(bm->fd, data, size, offset) != 0)
+    if (pwrite_all(bm->fd, data, size, offset) != 0)
     {
         return -1;
     }

@@ -952,7 +952,7 @@ typedef struct
     queue_t *queue;
     int num_ops;
     int thread_id;
-    struct timespec *start_time;
+    _Atomic int *start_flag;
 } benchmark_producer_args_t;
 
 typedef struct
@@ -967,7 +967,7 @@ static void *benchmark_producer(void *arg)
     benchmark_producer_args_t *args = (benchmark_producer_args_t *)arg;
 
     /* wait for all threads to be ready */
-    while (args->start_time->tv_sec == 0)
+    while (atomic_load(args->start_flag) == 0)
     {
         usleep(100);
     }
@@ -1028,7 +1028,7 @@ void benchmark_queue_concurrent_producers_consumers()
         malloc(num_consumers * sizeof(benchmark_consumer_args_t));
 
     _Atomic int items_consumed = 0;
-    struct timespec start_time = {0, 0};
+    _Atomic int start_flag = 0;
 
     /* create producers */
     for (int i = 0; i < num_producers; i++)
@@ -1036,7 +1036,7 @@ void benchmark_queue_concurrent_producers_consumers()
         producer_args[i].queue = queue;
         producer_args[i].num_ops = ops_per_producer;
         producer_args[i].thread_id = i;
-        producer_args[i].start_time = &start_time;
+        producer_args[i].start_flag = &start_flag;
         pthread_create(&producers[i], NULL, benchmark_producer, &producer_args[i]);
     }
 
@@ -1052,7 +1052,7 @@ void benchmark_queue_concurrent_producers_consumers()
     /* start timing */
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    start_time = start; /* signal threads to start */
+    atomic_store(&start_flag, 1); /* signal threads to start */
 
     /* wait for all producers */
     for (int i = 0; i < num_producers; i++)
@@ -1086,7 +1086,7 @@ typedef struct
 {
     queue_t *queue;
     int num_ops;
-    struct timespec *start_time;
+    _Atomic int *start_flag;
 } benchmark_mixed_args_t;
 
 static void *benchmark_mixed_thread(void *arg)
@@ -1094,7 +1094,7 @@ static void *benchmark_mixed_thread(void *arg)
     benchmark_mixed_args_t *args = (benchmark_mixed_args_t *)arg;
 
     /* wait for start signal */
-    while (args->start_time->tv_sec == 0)
+    while (atomic_load(args->start_flag) == 0)
     {
         usleep(100);
     }
@@ -1128,19 +1128,19 @@ void benchmark_queue_mixed_operations()
 
     pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
     benchmark_mixed_args_t *args = malloc(num_threads * sizeof(benchmark_mixed_args_t));
-    struct timespec start_time = {0, 0};
+    _Atomic int start_flag = 0;
 
     for (int i = 0; i < num_threads; i++)
     {
         args[i].queue = queue;
         args[i].num_ops = ops_per_thread;
-        args[i].start_time = &start_time;
+        args[i].start_flag = &start_flag;
         pthread_create(&threads[i], NULL, benchmark_mixed_thread, &args[i]);
     }
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    start_time = start;
+    atomic_store(&start_flag, 1);
 
     for (int i = 0; i < num_threads; i++)
     {
@@ -1181,20 +1181,20 @@ void benchmark_queue_scaling()
 
         pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
         benchmark_producer_args_t *args = malloc(num_threads * sizeof(benchmark_producer_args_t));
-        struct timespec start_time = {0, 0};
+        _Atomic int start_flag = 0;
 
         for (int i = 0; i < num_threads; i++)
         {
             args[i].queue = queue;
             args[i].num_ops = ops_per_thread;
             args[i].thread_id = i;
-            args[i].start_time = &start_time;
+            args[i].start_flag = &start_flag;
             pthread_create(&threads[i], NULL, benchmark_producer, &args[i]);
         }
 
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        start_time = start;
+        atomic_store(&start_flag, 1);
 
         for (int i = 0; i < num_threads; i++)
         {

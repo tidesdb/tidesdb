@@ -96,10 +96,12 @@ static tidesdb_objstore_t *node_make_store(void)
 #ifdef TIDESDB_WITH_S3
     if (strcmp(backend, "s3") == 0)
     {
-        return tidesdb_objstore_s3_create(env_or("TIDESDB_S3_ENDPOINT", "localhost:9000"),
-                                          env_or("TIDESDB_S3_BUCKET", "tidesdb-test"), "",
-                                          env_or("TIDESDB_S3_ACCESS_KEY", "minioadmin"),
-                                          env_or("TIDESDB_S3_SECRET_KEY", "minioadmin"), 0, 1);
+        return tidesdb_objstore_s3_create(
+            env_or("TIDESDB_S3_ENDPOINT", "localhost:9000"),
+            env_or("TIDESDB_S3_BUCKET", "tidesdb-test"), "" /* prefix */,
+            env_or("TIDESDB_S3_ACCESS_KEY", "minioadmin"),
+            env_or("TIDESDB_S3_SECRET_KEY", "minioadmin"), env_or("TIDESDB_S3_REGION", "us-east-1"),
+            0 /* use_ssl */, 1 /* use_path_style */);
     }
 #endif
     node_log("unsupported TDB_NODE_BACKEND");
@@ -151,8 +153,8 @@ static int node_open(void)
 static void reply(int fd, const char *s)
 {
     size_t len = strlen(s);
-    (void)write(fd, s, len);
-    (void)write(fd, "\n", 1);
+    /* use the result so warn_unused_result is satisfied; a dead client is fine to ignore */
+    if (write(fd, s, len) < 0 || write(fd, "\n", 1) < 0) return;
 }
 
 static void handle_put(int fd, char *args)

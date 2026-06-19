@@ -91,7 +91,6 @@ reset_cluster() {
     for p in "${ALL_PODS[@]}"; do kubectl wait --for=condition=Ready "pod/$p" --timeout=180s >/dev/null; done
 }
 
-# ----------------------------------------------------------------------------
 # every replica receives what the primary writes
 scenario_fanout_converge() {
     echo "== k8s scenario fanout_converge =="
@@ -170,7 +169,6 @@ scenario_cascading_failover() {
     check "data from the first new primary" "$(kverify tdb-replica-1 1 20 d)" 20
 }
 
-# ----------------------------------------------------------------------------
 echo "Applying MinIO..."
 kubectl apply -f "$K8S_DIR/minio.yaml" >/dev/null
 kubectl rollout status deploy/minio --timeout=180s >/dev/null

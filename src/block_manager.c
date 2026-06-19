@@ -167,47 +167,6 @@ static uint8_t *bm_get_read_buf(const size_t needed)
     return new_buf;
 }
 
-/*
- * pwrite_all
- * Writes exactly nbyte bytes from buf to fd at the specified offset.
- *
- * This is a wrapper around pwrite(2) that handles partial writes and
- * EINTR interruptions by retrying until either:
- *   - all nbyte bytes have been written, or
- *   - an unrecoverable error occurs.
- * The caller is responsible for ensuring that buf points to at least nbyte
- * bytes of valid memory. Because only a pointer is passed, this function
- * cannot determine the size of the object referenced by buf.
- *
- * @param fd the file descriptor
- * @param buf buffer to write from
- * @param nbyte number of bytes that "must" be written for the call to be successful
- * @return 0 on success (all bytes written), -1 on failure with errno set appropriately.
- */
-static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset)
-{
-    size_t total = 0;
-    while (total < nbyte)
-    {
-        ssize_t written = pwrite(fd, (const uint8_t *)buf + total, nbyte - total, offset + total);
-
-        if (BM_UNLIKELY(written == -1))
-        {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-
-        if (BM_UNLIKELY(written == 0))
-        {
-            errno = EIO;
-            return -1;
-        }
-        total += (size_t)written;
-    }
-
-    return 0;
-}
-
 /**
  * pwrite_all
  * write exactly nbyte bytes at offset, retrying short writes and EINTR. a bare pwrite treats a

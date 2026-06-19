@@ -137,9 +137,10 @@ static void fs_full_path(const fs_ctx_t *ctx, const char *key, char *out, size_t
  * copy file contents from src_path to dst_path
  * @param src_path source file path
  * @param dst_path destination file path (parent dirs created if needed)
+ * @param limit when nonzero, copy only the first limit bytes (skips a WAL's preallocated tail)
  * @return 0 on success, -1 on error
  */
-static int fs_copy_file(const char *src_path, const char *dst_path)
+static int fs_copy_file(const char *src_path, const char *dst_path, size_t limit)
 {
     FILE *src = fopen(src_path, "rb");
     if (!src) return -1;
@@ -155,14 +156,18 @@ static int fs_copy_file(const char *src_path, const char *dst_path)
 
     char buf[TDB_FS_COPY_BUF];
     size_t n;
+    size_t copied = 0;
     int rc = 0;
     while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
     {
+        if (limit && copied + n > limit) n = limit - copied;
         if (fwrite(buf, 1, n, dst) != n)
         {
             rc = -1;
             break;
         }
+        copied += n;
+        if (limit && copied >= limit) break;
     }
     if (ferror(src)) rc = -1;
 
@@ -177,14 +182,15 @@ static int fs_copy_file(const char *src_path, const char *dst_path)
 }
 
 /**
- * fs_put
- * upload a local file as an object by copying it to the root directory
+ * fs_put_limited
+ * write a local file as an object, optionally only its first limit bytes (0 = whole file)
  * @param ctx opaque connector context
  * @param key object key (relative path)
  * @param local_path local file to upload
+ * @param limit byte limit (0 = whole file)
  * @return 0 on success, -1 on error
  */
-static int fs_put(void *ctx, const char *key, const char *local_path)
+static int fs_put_limited(void *ctx, const char *key, const char *local_path, size_t limit)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
     char full[TDB_FS_MAX_PATH * 2];
@@ -197,7 +203,7 @@ static int fs_put(void *ctx, const char *key, const char *local_path)
     char tmp[TDB_FS_MAX_PATH * 2 + TDB_FS_TMP_SUFFIX_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%lu", full, (long)TDB_GETPID(), TDB_THREAD_ID());
 
-    if (fs_copy_file(local_path, tmp) != 0) return -1;
+    if (fs_copy_file(local_path, tmp, limit) != 0) return -1;
 
     if (atomic_rename_file(tmp, full) != 0)
     {
@@ -205,6 +211,19 @@ static int fs_put(void *ctx, const char *key, const char *local_path)
         return -1;
     }
     return 0;
+}
+
+/**
+ * fs_put
+ * upload a local file as an object (whole file)
+ * @param ctx opaque connector context
+ * @param key object key (relative path)
+ * @param local_path local file to upload
+ * @return 0 on success, -1 on error
+ */
+static int fs_put(void *ctx, const char *key, const char *local_path)
+{
+    return fs_put_limited(ctx, key, local_path, 0);
 }
 
 /**
@@ -220,7 +239,7 @@ static int fs_get(void *ctx, const char *key, const char *local_path)
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
     char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
-    return fs_copy_file(full, local_path);
+    return fs_copy_file(full, local_path, 0);
 }
 
 /**
@@ -376,7 +395,7 @@ static int fs_write_text(const char *path, const char *text)
  */
 static int fs_put_if(void *ctx, const char *key, const char *local_path, tidesdb_put_cond_t cond,
                      const char *expected_etag, uint64_t meta_epoch, char *etag_out,
-                     size_t etag_out_sz)
+                     size_t etag_out_sz, size_t max_bytes)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
 
@@ -413,7 +432,7 @@ static int fs_put_if(void *ctx, const char *key, const char *local_path, tidesdb
     {
         rc = TDB_ERR_PRECONDITION;
     }
-    else if (fs_put(ctx, key, local_path) != 0)
+    else if (fs_put_limited(ctx, key, local_path, max_bytes) != 0)
     {
         rc = -1;
     }

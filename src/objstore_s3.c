@@ -1312,7 +1312,7 @@ static size_t s3_capture_head_header(char *buffer, size_t size, size_t nitems, v
  */
 static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb_put_cond_t cond,
                      const char *expected_etag, uint64_t meta_epoch, char *etag_out,
-                     size_t etag_out_sz)
+                     size_t etag_out_sz, size_t max_bytes)
 {
     s3_ctx_t *s3 = (s3_ctx_t *)ctx;
 
@@ -1330,6 +1330,10 @@ static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb
         return -1;
     }
     rewind(fp);
+
+    /* upload only the logical length when asked, so a WAL's preallocated zero tail is not shipped.
+     * curl uploads exactly INFILESIZE bytes from the read stream. */
+    if (max_bytes > 0 && (long)max_bytes < file_size) file_size = (long)max_bytes;
 
     /* x-amz-* metadata must be signed; build the canonical (trailing newline preserves the
      * SigV4 separator line) and signed-header fragments. the epoch sorts after x-amz-date. */

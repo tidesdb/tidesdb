@@ -4859,8 +4859,9 @@ typedef struct
 {
     char local_path[TDB_MAX_PATH_LEN];
     char object_key[TDB_MAX_PATH_LEN];
-    uint64_t wal_generation; /* WAL gen to fence after upload (0 = no fence) */
-    uint64_t meta_epoch;     /* single-writer lease epoch to tag the object with (0 = untagged) */
+    uint64_t wal_generation;   /* WAL gen to fence after upload (0 = no fence) */
+    uint64_t meta_epoch;       /* single-writer lease epoch to tag the object with (0 = untagged) */
+    uint64_t upload_max_bytes; /* logical length to upload (0 = whole file) */
 } tdb_upload_job_t;
 
 /**
@@ -4884,12 +4885,13 @@ static void *tdb_upload_worker_thread(void *arg)
             unsigned int backoff_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
             for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
             {
-                /* tag with the lease epoch when set (WAL fencing) so a replica can skip a
-                 * superseded primary's segments; otherwise a plain put. */
-                if (job->meta_epoch && db->object_store->put_if)
-                    rc = db->object_store->put_if(db->object_store->ctx, job->object_key,
-                                                  job->local_path, TDB_PUT_OVERWRITE, NULL,
-                                                  job->meta_epoch, NULL, 0);
+                /* use put_if when the object is epoch-tagged (WAL fencing) or a partial upload is
+                 * requested (active WAL's logical length, skipping its preallocated tail) -- both
+                 * need put_if, which also works untagged (epoch 0). otherwise a plain put. */
+                if ((job->meta_epoch || job->upload_max_bytes) && db->object_store->put_if)
+                    rc = db->object_store->put_if(
+                        db->object_store->ctx, job->object_key, job->local_path, TDB_PUT_OVERWRITE,
+                        NULL, job->meta_epoch, NULL, 0, (size_t)job->upload_max_bytes);
                 else
                     rc = db->object_store->put(db->object_store->ctx, job->object_key,
                                                job->local_path);
@@ -4907,16 +4909,20 @@ static void *tdb_upload_worker_thread(void *arg)
                     struct stat local_st;
                     if (stat(job->local_path, &local_st) == 0)
                     {
+                        /* a partial WAL upload's remote size is the logical length, not the
+                         * preallocated local file size */
+                        size_t expected = job->upload_max_bytes ? (size_t)job->upload_max_bytes
+                                                                : (size_t)local_st.st_size;
                         size_t remote_size = 0;
                         const int verify = db->object_store->exists(db->object_store->ctx,
                                                                     job->object_key, &remote_size);
-                        if (verify != 1 || remote_size != (size_t)local_st.st_size)
+                        if (verify != 1 || remote_size != expected)
                         {
                             TDB_DEBUG_LOG(
                                 TDB_LOG_ERROR,
-                                "Upload verification failed for %s (local=%zu, remote=%zu, "
+                                "Upload verification failed for %s (expected=%zu, remote=%zu, "
                                 "exists=%d)",
-                                job->object_key, (size_t)local_st.st_size, remote_size, verify);
+                                job->object_key, expected, remote_size, verify);
                             rc = -1;
                         }
                     }
@@ -4978,9 +4984,11 @@ static void *tdb_upload_worker_thread(void *arg)
  * @param local_path local file path to upload
  * @param wal_generation WAL generation to fence after upload (0 = no fence)
  * @param meta_epoch single-writer lease epoch to tag the object with (0 = untagged)
+ * @param max_bytes logical length to upload (0 = whole file)
  */
 static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_path,
-                                        const uint64_t wal_generation, const uint64_t meta_epoch)
+                                        const uint64_t wal_generation, const uint64_t meta_epoch,
+                                        const uint64_t max_bytes)
 {
     if (!db->object_store || !db->upload_queue || !local_path) return;
 
@@ -4991,6 +4999,7 @@ static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_p
     tdb_path_to_object_key(db, local_path, job->object_key, sizeof(job->object_key));
     job->wal_generation = wal_generation;
     job->meta_epoch = meta_epoch;
+    job->upload_max_bytes = max_bytes;
 
     if (queue_enqueue(db->upload_queue, job) != 0)
     {
@@ -5041,17 +5050,24 @@ static void tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path)
  * skip a superseded primary's segments. falls back to the plain sync upload when fencing is off.
  * @param db database instance
  * @param local_path WAL file path to upload
+ * @param max_bytes logical WAL length to upload (0 = whole file); the active WAL is preallocated
+ *                  far past its data, so shipping the whole file would copy a huge zero tail
  */
-static void tdb_objstore_upload_wal_sync(tidesdb_t *db, const char *local_path)
+static void tdb_objstore_upload_wal_sync(tidesdb_t *db, const char *local_path, uint64_t max_bytes)
 {
     if (!db->object_store || !local_path) return;
 
-    uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
-    if (epoch == 0 || !db->object_store->put_if)
+    /* route through put_if whenever the connector has it, even before a lease is held (epoch 0):
+     * it is the only upload that honors max_bytes, so it ships the active WAL's logical length
+     * rather than its 64MB preallocated extent. an untagged (epoch 0) WAL is fine -- a reader
+     * treats epoch 0 as never-stale. only a legacy connector lacking put_if falls back. */
+    if (!db->object_store->put_if)
     {
         tdb_objstore_upload_file_sync(db, local_path);
         return;
     }
+
+    uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
 
     char key[TDB_MAX_PATH_LEN];
     tdb_path_to_object_key(db, local_path, key, sizeof(key));
@@ -5060,7 +5076,7 @@ static void tdb_objstore_upload_wal_sync(tidesdb_t *db, const char *local_path)
     for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
     {
         if (db->object_store->put_if(db->object_store->ctx, key, local_path, TDB_PUT_OVERWRITE,
-                                     NULL, epoch, NULL, 0) == 0)
+                                     NULL, epoch, NULL, 0, (size_t)max_bytes) == 0)
         {
             atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
             return;
@@ -5089,7 +5105,7 @@ static void tdb_objstore_upload_file(tidesdb_t *db, const char *local_path)
     /* we use async pipeline if upload queue exists */
     if (db->upload_queue)
     {
-        tdb_objstore_enqueue_upload(db, local_path, 0, 0);
+        tdb_objstore_enqueue_upload(db, local_path, 0, 0, 0);
         return;
     }
 
@@ -5422,9 +5438,10 @@ static int tdb_objstore_verify_conditional_writes(tidesdb_t *db)
     snprintf(probe_key, sizeof(probe_key), "%s_%s", TDB_FENCE_PROBE_KEY, db->node_id);
 
     os->delete_object(os->ctx, probe_key); /* clear any leftover from a prior crash */
-    int first = os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0);
+    int first =
+        os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0, 0);
     int second =
-        os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0);
+        os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0, 0);
     os->delete_object(os->ctx, probe_key);
     tdb_unlink(probe_body);
 
@@ -5500,7 +5517,7 @@ static int tdb_objstore_lease_acquire_locked(tidesdb_t *db)
     char new_etag[TDB_OBJSTORE_ETAG_MAX] = {0};
     int rc = os->put_if(os->ctx, TDB_PRIMARY_LEASE_KEY, lease_path,
                         exists ? TDB_PUT_IF_MATCH : TDB_PUT_IF_NONE_MATCH, exists ? cur_etag : NULL,
-                        new_epoch, new_etag, sizeof(new_etag));
+                        new_epoch, new_etag, sizeof(new_etag), 0);
     tdb_unlink(lease_path);
 
     if (rc == TDB_ERR_PRECONDITION) return TDB_ERR_PRECONDITION;
@@ -5543,7 +5560,7 @@ static int tdb_objstore_lease_renew_locked(tidesdb_t *db)
 
     char new_etag[TDB_OBJSTORE_ETAG_MAX] = {0};
     int rc = os->put_if(os->ctx, TDB_PRIMARY_LEASE_KEY, lease_path, TDB_PUT_IF_MATCH,
-                        db->lease_etag, epoch, new_etag, sizeof(new_etag));
+                        db->lease_etag, epoch, new_etag, sizeof(new_etag), 0);
     tdb_unlink(lease_path);
 
     if (rc == TDB_ERR_PRECONDITION) return TDB_ERR_PRECONDITION;
@@ -5604,7 +5621,7 @@ static void tdb_objstore_upload_manifest(tidesdb_t *db, tidesdb_column_family_t 
         {
             uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
             rc = os->put_if(os->ctx, manifest_key, cf->manifest->path, TDB_PUT_OVERWRITE, NULL,
-                            epoch, NULL, 0);
+                            epoch, NULL, 0, 0);
             if (rc == 0) atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
         }
         pthread_mutex_unlock(&db->lease_lock);
@@ -20361,10 +20378,12 @@ static void *tidesdb_reaper_thread(void *arg)
                              * reaper thread, stalling deferred-flush retry, memory
                              * pressure tracking and sstable eviction. generation 0
                              * means a plain snapshot upload -- the worker must not
-                             * fence or delete the still-active WAL. */
+                             * fence or delete the still-active WAL. ship only the logical
+                             * length, not the preallocated extent. */
                             tdb_objstore_enqueue_upload(
                                 db, umt->wal->file_path, 0,
-                                atomic_load_explicit(&db->primary_epoch, memory_order_acquire));
+                                atomic_load_explicit(&db->primary_epoch, memory_order_acquire),
+                                wal_size);
                             TDB_DEBUG_LOG(TDB_LOG_INFO,
                                           "Unified WAL sync enqueued for async upload");
                             db->last_wal_sync_size = wal_size;
@@ -28130,7 +28149,9 @@ static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm
     {
         if (db->config.object_store_config->wal_upload_sync)
         {
-            tdb_objstore_upload_wal_sync(db, wal_path);
+            /* the WAL was closed above, so it is already trimmed to its data -- ship the whole
+             * file */
+            tdb_objstore_upload_wal_sync(db, wal_path, 0);
             tdb_unlink(wal_path);
             tdb_sync_directory(db->db_path);
         }
@@ -28138,10 +28159,11 @@ static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm
         {
             /** async upload with the wal generation for fence tracking, tagged with the
              *  lease epoch so a replica skips a superseded primary's WAL. the reaper
-             *  cleans up the local file after the upload confirms. */
+             *  cleans up the local file after the upload confirms. the closed WAL is already
+             *  trimmed, so the whole file is shipped. */
             tdb_objstore_enqueue_upload(
                 db, wal_path, imm_gen,
-                atomic_load_explicit(&db->primary_epoch, memory_order_acquire));
+                atomic_load_explicit(&db->primary_epoch, memory_order_acquire), 0);
         }
     }
     else
@@ -28875,11 +28897,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
         }
 
-        /* sync-on-commit WAL upload for RPO=0 replication */
+        /* sync-on-commit WAL upload for RPO=0 replication. ship only the active WAL's logical
+         * length, not its 64MB-preallocated extent. */
         if (txn->db->object_store && txn->db->config.object_store_config &&
             txn->db->config.object_store_config->wal_sync_on_commit && umt->wal)
         {
-            tdb_objstore_upload_wal_sync(txn->db, umt->wal->file_path);
+            uint64_t wal_len = 0;
+            block_manager_get_size(umt->wal, &wal_len);
+            tdb_objstore_upload_wal_sync(txn->db, umt->wal->file_path, wal_len);
         }
 
         /* we apply ops to unified skip list with prefixed keys */

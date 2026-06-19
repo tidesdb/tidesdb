@@ -168,12 +168,15 @@ typedef struct
      * @param meta_epoch    when nonzero, stored as object metadata (x-amz-meta-epoch)
      * @param etag_out      when non-NULL, receives the new object ETag on success
      * @param etag_out_sz   size of etag_out
+     * @param max_bytes     when nonzero, upload only the first max_bytes of the file instead of
+     *                      the whole file -- used to ship a WAL's logical length and skip its
+     *                      preallocated zero tail
      * @return 0 on success, TDB_ERR_PRECONDITION when the precondition fails (HTTP 412),
      *         -1 on any other error
      */
     int (*put_if)(void *ctx, const char *key, const char *local_path, tidesdb_put_cond_t cond,
                   const char *expected_etag, uint64_t meta_epoch, char *etag_out,
-                  size_t etag_out_sz);
+                  size_t etag_out_sz, size_t max_bytes);
 
     /**
      * head -- fetch an object's ETag and epoch metadata without downloading the body.

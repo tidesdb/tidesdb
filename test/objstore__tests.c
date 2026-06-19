@@ -351,13 +351,13 @@ void test_objstore_fs_put_if_head_fence(void)
 
     /* create-only succeeds on an absent key, stamps epoch 1, returns a non-empty etag */
     char etag1[TDB_OBJSTORE_ETAG_MAX] = {0};
-    ASSERT_EQ(
-        store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 1, etag1, sizeof(etag1)),
-        0);
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 1, etag1,
+                            sizeof(etag1), 0),
+              0);
     ASSERT_TRUE(etag1[0] != '\0');
 
     /* create-only on an existing key fails the precondition */
-    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 2, NULL, 0),
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 2, NULL, 0, 0),
               TDB_ERR_PRECONDITION);
 
     /* head returns the stored etag + epoch */
@@ -366,7 +366,7 @@ void test_objstore_fs_put_if_head_fence(void)
     ASSERT_EQ((int)epoch, 1);
 
     /* If-Match with a stale etag fails and leaves the object untouched */
-    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, "stale", 9, NULL, 0),
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, "stale", 9, NULL, 0, 0),
               TDB_ERR_PRECONDITION);
     ASSERT_EQ(store->head(store->ctx, key, etag, sizeof(etag), &epoch), 1);
     ASSERT_EQ(strcmp(etag, etag1), 0);
@@ -375,20 +375,21 @@ void test_objstore_fs_put_if_head_fence(void)
     /* If-Match with the current etag succeeds, advances the epoch, and rotates the etag */
     char etag2[TDB_OBJSTORE_ETAG_MAX] = {0};
     ASSERT_EQ(
-        store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 2, etag2, sizeof(etag2)), 0);
+        store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 2, etag2, sizeof(etag2), 0),
+        0);
     ASSERT_TRUE(strcmp(etag2, etag1) != 0);
     ASSERT_EQ(store->head(store->ctx, key, etag, sizeof(etag), &epoch), 1);
     ASSERT_EQ(strcmp(etag, etag2), 0);
     ASSERT_EQ((int)epoch, 2);
 
     /* the superseded holder's old etag is now stale -- its renew is fenced out */
-    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 1, NULL, 0),
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 1, NULL, 0, 0),
               TDB_ERR_PRECONDITION);
 
     /* delete clears the sidecars, so a create-only on the same key succeeds again */
     ASSERT_EQ(store->delete_object(store->ctx, key), 0);
     ASSERT_EQ(store->head(store->ctx, key, NULL, 0, &epoch), 0);
-    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 7, NULL, 0), 0);
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 7, NULL, 0, 0), 0);
     ASSERT_EQ(store->head(store->ctx, key, NULL, 0, &epoch), 1);
     ASSERT_EQ((int)epoch, 7);
 
@@ -411,8 +412,8 @@ void test_objstore_fs_put_if_sidecars_hidden(void)
     create_test_file(body, "data", 4);
 
     /* a fenced (epoch-tagged) put writes etag/epoch sidecars under the hood */
-    ASSERT_EQ(store->put_if(store->ctx, "cf/MANIFEST", body, TDB_PUT_OVERWRITE, NULL, 5, NULL, 0),
-              0);
+    ASSERT_EQ(
+        store->put_if(store->ctx, "cf/MANIFEST", body, TDB_PUT_OVERWRITE, NULL, 5, NULL, 0, 0), 0);
 
     /* list under the data prefix sees exactly the one object, not its sidecars */
     list_ctx_t lctx;
@@ -421,6 +422,41 @@ void test_objstore_fs_put_if_sidecars_hidden(void)
     ASSERT_EQ(n, 1);
     ASSERT_EQ(lctx.count, 1);
     ASSERT_EQ(strcmp(lctx.keys[0], "cf/MANIFEST"), 0);
+
+    store->destroy(store->ctx);
+    free(store);
+    cleanup_dirs();
+}
+
+/* put_if max_bytes uploads only the logical prefix -- the fix that stops a WAL's preallocated
+ * zero tail from being shipped on every commit */
+void test_objstore_fs_put_if_partial(void)
+{
+    cleanup_dirs();
+    mkdir(TEST_OBJSTORE_DIR2, 0755);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(TEST_OBJSTORE_DIR);
+    ASSERT_TRUE(store != NULL);
+
+    /* a 1000-byte source (mimicking a preallocated WAL) of which only 10 bytes are "live" */
+    char body[256];
+    snprintf(body, sizeof(body), "%s" PATH_SEPARATOR "wal.dat", TEST_OBJSTORE_DIR2);
+    char big[1000];
+    memset(big, 'x', sizeof(big));
+    create_test_file(body, big, sizeof(big));
+
+    /* upload only the first 10 bytes */
+    ASSERT_EQ(store->put_if(store->ctx, "cf/wal", body, TDB_PUT_OVERWRITE, NULL, 3, NULL, 0, 10),
+              0);
+
+    size_t size_out = 0;
+    ASSERT_EQ(store->exists(store->ctx, "cf/wal", &size_out), 1);
+    ASSERT_EQ(size_out, 10);
+
+    /* max_bytes 0 ships the whole file */
+    ASSERT_EQ(store->put_if(store->ctx, "cf/wal", body, TDB_PUT_OVERWRITE, NULL, 3, NULL, 0, 0), 0);
+    ASSERT_EQ(store->exists(store->ctx, "cf/wal", &size_out), 1);
+    ASSERT_EQ(size_out, 1000);
 
     store->destroy(store->ctx);
     free(store);
@@ -617,6 +653,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_fs_overwrite, tests_passed);
     RUN_TEST(test_objstore_fs_put_if_head_fence, tests_passed);
     RUN_TEST(test_objstore_fs_put_if_sidecars_hidden, tests_passed);
+    RUN_TEST(test_objstore_fs_put_if_partial, tests_passed);
     RUN_TEST(test_objstore_fs_nested_keys, tests_passed);
 #ifdef TIDESDB_WITH_S3
     RUN_TEST(test_objstore_s3_create_config, tests_passed);

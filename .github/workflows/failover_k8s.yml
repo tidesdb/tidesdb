@@ -1,0 +1,52 @@
+name: Failover (cloud sim, kind + MinIO)
+
+# higher-fidelity failover: real pods on a kind cluster fencing against a real MinIO bucket over
+# the S3 connector's conditional writes. heavier than the local fs run, so it is nightly + manual,
+# plus on PRs that touch the fencing / object-store code.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - "src/objstore*"
+      - "src/tidesdb.c"
+      - "src/tidesdb.h"
+      - "test/failover/**"
+      - ".github/workflows/failover_k8s.yml"
+
+jobs:
+  failover-k8s:
+    runs-on: ubuntu-latest
+    name: Kubernetes Failover Simulation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: tidesdb-failover
+
+      - name: Build node image
+        run: docker build -f test/failover/Dockerfile -t tidesdb-node:ci .
+
+      - name: Load image into kind
+        run: kind load docker-image tidesdb-node:ci --name tidesdb-failover
+
+      - name: Run failover scenarios
+        run: |
+          chmod +x test/failover/run_k8s.sh
+          ./test/failover/run_k8s.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl describe pods -l app=tdb-node || true
+          for p in tdb-primary tdb-replica-0 tdb-replica-1 tdb-replica-2; do
+            echo "=== logs $p ==="; kubectl logs "$p" --tail=80 || true
+          done
+          kubectl logs deploy/minio --tail=40 || true

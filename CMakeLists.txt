@@ -768,6 +768,18 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
             BENCH_USE_BTREE=${BENCH_USE_BTREE}
     )
 
+    # failover harness node -- a minimal networked tidesdb instance (one process = one cluster
+    # node) driven by the object-store failover tests in test/failover. POSIX sockets, so it is
+    # not built on Windows.
+    if(NOT WIN32)
+        add_executable(tidesdb_node test/failover/tidesdb_node.c)
+        target_link_libraries(tidesdb_node PRIVATE tidesdb)
+        target_include_directories(tidesdb_node PRIVATE src external)
+        if(TIDESDB_WITH_S3)
+            target_compile_definitions(tidesdb_node PRIVATE TIDESDB_WITH_S3)
+        endif()
+    endif()
+
     # add include and link directories for test executables
     foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests sha256_tests hmac_sha256_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)

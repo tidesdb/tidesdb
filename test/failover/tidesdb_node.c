@@ -28,9 +28,9 @@
  *   PUT <key> <value>   -> OK | ERR <code>          (value is the rest of the line)
  *   GET <key>           -> VAL <value> | NF | ERR <code>
  *   DEL <key>           -> OK | ERR <code>
- *   FLUSH               -> OK | ERR <code>          (flush + compact, forces a manifest publish)
+ *   FLUSH               -> OK | ERR <code>          (flush the memtable, publishing a manifest)
  *   PROMOTE             -> OK <epoch> | ERR <code>
- *   STAT                -> replica_mode=<0|1> primary_epoch=<n> fencing=<0|1> seq=<n>
+ *   STAT                -> replica_mode=<0|1> primary_epoch=<n> seq=<n> sstables=<n> walgen=<n>
  *   QUIT                -> closes the connection
  *
  * configuration is via environment:

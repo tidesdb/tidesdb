@@ -778,6 +778,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         if(TIDESDB_WITH_S3)
             target_compile_definitions(tidesdb_node PRIVATE TIDESDB_WITH_S3)
         endif()
+        # on illumos/Solaris the socket calls live in libsocket/libnsl, not libc
+        if(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+            target_link_libraries(tidesdb_node PRIVATE socket nsl)
+        endif()
     endif()
 
     # add include and link directories for test executables

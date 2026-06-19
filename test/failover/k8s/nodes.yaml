@@ -34,6 +34,9 @@ spec:
       env:
         - { name: TDB_NODE_REPLICA, value: "0" }
         - { name: TDB_NODE_ID, value: "primary" }
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN"] # the partition scenario runs iptables inside the pod's netns
       readinessProbe:
         tcpSocket: { port: 7400 }
         initialDelaySeconds: 2
@@ -55,6 +58,9 @@ spec:
       env:
         - { name: TDB_NODE_REPLICA, value: "1" }
         - { name: TDB_NODE_ID, value: "replica-0" }
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN"] # the partition scenario runs iptables inside the pod's netns
       readinessProbe:
         tcpSocket: { port: 7400 }
         initialDelaySeconds: 2
@@ -76,6 +82,9 @@ spec:
       env:
         - { name: TDB_NODE_REPLICA, value: "1" }
         - { name: TDB_NODE_ID, value: "replica-1" }
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN"] # the partition scenario runs iptables inside the pod's netns
       readinessProbe:
         tcpSocket: { port: 7400 }
         initialDelaySeconds: 2
@@ -97,6 +106,9 @@ spec:
       env:
         - { name: TDB_NODE_REPLICA, value: "1" }
         - { name: TDB_NODE_ID, value: "replica-2" }
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN"] # the partition scenario runs iptables inside the pod's netns
       readinessProbe:
         tcpSocket: { port: 7400 }
         initialDelaySeconds: 2

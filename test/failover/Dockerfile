@@ -14,9 +14,11 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_SANITIZER=OFF 
     && cmake --build build --target tidesdb tidesdb_node -j"$(nproc)"
 
 FROM ubuntu:24.04
-# bash is needed so the scenario driver can speak the node's TCP protocol via kubectl exec
+# bash: the scenario driver speaks the node's TCP protocol via kubectl exec.
+# iptables: the partition scenario severs this pod's egress to MinIO from inside its own netns
+# (needs the NET_ADMIN capability, set on the pod), so no CNI NetworkPolicy support is required.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash libcurl4 liblz4-1 libzstd1 libsnappy1v5 \
+        bash iptables libcurl4 liblz4-1 libzstd1 libsnappy1v5 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/tidesdb_node /usr/local/bin/tidesdb_node
 COPY --from=build /src/build/libtidesdb.so* /usr/local/lib/

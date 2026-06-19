@@ -53,6 +53,13 @@ kverify() { # pod start end prefix -> count
 
 kstat_field() { kexec "$1" STAT | grep -o "$2=[0-9]*" | cut -d= -f2; }
 
+minio_clusterip() { kubectl get svc minio -o jsonpath='{.spec.clusterIP}'; }
+
+# sever / restore a pod's egress to MinIO from inside its own netns (needs NET_ADMIN). works
+# regardless of the CNI because it is the pod's own iptables, not a NetworkPolicy.
+partition_from_minio() { kubectl exec "$1" -- iptables -A OUTPUT -d "$2" -p tcp --dport 9000 -j REJECT; }
+heal_partition() { kubectl exec "$1" -- iptables -D OUTPUT -d "$2" -p tcp --dport 9000 -j REJECT; }
+
 # run mc inside the cluster (the runner cannot reach the MinIO ClusterIP directly)
 mc_do() {
     local name="mc-$RANDOM"
@@ -169,6 +176,36 @@ scenario_cascading_failover() {
     check "data from the first new primary" "$(kverify tdb-replica-1 1 20 d)" 20
 }
 
+# a primary fully cut off from the bucket misses the failover entirely; on reconnect its publish
+# must still fail the lease renew and self-demote, and its isolated writes must not win
+scenario_partition_zombie() {
+    echo "== k8s scenario partition_zombie =="
+    reset_cluster
+    local minio_ip; minio_ip=$(minio_clusterip)
+
+    kbulk_put tdb-primary 1 50 p
+    kexec tdb-primary FLUSH >/dev/null
+    wait_all_converge 50 p "${REPLICAS[@]}"
+
+    # cut the primary off from the bucket -- it cannot observe the failover
+    partition_from_minio tdb-primary "$minio_ip"
+
+    # promote a replica while the primary is isolated and oblivious
+    check "promote replica-0" "$(kexec tdb-replica-0 PROMOTE)" "OK 2"
+
+    # the isolated primary keeps taking writes: they commit locally but cannot reach the bucket
+    # (each blocks on the WAL-upload retry, so keep the count small)
+    kbulk_put tdb-primary 1 3 q
+
+    # heal the partition; the primary's next publish must fail the lease renew and self-demote
+    heal_partition tdb-primary "$minio_ip"
+    kexec tdb-primary FLUSH >/dev/null
+    sleep 2
+    check "reconnected primary self-demoted" "$(kstat_field tdb-primary replica_mode)" 1
+    check "isolated writes never won" "$(kverify tdb-replica-0 1 3 q)" 0
+    check "baseline preserved" "$(kverify tdb-replica-0 1 50 p)" 50
+}
+
 echo "Applying MinIO..."
 kubectl apply -f "$K8S_DIR/minio.yaml" >/dev/null
 kubectl rollout status deploy/minio --timeout=180s >/dev/null
@@ -177,6 +214,7 @@ scenario_fanout_converge
 scenario_failover_refollow
 scenario_zombie_fence
 scenario_cascading_failover
+scenario_partition_zombie
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL K8S FAILOVER SCENARIOS PASSED"; else echo "K8S FAILOVER SCENARIOS FAILED"; fi

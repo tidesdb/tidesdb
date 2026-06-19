@@ -178,7 +178,7 @@ void sha256_final(sha256_ctx *ctx, uint8_t out[SHA256_DIGEST_SIZE])
      * byte first). This converts the internal 8x32-bit state into the
      * 32-byte digest expected by callers.
      *
-     * state[i] == 0x11223344 -> bytes: 0x11, 0x22, 0x33, 0x44
+     * state[i] == 0x11223344 -> bytes -- 0x11, 0x22, 0x33, 0x44
      */
     for (i = 0; i < 8; ++i)
     {

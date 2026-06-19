@@ -663,7 +663,7 @@ static inline int tdb_spawn_wait(const char *cmd, char *const argv[])
 
 /* struct timeval (used by gettimeofday) lives in winsock. windows.h pulls winsock in normally but
  * not under WIN32_LEAN_AND_MEAN (e.g. the mariadb build). only define it ourselves when winsock is
- * not in the translation unit: newer SDK winsock.h guards the file with _WINSOCKAPI_ and does not
+ * not in the translation unit-- newer SDK winsock.h guards the file with _WINSOCKAPI_ and does not
  * set the inner _TIMEVAL_DEFINED, so a bare _TIMEVAL_DEFINED check would redefine it when winsock
  * is present. */
 #if !defined(_TIMEVAL_DEFINED) && !defined(_WINSOCKAPI_) && !defined(_WINSOCK2API_)
@@ -3885,11 +3885,11 @@ static inline long tdb_max_open_files(void)
 
 /**
  * tdb_raise_max_open_files
- * raise THIS process's open-file ceiling toward `desired` descriptors and return the ceiling in
+ * raise this process's open-file ceiling toward `desired` descriptors and return the ceiling in
  * effect afterwards. POSIX raises the RLIMIT_NOFILE soft limit toward the hard limit (never
  * lowering it, clamped to the hard limit); Windows raises the CRT stdio cap via _setmaxstdio
  * (clamped to its 8192 maximum). an explicit, opt-in action -- tidesdb never raises the limit on
- * its own. a partial or failed raise is non-fatal: the prior ceiling simply stands.
+ * its own. a partial or failed raise is non-fatal-- the prior ceiling simply stands.
  * @param desired target descriptor count; <= 0 just reports the current ceiling without raising
  * @return the open-file ceiling after the attempt
  */

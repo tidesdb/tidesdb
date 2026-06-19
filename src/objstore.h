@@ -33,6 +33,27 @@ typedef enum
     TDB_BACKEND_UNKNOWN = 99
 } tidesdb_objstore_backend_t;
 
+/* maximum stored object ETag length (quotes included, as returned by S3) */
+#define TDB_OBJSTORE_ETAG_MAX 128
+
+/* connector return code for a failed conditional precondition (HTTP 412)-- the shared
+ * object was changed by another writer. defined here so the backends need not pull the
+ * public header; tidesdb.h carries an identical definition for the engine side. */
+#ifndef TDB_ERR_PRECONDITION
+#define TDB_ERR_PRECONDITION -15
+#endif
+
+/**
+ * tidesdb_put_cond_t
+ * precondition mode for the conditional put_if op (single-writer fencing).
+ */
+typedef enum
+{
+    TDB_PUT_OVERWRITE = 0,     /* unconditional overwrite (no precondition) */
+    TDB_PUT_IF_NONE_MATCH = 1, /* create only -- fail if the object already exists */
+    TDB_PUT_IF_MATCH = 2       /* fail unless the object's current ETag equals expected_etag */
+} tidesdb_put_cond_t;
+
 /**
  * tidesdb_objstore_backend_name
  * return a human-readable string for a backend enum value
@@ -133,6 +154,39 @@ typedef struct
      */
     int (*list)(void *ctx, const char *prefix,
                 void (*cb)(const char *key, size_t size, void *cb_ctx), void *cb_ctx);
+
+    /**
+     * put_if -- conditional upload carrying an optional epoch tag.
+     * used by single-writer fencing to make the manifest publish and the primary
+     * lease CAS-style writes against shared state. NULL when the backend predates
+     * fencing (callers must NULL-check).
+     * @param ctx           opaque connector context
+     * @param key           object key
+     * @param local_path    local file to upload
+     * @param cond          precondition mode (see tidesdb_put_cond_t)
+     * @param expected_etag  ETag to match for TDB_PUT_IF_MATCH (ignored otherwise)
+     * @param meta_epoch    when nonzero, stored as object metadata (x-amz-meta-epoch)
+     * @param etag_out      when non-NULL, receives the new object ETag on success
+     * @param etag_out_sz   size of etag_out
+     * @return 0 on success, TDB_ERR_PRECONDITION when the precondition fails (HTTP 412),
+     *         -1 on any other error
+     */
+    int (*put_if)(void *ctx, const char *key, const char *local_path, tidesdb_put_cond_t cond,
+                  const char *expected_etag, uint64_t meta_epoch, char *etag_out,
+                  size_t etag_out_sz);
+
+    /**
+     * head -- fetch an object's ETag and epoch metadata without downloading the body.
+     * NULL when the backend predates fencing (callers must NULL-check).
+     * @param ctx            opaque connector context
+     * @param key            object key
+     * @param etag_out       when non-NULL, receives the object ETag (empty if none)
+     * @param etag_out_sz    size of etag_out
+     * @param meta_epoch_out when non-NULL, receives x-amz-meta-epoch (0 if absent)
+     * @return 1 if the object exists, 0 if not, -1 on error
+     */
+    int (*head)(void *ctx, const char *key, char *etag_out, size_t etag_out_sz,
+                uint64_t *meta_epoch_out);
 
     /**
      * destroy -- free connector resources.

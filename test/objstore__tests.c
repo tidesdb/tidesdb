@@ -323,6 +323,103 @@ void test_objstore_fs_overwrite(void)
     cleanup_dirs();
 }
 
+/* the conditional-put + head primitives that single-writer fencing rests on:
+ * create-only, If-Match success/failure, and epoch metadata readback */
+void test_objstore_fs_put_if_head_fence(void)
+{
+    cleanup_dirs();
+    mkdir(TEST_OBJSTORE_DIR2, 0755);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(TEST_OBJSTORE_DIR);
+    ASSERT_TRUE(store != NULL);
+    ASSERT_TRUE(store->put_if != NULL);
+    ASSERT_TRUE(store->head != NULL);
+
+    char body[256];
+    snprintf(body, sizeof(body), "%s" PATH_SEPARATOR "lease_body.dat", TEST_OBJSTORE_DIR2);
+    create_test_file(body, "epoch1", 6);
+
+    const char *key = "_tdb_primary_lease";
+
+    /* head on a missing object reports absence with empty etag and epoch 0 */
+    char etag[TDB_OBJSTORE_ETAG_MAX];
+    uint64_t epoch = 12345;
+    snprintf(etag, sizeof(etag), "sentinel");
+    ASSERT_EQ(store->head(store->ctx, key, etag, sizeof(etag), &epoch), 0);
+    ASSERT_EQ(etag[0], '\0');
+    ASSERT_EQ((int)epoch, 0);
+
+    /* create-only succeeds on an absent key, stamps epoch 1, returns a non-empty etag */
+    char etag1[TDB_OBJSTORE_ETAG_MAX] = {0};
+    ASSERT_EQ(
+        store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 1, etag1, sizeof(etag1)),
+        0);
+    ASSERT_TRUE(etag1[0] != '\0');
+
+    /* create-only on an existing key fails the precondition */
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 2, NULL, 0),
+              TDB_ERR_PRECONDITION);
+
+    /* head returns the stored etag + epoch */
+    ASSERT_EQ(store->head(store->ctx, key, etag, sizeof(etag), &epoch), 1);
+    ASSERT_EQ(strcmp(etag, etag1), 0);
+    ASSERT_EQ((int)epoch, 1);
+
+    /* If-Match with a stale etag fails and leaves the object untouched */
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, "stale", 9, NULL, 0),
+              TDB_ERR_PRECONDITION);
+    ASSERT_EQ(store->head(store->ctx, key, etag, sizeof(etag), &epoch), 1);
+    ASSERT_EQ(strcmp(etag, etag1), 0);
+    ASSERT_EQ((int)epoch, 1);
+
+    /* If-Match with the current etag succeeds, advances the epoch, and rotates the etag */
+    char etag2[TDB_OBJSTORE_ETAG_MAX] = {0};
+    ASSERT_EQ(
+        store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 2, etag2, sizeof(etag2)), 0);
+    ASSERT_TRUE(strcmp(etag2, etag1) != 0);
+    ASSERT_EQ(store->head(store->ctx, key, etag, sizeof(etag), &epoch), 1);
+    ASSERT_EQ(strcmp(etag, etag2), 0);
+    ASSERT_EQ((int)epoch, 2);
+
+    /* the superseded holder's old etag is now stale -- its renew is fenced out */
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 1, NULL, 0),
+              TDB_ERR_PRECONDITION);
+
+    store->destroy(store->ctx);
+    free(store);
+    cleanup_dirs();
+}
+
+/* the fence sidecars must stay invisible to list() so manifest/WAL discovery is unaffected */
+void test_objstore_fs_put_if_sidecars_hidden(void)
+{
+    cleanup_dirs();
+    mkdir(TEST_OBJSTORE_DIR2, 0755);
+
+    tidesdb_objstore_t *store = tidesdb_objstore_fs_create(TEST_OBJSTORE_DIR);
+    ASSERT_TRUE(store != NULL);
+
+    char body[256];
+    snprintf(body, sizeof(body), "%s" PATH_SEPARATOR "obj.dat", TEST_OBJSTORE_DIR2);
+    create_test_file(body, "data", 4);
+
+    /* a fenced (epoch-tagged) put writes etag/epoch sidecars under the hood */
+    ASSERT_EQ(store->put_if(store->ctx, "cf/MANIFEST", body, TDB_PUT_OVERWRITE, NULL, 5, NULL, 0),
+              0);
+
+    /* list under the data prefix sees exactly the one object, not its sidecars */
+    list_ctx_t lctx;
+    memset(&lctx, 0, sizeof(lctx));
+    int n = store->list(store->ctx, "cf/", list_callback, &lctx);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(lctx.count, 1);
+    ASSERT_EQ(strcmp(lctx.keys[0], "cf/MANIFEST"), 0);
+
+    store->destroy(store->ctx);
+    free(store);
+    cleanup_dirs();
+}
+
 void test_objstore_fs_nested_keys(void)
 {
     cleanup_dirs();
@@ -511,6 +608,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_fs_list, tests_passed);
     RUN_TEST(test_objstore_fs_put_get_nonexistent, tests_passed);
     RUN_TEST(test_objstore_fs_overwrite, tests_passed);
+    RUN_TEST(test_objstore_fs_put_if_head_fence, tests_passed);
+    RUN_TEST(test_objstore_fs_put_if_sidecars_hidden, tests_passed);
     RUN_TEST(test_objstore_fs_nested_keys, tests_passed);
 #ifdef TIDESDB_WITH_S3
     RUN_TEST(test_objstore_s3_create_config, tests_passed);

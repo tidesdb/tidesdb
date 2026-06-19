@@ -63,7 +63,7 @@
 #define BLOCK_MANAGER_PREALLOC_CHUNK    (64ull * 1024 * 1024) /* extend by 64 MB at a time */
 #define BLOCK_MANAGER_PREALLOC_LOWWATER (4ull * 1024 * 1024)  /* trigger extend when 4 MB left */
 
-/* sstable-construction writeback pacing: when smoothing is enabled, start async writeback
+/* sstable-construction writeback pacing-- when smoothing is enabled, start async writeback
  * of the file each time this many bytes accumulate since the last hint, so the final
  * fdatasync barrier flushes only a small residual rather than the whole sstable */
 #define BLOCK_MANAGER_SMOOTH_WRITEBACK_BYTES (1ull * 1024 * 1024)

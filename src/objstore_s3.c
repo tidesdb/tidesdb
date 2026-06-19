@@ -55,10 +55,11 @@
 #define TDB_S3_REGION_MAX   64
 
 /* HTTP status codes */
-#define TDB_S3_HTTP_OK        200
-#define TDB_S3_HTTP_PARTIAL   206
-#define TDB_S3_HTTP_REDIRECT  300
-#define TDB_S3_HTTP_NOT_FOUND 404
+#define TDB_S3_HTTP_OK           200
+#define TDB_S3_HTTP_PARTIAL      206
+#define TDB_S3_HTTP_REDIRECT     300
+#define TDB_S3_HTTP_NOT_FOUND    404
+#define TDB_S3_HTTP_PRECONDITION 412 /* If-Match / If-None-Match precondition failed */
 
 /* signing and response buffers. host and key_date buffers must be large
  * enough for concatenated bucket+endpoint or "AWS4"+secret_key strings. */
@@ -256,7 +257,7 @@ static void s3_signing_key(const char *secret_key, const char *date8, const char
     snprintf(key_date, sizeof(key_date), "AWS4%s", secret_key);
 
     /* each HMAC-SHA-256 step emits exactly TDB_S3_SHA256_DIGEST bytes, which is the key for the
-     * next step: date -> region -> service -> aws4_request */
+     * next step-- date -> region -> service -> aws4_request */
     unsigned char k1[TDB_S3_SHA256_DIGEST], k2[TDB_S3_SHA256_DIGEST], k3[TDB_S3_SHA256_DIGEST];
     hmac_sha256(key_date, strlen(key_date), date8, strlen(date8), k1);
     hmac_sha256(k1, TDB_S3_SHA256_DIGEST, region, strlen(region), k2);
@@ -1237,6 +1238,215 @@ static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size
 }
 
 /**
+ * s3_head_ctx_t
+ * captures the ETag and x-amz-meta-epoch response headers of a HEAD/PUT.
+ * @param etag receives the object ETag (quotes included, as returned)
+ * @param epoch receives the x-amz-meta-epoch value (0 if absent)
+ * @param found_etag set once an ETag header has been captured
+ */
+typedef struct
+{
+    char etag[TDB_S3_ETAG_MAX];
+    uint64_t epoch;
+    int found_etag;
+} s3_head_ctx_t;
+
+/**
+ * s3_capture_head_header
+ * curl header callback capturing both ETag and x-amz-meta-epoch. header field
+ * names are case-insensitive per RFC 7230.
+ * @param userdata pointer to s3_head_ctx_t
+ * @return number of bytes consumed (must equal size * nitems)
+ */
+/* case-insensitive match of a header field name (buffer[0..name_len)) against a
+ * lowercase literal -- avoids strncasecmp, which is not portable to MSVC */
+static int s3_header_name_is(const char *buffer, size_t name_len, const char *lower)
+{
+    if (name_len != strlen(lower)) return 0;
+    for (size_t i = 0; i < name_len; i++)
+        if ((char)tolower((unsigned char)buffer[i]) != lower[i]) return 0;
+    return 1;
+}
+
+static size_t s3_capture_head_header(char *buffer, size_t size, size_t nitems, void *userdata)
+{
+    s3_head_ctx_t *h = (s3_head_ctx_t *)userdata;
+    size_t len = size * nitems;
+
+    const char *colon = memchr(buffer, ':', len);
+    if (!colon) return len;
+
+    size_t name_len = (size_t)(colon - buffer);
+    const char *v = colon + 1;
+    size_t vlen = len - name_len - 1;
+    while (vlen > 0 && (*v == ' ' || *v == '\t'))
+    {
+        v++;
+        vlen--;
+    }
+    while (vlen > 0 && (v[vlen - 1] == '\r' || v[vlen - 1] == '\n' || v[vlen - 1] == ' ')) vlen--;
+
+    if (s3_header_name_is(buffer, name_len, "etag"))
+    {
+        if (vlen >= sizeof(h->etag)) vlen = sizeof(h->etag) - 1;
+        memcpy(h->etag, v, vlen);
+        h->etag[vlen] = '\0';
+        h->found_etag = 1;
+    }
+    else if (s3_header_name_is(buffer, name_len, "x-amz-meta-epoch"))
+    {
+        char num[32] = {0};
+        size_t n = vlen < sizeof(num) - 1 ? vlen : sizeof(num) - 1;
+        memcpy(num, v, n);
+        h->epoch = strtoull(num, NULL, 10);
+    }
+    return len;
+}
+
+/**
+ * s3_put_if
+ * conditional single PUT carrying an optional x-amz-meta-epoch, capturing the
+ * new ETag. used by single-writer fencing for the lease and manifest publish,
+ * which are small control objects (always a single PUT, never multipart).
+ * @return 0 on success, TDB_ERR_PRECONDITION on 412, -1 on any other error
+ */
+static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb_put_cond_t cond,
+                     const char *expected_etag, uint64_t meta_epoch, char *etag_out,
+                     size_t etag_out_sz)
+{
+    s3_ctx_t *s3 = (s3_ctx_t *)ctx;
+
+    FILE *fp = fopen(local_path, "rb");
+    if (!fp) return -1;
+    if (fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        return -1;
+    }
+    long file_size = ftell(fp);
+    if (file_size < 0)
+    {
+        fclose(fp);
+        return -1;
+    }
+    rewind(fp);
+
+    /* x-amz-* metadata must be signed; build the canonical (trailing newline preserves the
+     * SigV4 separator line) and signed-header fragments. the epoch sorts after x-amz-date. */
+    char extra_canonical[64] = {0};
+    const char *extra_signed = NULL;
+    if (meta_epoch)
+    {
+        snprintf(extra_canonical, sizeof(extra_canonical), "x-amz-meta-epoch:%llu\n",
+                 (unsigned long long)meta_epoch);
+        extra_signed = ";x-amz-meta-epoch";
+    }
+
+    struct curl_slist *headers =
+        s3_sign_request(s3, "PUT", key, "UNSIGNED-PAYLOAD",
+                        extra_canonical[0] ? extra_canonical : NULL, extra_signed);
+
+    /* the signed metadata header (value must match the canonical, trimmed form) */
+    char hdr[TDB_S3_MAX_HEADER];
+    if (meta_epoch)
+    {
+        snprintf(hdr, sizeof(hdr), "x-amz-meta-epoch: %llu", (unsigned long long)meta_epoch);
+        headers = curl_slist_append(headers, hdr);
+    }
+
+    /* conditional headers are standard HTTP and sent unsigned (S3 does not require them signed) */
+    if (cond == TDB_PUT_IF_NONE_MATCH)
+        headers = curl_slist_append(headers, "If-None-Match: *");
+    else if (cond == TDB_PUT_IF_MATCH && expected_etag)
+    {
+        snprintf(hdr, sizeof(hdr), "If-Match: %s", expected_etag);
+        headers = curl_slist_append(headers, hdr);
+    }
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+
+    CURL *curl = s3_curl_new(s3);
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        fclose(fp);
+        return -1;
+    }
+
+    s3_head_ctx_t hctx = {.epoch = 0, .found_etag = 0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_write_discard);
+    curl_easy_setopt(curl, CURLOPT_READDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3_capture_head_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hctx);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    fclose(fp);
+
+    if (res != CURLE_OK) return -1;
+    if (http_code == TDB_S3_HTTP_PRECONDITION) return TDB_ERR_PRECONDITION;
+    if (http_code < TDB_S3_HTTP_OK || http_code >= TDB_S3_HTTP_REDIRECT) return -1;
+
+    if (etag_out && etag_out_sz > 0)
+        snprintf(etag_out, etag_out_sz, "%s", hctx.found_etag ? hctx.etag : "");
+    return 0;
+}
+
+/**
+ * s3_head
+ * issue a HEAD and return the object's ETag and x-amz-meta-epoch.
+ * @return 1 if the object exists, 0 if not, -1 on error
+ */
+static int s3_head(void *ctx, const char *key, char *etag_out, size_t etag_out_sz,
+                   uint64_t *meta_epoch_out)
+{
+    s3_ctx_t *s3 = (s3_ctx_t *)ctx;
+    char empty_sha[TDB_S3_HASH_HEX_LEN];
+    sha256_hex("", 0, empty_sha);
+    struct curl_slist *headers = s3_sign_request(s3, "HEAD", key, empty_sha, NULL, NULL);
+
+    char url[TDB_S3_MAX_PATH];
+    s3_build_url(s3, key, url, sizeof(url));
+
+    CURL *curl = s3_curl_new(s3);
+    if (!curl)
+    {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+
+    s3_head_ctx_t hctx = {.epoch = 0, .found_etag = 0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3_capture_head_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hctx);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (etag_out && etag_out_sz > 0)
+        snprintf(etag_out, etag_out_sz, "%s", hctx.found_etag ? hctx.etag : "");
+    if (meta_epoch_out) *meta_epoch_out = hctx.epoch;
+
+    if (res != CURLE_OK) return -1;
+    if (http_code == TDB_S3_HTTP_OK) return 1;
+    if (http_code == TDB_S3_HTTP_NOT_FOUND) return 0;
+    return -1;
+}
+
+/**
  * s3_put_multipart
  * upload a large object as a multipart upload -- create, stream fixed-size
  * parts from the file, then complete. on any failure the upload is aborted
@@ -1586,6 +1796,8 @@ tidesdb_objstore_t *tidesdb_objstore_s3_create_config(const tidesdb_objstore_s3_
     store->delete_object = s3_delete_object;
     store->exists = s3_exists;
     store->list = s3_list;
+    store->put_if = s3_put_if;
+    store->head = s3_head;
     store->destroy = s3_destroy;
     store->ctx = s3;
 

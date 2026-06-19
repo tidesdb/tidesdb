@@ -572,7 +572,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
 
     if (encoding == BF_ENCODING_DENSE)
     {
-        /* raw bitset: exactly size_in_words little-endian words must remain */
+        /* raw bitset-- exactly size_in_words little-endian words must remain */
         if ((size_t)(end - ptr) < (size_t)size_in_words * BF_DENSE_WORD_BYTES)
         {
             free(bitset);

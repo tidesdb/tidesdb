@@ -47,14 +47,6 @@
  * memory-based refusal happens (e.g. block_manager unit tests with no db). */
 static _Atomic(uint64_t) bm_max_safe_block_bytes = 0;
 
-void block_manager_set_max_safe_block_bytes(uint64_t bytes)
-{
-    atomic_store_explicit(&bm_max_safe_block_bytes, bytes, memory_order_relaxed);
-}
-
-static pthread_key_t bm_tls_key;
-static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
-
 /**
  *
  *  * * * * * * * * * *
@@ -97,12 +89,31 @@ static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
  * global block cache in tidesdb.c uses these functions for safe sharing
  */
 
+static pthread_key_t bm_tls_key;
+static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
+
+/**
+ * bm_tls_read_buf_t
+ * per-thread reusable read buffer (see bm_get_read_buf)
+ * @param buf the buffer, grown on demand and freed on thread exit
+ * @param capacity allocated size of buf in bytes
+ */
 typedef struct
 {
     uint8_t *buf;
     size_t capacity;
 } bm_tls_read_buf_t;
 
+void block_manager_set_max_safe_block_bytes(uint64_t bytes)
+{
+    atomic_store_explicit(&bm_max_safe_block_bytes, bytes, memory_order_relaxed);
+}
+
+/**
+ * bm_tls_destructor
+ * frees a thread's read buffer when the thread exits
+ * @param ptr the thread-local bm_tls_read_buf_t
+ */
 static void bm_tls_destructor(void *ptr)
 {
     if (ptr)
@@ -113,11 +124,24 @@ static void bm_tls_destructor(void *ptr)
     }
 }
 
+/**
+ * bm_tls_init_key
+ * one-time creation of the thread-local read-buffer key
+ */
 static void bm_tls_init_key(void)
 {
     pthread_key_create(&bm_tls_key, bm_tls_destructor);
 }
 
+/**
+ * bm_get_read_buf
+ * returns the calling thread's reusable read buffer, growing it (capacity doubling)
+ * to hold at least needed bytes. avoids a fresh malloc and its page faults on every
+ * read. the grow uses realloc, so bytes already in the buffer are preserved -- callers
+ * rely on this to keep an already-read header across a grow for the payload remainder.
+ * @param needed minimum buffer size in bytes
+ * @return the buffer, or NULL on allocation failure
+ */
 static uint8_t *bm_get_read_buf(const size_t needed)
 {
     pthread_once(&bm_tls_once, bm_tls_init_key);
@@ -185,6 +209,39 @@ static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset
 }
 
 /**
+ * pwrite_all
+ * write exactly nbyte bytes at offset, retrying short writes and EINTR. a bare pwrite treats a
+ * short write as a hard error, but a large write_raw can legitimately come up short under a
+ * signal. the append path already gets this via tdb_pwritev_safe.
+ * @param fd the file descriptor
+ * @param buf the buffer to write
+ * @param nbyte the number of bytes that must be written
+ * @param offset the file offset to write at
+ * @return 0 if all bytes were written, -1 on error (errno set)
+ */
+static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset)
+{
+    size_t total = 0;
+    while (total < nbyte)
+    {
+        const ssize_t written =
+            pwrite(fd, (const uint8_t *)buf + total, nbyte - total, offset + total);
+        if (BM_UNLIKELY(written < 0))
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (BM_UNLIKELY(written == 0))
+        {
+            errno = EIO;
+            return -1;
+        }
+        total += (size_t)written;
+    }
+    return 0;
+}
+
+/**
  * odsync_available
  * check if O_DSYNC is available on the specific platform
  * @return 1 if O_DSYNC is available, 0 otherwise
@@ -197,12 +254,12 @@ static inline int odsync_available(void)
 /**
  * is_sync_full
  * is a block manager in sync full mode?
- * @param bm
+ * @param bm the block manager
  * @return 1 if sync mode is full, 0 otherwise
  */
 static inline int is_sync_full(const block_manager_t *bm)
 {
-    return bm->sync_full_cached;
+    return atomic_load_explicit(&bm->sync_full_cached, memory_order_relaxed);
 }
 
 /**
@@ -419,7 +476,9 @@ static int reopen_fd(block_manager_t *bm)
 
 /**
  * truncate_to_header
- * truncates a block manager file to just the header and syncs
+ * truncates a block manager file back to just the header, resetting the tracked file
+ * size and preallocation extent. syncs in full-sync mode (ftruncate is not covered by
+ * O_DSYNC).
  * @param bm the block manager
  * @return 0 if successful, -1 if not
  */
@@ -442,10 +501,12 @@ static int truncate_to_header(block_manager_t *bm)
 
 /**
  * block_manager_open_internal
- * opens a block manager (no cache)
- * @param bm the block manager to open
+ * allocates the block manager, opens or creates the file, then writes a fresh header
+ * (new file) or validates the existing one. on failure the errno of the failing syscall
+ * is preserved for the caller.
+ * @param bm output, set to the opened block manager (NULL on failure)
  * @param file_path the path of the file
- * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
+ * @param sync_mode the sync mode (BLOCK_MANAGER_SYNC_NONE, BLOCK_MANAGER_SYNC_FULL)
  * @return 0 if successful, -1 if not
  */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
@@ -465,7 +526,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     atomic_init(&new_bm->group_sync_active, 0);
 
     new_bm->sync_mode = sync_mode;
-    new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
+    atomic_init(&new_bm->sync_full_cached, sync_mode == BLOCK_MANAGER_SYNC_FULL);
     new_bm->smooth_writeback = 0;
     new_bm->smooth_synced_offset = 0;
 
@@ -652,6 +713,9 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
  * reserved tail offset via a single pwritev. shared by block_write and write_raw
  * so the on-disk encoding lives in one place. data must be non-NULL and size
  * non-zero -- the caller validates (a zero size_field reads back as EOF).
+ * @param bm the block manager
+ * @param data the payload to frame and append
+ * @param size the payload size in bytes
  * @return the offset written at, or -1 on failure
  */
 static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint32_t size)
@@ -745,8 +809,11 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         }
         if (blocks[i]->size > UINT32_MAX) return -1;
 
-        total_batch_size +=
+        const size_t framed =
             BLOCK_MANAGER_BLOCK_HEADER_SIZE + blocks[i]->size + BLOCK_MANAGER_FOOTER_SIZE;
+        /* guard size_t overflow of the running total on 32-bit platforms */
+        if (framed > SIZE_MAX - total_batch_size) return -1;
+        total_batch_size += framed;
         valid_count++;
     }
 
@@ -959,7 +1026,6 @@ int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manage
     /* we initialize to position before first block */
     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     cursor->current_block_size = 0;
-    cursor->block_index = -1; /* -1 means before first block */
     cursor->block_size_valid = 0;
 
     /* we position at first block so cursor_read works immediately */
@@ -1015,7 +1081,6 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_size_valid = 0; /* we invalidate cache after moving */
-    cursor->block_index++;
 
     return 0;
 }
@@ -1091,7 +1156,6 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
             BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
         cursor->current_block_size = 0;
         cursor->block_size_valid = 0;
-        cursor->block_index++;
         return 0;
     }
 
@@ -1105,7 +1169,6 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_size_valid = 0;
-    cursor->block_index++;
     return 0;
 }
 
@@ -1297,7 +1360,6 @@ block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_curso
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_size_valid = 0; /* invalidate cache -- we moved to a new position */
-    cursor->block_index++;
 
     return block;
 }
@@ -1359,7 +1421,6 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     cursor->current_pos = prev_block_start;
     cursor->current_block_size = prev_block_size;
     cursor->block_size_valid = 1; /* we know the size from footer */
-    cursor->block_index--;
 
     return 0;
 }
@@ -1370,7 +1431,6 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
 
     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     cursor->current_block_size = 0;
-    cursor->block_index = -1;
     cursor->block_size_valid = 0;
 
     return 0;
@@ -1416,7 +1476,6 @@ int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, const 
     cursor->current_pos = end_offset - total_block_size;
     cursor->current_block_size = block_size;
     cursor->block_size_valid = 1; /* we know the size from footer */
-    cursor->block_index = -1;     /* unknown index */
 
     return 0;
 }
@@ -1521,7 +1580,6 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos
 
     cursor->current_pos = pos;
     cursor->block_size_valid = 0; /* we invalidate cache when jumping to arbitrary position */
-    cursor->block_index = -1;     /* index is unknown after an arbitrary jump */
     return 0;
 }
 
@@ -1737,20 +1795,20 @@ int block_manager_validate_last_block(block_manager_t *bm,
             scan_pos += total_block_size;
         }
 
-        /* if we stopped without explicit corruption, verify the trailing region is
-         * all zeros -- that confirms it's preallocation tail, not a partial write. */
-        const int trailing_zero =
-            hit_corruption ? 0 : is_trailing_zero(bm->fd, valid_size, file_size);
-
         if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
+            /* the trailing region must be all zeros to confirm it's preallocation tail
+             * rather than a partial write; permissive mode truncates either way and so
+             * never needs this scan */
+            const int trailing_zero =
+                hit_corruption ? 0 : is_trailing_zero(bm->fd, valid_size, file_size);
             if (hit_corruption || trailing_zero != 1) return -1;
             /* preallocation tail is legitimate; don't truncate, just record true extent */
             atomic_store(&bm->current_file_size, valid_size);
             return 0;
         }
 
-        /* permissive mode -- truncate trailing garbage OR preallocation tail so
+        /* permissive mode -- truncate trailing garbage or preallocation tail so
          * the file is always self-describing on next open */
         if (valid_size != file_size)
         {
@@ -1821,7 +1879,8 @@ void block_manager_set_sync_mode(block_manager_t *bm, const int sync_mode)
 {
     if (!bm) return;
     bm->sync_mode = convert_sync_mode(sync_mode);
-    bm->sync_full_cached = (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL);
+    atomic_store_explicit(&bm->sync_full_cached, bm->sync_mode == BLOCK_MANAGER_SYNC_FULL,
+                          memory_order_relaxed);
 }
 
 int block_manager_get_block_size_at_offset(block_manager_t *bm, const uint64_t offset,

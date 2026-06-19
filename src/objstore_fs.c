@@ -17,7 +17,9 @@
  * limitations under the License.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -25,6 +27,7 @@
 
 #ifndef _WIN32
 #include <dirent.h>
+#include <sys/file.h> /* flock -- serializes the put_if read-modify-write */
 #include <unistd.h>
 #else
 #include <direct.h>
@@ -36,6 +39,10 @@
 #define TDB_FS_DIR_MODE 0755
 /* extra bytes reserved for the ".tmp.<pid>.<tid>" suffix on the atomic-put temp path */
 #define TDB_FS_TMP_SUFFIX_MAX 64
+/* sidecar directory holding put_if ETag/epoch/lock state, isolated from the object
+ * keyspace so list() under data prefixes (uwal_, cf/MANIFEST) never sees it */
+#define TDB_FS_META_DIR  ".tdb_objmeta"
+#define TDB_FS_META_PATH (TDB_FS_MAX_PATH * 2 + 64)
 
 /* default object store config values */
 #define TDB_OBJSTORE_DEFAULT_CACHE_ON_READ         1
@@ -63,6 +70,9 @@ typedef struct
     char root_dir[TDB_FS_MAX_PATH];
 } fs_ctx_t;
 
+static void fs_meta_path(const fs_ctx_t *ctx, const char *key, const char *suffix, char *out,
+                         size_t out_size);
+
 /**
  * fs_mkdir_p
  * create all intermediate directories for a file path
@@ -70,7 +80,9 @@ typedef struct
  */
 static void fs_mkdir_p(const char *file_path)
 {
-    char tmp[TDB_FS_MAX_PATH];
+    /* sized to the largest path any caller passes (full object paths and meta sidecars are
+     * root + key, up to TDB_FS_META_PATH) so a long key's parent dirs are not truncated */
+    char tmp[TDB_FS_META_PATH];
     snprintf(tmp, sizeof(tmp), "%s", file_path);
 
     /* we find last separator to get directory portion */
@@ -125,9 +137,10 @@ static void fs_full_path(const fs_ctx_t *ctx, const char *key, char *out, size_t
  * copy file contents from src_path to dst_path
  * @param src_path source file path
  * @param dst_path destination file path (parent dirs created if needed)
+ * @param limit when nonzero, copy only the first limit bytes (skips a WAL's preallocated tail)
  * @return 0 on success, -1 on error
  */
-static int fs_copy_file(const char *src_path, const char *dst_path)
+static int fs_copy_file(const char *src_path, const char *dst_path, size_t limit)
 {
     FILE *src = fopen(src_path, "rb");
     if (!src) return -1;
@@ -143,14 +156,18 @@ static int fs_copy_file(const char *src_path, const char *dst_path)
 
     char buf[TDB_FS_COPY_BUF];
     size_t n;
+    size_t copied = 0;
     int rc = 0;
     while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
     {
+        if (limit && copied + n > limit) n = limit - copied;
         if (fwrite(buf, 1, n, dst) != n)
         {
             rc = -1;
             break;
         }
+        copied += n;
+        if (limit && copied >= limit) break;
     }
     if (ferror(src)) rc = -1;
 
@@ -165,14 +182,15 @@ static int fs_copy_file(const char *src_path, const char *dst_path)
 }
 
 /**
- * fs_put
- * upload a local file as an object by copying it to the root directory
+ * fs_put_limited
+ * write a local file as an object, optionally only its first limit bytes (0 = whole file)
  * @param ctx opaque connector context
  * @param key object key (relative path)
  * @param local_path local file to upload
+ * @param limit byte limit (0 = whole file)
  * @return 0 on success, -1 on error
  */
-static int fs_put(void *ctx, const char *key, const char *local_path)
+static int fs_put_limited(void *ctx, const char *key, const char *local_path, size_t limit)
 {
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
     char full[TDB_FS_MAX_PATH * 2];
@@ -185,7 +203,7 @@ static int fs_put(void *ctx, const char *key, const char *local_path)
     char tmp[TDB_FS_MAX_PATH * 2 + TDB_FS_TMP_SUFFIX_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%lu", full, (long)TDB_GETPID(), TDB_THREAD_ID());
 
-    if (fs_copy_file(local_path, tmp) != 0) return -1;
+    if (fs_copy_file(local_path, tmp, limit) != 0) return -1;
 
     if (atomic_rename_file(tmp, full) != 0)
     {
@@ -193,6 +211,19 @@ static int fs_put(void *ctx, const char *key, const char *local_path)
         return -1;
     }
     return 0;
+}
+
+/**
+ * fs_put
+ * upload a local file as an object (whole file)
+ * @param ctx opaque connector context
+ * @param key object key (relative path)
+ * @param local_path local file to upload
+ * @return 0 on success, -1 on error
+ */
+static int fs_put(void *ctx, const char *key, const char *local_path)
+{
+    return fs_put_limited(ctx, key, local_path, 0);
 }
 
 /**
@@ -208,7 +239,7 @@ static int fs_get(void *ctx, const char *key, const char *local_path)
     fs_ctx_t *fs = (fs_ctx_t *)ctx;
     char full[TDB_FS_MAX_PATH * 2];
     fs_full_path(fs, key, full, sizeof(full));
-    return fs_copy_file(full, local_path);
+    return fs_copy_file(full, local_path, 0);
 }
 
 /**
@@ -254,6 +285,15 @@ static int fs_delete_object(void *ctx, const char *key)
 #else
     unlink(full);
 #endif
+
+    /* drop the put_if sidecars too, or a later create-only would see the key as still present */
+    const char *suffixes[] = {".etag", ".epoch", ".lock"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++)
+    {
+        char meta[TDB_FS_META_PATH];
+        fs_meta_path(fs, key, suffixes[i], meta, sizeof(meta));
+        tdb_unlink(meta);
+    }
     return 0;
 }
 
@@ -280,6 +320,187 @@ static int fs_exists(void *ctx, const char *key, size_t *size_out)
 
     if (size_out) *size_out = (size_t)st.st_size;
     return 1;
+}
+
+/**
+ * fs_meta_path
+ * build the sidecar metadata path for a key under the isolated meta directory:
+ * <root>/.tdb_objmeta/<key><suffix>
+ * @param ctx connector context
+ * @param key object key
+ * @param suffix sidecar suffix (".etag", ".epoch", ".lock")
+ * @param out output buffer
+ * @param out_size size of the output buffer
+ */
+static void fs_meta_path(const fs_ctx_t *ctx, const char *key, const char *suffix, char *out,
+                         size_t out_size)
+{
+    snprintf(out, out_size, "%s/%s/%s%s", ctx->root_dir, TDB_FS_META_DIR, key, suffix);
+}
+
+/**
+ * fs_read_text
+ * read a short text sidecar, NUL-terminate, and trim a trailing newline.
+ * @return 0 on success, -1 if the file is absent or unreadable
+ */
+static int fs_read_text(const char *path, char *out, size_t out_size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(out, 1, out_size - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = '\0';
+    return 0;
+}
+
+/**
+ * fs_write_text
+ * write text to a sidecar atomically (tmp + rename), creating parent dirs.
+ * @return 0 on success, -1 on error
+ */
+static int fs_write_text(const char *path, const char *text)
+{
+    fs_mkdir_p(path);
+    char tmp[TDB_FS_META_PATH + TDB_FS_TMP_SUFFIX_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%lu", path, (long)TDB_GETPID(), TDB_THREAD_ID());
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return -1;
+    int ok = (fputs(text, f) >= 0);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok)
+    {
+        tdb_unlink(tmp);
+        return -1;
+    }
+    if (atomic_rename_file(tmp, path) != 0)
+    {
+        tdb_unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * fs_put_if
+ * conditional upload emulated with ETag/epoch sidecars under a per-key lock, so the
+ * single-writer fence is exercised by the test backend without a live S3.
+ *
+ * the critical section uses flock() rather than the compat.h lock helpers on purpose --
+ * those carry whole-DB PID / F_SETLK semantics (same-process re-lock is allowed), whereas
+ * a primary and a replica handle in one test process must serialize against each other.
+ * flock locks the open file description, so two independent opens contend even in-process.
+ * @return 0 on success, TDB_ERR_PRECONDITION on precondition failure, -1 on error
+ */
+static int fs_put_if(void *ctx, const char *key, const char *local_path, tidesdb_put_cond_t cond,
+                     const char *expected_etag, uint64_t meta_epoch, char *etag_out,
+                     size_t etag_out_sz, size_t max_bytes)
+{
+    fs_ctx_t *fs = (fs_ctx_t *)ctx;
+
+    char etag_path[TDB_FS_META_PATH];
+    char epoch_path[TDB_FS_META_PATH];
+    char lock_path[TDB_FS_META_PATH];
+    fs_meta_path(fs, key, ".etag", etag_path, sizeof(etag_path));
+    fs_meta_path(fs, key, ".epoch", epoch_path, sizeof(epoch_path));
+    fs_meta_path(fs, key, ".lock", lock_path, sizeof(lock_path));
+
+    fs_mkdir_p(lock_path);
+    int lockfd = open(lock_path, O_CREAT | O_RDWR, 0644);
+    if (lockfd < 0) return -1;
+#ifndef _WIN32
+    if (flock(lockfd, LOCK_EX) != 0)
+    {
+        close(lockfd);
+        return -1;
+    }
+#endif
+
+    char cur_etag[TDB_OBJSTORE_ETAG_MAX] = {0};
+    int have = (fs_read_text(etag_path, cur_etag, sizeof(cur_etag)) == 0);
+
+    int precond_fail = 0;
+    if (cond == TDB_PUT_IF_NONE_MATCH && have)
+        precond_fail = 1;
+    else if (cond == TDB_PUT_IF_MATCH &&
+             (!have || !expected_etag || strcmp(cur_etag, expected_etag) != 0))
+        precond_fail = 1;
+
+    int rc;
+    if (precond_fail)
+    {
+        rc = TDB_ERR_PRECONDITION;
+    }
+    else if (fs_put_limited(ctx, key, local_path, max_bytes) != 0)
+    {
+        rc = -1;
+    }
+    else
+    {
+        /* a strictly increasing per-object counter -- a fresh ETag on every write so a
+         * superseded writer that renews with identical content still sees its old ETag go
+         * stale (a content-hash ETag would not change and would defeat the CAS). */
+        unsigned long long counter = 0;
+        if (have) sscanf(cur_etag, "%llu", &counter);
+        counter++;
+        char new_etag[TDB_OBJSTORE_ETAG_MAX];
+        snprintf(new_etag, sizeof(new_etag), "%llu", counter);
+
+        if (fs_write_text(etag_path, new_etag) != 0)
+        {
+            rc = -1;
+        }
+        else
+        {
+            char epoch_buf[32];
+            snprintf(epoch_buf, sizeof(epoch_buf), "%llu", (unsigned long long)meta_epoch);
+            fs_write_text(epoch_path, epoch_buf); /* best-effort; 0 reads back as 'absent' */
+            if (etag_out) snprintf(etag_out, etag_out_sz, "%s", new_etag);
+            rc = 0;
+        }
+    }
+
+#ifndef _WIN32
+    flock(lockfd, LOCK_UN);
+#endif
+    close(lockfd);
+    return rc;
+}
+
+/**
+ * fs_head
+ * return a key's ETag and epoch sidecars without reading the object body.
+ * @return 1 if the object exists, 0 if not, -1 on error
+ */
+static int fs_head(void *ctx, const char *key, char *etag_out, size_t etag_out_sz,
+                   uint64_t *meta_epoch_out)
+{
+    fs_ctx_t *fs = (fs_ctx_t *)ctx;
+    char full[TDB_FS_MAX_PATH * 2];
+    fs_full_path(fs, key, full, sizeof(full));
+
+    struct stat st;
+    int exists = (stat(full, &st) == 0);
+    int stat_errno = errno;
+
+    if (etag_out)
+    {
+        char etag_path[TDB_FS_META_PATH];
+        fs_meta_path(fs, key, ".etag", etag_path, sizeof(etag_path));
+        if (fs_read_text(etag_path, etag_out, etag_out_sz) != 0) etag_out[0] = '\0';
+    }
+    if (meta_epoch_out)
+    {
+        char epoch_path[TDB_FS_META_PATH];
+        char buf[32];
+        fs_meta_path(fs, key, ".epoch", epoch_path, sizeof(epoch_path));
+        *meta_epoch_out =
+            (fs_read_text(epoch_path, buf, sizeof(buf)) == 0) ? strtoull(buf, NULL, 10) : 0;
+    }
+
+    if (exists) return 1;
+    return (stat_errno == ENOENT) ? 0 : -1;
 }
 
 /**
@@ -314,6 +535,9 @@ static int fs_list_walk(const char *abs_dir, const char *rel_dir, size_t rel_dir
     {
         if (fd.name[0] == '.' && (fd.name[1] == '\0' || (fd.name[1] == '.' && fd.name[2] == '\0')))
             continue;
+
+        /* the put_if meta sidecar dir is internal bookkeeping, never an object */
+        if (rel_dir_len == 0 && strcmp(fd.name, TDB_FS_META_DIR) == 0) continue;
 
         char child_rel[TDB_FS_MAX_PATH];
         int n = (rel_dir_len == 0)
@@ -353,6 +577,9 @@ static int fs_list_walk(const char *abs_dir, const char *rel_dir, size_t rel_dir
         if (ent->d_name[0] == '.' &&
             (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
             continue;
+
+        /* the put_if meta sidecar dir is internal bookkeeping, never an object */
+        if (rel_dir_len == 0 && strcmp(ent->d_name, TDB_FS_META_DIR) == 0) continue;
 
         char child_rel[TDB_FS_MAX_PATH];
         int n = (rel_dir_len == 0)
@@ -535,6 +762,8 @@ tidesdb_objstore_t *tidesdb_objstore_fs_create(const char *root_dir)
     store->delete_object = fs_delete_object;
     store->exists = fs_exists;
     store->list = fs_list;
+    store->put_if = fs_put_if;
+    store->head = fs_head;
     store->destroy = fs_destroy;
     store->ctx = fs;
 

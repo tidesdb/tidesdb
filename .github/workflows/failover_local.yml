@@ -1,0 +1,37 @@
+name: Failover (local, fs backend)
+
+# fast, dependency-free failover coverage: real tidesdb_node processes share a filesystem
+# bucket on the runner (the fs connector uses flock, so the single-writer fence holds across
+# processes) and the suite drives clean failover, zombie-primary fencing, and RPO=0 recovery.
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  failover-local:
+    runs-on: ubuntu-latest
+    name: Local Failover Scenarios
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential liblz4-dev libzstd-dev libsnappy-dev \
+            libcurl4-openssl-dev
+
+      - name: Build library and node
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_SANITIZER=OFF
+          cmake --build build --target tidesdb tidesdb_node -j"$(nproc)"
+
+      - name: Run failover scenarios
+        env:
+          TDB_NODE_BIN: ${{ github.workspace }}/build/tidesdb_node
+          TDB_NODE_LIBDIR: ${{ github.workspace }}/build
+        run: ./test/failover/run_local.sh

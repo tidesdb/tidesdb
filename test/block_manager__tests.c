@@ -3506,6 +3506,93 @@ void test_block_manager_permissive_validation_truncates_prealloc_tail()
     (void)remove(path);
 }
 
+void test_block_manager_large_block_read_roundtrip(void)
+{
+    /* a payload past the read-ahead hint forces bm_read_block_tls to issue its
+     * second pread for the remainder; verify the stitched buffer is intact */
+    const char *path = "test_large_read.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const uint32_t big = 64u * 1024u;
+    uint8_t *payload = malloc(big);
+    ASSERT_TRUE(payload != NULL);
+    for (uint32_t i = 0; i < big; i++) payload[i] = (uint8_t)((i * 131u + 7u) & 0xFF);
+
+    block_manager_block_t *block = block_manager_block_create(big, payload);
+    ASSERT_TRUE(block != NULL);
+    int64_t offset = block_manager_block_write(bm, block);
+    ASSERT_TRUE(offset >= 0);
+    block_manager_block_free(block);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(block->size, big);
+    ASSERT_EQ(memcmp(block->data, payload, big), 0);
+    block_manager_block_free(block);
+
+    /* the offset-based reader (vlog path) must stitch the same bytes */
+    uint8_t *out = NULL;
+    uint32_t out_size = 0;
+    ASSERT_EQ(block_manager_read_block_data_at_offset(bm, (uint64_t)offset, &out, &out_size), 0);
+    ASSERT_EQ(out_size, big);
+    ASSERT_EQ(memcmp(out, payload, big), 0);
+    free(out);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    free(payload);
+    (void)remove(path);
+}
+
+void test_block_manager_max_safe_block_bytes_refusal(void)
+{
+    /* the budget is only consulted past the large-block threshold (256 MB); a block
+     * over both threshold and budget is refused with NULL instead of being allocated */
+    const uint64_t large_block_threshold = 256ull * 1024 * 1024;
+    const uint32_t big = (uint32_t)(large_block_threshold + 4096);
+
+    const char *path = "test_budget_refusal.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    uint8_t *payload = calloc(1, big);
+    ASSERT_TRUE(payload != NULL);
+    int64_t offset = block_manager_write_raw(bm, payload, big);
+    ASSERT_TRUE(offset >= 0);
+    free(payload);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    /* no budget configured -- the oversized block reads back fine */
+    block_manager_set_max_safe_block_bytes(0);
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(block->size, big);
+    block_manager_block_free(block);
+
+    /* budget below the block size -- the read is refused (graceful, no OOM) */
+    block_manager_set_max_safe_block_bytes(large_block_threshold);
+    ASSERT_TRUE(block_manager_cursor_read(cursor) == NULL);
+
+    /* restore the process-wide budget so later tests are unaffected */
+    block_manager_set_max_safe_block_bytes(0);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -3574,6 +3661,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_strict_validation_accepts_prealloc_tail, tests_passed);
     RUN_TEST(test_block_manager_strict_validation_rejects_garbage_tail, tests_passed);
     RUN_TEST(test_block_manager_permissive_validation_truncates_prealloc_tail, tests_passed);
+    RUN_TEST(test_block_manager_large_block_read_roundtrip, tests_passed);
+    RUN_TEST(test_block_manager_max_safe_block_bytes_refusal, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

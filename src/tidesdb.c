@@ -117,9 +117,17 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_UNIFIED_CF_INDEX_MAP_LINE_MAX    (TDB_MAX_CF_NAME_LEN + 32)
 #define TDB_REPLICA_WAL_TMP                  "replica_wal_tmp.log"
 #define TDB_REPLICA_MANIFEST_TMP             "MANIFEST.replica_tmp"
-#define TDB_PREFIXED_KEY_STACK_MAX           256
-#define TDB_BUP_CPY_FILE_SRC_MODE            "rb"
-#define TDB_BUP_CPY_FILE_DST_MODE            "wb"
+/* single-writer fencing -- object-store key of the primary lease, and the local temp
+ * file used to stage its small body before a conditional upload */
+#define TDB_PRIMARY_LEASE_KEY "_tdb_primary_lease"
+#define TDB_PRIMARY_LEASE_TMP "primary_lease_tmp"
+/* startup probe verifying the backend enforces conditional writes (key suffixed with the node
+ * id); local temp file staging the probe body */
+#define TDB_FENCE_PROBE_KEY        "_tdb_fence_probe"
+#define TDB_FENCE_PROBE_TMP        "fence_probe_tmp"
+#define TDB_PREFIXED_KEY_STACK_MAX 256
+#define TDB_BUP_CPY_FILE_SRC_MODE  "rb"
+#define TDB_BUP_CPY_FILE_DST_MODE  "wb"
 
 #define TDB_CNF_FILE_MODE "w"
 
@@ -4851,7 +4859,9 @@ typedef struct
 {
     char local_path[TDB_MAX_PATH_LEN];
     char object_key[TDB_MAX_PATH_LEN];
-    uint64_t wal_generation; /* WAL gen to fence after upload (0 = no fence) */
+    uint64_t wal_generation;   /* WAL gen to fence after upload (0 = no fence) */
+    uint64_t meta_epoch;       /* single-writer lease epoch to tag the object with (0 = untagged) */
+    uint64_t upload_max_bytes; /* logical length to upload (0 = whole file) */
 } tdb_upload_job_t;
 
 /**
@@ -4875,7 +4885,16 @@ static void *tdb_upload_worker_thread(void *arg)
             unsigned int backoff_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
             for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
             {
-                rc = db->object_store->put(db->object_store->ctx, job->object_key, job->local_path);
+                /* use put_if when the object is epoch-tagged (WAL fencing) or a partial upload is
+                 * requested (active WAL's logical length, skipping its preallocated tail) -- both
+                 * need put_if, which also works untagged (epoch 0). otherwise a plain put. */
+                if ((job->meta_epoch || job->upload_max_bytes) && db->object_store->put_if)
+                    rc = db->object_store->put_if(
+                        db->object_store->ctx, job->object_key, job->local_path, TDB_PUT_OVERWRITE,
+                        NULL, job->meta_epoch, NULL, 0, (size_t)job->upload_max_bytes);
+                else
+                    rc = db->object_store->put(db->object_store->ctx, job->object_key,
+                                               job->local_path);
                 if (rc != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload attempt %d/%d failed: %s", attempt + 1,
@@ -4890,16 +4909,20 @@ static void *tdb_upload_worker_thread(void *arg)
                     struct stat local_st;
                     if (stat(job->local_path, &local_st) == 0)
                     {
+                        /* a partial WAL upload's remote size is the logical length, not the
+                         * preallocated local file size */
+                        size_t expected = job->upload_max_bytes ? (size_t)job->upload_max_bytes
+                                                                : (size_t)local_st.st_size;
                         size_t remote_size = 0;
                         const int verify = db->object_store->exists(db->object_store->ctx,
                                                                     job->object_key, &remote_size);
-                        if (verify != 1 || remote_size != (size_t)local_st.st_size)
+                        if (verify != 1 || remote_size != expected)
                         {
                             TDB_DEBUG_LOG(
                                 TDB_LOG_ERROR,
-                                "Upload verification failed for %s (local=%zu, remote=%zu, "
+                                "Upload verification failed for %s (expected=%zu, remote=%zu, "
                                 "exists=%d)",
-                                job->object_key, (size_t)local_st.st_size, remote_size, verify);
+                                job->object_key, expected, remote_size, verify);
                             rc = -1;
                         }
                     }
@@ -4960,9 +4983,12 @@ static void *tdb_upload_worker_thread(void *arg)
  * @param db database instance
  * @param local_path local file path to upload
  * @param wal_generation WAL generation to fence after upload (0 = no fence)
+ * @param meta_epoch single-writer lease epoch to tag the object with (0 = untagged)
+ * @param max_bytes logical length to upload (0 = whole file)
  */
 static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_path,
-                                        const uint64_t wal_generation)
+                                        const uint64_t wal_generation, const uint64_t meta_epoch,
+                                        const uint64_t max_bytes)
 {
     if (!db->object_store || !db->upload_queue || !local_path) return;
 
@@ -4972,6 +4998,8 @@ static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_p
     snprintf(job->local_path, sizeof(job->local_path), "%s", local_path);
     tdb_path_to_object_key(db, local_path, job->object_key, sizeof(job->object_key));
     job->wal_generation = wal_generation;
+    job->meta_epoch = meta_epoch;
+    job->upload_max_bytes = max_bytes;
 
     if (queue_enqueue(db->upload_queue, job) != 0)
     {
@@ -5017,6 +5045,53 @@ static void tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path)
 }
 
 /**
+ * tdb_objstore_upload_wal_sync
+ * synchronous WAL upload that tags the object with the current lease epoch so a replica can
+ * skip a superseded primary's segments. falls back to the plain sync upload when fencing is off.
+ * @param db database instance
+ * @param local_path WAL file path to upload
+ * @param max_bytes logical WAL length to upload (0 = whole file); the active WAL is preallocated
+ *                  far past its data, so shipping the whole file would copy a huge zero tail
+ */
+static void tdb_objstore_upload_wal_sync(tidesdb_t *db, const char *local_path, uint64_t max_bytes)
+{
+    if (!db->object_store || !local_path) return;
+
+    /* route through put_if whenever the connector has it, even before a lease is held (epoch 0):
+     * it is the only upload that honors max_bytes, so it ships the active WAL's logical length
+     * rather than its 64MB preallocated extent. an untagged (epoch 0) WAL is fine -- a reader
+     * treats epoch 0 as never-stale. only a legacy connector lacking put_if falls back. */
+    if (!db->object_store->put_if)
+    {
+        tdb_objstore_upload_file_sync(db, local_path);
+        return;
+    }
+
+    uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
+
+    char key[TDB_MAX_PATH_LEN];
+    tdb_path_to_object_key(db, local_path, key, sizeof(key));
+
+    unsigned int delay_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
+    for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
+    {
+        if (db->object_store->put_if(db->object_store->ctx, key, local_path, TDB_PUT_OVERWRITE,
+                                     NULL, epoch, NULL, 0, (size_t)max_bytes) == 0)
+        {
+            atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
+            return;
+        }
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync WAL upload attempt %d/%d failed: %s",
+                      attempt + 1, TDB_UPLOAD_MAX_RETRIES, key);
+        if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES) usleep(delay_us);
+        delay_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
+    }
+    atomic_fetch_add_explicit(&db->total_upload_failures, 1, memory_order_relaxed);
+    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync WAL upload failed after %d attempts: %s",
+                  TDB_UPLOAD_MAX_RETRIES, key);
+}
+
+/**
  * tdb_objstore_upload_file
  * upload a local file to the object store.
  * uses async pipeline for sstable data files, falls back to synchronous.
@@ -5030,7 +5105,7 @@ static void tdb_objstore_upload_file(tidesdb_t *db, const char *local_path)
     /* we use async pipeline if upload queue exists */
     if (db->upload_queue)
     {
-        tdb_objstore_enqueue_upload(db, local_path, 0);
+        tdb_objstore_enqueue_upload(db, local_path, 0, 0, 0);
         return;
     }
 
@@ -5325,9 +5400,197 @@ static int tidesdb_vlog_range_get_value(const tidesdb_t *db, const tidesdb_sstab
     return TDB_SUCCESS;
 }
 
+/* tdb_objstore_fencing_enabled
+ * fencing is active only when the connector implements the conditional-write and head
+ * primitives and the backend was proven to enforce the precondition (tdb_objstore_verify_
+ * conditional_writes). otherwise the write paths fall back to unfenced uploads rather than
+ * give false safety. */
+static int tdb_objstore_fencing_enabled(const tidesdb_t *db)
+{
+    return db->object_store && db->object_store->put_if && db->object_store->head &&
+           atomic_load_explicit(&db->fencing_supported, memory_order_acquire);
+}
+
+/* tdb_objstore_verify_conditional_writes
+ * probe whether the backend actually enforces conditional puts: a create-only put on a fresh
+ * key must succeed and an immediate second create-only on the same key must fail the
+ * precondition. a store that ignores If-None-Match returns success twice, so fencing would be
+ * false safety -- callers disable it in that case. uses a node-unique key to avoid cross-node
+ * races and cleans up after itself.
+ * @return 1 if conditional writes are enforced, 0 otherwise */
+static int tdb_objstore_verify_conditional_writes(tidesdb_t *db)
+{
+    tidesdb_objstore_t *os = db->object_store;
+    if (!os || !os->put_if || !os->head) return 0;
+
+    char probe_body[TDB_MAX_PATH_LEN];
+    snprintf(probe_body, sizeof(probe_body), "%s" PATH_SEPARATOR TDB_FENCE_PROBE_TMP, db->db_path);
+    FILE *pf = fopen(probe_body, "wb");
+    if (!pf) return 0;
+    fputc('1', pf);
+    if (fclose(pf) != 0)
+    {
+        tdb_unlink(probe_body);
+        return 0;
+    }
+
+    char probe_key[TDB_MAX_PATH_LEN];
+    snprintf(probe_key, sizeof(probe_key), "%s_%s", TDB_FENCE_PROBE_KEY, db->node_id);
+
+    os->delete_object(os->ctx, probe_key); /* clear any leftover from a prior crash */
+    int first =
+        os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0, 0);
+    int second =
+        os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0, 0);
+    os->delete_object(os->ctx, probe_key);
+    tdb_unlink(probe_body);
+
+    int enforced = (first == 0 && second == TDB_ERR_PRECONDITION);
+    if (!enforced)
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "object store does not enforce conditional writes (create-only rc %d/%d) -- "
+                      "single-writer fencing disabled, no split-brain protection",
+                      first, second);
+    return enforced;
+}
+
+/* tdb_objstore_obj_epoch_is_stale
+ * an object tagged with a nonzero epoch below the current lease epoch was written by a
+ * superseded primary and must be ignored. epoch 0 (legacy / written before any lease was
+ * acquired) is never treated as stale, which keeps pre-fencing buckets readable. */
+static int tdb_objstore_obj_epoch_is_stale(uint64_t obj_epoch, uint64_t lease_epoch)
+{
+    return obj_epoch != 0 && obj_epoch < lease_epoch;
+}
+
+/* tdb_objstore_lease_epoch
+ * read the current primary lease epoch from the object store (0 if absent or unsupported). */
+static uint64_t tdb_objstore_lease_epoch(tidesdb_t *db)
+{
+    tidesdb_objstore_t *os = db->object_store;
+    if (!os || !os->head) return 0;
+    uint64_t epoch = 0;
+    if (os->head(os->ctx, TDB_PRIMARY_LEASE_KEY, NULL, 0, &epoch) < 0) return 0;
+    return epoch;
+}
+
+/* tdb_objstore_lease_stage_body
+ * write the small human-readable lease body (epoch + node id) to the staging temp file.
+ * @return 0 on success, -1 on error */
+static int tdb_objstore_lease_stage_body(tidesdb_t *db, uint64_t epoch, char *path_out,
+                                         size_t path_out_sz)
+{
+    snprintf(path_out, path_out_sz, "%s" PATH_SEPARATOR TDB_PRIMARY_LEASE_TMP, db->db_path);
+    FILE *lf = fopen(path_out, "wb");
+    if (!lf) return -1;
+    fprintf(lf, "epoch=%llu\nnode=%s\n", (unsigned long long)epoch, db->node_id);
+    if (fclose(lf) != 0)
+    {
+        tdb_unlink(path_out);
+        return -1;
+    }
+    return 0;
+}
+
+/* tdb_objstore_lease_acquire_locked
+ * claim or advance the primary lease by CAS-incrementing its epoch -- read the current lease
+ * (head -> etag + epoch), then conditionally write epoch+1 (create-only if absent, else
+ * If-Match on the etag we just read). on success records the new epoch + etag on db.
+ * caller holds lease_lock.
+ * @return TDB_SUCCESS, TDB_ERR_PRECONDITION if another node won the race, or an error code */
+static int tdb_objstore_lease_acquire_locked(tidesdb_t *db)
+{
+    tidesdb_objstore_t *os = db->object_store;
+    if (!os || !os->head || !os->put_if) return TDB_ERR_INVALID_ARGS;
+
+    char cur_etag[TDB_OBJSTORE_ETAG_MAX] = {0};
+    uint64_t cur_epoch = 0;
+    int hr = os->head(os->ctx, TDB_PRIMARY_LEASE_KEY, cur_etag, sizeof(cur_etag), &cur_epoch);
+    if (hr < 0) return TDB_ERR_IO;
+    int exists = (hr == 1);
+
+    uint64_t new_epoch = cur_epoch + 1;
+    char lease_path[TDB_MAX_PATH_LEN];
+    if (tdb_objstore_lease_stage_body(db, new_epoch, lease_path, sizeof(lease_path)) != 0)
+        return TDB_ERR_IO;
+
+    char new_etag[TDB_OBJSTORE_ETAG_MAX] = {0};
+    int rc = os->put_if(os->ctx, TDB_PRIMARY_LEASE_KEY, lease_path,
+                        exists ? TDB_PUT_IF_MATCH : TDB_PUT_IF_NONE_MATCH, exists ? cur_etag : NULL,
+                        new_epoch, new_etag, sizeof(new_etag), 0);
+    tdb_unlink(lease_path);
+
+    if (rc == TDB_ERR_PRECONDITION) return TDB_ERR_PRECONDITION;
+    if (rc != 0) return TDB_ERR_IO;
+
+    atomic_store_explicit(&db->primary_epoch, new_epoch, memory_order_release);
+    snprintf(db->lease_etag, sizeof(db->lease_etag), "%s", new_etag);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Acquired primary lease epoch %llu (node %s)",
+                  (unsigned long long)new_epoch, db->node_id);
+    return TDB_SUCCESS;
+}
+
+/* tdb_objstore_lease_acquire
+ * lease_lock-guarded wrapper around tdb_objstore_lease_acquire_locked. */
+static int tdb_objstore_lease_acquire(tidesdb_t *db)
+{
+    pthread_mutex_lock(&db->lease_lock);
+    int rc = tdb_objstore_lease_acquire_locked(db);
+    pthread_mutex_unlock(&db->lease_lock);
+    return rc;
+}
+
+/* tdb_objstore_lease_renew_locked
+ * re-assert that we still hold the lease by CAS-writing it conditional on our stored etag,
+ * keeping the same epoch and refreshing the etag. a primary that never acquired a lease (the
+ * first primary of a fresh cluster, which does not go through promotion) acquires one here on
+ * its first publish. caller holds lease_lock.
+ * @return TDB_SUCCESS, TDB_ERR_PRECONDITION if superseded, or an error */
+static int tdb_objstore_lease_renew_locked(tidesdb_t *db)
+{
+    tidesdb_objstore_t *os = db->object_store;
+    if (!os || !os->put_if) return TDB_ERR_INVALID_ARGS;
+
+    uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
+    if (epoch == 0 || db->lease_etag[0] == '\0') return tdb_objstore_lease_acquire_locked(db);
+
+    char lease_path[TDB_MAX_PATH_LEN];
+    if (tdb_objstore_lease_stage_body(db, epoch, lease_path, sizeof(lease_path)) != 0)
+        return TDB_ERR_IO;
+
+    char new_etag[TDB_OBJSTORE_ETAG_MAX] = {0};
+    int rc = os->put_if(os->ctx, TDB_PRIMARY_LEASE_KEY, lease_path, TDB_PUT_IF_MATCH,
+                        db->lease_etag, epoch, new_etag, sizeof(new_etag), 0);
+    tdb_unlink(lease_path);
+
+    if (rc == TDB_ERR_PRECONDITION) return TDB_ERR_PRECONDITION;
+    if (rc != 0) return TDB_ERR_IO;
+    snprintf(db->lease_etag, sizeof(db->lease_etag), "%s", new_etag);
+    return TDB_SUCCESS;
+}
+
+/* tdb_objstore_self_demote
+ * a primary write found the lease taken by another node. stop writing immediately and fall
+ * back to replica so this node re-syncs from the bucket instead of uploading orphans. this is
+ * hygiene, not correctness -- a superseded writer's manifest is already ignored by readers. */
+static void tdb_objstore_self_demote(tidesdb_t *db, const char *reason)
+{
+    if (atomic_exchange_explicit(&db->replica_mode, 1, memory_order_acq_rel) == 0)
+    {
+        TDB_DEBUG_LOG(
+            TDB_LOG_WARN,
+            "Primary lease lost (%s) -- self-demoting to replica (node %s, epoch %llu)", reason,
+            db->node_id,
+            (unsigned long long)atomic_load_explicit(&db->primary_epoch, memory_order_acquire));
+    }
+}
+
 /**
  * tdb_objstore_upload_manifest
- * upload the MANIFEST file to object store after a commit.
+ * publish the MANIFEST to the object store after a commit. under fencing this is the one
+ * authoritative write that makes data real, so it re-asserts the primary lease and tags the
+ * manifest with the lease epoch before publishing; a superseded primary self-demotes and skips
+ * the upload. without the fencing primitives it falls back to the unfenced async upload.
  * @param db database instance
  * @param cf column family whose MANIFEST should be uploaded
  */
@@ -5339,10 +5602,39 @@ static void tdb_objstore_upload_manifest(tidesdb_t *db, tidesdb_column_family_t 
      * it would obsolete the primary's real-data sstables. mirrors the sstable-upload gate in
      * tidesdb_level_add_sstable; promotion clears replica_mode before any primary write. */
     if (atomic_load_explicit(&db->replica_mode, memory_order_acquire)) return;
-    /* MANIFEST is uploaded via the async pipeline to avoid blocking flush workers.
-     * the local MANIFEST is always up to date for same-node readers. remote readers
-     * doing cold start will see it after the upload completes. the async queue
-     * preserves ordering so the MANIFEST always reflects the latest sstable inventory. */
+
+    if (tdb_objstore_fencing_enabled(db))
+    {
+        tidesdb_objstore_t *os = db->object_store;
+        char manifest_key[TDB_MAX_PATH_LEN];
+        snprintf(manifest_key, sizeof(manifest_key), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME,
+                 cf->name);
+
+        /* re-assert the lease, then publish tagged with our epoch -- both under lease_lock so a
+         * concurrent publish cannot interleave a stale etag. the manifest overwrite needs no
+         * precondition -- the lease renew already proved we are the unique holder, and readers
+         * ignore any manifest whose epoch is below the lease. small + synchronous on purpose;
+         * correctness here outranks the async pipeline's latency saving. */
+        pthread_mutex_lock(&db->lease_lock);
+        int rc = tdb_objstore_lease_renew_locked(db);
+        if (rc == TDB_SUCCESS)
+        {
+            uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
+            rc = os->put_if(os->ctx, manifest_key, cf->manifest->path, TDB_PUT_OVERWRITE, NULL,
+                            epoch, NULL, 0, 0);
+            if (rc == 0) atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
+        }
+        pthread_mutex_unlock(&db->lease_lock);
+
+        if (rc == TDB_ERR_PRECONDITION)
+            tdb_objstore_self_demote(db, "manifest publish");
+        else if (rc != TDB_SUCCESS)
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Fenced manifest publish failed for CF '%s' (rc=%d)",
+                          cf->name, rc);
+        return;
+    }
+
+    /* legacy connector without fencing primitives -- async, ordering preserved by the queue */
     tdb_objstore_upload_file(db, cf->manifest->path);
 }
 
@@ -5465,10 +5757,16 @@ static void tdb_objstore_prefetch_sstables(tidesdb_t *db, tidesdb_sstable_t **ss
  * removed sstables (in local but not remote) are removed from levels.
  * @param db database instance in replica mode
  */
-static void tdb_replica_sync_manifests(tidesdb_t *db)
+static void tdb_replica_sync_manifests(tidesdb_t *db, uint64_t lease_epoch)
 {
     /* we discover and create any new CFs the primary added since last sync */
     tdb_replica_discover_new_cfs(db);
+
+    /* a manifest tagged below lease_epoch was written by a superseded primary and is skipped.
+     * the promotion handoff passes the outgoing epoch so it still absorbs that primary's final
+     * manifest; the periodic sweep passes the live epoch. 0 when fencing is off. */
+    if (lease_epoch > atomic_load_explicit(&db->seen_epoch, memory_order_acquire))
+        atomic_store_explicit(&db->seen_epoch, lease_epoch, memory_order_release);
 
     pthread_rwlock_rdlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
@@ -5482,6 +5780,23 @@ static void tdb_replica_sync_manifests(tidesdb_t *db)
         char tmp_path[TDB_MAX_PATH_LEN];
         snprintf(tmp_path, sizeof(tmp_path), "%s" PATH_SEPARATOR TDB_REPLICA_MANIFEST_TMP,
                  cf->directory);
+
+        /* skip a manifest a superseded primary may have published at an old epoch -- the head
+         * is cheap and avoids both the download and applying a stale sstable inventory. */
+        if (db->object_store->head)
+        {
+            uint64_t mepoch = 0;
+            if (db->object_store->head(db->object_store->ctx, remote_key, NULL, 0, &mepoch) == 1 &&
+                tdb_objstore_obj_epoch_is_stale(mepoch, lease_epoch))
+            {
+                TDB_DEBUG_LOG(
+                    TDB_LOG_WARN,
+                    "Replica sync skipping stale MANIFEST for CF '%s' (epoch %llu < lease "
+                    "%llu)",
+                    cf->name, (unsigned long long)mepoch, (unsigned long long)lease_epoch);
+                continue;
+            }
+        }
 
         if (db->object_store->get(db->object_store->ctx, remote_key, tmp_path) != 0) continue;
 
@@ -5821,8 +6136,10 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
  * idempotent replay -- entries already covered by recovered sstables are skipped.
  * @param db database instance with an object store and a unified memtable
  * @param cold_start 1 when called from cold-start recovery, 0 from the sync thread (log prefix)
+ * @param lease_epoch segments tagged below this are skipped as a superseded primary's; the
+ *                    promotion handoff passes the outgoing epoch, the sweep the live one
  */
-static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start)
+static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start, uint64_t lease_epoch)
 {
     if (!db->unified_mt.enabled || !db->object_store)
     {
@@ -5908,6 +6225,20 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start)
         snprintf(wal_key, sizeof(wal_key), TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
                  TDB_U64_CAST(discovery.generations[wi]));
 
+        if (lease_epoch > 0 && db->object_store->head)
+        {
+            uint64_t wepoch = 0;
+            if (db->object_store->head(db->object_store->ctx, wal_key, NULL, 0, &wepoch) == 1 &&
+                tdb_objstore_obj_epoch_is_stale(wepoch, lease_epoch))
+            {
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "Replica WAL replay skipping stale segment %s (epoch %llu < lease "
+                              "%llu)",
+                              wal_key, (unsigned long long)wepoch, (unsigned long long)lease_epoch);
+                continue;
+            }
+        }
+
         if (db->object_store->get(db->object_store->ctx, wal_key, wal_local) != 0) continue;
 
         int n = tdb_replica_replay_single_wal(db, wal_local, umt, &max_seq);
@@ -5989,6 +6320,7 @@ typedef struct
 {
     tidesdb_t *db;
     const char *cf_name;
+    uint64_t lease_epoch; /* current primary lease epoch, for stale-manifest fencing (0 = off) */
 } tdb_cold_start_download_arg_t;
 
 /**
@@ -6002,6 +6334,25 @@ static void *tdb_cold_start_download_worker(void *arg)
     tdb_cold_start_download_arg_t *ctx = (tdb_cold_start_download_arg_t *)arg;
     const tidesdb_t *db = ctx->db;
     const char *cf_name = ctx->cf_name;
+
+    /* if a superseded primary published this CF's MANIFEST at an old epoch,
+     * skip it entirely rather than cold-start onto stale data -- the periodic replica sync picks
+     * the CF up once the current primary republishes at the live epoch. */
+    if (db->object_store->head)
+    {
+        char mkey[TDB_MAX_PATH_LEN];
+        snprintf(mkey, sizeof(mkey), "%s/" TDB_COLUMN_FAMILY_MANIFEST_NAME, cf_name);
+        uint64_t mepoch = 0;
+        if (db->object_store->head(db->object_store->ctx, mkey, NULL, 0, &mepoch) == 1 &&
+            tdb_objstore_obj_epoch_is_stale(mepoch, ctx->lease_epoch))
+        {
+            TDB_DEBUG_LOG(
+                TDB_LOG_WARN,
+                "Cold start skipping stale MANIFEST for CF '%s' (epoch %llu < lease %llu)", cf_name,
+                (unsigned long long)mepoch, (unsigned long long)ctx->lease_epoch);
+            return NULL;
+        }
+    }
 
     /* we create local CF directory (leave room for /config.ini and /MANIFEST suffixes) */
     char cf_dir[TDB_MAX_PATH_LEN - TDB_PATH_SUFFIX_RESERVE];
@@ -6072,6 +6423,12 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Object store cold start discovered %d CFs in remote store",
                   discovery.count);
 
+    /* resolve the lease epoch once so every CF's worker fences its MANIFEST against the same
+     * value (0 when fencing is off) */
+    uint64_t lease_epoch = tdb_objstore_lease_epoch(db);
+    if (lease_epoch > atomic_load_explicit(&db->seen_epoch, memory_order_acquire))
+        atomic_store_explicit(&db->seen_epoch, lease_epoch, memory_order_release);
+
     /* we download config + MANIFEST for all CFs in parallel */
     tdb_cold_start_download_arg_t args[TDB_MAX_CF_DISCOVERY];
     pthread_t threads[TDB_MAX_CF_DISCOVERY];
@@ -6081,6 +6438,7 @@ static void tdb_objstore_cold_start_discover(tidesdb_t *db)
     {
         args[i].db = db;
         args[i].cf_name = discovery.cf_names[i];
+        args[i].lease_epoch = lease_epoch;
         if (pthread_create(&threads[launched], NULL, tdb_cold_start_download_worker, &args[i]) == 0)
         {
             launched++;
@@ -19469,10 +19827,11 @@ static void *tidesdb_replica_sync_thread(void *arg)
         if (!atomic_load_explicit(&db->replica_sync_thread_active, memory_order_acquire)) break;
         if (!db->object_store) continue;
 
-        tdb_replica_sync_manifests(db);
+        uint64_t lease_epoch = tdb_objstore_lease_epoch(db);
+        tdb_replica_sync_manifests(db, lease_epoch);
         if (db->config.object_store_config && db->config.object_store_config->replica_replay_wal)
         {
-            tdb_objstore_replay_remote_wals(db, 0);
+            tdb_objstore_replay_remote_wals(db, 0, lease_epoch);
         }
     }
 
@@ -20019,8 +20378,12 @@ static void *tidesdb_reaper_thread(void *arg)
                              * reaper thread, stalling deferred-flush retry, memory
                              * pressure tracking and sstable eviction. generation 0
                              * means a plain snapshot upload -- the worker must not
-                             * fence or delete the still-active WAL. */
-                            tdb_objstore_enqueue_upload(db, umt->wal->file_path, 0);
+                             * fence or delete the still-active WAL. ship only the logical
+                             * length, not the preallocated extent. */
+                            tdb_objstore_enqueue_upload(
+                                db, umt->wal->file_path, 0,
+                                atomic_load_explicit(&db->primary_epoch, memory_order_acquire),
+                                wal_size);
                             TDB_DEBUG_LOG(TDB_LOG_INFO,
                                           "Unified WAL sync enqueued for async upload");
                             db->last_wal_sync_size = wal_size;
@@ -20559,6 +20922,23 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         ((*db)->config.object_store_config && (*db)->config.object_store_config->replica_mode) ? 1
                                                                                                : 0);
     atomic_init(&(*db)->replica_sync_thread_active, 0);
+
+    /* single-writer fencing lease state. epoch 0 means no lease held yet; a primary
+     * acquires one on promotion (or first publish, see tdb_objstore_lease_renew). the
+     * node id is for observability only -- correctness rests on the lease CAS, not it. */
+    atomic_init(&(*db)->primary_epoch, 0);
+    atomic_init(&(*db)->seen_epoch, 0);
+    atomic_init(&(*db)->fencing_supported, 0);
+    pthread_mutex_init(&(*db)->lease_lock, NULL);
+    (*db)->lease_etag[0] = '\0';
+    snprintf((*db)->node_id, sizeof((*db)->node_id), "%ld-%lu", (long)TDB_GETPID(),
+             (unsigned long)TDB_THREAD_ID());
+
+    /* prove the backend enforces conditional writes before relying on the fence. the probe writes
+     * a throwaway key, so only a primary runs it; a replica verifies when it promotes. */
+    if ((*db)->object_store && !atomic_load_explicit(&(*db)->replica_mode, memory_order_acquire))
+        atomic_store_explicit(&(*db)->fencing_supported,
+                              tdb_objstore_verify_conditional_writes(*db), memory_order_release);
 
     /* we initialize log file to NULL (stderr) by default. the log file globals
      * are read by tidesdb_log_write under tidesdb_log_mutex, so writes here take
@@ -21774,6 +22154,7 @@ int tidesdb_close(tidesdb_t *db)
     pthread_cond_destroy(&db->sync_thread_cond);
     pthread_mutex_destroy(&db->btree_cache_lock);
     pthread_mutex_destroy(&db->compaction_gate_lock);
+    pthread_mutex_destroy(&db->lease_lock);
 
     if (atomic_load(&db->reaper_active))
     {
@@ -22078,6 +22459,33 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Promoting replica to primary mode");
 
+    /* this node is now going to write, so verify the backend enforces conditional writes before
+     * trusting the fence (the open-time probe only runs on a node that started as a primary). */
+    if (db->object_store && db->object_store->put_if && db->object_store->head)
+        atomic_store_explicit(&db->fencing_supported, tdb_objstore_verify_conditional_writes(db),
+                              memory_order_release);
+
+    /* the outgoing primary's epoch, captured before we bump it. the final catch-up gates on this
+     * value so it still absorbs that primary's just-published manifest and WAL instead of
+     * skipping them as stale against our new epoch. */
+    uint64_t prev_epoch = tdb_objstore_lease_epoch(db);
+
+    /* claim the lease before tearing down any replica machinery, so a
+     * failed acquire leaves the node a working replica (sync thread still running). winning the
+     * CAS makes us the unique epoch holder and immediately fences the old primary -- its next
+     * manifest publish will fail the lease renew and self-demote. if another node already
+     * advanced the epoch we refuse promotion; the orchestrator can retry. */
+    if (tdb_objstore_fencing_enabled(db))
+    {
+        int lrc = tdb_objstore_lease_acquire(db);
+        if (lrc != TDB_SUCCESS)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Promotion aborted -- could not acquire primary lease (%d)",
+                          lrc);
+            return (lrc == TDB_ERR_PRECONDITION) ? TDB_ERR_PRECONDITION : TDB_ERR_IO;
+        }
+    }
+
     /* stop the dedicated replica sync thread before flipping replica_mode.
      * joining it drains any in-flight MANIFEST sync / WAL replay -- flipping
      * replica_mode mid-sync would let a query thread waiting on cf_list_lock as
@@ -22089,15 +22497,16 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
         pthread_join(db->replica_sync_thread, NULL);
     }
 
-    /* final MANIFEST sync and WAL replay to catch last writes from old primary */
+    /* final MANIFEST sync and WAL replay to catch last writes from the old primary, gated on its
+     * epoch so nothing it committed is skipped as stale */
     if (db->object_store)
     {
-        tdb_replica_sync_manifests(db);
+        tdb_replica_sync_manifests(db, prev_epoch);
 
         if (db->unified_mt.enabled && db->config.object_store_config &&
             db->config.object_store_config->replica_replay_wal)
         {
-            tdb_objstore_replay_remote_wals(db, 0);
+            tdb_objstore_replay_remote_wals(db, 0, prev_epoch);
         }
     }
 
@@ -27740,15 +28149,21 @@ static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm
     {
         if (db->config.object_store_config->wal_upload_sync)
         {
-            tdb_objstore_upload_file_sync(db, wal_path);
+            /* the WAL was closed above, so it is already trimmed to its data -- ship the whole
+             * file */
+            tdb_objstore_upload_wal_sync(db, wal_path, 0);
             tdb_unlink(wal_path);
             tdb_sync_directory(db->db_path);
         }
         else
         {
-            /** async upload with the wal generation for fence tracking. the reaper
-             *  cleans up the local file after the upload confirms. */
-            tdb_objstore_enqueue_upload(db, wal_path, imm_gen);
+            /** async upload with the wal generation for fence tracking, tagged with the
+             *  lease epoch so a replica skips a superseded primary's WAL. the reaper
+             *  cleans up the local file after the upload confirms. the closed WAL is already
+             *  trimmed, so the whole file is shipped. */
+            tdb_objstore_enqueue_upload(
+                db, wal_path, imm_gen,
+                atomic_load_explicit(&db->primary_epoch, memory_order_acquire), 0);
         }
     }
     else
@@ -28482,11 +28897,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
         }
 
-        /* sync-on-commit WAL upload for RPO=0 replication */
+        /* sync-on-commit WAL upload for RPO=0 replication. ship only the active WAL's logical
+         * length, not its 64MB-preallocated extent. */
         if (txn->db->object_store && txn->db->config.object_store_config &&
             txn->db->config.object_store_config->wal_sync_on_commit && umt->wal)
         {
-            tdb_objstore_upload_file_sync(txn->db, umt->wal->file_path);
+            uint64_t wal_len = 0;
+            block_manager_get_size(umt->wal, &wal_len);
+            tdb_objstore_upload_wal_sync(txn->db, umt->wal->file_path, wal_len);
         }
 
         /* we apply ops to unified skip list with prefixed keys */
@@ -33366,7 +33784,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Cold start replaying remote WALs from object store for CF recovery");
-        tdb_objstore_replay_remote_wals(db, 1);
+        tdb_objstore_replay_remote_wals(db, 1, tdb_objstore_lease_epoch(db));
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Database recovery completed successfully");
@@ -33761,6 +34179,8 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
     }
 
     stats->replica_mode = atomic_load_explicit(&db->replica_mode, memory_order_relaxed);
+    stats->primary_epoch = atomic_load_explicit(&db->primary_epoch, memory_order_relaxed);
+    stats->seen_epoch = atomic_load_explicit(&db->seen_epoch, memory_order_relaxed);
 
     return TDB_SUCCESS;
 }

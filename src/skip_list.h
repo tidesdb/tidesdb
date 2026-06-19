@@ -364,7 +364,7 @@ int skip_list_new_with_arena(skip_list_t **list, int max_level, float probabilit
  * skip_list_random_level
  * generates a random level for a new node
  * @param list skip list
- * @return random level
+ * @return random level, or -1 if list is NULL
  */
 int skip_list_random_level(const skip_list_t *list);
 
@@ -376,7 +376,7 @@ int skip_list_random_level(const skip_list_t *list);
  * @param key1_size size of first key
  * @param key2 second key
  * @param key2_size size of second key
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
+ * @return negative if key1 < key2, 0 if equal (or if list/key is NULL), positive if key1 > key2
  */
 int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t key1_size,
                            const uint8_t *key2, size_t key2_size);
@@ -407,8 +407,10 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
  * @param list skip list
  * @param key key data
  * @param key_size size of key
- * @param seq sequence number for the deletion (must be greater than existing versions)
- * @return 0 on success, -1 on failure (including if seq <= existing version seq)
+ * @param seq sequence number for the tombstone; must differ from every existing version of the
+ *            key, but need not exceed them (out-of-order seqs splice into the chain)
+ * @return 0 on success or when the key is absent (no-op), -1 only on a duplicate seq or
+ *         allocation failure
  */
 int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t seq);
 
@@ -629,7 +631,8 @@ int skip_list_cursor_next_get(skip_list_cursor_t *cursor, uint8_t **key, size_t 
  * @param value pointer to value
  * @param value_size pointer to value size
  * @param ttl pointer to TTL
- * @param deleted pointer to deleted flag
+ * @param deleted out flag carrying the version's SKIP_LIST_FLAG_* bits -- SKIP_LIST_FLAG_DELETED
+ *                for a tombstone or expired ttl, OR'd with SKIP_LIST_FLAG_SINGLE_DELETE when set
  * @param seq pointer to sequence number
  * @return 0 on success, -1 on failure
  */
@@ -675,7 +678,7 @@ int skip_list_cursor_at_end(const skip_list_cursor_t *cursor);
  * skip_list_cursor_has_next
  * checks if cursor has next entry
  * @param cursor cursor
- * @return 1 if has next, 0 if not
+ * @return 1 if has next, 0 if not, -1 on error or when positioned at the tail
  */
 int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
 
@@ -683,7 +686,7 @@ int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
  * skip_list_cursor_has_prev
  * checks if cursor has previous entry
  * @param cursor cursor
- * @return 1 if has prev, 0 if not
+ * @return 1 if has prev, 0 if not, -1 on error or when positioned at the tail
  */
 int skip_list_cursor_has_prev(skip_list_cursor_t *cursor);
 
@@ -733,11 +736,12 @@ int skip_list_cursor_seek_ge(skip_list_cursor_t *cursor, const uint8_t *key, siz
 
 /**
  * skip_list_cursor_seek_for_prev
- * seeks cursor to last key <= target
+ * seeks cursor to the last key <= target
  * @param cursor cursor
  * @param key target key
  * @param key_size size of target key
- * @return 0 on success, -1 on failure
+ * @return 0 on success, -1 only on invalid arguments. when no key <= target exists the cursor
+ *         parks on the header sentinel and skip_list_cursor_valid then returns 0
  */
 int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
 
@@ -766,10 +770,10 @@ void skip_list_free(skip_list_t *list);
 
 /**
  * skip_list_check_and_update_ttl
- * checks and updates TTL for a node
+ * checks whether a node's latest version has expired by TTL
  * @param list skip list
  * @param node node to check
- * @return 0 on success, -1 on failure
+ * @return 1 if the latest version has expired, 0 if not, -1 if node is NULL
  */
 int skip_list_check_and_update_ttl(const skip_list_t *list, skip_list_node_t *node);
 
@@ -785,7 +789,7 @@ size_t skip_list_get_size(skip_list_t *list);
  * skip_list_count_entries
  * counts number of entries in skip list
  * @param list skip list
- * @return number of entries
+ * @return number of entries, or -1 if list is NULL
  */
 int skip_list_count_entries(skip_list_t *list);
 

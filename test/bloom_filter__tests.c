@@ -870,6 +870,144 @@ static void test_bloom_filter_new_failure_nulls_out(void)
     bloom_filter_add(bf2, (const uint8_t *)"x", 1); /* must not crash */
 }
 
+/* a densely filled filter (almost every 64-bit word non-zero) must serialize with
+ * the dense encoding: smaller than the raw bitset plus a small header, never the
+ * sparse bloat it used to produce. format byte high nibble == 1 marks dense. */
+void test_bloom_filter_dense_encoding(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 1000), 0);
+
+    /* over-fill so essentially every word has a bit set */
+    for (int i = 0; i < 2000; i++)
+    {
+        char key[24];
+        int n = snprintf(key, sizeof(key), "dense_key_%d", i);
+        bloom_filter_add(bf, (const uint8_t *)key, (size_t)n);
+    }
+
+    size_t size;
+    uint8_t *data = bloom_filter_serialize(bf, &size);
+    ASSERT_TRUE(data != NULL);
+
+    /* versioned + dense framing */
+    ASSERT_EQ(data[0], 0x00);
+    ASSERT_EQ(data[1] >> 4, 1);   /* encoding nibble == dense */
+    ASSERT_EQ(data[1] & 0x0F, 2); /* hash version 2 */
+
+    /* dense output must not exceed the raw bitset plus a tiny header -- the whole
+     * point of the encoding is that it never bloats past raw */
+    ASSERT_TRUE(size <= (size_t)bf->size_in_words * 8 + 16);
+
+    bloom_filter_t *rt = bloom_filter_deserialize(data, size);
+    ASSERT_TRUE(rt != NULL);
+    ASSERT_EQ(rt->m, bf->m);
+    ASSERT_EQ(rt->h, bf->h);
+    ASSERT_EQ(rt->size_in_words, bf->size_in_words);
+    ASSERT_EQ(rt->hash_version, bf->hash_version);
+    for (unsigned int i = 0; i < bf->size_in_words; i++) ASSERT_EQ(rt->bitset[i], bf->bitset[i]);
+
+    free(data);
+    bloom_filter_free(bf);
+    bloom_filter_free(rt);
+}
+
+/* a sparsely filled filter keeps the sparse encoding, and its framing is the
+ * byte-identical legacy v2 form (0x00, 0x02) so older binaries still read it */
+void test_bloom_filter_sparse_encoding_unchanged(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100000), 0);
+
+    const char *keys[] = {"a", "b", "c"};
+    for (int i = 0; i < 3; i++) bloom_filter_add(bf, (const uint8_t *)keys[i], strlen(keys[i]));
+
+    size_t size;
+    uint8_t *data = bloom_filter_serialize(bf, &size);
+    ASSERT_TRUE(data != NULL);
+    ASSERT_EQ(data[0], 0x00);
+    ASSERT_EQ(data[1], 0x02); /* sparse + hash version 2, unchanged from legacy v2 */
+
+    bloom_filter_t *rt = bloom_filter_deserialize(data, size);
+    ASSERT_TRUE(rt != NULL);
+    for (int i = 0; i < 3; i++)
+        ASSERT_EQ(bloom_filter_contains(rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
+
+    free(data);
+    bloom_filter_free(bf);
+    bloom_filter_free(rt);
+}
+
+/* deserialize must reject malformed buffers without over-reading: a buffer ending
+ * mid-varint, a lone sentinel, an unknown hash version, an unknown encoding, and
+ * a header that promises more bitset words than the buffer holds */
+void test_bloom_filter_deserialize_malformed(void)
+{
+    /* buffer ends inside a varint (legacy framing, first byte is varint(m)) */
+    uint8_t trunc_varint[1] = {0x80};
+    ASSERT_TRUE(bloom_filter_deserialize(trunc_varint, 1) == NULL);
+
+    /* lone sentinel with no format byte */
+    uint8_t lone_sentinel[1] = {0x00};
+    ASSERT_TRUE(bloom_filter_deserialize(lone_sentinel, 1) == NULL);
+
+    /* unknown hash version (low nibble 3 > current) */
+    uint8_t bad_version[2] = {0x00, 0x03};
+    ASSERT_TRUE(bloom_filter_deserialize(bad_version, 2) == NULL);
+
+    /* unknown encoding (high nibble 2), valid hash version */
+    uint8_t bad_encoding[2] = {0x00, 0x22};
+    ASSERT_TRUE(bloom_filter_deserialize(bad_encoding, 2) == NULL);
+
+    /* sparse: count claims 3 words but only one is present */
+    uint8_t trunc_sparse[16];
+    uint8_t *p = trunc_sparse;
+    p = encode_varint32(p, 128);  /* m = 128 -> 2 words */
+    p = encode_varint32(p, 1);    /* h = 1 */
+    p = encode_varint32(p, 3);    /* non_zero_count = 3 */
+    p = encode_varint32(p, 0);    /* index 0 */
+    p = encode_varint64(p, 0xFF); /* value -- and then nothing more */
+    ASSERT_TRUE(bloom_filter_deserialize(trunc_sparse, (size_t)(p - trunc_sparse)) == NULL);
+
+    /* dense: header says 2 words but the raw body is missing */
+    uint8_t trunc_dense[8];
+    p = trunc_dense;
+    *p++ = 0x00;                    /* sentinel */
+    *p++ = (uint8_t)((1 << 4) | 2); /* dense + hash version 2 */
+    p = encode_varint32(p, 128);    /* m = 128 -> 2 words = 16 raw bytes expected */
+    p = encode_varint32(p, 1);      /* h = 1, then 0 body bytes */
+    ASSERT_TRUE(bloom_filter_deserialize(trunc_dense, (size_t)(p - trunc_dense)) == NULL);
+}
+
+/* is_full over a multi-word filter: the all-words-set return-1 path and both the
+ * partial-last-word (remaining_bits != 0) and exact-multiple (== 0) branches */
+void test_bloom_filter_is_full_multiword(void)
+{
+    /* m = 96 -> 2 words, last word holds 32 valid bits (remaining_bits != 0) */
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 10), 0);
+    ASSERT_TRUE(bf->size_in_words >= 2);
+    for (unsigned int i = 0; i < bf->size_in_words; i++) bf->bitset[i] = UINT64_MAX;
+    ASSERT_EQ(bloom_filter_is_full(bf), 1);
+
+    /* not full once a valid bit in the last word is cleared */
+    bf->bitset[bf->size_in_words - 1] &= ~1ULL;
+    ASSERT_EQ(bloom_filter_is_full(bf), 0);
+    bloom_filter_free(bf);
+
+    /* exact multiple of 64 bits -> remaining_bits == 0 branch */
+    bloom_filter_t *bf2;
+    ASSERT_EQ(bloom_filter_new(&bf2, 0.01, 10), 0);
+    bf2->m = 128; /* 2 full words, no partial tail */
+    ASSERT_EQ(bf2->size_in_words, 2u);
+    bf2->bitset[0] = UINT64_MAX;
+    bf2->bitset[1] = UINT64_MAX;
+    ASSERT_EQ(bloom_filter_is_full(bf2), 1);
+    bf2->bitset[1] = UINT64_MAX - 1;
+    ASSERT_EQ(bloom_filter_is_full(bf2), 0);
+    bloom_filter_free(bf2);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -900,6 +1038,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_bloom_filter_is_full_null_bitset, tests_passed);
     RUN_TEST(test_bloom_filter_hash_key_sizes, tests_passed);
     RUN_TEST(test_bloom_filter_deserialize_overflow_m, tests_passed);
+    RUN_TEST(test_bloom_filter_dense_encoding, tests_passed);
+    RUN_TEST(test_bloom_filter_sparse_encoding_unchanged, tests_passed);
+    RUN_TEST(test_bloom_filter_deserialize_malformed, tests_passed);
+    RUN_TEST(test_bloom_filter_is_full_multiword, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

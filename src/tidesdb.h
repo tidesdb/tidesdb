@@ -969,9 +969,10 @@ struct tidesdb_t
     /* single-writer fencing (object-store mode) -- the primary lease. the lease object is a
      * conditional-write CAS target whose epoch fences a superseded primary -- it can no longer
      * publish a manifest readers honor. unused when object_store == NULL. */
-    _Atomic(uint64_t) primary_epoch;        /* lease epoch this primary holds (0 = none) */
-    _Atomic(uint64_t) seen_epoch;           /* highest lease epoch a replica has observed */
-    pthread_mutex_t lease_lock;             /* serializes lease CAS-renew + lease_etag update */
+    _Atomic(uint64_t) primary_epoch; /* lease epoch this primary holds (0 = none) */
+    _Atomic(uint64_t) seen_epoch;    /* highest lease epoch a replica has observed */
+    _Atomic(int) fencing_supported; /* 1 once the backend is proven to enforce conditional writes */
+    pthread_mutex_t lease_lock;     /* serializes lease CAS-renew + lease_etag update */
     char lease_etag[TDB_OBJSTORE_ETAG_MAX]; /* ETag of the lease we last wrote (guarded by
                                                lease_lock) */
     char node_id[TDB_NODE_ID_MAX]; /* this node's id, recorded in the lease for observability */
@@ -1291,6 +1292,12 @@ typedef struct tidesdb_db_stats_t
     uint64_t total_uploads;
     uint64_t total_upload_failures;
     int replica_mode;
+    /* single-writer fencing (object-store mode). primary_epoch is the lease epoch this primary
+     * currently holds (0 when not a primary / no lease); seen_epoch is the highest lease epoch a
+     * replica has observed. a promotion that took bumps primary_epoch; a fenced primary sees
+     * replica_mode flip back to 1. */
+    uint64_t primary_epoch;
+    uint64_t seen_epoch;
     /* write-amplification counters (lifetime since open, on-disk framed bytes). uwal is the
      * shared unified WAL volume (zero when unified mode is off); the remaining fields are
      * summed across all column families. db-wide WA = (uwal + wal + flush + compaction) /

@@ -119,8 +119,12 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_REPLICA_MANIFEST_TMP             "MANIFEST.replica_tmp"
 /* single-writer fencing -- object-store key of the primary lease, and the local temp
  * file used to stage its small body before a conditional upload */
-#define TDB_PRIMARY_LEASE_KEY      "_tdb_primary_lease"
-#define TDB_PRIMARY_LEASE_TMP      "primary_lease_tmp"
+#define TDB_PRIMARY_LEASE_KEY "_tdb_primary_lease"
+#define TDB_PRIMARY_LEASE_TMP "primary_lease_tmp"
+/* startup probe verifying the backend enforces conditional writes (key suffixed with the node
+ * id); local temp file staging the probe body */
+#define TDB_FENCE_PROBE_KEY        "_tdb_fence_probe"
+#define TDB_FENCE_PROBE_TMP        "fence_probe_tmp"
 #define TDB_PREFIXED_KEY_STACK_MAX 256
 #define TDB_BUP_CPY_FILE_SRC_MODE  "rb"
 #define TDB_BUP_CPY_FILE_DST_MODE  "wb"
@@ -5382,10 +5386,55 @@ static int tidesdb_vlog_range_get_value(const tidesdb_t *db, const tidesdb_sstab
 
 /* tdb_objstore_fencing_enabled
  * fencing is active only when the connector implements the conditional-write and head
- * primitives. legacy connectors fall back to the unfenced upload paths. */
+ * primitives and the backend was proven to enforce the precondition (tdb_objstore_verify_
+ * conditional_writes). otherwise the write paths fall back to unfenced uploads rather than
+ * give false safety. */
 static int tdb_objstore_fencing_enabled(const tidesdb_t *db)
 {
-    return db->object_store && db->object_store->put_if && db->object_store->head;
+    return db->object_store && db->object_store->put_if && db->object_store->head &&
+           atomic_load_explicit(&db->fencing_supported, memory_order_acquire);
+}
+
+/* tdb_objstore_verify_conditional_writes
+ * probe whether the backend actually enforces conditional puts: a create-only put on a fresh
+ * key must succeed and an immediate second create-only on the same key must fail the
+ * precondition. a store that ignores If-None-Match returns success twice, so fencing would be
+ * false safety -- callers disable it in that case. uses a node-unique key to avoid cross-node
+ * races and cleans up after itself.
+ * @return 1 if conditional writes are enforced, 0 otherwise */
+static int tdb_objstore_verify_conditional_writes(tidesdb_t *db)
+{
+    tidesdb_objstore_t *os = db->object_store;
+    if (!os || !os->put_if || !os->head) return 0;
+
+    char probe_body[TDB_MAX_PATH_LEN];
+    snprintf(probe_body, sizeof(probe_body), "%s" PATH_SEPARATOR TDB_FENCE_PROBE_TMP, db->db_path);
+    FILE *pf = fopen(probe_body, "wb");
+    if (!pf) return 0;
+    fputc('1', pf);
+    if (fclose(pf) != 0)
+    {
+        tdb_unlink(probe_body);
+        return 0;
+    }
+
+    char probe_key[TDB_MAX_PATH_LEN];
+    snprintf(probe_key, sizeof(probe_key), "%s_%s", TDB_FENCE_PROBE_KEY, db->node_id);
+
+    os->delete_object(os->ctx, probe_key); /* clear any leftover from a prior crash */
+    int first = os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0);
+    int second =
+        os->put_if(os->ctx, probe_key, probe_body, TDB_PUT_IF_NONE_MATCH, NULL, 0, NULL, 0);
+    os->delete_object(os->ctx, probe_key);
+    tdb_unlink(probe_body);
+
+    int enforced = (first == 0 && second == TDB_ERR_PRECONDITION);
+    if (!enforced)
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "object store does not enforce conditional writes (create-only rc %d/%d) -- "
+                      "single-writer fencing disabled, no split-brain protection",
+                      first, second);
+    return enforced;
 }
 
 /* tdb_objstore_obj_epoch_is_stale
@@ -5691,15 +5740,14 @@ static void tdb_objstore_prefetch_sstables(tidesdb_t *db, tidesdb_sstable_t **ss
  * removed sstables (in local but not remote) are removed from levels.
  * @param db database instance in replica mode
  */
-static void tdb_replica_sync_manifests(tidesdb_t *db)
+static void tdb_replica_sync_manifests(tidesdb_t *db, uint64_t lease_epoch)
 {
     /* we discover and create any new CFs the primary added since last sync */
     tdb_replica_discover_new_cfs(db);
 
-    /* resolve the current lease epoch once per sweep. any manifest tagged
-     * with an older epoch was written by a superseded primary and is skipped so a zombie's
-     * manifest never becomes a replica's truth. 0 when fencing is off (legacy bucket). */
-    uint64_t lease_epoch = tdb_objstore_lease_epoch(db);
+    /* a manifest tagged below lease_epoch was written by a superseded primary and is skipped.
+     * the promotion handoff passes the outgoing epoch so it still absorbs that primary's final
+     * manifest; the periodic sweep passes the live epoch. 0 when fencing is off. */
     if (lease_epoch > atomic_load_explicit(&db->seen_epoch, memory_order_acquire))
         atomic_store_explicit(&db->seen_epoch, lease_epoch, memory_order_release);
 
@@ -6071,8 +6119,10 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
  * idempotent replay -- entries already covered by recovered sstables are skipped.
  * @param db database instance with an object store and a unified memtable
  * @param cold_start 1 when called from cold-start recovery, 0 from the sync thread (log prefix)
+ * @param lease_epoch segments tagged below this are skipped as a superseded primary's; the
+ *                    promotion handoff passes the outgoing epoch, the sweep the live one
  */
-static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start)
+static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start, uint64_t lease_epoch)
 {
     if (!db->unified_mt.enabled || !db->object_store)
     {
@@ -6151,11 +6201,6 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start)
     uint64_t max_seq = cur_global > 0 ? cur_global - 1 : 0;
     const uint64_t start_max_seq = max_seq;
     int total_replayed = 0;
-
-    /* a WAL tagged with an epoch below the current lease was uploaded by a
-     * superseded primary; replaying it would diverge the replica from the live primary's
-     * timeline. resolve the lease epoch once and skip those segments. */
-    uint64_t lease_epoch = tdb_objstore_lease_epoch(db);
 
     for (int wi = 0; wi < discovery.count; wi++)
     {
@@ -19765,10 +19810,11 @@ static void *tidesdb_replica_sync_thread(void *arg)
         if (!atomic_load_explicit(&db->replica_sync_thread_active, memory_order_acquire)) break;
         if (!db->object_store) continue;
 
-        tdb_replica_sync_manifests(db);
+        uint64_t lease_epoch = tdb_objstore_lease_epoch(db);
+        tdb_replica_sync_manifests(db, lease_epoch);
         if (db->config.object_store_config && db->config.object_store_config->replica_replay_wal)
         {
-            tdb_objstore_replay_remote_wals(db, 0);
+            tdb_objstore_replay_remote_wals(db, 0, lease_epoch);
         }
     }
 
@@ -20863,10 +20909,17 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
      * node id is for observability only -- correctness rests on the lease CAS, not it. */
     atomic_init(&(*db)->primary_epoch, 0);
     atomic_init(&(*db)->seen_epoch, 0);
+    atomic_init(&(*db)->fencing_supported, 0);
     pthread_mutex_init(&(*db)->lease_lock, NULL);
     (*db)->lease_etag[0] = '\0';
     snprintf((*db)->node_id, sizeof((*db)->node_id), "%ld-%lu", (long)TDB_GETPID(),
              (unsigned long)TDB_THREAD_ID());
+
+    /* prove the backend enforces conditional writes before relying on the fence. the probe writes
+     * a throwaway key, so only a primary runs it; a replica verifies when it promotes. */
+    if ((*db)->object_store && !atomic_load_explicit(&(*db)->replica_mode, memory_order_acquire))
+        atomic_store_explicit(&(*db)->fencing_supported,
+                              tdb_objstore_verify_conditional_writes(*db), memory_order_release);
 
     /* we initialize log file to NULL (stderr) by default. the log file globals
      * are read by tidesdb_log_write under tidesdb_log_mutex, so writes here take
@@ -22387,6 +22440,17 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Promoting replica to primary mode");
 
+    /* this node is now going to write, so verify the backend enforces conditional writes before
+     * trusting the fence (the open-time probe only runs on a node that started as a primary). */
+    if (db->object_store && db->object_store->put_if && db->object_store->head)
+        atomic_store_explicit(&db->fencing_supported, tdb_objstore_verify_conditional_writes(db),
+                              memory_order_release);
+
+    /* the outgoing primary's epoch, captured before we bump it. the final catch-up gates on this
+     * value so it still absorbs that primary's just-published manifest and WAL instead of
+     * skipping them as stale against our new epoch. */
+    uint64_t prev_epoch = tdb_objstore_lease_epoch(db);
+
     /* claim the lease before tearing down any replica machinery, so a
      * failed acquire leaves the node a working replica (sync thread still running). winning the
      * CAS makes us the unique epoch holder and immediately fences the old primary -- its next
@@ -22414,15 +22478,16 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
         pthread_join(db->replica_sync_thread, NULL);
     }
 
-    /* final MANIFEST sync and WAL replay to catch last writes from old primary */
+    /* final MANIFEST sync and WAL replay to catch last writes from the old primary, gated on its
+     * epoch so nothing it committed is skipped as stale */
     if (db->object_store)
     {
-        tdb_replica_sync_manifests(db);
+        tdb_replica_sync_manifests(db, prev_epoch);
 
         if (db->unified_mt.enabled && db->config.object_store_config &&
             db->config.object_store_config->replica_replay_wal)
         {
-            tdb_objstore_replay_remote_wals(db, 0);
+            tdb_objstore_replay_remote_wals(db, 0, prev_epoch);
         }
     }
 
@@ -33694,7 +33759,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Cold start replaying remote WALs from object store for CF recovery");
-        tdb_objstore_replay_remote_wals(db, 1);
+        tdb_objstore_replay_remote_wals(db, 1, tdb_objstore_lease_epoch(db));
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Database recovery completed successfully");
@@ -34089,6 +34154,8 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
     }
 
     stats->replica_mode = atomic_load_explicit(&db->replica_mode, memory_order_relaxed);
+    stats->primary_epoch = atomic_load_explicit(&db->primary_epoch, memory_order_relaxed);
+    stats->seen_epoch = atomic_load_explicit(&db->seen_epoch, memory_order_relaxed);
 
     return TDB_SUCCESS;
 }

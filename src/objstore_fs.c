@@ -70,6 +70,9 @@ typedef struct
     char root_dir[TDB_FS_MAX_PATH];
 } fs_ctx_t;
 
+static void fs_meta_path(const fs_ctx_t *ctx, const char *key, const char *suffix, char *out,
+                         size_t out_size);
+
 /**
  * fs_mkdir_p
  * create all intermediate directories for a file path
@@ -263,6 +266,15 @@ static int fs_delete_object(void *ctx, const char *key)
 #else
     unlink(full);
 #endif
+
+    /* drop the put_if sidecars too, or a later create-only would see the key as still present */
+    const char *suffixes[] = {".etag", ".epoch", ".lock"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++)
+    {
+        char meta[TDB_FS_META_PATH];
+        fs_meta_path(fs, key, suffixes[i], meta, sizeof(meta));
+        tdb_unlink(meta);
+    }
     return 0;
 }
 

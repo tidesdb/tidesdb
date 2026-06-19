@@ -385,6 +385,13 @@ void test_objstore_fs_put_if_head_fence(void)
     ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_MATCH, etag1, 1, NULL, 0),
               TDB_ERR_PRECONDITION);
 
+    /* delete clears the sidecars, so a create-only on the same key succeeds again */
+    ASSERT_EQ(store->delete_object(store->ctx, key), 0);
+    ASSERT_EQ(store->head(store->ctx, key, NULL, 0, &epoch), 0);
+    ASSERT_EQ(store->put_if(store->ctx, key, body, TDB_PUT_IF_NONE_MATCH, NULL, 7, NULL, 0), 0);
+    ASSERT_EQ(store->head(store->ctx, key, NULL, 0, &epoch), 1);
+    ASSERT_EQ((int)epoch, 7);
+
     store->destroy(store->ctx);
     free(store);
     cleanup_dirs();

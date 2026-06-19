@@ -165,6 +165,7 @@ typedef enum
 #define TDB_ERR_LOCKED       -12
 #define TDB_ERR_READONLY     -13
 #define TDB_ERR_BUSY         -14
+#define TDB_ERR_PRECONDITION -15
 
 /** configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
@@ -515,6 +516,12 @@ typedef struct tidesdb_db_stats_t
     uint64_t total_uploads;
     uint64_t total_upload_failures;
     int replica_mode;
+    /* single-writer fencing (object-store mode). primary_epoch is the lease epoch this primary
+     * currently holds (0 when not a primary / no lease); seen_epoch is the highest lease epoch a
+     * replica has observed. a promotion that took bumps primary_epoch; a fenced primary sees
+     * replica_mode flip back to 1. */
+    uint64_t primary_epoch;
+    uint64_t seen_epoch;
     /* write-amplification counters (lifetime since open, on-disk framed bytes). uwal is the
      * shared unified WAL volume (zero when unified mode is off); the remaining fields are
      * summed across all column families. db-wide WA = (uwal + wal + flush + compaction) /

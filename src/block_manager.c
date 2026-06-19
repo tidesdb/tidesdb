@@ -168,6 +168,39 @@ static uint8_t *bm_get_read_buf(const size_t needed)
 }
 
 /**
+ * pwrite_all
+ * write exactly nbyte bytes at offset, retrying short writes and EINTR. a bare pwrite treats a
+ * short write as a hard error, but a large write_raw can legitimately come up short under a
+ * signal. the append path already gets this via tdb_pwritev_safe.
+ * @param fd the file descriptor
+ * @param buf the buffer to write
+ * @param nbyte the number of bytes that must be written
+ * @param offset the file offset to write at
+ * @return 0 if all bytes were written, -1 on error (errno set)
+ */
+static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset)
+{
+    size_t total = 0;
+    while (total < nbyte)
+    {
+        const ssize_t written =
+            pwrite(fd, (const uint8_t *)buf + total, nbyte - total, offset + total);
+        if (BM_UNLIKELY(written < 0))
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (BM_UNLIKELY(written == 0))
+        {
+            errno = EIO;
+            return -1;
+        }
+        total += (size_t)written;
+    }
+    return 0;
+}
+
+/**
  * odsync_available
  * check if O_DSYNC is available on the specific platform
  * @return 1 if O_DSYNC is available, 0 otherwise
@@ -331,8 +364,7 @@ static int write_header(const int fd)
     encode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
                             padding);
 
-    const ssize_t written = pwrite(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
-    return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
+    return pwrite_all(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
 }
 
 /**
@@ -847,8 +879,7 @@ int block_manager_write_at(block_manager_t *bm, const int64_t offset, const uint
      * grow the file without advancing current_file_size, desyncing the two */
     if ((uint64_t)offset + size > atomic_load(&bm->current_file_size)) return -1;
 
-    const ssize_t written = pwrite(bm->fd, data, size, offset);
-    if (written != (ssize_t)size)
+    if (pwrite_all(bm->fd, data, size, offset) != 0)
     {
         return -1;
     }
@@ -895,8 +926,7 @@ int block_manager_update_checksum(block_manager_t *bm, const int64_t block_offse
     encode_uint32_le_compat(checksum_buf, new_checksum);
 
     const off_t checksum_offset = block_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE;
-    if (pwrite(bm->fd, checksum_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, checksum_offset) !=
-        BLOCK_MANAGER_CHECKSUM_LENGTH)
+    if (pwrite_all(bm->fd, checksum_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, checksum_offset) != 0)
     {
         return -1;
     }

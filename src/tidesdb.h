@@ -893,6 +893,11 @@ struct tidesdb_t
     _Atomic(time_t) last_open_fail_log_sec;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
+    /* highest seq all of whose predecessors have a decided fate (committed or aborted). snapshots
+     * read from here rather than global_seq - 1 so a snapshot never names an in-flight commit,
+     * which would otherwise be both invisible to reads and missed by the post-apply write-write
+     * scan. */
+    _Atomic(uint64_t) visible_seq;
     tidesdb_commit_status_t *commit_status;
     pthread_rwlock_t active_txns_lock;
     tidesdb_txn_t **active_txns;

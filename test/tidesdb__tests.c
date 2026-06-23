@@ -8287,6 +8287,259 @@ static void test_snapshot_write_write_conflict_still_works(void)
     cleanup_test_dir();
 }
 
+/* ***** concurrent write-write conflict (lost-update / stale-index) repros *****
+ * the sequential write-write test above passes because t1 fully commits (and applies) before t2
+ * validates. the defect is in the CONCURRENT path -- two committers both validate before either
+ * applies, so neither sees the other and both commit. these threaded tests pin first-committer-wins
+ * under contention; they fail on the current engine and pass once validate+apply is serialized. */
+
+#define OCC_THREADS  8
+#define OCC_INCRS    500
+#define OCC_IDX_ROWS 64
+#define OCC_IDX_OPS  1000
+
+static int occ_rc_retryable(int rc)
+{
+    return rc == TDB_ERR_BUSY || rc == TDB_ERR_MEMORY_LIMIT || rc == TDB_ERR_CONFLICT;
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int incrs;
+    tidesdb_isolation_level_t iso;
+} occ_counter_arg_t;
+
+/* increment a single shared counter, retrying until each increment commits. with correct
+ * first-committer-wins every successful commit advances the counter by exactly one. */
+static void *occ_counter_worker(void *vp)
+{
+    occ_counter_arg_t *a = (occ_counter_arg_t *)vp;
+    const uint8_t key[] = "counter";
+    for (int i = 0; i < a->incrs; i++)
+    {
+        for (long attempt = 0; attempt < 100000000L; attempt++)
+        {
+            tidesdb_txn_t *t = NULL;
+            if (tidesdb_txn_begin_with_isolation(a->db, a->iso, &t) != 0) continue;
+            uint8_t *val = NULL;
+            size_t vs = 0;
+            uint64_t cur = 0;
+            int rc = tidesdb_txn_get(t, a->cf, key, sizeof(key), &val, &vs);
+            if (rc == 0 && val && vs == sizeof(uint64_t)) memcpy(&cur, val, sizeof(uint64_t));
+            if (val) free(val);
+            uint64_t next = cur + 1;
+            rc = tidesdb_txn_put(t, a->cf, key, sizeof(key), (uint8_t *)&next, sizeof(next), 0);
+            if (rc == 0) rc = tidesdb_txn_commit(t);
+            tidesdb_txn_free(t);
+            if (rc == 0) break;
+            if (!occ_rc_retryable(rc)) break; /* unexpected -- let the final count flag it */
+        }
+    }
+    return NULL;
+}
+
+static void run_concurrent_counter_no_lost_update(tidesdb_isolation_level_t iso, const char *label,
+                                                  int n_threads, int n_incrs)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "occ_counter_cf", &cfg), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "occ_counter_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const uint8_t key[] = "counter";
+    uint64_t zero = 0;
+    tidesdb_txn_t *t0 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &t0), 0);
+    ASSERT_EQ(tidesdb_txn_put(t0, cf, key, sizeof(key), (uint8_t *)&zero, sizeof(zero), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(t0), 0);
+    tidesdb_txn_free(t0);
+
+    pthread_t th[OCC_THREADS];
+    occ_counter_arg_t args[OCC_THREADS];
+    for (int i = 0; i < n_threads; i++)
+    {
+        args[i] = (occ_counter_arg_t){db, cf, n_incrs, iso};
+        pthread_create(&th[i], NULL, occ_counter_worker, &args[i]);
+    }
+    for (int i = 0; i < n_threads; i++) pthread_join(th[i], NULL);
+
+    tidesdb_txn_t *tr = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &tr), 0);
+    uint8_t *val = NULL;
+    size_t vs = 0;
+    ASSERT_EQ(tidesdb_txn_get(tr, cf, key, sizeof(key), &val, &vs), 0);
+    ASSERT_TRUE(val != NULL && vs == sizeof(uint64_t));
+    uint64_t final_val = 0;
+    memcpy(&final_val, val, sizeof(final_val));
+    free(val);
+    tidesdb_txn_rollback(tr);
+    tidesdb_txn_free(tr);
+
+    printf("  %s counter: expected=%d final=%llu (deficit=%lld = lost updates)\n", label,
+           n_threads * n_incrs, (unsigned long long)final_val,
+           (long long)(n_threads * n_incrs) - (long long)final_val);
+    ASSERT_EQ(final_val, (uint64_t)(n_threads * n_incrs));
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_concurrent_snapshot_no_lost_update(void)
+{
+    run_concurrent_counter_no_lost_update(TDB_ISOLATION_SNAPSHOT, "snapshot", OCC_THREADS,
+                                          OCC_INCRS);
+}
+
+static void test_concurrent_serializable_no_lost_update(void)
+{
+    run_concurrent_counter_no_lost_update(TDB_ISOLATION_SERIALIZABLE, "serializable", OCC_THREADS,
+                                          OCC_INCRS);
+}
+
+static _Atomic uint64_t occ_idx_next_k;
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *dc;
+    tidesdb_column_family_t *ic;
+    int ops;
+    unsigned seed;
+} occ_idx_arg_t;
+
+static void occ_be64(uint8_t *p, uint64_t v)
+{
+    for (int i = 7; i >= 0; i--)
+    {
+        p[i] = (uint8_t)(v & 0xff);
+        v >>= 8;
+    }
+}
+static uint64_t occ_rb64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+/* mirror the TideSQL secondary-index write path: each update moves a row to a unique new k while
+ * maintaining a separate index CF (delete old idx key, put new). concurrent updates to the same row
+ * that both commit orphan the loser's index entry -- a stale secondary index. */
+static void *occ_idx_worker(void *vp)
+{
+    occ_idx_arg_t *a = (occ_idx_arg_t *)vp;
+    const uint8_t one = 1;
+    for (int i = 0; i < a->ops; i++)
+    {
+        uint64_t id = rand_r(&a->seed) % OCC_IDX_ROWS;
+        for (long attempt = 0; attempt < 100000000L; attempt++)
+        {
+            tidesdb_txn_t *t = NULL;
+            if (tidesdb_txn_begin_with_isolation(a->db, TDB_ISOLATION_SNAPSHOT, &t) != 0) continue;
+            uint8_t dk[8];
+            occ_be64(dk, id);
+            uint8_t *val = NULL;
+            size_t vs = 0;
+            uint64_t curk = 0;
+            int rc = tidesdb_txn_get(t, a->dc, dk, 8, &val, &vs);
+            if (rc == 0 && val && vs == 8) curk = occ_rb64(val);
+            if (val) free(val);
+            uint64_t newk = atomic_fetch_add(&occ_idx_next_k, 1);
+            uint8_t dv[8], ok[16], nk[16];
+            occ_be64(dv, newk);
+            occ_be64(ok, curk);
+            occ_be64(ok + 8, id);
+            occ_be64(nk, newk);
+            occ_be64(nk + 8, id);
+            rc = tidesdb_txn_put(t, a->dc, dk, 8, dv, 8, 0);
+            if (rc == 0) rc = tidesdb_txn_delete(t, a->ic, ok, 16);
+            if (rc == 0) rc = tidesdb_txn_put(t, a->ic, nk, 16, &one, 1, 0);
+            if (rc == 0) rc = tidesdb_txn_commit(t);
+            tidesdb_txn_free(t);
+            if (rc == 0) break;
+            if (!occ_rc_retryable(rc)) break;
+        }
+    }
+    return NULL;
+}
+
+static void test_concurrent_snapshot_secondary_index_consistency(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "occ_data", &cfg), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "occ_idx", &cfg), 0);
+    tidesdb_column_family_t *dc = tidesdb_get_column_family(db, "occ_data");
+    tidesdb_column_family_t *ic = tidesdb_get_column_family(db, "occ_idx");
+    ASSERT_TRUE(dc != NULL && ic != NULL);
+    atomic_store(&occ_idx_next_k, 1ull << 20);
+
+    const uint8_t one = 1;
+    for (uint64_t id = 0; id < OCC_IDX_ROWS; id++)
+    {
+        tidesdb_txn_t *t = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &t), 0);
+        uint8_t dk[8], dv[8], ik[16];
+        occ_be64(dk, id);
+        occ_be64(dv, 0);
+        occ_be64(ik, 0);
+        occ_be64(ik + 8, id);
+        ASSERT_EQ(tidesdb_txn_put(t, dc, dk, 8, dv, 8, 0), 0);
+        ASSERT_EQ(tidesdb_txn_put(t, ic, ik, 16, &one, 1, 0), 0);
+        ASSERT_EQ(tidesdb_txn_commit(t), 0);
+        tidesdb_txn_free(t);
+    }
+
+    pthread_t th[OCC_THREADS];
+    occ_idx_arg_t args[OCC_THREADS];
+    for (int i = 0; i < OCC_THREADS; i++)
+    {
+        args[i] = (occ_idx_arg_t){db, dc, ic, OCC_IDX_OPS, (unsigned)(i * 2654435761u + 1)};
+        pthread_create(&th[i], NULL, occ_idx_worker, &args[i]);
+    }
+    for (int i = 0; i < OCC_THREADS; i++) pthread_join(th[i], NULL);
+
+    /* every live index key (k,id) must resolve to a data row whose stored k equals it */
+    tidesdb_txn_t *t = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &t), 0);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(t, ic, &it), 0);
+    tidesdb_iter_seek_to_first(it);
+    uint64_t idx_keys = 0, stale = 0;
+    while (tidesdb_iter_valid(it))
+    {
+        uint8_t *k = NULL;
+        size_t ks = 0;
+        if (tidesdb_iter_key(it, &k, &ks) != 0 || !k || ks < 16) break;
+        uint64_t ik = occ_rb64(k), id = occ_rb64(k + 8);
+        idx_keys++;
+        uint8_t dk[8];
+        occ_be64(dk, id);
+        uint8_t *val = NULL;
+        size_t vs = 0;
+        int rc = tidesdb_txn_get(t, dc, dk, 8, &val, &vs);
+        uint64_t rowk = (rc == 0 && val && vs == 8) ? occ_rb64(val) : ~0ull;
+        if (val) free(val);
+        if (rowk != ik) stale++;
+        tidesdb_iter_next(it);
+    }
+    tidesdb_iter_free(it);
+    tidesdb_txn_rollback(t);
+    tidesdb_txn_free(t);
+
+    printf("  snapshot secondary index: index_keys=%llu stale=%llu\n", (unsigned long long)idx_keys,
+           (unsigned long long)stale);
+    ASSERT_EQ(stale, (uint64_t)0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_serializable_phantom_prevention(void)
 {
     cleanup_test_dir();
@@ -30491,6 +30744,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_snapshot_no_read_conflict, tests_passed);
     RUN_TEST(test_snapshot_allows_write_skew, tests_passed);
     RUN_TEST(test_snapshot_write_write_conflict_still_works, tests_passed);
+    RUN_TEST(test_concurrent_snapshot_no_lost_update, tests_passed);
+    RUN_TEST(test_concurrent_serializable_no_lost_update, tests_passed);
+    RUN_TEST(test_concurrent_snapshot_secondary_index_consistency, tests_passed);
     RUN_TEST(test_serializable_phantom_prevention, tests_passed);
     RUN_TEST(test_transaction_abort_retry, tests_passed);
     RUN_TEST(test_long_running_transaction, tests_passed);

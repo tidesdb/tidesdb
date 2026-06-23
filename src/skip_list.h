@@ -92,6 +92,11 @@ struct skip_list_arena_t
           * has been put at most once since the last         \
           * single-delete or start, so put+single-delete can \
           * be reaped together at compaction. */
+#define SKIP_LIST_FLAG_ABORTED                               \
+    0x04 /* version belongs to a transaction that failed its \
+          * write-write conflict check after applying. it is \
+          * invisible to reads and skipped by flush and by   \
+          * later conflict scans, then reclaimed by gc. */
 
 /**
  * skip_list_cmp_type_t
@@ -113,6 +118,9 @@ typedef enum
 /* helper macros for flag access */
 #define VERSION_IS_DELETED(version) \
     (atomic_load_explicit(&(version)->flags, memory_order_acquire) & SKIP_LIST_FLAG_DELETED)
+
+#define VERSION_IS_ABORTED(version) \
+    (atomic_load_explicit(&(version)->flags, memory_order_acquire) & SKIP_LIST_FLAG_ABORTED)
 
 #define NODE_IS_SENTINEL(node) ((node)->node_flags & SKIP_LIST_NODE_FLAG_SENTINEL)
 
@@ -557,6 +565,33 @@ int skip_list_get_with_seq_ref(skip_list_t *list, const uint8_t *key, size_t key
  */
 int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
                           uint64_t *out_seq);
+
+/**
+ * skip_list_has_write_conflict
+ * reports whether the key carries a version newer than threshold_seq that was written by another
+ * transaction, used by apply-before-validate write-write detection. the committer scans after
+ * inserting its own version, so its own seq and any aborted version are excluded.
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @param threshold_seq the committing transaction's snapshot sequence
+ * @param exclude_seq the committing transaction's own commit sequence
+ * @return 1 if a conflicting version exists, 0 otherwise
+ */
+int skip_list_has_write_conflict(skip_list_t *list, const uint8_t *key, size_t key_size,
+                                 uint64_t threshold_seq, uint64_t exclude_seq);
+
+/**
+ * skip_list_mark_aborted
+ * flags the version with the given seq as aborted so reads, flush and later conflict scans skip it.
+ * called when a transaction loses its post-apply conflict check.
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @param seq sequence number of the version to abort
+ * @return 0 if the version was found and flagged, -1 otherwise
+ */
+int skip_list_mark_aborted(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t seq);
 
 /**
  * skip_list_get_min_seq

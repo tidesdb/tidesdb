@@ -746,6 +746,9 @@ struct tidesdb_kv_pair_t
 
 #define TDB_COMMIT_STATUS_IN_PROGRESS 0
 #define TDB_COMMIT_STATUS_COMMITTED   1
+#define TDB_COMMIT_STATUS_ABORTED                                \
+    2 /* lost its post-apply write-write check; lets the visible \
+       * watermark advance past it and keeps its versions unseen */
 
 /**
  * tidesdb_commit_status_t
@@ -1353,6 +1356,53 @@ static void tidesdb_commit_status_mark(tidesdb_commit_status_t *cs, uint64_t seq
 }
 
 /**
+ * tidesdb_visible_seq_advance
+ * pushes db->visible_seq forward over every contiguous decided commit (committed or aborted), so a
+ * snapshot taken from visible_seq never names an in-flight commit. called once a commit reaches its
+ * fate. the walk stops at the first undecided seq and never crosses global_seq, since a slot past
+ * the highest allocated seq may still hold a stale status from a wrapped-around earlier seq.
+ * @param db database
+ */
+static void tidesdb_visible_seq_advance(tidesdb_t *db)
+{
+    tidesdb_commit_status_t *cs = db->commit_status;
+    if (!cs) return;
+
+    uint64_t v = atomic_load_explicit(&db->visible_seq, memory_order_acquire);
+    while (1)
+    {
+        const uint64_t next = v + 1;
+        if (next >= atomic_load_explicit(&db->global_seq, memory_order_acquire)) break;
+        const uint8_t st =
+            atomic_load_explicit(&cs->status[next % cs->capacity], memory_order_acquire);
+        if (st != TDB_COMMIT_STATUS_COMMITTED && st != TDB_COMMIT_STATUS_ABORTED) break;
+        if (atomic_compare_exchange_weak_explicit(&db->visible_seq, &v, next, memory_order_release,
+                                                  memory_order_acquire))
+            v = next; /* claimed next; keep walking */
+        /* CAS failure reloaded v into the new watermark; retest next against it */
+    }
+}
+
+/**
+ * tidesdb_commit_status_is_aborted
+ * whether seq belongs to a transaction that lost its post-apply conflict check. an aborted seq is
+ * recent -- it lives only in a memtable until flush skips it -- so the global_seq window guards a
+ * wrapped circular-buffer slot (a much older committed sstable seq) from being misread as aborted.
+ * @param cs commit status tracker
+ * @param seq sequence number to test
+ * @param global_seq the current global sequence
+ * @return 1 if seq is a recent aborted transaction, 0 otherwise
+ */
+static int tidesdb_commit_status_is_aborted(tidesdb_commit_status_t *cs, uint64_t seq,
+                                            uint64_t global_seq)
+{
+    if (!cs || seq == 0 || seq == UINT64_MAX) return 0;
+    if (seq + cs->capacity <= global_seq) return 0;
+    return atomic_load_explicit(&cs->status[seq % cs->capacity], memory_order_acquire) ==
+           TDB_COMMIT_STATUS_ABORTED;
+}
+
+/**
  * tidesdb_visibility_check_callback
  * callback for skip list to check if a sequence is committed
  * used by skip_list_get_with_seq for visibility determination
@@ -1719,7 +1769,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
                                      const int end_level);
 static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t **inputs,
                                   int input_count, int min_input_level, int max_input_level,
-                                  int target_level);
+                                  int target_level, const uint8_t *drop_range_start,
+                                  size_t drop_range_start_size, const uint8_t *drop_range_end,
+                                  size_t drop_range_end_size);
 static int tidesdb_compact_range_internal(tidesdb_column_family_t *cf, const uint8_t *start_key,
                                           size_t start_key_size, const uint8_t *end_key,
                                           size_t end_key_size, int target_level_override);
@@ -1739,7 +1791,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  bloom_filter_t *bloom, queue_t *sstables_to_delete,
                                                  int is_largest_level, const uint8_t *range_start,
                                                  size_t range_start_size, const uint8_t *range_end,
-                                                 size_t range_end_size,
+                                                 size_t range_end_size, int keep_out_of_range,
                                                  uint64_t oldest_unflushed_seq);
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction);
 static int tidesdb_enqueue_compaction(tidesdb_column_family_t *cf, int full_compaction);
@@ -6514,13 +6566,15 @@ static void tdb_objstore_replay_remote_wals(tidesdb_t *db, int cold_start, uint6
 
     /* max_seq is the highest seq applied; global_seq is the next seq to assign, so it
      * must reach max_seq + 1. comparing max_seq directly leaves a replica that is one
-     * step behind stuck, global_seq never advances, the read snapshot (global_seq - 1)
-     * stays below the newest entry, and just-replayed rows stay invisible while the
-     * replay re-applies the same tail every tick. */
+     * step behind stuck, global_seq never advances, the read snapshot stays below the
+     * newest entry, and just-replayed rows stay invisible while the replay re-applies
+     * the same tail every tick. replayed entries are all committed, so the visible
+     * watermark advances with global_seq. */
     const uint64_t next_seq = max_seq + 1;
     if (next_seq > atomic_load_explicit(&db->global_seq, memory_order_acquire))
     {
         atomic_store_explicit(&db->global_seq, next_seq, memory_order_release);
+        atomic_store_explicit(&db->visible_seq, max_seq, memory_order_release);
     }
 
     /* the boundary entry at seq == start_max_seq is re-applied every tick (idempotent), so
@@ -8496,6 +8550,16 @@ static int tidesdb_sstable_write_from_memtable_btree_ex(tidesdb_t *db, tidesdb_c
                 key_size -= seg_prefix_len;
             }
 
+            /* an aborted version lost its conflict check and is invisible, so it must never reach
+             * the sstable. skip it, stopping the chain walk once below the snapshot floor where
+             * older versions are dominated anyway. */
+            if (deleted & SKIP_LIST_FLAG_ABORTED)
+            {
+                if (seq <= min_snapshot_seq) break;
+                if (skip_list_cursor_advance_in_node(cursor) != 0) break;
+                continue;
+            }
+
             /* we write value to vlog if it exceeds the threshold, matching the
              * compaction merge path. small values are stored inline in the btree. */
             uint64_t vlog_offset = 0;
@@ -8699,6 +8763,33 @@ static uint64_t tidesdb_cf_oldest_unflushed_seq(tidesdb_column_family_t *cf)
 }
 
 /**
+ * tdb_key_in_drop_range
+ * whether key lies in [range_start, range_end), a NULL bound being unbounded on that side. a
+ * key-range targeted merge collects whole sstables that overhang the range, so it may only GC a
+ * tombstone for a key inside the range it fully covers -- an out-of-range overhang key can have an
+ * older put in a deeper sstable that did not overlap the range and so was never collected, and
+ * dropping its tombstone would resurrect it.
+ * @param cmp_fn comparator
+ * @param cmp_ctx comparator context
+ * @param key candidate key
+ * @param key_size size of key
+ * @param range_start inclusive lower bound (NULL = unbounded)
+ * @param range_start_size size of range_start
+ * @param range_end exclusive upper bound (NULL = unbounded)
+ * @param range_end_size size of range_end
+ * @return 1 if in range, 0 otherwise
+ */
+static int tdb_key_in_drop_range(skip_list_comparator_fn cmp_fn, void *cmp_ctx, const uint8_t *key,
+                                 size_t key_size, const uint8_t *range_start,
+                                 size_t range_start_size, const uint8_t *range_end,
+                                 size_t range_end_size)
+{
+    if (range_start && cmp_fn(key, key_size, range_start, range_start_size, cmp_ctx) < 0) return 0;
+    if (range_end && cmp_fn(key, key_size, range_end, range_end_size, cmp_ctx) >= 0) return 0;
+    return 1;
+}
+
+/**
  * tidesdb_sstable_write_from_heap_btree
  * write merged entries from a heap to an sstable using B+tree format
  * @param cf column family
@@ -8709,13 +8800,17 @@ static uint64_t tidesdb_cf_oldest_unflushed_seq(tidesdb_column_family_t *cf)
  * @param bloom bloom filter (optional, may be NULL)
  * @param sstables_to_delete queue for corrupted sstables
  * @param is_largest_level whether this is the largest level
+ * @param keep_out_of_range when set, keys outside [range_start, range_end) are still written rather
+ *        than skipped (a single-output targeted merge must not drop the overhang of a boundary
+ *        sstable); their tombstones are never GC'd regardless. when clear a partition writer skips
+ *        them, since the other partitions cover them.
  * @return 0 on success, error code on failure
  */
 static int tidesdb_sstable_write_from_heap_btree(
     tidesdb_column_family_t *cf, tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
     block_manager_t *klog_bm, block_manager_t *vlog_bm, bloom_filter_t *bloom,
     queue_t *sstables_to_delete, const int is_largest_level, const uint8_t *range_start,
-    size_t range_start_size, const uint8_t *range_end, size_t range_end_size,
+    size_t range_start_size, const uint8_t *range_end, size_t range_end_size, int keep_out_of_range,
     uint64_t oldest_unflushed_seq)
 {
     if (!cf || !sst || !heap || !klog_bm || !vlog_bm) return TDB_ERR_INVALID_ARGS;
@@ -8801,11 +8896,12 @@ static int tidesdb_sstable_write_from_heap_btree(
          * partition output must contain only keys in [range_start, range_end). without this the
          * btree partition writer wrote out-of-range keys and, worse, processed (and at the largest
          * level GC'd) tombstones for keys owned by other partitions whose puts then resurfaced.
-         * all versions of a key share the key, so skipping by key is safe. */
-        if (kv && ((range_start && comparator_fn(kv->key, kv->entry.key_size, range_start,
-                                                 range_start_size, comparator_ctx) < 0) ||
-                   (range_end && comparator_fn(kv->key, kv->entry.key_size, range_end,
-                                               range_end_size, comparator_ctx) >= 0)))
+         * all versions of a key share the key, so skipping by key is safe. a single-output targeted
+         * merge instead keeps the overhang (keep_out_of_range) and relies on the GC gate below, as
+         * skipping there would drop a boundary sstable's out-of-range keys with nowhere to land. */
+        if (!keep_out_of_range && kv &&
+            !tdb_key_in_drop_range(comparator_fn, comparator_ctx, kv->key, kv->entry.key_size,
+                                   range_start, range_start_size, range_end, range_end_size))
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -8832,10 +8928,16 @@ static int tidesdb_sstable_write_from_heap_btree(
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
             /* never reap a tombstone newer than the oldest write still unflushed in a memtable --
-             * that older version is off the merge's snapshot and would resurface once it flushes */
-            const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
-                                       is_largest_level && pending->entry.seq <= min_snapshot_seq &&
-                                       pending->entry.seq < oldest_unflushed_seq;
+             * that older version is off the merge's snapshot and would resurface once it flushes.
+             * an out-of-range overhang key is never reaped here either -- its older versions may
+             * sit in sstables that did not overlap the merge range and so were not collected. */
+            const int tombstone_drop =
+                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level &&
+                pending->entry.seq <= min_snapshot_seq &&
+                pending->entry.seq < oldest_unflushed_seq &&
+                tdb_key_in_drop_range(comparator_fn, comparator_ctx, pending->key,
+                                      pending->entry.key_size, range_start, range_start_size,
+                                      range_end, range_end_size);
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -9182,6 +9284,16 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
                     }
                     key += seg_prefix_len;
                     key_size -= seg_prefix_len;
+                }
+
+                /* an aborted version lost its conflict check and is invisible, so it must never
+                 * reach the sstable. skip it, stopping the chain walk once below the snapshot floor
+                 * where older versions are dominated anyway. */
+                if (deleted & SKIP_LIST_FLAG_ABORTED)
+                {
+                    if (seq <= min_snapshot_seq) break;
+                    if (skip_list_cursor_advance_in_node(cursor) != 0) break;
+                    continue;
                 }
 
                 /* we populate stack-allocated KV pair (no malloc needed) */
@@ -14920,7 +15032,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
         {
             int btree_result = tidesdb_sstable_write_from_heap_btree(
                 cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level,
-                range_start, range_start_size, range_end, range_end_size, c->oldest_unflushed_seq);
+                range_start, range_start_size, range_end, range_end_size, 0,
+                c->oldest_unflushed_seq);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(heap);
@@ -15467,11 +15580,19 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
  * @param min_input_level smallest 0-indexed level any input lives in
  * @param max_input_level largest 0-indexed level any input lives in
  * @param target_level 0-indexed level to write output to
+ * @param drop_range_start lower bound of the range this merge fully covers (NULL = unbounded); a
+ *        tombstone is only GC'd for a key inside [drop_range_start, drop_range_end), since an
+ *        overhang key of a boundary input sstable may have older versions that were not collected
+ * @param drop_range_start_size size of drop_range_start
+ * @param drop_range_end upper bound, exclusive (NULL = unbounded)
+ * @param drop_range_end_size size of drop_range_end
  * @return TDB_SUCCESS on success, error code on failure
  */
 static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t **inputs,
                                   int input_count, int min_input_level, int max_input_level,
-                                  int target_level)
+                                  int target_level, const uint8_t *drop_range_start,
+                                  size_t drop_range_start_size, const uint8_t *drop_range_end,
+                                  size_t drop_range_end_size)
 {
     if (!cf || !inputs || input_count <= 0) return TDB_ERR_INVALID_ARGS;
     if (min_input_level < 0 || max_input_level < min_input_level) return TDB_ERR_INVALID_ARGS;
@@ -15588,8 +15709,9 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
     if (cf->config.use_btree)
     {
         int btree_result = tidesdb_sstable_write_from_heap_btree(
-            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level, NULL,
-            0, NULL, 0, oldest_unflushed_seq);
+            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete, is_largest_level,
+            drop_range_start, drop_range_start_size, drop_range_end, drop_range_end_size, 1,
+            oldest_unflushed_seq);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         tidesdb_merge_heap_free(heap);
@@ -15675,9 +15797,15 @@ static int tidesdb_targeted_merge(tidesdb_column_family_t *cf, tidesdb_sstable_t
         if (pending)
         {
             const int sd_pair_drop = pending_is_single_delete && pending_sd_paired_with_put;
-            const int tombstone_drop = (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
-                                       is_largest_level && pending->entry.seq <= min_snapshot_seq &&
-                                       pending->entry.seq < oldest_unflushed_seq;
+            /* an out-of-range overhang key of a boundary input is written but never reaped -- its
+             * older versions may live in sstables that did not overlap the merge range */
+            const int tombstone_drop =
+                (pending->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level &&
+                pending->entry.seq <= min_snapshot_seq &&
+                pending->entry.seq < oldest_unflushed_seq &&
+                tdb_key_in_drop_range(comparator_fn, comparator_ctx, pending->key,
+                                      pending->entry.key_size, drop_range_start,
+                                      drop_range_start_size, drop_range_end, drop_range_end_size);
             const int ttl_drop =
                 pending->entry.ttl > 0 &&
                 pending->entry.ttl <
@@ -16547,7 +16675,8 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
 
             int btree_result = tidesdb_sstable_write_from_heap_btree(
                 cf, new_sst, partition_heap, klog_bm, vlog_bm, bloom, NULL, is_largest_level,
-                range_start, range_start_size, range_end, range_end_size, c->oldest_unflushed_seq);
+                range_start, range_start_size, range_end, range_end_size, 0,
+                c->oldest_unflushed_seq);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -17719,7 +17848,7 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
             {
                 int btree_result = tidesdb_sstable_write_from_heap_btree(
                     cf, new_sst, heap, klog_bm, vlog_bm, bloom, NULL, reap_tombstones, range_start,
-                    range_start_size, range_end, range_end_size, c->oldest_unflushed_seq);
+                    range_start_size, range_end, range_end_size, 0, c->oldest_unflushed_seq);
                 block_manager_close(klog_bm);
                 block_manager_close(vlog_bm);
                 tidesdb_merge_heap_free(heap);
@@ -21412,6 +21541,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     atomic_init(&(*db)->next_txn_id, 1);
     atomic_init(&(*db)->global_seq, 1);
+    atomic_init(&(*db)->visible_seq, 0);
     atomic_init(&(*db)->num_open_sstables, 0);
 
     (*db)->commit_status = tidesdb_commit_status_create();
@@ -25263,8 +25393,13 @@ static int tidesdb_compact_range_internal(tidesdb_column_family_t *cf, const uin
         if (target_level < min_input_level) target_level = min_input_level;
     }
 
-    const int merge_result = tidesdb_targeted_merge(cf, inputs, input_count, min_input_level,
-                                                    max_input_level, target_level);
+    /* the merge fully covers [start_key, end_key) -- it collected every sstable overlapping that
+     * range, so only there is a key guaranteed to have all its versions in this merge and its
+     * tombstone safe to reap. boundary inputs overhang the range and their overhang keys are kept
+     * but never reaped. */
+    const int merge_result =
+        tidesdb_targeted_merge(cf, inputs, input_count, min_input_level, max_input_level,
+                               target_level, start_key, start_key_size, end_key, end_key_size);
     free(inputs);
 
     atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
@@ -25936,9 +26071,10 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, const tidesdb_isolation_leve
     else
     {
         /** REPEATABLE_READ, SNAPSHOT, SERIALIZABLE = consistent snapshot
-         *  we capture global_seq -- 1 to see only transactions committed before we started */
-        uint64_t current_seq = atomic_load_explicit(&db->global_seq, memory_order_acquire);
-        (*txn)->snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
+         *  we read visible_seq, the highest seq with no in-flight predecessor, so the snapshot can
+         *  never name a commit that is still applying -- such a commit is invisible to reads and
+         *  would otherwise also slip past the post-apply write-write scan */
+        (*txn)->snapshot_seq = atomic_load_explicit(&db->visible_seq, memory_order_acquire);
     }
 
     (*txn)->commit_seq = 0;
@@ -27154,8 +27290,7 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
     }
     else
     {
-        uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
-        txn->snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
+        txn->snapshot_seq = atomic_load_explicit(&txn->db->visible_seq, memory_order_acquire);
     }
 
     txn->commit_seq = 0;
@@ -27433,46 +27568,30 @@ static int tidesdb_txn_check_read_conflicts(const tidesdb_txn_t *txn)
     tidesdb_immutable_memtable_t **imm_refs = NULL;
     size_t imm_count = 0;
 
+    /* serializable also runs the post-apply write-write check, which already serializes any key it
+     * writes; re-validating such a key as a read here is redundant and turns a hot
+     * read-modify-write key into a livelock. repeatable_read has no write-write check, so it must
+     * validate every read. */
+    const int skip_written = (txn->isolation_level == TDB_ISOLATION_SERIALIZABLE);
+
     for (int r = 0; r < txn->read_set_count; r++)
     {
+        if (skip_written)
+        {
+            int in_write_set = 0;
+            for (int w = 0; w < txn->num_ops && !in_write_set; w++)
+            {
+                const tidesdb_txn_op_t *op = &txn->ops[w];
+                if (op->cf == txn->read_cfs[r] && op->key_size == txn->read_key_sizes[r] &&
+                    memcmp(op->key, txn->read_keys[r], op->key_size) == 0)
+                    in_write_set = 1;
+            }
+            if (in_write_set) continue;
+        }
+
         const int result = tidesdb_txn_check_key_conflict(txn, txn->read_cfs[r], txn->read_keys[r],
                                                           txn->read_key_sizes[r], txn->read_seqs[r],
                                                           &imm_refs, &imm_count, &last_cf);
-
-        if (result != TDB_SUCCESS)
-        {
-            if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
-            return result;
-        }
-    }
-
-    if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
-    return TDB_SUCCESS;
-}
-
-/**
- * tidesdb_txn_check_write_conflicts
- * check write-set for conflicts (snapshot isolation and higher)
- * @param txn transaction to check
- * @return TDB_SUCCESS if no conflicts, TDB_ERR_CONFLICT otherwise
- */
-static int tidesdb_txn_check_write_conflicts(const tidesdb_txn_t *txn)
-{
-    if (txn->isolation_level < TDB_ISOLATION_SNAPSHOT || txn->num_ops == 0)
-    {
-        return TDB_SUCCESS;
-    }
-
-    tidesdb_column_family_t *last_cf = NULL;
-    tidesdb_immutable_memtable_t **imm_refs = NULL;
-    size_t imm_count = 0;
-
-    for (int w = 0; w < txn->num_ops; w++)
-    {
-        const tidesdb_txn_op_t *op = &txn->ops[w];
-
-        const int result = tidesdb_txn_check_key_conflict(
-            txn, op->cf, op->key, op->key_size, txn->snapshot_seq, &imm_refs, &imm_count, &last_cf);
 
         if (result != TDB_SUCCESS)
         {
@@ -29082,16 +29201,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         return TDB_SUCCESS;
     }
 
-    /*** we skip all conflict checks for READ_UNCOMMITTED and READ_COMMITTED
-     **  read conflicts require REPEATABLE_READ+, write conflicts require SNAPSHOT+,
-     *   SSI conflicts require SERIALIZABLE -- none apply at lower isolation levels */
+    /*** we skip read and ssi checks for READ_UNCOMMITTED and READ_COMMITTED
+     **  read conflicts require REPEATABLE_READ+, ssi conflicts require SERIALIZABLE. write-write is
+     *   detected after apply below, so a concurrent committer's version is already on the chain
+     *   when we scan and cannot be missed by both of us. */
     int result;
     if (txn->isolation_level > TDB_ISOLATION_READ_COMMITTED)
     {
         result = tidesdb_txn_check_read_conflicts(txn);
-        if (result != TDB_SUCCESS) return result;
-
-        result = tidesdb_txn_check_write_conflicts(txn);
         if (result != TDB_SUCCESS) return result;
 
         result = tidesdb_txn_check_ssi_conflicts(txn);
@@ -29202,6 +29319,52 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             return result;
         }
 
+        /* apply-before-validate write-write detection, mirroring the per-cf path but over the
+         * shared chain with prefixed keys, run while writers are still held. a concurrent committer
+         * of the same key cannot be missed by both of us; on a conflict we flag our applied
+         * versions aborted so reads, flush and later scans skip them, then abort. */
+        if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+        {
+            int conflict = 0;
+            for (int op_idx = 0; op_idx < txn->num_ops && !conflict; op_idx++)
+            {
+                const tidesdb_txn_op_t *op = &txn->ops[op_idx];
+                if (!op->cf) continue;
+                uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
+                const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+                uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
+                if (!pk) continue;
+                const size_t pk_size =
+                    tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, pk);
+                if (skip_list_has_write_conflict(umt->skip_list, pk, pk_size, txn->snapshot_seq,
+                                                 txn->commit_seq))
+                    conflict = 1;
+                if (pk != pk_stack) free(pk);
+            }
+            if (conflict)
+            {
+                for (int op_idx = 0; op_idx < txn->num_ops; op_idx++)
+                {
+                    const tidesdb_txn_op_t *op = &txn->ops[op_idx];
+                    if (!op->cf) continue;
+                    uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
+                    const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
+                    uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
+                    if (!pk) continue;
+                    const size_t pk_size =
+                        tdb_build_prefixed_key(op->cf->unified_cf_index, op->key, op->key_size, pk);
+                    skip_list_mark_aborted(umt->skip_list, pk, pk_size, txn->commit_seq);
+                    if (pk != pk_stack) free(pk);
+                }
+                tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
+                                           TDB_COMMIT_STATUS_ABORTED);
+                tidesdb_visible_seq_advance(txn->db);
+                atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
+                atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
+                return TDB_ERR_CONFLICT;
+            }
+        }
+
         /* we check if unified memtable needs rotation */
         const size_t umt_size = (size_t)skip_list_get_size(umt->skip_list);
         atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
@@ -29247,6 +29410,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         atomic_thread_fence(memory_order_seq_cst);
         tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
                                    TDB_COMMIT_STATUS_COMMITTED);
+        tidesdb_visible_seq_advance(txn->db);
         tidesdb_txn_remove_from_active_list(txn);
 
         /* we invoke commit hooks */
@@ -29440,6 +29604,48 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
     }
 
+    /* apply-before-validate write-write detection, run while writers are still held so a flush
+     * cannot snapshot the memtable until our fate is sealed. our writes are on the version chains,
+     * so a concurrent committer that wrote the same key was either inserted before our scan (we see
+     * it and abort) or inserts after and sees us, never both. on a conflict we flag every applied
+     * version aborted so reads, flush and later scans skip it, then release refs via cleanup. */
+    if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+    {
+        int conflict = 0;
+        for (int op_idx = 0; op_idx < txn->num_ops && !conflict; op_idx++)
+        {
+            const tidesdb_txn_op_t *op = &txn->ops[op_idx];
+            if (!op->cf) continue;
+            for (int c = 0; c < txn->num_cfs; c++)
+            {
+                if (txn->cfs[c] != op->cf || !cf_skiplists[c]) continue;
+                if (skip_list_has_write_conflict(cf_skiplists[c], op->key, op->key_size,
+                                                 txn->snapshot_seq, txn->commit_seq))
+                    conflict = 1;
+                break;
+            }
+        }
+        if (conflict)
+        {
+            for (int op_idx = 0; op_idx < txn->num_ops; op_idx++)
+            {
+                const tidesdb_txn_op_t *op = &txn->ops[op_idx];
+                if (!op->cf) continue;
+                for (int c = 0; c < txn->num_cfs; c++)
+                {
+                    if (txn->cfs[c] != op->cf || !cf_skiplists[c]) continue;
+                    skip_list_mark_aborted(cf_skiplists[c], op->key, op->key_size, txn->commit_seq);
+                    break;
+                }
+            }
+            tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
+                                       TDB_COMMIT_STATUS_ABORTED);
+            tidesdb_visible_seq_advance(txn->db);
+            result = TDB_ERR_CONFLICT;
+            goto cleanup;
+        }
+    }
+
     /**** second pass is we release refs and trigger flushes. deferred from the first loop
      ***  because flush can block on backpressure and we don't want to hold refs
      **   to other CFs' memtables while waiting. */
@@ -29516,6 +29722,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     atomic_thread_fence(memory_order_seq_cst);
     tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
                                TDB_COMMIT_STATUS_COMMITTED);
+    tidesdb_visible_seq_advance(txn->db);
     tidesdb_txn_remove_from_active_list(txn);
 
     /*** we invoke commit hooks for each CF that has one registered
@@ -29779,6 +29986,17 @@ static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv)
     if (!seq_visible)
     {
         return 0; /* not visible due to isolation level */
+    }
+
+    /* an aborted version is invisible regardless of isolation -- the point-get path skips it via
+     * the skip-list flag, and the iterator path skips it here so the conflict loser never surfaces
+     */
+    tidesdb_t *db = iter->cf->db;
+    if (tidesdb_commit_status_is_aborted(
+            db->commit_status, kv->entry.seq,
+            atomic_load_explicit(&db->global_seq, memory_order_acquire)))
+    {
+        return 0;
     }
 
     /** we now check if it's a tombstone -- if visible tombstone, return -1 to signal
@@ -33577,6 +33795,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     if (global_max_seq >= current_seq)
     {
         atomic_store(&cf->db->global_seq, global_max_seq + 1);
+        atomic_store(&cf->db->visible_seq, global_max_seq);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' has updated global_seq from %" PRIu64 " to %" PRIu64,
                       cf->name, current_seq, global_max_seq + 1);
     }
@@ -33898,6 +34117,7 @@ static int tidesdb_unified_wal_recover(tidesdb_t *db)
         if (max_seq >= current_seq)
         {
             atomic_store_explicit(&db->global_seq, max_seq + 1, memory_order_release);
+            atomic_store_explicit(&db->visible_seq, max_seq, memory_order_release);
         }
     }
 

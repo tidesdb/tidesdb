@@ -2669,6 +2669,89 @@ int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, const size_t ke
     return 0;
 }
 
+/**
+ * skip_list_find_node
+ * locates the node holding an exact key. shared traversal for the conflict scan and the abort
+ * marker, mirroring the descent in skip_list_get_max_seq.
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @return the node for key, or NULL when the key is absent
+ */
+static skip_list_node_t *skip_list_find_node(skip_list_t *list, const uint8_t *key, size_t key_size)
+{
+    skip_list_node_t *current = atomic_load_explicit(&list->header, memory_order_acquire);
+    const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
+    const skip_list_cmp_type_t cmp_type = list->cmp_type;
+
+    for (int i = max_level; i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        while (next != NULL && !NODE_IS_SENTINEL(next))
+        {
+            if (skip_list_compare_keys_with_type(cmp_type, list, next->key, next->key_size, key,
+                                                 key_size) >= 0)
+                break;
+            current = next;
+            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        }
+    }
+
+    skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
+    if (target == NULL || NODE_IS_SENTINEL(target)) return NULL;
+    if (skip_list_compare_keys_with_type(cmp_type, list, target->key, target->key_size, key,
+                                         key_size) != 0)
+        return NULL;
+    return target;
+}
+
+int skip_list_has_write_conflict(skip_list_t *list, const uint8_t *key, const size_t key_size,
+                                 const uint64_t threshold_seq, const uint64_t exclude_seq)
+{
+    if (list == NULL || key == NULL || key_size == 0) return 0;
+
+    skip_list_node_t *target = skip_list_find_node(list, key, key_size);
+    if (target == NULL) return 0;
+
+    /* versions descend by seq, so stop once at or below the snapshot since every version past it is
+     * older still. the version at exclude_seq is the scanner's own freshly applied write, and an
+     * aborted version belongs to a transaction that already lost, so neither counts as a conflict.
+     */
+    for (skip_list_version_t *v = atomic_load_explicit(&target->versions, memory_order_acquire);
+         v != NULL; v = atomic_load_explicit(&v->next, memory_order_acquire))
+    {
+        const uint64_t seq = atomic_load_explicit(&v->seq, memory_order_acquire);
+        if (seq <= threshold_seq) break;
+        if (seq == exclude_seq) continue;
+        if (atomic_load_explicit(&v->flags, memory_order_acquire) & SKIP_LIST_FLAG_ABORTED)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+int skip_list_mark_aborted(skip_list_t *list, const uint8_t *key, const size_t key_size,
+                           const uint64_t seq)
+{
+    if (list == NULL || key == NULL || key_size == 0) return -1;
+
+    skip_list_node_t *target = skip_list_find_node(list, key, key_size);
+    if (target == NULL) return -1;
+
+    for (skip_list_version_t *v = atomic_load_explicit(&target->versions, memory_order_acquire);
+         v != NULL; v = atomic_load_explicit(&v->next, memory_order_acquire))
+    {
+        const uint64_t vseq = atomic_load_explicit(&v->seq, memory_order_acquire);
+        if (vseq == seq)
+        {
+            atomic_fetch_or_explicit(&v->flags, SKIP_LIST_FLAG_ABORTED, memory_order_release);
+            return 0;
+        }
+        if (vseq < seq) break;
+    }
+    return -1;
+}
+
 int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t key_size,
                            uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted,
                            uint64_t *seq, uint64_t snapshot_seq,
@@ -2721,6 +2804,9 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
 
     if (snapshot_seq == UINT64_MAX)
     {
+        /* an aborted version is invisible to every reader, so we descend to the first live one */
+        while (version != NULL && VERSION_IS_ABORTED(version))
+            version = atomic_load_explicit(&version->next, memory_order_acquire);
         if (version == NULL) return -1;
     }
     else
@@ -2731,6 +2817,11 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
          * version that passes both checks. */
         while (version != NULL)
         {
+            if (VERSION_IS_ABORTED(version))
+            {
+                version = atomic_load_explicit(&version->next, memory_order_acquire);
+                continue;
+            }
             uint64_t version_seq = atomic_load_explicit(&version->seq, memory_order_acquire);
 
             /* we check if version is within snapshot range */
@@ -2845,12 +2936,21 @@ int skip_list_get_with_seq_ref(skip_list_t *list, const uint8_t *key, const size
 
     if (snapshot_seq == UINT64_MAX)
     {
+        /* an aborted version belongs to a transaction that lost its conflict check and is invisible
+         * to every reader, so we descend to the first live version */
+        while (version != NULL && VERSION_IS_ABORTED(version))
+            version = atomic_load_explicit(&version->next, memory_order_acquire);
         if (version == NULL) return -1;
     }
     else
     {
         while (version != NULL)
         {
+            if (VERSION_IS_ABORTED(version))
+            {
+                version = atomic_load_explicit(&version->next, memory_order_acquire);
+                continue;
+            }
             uint64_t version_seq = atomic_load_explicit(&version->seq, memory_order_acquire);
 
             if (version_seq <= snapshot_seq)

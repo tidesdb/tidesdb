@@ -1359,6 +1359,16 @@ static int tidesdb_visibility_check_callback(void *opaque_ctx, const uint64_t se
 
     tidesdb_commit_status_t *cs = (tidesdb_commit_status_t *)opaque_ctx;
 
+    /* the ring only distinguishes the last cs->capacity sequence numbers. once a seq falls
+     * more than capacity behind the high-water mark its slot has been recycled by a newer
+     * seq, so the slot no longer describes it. a version reaches a reader only after its
+     * commit applied it to the skip list, and a seq that far back cannot still be in flight,
+     * so an evicted seq is committed -- the same assumption recovery makes when it backfills
+     * the trailing window. without this an old committed version reads its slot as the newer
+     * seq's in-progress status and falls through as a stale snapshot read */
+    const uint64_t max_seq = atomic_load_explicit(&cs->max_seq, memory_order_acquire);
+    if (max_seq >= cs->capacity && seq <= max_seq - cs->capacity) return 1;
+
     /* we map seq to circular buffer index */
     const size_t idx = seq % cs->capacity;
     uint8_t status = atomic_load_explicit(&cs->status[idx], memory_order_acquire);

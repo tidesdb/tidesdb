@@ -496,9 +496,16 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_NO_CF_SYNC_SLEEP_US                 100000
 
 /* object store retry constants */
-#define TDB_UPLOAD_MAX_RETRIES          3
-#define TDB_UPLOAD_INITIAL_BACKOFF_US   100000 /* 100ms */
-#define TDB_UPLOAD_BACKOFF_MULTIPLIER   4      /* 100ms -> 400ms -> 1600ms */
+#define TDB_UPLOAD_MAX_RETRIES        3
+#define TDB_UPLOAD_INITIAL_BACKOFF_US 100000 /* 100ms */
+#define TDB_UPLOAD_BACKOFF_MULTIPLIER 4      /* 100ms -> 400ms -> 1600ms */
+/* an upload that exhausts the fast inner retries above is parked in a backlog rather than dropped,
+ * and the reaper re-attempts it on a slow outer backoff so a multi-minute object store outage still
+ * delivers eventually instead of giving up after half a second */
+#define TDB_UPLOAD_DEFER_MAX            256 /* cap on parked uploads; over this the oldest is dropped */
+#define TDB_UPLOAD_DEFER_INITIAL_SEC    2  /* first outer-retry delay; doubles each miss */
+#define TDB_UPLOAD_DEFER_MAX_SEC        60 /* outer-retry backoff ceiling */
+#define TDB_UPLOAD_DEFER_MAX_SHIFT      6  /* clamp on the doubling exponent (2<<6 already > 60s) */
 #define TDB_DOWNLOAD_MAX_RETRIES        3
 #define TDB_DOWNLOAD_INITIAL_BACKOFF_US 50000 /* 50ms */
 #define TDB_DOWNLOAD_BACKOFF_MULTIPLIER 4     /* 50ms -> 200ms -> 800ms */
@@ -4864,6 +4871,8 @@ static void tdb_path_to_object_key(const tidesdb_t *db, const char *local_path, 
  * @param local_path local file path of the file to upload
  * @param object_key object store key derived from local_path
  * @param wal_generation WAL generation to fence after upload (0 = no fence)
+ * @param track_in_cache register the file with the local cache once the upload confirms (sstable
+ *        files stay untracked -- and therefore unevictable -- until they are safely remote)
  */
 typedef struct
 {
@@ -4872,7 +4881,296 @@ typedef struct
     uint64_t wal_generation;   /* WAL gen to fence after upload (0 = no fence) */
     uint64_t meta_epoch;       /* single-writer lease epoch to tag the object with (0 = untagged) */
     uint64_t upload_max_bytes; /* logical length to upload (0 = whole file) */
+    int track_in_cache;        /* 1 = cache-track local_path on success (sstable) */
 } tdb_upload_job_t;
+
+/**
+ * tdb_deferred_upload_t
+ * a parked upload that exhausted the fast inner retries, awaiting slow outer retry by the reaper
+ * @param job the original upload job (local_path, object_key, fence/epoch/size, track flag)
+ * @param outer_attempts number of slow retries already spent (drives the backoff)
+ * @param next_retry_sec earliest cached_current_time (seconds) at which to retry again
+ */
+typedef struct
+{
+    tdb_upload_job_t job;
+    unsigned int outer_attempts;
+    time_t next_retry_sec;
+} tdb_deferred_upload_t;
+
+/**
+ * tdb_objstore_put_once
+ * attempts a single upload and confirms it. an epoch-tagged or partial upload goes through put_if,
+ * anything else through a plain put, and the object is then verified to have landed at the size we
+ * expect.
+ * @param db database
+ * @param job upload job describing the object
+ * @return 0 if the object landed and verified, -1 otherwise
+ */
+static int tdb_objstore_put_once(tidesdb_t *db, const tdb_upload_job_t *job)
+{
+    int rc;
+    /* use put_if when the object is epoch-tagged (WAL fencing) or a partial upload is requested
+     * (active WAL's logical length, skipping its preallocated tail) -- both need put_if, which
+     * also works untagged (epoch 0). otherwise a plain put. */
+    if ((job->meta_epoch || job->upload_max_bytes) && db->object_store->put_if)
+        rc = db->object_store->put_if(db->object_store->ctx, job->object_key, job->local_path,
+                                      TDB_PUT_OVERWRITE, NULL, job->meta_epoch, NULL, 0,
+                                      (size_t)job->upload_max_bytes);
+    else
+        rc = db->object_store->put(db->object_store->ctx, job->object_key, job->local_path);
+    if (rc != 0) return -1;
+
+    /* verify the upload landed with the correct size. MANIFEST is skipped -- it is mutable and may
+     * grow between upload and the exists check due to concurrent flushes. */
+    if (!strstr(job->object_key, TDB_COLUMN_FAMILY_MANIFEST_NAME))
+    {
+        struct stat local_st;
+        if (stat(job->local_path, &local_st) == 0)
+        {
+            /* a partial WAL upload's remote size is the logical length, not the preallocated file
+             */
+            size_t expected =
+                job->upload_max_bytes ? (size_t)job->upload_max_bytes : (size_t)local_st.st_size;
+            size_t remote_size = 0;
+            const int verify =
+                db->object_store->exists(db->object_store->ctx, job->object_key, &remote_size);
+            if (verify != 1 || remote_size != expected)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Upload verification failed for %s (expected=%zu, remote=%zu, "
+                              "exists=%d)",
+                              job->object_key, expected, remote_size, verify);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
+ * tdb_objstore_cancel_deferred
+ * drop any parked retry whose object_key matches -- a fresh successful upload of a key retires a
+ * stale pending retry for it (e.g. a newer MANIFEST supersedes an older failed one).
+ * @param db database
+ * @param object_key key to cancel
+ */
+static void tdb_objstore_cancel_deferred(tidesdb_t *db, const char *object_key)
+{
+    pthread_mutex_lock(&db->pending_upload_lock);
+    tdb_deferred_upload_t *arr = db->pending_uploads;
+    for (size_t i = 0; i < db->pending_upload_count;)
+    {
+        if (strcmp(arr[i].job.object_key, object_key) == 0)
+            arr[i] = arr[--db->pending_upload_count]; /* swap-remove */
+        else
+            i++;
+    }
+    pthread_mutex_unlock(&db->pending_upload_lock);
+}
+
+/**
+ * tdb_objstore_on_upload_success
+ * runs the shared bookkeeping once an object has been delivered. it counts the upload, and for a
+ * rotated WAL advances the fence and deletes the now-redundant local copy. an sstable file stays
+ * untracked (and so unevictable) until it is proven remote, so it is registered with the local
+ * cache here. any retry still parked for the same key is cancelled.
+ * @param db database
+ * @param job the delivered upload job
+ */
+static void tdb_objstore_on_upload_success(tidesdb_t *db, const tdb_upload_job_t *job)
+{
+    atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
+
+    /* we advance the WAL fence if this upload advances it */
+    if (job->wal_generation > 0)
+    {
+        uint64_t cur = atomic_load_explicit(&db->last_uploaded_gen, memory_order_relaxed);
+        while (job->wal_generation > cur)
+        {
+            if (atomic_compare_exchange_weak_explicit(&db->last_uploaded_gen, &cur,
+                                                      job->wal_generation, memory_order_release,
+                                                      memory_order_relaxed))
+                break;
+        }
+        /* the rotated WAL is confirmed present (exists + size verify above), so the local copy is
+         * deleted here. recovery replays the WAL from the object store if the node restarts before
+         * the immutable has flushed. */
+        tdb_unlink(job->local_path);
+    }
+
+    /* an sstable file stayed untracked (and so unevictable) until it was safely remote -- track it
+     * now so the local cache can reclaim it */
+    if (job->track_in_cache && db->local_cache)
+        tdb_local_cache_track(db->local_cache, job->local_path);
+
+    tdb_objstore_cancel_deferred(db, job->object_key);
+}
+
+/**
+ * tdb_objstore_park_locked
+ * insert or replace a deferred entry for job->object_key. caller holds pending_upload_lock. dedups
+ * by key (a later attempt supersedes an earlier one), grows the backlog, and enforces the cap by
+ * dropping the oldest entry (its file persists locally for the next startup to re-upload).
+ * @param db database
+ * @param job upload job to park
+ * @param attempts outer retries already spent (drives the next backoff)
+ * @param next_retry_sec earliest time (seconds) to retry
+ */
+static void tdb_objstore_park_locked(tidesdb_t *db, const tdb_upload_job_t *job,
+                                     unsigned int attempts, time_t next_retry_sec)
+{
+    tdb_deferred_upload_t *arr = db->pending_uploads;
+    for (size_t i = 0; i < db->pending_upload_count; i++)
+    {
+        if (strcmp(arr[i].job.object_key, job->object_key) == 0)
+        {
+            arr[i].job = *job;
+            arr[i].outer_attempts = attempts;
+            arr[i].next_retry_sec = next_retry_sec;
+            return;
+        }
+    }
+
+    if (db->pending_upload_count == db->pending_upload_capacity)
+    {
+        size_t new_cap = db->pending_upload_capacity ? db->pending_upload_capacity * 2 : 16;
+        if (new_cap > TDB_UPLOAD_DEFER_MAX) new_cap = TDB_UPLOAD_DEFER_MAX;
+        if (new_cap > db->pending_upload_capacity)
+        {
+            tdb_deferred_upload_t *grown = realloc(arr, new_cap * sizeof(*grown));
+            if (grown)
+            {
+                db->pending_uploads = arr = grown;
+                db->pending_upload_capacity = new_cap;
+            }
+        }
+    }
+
+    if (db->pending_upload_count == db->pending_upload_capacity)
+    {
+        if (db->pending_upload_count == 0) return; /* cap pinned at 0 -- nothing to park into */
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Deferred-upload backlog full (%d) dropping oldest to park %s",
+                      TDB_UPLOAD_DEFER_MAX, job->object_key);
+        memmove(&arr[0], &arr[1], (db->pending_upload_count - 1) * sizeof(*arr));
+        db->pending_upload_count--;
+    }
+
+    arr[db->pending_upload_count].job = *job;
+    arr[db->pending_upload_count].outer_attempts = attempts;
+    arr[db->pending_upload_count].next_retry_sec = next_retry_sec;
+    db->pending_upload_count++;
+}
+
+/**
+ * tdb_objstore_defer_upload
+ * park an upload that exhausted its fast inner retries for slow outer retry by the reaper.
+ * @param db database
+ * @param job upload job to park
+ */
+static void tdb_objstore_defer_upload(tidesdb_t *db, const tdb_upload_job_t *job)
+{
+    const time_t now = atomic_load_explicit(&db->cached_current_time, memory_order_relaxed);
+    pthread_mutex_lock(&db->pending_upload_lock);
+    tdb_objstore_park_locked(db, job, 0, now + TDB_UPLOAD_DEFER_INITIAL_SEC);
+    pthread_mutex_unlock(&db->pending_upload_lock);
+}
+
+/**
+ * tdb_objstore_retry_deferred
+ * the reaper's sweep over the deferred-upload backlog. it re-attempts each parked upload whose
+ * backoff has elapsed. a vanished local file (compaction replaced the sstable, a rotation deleted
+ * the WAL) is dropped without counting a failure, since its data is durable elsewhere. a delivered
+ * upload runs the shared success bookkeeping, while a still-failing one is re-parked with a longer,
+ * capped backoff. the network put runs with the lock released so writers can keep parking failures
+ * meanwhile.
+ * @param db database
+ */
+static void tdb_objstore_retry_deferred(tidesdb_t *db)
+{
+    if (!db->object_store || !db->object_store->put) return;
+    const time_t now = atomic_load_explicit(&db->cached_current_time, memory_order_relaxed);
+
+    while (1)
+    {
+        tdb_upload_job_t job;
+        unsigned int attempts = 0;
+        int found = 0;
+
+        pthread_mutex_lock(&db->pending_upload_lock);
+        tdb_deferred_upload_t *arr = db->pending_uploads;
+        for (size_t i = 0; i < db->pending_upload_count; i++)
+        {
+            if (arr[i].next_retry_sec <= now)
+            {
+                job = arr[i].job;
+                attempts = arr[i].outer_attempts;
+                arr[i] =
+                    arr[--db->pending_upload_count]; /* swap-remove; re-parked below on failure */
+                found = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&db->pending_upload_lock);
+        if (!found) break;
+
+        struct stat st;
+        if (stat(job.local_path, &st) != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Deferred upload local file gone dropping %s",
+                          job.object_key);
+            continue;
+        }
+
+        if (tdb_objstore_put_once(db, &job) == 0)
+        {
+            tdb_objstore_on_upload_success(db, &job);
+            continue;
+        }
+
+        /* still failing -- re-park with a doubled, capped outer backoff */
+        unsigned int next_attempts = attempts + 1;
+        unsigned int shift =
+            next_attempts < TDB_UPLOAD_DEFER_MAX_SHIFT ? next_attempts : TDB_UPLOAD_DEFER_MAX_SHIFT;
+        time_t delay = (time_t)TDB_UPLOAD_DEFER_INITIAL_SEC << shift;
+        if (delay > TDB_UPLOAD_DEFER_MAX_SEC) delay = TDB_UPLOAD_DEFER_MAX_SEC;
+
+        pthread_mutex_lock(&db->pending_upload_lock);
+        tdb_objstore_park_locked(db, &job, next_attempts, now + delay);
+        pthread_mutex_unlock(&db->pending_upload_lock);
+    }
+}
+
+/**
+ * tdb_objstore_drain_deferred
+ * one final pass over the deferred backlog at close (reaper stopped, workers joined -- single
+ * threaded), then free it. anything still undelivered persists on local disk for the next startup.
+ * @param db database
+ */
+static void tdb_objstore_drain_deferred(tidesdb_t *db)
+{
+    pthread_mutex_lock(&db->pending_upload_lock);
+    tdb_deferred_upload_t *arr = db->pending_uploads;
+    size_t n = db->pending_upload_count;
+    db->pending_uploads = NULL; /* detach so on_upload_success -> cancel is a noop while draining */
+    db->pending_upload_count = 0;
+    db->pending_upload_capacity = 0;
+    pthread_mutex_unlock(&db->pending_upload_lock);
+
+    for (size_t i = 0; i < n; i++)
+    {
+        struct stat st;
+        if (db->object_store && db->object_store->put && stat(arr[i].job.local_path, &st) == 0 &&
+            tdb_objstore_put_once(db, &arr[i].job) == 0)
+        {
+            tdb_objstore_on_upload_success(db, &arr[i].job);
+            continue;
+        }
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Deferred upload undelivered at close persists locally %s",
+                      arr[i].job.object_key);
+    }
+    free(arr);
+}
 
 /**
  * tdb_upload_worker_thread
@@ -4895,51 +5193,10 @@ static void *tdb_upload_worker_thread(void *arg)
             unsigned int backoff_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
             for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
             {
-                /* use put_if when the object is epoch-tagged (WAL fencing) or a partial upload is
-                 * requested (active WAL's logical length, skipping its preallocated tail) -- both
-                 * need put_if, which also works untagged (epoch 0). otherwise a plain put. */
-                if ((job->meta_epoch || job->upload_max_bytes) && db->object_store->put_if)
-                    rc = db->object_store->put_if(
-                        db->object_store->ctx, job->object_key, job->local_path, TDB_PUT_OVERWRITE,
-                        NULL, job->meta_epoch, NULL, 0, (size_t)job->upload_max_bytes);
-                else
-                    rc = db->object_store->put(db->object_store->ctx, job->object_key,
-                                               job->local_path);
-                if (rc != 0)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload attempt %d/%d failed: %s", attempt + 1,
-                                  TDB_UPLOAD_MAX_RETRIES, job->object_key);
-                }
-                else if (!strstr(job->object_key, TDB_COLUMN_FAMILY_MANIFEST_NAME))
-                {
-                    /* verify the upload landed with the correct size. MANIFEST is skipped --
-                     * it is mutable and may grow between upload and the exists check due to
-                     * concurrent flushes. a verify mismatch now retries the put (rc=-1 below)
-                     * instead of being a permanent failure with no re-upload. */
-                    struct stat local_st;
-                    if (stat(job->local_path, &local_st) == 0)
-                    {
-                        /* a partial WAL upload's remote size is the logical length, not the
-                         * preallocated local file size */
-                        size_t expected = job->upload_max_bytes ? (size_t)job->upload_max_bytes
-                                                                : (size_t)local_st.st_size;
-                        size_t remote_size = 0;
-                        const int verify = db->object_store->exists(db->object_store->ctx,
-                                                                    job->object_key, &remote_size);
-                        if (verify != 1 || remote_size != expected)
-                        {
-                            TDB_DEBUG_LOG(
-                                TDB_LOG_ERROR,
-                                "Upload verification failed for %s (expected=%zu, remote=%zu, "
-                                "exists=%d)",
-                                job->object_key, expected, remote_size, verify);
-                            rc = -1;
-                        }
-                    }
-                }
-
+                rc = tdb_objstore_put_once(db, job);
                 if (rc == 0) break;
-
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload attempt %d/%d failed: %s", attempt + 1,
+                              TDB_UPLOAD_MAX_RETRIES, job->object_key);
                 if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES)
                 {
                     usleep(backoff_us);
@@ -4949,35 +5206,27 @@ static void *tdb_upload_worker_thread(void *arg)
 
             if (rc == 0)
             {
-                atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
-
-                /* we update WAL fence if this upload advances it */
-                if (job->wal_generation > 0)
-                {
-                    uint64_t cur =
-                        atomic_load_explicit(&db->last_uploaded_gen, memory_order_relaxed);
-                    while (job->wal_generation > cur)
-                    {
-                        if (atomic_compare_exchange_weak_explicit(
-                                &db->last_uploaded_gen, &cur, job->wal_generation,
-                                memory_order_release, memory_order_relaxed))
-                            break;
-                    }
-
-                    /* the rotated WAL is now confirmed present on the object
-                     * store (the exists + size verify above proved it), so the
-                     * upload worker deletes the local copy here. this replaces
-                     * the reaper's old synchronous per-generation exists() sweep.
-                     * recovery can replay the WAL from the object store if the
-                     * node restarts before the immutable has flushed. */
-                    tdb_unlink(job->local_path);
-                }
+                tdb_objstore_on_upload_success(db, job);
             }
             else
             {
                 atomic_fetch_add_explicit(&db->total_upload_failures, 1, memory_order_relaxed);
-                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Upload permanently failed after %d attempts: %s",
-                              TDB_UPLOAD_MAX_RETRIES, job->object_key);
+                /* an active-WAL snapshot (generation 0, partial length) is re-shipped to the same
+                 * key every sync interval, so the periodic resync is its own retry and parking it
+                 * would only risk a stale shorter snapshot overwriting a newer one. everything else
+                 * is parked for the reaper so a longer object store outage still delivers instead
+                 * of dropping the upload here. */
+                if (job->wal_generation == 0 && job->upload_max_bytes > 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "WAL snapshot upload failed after %d attempts %s",
+                                  TDB_UPLOAD_MAX_RETRIES, job->object_key);
+                }
+                else
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "Upload failed after %d attempts parking %s",
+                                  TDB_UPLOAD_MAX_RETRIES, job->object_key);
+                    tdb_objstore_defer_upload(db, job);
+                }
             }
         }
 
@@ -5010,6 +5259,8 @@ static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_p
     job->wal_generation = wal_generation;
     job->meta_epoch = meta_epoch;
     job->upload_max_bytes = max_bytes;
+    job->track_in_cache =
+        0; /* async path serves WAL/manifest/config, never sstable cache tracking */
 
     if (queue_enqueue(db->upload_queue, job) != 0)
     {
@@ -5019,86 +5270,102 @@ static void tdb_objstore_enqueue_upload(const tidesdb_t *db, const char *local_p
 }
 
 /**
- * tdb_objstore_upload_file_sync
- * upload a local file synchronously (blocks until complete).
- * used for small metadata files (config.ini, MANIFEST) that must be
- * visible immediately after the call returns.
- * @param db database instance
- * @param local_path local file path to upload
+ * tdb_objstore_upload_job_sync
+ * the synchronous sibling of the async worker. it runs the same fast inner retries and, on success,
+ * the shared bookkeeping. on failure it parks the job for the reaper's slow outer retry when
+ * defer_on_fail is set, and otherwise only records the failure for a caller that retries by other
+ * means (an active WAL snapshot is re-shipped every sync interval, so it needs no parking).
+ * @param db database
+ * @param job upload job describing the object
+ * @param defer_on_fail park the job for deferred retry once the inner retries are exhausted
+ * @return 0 on success, -1 otherwise
  */
-static void tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path)
+static int tdb_objstore_upload_job_sync(tidesdb_t *db, const tdb_upload_job_t *job,
+                                        int defer_on_fail)
 {
-    if (!db->object_store || !local_path) return;
-    char key[TDB_MAX_PATH_LEN];
-    tdb_path_to_object_key(db, local_path, key, sizeof(key));
-
-    /* we retry with exponential backoff matching the async upload worker. the upload counters
-     * cover both paths, so the sync sstable/config/wal uploads count alongside the async
-     * manifest/wal ones. */
     unsigned int delay_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
     for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
     {
-        if (db->object_store->put(db->object_store->ctx, key, local_path) == 0)
+        if (tdb_objstore_put_once(db, job) == 0)
         {
-            atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
-            return;
+            tdb_objstore_on_upload_success(db, job);
+            return 0;
         }
-
         TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync upload attempt %d/%d failed: %s",
-                      attempt + 1, TDB_UPLOAD_MAX_RETRIES, key);
+                      attempt + 1, TDB_UPLOAD_MAX_RETRIES, job->object_key);
         if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES) usleep(delay_us);
         delay_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
     }
+
     atomic_fetch_add_explicit(&db->total_upload_failures, 1, memory_order_relaxed);
-    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync upload failed after %d attempts: %s",
-                  TDB_UPLOAD_MAX_RETRIES, key);
+    if (defer_on_fail)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync upload failed after %d attempts parking %s",
+                      TDB_UPLOAD_MAX_RETRIES, job->object_key);
+        tdb_objstore_defer_upload(db, job);
+    }
+    else
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync upload failed after %d attempts %s",
+                      TDB_UPLOAD_MAX_RETRIES, job->object_key);
+    }
+    return -1;
+}
+
+/**
+ * tdb_objstore_upload_file_sync
+ * upload a local file synchronously, blocking until it lands. used for the small metadata files
+ * (config.ini, MANIFEST, the cf-index map) and for sstable data files, which must be on the store
+ * before the local cache is allowed to evict them. a failed upload is parked for deferred retry.
+ * @param db database
+ * @param local_path local file path to upload
+ * @param track_in_cache register the file with the local cache once it is confirmed remote
+ * (sstable)
+ * @return 0 on success, -1 otherwise
+ */
+static int tdb_objstore_upload_file_sync(tidesdb_t *db, const char *local_path, int track_in_cache)
+{
+    if (!db->object_store || !local_path) return -1;
+
+    tdb_upload_job_t job;
+    snprintf(job.local_path, sizeof(job.local_path), "%s", local_path);
+    tdb_path_to_object_key(db, local_path, job.object_key, sizeof(job.object_key));
+    job.wal_generation = 0;
+    job.meta_epoch = 0;
+    job.upload_max_bytes = 0;
+    job.track_in_cache = track_in_cache;
+    return tdb_objstore_upload_job_sync(db, &job, 1);
 }
 
 /**
  * tdb_objstore_upload_wal_sync
- * synchronous WAL upload that tags the object with the current lease epoch so a replica can
- * skip a superseded primary's segments. falls back to the plain sync upload when fencing is off.
- * @param db database instance
+ * synchronous WAL upload that tags the object with the current lease epoch so a replica can skip a
+ * superseded primary's segments. a rotated WAL (wal_generation > 0) advances the upload fence and
+ * has its local copy deleted on success, and is parked for deferred retry on failure. an active-WAL
+ * snapshot (generation 0, partial length) is re-shipped every sync interval, so it is not parked.
+ * put_once routes through put_if whenever the connector has it so the snapshot honors max_bytes and
+ * ships the WAL's logical length rather than its preallocated extent.
+ * @param db database
  * @param local_path WAL file path to upload
  * @param max_bytes logical WAL length to upload (0 = whole file); the active WAL is preallocated
  *                  far past its data, so shipping the whole file would copy a huge zero tail
+ * @param wal_generation rotated-WAL generation to fence on success (0 = active WAL, no fence)
+ * @return 0 on success, -1 otherwise
  */
-static void tdb_objstore_upload_wal_sync(tidesdb_t *db, const char *local_path, uint64_t max_bytes)
+static int tdb_objstore_upload_wal_sync(tidesdb_t *db, const char *local_path, uint64_t max_bytes,
+                                        uint64_t wal_generation)
 {
-    if (!db->object_store || !local_path) return;
+    if (!db->object_store || !local_path) return -1;
 
-    /* route through put_if whenever the connector has it, even before a lease is held (epoch 0):
-     * it is the only upload that honors max_bytes, so it ships the active WAL's logical length
-     * rather than its 64MB preallocated extent. an untagged (epoch 0) WAL is fine -- a reader
-     * treats epoch 0 as never-stale. only a legacy connector lacking put_if falls back. */
-    if (!db->object_store->put_if)
-    {
-        tdb_objstore_upload_file_sync(db, local_path);
-        return;
-    }
+    tdb_upload_job_t job;
+    snprintf(job.local_path, sizeof(job.local_path), "%s", local_path);
+    tdb_path_to_object_key(db, local_path, job.object_key, sizeof(job.object_key));
+    job.wal_generation = wal_generation;
+    job.meta_epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
+    job.upload_max_bytes = max_bytes;
+    job.track_in_cache = 0;
 
-    uint64_t epoch = atomic_load_explicit(&db->primary_epoch, memory_order_acquire);
-
-    char key[TDB_MAX_PATH_LEN];
-    tdb_path_to_object_key(db, local_path, key, sizeof(key));
-
-    unsigned int delay_us = TDB_UPLOAD_INITIAL_BACKOFF_US;
-    for (int attempt = 0; attempt < TDB_UPLOAD_MAX_RETRIES; attempt++)
-    {
-        if (db->object_store->put_if(db->object_store->ctx, key, local_path, TDB_PUT_OVERWRITE,
-                                     NULL, epoch, NULL, 0, (size_t)max_bytes) == 0)
-        {
-            atomic_fetch_add_explicit(&db->total_uploads, 1, memory_order_relaxed);
-            return;
-        }
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "Object store sync WAL upload attempt %d/%d failed: %s",
-                      attempt + 1, TDB_UPLOAD_MAX_RETRIES, key);
-        if (attempt + 1 < TDB_UPLOAD_MAX_RETRIES) usleep(delay_us);
-        delay_us *= TDB_UPLOAD_BACKOFF_MULTIPLIER;
-    }
-    atomic_fetch_add_explicit(&db->total_upload_failures, 1, memory_order_relaxed);
-    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Object store sync WAL upload failed after %d attempts: %s",
-                  TDB_UPLOAD_MAX_RETRIES, key);
+    return tdb_objstore_upload_job_sync(db, &job, wal_generation > 0);
 }
 
 /**
@@ -5120,7 +5387,7 @@ static void tdb_objstore_upload_file(tidesdb_t *db, const char *local_path)
     }
 
     /* we fallback to synchronous upload (retries and counts via the sync helper) */
-    tdb_objstore_upload_file_sync(db, local_path);
+    tdb_objstore_upload_file_sync(db, local_path, 0);
 }
 
 /**
@@ -5422,7 +5689,7 @@ static int tdb_objstore_fencing_enabled(const tidesdb_t *db)
 }
 
 /* tdb_objstore_verify_conditional_writes
- * probe whether the backend actually enforces conditional puts: a create-only put on a fresh
+ * probe whether the backend actually enforces conditional puts, a create-only put on a fresh
  * key must succeed and an immediate second create-only on the same key must fail the
  * precondition. a store that ignores If-None-Match returns success twice, so fencing would be
  * false safety -- callers disable it in that case. uses a node-unique key to avoid cross-node
@@ -10535,21 +10802,22 @@ static int64_t tidesdb_sstable_aux_memory_bytes(const tidesdb_sstable_t *sst)
  */
 static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *sst)
 {
-    /* we upload sstable files synchronously before tracking in the local cache.
-     * this ensures the object store has a copy before cache eviction can delete
-     * the local file (the eviction path unlinks cold files from disk).
-     * a replica never creates sstables -- its adds come from sync/cold-start and
-     * already exist remotely, so re-uploading wastes bandwidth and, on an incomplete
-     * local copy, could clobber good remote data. it can also always re-fetch on
-     * eviction, so only primaries push to the store. */
+    /* a primary uploads each sstable file synchronously and only marks it cache-trackable -- and
+     * so evictable -- once the upload confirms, since the eviction path unlinks cold files from
+     * disk and must never reclaim a file that is not yet on the store. an upload that exhausts the
+     * fast retries is parked for deferred retry and the file stays untracked (pinned on disk) until
+     * the reaper delivers it. a replica never creates sstables -- its adds come from
+     * sync/cold-start and already exist remotely, so it tracks them for eviction directly and can
+     * re-fetch on a miss, never pushing to the store (re-uploading an incomplete local copy could
+     * clobber good remote data). */
     if (sst->db && sst->db->object_store)
     {
         if (!atomic_load_explicit(&sst->db->replica_mode, memory_order_acquire))
         {
-            tdb_objstore_upload_file_sync(sst->db, sst->klog_path);
-            tdb_objstore_upload_file_sync(sst->db, sst->vlog_path);
+            tdb_objstore_upload_file_sync(sst->db, sst->klog_path, 1);
+            tdb_objstore_upload_file_sync(sst->db, sst->vlog_path, 1);
         }
-        if (sst->db->local_cache)
+        else if (sst->db->local_cache)
         {
             tdb_local_cache_track(sst->db->local_cache, sst->klog_path);
             tdb_local_cache_track(sst->db->local_cache, sst->vlog_path);
@@ -20404,6 +20672,10 @@ static void *tidesdb_reaper_thread(void *arg)
             }
         }
 
+        /* re-attempt any uploads parked by a failed put, now that some time has passed and the
+         * object store may have recovered */
+        tdb_objstore_retry_deferred(db);
+
         int current_open = atomic_load(&db->num_open_sstables);
         int max_open = (int)db->config.max_open_sstables;
         /* evict down to the reader budget, not max_open, keeping num_open at/below the budget
@@ -21745,6 +22017,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
 
     pthread_mutex_init(&(*db)->reaper_thread_mutex, NULL);
+    /* deferred-upload backlog -- initialized unconditionally so close can always destroy it,
+     * even for non-object-store databases that never populate it */
+    (*db)->pending_uploads = NULL;
+    (*db)->pending_upload_count = 0;
+    (*db)->pending_upload_capacity = 0;
+    pthread_mutex_init(&(*db)->pending_upload_lock, NULL);
 #if defined(__linux__)
     {
         pthread_condattr_t cattr;
@@ -22265,10 +22543,16 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->upload_queue);
         db->upload_queue = NULL;
 
+        /* one best-effort pass over the deferred backlog -- the reaper is already stopped and the
+         * workers are joined, so this is single-threaded. anything still undelivered persists on
+         * local disk for the next startup to re-upload */
+        tdb_objstore_drain_deferred(db);
+
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Upload pipeline stopped (%" PRIu64 " uploads, %" PRIu64 " failures)",
                       atomic_load(&db->total_uploads), atomic_load(&db->total_upload_failures));
     }
+    pthread_mutex_destroy(&db->pending_upload_lock);
 
     /* we clean up unified memtable state if enabled */
     if (db->unified_mt.enabled)
@@ -22601,7 +22885,7 @@ static int tidesdb_unimap_persist(tidesdb_t *db)
      * MANIFEST so replicas reconstruct cf indexes the same way the primary did */
     if (db->object_store)
     {
-        tdb_objstore_upload_file_sync(db, final_path);
+        tdb_objstore_upload_file_sync(db, final_path, 0);
     }
 
     return TDB_SUCCESS;
@@ -23450,14 +23734,14 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     /* we upload config.ini to object store (sync -- small file, must be visible immediately) */
     if (db->object_store && save_result == TDB_SUCCESS)
     {
-        tdb_objstore_upload_file_sync(db, config_path);
+        tdb_objstore_upload_file_sync(db, config_path, 0);
 
         /* commit + upload the empty MANIFEST so replicas can discover this CF
          * before its first flush -- discovery keys off <cf>/MANIFEST */
         if (tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
                                     cf->config.sync_mode != TDB_SYNC_NONE) == 0)
         {
-            tdb_objstore_upload_file_sync(db, cf->manifest->path);
+            tdb_objstore_upload_file_sync(db, cf->manifest->path, 0);
         }
     }
 
@@ -28159,11 +28443,13 @@ static void tidesdb_unified_close_wal(tidesdb_t *db, tidesdb_memtable_t *umt_imm
     {
         if (db->config.object_store_config->wal_upload_sync)
         {
-            /* the WAL was closed above, so it is already trimmed to its data -- ship the whole
-             * file */
-            tdb_objstore_upload_wal_sync(db, wal_path, 0);
-            tdb_unlink(wal_path);
-            tdb_sync_directory(db->db_path);
+            /* the WAL was closed above and is trimmed to its data, so the whole file ships. on
+             * success the upload helper advances the fence and deletes the local copy, so the
+             * directory sync just persists that deletion. on failure the WAL is parked for the
+             * reaper and the local file is kept for that retry and for recovery to replay if we
+             * restart first. */
+            if (tdb_objstore_upload_wal_sync(db, wal_path, 0, imm_gen) == 0)
+                tdb_sync_directory(db->db_path);
         }
         else
         {
@@ -28914,7 +29200,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         {
             uint64_t wal_len = 0;
             block_manager_get_size(umt->wal, &wal_len);
-            tdb_objstore_upload_wal_sync(txn->db, umt->wal->file_path, wal_len);
+            tdb_objstore_upload_wal_sync(txn->db, umt->wal->file_path, wal_len, 0);
         }
 
         /* we apply ops to unified skip list with prefixed keys */

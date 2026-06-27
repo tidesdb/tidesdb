@@ -958,8 +958,15 @@ struct tidesdb_t
     _Atomic(uint64_t) last_uploaded_gen;     /* highest WAL gen confirmed uploaded */
     _Atomic(uint64_t) total_uploads;         /* lifetime upload count */
     _Atomic(uint64_t) total_upload_failures; /* lifetime failed upload count */
-    _Atomic(uint64_t) last_wal_sync_size;    /* WAL file size at last object store sync;
-                                              * _Atomic -- reaper writes it, open seeds it */
+    /* uploads that exhausted the fast inner retries are parked here and re-attempted by the reaper
+     * on a slow outer backoff so a long object store outage still delivers eventually. the backlog
+     * is a dynamic array of tdb_deferred_upload_t guarded by pending_upload_lock */
+    void *pending_uploads; /* tdb_deferred_upload_t[], void* to avoid a fwd decl */
+    size_t pending_upload_count;
+    size_t pending_upload_capacity;
+    pthread_mutex_t pending_upload_lock;
+    _Atomic(uint64_t) last_wal_sync_size; /* WAL file size at last object store sync;
+                                           * _Atomic -- reaper writes it, open seeds it */
 
     /* replica mode runtime state */
     _Atomic(int) replica_mode;               /* 1 = read-only replica, 0 = primary */

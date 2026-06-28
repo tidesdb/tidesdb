@@ -30441,7 +30441,10 @@ typedef struct
     tidesdb_column_family_t *cf;
     int isolation;
     int id;
-    _Atomic(uint64_t) *commits; /* per-key successful-commit counts */
+    /* per-thread per-key successful-commit counts. each worker owns its own arg, so these need
+       no atomics or sharing; the main thread sums them across workers after join. avoids a shared
+       atomic counter, which is the only thing this test would need one for. */
+    uint64_t commits[LOSTUPD_KEYS];
 } lostupd_arg_t;
 
 /* tiny per-thread xorshift so the test needs no posix rand_r (absent on msvc); the seed is
@@ -30489,7 +30492,7 @@ static void *lostupd_increment_worker(void *arg)
 
             if (rc == 0)
             {
-                atomic_fetch_add(&a->commits[k], 1);
+                a->commits[k]++; /* thread-private, no atomics needed */
                 break;
             }
             if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_BUSY) break;
@@ -30519,20 +30522,17 @@ static void test_concurrent_increment_no_lost_update(void)
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ctr_cf");
         ASSERT_TRUE(cf != NULL);
 
-        _Atomic(uint64_t) commits[LOSTUPD_KEYS];
-        for (int k = 0; k < LOSTUPD_KEYS; k++) atomic_init(&commits[k], 0);
-
         pthread_t threads[LOSTUPD_THREADS];
         lostupd_arg_t args[LOSTUPD_THREADS];
         for (int t = 0; t < LOSTUPD_THREADS; t++)
         {
-            args[t] = (lostupd_arg_t){
-                .db = db, .cf = cf, .isolation = isos[ii], .id = t, .commits = commits};
+            args[t] = (lostupd_arg_t){.db = db, .cf = cf, .isolation = isos[ii], .id = t};
             pthread_create(&threads[t], NULL, lostupd_increment_worker, &args[t]);
         }
         for (int t = 0; t < LOSTUPD_THREADS; t++) pthread_join(threads[t], NULL);
 
-        /* each counter must equal the commits it received -- no lost update */
+        /* each counter must equal the commits it received summed across workers -- no lost update
+         */
         for (int k = 0; k < LOSTUPD_KEYS; k++)
         {
             uint8_t key[16];
@@ -30546,7 +30546,10 @@ static void test_concurrent_increment_no_lost_update(void)
                 for (int i = 0; i < 8; i++) v = (v << 8) | val[i];
             free(val);
             tidesdb_txn_free(txn);
-            ASSERT_EQ(v, atomic_load(&commits[k]));
+
+            uint64_t committed = 0;
+            for (int t = 0; t < LOSTUPD_THREADS; t++) committed += args[t].commits[k];
+            ASSERT_EQ(v, committed);
         }
 
         ASSERT_EQ(tidesdb_close(db), 0);

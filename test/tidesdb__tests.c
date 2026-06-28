@@ -30422,14 +30422,26 @@ typedef struct
     _Atomic(uint64_t) *commits; /* per-key successful-commit counts */
 } lostupd_arg_t;
 
+/* tiny per-thread xorshift so the test needs no posix rand_r (absent on msvc); the seed is
+ * always non-zero because id*odd + 1 cannot be zero for any thread id in range */
+static inline uint32_t lostupd_rand(uint32_t *s)
+{
+    uint32_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *s = x;
+    return x;
+}
+
 static void *lostupd_increment_worker(void *arg)
 {
     lostupd_arg_t *a = arg;
-    unsigned seed = (unsigned)(a->id * 2654435761u + 1u);
+    uint32_t seed = (uint32_t)(a->id * 2654435761u + 1u);
 
     for (int n = 0; n < LOSTUPD_OPS; n++)
     {
-        const int k = rand_r(&seed) % LOSTUPD_KEYS;
+        const int k = (int)(lostupd_rand(&seed) % LOSTUPD_KEYS);
         uint8_t key[16];
         const int klen = snprintf((char *)key, sizeof(key), "ctr:%d", k);
 

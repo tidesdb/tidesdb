@@ -22206,14 +22206,20 @@ static void test_range_cost_no_block_indexes(void)
 
     ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
 
+    /* settle to a stable layout before probing. a 4 KB write buffer produces several L1
+       sstables, and a background compaction running between the wide and narrow range_cost()
+       calls would change the overlapping-source count and make the two estimates incomparable
+       -- the cause of an intermittent narrow_cost > wide_cost. A full compaction reaches a
+       settled layout that no longer trips the file-count or capacity triggers, so both probes
+       below see the same sstables. */
+    tidesdb_compact(cf);
     int wait_count = 0;
-    while (tidesdb_is_flushing(cf) && wait_count < 100)
+    while ((tidesdb_is_flushing(cf) || tidesdb_is_compacting(cf)) && wait_count < 500)
     {
         usleep(10000);
         wait_count++;
     }
 
-    /* verify sstables exist */
     tidesdb_stats_t *stats = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
     int total_sstables = 0;

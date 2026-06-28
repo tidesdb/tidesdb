@@ -17484,7 +17484,7 @@ static void test_unlimited_max_open_no_eviction(void)
 {
     cleanup_test_dir();
 
-    /* max_open_sstables = 0 means unlimited: the reaper must never evict for budget and a reader
+    /* max_open_sstables = 0 means unlimited, the reaper must never evict for budget and a reader
      * must never back off with TDB_ERR_BUSY. this also guards the sentinel itself -- if 0 were
      * treated as a literal budget of zero the reader gate would reject every open and every read
      * would return BUSY. */
@@ -17534,7 +17534,7 @@ static void test_unlimited_max_open_no_eviction(void)
     }
     usleep(200000); /* give the reaper ample time -- under unlimited it must not evict */
 
-    /* every read uses a plain get (no retry): unlimited means no fd-budget backoff, so each read
+    /* every read uses a plain get (no retry), unlimited means no fd-budget backoff, so each read
      * resolves directly with no TDB_ERR_BUSY */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
@@ -24288,7 +24288,7 @@ static void *mcf_atom_compactor_thread(void *arg)
 }
 
 /* a one-sided NOT_FOUND in the verify can be a transient read-vs-compaction miss rather than a real
- * loss: the long-lived verify txn reads while background compaction relocates keys, and the
+ * loss. the long-lived verify txn reads while background compaction relocates keys, and the
  * point-get layout guard only converts some such races to a retryable BUSY. re-read the missing key
  * with fresh txns over ~1s -- if it reappears the pair is durably present (atomicity held); if it
  * stays gone it is a genuine one-sided loss. returns 1 if still gone (durable), 0 if it reappeared.
@@ -30405,6 +30405,133 @@ static void test_crash_recovery_no_clean_close(void)
     (void)remove_directory(CRASH_RECOVERY_DB_PATH);
 }
 
+/* concurrent read-modify-write of a few hot keys -- pins first-committer-wins for snapshot and
+ * serializable. each increment reads the counter and writes value+1, retrying on conflict, so a
+ * correct engine that lets only one of two racing same-key commits win ends with each counter
+ * equal to the number of commits it received. a lost update would leave the counter short. */
+#define LOSTUPD_THREADS 8
+#define LOSTUPD_KEYS    4
+#define LOSTUPD_OPS     500
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int isolation;
+    int id;
+    _Atomic(uint64_t) *commits; /* per-key successful-commit counts */
+} lostupd_arg_t;
+
+/* tiny per-thread xorshift so the test needs no posix rand_r (absent on msvc); the seed is
+ * always non-zero because id*odd + 1 cannot be zero for any thread id in range */
+static inline uint32_t lostupd_rand(uint32_t *s)
+{
+    uint32_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *s = x;
+    return x;
+}
+
+static void *lostupd_increment_worker(void *arg)
+{
+    lostupd_arg_t *a = arg;
+    uint32_t seed = (uint32_t)(a->id * 2654435761u + 1u);
+
+    for (int n = 0; n < LOSTUPD_OPS; n++)
+    {
+        const int k = (int)(lostupd_rand(&seed) % LOSTUPD_KEYS);
+        uint8_t key[16];
+        const int klen = snprintf((char *)key, sizeof(key), "ctr:%d", k);
+
+        for (;;) /* retry until this increment commits */
+        {
+            tidesdb_txn_t *txn = NULL;
+            if (tidesdb_txn_begin_with_isolation(a->db, a->isolation, &txn) != 0) break;
+
+            uint64_t v = 0;
+            uint8_t *old = NULL;
+            size_t oldn = 0;
+            if (tidesdb_txn_get(txn, a->cf, key, (size_t)klen, &old, &oldn) == 0 && oldn == 8)
+                for (int i = 0; i < 8; i++) v = (v << 8) | old[i];
+            free(old);
+
+            uint64_t nv = v + 1;
+            uint8_t vb[8];
+            for (int i = 0; i < 8; i++) vb[i] = (uint8_t)(nv >> (8 * (7 - i)));
+
+            int rc = tidesdb_txn_put(txn, a->cf, key, (size_t)klen, vb, 8, 0);
+            if (rc == 0) rc = tidesdb_txn_commit(txn);
+            tidesdb_txn_free(txn);
+
+            if (rc == 0)
+            {
+                atomic_fetch_add(&a->commits[k], 1);
+                break;
+            }
+            if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_BUSY) break;
+        }
+    }
+    return NULL;
+}
+
+static void test_concurrent_increment_no_lost_update(void)
+{
+    const int isos[] = {TDB_ISOLATION_SNAPSHOT, TDB_ISOLATION_SERIALIZABLE};
+
+    for (int ii = 0; ii < 2; ii++)
+    {
+        cleanup_test_dir();
+
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.unified_memtable = 1;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "ctr_cf", &cf_config), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ctr_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        _Atomic(uint64_t) commits[LOSTUPD_KEYS];
+        for (int k = 0; k < LOSTUPD_KEYS; k++) atomic_init(&commits[k], 0);
+
+        pthread_t threads[LOSTUPD_THREADS];
+        lostupd_arg_t args[LOSTUPD_THREADS];
+        for (int t = 0; t < LOSTUPD_THREADS; t++)
+        {
+            args[t] = (lostupd_arg_t){
+                .db = db, .cf = cf, .isolation = isos[ii], .id = t, .commits = commits};
+            pthread_create(&threads[t], NULL, lostupd_increment_worker, &args[t]);
+        }
+        for (int t = 0; t < LOSTUPD_THREADS; t++) pthread_join(threads[t], NULL);
+
+        /* each counter must equal the commits it received -- no lost update */
+        for (int k = 0; k < LOSTUPD_KEYS; k++)
+        {
+            uint8_t key[16];
+            const int klen = snprintf((char *)key, sizeof(key), "ctr:%d", k);
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            uint8_t *val = NULL;
+            size_t vn = 0;
+            uint64_t v = 0;
+            if (tidesdb_txn_get(txn, cf, key, (size_t)klen, &val, &vn) == 0 && vn == 8)
+                for (int i = 0; i < 8; i++) v = (v << 8) | val[i];
+            free(val);
+            tidesdb_txn_free(txn);
+            ASSERT_EQ(v, atomic_load(&commits[k]));
+        }
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     g_test_argv0 = argv[0];
@@ -30802,6 +30929,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_four_cf_single_txn, tests_passed);
     RUN_TEST(test_unified_iter_unflushed, tests_passed);
     RUN_TEST(test_unified_snapshot_commit, tests_passed);
+    RUN_TEST(test_concurrent_increment_no_lost_update, tests_passed);
     RUN_TEST(test_perf_cached_iter_seek, tests_passed);
     RUN_TEST(test_block_index_shared_prefix, tests_passed);
     RUN_TEST(test_objstore_fs_roundtrip, tests_passed);

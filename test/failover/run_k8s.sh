@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 #
-# cloud-simulation failover test: real pods on a kind cluster, fencing against a real MinIO
+# cloud-simulation failover test with real pods on a kind cluster, fencing against a real MinIO
 # bucket over the S3 connector's conditional writes (not the fs/flock shortcut). a "node loss" is
 # a real pod deletion and the writers are separate containers. one primary + three replicas let
 # the matrix cover fan-out replication, a failover the surviving replicas re-follow, split-brain
 # fencing of a live zombie, and cascading (sequential) failovers with a monotonic epoch.
-#
-# assumes a working kubectl context (the kind cluster) with the node image loaded as
-# tidesdb-node:ci. test infrastructure only.
 set -u
 
 K8S_DIR="$(cd "$(dirname "$0")/k8s" && pwd)"

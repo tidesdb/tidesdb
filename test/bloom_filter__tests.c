@@ -840,26 +840,26 @@ static void test_bloom_filter_new_failure_nulls_out(void)
      * bloom_filter_new malloc()s the struct first then hits the h validator
      * and free()s it -- pre-fix this returned -1 with *bf pointing at the
      * freed struct */
-    bloom_filter_t *bf = (bloom_filter_t *)0xdeadbeef;
+    bloom_filter_t *bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
     int rc = bloom_filter_new(&bf, 1e-300, 100);
     ASSERT_EQ(rc, -1);
     ASSERT_EQ(bf, NULL);
 
     /* size_in_words overflow path: very small p combined with n large enough
      * to push m past UINT32_MAX */
-    bf = (bloom_filter_t *)0xdeadbeef;
+    bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
     rc = bloom_filter_new(&bf, 1e-9, INT_MAX);
     ASSERT_EQ(rc, -1);
     ASSERT_EQ(bf, NULL);
 
     /* invalid args path (returns before malloc, *bf untouched) -- the
      * sentinel must still be observable */
-    bf = (bloom_filter_t *)0xdeadbeef;
+    bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
     rc = bloom_filter_new(&bf, 0.0, 100);
     ASSERT_EQ(rc, -1);
     /* this path does not malloc so it leaves *bf alone -- documented
      * carve-out from the contract above */
-    ASSERT_EQ(bf, (bloom_filter_t *)0xdeadbeef);
+    ASSERT_EQ(bf, (bloom_filter_t *)(uintptr_t)0xdeadbeef);
 
     /* and a caller that ignores the return code must not UAF. with the
      * contract fix bf is NULL after a failed new() and bloom_filter_add

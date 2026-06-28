@@ -4,12 +4,12 @@
 # starts real tidesdb_node processes against a shared filesystem bucket (the fs backend uses
 # flock, so the fence works across processes on one host) and drives two scenarios:
 #
-#   failover_catchup -- the replica is given a huge sync interval so it never polls; all of the
+#   failover_catchup    the replica is given a huge sync interval so it never polls; all of the
 #                       outgoing primary's data must arrive via the promotion catch-up. proves the
 #                       catch-up gates on the outgoing epoch (the ordering fix) rather than
 #                       skipping it as stale. writes enough through a small write buffer to build
 #                       many sstables and WAL generations.
-#   zombie_fence     -- after a replica is promoted, the old primary keeps writing. its next
+#   zombie_fence        after a replica is promoted, the old primary keeps writing. its next
 #                       publish must fail the lease renew and self-demote, and its post-promotion
 #                       writes must never appear on the new primary.
 #

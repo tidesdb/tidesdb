@@ -1,4 +1,4 @@
-# Cluster nodes for the failover simulation: one primary and three replicas, all pointed at the
+# Cluster nodes for the failover simulation with one primary and three replicas, all pointed at the
 # shared MinIO bucket. the image is built from test/failover/Dockerfile and loaded into kind.
 # restartPolicy Never so deleting a pod is a real node loss. three replicas let the matrix cover
 # fan-out convergence, surviving replicas re-following a newly promoted primary, and cascading

@@ -747,12 +747,21 @@ struct tidesdb_kv_pair_t
 #define TDB_COMMIT_STATUS_IN_PROGRESS 0
 #define TDB_COMMIT_STATUS_COMMITTED   1
 
+/* write-write reservation slots for first-committer-wins under snapshot/serializable. fixed
+ * and large so hash collisions are rare, and a collision only ever costs a spurious conflict
+ * (a retry), never a missed one. lives in memory only and is empty after recovery, so it
+ * changes no on-disk format. */
+#define TDB_WRITE_RESERVATION_SLOTS (1u << 20)
+#define TDB_WRITE_RESERVATION_MASK  (TDB_WRITE_RESERVATION_SLOTS - 1)
+
 /**
  * tidesdb_commit_status_t
  * @param status array of commit statuses (0=in-progress, 1=committed)
  * @param min_seq minimum sequence number tracked in this buffer
  * @param max_seq maximum sequence number tracked in this buffer
  * @param capacity size of the status array
+ * @param write_res per-key reservation slots holding the latest commit_seq that claimed each
+ *                  slot, used by the commit-time write-write conflict check
  */
 struct tidesdb_commit_status_t
 {
@@ -760,6 +769,7 @@ struct tidesdb_commit_status_t
     _Atomic(uint64_t) min_seq;
     _Atomic(uint64_t) max_seq;
     size_t capacity;
+    _Atomic(uint64_t) *write_res;
 };
 
 /**
@@ -1307,6 +1317,15 @@ static tidesdb_commit_status_t *tidesdb_commit_status_create()
         atomic_init(&cs->status[i], TDB_COMMIT_STATUS_IN_PROGRESS);
     }
 
+    /* write-write reservation slots all start unclaimed (0 == no committer) */
+    cs->write_res = calloc(TDB_WRITE_RESERVATION_SLOTS, sizeof(_Atomic(uint64_t)));
+    if (!cs->write_res)
+    {
+        free((void *)cs->status);
+        free(cs);
+        return NULL;
+    }
+
     atomic_init(&cs->min_seq, 1);
     atomic_init(&cs->max_seq, 0);
     cs->capacity = TDB_COMMIT_STATUS_BUFFER_SIZE;
@@ -1323,6 +1342,7 @@ static void tidesdb_commit_status_destroy(tidesdb_commit_status_t *cs)
 {
     if (!cs) return;
     free((void *)cs->status);
+    free((void *)cs->write_res);
     free(cs);
 }
 
@@ -25719,13 +25739,17 @@ static void tidesdb_txn_remove_from_active_list(tidesdb_txn_t *txn)
  */
 static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                                        const uint8_t *key, const size_t key_size,
-                                       const uint64_t seq)
+                                       const uint64_t seq, const int point_read)
 {
-    /*** we skip read tracking for isolation levels that dont need conflict detection
-     **  SNAPSHOT only needs write-write conflict detection (no read set tracking)
-     *   only REPEATABLE_READ and SERIALIZABLE need read tracking */
+    /*** REPEATABLE_READ and SERIALIZABLE track every read for read-write conflict detection.
+     **  SNAPSHOT does no read-write conflict detection, but it records point reads so the
+     **  write-write reservation can validate a write against the version actually read, not
+     **  just the snapshot start -- this closes the window where a writer becomes visible
+     **  between our read and our commit. range-scan reads are not recorded for SNAPSHOT,
+     *   they would grow a read set it never consults. */
     if (txn->isolation_level != TDB_ISOLATION_REPEATABLE_READ &&
-        txn->isolation_level != TDB_ISOLATION_SERIALIZABLE)
+        txn->isolation_level != TDB_ISOLATION_SERIALIZABLE &&
+        !(txn->isolation_level == TDB_ISOLATION_SNAPSHOT && point_read))
     {
         return 0;
     }
@@ -26404,7 +26428,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     *value_size = temp_val_size;
                     tidesdb_immutable_memtable_unref(umt);
                     PROFILE_INC(txn->db, memtable_hits);
-                    tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
+                    tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u, 1);
                     unified_rc = TDB_SUCCESS;
                     goto unified_memtable_done;
                 }
@@ -26480,7 +26504,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                             memcpy(*value, temp_val, temp_val_size);
                             *value_size = temp_val_size;
                             PROFILE_INC(txn->db, immutable_hits);
-                            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u);
+                            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u, 1);
                             unified_rc = TDB_SUCCESS;
                         }
                     }
@@ -26537,6 +26561,11 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         if (deleted)
         {
             if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
+            /* record the absent read at the tombstone we saw so the reservation rejects a
+             * concurrent re-insert of this key (insert-insert is also a same-key write race).
+             * snapshot/serializable only -- repeatable read must not gain phantom detection */
+            if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+                tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq, 1);
             return TDB_ERR_NOT_FOUND;
         }
 
@@ -26554,11 +26583,13 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
 
             PROFILE_INC(txn->db, memtable_hits);
-            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq);
+            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq, 1);
             return TDB_SUCCESS;
         }
 
         if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
+        if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq, 1);
         return TDB_ERR_NOT_FOUND;
     }
 
@@ -26612,7 +26643,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         memcpy(*value, temp_value, temp_value_size);
                         *value_size = temp_value_size;
                         PROFILE_INC(txn->db, immutable_hits);
-                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq);
+                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq, 1);
                         result = TDB_SUCCESS;
                         break;
                     }
@@ -26863,12 +26894,17 @@ unified_sst_search:;
             {
                 *value = best_value;
                 *value_size = best_value_size;
-                tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq);
+                tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq, 1);
                 return TDB_SUCCESS;
             }
 
             if (best_value) free(best_value);
-            return (!best_is_dead) ? TDB_ERR_MEMORY : TDB_ERR_NOT_FOUND;
+            if (!best_is_dead) return TDB_ERR_MEMORY;
+            /* absent because the newest version in range is a tombstone -- record it so the
+             * reservation rejects a concurrent re-insert at the same key (snapshot/serializable) */
+            if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+                tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq, 1);
+            return TDB_ERR_NOT_FOUND;
         }
     }
 
@@ -26887,6 +26923,10 @@ unified_sst_search:;
         return TDB_ERR_BUSY;
     }
 
+    /* nothing existed for this key in our snapshot -- record the absent read at seq 0 so the
+     * reservation rejects a concurrent first insert of the same key (snapshot/serializable) */
+    if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, 0, 1);
     return TDB_ERR_NOT_FOUND;
 }
 
@@ -29075,6 +29115,122 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
+/**
+ * tidesdb_txn_read_seq
+ * look up the sequence this transaction observed when it last read (cf, key). the write-write
+ * reservation validates a write against the version actually read instead of the snapshot
+ * start, so a writer that became visible between our read and our commit is still caught. only
+ * snapshot point reads and RR/SERIALIZABLE reads are recorded, so a key written without a
+ * prior point read is reported not found and the caller falls back to the snapshot start.
+ * @param txn transaction
+ * @param cf column family
+ * @param key key
+ * @param key_size key size
+ * @param out_seq receives the highest observed read seq when found
+ * @return 1 if a read of this key was recorded, 0 otherwise
+ */
+static int tidesdb_txn_read_seq(const tidesdb_txn_t *txn, const tidesdb_column_family_t *cf,
+                                const uint8_t *key, const size_t key_size, uint64_t *out_seq)
+{
+    uint64_t best = 0;
+    int found = 0;
+    for (int i = 0; i < txn->read_set_count; i++)
+    {
+        if (txn->read_cfs[i] == cf && txn->read_key_sizes[i] == key_size &&
+            memcmp(txn->read_keys[i], key, key_size) == 0)
+        {
+            if (!found || txn->read_seqs[i] > best) best = txn->read_seqs[i];
+            found = 1;
+        }
+    }
+    if (found) *out_seq = best;
+    return found;
+}
+
+/**
+ * tidesdb_txn_release_writes
+ * undo this transaction's write-write reservations after a snapshot/serializable commit
+ * loses. each write key's slot is CAS'd from our commit_seq back to unclaimed; a CAS that
+ * fails means a newer committer already owns the slot and we leave it alone. dropping a slot
+ * to unclaimed can only lose a conflict against an already-committed writer, which
+ * tidesdb_txn_check_write_conflicts still catches against the memtable, so it stays safe.
+ * @param txn transaction whose reservations to release
+ */
+static void tidesdb_txn_release_writes(tidesdb_txn_t *txn)
+{
+    _Atomic(uint64_t) *res = txn->db->commit_status ? txn->db->commit_status->write_res : NULL;
+    if (!res || txn->commit_seq == 0) return;
+
+    for (int i = 0; i < txn->num_ops; i++)
+    {
+        const tidesdb_txn_op_t *op = &txn->ops[i];
+        if (!op->cf) continue;
+        const uint32_t slot =
+            tidesdb_write_set_hash_key(op->cf, op->key, op->key_size) & TDB_WRITE_RESERVATION_MASK;
+        uint64_t expect = txn->commit_seq;
+        atomic_compare_exchange_strong_explicit(&res[slot], &expect, 0, memory_order_acq_rel,
+                                                memory_order_acquire);
+    }
+}
+
+/**
+ * tidesdb_txn_reserve_writes
+ * first-committer-wins write-write conflict reservation for snapshot/serializable commits.
+ * each write key claims its reservation slot with this transaction's commit_seq. we lose and
+ * abort if a slot already holds a seq committed after our snapshot, or a seq still in flight
+ * that our snapshot could not have read -- both mean a concurrent writer beat us to the key.
+ * the slot CAS lets exactly one of two racing same-key committers win. this runs before the
+ * WAL write, so a loser aborts having written nothing, and partial claims are undone so an
+ * aborted reservation never poisons a slot. it complements tidesdb_txn_check_write_conflicts,
+ * which only sees writers that already applied and so misses concurrent in-flight committers.
+ * @param txn transaction reserving its write set
+ * @return TDB_SUCCESS with all keys reserved, or TDB_ERR_CONFLICT with partial claims undone
+ */
+static int tidesdb_txn_reserve_writes(tidesdb_txn_t *txn)
+{
+    tidesdb_commit_status_t *cs = txn->db->commit_status;
+    if (!cs || !cs->write_res) return TDB_SUCCESS;
+    _Atomic(uint64_t) *res = cs->write_res;
+    const uint64_t snap = txn->snapshot_seq;
+    const uint64_t myseq = txn->commit_seq;
+
+    for (int i = 0; i < txn->num_ops; i++)
+    {
+        const tidesdb_txn_op_t *op = &txn->ops[i];
+        if (!op->cf) continue;
+        const uint32_t slot =
+            tidesdb_write_set_hash_key(op->cf, op->key, op->key_size) & TDB_WRITE_RESERVATION_MASK;
+
+        /* validate against the version we actually read for this key, falling back to the
+         * snapshot start for a blind write. a writer that landed after our read -- including one
+         * that was in flight when we read and committed before we reached here, whose seq still
+         * sits at or below our snapshot -- pushes the slot past our read seq and is caught */
+        uint64_t base = snap;
+        uint64_t rseq;
+        if (tidesdb_txn_read_seq(txn, op->cf, op->key, op->key_size, &rseq)) base = rseq;
+
+        for (;;)
+        {
+            uint64_t r = atomic_load_explicit(&res[slot], memory_order_acquire);
+            if (r == myseq) break; /* already ours -- a duplicate key or a colliding sibling key */
+
+            /* a committer claimed this key after the version we read, or is committing it right
+             * now and we could not have seen it. visibility_check returns committed (including
+             * evicted) seqs as true, so the second test fires only for a genuinely in-flight one */
+            if (r > base || (r != 0 && !tidesdb_visibility_check_callback(cs, r)))
+            {
+                tidesdb_txn_release_writes(txn);
+                return TDB_ERR_CONFLICT;
+            }
+            if (atomic_compare_exchange_weak_explicit(&res[slot], &r, myseq, memory_order_acq_rel,
+                                                      memory_order_acquire))
+                break;
+            /* CAS lost to a concurrent claimer -- re-read and re-evaluate this slot */
+        }
+    }
+    return TDB_SUCCESS;
+}
+
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn || txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
@@ -29111,6 +29267,17 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     txn->commit_seq = atomic_fetch_add_explicit(&txn->db->global_seq, 1, memory_order_relaxed);
     tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
                                TDB_COMMIT_STATUS_IN_PROGRESS);
+
+    /* first-committer-wins write-write reservation before the WAL write. snapshot and
+     * serializable must not let two concurrent commits to the same key both win; the
+     * check_write_conflicts pass above only sees writers that already applied, so a
+     * concurrent in-flight committer slips past it. reserving here publishes our claim
+     * before anything is written, so a racing committer sees it and exactly one wins */
+    if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+    {
+        result = tidesdb_txn_reserve_writes(txn);
+        if (result != TDB_SUCCESS) return result;
+    }
 
     /* with the unified path, we do single WAL + single skip list */
     if (txn->db->unified_mt.enabled)
@@ -32708,7 +32875,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         if (iter->txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
         {
             tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
-                                        kv->entry.seq);
+                                        kv->entry.seq, 0);
         }
 
         tidesdb_kv_pair_free(prev);
@@ -32793,7 +32960,7 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         if (iter->txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
         {
             tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
-                                        kv->entry.seq);
+                                        kv->entry.seq, 0);
         }
 
         tidesdb_kv_pair_free(prev);

@@ -43,7 +43,7 @@
  *   TDB_NODE_WAL_SYNC_ON_COMMIT   0 | 1 (default 1, RPO=0)
  *   TDB_NODE_REPLICA_SYNC_US      replica poll interval (default 500000)
  *   TDB_NODE_ID                   label used in log lines (default the port)
- * for the s3 backend: TIDESDB_S3_ENDPOINT, TIDESDB_S3_BUCKET, TIDESDB_S3_ACCESS_KEY,
+ * for the s3 backend TIDESDB_S3_ENDPOINT, TIDESDB_S3_BUCKET, TIDESDB_S3_ACCESS_KEY,
  * TIDESDB_S3_SECRET_KEY (matching the existing object-store CI workflow).
  */
 

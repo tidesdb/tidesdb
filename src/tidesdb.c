@@ -29202,6 +29202,15 @@ static int tidesdb_txn_reserve_writes(tidesdb_txn_t *txn)
     const uint64_t snap = txn->snapshot_seq;
     const uint64_t myseq = txn->commit_seq;
 
+    /* a slot is shared by every key whose hash lands on it and it is never cleared on the
+     * success path, so it holds the most recent committer's seq for the whole bucket, not for
+     * our key. that makes the cheap slot test a filter, not a verdict -- when it trips we
+     * re-read this key's real version chain before aborting. these mirror check_write_conflicts
+     * and are allocated lazily so a commit that never trips the filter pays nothing. */
+    tidesdb_column_family_t *last_cf = NULL;
+    tidesdb_immutable_memtable_t **imm_refs = NULL;
+    size_t imm_count = 0;
+
     for (int i = 0; i < txn->num_ops; i++)
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
@@ -29222,20 +29231,42 @@ static int tidesdb_txn_reserve_writes(tidesdb_txn_t *txn)
             uint64_t r = atomic_load_explicit(&res[slot], memory_order_acquire);
             if (r == myseq) break; /* already ours -- a duplicate key or a colliding sibling key */
 
-            /* a committer claimed this key after the version we read, or is committing it right
-             * now and we could not have seen it. visibility_check returns committed (including
-             * evicted) seqs as true, so the second test fires only for a genuinely in-flight one */
-            if (r > base || (r != 0 && !tidesdb_visibility_check_callback(cs, r)))
+            /* an in-flight occupant could be a concurrent same-key committer we must lose to.
+             * the writer has not applied yet so a scan cannot see it and we cannot tell it apart
+             * from a colliding key, so we abort conservatively. this fires only when a different
+             * in-flight committer happens to collide here, which is bounded by concurrency */
+            if (r != 0 && !tidesdb_visibility_check_callback(cs, r))
             {
+                if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
                 tidesdb_txn_release_writes(txn);
                 return TDB_ERR_CONFLICT;
             }
+
+            /* a committed writer owns the slot past our read seq. usually that is a different
+             * key colliding into the bucket, not a conflict on ours, so we re-validate against
+             * this key's actual version chain and abort only on a genuine newer version of it.
+             * a false-positive collision costs one re-read, not a spurious abort -- which is
+             * what made a single-connection read-modify-write loop conflict at the reservation
+             * table's load factor */
+            if (r > base)
+            {
+                if (tidesdb_txn_check_key_conflict(txn, op->cf, op->key, op->key_size, base,
+                                                   &imm_refs, &imm_count, &last_cf) != TDB_SUCCESS)
+                {
+                    if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
+                    tidesdb_txn_release_writes(txn);
+                    return TDB_ERR_CONFLICT;
+                }
+            }
+
             if (atomic_compare_exchange_weak_explicit(&res[slot], &r, myseq, memory_order_acq_rel,
                                                       memory_order_acquire))
                 break;
             /* CAS lost to a concurrent claimer -- re-read and re-evaluate this slot */
         }
     }
+
+    if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
     return TDB_SUCCESS;
 }
 

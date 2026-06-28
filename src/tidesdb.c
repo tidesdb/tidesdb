@@ -8288,7 +8288,7 @@ static void tidesdb_sstable_write_footer_aux(tidesdb_sstable_t *sst, block_manag
             index_size = TDB_EMPTY_BLOCK_INDEX_SIZE;
         }
         tidesdb_sstable_write_aux_blob(klog_bm, index_data, index_size, &index_off);
-        index_chunked = (index_size > TDB_AUX_BLOCK_CHUNK_MAX);
+        index_chunked = ((uint64_t)index_size > TDB_AUX_BLOCK_CHUNK_MAX);
         free(index_owned);
     }
 
@@ -8309,7 +8309,7 @@ static void tidesdb_sstable_write_footer_aux(tidesdb_sstable_t *sst, block_manag
     tidesdb_sstable_write_aux_blob(klog_bm, bloom_data, bloom_size, &bloom_off);
     free(bloom_owned);
 
-    if (index_chunked || bloom_size > TDB_AUX_BLOCK_CHUNK_MAX)
+    if (index_chunked || (uint64_t)bloom_size > TDB_AUX_BLOCK_CHUNK_MAX)
     {
         sst->aux_chunked = 1;
         sst->index_blob_offset = write_index ? index_off : 0;

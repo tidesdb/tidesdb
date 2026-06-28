@@ -754,6 +754,18 @@ struct tidesdb_kv_pair_t
 #define TDB_WRITE_RESERVATION_SLOTS (1u << 20)
 #define TDB_WRITE_RESERVATION_MASK  (TDB_WRITE_RESERVATION_SLOTS - 1)
 
+/* each reservation slot packs a 16-bit key fingerprint in the high bits and the claiming
+   commit_seq in the low 48. the fingerprint lets a committer tell a real same-key conflict from a
+   hash collision using the slot alone -- no cross-thread read of another committer's applied
+   version -- which keeps the decision portable across memory models. 48 bits of seq is ~2.8e14
+   commits, far beyond any real lifetime. */
+#define TDB_WRITE_RES_SEQ_BITS    48
+#define TDB_WRITE_RES_SEQ_MASK    ((1ULL << TDB_WRITE_RES_SEQ_BITS) - 1)
+#define TDB_WRITE_RES_FP(packed)  ((uint16_t)((packed) >> TDB_WRITE_RES_SEQ_BITS))
+#define TDB_WRITE_RES_SEQ(packed) ((packed)&TDB_WRITE_RES_SEQ_MASK)
+#define TDB_WRITE_RES_PACK(fp, seq) \
+    (((uint64_t)(fp) << TDB_WRITE_RES_SEQ_BITS) | ((seq)&TDB_WRITE_RES_SEQ_MASK))
+
 /**
  * tidesdb_commit_status_t
  * @param status array of commit statuses (0=in-progress, 1=committed)
@@ -7396,12 +7408,18 @@ static void tidesdb_write_set_hash_free(tidesdb_write_set_hash_t *hash)
  * @param key_size key size
  * @return hash value
  */
-static uint32_t tidesdb_write_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
-                                           const size_t key_size)
+static uint64_t tidesdb_write_set_hash_key64(tidesdb_column_family_t *cf, const uint8_t *key,
+                                             const size_t key_size)
 {
     /* we mix CF pointer into seed for better distribution across CFs */
     const uint64_t seed = TDB_TXN_HASH_SEED ^ (uint64_t)(uintptr_t)cf;
-    return (uint32_t)XXH64(key, key_size, seed);
+    return XXH64(key, key_size, seed);
+}
+
+static uint32_t tidesdb_write_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
+                                           const size_t key_size)
+{
+    return (uint32_t)tidesdb_write_set_hash_key64(cf, key, key_size);
 }
 
 /**
@@ -29173,9 +29191,10 @@ static void tidesdb_txn_release_writes(tidesdb_txn_t *txn)
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
         if (!op->cf) continue;
-        const uint32_t slot =
-            tidesdb_write_set_hash_key(op->cf, op->key, op->key_size) & TDB_WRITE_RESERVATION_MASK;
-        uint64_t expect = txn->commit_seq;
+        const uint64_t h = tidesdb_write_set_hash_key64(op->cf, op->key, op->key_size);
+        const uint32_t slot = (uint32_t)h & TDB_WRITE_RESERVATION_MASK;
+        uint64_t expect =
+            TDB_WRITE_RES_PACK((uint16_t)(h >> TDB_WRITE_RES_SEQ_BITS), txn->commit_seq);
         atomic_compare_exchange_strong_explicit(&res[slot], &expect, 0, memory_order_acq_rel,
                                                 memory_order_acquire);
     }
@@ -29200,23 +29219,24 @@ static int tidesdb_txn_reserve_writes(tidesdb_txn_t *txn)
     if (!cs || !cs->write_res) return TDB_SUCCESS;
     _Atomic(uint64_t) *res = cs->write_res;
     const uint64_t snap = txn->snapshot_seq;
-    const uint64_t myseq = txn->commit_seq;
+    const uint64_t myseq = txn->commit_seq & TDB_WRITE_RES_SEQ_MASK;
 
-    /* a slot is shared by every key whose hash lands on it and it is never cleared on the
-     * success path, so it holds the most recent committer's seq for the whole bucket, not for
-     * our key. that makes the cheap slot test a filter, not a verdict -- when it trips we
-     * re-read this key's real version chain before aborting. these mirror check_write_conflicts
-     * and are allocated lazily so a commit that never trips the filter pays nothing. */
-    tidesdb_column_family_t *last_cf = NULL;
-    tidesdb_immutable_memtable_t **imm_refs = NULL;
-    size_t imm_count = 0;
+    /* oldest snapshot still open. a committed seq at or below it has been observed by every active
+       transaction, so a same-key writer at that seq would already sit in our read set -- a slot
+       past our read seq that old can only be a different key colliding into the bucket, safe to
+       suppress. a newer one might be a concurrent writer of that colliding key, so we stay
+       conservative there. this and the fingerprint are the only signals we use; we never read
+       another committer's applied version, so the verdict is the same on every memory model */
+    const uint64_t min_snap = tidesdb_min_active_snapshot_seq(txn->db);
 
     for (int i = 0; i < txn->num_ops; i++)
     {
         const tidesdb_txn_op_t *op = &txn->ops[i];
         if (!op->cf) continue;
-        const uint32_t slot =
-            tidesdb_write_set_hash_key(op->cf, op->key, op->key_size) & TDB_WRITE_RESERVATION_MASK;
+        const uint64_t h = tidesdb_write_set_hash_key64(op->cf, op->key, op->key_size);
+        const uint32_t slot = (uint32_t)h & TDB_WRITE_RESERVATION_MASK;
+        const uint16_t myfp = (uint16_t)(h >> TDB_WRITE_RES_SEQ_BITS);
+        const uint64_t mine = TDB_WRITE_RES_PACK(myfp, myseq);
 
         /* validate against the version we actually read for this key, falling back to the
          * snapshot start for a blind write. a writer that landed after our read -- including one
@@ -29228,45 +29248,39 @@ static int tidesdb_txn_reserve_writes(tidesdb_txn_t *txn)
 
         for (;;)
         {
-            uint64_t r = atomic_load_explicit(&res[slot], memory_order_acquire);
-            if (r == myseq) break; /* already ours -- a duplicate key or a colliding sibling key */
+            const uint64_t cur = atomic_load_explicit(&res[slot], memory_order_acquire);
+            const uint64_t cseq = TDB_WRITE_RES_SEQ(cur);
+            if (cseq == myseq) break; /* already ours -- a duplicate key or a colliding sibling */
 
-            /* an in-flight occupant could be a concurrent same-key committer we must lose to.
-             * the writer has not applied yet so a scan cannot see it and we cannot tell it apart
-             * from a colliding key, so we abort conservatively. this fires only when a different
-             * in-flight committer happens to collide here, which is bounded by concurrency */
-            if (r != 0 && !tidesdb_visibility_check_callback(cs, r))
+            /* an occupant still in flight could be a concurrent same-key committer we must lose
+             * to; we cannot tell it apart from a colliding key without its applied version, so we
+             * abort conservatively. visibility_check returns committed (and evicted) seqs as true,
+             * so this fires only for a genuinely in-flight occupant */
+            if (cseq != 0 && !tidesdb_visibility_check_callback(cs, cseq))
             {
-                if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
                 tidesdb_txn_release_writes(txn);
                 return TDB_ERR_CONFLICT;
             }
 
-            /* a committed writer owns the slot past our read seq. usually that is a different
-             * key colliding into the bucket, not a conflict on ours, so we re-validate against
-             * this key's actual version chain and abort only on a genuine newer version of it.
-             * a false-positive collision costs one re-read, not a spurious abort -- which is
-             * what made a single-connection read-modify-write loop conflict at the reservation
-             * table's load factor */
-            if (r > base)
+            /* a committed seq landed past the version we read. if its fingerprint matches ours it
+             * is a real same-key writer and we lose. if it differs it is a hash collision into a
+             * shared slot, harmless to us -- suppress it unless it is recent enough (above the
+             * oldest open snapshot) that a concurrent writer of that other key could still depend
+             * on the slot, where we stay conservative. decided from the slot alone */
+            if (cseq > base && (TDB_WRITE_RES_FP(cur) == myfp || cseq > min_snap))
             {
-                if (tidesdb_txn_check_key_conflict(txn, op->cf, op->key, op->key_size, base,
-                                                   &imm_refs, &imm_count, &last_cf) != TDB_SUCCESS)
-                {
-                    if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
-                    tidesdb_txn_release_writes(txn);
-                    return TDB_ERR_CONFLICT;
-                }
+                tidesdb_txn_release_writes(txn);
+                return TDB_ERR_CONFLICT;
             }
 
-            if (atomic_compare_exchange_weak_explicit(&res[slot], &r, myseq, memory_order_acq_rel,
-                                                      memory_order_acquire))
+            uint64_t expect = cur;
+            if (atomic_compare_exchange_weak_explicit(&res[slot], &expect, mine,
+                                                      memory_order_acq_rel, memory_order_acquire))
                 break;
             /* CAS lost to a concurrent claimer -- re-read and re-evaluate this slot */
         }
     }
 
-    if (imm_refs) tidesdb_txn_cleanup_imm_snapshot(imm_refs, imm_count);
     return TDB_SUCCESS;
 }
 

@@ -23452,10 +23452,14 @@ static void *multi_cf_writer_thread(void *arg)
         }
 
         /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
-         * flushers/compaction), not a failure -- the txn simply did not commit. only real
-         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+         * flushers/compaction).  TDB_ERR_CONFLICT is the first-committer-wins write-write
+         * reservation -- the loser of a concurrent same-slot commit (a real same-key race, or a
+         * spurious hash-collision between two distinct keys sharing a fixed reservation slot)
+         * simply did not apply.  Both are normal, retryable transient outcomes under concurrency,
+         * not failures; only a genuine error counts. */
         const int crc = tidesdb_txn_commit(txn);
-        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
+        if (crc != 0 && crc != TDB_ERR_BUSY && crc != TDB_ERR_CONFLICT)
+            atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -24565,10 +24569,14 @@ static void *mcf_iter_mut_writer_thread(void *arg)
                         0);
 
         /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
-         * flushers/compaction), not a failure -- the txn simply did not commit. only real
-         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+         * flushers/compaction).  TDB_ERR_CONFLICT is the first-committer-wins write-write
+         * reservation -- the loser of a concurrent same-slot commit (a real same-key race, or a
+         * spurious hash-collision between two distinct keys sharing a fixed reservation slot)
+         * simply did not apply.  Both are normal, retryable transient outcomes under concurrency,
+         * not failures; only a genuine error counts. */
         const int crc = tidesdb_txn_commit(txn);
-        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
+        if (crc != 0 && crc != TDB_ERR_BUSY && crc != TDB_ERR_CONFLICT)
+            atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -25028,10 +25036,14 @@ static void *mcf_churn_writer_thread(void *arg)
                         strlen(val) + 1, 0);
 
         /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
-         * flushers/compaction), not a failure -- the txn simply did not commit. only real
-         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+         * flushers/compaction).  TDB_ERR_CONFLICT is the first-committer-wins write-write
+         * reservation -- the loser of a concurrent same-slot commit (a real same-key race, or a
+         * spurious hash-collision between two distinct keys sharing a fixed reservation slot)
+         * simply did not apply.  Both are normal, retryable transient outcomes under concurrency,
+         * not failures; only a genuine error counts. */
         const int crc = tidesdb_txn_commit(txn);
-        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
+        if (crc != 0 && crc != TDB_ERR_BUSY && crc != TDB_ERR_CONFLICT)
+            atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;
@@ -25196,10 +25208,14 @@ static void *mcf_iso_writer_thread(void *arg)
                         strlen(val) + 1, 0);
 
         /* TDB_ERR_BUSY is transient write backpressure (small write buffer + concurrent
-         * flushers/compaction), not a failure -- the txn simply did not commit. only real
-         * errors count; these writers are write-only so cannot legitimately hit SSI conflict. */
+         * flushers/compaction).  TDB_ERR_CONFLICT is the first-committer-wins write-write
+         * reservation -- the loser of a concurrent same-slot commit (a real same-key race, or a
+         * spurious hash-collision between two distinct keys sharing a fixed reservation slot)
+         * simply did not apply.  Both are normal, retryable transient outcomes under concurrency,
+         * not failures; only a genuine error counts. */
         const int crc = tidesdb_txn_commit(txn);
-        if (crc != 0 && crc != TDB_ERR_BUSY) atomic_fetch_add(d->errors, 1);
+        if (crc != 0 && crc != TDB_ERR_BUSY && crc != TDB_ERR_CONFLICT)
+            atomic_fetch_add(d->errors, 1);
         tidesdb_txn_free(txn);
     }
     return NULL;

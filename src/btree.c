@@ -139,21 +139,6 @@ static inline size_t btree_signed_varint_encode(uint8_t *buf, const int64_t val)
     return btree_varint_encode(buf, uval);
 }
 
-/**
- * btree_signed_varint_decode
- * decodes a zigzag-encoded signed varint from a buffer
- * @param buf the buffer to decode from
- * @param val output parameter for the decoded signed value
- * @return the number of bytes decoded
- */
-static inline size_t btree_signed_varint_decode(const uint8_t *buf, int64_t *val)
-{
-    uint64_t uval;
-    const size_t n = btree_varint_decode(buf, &uval);
-    *val = (int64_t)((uval >> 1) ^ (~(uval & 1) + 1));
-    return n;
-}
-
 /* bounded LEB128 decode for parsing on-disk (untrusted) node bytes in which reads at most
  * the bytes remaining before `end` and at most 10. returns bytes consumed, or 0 on
  * truncation / overlong encoding so the caller can reject a malformed node. */

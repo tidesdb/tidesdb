@@ -24726,11 +24726,25 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         return TDB_SUCCESS;
     }
 
+    /* the new active memtable never receives writes when the db is unified (writes go to the shared
+     * unified memtable, mirroring tidesdb_create_column_family) or when this rotation is part of
+     * close (the new active is torn down right after). a minimal arena then avoids reserving
+     * write_buffer_size x TDB_MEMTABLE_ARENA_SIZE_FACTOR for a memtable that stays empty -- on the
+     * 64MB default that is a 128MB block that needlessly fails under a constrained address space.
+     * recovery is excluded (is_recovering) so the post-recovery active, which does take writes,
+     * keeps its full arena. */
+    const int new_active_unused =
+        cf->db->unified_mt.enabled ||
+        (!atomic_load_explicit(&cf->db->is_open, memory_order_acquire) &&
+         !atomic_load_explicit(&cf->db->is_recovering, memory_order_acquire));
+    const size_t new_arena_init =
+        new_active_unused ? TDB_UNIFIED_PER_CF_ARENA_INIT
+                          : cf->config.write_buffer_size * TDB_MEMTABLE_ARENA_SIZE_FACTOR;
+
     skip_list_t *new_memtable;
-    if (skip_list_new_with_arena(
-            &new_memtable, cf->config.skip_list_max_level, cf->config.skip_list_probability,
-            comparator_fn, comparator_ctx, &cf->db->cached_current_time,
-            cf->config.write_buffer_size * TDB_MEMTABLE_ARENA_SIZE_FACTOR) != 0)
+    if (skip_list_new_with_arena(&new_memtable, cf->config.skip_list_max_level,
+                                 cf->config.skip_list_probability, comparator_fn, comparator_ctx,
+                                 &cf->db->cached_current_time, new_arena_init) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to create new memtable", cf->name);
         atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
@@ -29108,11 +29122,17 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     atomic_init(&new_mt->writers, 0);
     atomic_init(&new_mt->flushed, 0);
 
+    /* enqueue old onto the immutable queue before swapping the active pointer. this eliminates the
+     * read visibility gap where a reader loads the new (empty) active and then walks the immutable
+     * queue before the enqueue lands, missing a just-committed key that is in neither place and not
+     * yet in any sstable. the enqueue is ordered before the release store of active, so any reader
+     * that observes the new active also observes old_mt in the queue. a reader seeing old_mt in
+     * both active and immutable is harmless -- active is checked first and versions resolve by seq.
+     * this mirrors the per-CF enqueue-before-swap ordering in tidesdb_flush_memtable_internal. */
+    queue_enqueue(db->unified_mt.immutables, old_mt);
+
     /* we swap active, now old becomes immutable */
     atomic_store_explicit(&db->unified_mt.active, new_mt, memory_order_release);
-
-    /* we enqueue old to immutable queue (for read path scanning) */
-    queue_enqueue(db->unified_mt.immutables, old_mt);
 
     /* we enqueue flush work item with cf=NULL to signal unified flush */
     tidesdb_flush_work_t *uwork = malloc(sizeof(tidesdb_flush_work_t));
@@ -32033,6 +32053,10 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
     block_manager_block_t *last_valid_bmblock = NULL;
     uint8_t *last_valid_decompressed = NULL;
     clock_cache_entry_t *last_valid_pin = NULL;
+    /* file offset of last_valid_block -- the scan reads forward past the chosen block, so we must
+     * leave the cursor sitting on that block (not the one after it) or a later backward retreat
+     * that crosses the block boundary would cursor_prev back onto this same block and re-emit it */
+    uint64_t last_valid_pos = 0;
 
     int blocks_scanned = 0;
 
@@ -32042,6 +32066,8 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         {
             break;
         }
+
+        const uint64_t block_pos = cursor->current_pos;
 
         tidesdb_klog_block_t *kb = NULL;
         block_manager_block_t *bmblock = NULL;
@@ -32105,6 +32131,7 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
             last_valid_bmblock = bmblock;
             last_valid_decompressed = decompressed;
             last_valid_pin = pin;
+            last_valid_pos = block_pos;
         }
         else
         {
@@ -32128,6 +32155,9 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         source->source.sstable.current_entry_idx = last_valid_idx;
         source->current_kv =
             tidesdb_iter_create_kv_from_block(iter, sst, last_valid_block, last_valid_idx);
+        /* leave the cursor on current_block so a subsequent cross-block retreat steps to the block
+         * before it rather than re-reading current_block */
+        block_manager_cursor_goto(cursor, last_valid_pos);
     }
     else
     {
@@ -32201,6 +32231,116 @@ static int tidesdb_iter_find_visible_entry(tidesdb_iter_t *iter, const int direc
     }
 
     return TDB_ERR_NOT_FOUND;
+}
+
+/**
+ * tidesdb_iter_reposition_source
+ * reposition a single cached merge source onto the target key for the given direction. a
+ * direction > 0 lands on the first entry >= key (forward), a direction < 0 on the last entry <= key
+ * (backward). this is the per-source dispatch shared by seek, seek_for_prev, and the next/prev
+ * direction-flip rebuild.
+ * @param iter iterator (for sstable source db handle)
+ * @param source source to reposition
+ * @param key target key
+ * @param key_size target key size
+ * @param direction 1 forward, -1 backward
+ */
+static void tidesdb_iter_reposition_source(tidesdb_iter_t *iter, tidesdb_merge_source_t *source,
+                                           const uint8_t *key, const size_t key_size,
+                                           const int direction)
+{
+    tidesdb_kv_pair_free(source->current_kv);
+    source->current_kv = NULL;
+
+    if (source->type == MERGE_SOURCE_MEMTABLE)
+    {
+        tidesdb_iter_seek_memtable_source(source, key, key_size, direction);
+    }
+    else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
+    {
+        /* we build prefixed key and seek, then strip prefix via advance_to_cf */
+        uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
+        const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
+        uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
+        if (pk)
+        {
+            tdb_build_prefixed_key(source->source.unified.cf_index, key, key_size, pk);
+            skip_list_cursor_t *cursor = source->source.unified.cursor;
+            const int sought = (direction > 0)
+                                   ? skip_list_cursor_seek_ge(cursor, pk, pk_total)
+                                   : skip_list_cursor_seek_for_prev(cursor, pk, pk_total);
+            if (sought == 0) tidesdb_unified_source_advance_to_cf(source, direction > 0 ? 1 : 0);
+            if (pk != pk_stack) free(pk);
+        }
+    }
+    else if (source->type == MERGE_SOURCE_BTREE)
+    {
+        if (direction > 0)
+            tidesdb_iter_seek_btree_source_forward(source, key, key_size);
+        else
+            tidesdb_iter_seek_btree_source_backward(source, key, key_size);
+    }
+    else if (source->type == MERGE_SOURCE_TXN_OPS)
+    {
+        tidesdb_iter_seek_txn_ops_source(source, key, key_size, direction);
+    }
+    else
+    {
+        if (direction > 0)
+            tidesdb_iter_seek_sstable_source_forward(iter, source, key, key_size);
+        else
+            tidesdb_iter_seek_sstable_source_backward(iter, source, key, key_size);
+    }
+}
+
+/**
+ * tidesdb_iter_rebuild_for_flip
+ * rebuild the merge heap for a direction change. repositions every cached source onto the
+ * last-returned key (pivot) in the new direction and re-adds it, then heapifies. unlike retreating
+ * or advancing only the sources still in the heap, this revives sources that exhausted in the prior
+ * direction -- tidesdb_merge_heap_pop drops an exhausted source from the heap, so retreating the
+ * survivors alone would silently lose its keys after the flip. the caller's dedup against the held
+ * pivot key skips the pivot itself so the first step returns its neighbor in the new direction.
+ * @param iter iterator
+ * @param pivot last-returned kv (target key for the reposition)
+ * @param direction new direction (1 forward, -1 backward)
+ */
+static void tidesdb_iter_rebuild_for_flip(tidesdb_iter_t *iter, const tidesdb_kv_pair_t *pivot,
+                                          const int direction)
+{
+    /* iterator heaps hold only cached sources, but free any non-cached straggler before clearing to
+     * mirror the seek paths */
+    for (int i = 0; i < iter->heap->num_sources; i++)
+    {
+        if (!iter->heap->sources[i]->is_cached) tidesdb_merge_source_free(iter->heap->sources[i]);
+    }
+    iter->heap->num_sources = 0;
+
+    for (int i = 0; i < iter->num_cached_mt_sources; i++)
+    {
+        tidesdb_merge_source_t *s = (tidesdb_merge_source_t *)iter->cached_mt_sources[i];
+        tidesdb_iter_reposition_source(iter, s, pivot->key, pivot->entry.key_size, direction);
+        if (s->current_kv != NULL) tidesdb_merge_heap_add_source(iter->heap, s);
+    }
+    for (int i = 0; i < iter->num_cached_sources; i++)
+    {
+        tidesdb_merge_source_t *s = (tidesdb_merge_source_t *)iter->cached_sources[i];
+        /* drop any block state left from the prior direction so the seek runs its cursor-consistent
+         * slow path. the backward/forward fast path can reuse a block whose klog cursor is still
+         * positioned for the old direction (e.g. a source exhausted going forward), which then
+         * wraps at the block-0 boundary on retreat and re-emits the source's keys. */
+        if (s->type == MERGE_SOURCE_SSTABLE) tidesdb_iter_release_sst_source_block(s);
+        tidesdb_iter_reposition_source(iter, s, pivot->key, pivot->entry.key_size, direction);
+        if (s->current_kv != NULL) tidesdb_merge_heap_add_source(iter->heap, s);
+    }
+
+    for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
+    {
+        if (direction > 0)
+            heap_sift_down(iter->heap, i);
+        else
+            heap_sift_down_max(iter->heap, i);
+    }
 }
 
 int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key_size)
@@ -32304,42 +32444,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
             }
         }
 
-        tidesdb_kv_pair_free(source->current_kv);
-        source->current_kv = NULL;
-
-        if (source->type == MERGE_SOURCE_MEMTABLE)
-        {
-            tidesdb_iter_seek_memtable_source(source, key, key_size, 1);
-        }
-        else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
-        {
-            /* we build prefixed key and seek, then strip prefix via advance_to_cf */
-            uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
-            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
-            uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
-            if (pk)
-            {
-                tdb_build_prefixed_key(source->source.unified.cf_index, key, key_size, pk);
-                skip_list_cursor_t *cursor = source->source.unified.cursor;
-                if (skip_list_cursor_seek_ge(cursor, pk, pk_total) == 0)
-                {
-                    tidesdb_unified_source_advance_to_cf(source, 1);
-                }
-                if (pk != pk_stack) free(pk);
-            }
-        }
-        else if (source->type == MERGE_SOURCE_BTREE)
-        {
-            tidesdb_iter_seek_btree_source_forward(source, key, key_size);
-        }
-        else if (source->type == MERGE_SOURCE_TXN_OPS)
-        {
-            tidesdb_iter_seek_txn_ops_source(source, key, key_size, 1);
-        }
-        else
-        {
-            tidesdb_iter_seek_sstable_source_forward(iter, source, key, key_size);
-        }
+        tidesdb_iter_reposition_source(iter, source, key, key_size, 1);
 
         if (source->current_kv != NULL)
         {
@@ -32442,41 +32547,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
             }
         }
 
-        tidesdb_kv_pair_free(source->current_kv);
-        source->current_kv = NULL;
-
-        if (source->type == MERGE_SOURCE_MEMTABLE)
-        {
-            tidesdb_iter_seek_memtable_source(source, key, key_size, -1);
-        }
-        else if (source->type == MERGE_SOURCE_UNIFIED_MEMTABLE)
-        {
-            uint8_t pk_stack[TDB_PREFIXED_KEY_STACK_MAX];
-            const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + key_size;
-            uint8_t *pk = pk_total <= sizeof(pk_stack) ? pk_stack : malloc(pk_total);
-            if (pk)
-            {
-                tdb_build_prefixed_key(source->source.unified.cf_index, key, key_size, pk);
-                skip_list_cursor_t *cursor = source->source.unified.cursor;
-                if (skip_list_cursor_seek_for_prev(cursor, pk, pk_total) == 0)
-                {
-                    tidesdb_unified_source_advance_to_cf(source, 0);
-                }
-                if (pk != pk_stack) free(pk);
-            }
-        }
-        else if (source->type == MERGE_SOURCE_BTREE)
-        {
-            tidesdb_iter_seek_btree_source_backward(source, key, key_size);
-        }
-        else if (source->type == MERGE_SOURCE_TXN_OPS)
-        {
-            tidesdb_iter_seek_txn_ops_source(source, key, key_size, -1);
-        }
-        else
-        {
-            tidesdb_iter_seek_sstable_source_backward(iter, source, key, key_size);
-        }
+        tidesdb_iter_reposition_source(iter, source, key, key_size, -1);
 
         if (source->current_kv != NULL)
         {
@@ -32874,24 +32945,11 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     iter->current = NULL;
     iter->valid = 0;
 
-    /* if direction changed, we advance all sources and rebuild as min-heap */
-    if (direction_changed)
-    {
-        for (int i = 0; i < iter->heap->num_sources; i++)
-        {
-            tidesdb_merge_source_t *source = iter->heap->sources[i];
-            if (tidesdb_merge_source_advance(source) != TDB_SUCCESS)
-            {
-                source->current_kv = NULL;
-            }
-        }
-
-        /* we rebuild as min-heap for forward iteration */
-        for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
-        {
-            heap_sift_down(iter->heap, i);
-        }
-    }
+    /* on a flip from backward to forward, rebuild the heap from every cached source positioned at
+     * the last-returned key. retreating only the in-heap survivors would drop any source that
+     * exhausted going backward (merge_heap_pop removes it from the heap), losing its forward keys.
+     * the dedup against prev below skips the pivot key itself so we advance to its successor. */
+    if (direction_changed) tidesdb_iter_rebuild_for_flip(iter, prev, 1);
 
     /* we pop from heap until we find next visible entry */
     while (!tidesdb_merge_heap_empty(iter->heap))
@@ -32961,24 +33019,11 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
     iter->current = NULL;
     iter->valid = 0;
 
-    /* if direction changed, we retreat all sources and rebuild as max-heap */
-    if (direction_changed)
-    {
-        for (int i = 0; i < iter->heap->num_sources; i++)
-        {
-            tidesdb_merge_source_t *source = iter->heap->sources[i];
-            if (tidesdb_merge_source_retreat(source) != TDB_SUCCESS)
-            {
-                source->current_kv = NULL;
-            }
-        }
-
-        /* we rebuild as max-heap for backward iteration */
-        for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
-        {
-            heap_sift_down_max(iter->heap, i);
-        }
-    }
+    /* on a flip from forward to backward, rebuild the heap from every cached source positioned at
+     * the last-returned key. retreating only the in-heap survivors would drop any source that
+     * exhausted going forward (merge_heap_pop removes it from the heap), losing its backward keys.
+     * the dedup against prev below skips the pivot key itself so we step to its predecessor. */
+    if (direction_changed) tidesdb_iter_rebuild_for_flip(iter, prev, -1);
 
     /* we pop from max-heap until we find previous visible entry */
     while (!tidesdb_merge_heap_empty(iter->heap))
@@ -34317,10 +34362,24 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     (*stats)->num_levels = num_levels;
-    tidesdb_memtable_t *active_mt_struct =
-        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
-    (*stats)->memtable_size = skip_list_get_size(active_mt);
+
+    /* pin the active memtable before reading its skip list -- a raw load+deref races a concurrent
+     * rotation that flushes and frees the old active out from under us, the same UAF the read path
+     * and tidesdb_get_db_stats guard against. capture both size and entry count under the pin */
+    size_t active_mt_size = 0;
+    uint64_t active_mt_keys = 0;
+    tidesdb_memtable_t *active_mt_struct = NULL;
+    if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
+                                        &active_mt_struct))
+    {
+        if (active_mt_struct->skip_list)
+        {
+            active_mt_size = (size_t)skip_list_get_size(active_mt_struct->skip_list);
+            active_mt_keys = (uint64_t)skip_list_count_entries(active_mt_struct->skip_list);
+        }
+        tidesdb_immutable_memtable_unref(active_mt_struct);
+    }
+    (*stats)->memtable_size = active_mt_size;
 
     (*stats)->level_sizes = malloc((*stats)->num_levels * sizeof(size_t));
     (*stats)->level_num_sstables = malloc((*stats)->num_levels * sizeof(int));
@@ -34342,30 +34401,30 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
 
     memcpy((*stats)->config, &cf->config, sizeof(tidesdb_column_family_config_t));
 
-    /* we count memtable keys */
-    const uint64_t memtable_keys = active_mt ? (uint64_t)skip_list_count_entries(active_mt) : 0;
-    uint64_t total_keys = memtable_keys;
+    uint64_t total_keys = active_mt_keys;
     uint64_t total_data_size = 0;
     uint64_t total_klog_size = 0;
 
-    /* immutable memtables still hold live data not yet on disk, thus we fold their
-     * bytes into memtable_size and their entries into total_keys. a flushed
-     * immutable is skipped, its data is already on disk and counted in the
-     * sstable totals, and it only lingers in the queue until batched cleanup */
-    if (cf->immutable_memtables)
+    /* immutable memtables still hold live data not yet on disk, thus we fold their bytes into
+     * memtable_size and their entries into total_keys. read them through the lock-free snapshot --
+     * the same gap-free source the read path uses -- not the raw queue. walking the raw queue races
+     * the flush-worker cleanup, which dequeues an immutable and re-enqueues it a few statements
+     * later (queue_enqueue does not hold read_lock), so a not-yet-flushed immutable is transiently
+     * absent and its still-in-memory keys vanish from the count. the snapshot already skips flushed
+     * immutables (their data is on disk and counted in the sstable totals) */
     {
-        queue_t *iq = cf->immutable_memtables;
-        pthread_rwlock_rdlock(&iq->read_lock);
-        for (queue_node_t *n = iq->head->next; n != NULL; n = n->next)
+        size_t imm_count = 0;
+        tidesdb_immutable_memtable_t **imms = tidesdb_snapshot_immutable_memtables(cf, &imm_count);
+        for (size_t i = 0; i < imm_count; i++)
         {
-            tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)n->data;
-            if (imm && imm->skip_list && !atomic_load_explicit(&imm->flushed, memory_order_acquire))
+            if (imms[i]->skip_list)
             {
-                (*stats)->memtable_size += skip_list_get_size(imm->skip_list);
-                total_keys += (uint64_t)skip_list_count_entries(imm->skip_list);
+                (*stats)->memtable_size += (size_t)skip_list_get_size(imms[i]->skip_list);
+                total_keys += (uint64_t)skip_list_count_entries(imms[i]->skip_list);
             }
+            tidesdb_immutable_memtable_unref(imms[i]);
         }
-        pthread_rwlock_unlock(&iq->read_lock);
+        free(imms);
     }
 
     /* btree stats aggregation */
@@ -34582,18 +34641,20 @@ int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats)
                 stats->total_memtable_bytes += (int64_t)skip_list_get_size(amt->skip_list);
             tidesdb_immutable_memtable_unref(amt);
         }
-        if (cf->immutable_memtables)
+        /* fold immutable bytes through the lock-free snapshot, not the raw queue -- walking the
+         * live queue races the flush-worker cleanup's dequeue/re-enqueue and transiently drops a
+         * not-yet-flushed immutable (see tidesdb_get_stats). the snapshot already skips flushed */
         {
-            queue_t *iq = cf->immutable_memtables;
-            pthread_rwlock_rdlock(&iq->read_lock);
-            for (queue_node_t *n = iq->head->next; n != NULL; n = n->next)
+            size_t imm_count = 0;
+            tidesdb_immutable_memtable_t **imms =
+                tidesdb_snapshot_immutable_memtables(cf, &imm_count);
+            for (size_t i = 0; i < imm_count; i++)
             {
-                tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)n->data;
-                if (imm && imm->skip_list &&
-                    !atomic_load_explicit(&imm->flushed, memory_order_acquire))
-                    stats->total_memtable_bytes += (int64_t)skip_list_get_size(imm->skip_list);
+                if (imms[i]->skip_list)
+                    stats->total_memtable_bytes += (int64_t)skip_list_get_size(imms[i]->skip_list);
+                tidesdb_immutable_memtable_unref(imms[i]);
             }
-            pthread_rwlock_unlock(&iq->read_lock);
+            free(imms);
         }
 
         int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);

@@ -24726,11 +24726,25 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         return TDB_SUCCESS;
     }
 
+    /* the new active memtable never receives writes when the db is unified (writes go to the shared
+     * unified memtable, mirroring tidesdb_create_column_family) or when this rotation is part of
+     * close (the new active is torn down right after). a minimal arena then avoids reserving
+     * write_buffer_size x TDB_MEMTABLE_ARENA_SIZE_FACTOR for a memtable that stays empty -- on the
+     * 64MB default that is a 128MB block that needlessly fails under a constrained address space.
+     * recovery is excluded (is_recovering) so the post-recovery active, which does take writes,
+     * keeps its full arena. */
+    const int new_active_unused =
+        cf->db->unified_mt.enabled ||
+        (!atomic_load_explicit(&cf->db->is_open, memory_order_acquire) &&
+         !atomic_load_explicit(&cf->db->is_recovering, memory_order_acquire));
+    const size_t new_arena_init =
+        new_active_unused ? TDB_UNIFIED_PER_CF_ARENA_INIT
+                          : cf->config.write_buffer_size * TDB_MEMTABLE_ARENA_SIZE_FACTOR;
+
     skip_list_t *new_memtable;
-    if (skip_list_new_with_arena(
-            &new_memtable, cf->config.skip_list_max_level, cf->config.skip_list_probability,
-            comparator_fn, comparator_ctx, &cf->db->cached_current_time,
-            cf->config.write_buffer_size * TDB_MEMTABLE_ARENA_SIZE_FACTOR) != 0)
+    if (skip_list_new_with_arena(&new_memtable, cf->config.skip_list_max_level,
+                                 cf->config.skip_list_probability, comparator_fn, comparator_ctx,
+                                 &cf->db->cached_current_time, new_arena_init) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to create new memtable", cf->name);
         atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);

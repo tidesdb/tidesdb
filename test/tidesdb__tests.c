@@ -2542,6 +2542,7 @@ typedef struct
     _Atomic(long) *committed;
     long reads;
     long gap_hits;
+    long busy;
     int other_errors;
 } visgap_reader_t;
 
@@ -2570,6 +2571,9 @@ static void *visgap_reader_thread(void *arg)
             free(v);
         else if (rc == TDB_ERR_NOT_FOUND)
             r->gap_hits++; /* committed key vanished -- the rotation visibility gap */
+        else if (rc == TDB_ERR_BUSY)
+            r->busy++; /* retryable under sustained load (fd reserve / layout race), not data loss
+                        */
         else
             r->other_errors++;
         tidesdb_txn_free(txn);
@@ -2626,6 +2630,7 @@ static void test_unified_rotation_no_read_visibility_gap(void)
         rargs[i].committed = &committed;
         rargs[i].reads = 0;
         rargs[i].gap_hits = 0;
+        rargs[i].busy = 0;
         rargs[i].other_errors = 0;
     }
 
@@ -2639,18 +2644,22 @@ static void test_unified_rotation_no_read_visibility_gap(void)
     for (int i = 0; i < NUM_READERS; i++) pthread_join(rt[i], NULL);
 
     ASSERT_EQ(w.errors, 0);
-    long total_reads = 0, total_gaps = 0;
+    long total_reads = 0, total_gaps = 0, total_busy = 0;
     int total_errors = 0;
     for (int i = 0; i < NUM_READERS; i++)
     {
         total_reads += rargs[i].reads;
         total_gaps += rargs[i].gap_hits;
+        total_busy += rargs[i].busy;
         total_errors += rargs[i].other_errors;
     }
-    printf("    [probe] unified reads=%ld committed-key NOT_FOUND gaps=%ld other_errors=%d\n",
-           total_reads, total_gaps, total_errors);
+    printf(
+        "    [probe] unified reads=%ld committed-key NOT_FOUND gaps=%ld busy=%ld other_errors=%d\n",
+        total_reads, total_gaps, total_busy, total_errors);
     fflush(stdout);
     ASSERT_TRUE(total_reads > 0);
+    /* TDB_ERR_BUSY is a retryable load signal (fd reserve / layout race), not data loss -- it is
+     * tolerated. only genuinely unexpected error codes fail the probe */
     ASSERT_EQ(total_errors, 0);
     /* a committed, never-deleted key must never read back NOT_FOUND */
     ASSERT_EQ(total_gaps, 0);

@@ -1747,10 +1747,25 @@ static void *stats_probe_writer_thread(void *arg)
             tidesdb_txn_free(txn);
             continue;
         }
-        if (tidesdb_txn_commit(txn) != 0)
+        /* TDB_ERR_BUSY is retryable backpressure, not a failure -- with the tiny write buffer every
+         * commit rotates and flushes, so the flush engine can saturate on a slow runner and defer
+         * the commit. retry until it lands (or the sampler signals stop), matching the
+         * tdb_test_commit_with_retry pattern used across these concurrency tests; only a genuine
+         * non-BUSY error counts. */
+        int crc = tidesdb_txn_commit(txn);
+        while (crc == TDB_ERR_BUSY && !(w->stop && atomic_load(w->stop)))
+        {
+            usleep(1000);
+            crc = tidesdb_txn_commit(txn);
+        }
+        if (crc == 0)
+        {
+            if (w->committed) atomic_fetch_add(w->committed, 1);
+        }
+        else if (crc != TDB_ERR_BUSY)
+        {
             w->errors++;
-        else if (w->committed)
-            atomic_fetch_add(w->committed, 1);
+        }
         tidesdb_txn_free(txn);
     }
     return NULL;

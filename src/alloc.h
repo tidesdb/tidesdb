@@ -122,6 +122,19 @@ void tidesdb_ensure_initialized(void);
  * code that calls them automatically routes through the configured allocator with no source
  * changes. this affects every translation unit that includes this header (directly or via
  * tidesdb.h), which is what keeps all tidesdb allocations and frees on a single allocator.
+ *
+ * two invariants come with the redirection. first, never free a pointer that a libc function
+ * allocated internally -- strdup, strndup, getline, getdelim, asprintf, realpath, scandir and the
+ * like -- through this redirected free. it came from the real libc malloc, and under a custom
+ * allocator the redirected free hands it to a different heap, which is undefined behavior.
+ * duplicate owned strings with tdb_strdup below, which allocates through the redirected malloc so
+ * the result frees cleanly, and add tdb_-prefixed equivalents for any other such need. the core
+ * library holds to this -- it uses no libc allocating helper, only tdb_strdup.
+ *
+ * second, include order matters. the redirection rewrites every later malloc/free token in the
+ * translation unit, including prototypes and inline bodies in headers pulled in after this one, so
+ * system and third-party headers must be included before this header, or before tidesdb.h. the
+ * libc headers this file needs are included above the redirection for exactly that reason.
  */
 #undef malloc
 #undef calloc

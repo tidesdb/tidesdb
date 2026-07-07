@@ -1,9 +1,10 @@
 ### When contributing to TidesDB, keep a couple things in mind:
 
 - Make sure your code comments are all lower case and in English and using `/* */` style.
+- Avoid redundant comments
 - When adding to tidesdb.c or tidesdb.h please make sure you follow prefixing conventions for internal, public methods.
 - Use `code_formatter.sh` to format source code before submitting a pull request.
-- Assure your changes are tested and pass all tests.
+- Assure your changes are unit and integration tested and pass all tests.
 - Make sure your changes are well documented.
 
 ### Contributor License Agreement (CLA)

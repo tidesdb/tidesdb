@@ -43,24 +43,30 @@ typedef enum
 
 /**
  * compress_data
- * compresses data using the specified compression algorithm
+ * compresses data using the specified compression algorithm. type must be a real codec, not
+ * TDB_COMPRESS_NONE -- NONE means "store the bytes verbatim" and is the caller's job, so it is not
+ * a valid argument here and returns NULL like any other unsupported type. a type whose backend was
+ * not compiled into this build likewise returns NULL; a NULL return is always a failure, never a
+ * "no compression" signal.
  * @param data the data to compress
  * @param data_size the size of the data
- * @param compressed_size the size of the compressed data
- * @param type the compression algorithm to use
+ * @param compressed_size out-param for the compressed size; must not be NULL
+ * @param type the compression algorithm to use (must not be TDB_COMPRESS_NONE)
  * @return newly allocated compressed data (caller frees), or NULL on failure (bad args,
- *         allocation failure, unsupported type, or a codec error)
+ *         allocation failure, unsupported/uncompiled type, or a codec error)
  */
 uint8_t *compress_data(const uint8_t *data, size_t data_size, size_t *compressed_size,
                        compression_algorithm type);
 
 /**
  * decompress_data
- * decompresses data using the specified compression algorithm
+ * decompresses data using the specified compression algorithm. as with compress_data, type must be
+ * a real codec, not TDB_COMPRESS_NONE -- the caller reads verbatim bytes itself and only calls this
+ * for data it actually compressed. the type must match the one the data was compressed with.
  * @param data the data to decompress
  * @param data_size the size of the data
- * @param decompressed_size the size of the decompressed data
- * @param type the compression algorithm to use
+ * @param decompressed_size out-param for the decompressed size; must not be NULL
+ * @param type the compression algorithm to use (must not be TDB_COMPRESS_NONE)
  * @return newly allocated decompressed data (caller frees), or NULL on failure (bad args,
  *         allocation failure, or a codec/corruption error)
  */

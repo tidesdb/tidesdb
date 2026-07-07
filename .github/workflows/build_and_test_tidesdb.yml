@@ -460,6 +460,13 @@ jobs:
             CTEST_OUTPUT_ON_FAILURE=1 TIDESDB_QEMU_SKIP=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
             echo "**Linux RISC-V 64-bit tests run via QEMU emulation"
           else
+            if [ "${{ matrix.arch }}" == "x86" ]; then
+              # 32-bit ASan gives each thread an ~11MB FakeStack for
+              # detect_stack_use_after_return; the many-thread concurrent multi-CF
+              # tests exhaust the 32-bit address space and ASan OOMs. disable it on
+              # this lane only -- the x86-64 ASan job keeps that coverage.
+              export ASAN_OPTIONS="detect_stack_use_after_return=0"
+            fi
             ctest -V --output-on-failure --timeout 5400 --build-config Release
           fi
 

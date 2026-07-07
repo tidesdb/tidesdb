@@ -653,6 +653,14 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, const uint8_t *value, size_t value_size, time_t ttl);
 int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                     size_t key_size, uint8_t **value, size_t *value_size);
+/* non-tracking point get -- resolves at the snapshot but does not record the read into the txn's
+ * conflict footprint. for existence probes (e.g. PK-uniqueness on insert) that should not pollute
+ * the write-write reservation base. */
+int tidesdb_txn_get_notrack(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                            size_t key_size, uint8_t **value, size_t *value_size);
+/* non-tracking existence check; TDB_SUCCESS if present, TDB_ERR_NOT_FOUND if absent. */
+int tidesdb_txn_contains(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                         size_t key_size);
 int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                        size_t key_size);
 int tidesdb_txn_single_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
@@ -792,6 +800,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
 /**** statistics operations */
 int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
 void tidesdb_free_stats(tidesdb_stats_t *stats);
+int tidesdb_cf_estimate_cardinality(tidesdb_column_family_t *cf, uint64_t *out_estimate);
 int tidesdb_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *stats);
 int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 

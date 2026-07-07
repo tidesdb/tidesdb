@@ -24,11 +24,13 @@
 #define CLOCK_CACHE_PARTITION_FULL_THRESHOLD 85
 #define CLOCK_CACHE_REF_BIT                  1u
 #define CLOCK_CACHE_READER_INC               2u
-#define CLOCK_CACHE_REF_MASK                 ((uint8_t)(~1u & 0xFFu))
+#define CLOCK_CACHE_REF_MASK                 (~1u)
 #define CLOCK_CACHE_HAS_READERS(ref)         (((ref)&CLOCK_CACHE_REF_MASK) != 0)
-/* reader field (bits 1-7) is saturated, all reader bits set == 127 concurrent readers.
- * one more READER_INC would carry out of the byte and wrap the field to 0, which would make
- * HAS_READERS read false while readers are live -- free_entry would then free under them. */
+/* ref_bit packs the clock reference bit (bit 0) and a reader count (bits 1-31). the field is
+ * saturated when all reader bits are set == 2^31-1 concurrent readers. one more READER_INC would
+ * carry out of the word and wrap the field to 0, which would make HAS_READERS read false while
+ * readers are live -- free_entry would then free under them. the 32-bit width puts the cap far
+ * beyond any real thread count, so cc_try_pin_reader effectively never refuses a pin. */
 #define CLOCK_CACHE_READERS_SATURATED(ref) (((ref)&CLOCK_CACHE_REF_MASK) == CLOCK_CACHE_REF_MASK)
 #define CLOCK_CACHE_PAYLOAD_ALIGN          8 /* align payload for safe typed access */
 #define CLOCK_CACHE_ALIGN_UP(x, a)         (((x) + ((a)-1)) & ~((size_t)(a)-1))
@@ -189,9 +191,11 @@ static inline uint64_t compute_hash(const char *key, const size_t key_len)
  * @param partition the partition
  * @param hash the hash
  * @param slot_idx the slot index
+ * @return 0 on success, -1 if the probe chain was full (caller must not leave the entry
+ * indexed-less)
  */
-static void hash_table_insert(clock_cache_partition_t *partition, uint64_t hash,
-                              const size_t slot_idx)
+static int hash_table_insert(clock_cache_partition_t *partition, uint64_t hash,
+                             const size_t slot_idx)
 {
     clock_cache_entry_t *slot = &partition->slots[slot_idx];
 
@@ -213,16 +217,21 @@ static void hash_table_insert(clock_cache_partition_t *partition, uint64_t hash,
          * just advances to the next probe position */
         if (atomic_compare_exchange_weak(&partition->hash_index[pos], &expected, (int32_t)slot_idx))
         {
-            return;
+            return 0;
         }
 
         /* CAS failed; expected now holds the current value (CAS updates it on failure).
          * we check if this slot already points to our entry (reuse case) */
         if (expected == (int32_t)slot_idx)
         {
-            return; /* already indexed */
+            return 0; /* already indexed */
         }
     }
+
+    /* the probe chain was full -- the entry cannot be indexed. at a load factor near 0.5 this
+     * needs a pathological hash cluster, but the caller must roll the entry back rather than leave
+     * it valid-but-unfindable, so report the failure. */
+    return -1;
 }
 
 /**
@@ -307,11 +316,11 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
  * returns 1 with a ref held, 0 if already at max readers */
 static inline int cc_try_pin_reader(clock_cache_entry_t *entry)
 {
-    uint8_t cur = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
+    uint32_t cur = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
     for (;;)
     {
         if (CLOCK_CACHE_READERS_SATURATED(cur)) return 0;
-        const uint8_t desired = (uint8_t)(cur + CLOCK_CACHE_READER_INC);
+        const uint32_t desired = cur + CLOCK_CACHE_READER_INC;
         if (atomic_compare_exchange_weak_explicit(&entry->ref_bit, &cur, desired,
                                                   memory_order_acq_rel, memory_order_relaxed))
             return 1;
@@ -446,7 +455,7 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     }
 
     /* we check if entry is being read (upper bits indicate active readers) */
-    uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+    uint32_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
     if (CLOCK_CACHE_HAS_READERS(ref))
     {
         /* entry is being read by active readers, revert state and abort */
@@ -474,7 +483,9 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         atomic_store_explicit(&entry->key, key, memory_order_release);
         atomic_store_explicit(&entry->payload, payload, memory_order_release);
         atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
-        hash_table_insert(partition, hash, slot_idx);
+        /* best-effort re-index on the restore path -- if the probe chain is full the entry stays
+         * valid but unindexed, the pinned reader keeps it alive, and CLOCK reclaims it later */
+        (void)hash_table_insert(partition, hash, slot_idx);
         return;
     }
 
@@ -536,7 +547,7 @@ static int evict_for_space(clock_cache_t *cache, clock_cache_partition_t *partit
             const uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
             if (state != ENTRY_VALID) continue;
 
-            const uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+            const uint32_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
             if (CLOCK_CACHE_HAS_READERS(ref)) continue;
 
             if ((ref & CLOCK_CACHE_REF_BIT) == 0)
@@ -606,7 +617,7 @@ static size_t clock_evict(clock_cache_t *cache, clock_cache_partition_t *partiti
         }
 
         /* we check reference bit and active readers */
-        uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+        uint32_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
         if (CLOCK_CACHE_HAS_READERS(ref))
         {
             if (ref & CLOCK_CACHE_REF_BIT)
@@ -781,9 +792,6 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
     cache->max_bytes = config->max_bytes;
     cache->partition_mask = config->num_partitions - 1; /* assumes power of 2 */
     cache->evict_callback = config->evict_callback;     /* store eviction callback */
-    atomic_store_explicit(&cache->total_bytes, 0, memory_order_relaxed);
-    atomic_store_explicit(&cache->hits, 0, memory_order_relaxed);
-    atomic_store_explicit(&cache->misses, 0, memory_order_relaxed);
     atomic_store_explicit(&cache->shutdown, 0, memory_order_relaxed);
 
     /** we detect L3/CCX topology for NUMA-aware partition routing */
@@ -1021,7 +1029,15 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
 
-    hash_table_insert(partition, hash, slot_idx);
+    if (hash_table_insert(partition, hash, slot_idx) != 0)
+    {
+        /* the probe chain was full so the entry can't be indexed, and leaving it valid would strand
+         * an unfindable ghost holding a slot and byte budget until CLOCK reclaims it. free it
+         * cleanly instead -- free_entry runs the reader-safe teardown and undoes the accounting, so
+         * the put simply doesn't cache and the next lookup misses and repopulates. */
+        free_entry(cache, partition, entry);
+        return -1;
+    }
 
     return 0;
 }
@@ -1092,7 +1108,13 @@ int clock_cache_put_new(clock_cache_t *cache, const char *key, size_t key_len, c
     atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
 
-    hash_table_insert(partition, hash, slot_idx);
+    if (hash_table_insert(partition, hash, slot_idx) != 0)
+    {
+        /* probe chain full -- roll the entry back cleanly rather than strand an unfindable ghost
+         * (see clock_cache_put for the rationale) */
+        free_entry(cache, partition, entry);
+        return -1;
+    }
 
     return 0;
 }
@@ -1138,7 +1160,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     /* we release reader ref and conditionally mark as recently used
      * combining two atomic RMWs into one when ref bit is already set (hot entries) */
-    const uint8_t old_ref =
+    const uint32_t old_ref =
         atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
     if (!(old_ref & CLOCK_CACHE_REF_BIT))
     {
@@ -1187,7 +1209,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
 
     /* we conditionally mark as recently used -- skip atomic RMW when ref bit is already set
      * (hot entries); caller releases ref via clock_cache_release() */
-    uint8_t cur_ref = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
+    uint32_t cur_ref = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
     if (!(cur_ref & CLOCK_CACHE_REF_BIT))
     {
         atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);

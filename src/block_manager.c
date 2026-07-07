@@ -1234,6 +1234,91 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     return block;
 }
 
+int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return -1;
+
+    /* a reservation hole reads back as a zero size field. a nonzero size is either a real block or
+     * genuine corruption block_manager_cursor_skip_corrupt already stopped on, so leave it alone.
+     */
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+              (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+        return -1;
+    if (decode_uint32_le_compat(size_buf) != 0) return -1;
+
+    const uint64_t extent =
+        atomic_load_explicit(&cursor->bm->current_file_size, memory_order_acquire);
+
+    unsigned char magic[BLOCK_MANAGER_CHECKSUM_LENGTH];
+    encode_uint32_le_compat(magic, BLOCK_MANAGER_FOOTER_MAGIC);
+
+    /* small on-stack scan window -- a big buffer is risky on platforms with small thread stacks and
+     * the loop re-reads, so it buys nothing. windows overlap by the magic length minus one so a
+     * magic straddling a window boundary is still found. */
+    enum
+    {
+        BM_RESYNC_CHUNK = 8 * 1024
+    };
+    unsigned char buf[BM_RESYNC_CHUNK];
+
+    /* a footer magic at absolute offset m ends the block whose footer_size sits at m minus the size
+     * field and whose start is one header, its data, and one footer before the end of the magic.
+     * every candidate is validated by re-reading the framed block, so a magic-shaped byte run in a
+     * value cannot fool the resync, and a zero region holds no magic and resolves to end of data.
+     */
+    uint64_t pos = cursor->current_pos;
+    while (pos + BLOCK_MANAGER_FOOTER_SIZE <= extent)
+    {
+        size_t want = BM_RESYNC_CHUNK;
+        if ((uint64_t)want > extent - pos) want = (size_t)(extent - pos);
+
+        const ssize_t got = pread(cursor->bm->fd, buf, want, (off_t)pos);
+        if (got < (ssize_t)BLOCK_MANAGER_CHECKSUM_LENGTH) break;
+
+        for (ssize_t i = 0; i + (ssize_t)BLOCK_MANAGER_CHECKSUM_LENGTH <= got; i++)
+        {
+            if (buf[i] != magic[0] || memcmp(buf + i, magic, BLOCK_MANAGER_CHECKSUM_LENGTH) != 0)
+                continue;
+
+            const uint64_t abs_magic = pos + (uint64_t)i;
+            if (abs_magic < BLOCK_MANAGER_SIZE_FIELD_SIZE) continue;
+
+            unsigned char fsize_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+            if (pread(cursor->bm->fd, fsize_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                      (off_t)(abs_magic - BLOCK_MANAGER_SIZE_FIELD_SIZE)) !=
+                BLOCK_MANAGER_SIZE_FIELD_SIZE)
+                continue;
+            const uint32_t fsize = decode_uint32_le_compat(fsize_buf);
+            if (fsize == 0) continue;
+
+            const uint64_t frame =
+                BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)fsize + BLOCK_MANAGER_FOOTER_SIZE;
+            const uint64_t magic_end = abs_magic + BLOCK_MANAGER_CHECKSUM_LENGTH;
+            if (magic_end < frame) continue;
+            const uint64_t block_start = magic_end - frame;
+            if (block_start < cursor->current_pos) continue;
+
+            /* validate the whole frame by re-reading it -- the checksum inside bm_read_block_tls is
+             * the gate that rejects a false-positive magic */
+            uint32_t validated_size = 0;
+            if (bm_read_block_tls(cursor->bm->fd, block_start, extent, 0, &validated_size) &&
+                validated_size == fsize)
+            {
+                cursor->current_pos = block_start;
+                cursor->current_block_size = 0;
+                cursor->block_size_valid = 0;
+                return 0;
+            }
+        }
+
+        if ((uint64_t)got < want) break; /* short read means we reached end of file */
+        pos += (uint64_t)got - (BLOCK_MANAGER_CHECKSUM_LENGTH - 1);
+    }
+
+    return -1;
+}
+
 block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 {
     if (!cursor) return NULL;

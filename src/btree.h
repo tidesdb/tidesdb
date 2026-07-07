@@ -32,10 +32,6 @@
 #define BTREE_UNLIKELY(x) (x)
 #endif
 
-/* magic number "BTR+" in hex */
-#define BTREE_MAGIC   0x4254522B
-#define BTREE_VERSION 1
-
 /* btree clock-cache key layout. each key is "<cache_key_prefix><sep><offset_hex>" where
  * cache_key_prefix is set by tidesdb_sstable_create. exposed in the header so cache
  * invalidation paths in tidesdb.c can build matching prefixes. */
@@ -354,7 +350,11 @@ int btree_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t
 
 /**
  * btree_comparator_numeric
- * numeric comparator for 8-byte keys
+ * numeric comparator for 8-byte keys interpreted as host-native uint64. this orders keys by their
+ * value as a machine integer, so the ordering is host-native and not portable across hosts of
+ * differing endianness, and neither is a btree of a numeric column family. for an ordering that
+ * survives a cross-endian move, store keys big-endian and use the default memcmp comparator, which
+ * yields the same order portably. keys that are not exactly 8 bytes fall back to memcmp.
  * @param key1 first key
  * @param key1_size size of first key
  * @param key2 second key

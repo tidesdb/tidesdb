@@ -3418,6 +3418,26 @@ void test_skip_list_new_validation()
     ASSERT_EQ(skip_list_new(&list, 12, 1.5f), -1);
 }
 
+void test_skip_list_comparator_numeric_size_guard()
+{
+    /* 8-byte keys compare as host-native integers */
+    uint64_t a = 5, b = 9;
+    ASSERT_TRUE(skip_list_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&b, 8, NULL) < 0);
+    ASSERT_TRUE(skip_list_comparator_numeric((uint8_t *)&b, 8, (uint8_t *)&a, 8, NULL) > 0);
+    ASSERT_EQ(skip_list_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&a, 8, NULL), 0);
+
+    /* a key that is not 8 bytes must not drive an 8-byte read; it falls back to memcmp order */
+    const uint8_t short_key[3] = {'a', 'b', 'c'};
+    const uint8_t long_key[8] = {'a', 'b', 'c', 'd', 0, 0, 0, 0};
+    ASSERT_TRUE(skip_list_comparator_numeric(short_key, sizeof(short_key), long_key,
+                                             sizeof(long_key), NULL) < 0);
+    ASSERT_TRUE(skip_list_comparator_numeric(long_key, sizeof(long_key), short_key,
+                                             sizeof(short_key), NULL) > 0);
+    ASSERT_EQ(skip_list_comparator_numeric(short_key, sizeof(short_key), short_key,
+                                           sizeof(short_key), NULL),
+              0);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -3472,6 +3492,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_cached_time_ttl, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek_ge, tests_passed);
     RUN_TEST(test_skip_list_new_validation, tests_passed);
+    RUN_TEST(test_skip_list_comparator_numeric_size_guard, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);

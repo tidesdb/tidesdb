@@ -72,9 +72,6 @@
  * floating-point edge cases). typical real-world h is 7-15. */
 #define BF_MAX_HASH_FUNCTIONS 100
 
-/* varint worst-case sizes -- bound the parse loops in the bounded decoders */
-#define BF_VARINT32_MAX_BYTES 5
-#define BF_VARINT64_MAX_BYTES 10
 /* raw bytes per dense bitset word (uint64 little-endian) */
 #define BF_DENSE_WORD_BYTES 8
 
@@ -98,12 +95,14 @@ static inline uint32_t bf_hash_inline(const uint8_t *entry, const size_t size, c
     const uint8_t *limit = entry + size;
     uint32_t h = seed ^ ((uint32_t)size * prime);
 
+    /* read each 4-byte chunk little-endian so a key hashes identically on every host, matching the
+     * byte-wise tail below rather than depending on host byte order. on a little-endian host this
+     * is the same value the old host-order read produced, so existing filters keep querying. */
 #if UINTPTR_MAX == UINT64_MAX
     while (entry + 8 <= limit)
     {
-        uint32_t w1, w2;
-        memcpy(&w1, entry, sizeof(w1));
-        memcpy(&w2, entry + 4, sizeof(w2));
+        const uint32_t w1 = decode_uint32_le_compat(entry);
+        const uint32_t w2 = decode_uint32_le_compat(entry + 4);
         entry += 8;
         h += w1;
         h *= prime;
@@ -114,8 +113,7 @@ static inline uint32_t bf_hash_inline(const uint8_t *entry, const size_t size, c
     }
     if (entry + 4 <= limit)
     {
-        uint32_t w;
-        memcpy(&w, entry, sizeof(w));
+        const uint32_t w = decode_uint32_le_compat(entry);
         entry += 4;
         h += w;
         h *= prime;
@@ -124,8 +122,7 @@ static inline uint32_t bf_hash_inline(const uint8_t *entry, const size_t size, c
 #else
     while (entry + 4 <= limit)
     {
-        uint32_t w;
-        memcpy(&w, entry, sizeof(w));
+        const uint32_t w = decode_uint32_le_compat(entry);
         entry += 4;
         h += w;
         h *= prime;
@@ -459,50 +456,23 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     return buffer;
 }
 
-/* bounded varint decoders -- read at most the bytes a 32/64-bit value can occupy
- * and never past `end`. return 0 and advance *pp on success, -1 on truncation or a
- * malformed (unterminated) varint. these replace the unbounded compat decoders on
- * the parse-untrusted-bytes path so a corrupt buffer cannot drive an over-read. */
+/* thin adapters over the canonical bounded decoders in compat.h -- advance *pp and return 0 on
+ * success, -1 on truncation or an overlong varint, keeping the caller's advance-and-status style.
+ */
 static int bf_get_varint32(const uint8_t **pp, const uint8_t *end, uint32_t *out)
 {
-    uint32_t result = 0;
-    int shift = 0;
-    const uint8_t *p = *pp;
-    for (int i = 0; i < BF_VARINT32_MAX_BYTES; i++)
-    {
-        if (p >= end) return -1;
-        const uint8_t b = *p++;
-        result |= (uint32_t)(b & 0x7Fu) << shift;
-        if (!(b & 0x80u))
-        {
-            *pp = p;
-            *out = result;
-            return 0;
-        }
-        shift += 7;
-    }
-    return -1; /* no terminator within the max byte budget */
+    const uint8_t *next = decode_varint32_safe(*pp, end, out);
+    if (!next) return -1;
+    *pp = next;
+    return 0;
 }
 
 static int bf_get_varint64(const uint8_t **pp, const uint8_t *end, uint64_t *out)
 {
-    uint64_t result = 0;
-    int shift = 0;
-    const uint8_t *p = *pp;
-    for (int i = 0; i < BF_VARINT64_MAX_BYTES; i++)
-    {
-        if (p >= end) return -1;
-        const uint8_t b = *p++;
-        result |= (uint64_t)(b & 0x7Fu) << shift;
-        if (!(b & 0x80u))
-        {
-            *pp = p;
-            *out = result;
-            return 0;
-        }
-        shift += 7;
-    }
-    return -1;
+    const uint8_t *next = decode_varint64_safe(*pp, end, out);
+    if (!next) return -1;
+    *pp = next;
+    return 0;
 }
 
 bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
@@ -549,8 +519,10 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
     const unsigned int m = m_u32;
     const unsigned int h = h_u32;
 
-    /* we validate deserialized values */
-    if (m == 0 || h == 0)
+    /* we validate deserialized values. h is the per-query probe count, so an out-of-range h from a
+     * corrupt filter would turn every contains() into a multi-billion-iteration loop. reject it
+     * with the same cap the constructor enforces, which a valid filter can never exceed. */
+    if (m == 0 || h == 0 || h > BF_MAX_HASH_FUNCTIONS)
     {
         return NULL;
     }

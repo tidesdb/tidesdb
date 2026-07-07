@@ -266,7 +266,13 @@ int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uin
 
 /**
  * skip_list_comparator_numeric
- * numeric comparator
+ * numeric comparator for 8-byte keys interpreted as host-native uint64. this orders keys by their
+ * value as a machine integer, which is the point of the comparator -- a caller can store an
+ * in-memory uint64 directly as a key and get value order without byte-swapping first. the ordering
+ * is therefore host-native and not portable across hosts of differing endianness, and neither is an
+ * sstable of a numeric column family. for an ordering that survives a cross-endian move, store keys
+ * big-endian and use the default memcmp comparator, which yields the same order portably. keys that
+ * are not exactly 8 bytes fall back to memcmp.
  * @param key1 first key
  * @param key1_size size of first key
  * @param key2 second key

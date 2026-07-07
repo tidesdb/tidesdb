@@ -1484,15 +1484,15 @@ void test_zero_copy_get_release(void)
     printf("  ✓ Zero-copy get/release test passed\n");
 }
 
-void test_reader_saturation_refuses_pin(void)
+void test_many_concurrent_readers_pin(void)
 {
-    printf("Testing reader-count saturation refuses pins instead of wrapping...\n");
+    printf("Testing many concurrent readers pin past the old 127 cap...\n");
 
-    /* the ref_bit reader field is 7 bits, so at most this many readers can pin one entry at
-     * once. an unconditional increment would wrap the 128th pin to 0 and let a concurrent
-     * delete/evict free the entry under live readers (use-after-free). the acquire must instead
-     * refuse the over-cap pin and report a miss, leaving earlier pins valid. */
-    const int max_readers = 127;
+    /* the ref_bit reader field is now 31 bits, so far more than the old 7-bit cap of 127 readers
+     * can pin one entry at once. holding many refs must all succeed rather than spuriously miss
+     * once past the old cap, and a delete while any are held must still not free under them (the
+     * reader-safe deletion invariant is unchanged by the widening). */
+    const int num_readers = 300;
 
     cache_config_t config = {
         .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 256};
@@ -1503,11 +1503,11 @@ void test_reader_saturation_refuses_pin(void)
     const uint8_t payload[] = "saturation_payload_data";
     ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload), 0), 0);
 
-    clock_cache_entry_t *held[128] = {0};
+    clock_cache_entry_t *held[300] = {0};
     const uint8_t *first_data = NULL;
 
-    /* pin up to the reader cap -- all of these must succeed */
-    for (int i = 0; i < max_readers; i++)
+    /* pin well past the old 127 cap -- every pin must succeed now */
+    for (int i = 0; i < num_readers; i++)
     {
         size_t len = 0;
         const uint8_t *data = clock_cache_get_zero_copy(cache, key, strlen(key), &len, &held[i]);
@@ -1516,23 +1516,14 @@ void test_reader_saturation_refuses_pin(void)
         if (i == 0) first_data = data;
     }
 
-    /* the next pin would overflow the reader field -- it must be refused (reported as a miss) */
-    {
-        size_t len = 0;
-        clock_cache_entry_t *over = NULL;
-        const uint8_t *data = clock_cache_get_zero_copy(cache, key, strlen(key), &len, &over);
-        ASSERT_TRUE(data == NULL);
-        ASSERT_TRUE(over == NULL);
-    }
-
     /* delete while all readers are held -- free_entry must not reclaim the entry (it reverts to
      * VALID and aborts), so the held payload stays valid and readable; a use-after-free here
-     * would trip ASan, and a wrapped reader field would have let the free through. */
+     * would trip ASan. */
     clock_cache_delete(cache, key, strlen(key));
     ASSERT_TRUE(memcmp(first_data, payload, sizeof(payload)) == 0);
 
     /* release every reader, then delete again -- with no readers held the delete now takes */
-    for (int i = 0; i < max_readers; i++) clock_cache_release(held[i]);
+    for (int i = 0; i < num_readers; i++) clock_cache_release(held[i]);
     clock_cache_delete(cache, key, strlen(key));
     {
         size_t len = 0;
@@ -1542,7 +1533,7 @@ void test_reader_saturation_refuses_pin(void)
     }
 
     clock_cache_destroy(cache);
-    printf("  ✓ Reader saturation refuses over-cap pins, no wrap, no use-after-free\n");
+    printf("  ✓ Many concurrent readers pin past the old cap, reader-safe delete holds\n");
 }
 
 void test_large_payload(void)
@@ -2761,7 +2752,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_hash_collision_concurrent, tests_passed);
     RUN_TEST(test_shutdown_during_operations, tests_passed);
     RUN_TEST(test_zero_copy_get_release, tests_passed);
-    RUN_TEST(test_reader_saturation_refuses_pin, tests_passed);
+    RUN_TEST(test_many_concurrent_readers_pin, tests_passed);
     RUN_TEST(test_large_payload, tests_passed);
     RUN_TEST(test_many_small_entries, tests_passed);
     RUN_TEST(test_foreach_prefix_concurrent, tests_passed);

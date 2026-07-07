@@ -162,7 +162,7 @@ static void s3_uri_encode_path(const char *src, char *dst, size_t dst_size)
 /**
  * s3_ctx_t
  * internal context for the S3 connector, credentials, endpoint, TLS, and multipart config.
- * defined before s3_curl_new so that helper can apply the per-connector TLS options.
+ * defined before s3_curl_acquire so that helper can apply the per-connector TLS options.
  * @param endpoint S3 endpoint hostname
  * @param bucket S3 bucket name
  * @param prefix key prefix prepended to all object keys
@@ -192,19 +192,54 @@ typedef struct
     size_t multipart_part_size;
 } s3_ctx_t;
 
-/**
- * s3_curl_new
- * create a curl easy handle with the connector's common options applied -- a connection
- * timeout and a stalled-transfer timeout so a dead endpoint cannot hang a worker, NOSIGNAL
- * for safe use from multiple threads, and (over https) the connector's TLS settings, a custom
- * CA bundle when configured, and an opt-in insecure skip-verify for test endpoints.
- * @param s3 connector context (for TLS settings)
- * @return a configured handle, or NULL on allocation failure
- */
-static CURL *s3_curl_new(const s3_ctx_t *s3)
+/* per-thread reusable curl handle. reusing one handle per thread keeps the TCP connection and TLS
+ * session warm across operations -- curl caches both in the handle -- so only the first op on a
+ * thread pays the connect and handshake instead of every op, a real win for chatty replication to a
+ * single endpoint. each thread owns its own handle, so the connector stays thread-safe without
+ * sharing, and the handle is cleaned up when the thread exits via the key destructor. */
+static pthread_once_t s3_curl_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t s3_curl_key;
+
+static void s3_curl_tls_destroy(void *h)
 {
-    CURL *curl = curl_easy_init();
-    if (!curl) return NULL;
+    if (h) curl_easy_cleanup((CURL *)h);
+}
+
+static void s3_curl_key_init(void)
+{
+    pthread_key_create(&s3_curl_key, s3_curl_tls_destroy);
+}
+
+/**
+ * s3_curl_acquire
+ * return this thread's reusable curl handle with the connector's common options applied -- a
+ * connection timeout and a stalled-transfer timeout so a dead endpoint cannot hang a worker,
+ * NOSIGNAL for safe use from multiple threads, and (over https) the connector's TLS settings, a
+ * custom CA bundle when configured, and an opt-in insecure skip-verify for test endpoints. on first
+ * use the handle is created and stashed in thread-local storage; on reuse it is reset, which clears
+ * options but keeps the live connection, DNS, and TLS session caches, then reconfigured.
+ * @param s3 connector context (for TLS settings)
+ * @return the configured thread-local handle, or NULL on allocation failure
+ */
+static CURL *s3_curl_acquire(const s3_ctx_t *s3)
+{
+    pthread_once(&s3_curl_key_once, s3_curl_key_init);
+    CURL *curl = (CURL *)pthread_getspecific(s3_curl_key);
+    if (!curl)
+    {
+        curl = curl_easy_init();
+        if (!curl) return NULL;
+        if (pthread_setspecific(s3_curl_key, curl) != 0)
+        {
+            curl_easy_cleanup(curl);
+            return NULL;
+        }
+    }
+    else
+    {
+        curl_easy_reset(curl);
+    }
+
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)TDB_S3_CONNECT_TIMEOUT_S);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, (long)TDB_S3_LOW_SPEED_LIMIT);
@@ -222,6 +257,14 @@ static CURL *s3_curl_new(const s3_ctx_t *s3)
         }
     }
     return curl;
+}
+
+/* end an operation on the thread-local handle. the handle deliberately stays alive for reuse, so
+ * this is a no-op that replaces the old per-op curl_easy_cleanup -- the next s3_curl_acquire resets
+ * it and cleanup happens at thread exit via the key destructor. */
+static void s3_curl_release(CURL *curl)
+{
+    (void)curl;
 }
 
 /* SHA-256 (sha256_hex) and HMAC-SHA-256 (hmac_sha256) are provided by the bundled crypto modules
@@ -555,7 +598,15 @@ static int s3_get(void *ctx, const char *key, const char *local_path)
         mkdir(dir_buf, 0755);
     }
 
-    FILE *fp = fopen(local_path, "wb");
+    /* download to a unique temp path then atomically rename into place. a plain download straight
+     * to local_path leaves a partially written file visible to a concurrent reader, and a crash
+     * mid-transfer would strand a truncated file that looks complete to the next startup. with the
+     * rename, a reader sees either no file or the whole object, never a partial one. */
+    char tmp_path[TDB_S3_MAX_PATH];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%lu.%d", local_path,
+             (unsigned long)TDB_THREAD_ID(), TDB_GETPID());
+
+    FILE *fp = fopen(tmp_path, "wb");
     if (!fp)
     {
         curl_slist_free_all(headers);
@@ -564,11 +615,11 @@ static int s3_get(void *ctx, const char *key, const char *local_path)
 
     s3_write_ctx_t wctx = {.fp = fp};
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         fclose(fp);
-        unlink(local_path);
+        unlink(tmp_path);
         curl_slist_free_all(headers);
         return -1;
     }
@@ -583,11 +634,17 @@ static int s3_get(void *ctx, const char *key, const char *local_path)
 
     fclose(fp);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     if (res != CURLE_OK || http_code < TDB_S3_HTTP_OK || http_code >= TDB_S3_HTTP_REDIRECT)
     {
-        unlink(local_path);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (atomic_rename_file(tmp_path, local_path) != 0)
+    {
+        unlink(tmp_path);
         return -1;
     }
     return 0;
@@ -623,7 +680,7 @@ static ssize_t s3_range_get(void *ctx, const char *key, uint64_t offset, void *b
 
     s3_write_ctx_t wctx = {.buf = (char *)buf, .buf_size = size, .written = 0};
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -639,11 +696,18 @@ static ssize_t s3_range_get(void *ctx, const char *key, uint64_t offset, void *b
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
-    if (res != CURLE_OK || (http_code != TDB_S3_HTTP_OK && http_code != TDB_S3_HTTP_PARTIAL))
-        return -1;
-    return (ssize_t)wctx.written;
+    if (res != CURLE_OK) return -1;
+
+    /* a ranged request must come back 206 partial content. some non-compliant stores ignore the
+     * Range header and answer 200 with the full object body, which the write callback then
+     * truncates to the first `size` bytes. that is only the requested data at offset 0, where the
+     * leading bytes are exactly the range asked for. at any nonzero offset a 200 body is shifted
+     * data, so reject it and fail loud rather than hand back silently wrong bytes. */
+    if (http_code == TDB_S3_HTTP_PARTIAL || (http_code == TDB_S3_HTTP_OK && offset == 0))
+        return (ssize_t)wctx.written;
+    return -1;
 }
 
 /**
@@ -665,7 +729,7 @@ static int s3_delete_object(void *ctx, const char *key)
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -682,7 +746,7 @@ static int s3_delete_object(void *ctx, const char *key)
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     if (res != CURLE_OK) return -1;
     /* 2xx (200/204 No Content) = deleted, 404 Not Found = already absent; both are success.
@@ -714,7 +778,7 @@ static int s3_exists(void *ctx, const char *key, size_t *size_out)
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -737,7 +801,7 @@ static int s3_exists(void *ctx, const char *key, size_t *size_out)
     }
 
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     if (res != CURLE_OK) return -1;
     return (http_code == TDB_S3_HTTP_OK) ? 1 : 0;
@@ -935,7 +999,7 @@ static int s3_multipart_create(s3_ctx_t *s3, const char *key, char *upload_id_ou
         return -1;
     }
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         free(resp.data);
@@ -954,7 +1018,7 @@ static int s3_multipart_create(s3_ctx_t *s3, const char *key, char *upload_id_ou
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     int rc = -1;
     if (res == CURLE_OK && http_code == TDB_S3_HTTP_OK)
@@ -1020,7 +1084,7 @@ static int s3_upload_part(s3_ctx_t *s3, const char *key, const char *upload_id, 
     }
 
     s3_header_ctx_t hctx = {.found = 0};
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         fclose(mem_fp);
@@ -1041,7 +1105,7 @@ static int s3_upload_part(s3_ctx_t *s3, const char *key, const char *upload_id, 
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     fclose(mem_fp);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     if (res != CURLE_OK || http_code != TDB_S3_HTTP_OK || !hctx.found) return -1;
     if (strlen(hctx.etag) >= etag_size) return -1;
@@ -1108,7 +1172,7 @@ static int s3_multipart_complete(s3_ctx_t *s3, const char *key, const char *uplo
         return -1;
     }
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         free(body);
@@ -1128,7 +1192,7 @@ static int s3_multipart_complete(s3_ctx_t *s3, const char *key, const char *uplo
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
     free(body);
 
     /* CompleteMultipartUpload can return HTTP 200 with an <Error> body, so the
@@ -1176,7 +1240,7 @@ static int s3_multipart_abort(s3_ctx_t *s3, const char *key, const char *upload_
     char full_url[TDB_S3_MAX_PATH + TDB_S3_UPLOAD_ID_MAX * 4 + 32];
     snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url, enc_id);
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -1189,7 +1253,7 @@ static int s3_multipart_abort(s3_ctx_t *s3, const char *key, const char *upload_
 
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
     return (res == CURLE_OK) ? 0 : -1;
 }
 
@@ -1213,7 +1277,7 @@ static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -1230,7 +1294,7 @@ static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     return (res == CURLE_OK && http_code >= TDB_S3_HTTP_OK && http_code < TDB_S3_HTTP_REDIRECT)
                ? 0
@@ -1370,7 +1434,7 @@ static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -1392,7 +1456,7 @@ static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
     fclose(fp);
 
     if (res != CURLE_OK) return -1;
@@ -1420,7 +1484,7 @@ static int s3_head(void *ctx, const char *key, char *etag_out, size_t etag_out_s
     char url[TDB_S3_MAX_PATH];
     s3_build_url(s3, key, url, sizeof(url));
 
-    CURL *curl = s3_curl_new(s3);
+    CURL *curl = s3_curl_acquire(s3);
     if (!curl)
     {
         curl_slist_free_all(headers);
@@ -1438,7 +1502,7 @@ static int s3_head(void *ctx, const char *key, char *etag_out, size_t etag_out_s
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    s3_curl_release(curl);
 
     if (etag_out && etag_out_sz > 0)
         snprintf(etag_out, etag_out_sz, "%s", hctx.found_etag ? hctx.etag : "");
@@ -1649,7 +1713,7 @@ static int s3_list(void *ctx, const char *prefix,
             return count > 0 ? count : -1;
         }
 
-        CURL *curl = s3_curl_new(s3);
+        CURL *curl = s3_curl_acquire(s3);
         if (!curl)
         {
             free(resp.data);
@@ -1666,7 +1730,7 @@ static int s3_list(void *ctx, const char *prefix,
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
         curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
+        s3_curl_release(curl);
 
         if (res != CURLE_OK || http_code != TDB_S3_HTTP_OK)
         {
@@ -1753,13 +1817,23 @@ static void s3_destroy(void *ctx)
     free(ctx);
 }
 
+/* curl_global_init is not thread-safe and is meant to run exactly once per process before any curl
+ * use. calling it on every connector create races when two connectors are created concurrently, so
+ * gate it behind a one-time init. there is no matching curl_global_cleanup -- the connector cannot
+ * know when the last curl user in the process is done, so process teardown reclaims it. */
+static pthread_once_t s3_curl_once = PTHREAD_ONCE_INIT;
+static void s3_curl_global_init_once(void)
+{
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
 tidesdb_objstore_t *tidesdb_objstore_s3_create_config(const tidesdb_objstore_s3_config_t *config)
 {
     if (!config || !config->endpoint || !config->bucket || !config->access_key ||
         !config->secret_key)
         return NULL;
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    pthread_once(&s3_curl_once, s3_curl_global_init_once);
 
     s3_ctx_t *s3 = calloc(1, sizeof(s3_ctx_t));
     if (!s3) return NULL;

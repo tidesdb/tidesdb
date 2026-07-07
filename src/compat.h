@@ -71,16 +71,10 @@
 #define TDB_UNLIKELY(x) (x)
 #endif
 
-/* cross-platform fabs abstraction */
+/* cross-platform fabs abstraction. every platform maps to the same standard fabs, so this is a
+ * single unconditional definition rather than three identical conditional arms. */
 #include <math.h>
-#if defined(_MSC_VER)
 #define tdb_fabs(x) fabs(x)
-#elif defined(__APPLE__)
-#define tdb_fabs(x) fabs(x)
-#else
-/* POSIX systems */
-#define tdb_fabs(x) fabs(x)
-#endif
 
 /* cross-platform fsync abstraction */
 #if defined(_WIN32)
@@ -1105,7 +1099,10 @@ static inline struct dirent *readdir(DIR *dir)
             return NULL;
         }
     }
-    strncpy(dir->dirent.d_name, dir->findFileData.cFileName, MAX_PATH);
+    /* strncpy leaves the destination unterminated if the source fills all MAX_PATH bytes, so copy
+     * at most MAX_PATH-1 and terminate explicitly rather than relying on the source's terminator */
+    strncpy(dir->dirent.d_name, dir->findFileData.cFileName, MAX_PATH - 1);
+    dir->dirent.d_name[MAX_PATH - 1] = '\0';
     dir->findFileData.cFileName[0] = '\0'; /* reset */
     return &dir->dirent;
 }
@@ -2582,109 +2579,6 @@ static inline void encode_uint64_le_compat(uint8_t *buf, uint64_t val)
 }
 
 /*
- * encode_uint32_le
- * encodes a uint32_t value in little-endian format
- * @param buf buffer to store encoded value
- * @param val value to encode
- */
-static inline void encode_uint32_le(uint8_t *buf, uint32_t val)
-{
-    buf[0] = (uint8_t)(val & 0xFF);
-    buf[1] = (uint8_t)((val >> 8) & 0xFF);
-    buf[2] = (uint8_t)((val >> 16) & 0xFF);
-    buf[3] = (uint8_t)((val >> 24) & 0xFF);
-}
-
-/*
- * decode_uint32_le
- * decodes a uint32_t value in little-endian format
- * @param buf buffer containing encoded value
- * @return decoded value
- */
-static inline uint32_t decode_uint32_le(const uint8_t *buf)
-{
-    return ((uint32_t)buf[0]) | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
-           ((uint32_t)buf[3] << 24);
-}
-
-/*
- * encode_int64_le
- * encodes an int64_t value in little-endian format
- * @param buf buffer to store encoded value
- * @param val value to encode
- */
-static inline void encode_int64_le(uint8_t *buf, int64_t val)
-{
-    const uint64_t uval = (uint64_t)val;
-    buf[0] = (uint8_t)(uval & 0xFF);
-    buf[1] = (uint8_t)((uval >> 8) & 0xFF);
-    buf[2] = (uint8_t)((uval >> 16) & 0xFF);
-    buf[3] = (uint8_t)((uval >> 24) & 0xFF);
-    buf[4] = (uint8_t)((uval >> 32) & 0xFF);
-    buf[5] = (uint8_t)((uval >> 40) & 0xFF);
-    buf[6] = (uint8_t)((uval >> 48) & 0xFF);
-    buf[7] = (uint8_t)((uval >> 56) & 0xFF);
-}
-
-/*
- * decode_int64_le
- * decodes an int64_t value in little-endian format
- * @param buf buffer containing encoded value
- * @return decoded value
- */
-static inline int64_t decode_int64_le(const uint8_t *buf)
-{
-    const uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
-                          ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) |
-                          ((uint64_t)buf[5] << 40) | ((uint64_t)buf[6] << 48) |
-                          ((uint64_t)buf[7] << 56);
-    return (int64_t)uval;
-}
-
-/*
- * encode_uint64_le
- * encodes a uint64_t value in little-endian format
- * @param buf buffer to store encoded value
- * @param val value to encode
- */
-static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
-{
-    buf[0] = (uint8_t)(val & 0xFF);
-    buf[1] = (uint8_t)((val >> 8) & 0xFF);
-    buf[2] = (uint8_t)((val >> 16) & 0xFF);
-    buf[3] = (uint8_t)((val >> 24) & 0xFF);
-    buf[4] = (uint8_t)((val >> 32) & 0xFF);
-    buf[5] = (uint8_t)((val >> 40) & 0xFF);
-    buf[6] = (uint8_t)((val >> 48) & 0xFF);
-    buf[7] = (uint8_t)((val >> 56) & 0xFF);
-}
-
-/*
- * decode_uint64_le
- * decodes a uint64_t value in little-endian format
- * @param buf buffer containing encoded value
- * @return decoded value
- */
-static inline uint64_t decode_uint64_le(const uint8_t *buf)
-{
-    return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
-           ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
-           ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
-}
-
-/*
- * decode_fixed_32
- * decodes a uint32_t value in little-endian format
- * @param data buffer containing encoded value
- * @return decoded value
- */
-static inline uint32_t decode_fixed_32(const char *data)
-{
-    return ((uint32_t)(uint8_t)data[0]) | ((uint32_t)(uint8_t)data[1] << 8) |
-           ((uint32_t)(uint8_t)data[2] << 16) | ((uint32_t)(uint8_t)data[3] << 24);
-}
-
-/*
  * decode_uint64_le_compat
  * decodes a uint64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -2730,6 +2624,11 @@ static inline int64_t decode_int64_le_compat(const uint8_t *buf)
     return (int64_t)uval;
 }
 
+/* worst-case bytes for a LEB128 varint -- 7 data bits per byte, ceil(32/7) = 5 and ceil(64/7) = 10.
+ * these bound the parse loops in the bounded decoders below */
+#define VARINT32_MAX_BYTES 5
+#define VARINT64_MAX_BYTES 10
+
 /* varint encoding/decoding for compact serialization */
 static inline uint8_t *encode_varint32(uint8_t *ptr, uint32_t value)
 {
@@ -2753,6 +2652,8 @@ static inline uint8_t *encode_varint64(uint8_t *ptr, uint64_t value)
     return ptr;
 }
 
+/* unbounded -- assume a complete, trusted varint. on the parse-untrusted-bytes path use
+ * decode_varint32_safe / decode_varint64_safe below, which stop at a supplied end pointer. */
 static inline const uint8_t *decode_varint32(const uint8_t *ptr, uint32_t *value)
 {
     uint32_t result = 0;
@@ -2805,6 +2706,51 @@ static inline const uint8_t *decode_varint64(const uint8_t *ptr, uint64_t *value
     result |= (uint64_t)(*ptr) << shift;
     *value = result;
     return ptr + 1;
+}
+
+/* bounded varint decoders -- read at most the bytes a 32/64-bit value can occupy and never at or
+ * past `end`. return the pointer just past the decoded varint, or NULL on truncation (the buffer
+ * ends mid-varint) or an overlong encoding with no terminator in the byte budget. these are the
+ * canonical primitive for the parse-untrusted-bytes path so a corrupt or truncated buffer cannot
+ * drive an over-read; the unbounded decode_varint32/64 above assume a complete, trusted varint. */
+static inline const uint8_t *decode_varint32_safe(const uint8_t *ptr, const uint8_t *end,
+                                                  uint32_t *value)
+{
+    uint32_t result = 0;
+    int shift = 0;
+    for (int i = 0; i < VARINT32_MAX_BYTES; i++)
+    {
+        if (ptr >= end) return NULL;
+        const uint8_t b = *ptr++;
+        result |= (uint32_t)(b & 0x7Fu) << shift;
+        if (!(b & 0x80u))
+        {
+            *value = result;
+            return ptr;
+        }
+        shift += 7;
+    }
+    return NULL;
+}
+
+static inline const uint8_t *decode_varint64_safe(const uint8_t *ptr, const uint8_t *end,
+                                                  uint64_t *value)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    for (int i = 0; i < VARINT64_MAX_BYTES; i++)
+    {
+        if (ptr >= end) return NULL;
+        const uint8_t b = *ptr++;
+        result |= (uint64_t)(b & 0x7Fu) << shift;
+        if (!(b & 0x80u))
+        {
+            *value = result;
+            return ptr;
+        }
+        shift += 7;
+    }
+    return NULL;
 }
 
 /* length-prefixed KV serialization helpers */
@@ -2937,18 +2883,16 @@ static inline const uint8_t *deserialize_kv_varint(const uint8_t *ptr, const uin
                                                    const uint8_t **value_out)
 {
     /* read key size */
-    if (ptr >= end) return NULL;
-    ptr = decode_varint32(ptr, key_size);
-    if (ptr + *key_size > end) return NULL;
+    ptr = decode_varint32_safe(ptr, end, key_size);
+    if (!ptr || ptr + *key_size > end) return NULL;
 
     /* read key */
     *key_out = ptr;
     ptr += *key_size;
 
     /* read value size */
-    if (ptr >= end) return NULL;
-    ptr = decode_varint32(ptr, value_size);
-    if (ptr + *value_size > end) return NULL;
+    ptr = decode_varint32_safe(ptr, end, value_size);
+    if (!ptr || ptr + *value_size > end) return NULL;
 
     /* read value */
     *value_out = ptr;
@@ -2980,27 +2924,25 @@ static inline const uint8_t *deserialize_kv_varint_ex(const uint8_t *ptr, const 
     *flags = *ptr++;
 
     /* read key size */
-    if (ptr >= end) return NULL;
-    ptr = decode_varint32(ptr, key_size);
-    if (ptr + *key_size > end) return NULL;
+    ptr = decode_varint32_safe(ptr, end, key_size);
+    if (!ptr || ptr + *key_size > end) return NULL;
 
     /* read key */
     *key_out = ptr;
     ptr += *key_size;
 
     /* read value size */
-    if (ptr >= end) return NULL;
-    ptr = decode_varint32(ptr, value_size);
-    if (ptr + *value_size > end) return NULL;
+    ptr = decode_varint32_safe(ptr, end, value_size);
+    if (!ptr || ptr + *value_size > end) return NULL;
 
     /* read value */
     *value_out = ptr;
     ptr += *value_size;
 
     /* read ttl */
-    if (ptr >= end) return NULL;
     uint64_t ttl_u64;
-    ptr = decode_varint64(ptr, &ttl_u64);
+    ptr = decode_varint64_safe(ptr, end, &ttl_u64);
+    if (!ptr) return NULL;
     *ttl = (int64_t)ttl_u64;
 
     return ptr;
@@ -3032,31 +2974,29 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
     *flags = *ptr++;
 
     /* read key size */
-    if (ptr >= end) return NULL;
-    ptr = decode_varint32(ptr, key_size);
-    if (ptr + *key_size > end) return NULL;
+    ptr = decode_varint32_safe(ptr, end, key_size);
+    if (!ptr || ptr + *key_size > end) return NULL;
 
     /* read key */
     *key_out = ptr;
     ptr += *key_size;
 
     /* read value size */
-    if (ptr >= end) return NULL;
-    ptr = decode_varint32(ptr, value_size);
-    if (ptr + *value_size > end) return NULL;
+    ptr = decode_varint32_safe(ptr, end, value_size);
+    if (!ptr || ptr + *value_size > end) return NULL;
 
     /* read value */
     *value_out = ptr;
     ptr += *value_size;
 
     /* read ttl and seq */
-    if (ptr >= end) return NULL;
     uint64_t ttl_u64;
-    ptr = decode_varint64(ptr, &ttl_u64);
+    ptr = decode_varint64_safe(ptr, end, &ttl_u64);
+    if (!ptr) return NULL;
     *ttl = (int64_t)ttl_u64;
 
-    if (ptr >= end) return NULL;
-    ptr = decode_varint64(ptr, seq);
+    ptr = decode_varint64_safe(ptr, end, seq);
+    if (!ptr) return NULL;
 
     return ptr;
 }
@@ -3593,6 +3533,57 @@ static inline int tdb_sync_directory(const char *dir_path)
 #endif
 }
 
+/*
+ * tdb_fsync_parent_dir
+ * fsync the parent directory of path so a rename's directory entry is durable on a crash. the
+ * directory portion is copied into a heap buffer when it does not fit the stack one, so a very long
+ * path flushes rather than silently skipping the fsync (a fixed stack buffer with a length guard
+ * used to drop the flush for paths longer than the buffer). best-effort -- a directory that cannot
+ * be opened or an allocation failure just skips the flush, which is the pre-existing behavior for
+ * an unfsyncable directory.
+ * @param path a file path whose parent directory should be flushed
+ */
+static inline void tdb_fsync_parent_dir(const char *path)
+{
+    const char *last_sep = strrchr(path, '/');
+#ifdef _WIN32
+    const char *last_bsep = strrchr(path, '\\');
+    if (last_bsep && (!last_sep || last_bsep > last_sep)) last_sep = last_bsep;
+#endif
+    if (!last_sep) return;
+
+    const size_t dir_len = (size_t)(last_sep - path);
+    char stack_buf[4096];
+    char *dir_path = stack_buf;
+    char *heap_buf = NULL;
+    if (dir_len >= sizeof(stack_buf))
+    {
+        heap_buf = (char *)malloc(dir_len + 1);
+        if (!heap_buf) return;
+        dir_path = heap_buf;
+    }
+    memcpy(dir_path, path, dir_len);
+    dir_path[dir_len] = '\0';
+
+#ifdef _WIN32
+    HANDLE dir_handle = CreateFile(dir_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (dir_handle != INVALID_HANDLE_VALUE)
+    {
+        FlushFileBuffers(dir_handle);
+        CloseHandle(dir_handle);
+    }
+#else
+    const int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd >= 0)
+    {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+#endif
+    free(heap_buf);
+}
+
 /**
  * atomic_rename_file
  * atomically renames a file from old_path to new_path
@@ -3615,26 +3606,8 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
         return -1;
     }
 
-    /* flush parent directory to ensure rename is durable
-     * extract directory from new_path */
-    char dir_path[4096];
-    const char *last_sep = strrchr(new_path, '\\');
-    if (!last_sep) last_sep = strrchr(new_path, '/');
-    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
-    {
-        size_t dir_len = last_sep - new_path;
-        memcpy(dir_path, new_path, dir_len);
-        dir_path[dir_len] = '\0';
-
-        /* open directory and flush */
-        HANDLE dir_handle = CreateFile(dir_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        if (dir_handle != INVALID_HANDLE_VALUE)
-        {
-            FlushFileBuffers(dir_handle);
-            CloseHandle(dir_handle);
-        }
-    }
+    /* flush parent directory to ensure rename is durable */
+    tdb_fsync_parent_dir(new_path);
 
     return 0;
 #else
@@ -3649,21 +3622,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
      * https://groups.google.com/g/comp.unix.programmer/c/AM2V83RCOVE?pli=1
      * https://man7.org/linux/man-pages/man2/rename.2.html
      */
-    char dir_path[4096];
-    const char *last_sep = strrchr(new_path, '/');
-    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
-    {
-        size_t dir_len = last_sep - new_path;
-        memcpy(dir_path, new_path, dir_len);
-        dir_path[dir_len] = '\0';
-
-        const int dir_fd = open(dir_path, O_RDONLY);
-        if (dir_fd >= 0)
-        {
-            fsync(dir_fd);
-            close(dir_fd);
-        }
-    }
+    tdb_fsync_parent_dir(new_path);
 
     return 0;
 #endif
@@ -3702,21 +3661,7 @@ static inline int atomic_rename_dir(const char *old_path, const char *new_path)
     }
 
     /* sync parent directory for durability */
-    char dir_path[4096];
-    const char *last_sep = strrchr(new_path, '/');
-    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
-    {
-        size_t dir_len = last_sep - new_path;
-        memcpy(dir_path, new_path, dir_len);
-        dir_path[dir_len] = '\0';
-
-        const int dir_fd = open(dir_path, O_RDONLY);
-        if (dir_fd >= 0)
-        {
-            fsync(dir_fd);
-            close(dir_fd);
-        }
-    }
+    tdb_fsync_parent_dir(new_path);
 
     return 0;
 #endif

@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "xxhash.h"
+
 #define MANIFEST_TMP_EXT     ".tmp."
 #define MANIFEST_TMP_EXT_LEN (sizeof(MANIFEST_TMP_EXT) - 1)
 
@@ -32,6 +34,33 @@
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
                                                  uint64_t id, uint64_t num_entries,
                                                  uint64_t size_bytes);
+
+/**
+ * manifest_body_append
+ * append a raw manifest line's bytes to the growable body buffer used to verify the version 8
+ * checksum on read. grows the buffer by doubling.
+ * @param body pointer to the buffer pointer (grown in place)
+ * @param len pointer to the current byte length
+ * @param cap pointer to the current allocated capacity
+ * @param line the NUL-terminated line to append (its bytes, excluding the NUL)
+ * @return 0 on success, -1 on allocation failure
+ */
+static int manifest_body_append(char **body, size_t *len, size_t *cap, const char *line)
+{
+    const size_t ll = strlen(line);
+    if (*len + ll > *cap)
+    {
+        size_t new_cap = *cap ? *cap : MANIFEST_BODY_INIT_CAP;
+        while (new_cap < *len + ll) new_cap *= 2;
+        char *new_body = realloc(*body, new_cap);
+        if (!new_body) return -1;
+        *body = new_body;
+        *cap = new_cap;
+    }
+    memcpy(*body + *len, line, ll);
+    *len += ll;
+    return 0;
+}
 
 tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 {
@@ -138,11 +167,12 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
     char line[MANIFEST_MAX_LINE_LEN];
 
+    int is_v8 = 0;
     if (fgets(line, sizeof(line), fp))
     {
         char *endptr;
         const long version = strtol(line, &endptr, 10);
-        if (endptr == line || version != MANIFEST_VERSION)
+        if (endptr == line || (version != MANIFEST_VERSION && version != MANIFEST_VERSION_LEGACY))
         {
             fclose(fp);
             pthread_rwlock_destroy(&manifest->lock);
@@ -150,6 +180,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
             free(manifest);
             return NULL;
         }
+        is_v8 = (version == MANIFEST_VERSION);
     }
     else
     {
@@ -158,8 +189,39 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         return manifest;
     }
 
+    /* version 8 carries an xxhash64 of the body (sequence + entries) on the next line. read it
+     * here, then accumulate the raw body bytes as we parse so we can verify at end of file and
+     * refuse to open a corrupted manifest rather than silently dropping entries. */
+    uint64_t expected_checksum = 0;
+    char *body = NULL;
+    size_t body_len = 0;
+    size_t body_cap = 0;
+    if (is_v8)
+    {
+        char *cs_endptr;
+        if (!fgets(line, sizeof(line), fp) ||
+            (expected_checksum = strtoull(line, &cs_endptr, 16), cs_endptr == line))
+        {
+            fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
+    }
+
     if (fgets(line, sizeof(line), fp))
     {
+        if (is_v8 && manifest_body_append(&body, &body_len, &body_cap, line) != 0)
+        {
+            free(body);
+            fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
+
         char *seq_endptr;
         const unsigned long long seq = strtoull(line, &seq_endptr, 10);
         /* the sequence line must be a number terminated by end-of-line. reject junk
@@ -168,6 +230,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         if (seq_endptr == line ||
             (*seq_endptr != '\0' && *seq_endptr != '\n' && *seq_endptr != '\r'))
         {
+            free(body);
             fclose(fp);
             pthread_rwlock_destroy(&manifest->lock);
             free(manifest->entries);
@@ -180,6 +243,16 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     int skipped_lines = 0;
     while (fgets(line, sizeof(line), fp))
     {
+        if (is_v8 && manifest_body_append(&body, &body_len, &body_cap, line) != 0)
+        {
+            free(body);
+            fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
+
         const char *ptr = line;
         char *endptr;
 
@@ -220,6 +293,26 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         }
 
         tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+    }
+
+    /* version 8 -- verify the body checksum and refuse to open on a mismatch. a checksum-valid
+     * body has no corrupt lines to drop, so this replaces the silent line-skip with a hard fail
+     * that lets the operator restore the manifest instead of serving a damaged tree. */
+    if (is_v8)
+    {
+        const uint64_t actual_checksum = XXH64(body, body_len, 0);
+        free(body);
+        body = NULL;
+        if (actual_checksum != expected_checksum)
+        {
+            fprintf(stderr, "tidesdb manifest: checksum mismatch loading %s, refusing to open\n",
+                    manifest->path[0] ? manifest->path : "(unknown)");
+            fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
     }
 
     /* surface silent data loss, malformed entry lines were dropped. this leaf module has
@@ -391,15 +484,54 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
         return -1;
     }
 
-    fprintf(fp, "%d\n", MANIFEST_VERSION);
-    fprintf(fp, "%" PRIu64 "\n", atomic_load(&manifest->sequence));
-
-    for (int i = 0; i < manifest->num_entries; i++)
+    /* build the body (sequence then entries) in memory so we can checksum it before writing the
+     * header. each line is well under MANIFEST_BODY_LINE_MAX, so this buffer never has to grow. */
+    const size_t body_cap = (size_t)(manifest->num_entries + 2) * MANIFEST_BODY_LINE_MAX;
+    char *body = malloc(body_cap);
+    if (!body)
     {
-        fprintf(fp, "%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n", manifest->entries[i].level,
-                manifest->entries[i].id, manifest->entries[i].num_entries,
-                manifest->entries[i].size_bytes);
+        fclose(fp);
+        remove(temp_path);
+        pthread_rwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
+        return -1;
     }
+
+    size_t body_len = 0;
+    int n = snprintf(body, body_cap, "%" PRIu64 "\n", atomic_load(&manifest->sequence));
+    int body_ok = (n > 0 && (size_t)n < body_cap);
+    if (body_ok) body_len = (size_t)n;
+
+    for (int i = 0; body_ok && i < manifest->num_entries; i++)
+    {
+        n = snprintf(body + body_len, body_cap - body_len,
+                     "%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n", manifest->entries[i].level,
+                     manifest->entries[i].id, manifest->entries[i].num_entries,
+                     manifest->entries[i].size_bytes);
+        if (n <= 0 || (size_t)n >= body_cap - body_len)
+        {
+            body_ok = 0;
+            break;
+        }
+        body_len += (size_t)n;
+    }
+
+    if (!body_ok)
+    {
+        free(body);
+        fclose(fp);
+        remove(temp_path);
+        pthread_rwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
+        return -1;
+    }
+
+    /* header is the version then the xxhash64 of the body, then the body it covers */
+    const uint64_t body_checksum = XXH64(body, body_len, 0);
+    fprintf(fp, "%d\n", MANIFEST_VERSION);
+    fprintf(fp, "%016" PRIx64 "\n", body_checksum);
+    fwrite(body, 1, body_len, fp);
+    free(body);
 
     if (fflush(fp) != 0)
     {
@@ -471,12 +603,28 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
 {
     if (!manifest) return;
 
-    /* wait for all active operations to complete before destroying */
+    /* the caller is expected to have quiesced all manifest users before closing. tidesdb_close
+     * joins every flush, compaction, sync, and reaper thread before the owning column family is
+     * freed, so active_ops is normally already zero here. the bounded wait is a backstop for a
+     * caller that has not fully quiesced. */
     int wait_count = 0;
     while (atomic_load(&manifest->active_ops) > 0 && wait_count < MANIFEST_CLOSE_MAX_WAITS)
     {
         usleep(MANIFEST_CLOSE_WAIT_US);
         wait_count++;
+    }
+
+    /* if the drain expired with operations still in flight the close proceeds anyway rather than
+     * leaking the manifest on every shutdown, but that means a caller freed the manifest without
+     * quiescing its users -- a contract violation that risks a use-after-free, so surface it loudly
+     * rather than tearing down the lock and struct silently underneath a live operation. */
+    if (atomic_load(&manifest->active_ops) > 0)
+    {
+        fprintf(stderr,
+                "tidesdb manifest: closing %s with %d operation(s) still active after the drain "
+                "wait -- the caller did not quiesce manifest users before close\n",
+                manifest->path[0] ? manifest->path : "(unknown)",
+                atomic_load(&manifest->active_ops));
     }
 
     pthread_rwlock_wrlock(&manifest->lock);

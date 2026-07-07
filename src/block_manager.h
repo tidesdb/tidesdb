@@ -348,6 +348,22 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor);
 int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor);
 
 /**
+ * block_manager_cursor_resync_past_hole
+ * recovers forward past a zero-filled reservation hole left by a failed concurrent append. only
+ * acts when the size field at the cursor is zero -- a nonzero size with a valid footer but a bad
+ * checksum is genuine data corruption that block_manager_cursor_skip_corrupt deliberately stops on,
+ * so this never overrides that refusal. scans forward for the next checksum-valid block frame in
+ * the file and repositions the cursor at its start. the checksum gate makes the scan
+ * false-positive proof, and a zero region such as the preallocation tail holds no footer magic so
+ * it resolves to end of data. only call after block_manager_cursor_read returns NULL and
+ * block_manager_cursor_skip_corrupt returns -1.
+ * @param cursor the cursor positioned at the suspect block
+ * @return 0 if the cursor was repositioned at the next valid block, -1 if the size field was
+ *         nonzero (not a hole) or no valid block remains before end of file
+ */
+int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor);
+
+/**
  * block_manager_truncate
  * truncates a block manager to 0 removing all blocks
  * @param bm the block manager to truncate

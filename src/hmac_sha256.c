@@ -18,6 +18,16 @@
  */
 #include "hmac_sha256.h"
 
+/* zero a buffer so the compiler cannot elide the write as a dead store. writes through a volatile
+ * lvalue are observable side effects the standard requires to happen, which is the portable way to
+ * wipe secret material without depending on explicit_bzero (absent on macOS) or SecureZeroMemory.
+ */
+static void hmac_secure_zero(void *p, size_t n)
+{
+    volatile uint8_t *vp = (volatile uint8_t *)p;
+    while (n--) *vp++ = 0;
+}
+
 void hmac_sha256(const void *key, const size_t key_len, const void *data, const size_t data_len,
                  uint8_t out[HMAC_SHA256_DIGEST_SIZE])
 {
@@ -51,4 +61,11 @@ void hmac_sha256(const void *key, const size_t key_len, const void *data, const 
     sha256_update(&ctx, opad, sizeof(opad));
     sha256_update(&ctx, inner, sizeof(inner));
     sha256_final(&ctx, out);
+
+    /* wipe the key-derived material from the stack -- k_block holds the (padded) secret key and the
+     * pads hold it xored with a constant, so leaving them behind would expose the signing key to a
+     * later stack read. out is the caller's result and is left intact. */
+    hmac_secure_zero(k_block, sizeof(k_block));
+    hmac_secure_zero(ipad, sizeof(ipad));
+    hmac_secure_zero(opad, sizeof(opad));
 }

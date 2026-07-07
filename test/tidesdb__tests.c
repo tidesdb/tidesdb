@@ -9261,6 +9261,117 @@ static void test_read_write_conflict(void)
     cleanup_test_dir();
 }
 
+/* a tracked read (tidesdb_txn_get) of a key records it into the read set, so a concurrent overwrite
+ * of that key aborts the reader at commit even when the reader wrote only a disjoint key. the same
+ * scenario through tidesdb_txn_get_notrack must NOT abort, because the untracked read never enters
+ * the read set -- the whole point of the primitive for a PK-uniqueness probe. */
+static void test_txn_get_notrack_no_read_conflict(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "notrack_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "notrack_cf");
+
+    uint8_t probe[] = "probe_key";
+    uint8_t seedv[] = "seed";
+    uint8_t newv[] = "new";
+
+    /* seed the probe key so both variants read a present value */
+    tidesdb_txn_t *seed = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &seed), 0);
+    ASSERT_EQ(tidesdb_txn_put(seed, cf, probe, sizeof(probe), seedv, sizeof(seedv), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(seed), 0);
+    tidesdb_txn_free(seed);
+
+    /* tracking baseline -- the tracked read of probe conflicts with a concurrent overwrite even
+     * though the reader writes only its own disjoint key */
+    {
+        tidesdb_txn_t *a = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &a), 0);
+        uint8_t *v = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(a, cf, probe, sizeof(probe), &v, &vs), 0);
+        free(v);
+        uint8_t akey[] = "a_own_key";
+        ASSERT_EQ(tidesdb_txn_put(a, cf, akey, sizeof(akey), newv, sizeof(newv), 0), 0);
+
+        tidesdb_txn_t *b = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &b), 0);
+        ASSERT_EQ(tidesdb_txn_put(b, cf, probe, sizeof(probe), newv, sizeof(newv), 0), 0);
+        ASSERT_EQ(tidesdb_txn_commit(b), 0);
+        tidesdb_txn_free(b);
+
+        ASSERT_EQ(tidesdb_txn_commit(a), TDB_ERR_CONFLICT);
+        tidesdb_txn_free(a);
+    }
+
+    /* notrack -- the same shape, but the untracked read leaves the read set empty, so the reader's
+     * commit succeeds. the read still returns the value at the snapshot. */
+    {
+        tidesdb_txn_t *a = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &a), 0);
+        uint8_t *v = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get_notrack(a, cf, probe, sizeof(probe), &v, &vs), 0);
+        ASSERT_TRUE(v != NULL && vs > 0);
+        free(v);
+        uint8_t akey[] = "a_own_key2";
+        ASSERT_EQ(tidesdb_txn_put(a, cf, akey, sizeof(akey), newv, sizeof(newv), 0), 0);
+
+        tidesdb_txn_t *b = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &b), 0);
+        ASSERT_EQ(tidesdb_txn_put(b, cf, probe, sizeof(probe), seedv, sizeof(seedv), 0), 0);
+        ASSERT_EQ(tidesdb_txn_commit(b), 0);
+        tidesdb_txn_free(b);
+
+        ASSERT_EQ(tidesdb_txn_commit(a), 0);
+        tidesdb_txn_free(a);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* tidesdb_txn_contains reports existence at the snapshot without materializing the value or
+ * tracking the read. */
+static void test_txn_contains(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "contains_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "contains_cf");
+
+    uint8_t present[] = "present_key";
+    uint8_t absent[] = "absent_key";
+    uint8_t val[] = "value";
+
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &w), 0);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, present, sizeof(present), val, sizeof(val), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(w), 0);
+    tidesdb_txn_free(w);
+
+    tidesdb_txn_t *r = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &r), 0);
+    ASSERT_EQ(tidesdb_txn_contains(r, cf, present, sizeof(present)), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_contains(r, cf, absent, sizeof(absent)), TDB_ERR_NOT_FOUND);
+
+    /* get_notrack mirrors get for value materialization */
+    uint8_t *v = NULL;
+    size_t vs = 0;
+    ASSERT_EQ(tidesdb_txn_get_notrack(r, cf, present, sizeof(present), &v, &vs), TDB_SUCCESS);
+    ASSERT_TRUE(v != NULL && vs == sizeof(val) && memcmp(v, val, vs) == 0);
+    free(v);
+    v = NULL;
+    ASSERT_EQ(tidesdb_txn_get_notrack(r, cf, absent, sizeof(absent), &v, &vs), TDB_ERR_NOT_FOUND);
+
+    tidesdb_txn_free(r);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_snapshot_no_read_conflict(void)
 {
     cleanup_test_dir();
@@ -31693,6 +31804,154 @@ static void test_concurrent_increment_no_lost_update(void)
     cleanup_test_dir();
 }
 
+/* sums the distinct key count and the entry count across every sstable currently on disk for a
+ * column family, asserting no sstable reports the legacy unknown sentinel */
+static void sum_sstable_distinct(tidesdb_column_family_t *cf, uint64_t *out_distinct,
+                                 uint64_t *out_entries)
+{
+    uint64_t sum_distinct = 0, sum_entries = 0;
+    int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    for (int i = 0; i < num_levels; i++)
+    {
+        tidesdb_level_t *lvl = cf->levels[i];
+        tidesdb_sstable_t **ssts = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+        for (int j = 0; ssts[j] != NULL; j++)
+        {
+            ASSERT_TRUE(ssts[j]->distinct_key_count != TDB_DISTINCT_KEYS_UNKNOWN);
+            sum_distinct += ssts[j]->distinct_key_count;
+            sum_entries += ssts[j]->num_entries;
+        }
+    }
+    *out_distinct = sum_distinct;
+    *out_entries = sum_entries;
+}
+
+/* drains the flush queue so all memtable data has landed on disk before the sstables are read */
+static void wait_for_flush(tidesdb_t *db)
+{
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(50000);
+}
+
+/* a flush writes each distinct key once into the sstable's distinct-key summary, the estimate API
+ * reads it back, and the summary survives a serialize/deserialize round trip on reopen */
+static void test_sstable_distinct_key_cardinality(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 256 * 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "card_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "card_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int N = 800;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "k%06d", i);
+        snprintf(val, sizeof(val), "v%06d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    wait_for_flush(db);
+
+    uint64_t sum_distinct = 0, sum_entries = 0;
+    sum_sstable_distinct(cf, &sum_distinct, &sum_entries);
+    ASSERT_EQ(sum_distinct, (uint64_t)N);
+
+    uint64_t est = 0;
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cf, &est), TDB_SUCCESS);
+    ASSERT_EQ(est, (uint64_t)N);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* reopen so the sstable metadata is read back through sstable_metadata_deserialize -- the
+     * distinct-key summary must survive rather than fall back to the unknown sentinel */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    tidesdb_t *db2 = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db2), 0);
+    cf = tidesdb_get_column_family(db2, "card_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    sum_sstable_distinct(cf, &sum_distinct, &sum_entries);
+    ASSERT_EQ(sum_distinct, (uint64_t)N);
+
+    est = 0;
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cf, &est), TDB_SUCCESS);
+    ASSERT_EQ(est, (uint64_t)N);
+
+    ASSERT_EQ(tidesdb_close(db2), 0);
+    cleanup_test_dir();
+}
+
+/* with an open snapshot pinning the flush floor, several versions of each key land on disk, so the
+ * sstable entry count exceeds its distinct key count -- the case the summary exists to measure */
+static void test_distinct_key_count_collapses_versions(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 256 * 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "ver_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ver_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int N = 400;
+    const int REPS = 3;
+
+    /* a snapshot-isolation reader fixes min_active_snapshot_seq below the writes that follow, so
+     * the flush keeps every version above that floor instead of collapsing to the newest */
+    tidesdb_txn_t *snap = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &snap), 0);
+
+    for (int rep = 0; rep < REPS; rep++)
+    {
+        for (int i = 0; i < N; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], val[32];
+            snprintf(key, sizeof(key), "k%06d", i);
+            snprintf(val, sizeof(val), "v%d_%06d", rep, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    wait_for_flush(db);
+
+    uint64_t sum_distinct = 0, sum_entries = 0;
+    sum_sstable_distinct(cf, &sum_distinct, &sum_entries);
+
+    /* one distinct key per user key, regardless of how many versions were retained */
+    ASSERT_EQ(sum_distinct, (uint64_t)N);
+    /* the retained versions inflate the raw entry count above the distinct count */
+    ASSERT_TRUE(sum_entries > sum_distinct);
+
+    tidesdb_txn_free(snap);
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     g_test_argv0 = argv[0];
@@ -31750,6 +32009,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_stats_comprehensive, tests_passed);
     RUN_TEST(test_get_stats_no_uaf_under_concurrent_rotation, tests_passed);
     RUN_TEST(test_get_stats_key_count_never_undercounts_across_flush, tests_passed);
+    RUN_TEST(test_sstable_distinct_key_cardinality, tests_passed);
+    RUN_TEST(test_distinct_key_count_collapses_versions, tests_passed);
     RUN_TEST(test_iterator_snapshot_complete_under_flush_compaction, tests_passed);
     RUN_TEST(test_get_stats_multi_cf_concurrent_under_flush, tests_passed);
     RUN_TEST(test_iterator_multi_cf_snapshot_under_churn, tests_passed);
@@ -31786,6 +32047,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_snapshot_isolation_consistency, tests_passed);
     RUN_TEST(test_write_write_conflict, tests_passed);
     RUN_TEST(test_read_write_conflict, tests_passed);
+    RUN_TEST(test_txn_get_notrack_no_read_conflict, tests_passed);
+    RUN_TEST(test_txn_contains, tests_passed);
     RUN_TEST(test_snapshot_no_read_conflict, tests_passed);
     RUN_TEST(test_snapshot_allows_write_skew, tests_passed);
     RUN_TEST(test_snapshot_write_write_conflict_still_works, tests_passed);

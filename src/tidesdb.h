@@ -641,6 +641,10 @@ struct tidesdb_column_family_t
     _Atomic(time_t) last_backpressure_log_sec;
 };
 
+/* sentinel distinct_key_count for an sstable whose footer predates the distinct-key summary --
+ * consumers reading distinct_key_count must treat this value as no-estimate-available */
+#define TDB_DISTINCT_KEYS_UNKNOWN UINT64_MAX
+
 /**
  * tidesdb_sstable_t
  * an immutable sorted string table on disk
@@ -696,6 +700,9 @@ struct tidesdb_sstable_t
     size_t max_key_size;
     uint64_t num_entries;
     uint64_t tombstone_count;
+    /* number of distinct keys (not versions) in this sstable, counted during the sorted-run write.
+     * TDB_DISTINCT_KEYS_UNKNOWN for sstables written before SSTABLE_FLAG_DISTINCT_KEYS existed. */
+    uint64_t distinct_key_count;
     uint64_t num_klog_blocks;
     uint64_t num_vlog_blocks;
     uint64_t klog_data_end_offset;
@@ -1527,6 +1534,39 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, uint8_t **value, size_t *value_size);
 
 /**
+ * tidesdb_txn_get_notrack
+ * like tidesdb_txn_get, but does not record the read into the transaction's read set. the value is
+ * still resolved at the transaction's snapshot; the only difference is that this read does not
+ * participate in read-write conflict detection and does not seed the write-write reservation base.
+ * intended for existence probes -- e.g. a primary-key uniqueness check on insert -- that would
+ * otherwise pollute the write txn's conflict footprint. uniqueness is still enforced by the
+ * subsequent write's own reservation, so dropping the read tracking is safe for that use.
+ * @param txn transaction handle
+ * @param cf column family to get from
+ * @param key key to get
+ * @param key_size size of key
+ * @param value pointer to value (caller frees on success)
+ * @param value_size pointer to size of value
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_get_notrack(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                            size_t key_size, uint8_t **value, size_t *value_size);
+
+/**
+ * tidesdb_txn_contains
+ * non-tracking existence check for a key at the transaction's snapshot. equivalent to
+ * tidesdb_txn_get_notrack with the value discarded, so it neither materializes the value to the
+ * caller nor records the read into the transaction's conflict footprint.
+ * @param txn transaction handle
+ * @param cf column family to check
+ * @param key key to check
+ * @param key_size size of key
+ * @return TDB_SUCCESS if the key exists, TDB_ERR_NOT_FOUND if it does not, or -n on error
+ */
+int tidesdb_txn_contains(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                         size_t key_size);
+
+/**
  * tidesdb_txn_delete
  * adds a delete operation to a transaction
  * @param txn transaction handle
@@ -1958,6 +1998,20 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
  * @param stats statistics
  */
 void tidesdb_free_stats(tidesdb_stats_t *stats);
+
+/**
+ * tidesdb_cf_estimate_cardinality
+ * estimates the number of distinct keys in a column family without a full scan. sums the distinct
+ * key count each sstable recorded when it was written, falling back to an sstable's entry count
+ * when it predates the distinct-key summary, and adds the in-memory memtable entries. the result
+ * is an upper bound -- a key present in several sstables or in both memory and disk is counted
+ * once per place it lives -- suited to selectivity and row-count estimates rather than an exact
+ * count.
+ * @param cf column family handle
+ * @param out_estimate receives the estimated distinct key count
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_cf_estimate_cardinality(tidesdb_column_family_t *cf, uint64_t *out_estimate);
 
 /**
  * tidesdb_get_db_stats

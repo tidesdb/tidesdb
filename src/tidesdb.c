@@ -9213,6 +9213,10 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
     int result = TDB_SUCCESS;
     bloom_filter_t *bloom = NULL;
     tidesdb_block_index_t *block_indexes = NULL;
+    /* distinct key counter declared before the first goto cleanup so every cleanup path frees an
+     * initialized counter */
+    tidesdb_distinct_counter_t distinct;
+    tidesdb_distinct_counter_init(&distinct);
     tidesdb_klog_block_t *current_klog_block = NULL;
     skip_list_cursor_t *cursor = NULL;
     uint8_t *first_key = NULL;
@@ -9283,8 +9287,6 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
     size_t last_key_size = 0;
     uint64_t entry_count = 0;
     uint64_t tombstone_count = 0;
-    tidesdb_distinct_counter_t distinct;
-    tidesdb_distinct_counter_init(&distinct);
     uint64_t max_seq = 0;
     size_t block_first_key_size = 0;
     size_t block_last_key_size = 0;

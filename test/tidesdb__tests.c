@@ -31614,6 +31614,13 @@ static void test_crash_single_delete_replay(void)
     }
     tidesdb_txn_free(txn);
 
+    /* flush the replayed single-deletes out of the unified memtable so they land in an sstable and
+     * can pair-cancel the on-disk puts during the merges below -- otherwise the tombstones sit in
+     * memory shadowing the puts at read time but never reclaiming them, and get_stats counts both
+     * the in-memory tombstones and the on-disk puts */
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    wait_for_cf_flush_idle(db, cf);
+
     /* full compaction must keep them gone and reclaim the residue */
     for (int i = 0; i < 8; i++)
     {
@@ -31952,6 +31959,81 @@ static void test_distinct_key_count_collapses_versions(void)
     cleanup_test_dir();
 }
 
+/* puts count distinct keys into cf under a fresh committed transaction each */
+static void put_n_keys(tidesdb_t *db, tidesdb_column_family_t *cf, const char *prefix, int count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[48], val[32];
+        snprintf(key, sizeof(key), "%s_%06d", prefix, i);
+        snprintf(val, sizeof(val), "v%06d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+}
+
+/* under unified mode a column family's live keys sit in the shared memtable behind its 4-byte
+ * prefix, so the per-cf active and immutable memtables are empty. get_stats.total_keys and the
+ * cardinality estimate must still attribute each cf's own prefix run to it -- not zero, not the
+ * shared total -- and the count must be conserved as those keys flush from memory to sstables */
+static void test_unified_stats_per_cf_key_attribution(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 8 * 1024 * 1024; /* large -> stays in active */
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucnt_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ucnt_b", &cf_config), 0);
+    tidesdb_column_family_t *cfa = tidesdb_get_column_family(db, "ucnt_a");
+    tidesdb_column_family_t *cfb = tidesdb_get_column_family(db, "ucnt_b");
+    ASSERT_TRUE(cfa != NULL && cfb != NULL);
+
+    const int NA = 400, NB = 150;
+    put_n_keys(db, cfa, "ka", NA);
+    put_n_keys(db, cfb, "kb", NB);
+
+    /* the data is still in the shared active memtable -- each cf sees only its own run */
+    tidesdb_stats_t *sa = NULL, *sb = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cfa, &sa), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_get_stats(cfb, &sb), TDB_SUCCESS);
+    ASSERT_EQ(sa->total_keys, (uint64_t)NA);
+    ASSERT_EQ(sb->total_keys, (uint64_t)NB);
+    ASSERT_TRUE(sa->memtable_size > 0);
+    ASSERT_TRUE(sb->memtable_size > 0);
+    tidesdb_free_stats(sa);
+    tidesdb_free_stats(sb);
+
+    uint64_t ea = 0, eb = 0;
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cfa, &ea), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cfb, &eb), TDB_SUCCESS);
+    ASSERT_EQ(ea, (uint64_t)NA);
+    ASSERT_EQ(eb, (uint64_t)NB);
+
+    /* flush drains the shared memtable into per-cf sstables; the count is conserved as the keys
+     * move from the unified memtable fold-in to the sstable distinct-key totals */
+    ASSERT_EQ(tidesdb_flush_memtable(cfa), 0);
+    wait_for_flush(db);
+
+    ea = 0;
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cfa, &ea), TDB_SUCCESS);
+    ASSERT_EQ(ea, (uint64_t)NA);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     g_test_argv0 = argv[0];
@@ -32011,6 +32093,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_get_stats_key_count_never_undercounts_across_flush, tests_passed);
     RUN_TEST(test_sstable_distinct_key_cardinality, tests_passed);
     RUN_TEST(test_distinct_key_count_collapses_versions, tests_passed);
+    RUN_TEST(test_unified_stats_per_cf_key_attribution, tests_passed);
     RUN_TEST(test_iterator_snapshot_complete_under_flush_compaction, tests_passed);
     RUN_TEST(test_get_stats_multi_cf_concurrent_under_flush, tests_passed);
     RUN_TEST(test_iterator_multi_cf_snapshot_under_churn, tests_passed);

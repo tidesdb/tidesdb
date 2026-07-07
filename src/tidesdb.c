@@ -34567,6 +34567,9 @@ static int tidesdb_recover_database(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
+static void tidesdb_unified_cf_memtable_totals(tidesdb_t *db, uint32_t cf_index, uint64_t *out_keys,
+                                               uint64_t *out_bytes);
+
 int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
 {
     if (!cf || !stats) return TDB_ERR_INVALID_ARGS;
@@ -34640,6 +34643,17 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
             tidesdb_immutable_memtable_unref(imms[i]);
         }
         free(imms);
+    }
+
+    /* under unified mode the per-cf active and immutable reads above find nothing -- the cf's live
+     * and queued-for-flush keys sit in the shared unified memtable and its immutables under the cf
+     * prefix. fold that run into memtable_size and total_keys so a unified cf reports its in-memory
+     * data the same way a non-unified cf does. a no-op when unified mode is off */
+    {
+        uint64_t umt_keys = 0, umt_bytes = 0;
+        tidesdb_unified_cf_memtable_totals(cf->db, cf->unified_cf_index, &umt_keys, &umt_bytes);
+        (*stats)->memtable_size += (size_t)umt_bytes;
+        total_keys += umt_keys;
     }
 
     /* btree stats aggregation */
@@ -34808,6 +34822,81 @@ void tidesdb_free_stats(tidesdb_stats_t *stats)
     free(stats);
 }
 
+/**
+ * tidesdb_unified_cf_run_count
+ * counts one column family's distinct keys and their bytes in a single unified skip list by
+ * walking the contiguous run under its 4-byte cf_index prefix. matches skip_list_count_entries
+ * semantics -- one count per key node, not per version -- and sums each key plus its newest value
+ * size for the byte total. accumulates into the out params so a caller can fold several memtables
+ * into one running total.
+ */
+static void tidesdb_unified_cf_run_count(skip_list_t *sl, uint32_t cf_index, uint64_t *out_keys,
+                                         uint64_t *out_bytes)
+{
+    uint8_t prefix[TDB_UNIFIED_CF_PREFIX_SIZE];
+    tdb_encode_be32(cf_index, prefix);
+
+    skip_list_cursor_t *cursor = NULL;
+    if (skip_list_cursor_init(&cursor, sl) != 0) return;
+
+    if (skip_list_cursor_seek_ge(cursor, prefix, TDB_UNIFIED_CF_PREFIX_SIZE) == 0)
+    {
+        do
+        {
+            uint8_t *k = NULL, *v = NULL;
+            size_t ks = 0, vs = 0;
+            int64_t ttl = 0;
+            uint8_t deleted = 0;
+            if (skip_list_cursor_get(cursor, &k, &ks, &v, &vs, &ttl, &deleted) != 0) break;
+            if (ks < TDB_UNIFIED_CF_PREFIX_SIZE ||
+                memcmp(k, prefix, TDB_UNIFIED_CF_PREFIX_SIZE) != 0)
+                break; /* walked past this cf's contiguous prefix run */
+            (*out_keys)++;
+            *out_bytes += (uint64_t)ks + (uint64_t)vs;
+        } while (skip_list_cursor_next(cursor) == 0);
+    }
+    skip_list_cursor_free(cursor);
+}
+
+/**
+ * tidesdb_unified_cf_memtable_totals
+ * sums a column family's in-memory keys and bytes across the shared unified active memtable and
+ * its not-yet-flushed immutables. returns without touching the out params when unified mode is off,
+ * so a caller can add it unconditionally to the per-cf memtable totals, which stay empty under
+ * unified mode since a cf's own active memtable is never the write target. the active is pinned the
+ * way the read path pins it; the immutable queue is walked under its read lock, the same pattern
+ * the memory-pressure accounting uses. flushed immutables are skipped because their data is already
+ * counted in the sstable totals.
+ */
+static void tidesdb_unified_cf_memtable_totals(tidesdb_t *db, uint32_t cf_index, uint64_t *out_keys,
+                                               uint64_t *out_bytes)
+{
+    if (!db || !db->unified_mt.enabled) return;
+
+    tidesdb_memtable_t *umt = NULL;
+    if (tidesdb_active_memtable_try_ref(&db->unified_mt.active_mt_readers, &db->unified_mt.active,
+                                        &umt))
+    {
+        if (umt->skip_list)
+            tidesdb_unified_cf_run_count(umt->skip_list, cf_index, out_keys, out_bytes);
+        tidesdb_immutable_memtable_unref(umt);
+    }
+
+    if (db->unified_mt.immutables)
+    {
+        queue_t *q = db->unified_mt.immutables;
+        pthread_rwlock_rdlock(&q->read_lock);
+        for (queue_node_t *n = q->head->next; n != NULL; n = n->next)
+        {
+            tidesdb_memtable_t *uimm = (tidesdb_memtable_t *)n->data;
+            if (uimm && uimm->skip_list &&
+                !atomic_load_explicit(&uimm->flushed, memory_order_acquire))
+                tidesdb_unified_cf_run_count(uimm->skip_list, cf_index, out_keys, out_bytes);
+        }
+        pthread_rwlock_unlock(&q->read_lock);
+    }
+}
+
 int tidesdb_cf_estimate_cardinality(tidesdb_column_family_t *cf, uint64_t *out_estimate)
 {
     if (!cf || !out_estimate) return TDB_ERR_INVALID_ARGS;
@@ -34818,7 +34907,9 @@ int tidesdb_cf_estimate_cardinality(tidesdb_column_family_t *cf, uint64_t *out_e
      * the active memtable is pinned before we read it to avoid the rotation UAF the read path and
      * tidesdb_get_stats guard against. counting entries rather than distinct keys slightly
      * over-counts a memtable holding several versions of one key, in line with the upper-bound
-     * nature of this estimate */
+     * nature of this estimate. under unified mode the per-cf active and immutable memtables stay
+     * empty -- the shared unified memtable holds the data -- so these loops contribute nothing and
+     * the unified fold-in below supplies the in-memory keys instead */
     tidesdb_memtable_t *active_mt = NULL;
     if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &active_mt))
     {
@@ -34838,6 +34929,13 @@ int tidesdb_cf_estimate_cardinality(tidesdb_column_family_t *cf, uint64_t *out_e
         }
         free(imms);
     }
+
+    /* under unified mode the cf's live and queued-for-flush keys live in the shared memtable and
+     * its immutables, keyed by the cf prefix. fold in that per-cf run so the estimate covers the
+     * same in-memory data a non-unified cf counts above. a no-op when unified mode is off */
+    uint64_t umt_keys = 0, umt_bytes = 0;
+    tidesdb_unified_cf_memtable_totals(cf->db, cf->unified_cf_index, &umt_keys, &umt_bytes);
+    estimate += umt_keys;
 
     /* each sstable contributes the distinct key count recorded when it was written. an sstable
      * written before the distinct-key summary existed reports TDB_DISTINCT_KEYS_UNKNOWN, so we

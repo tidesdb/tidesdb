@@ -90,7 +90,17 @@ static skip_list_arena_t *skip_list_arena_create(const size_t initial_capacity)
     skip_list_arena_t *arena = malloc(sizeof(skip_list_arena_t));
     if (arena == NULL) return NULL;
 
-    skip_list_arena_block_t *block = skip_list_arena_create_block(initial_capacity);
+    /* the thread-local fast path allocates its own SKIP_LIST_ARENA_TL_BLOCK_SIZE blocks on demand,
+     * so this initial/current block is only ever used by the rare >MAX_THREADS shared fallback.
+     * size it to the tl block size rather than the full requested capacity -- eagerly reserving the
+     * whole arena (2x the write buffer, e.g. 128MB) is a block the common path never touches, which
+     * is a free lazy-overcommit reservation on 64-bit but a hard allocation failure under 32-bit
+     * ASan's constrained address space. block_size keeps the full capacity so the shared fallback,
+     * when it does run under heavy thread contention, still grows in large chunks. */
+    const size_t initial_block = initial_capacity < SKIP_LIST_ARENA_TL_BLOCK_SIZE
+                                     ? initial_capacity
+                                     : SKIP_LIST_ARENA_TL_BLOCK_SIZE;
+    skip_list_arena_block_t *block = skip_list_arena_create_block(initial_block);
     if (block == NULL)
     {
         free(arena);

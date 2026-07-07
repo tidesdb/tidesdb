@@ -1446,7 +1446,11 @@ static inline int encode_varint(uint8_t *buf, uint64_t value)
 static inline int decode_varint(const uint8_t *buf, uint64_t *value, const int max_bytes)
 {
     /* thin adapter over the canonical bounded decoder in compat.h that keeps this call site's
-     * byte-count bound and bytes-read return. the guard keeps buf + max_bytes well-defined. */
+     * byte-count bound and bytes-read return. the guard keeps buf + max_bytes well-defined. always
+     * write *value (0 on failure) so a trusted caller that does not check the return -- the klog
+     * block reads on data the engine itself wrote -- still reads a defined value, matching the
+     * original decoder which wrote *value on every path. */
+    *value = 0;
     if (TDB_UNLIKELY(max_bytes <= 0)) return -1;
     const uint8_t *next = decode_varint64_safe(buf, buf + max_bytes, value);
     return next ? (int)(next - buf) : -1;

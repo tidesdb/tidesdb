@@ -939,6 +939,116 @@ void test_manifest_large_uint64_roundtrip(void)
     remove(test_path);
 }
 
+void test_manifest_v8_checksum_roundtrip(void)
+{
+    const char *test_path = "." PATH_SEPARATOR "test_v8_manifest";
+
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(manifest != NULL);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
+    tidesdb_manifest_update_sequence(manifest, 4242);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
+    tidesdb_manifest_close(manifest);
+
+    /* the committed file must carry the current version and a 16-hex checksum on the next line */
+    FILE *f = tdb_fopen(test_path, "r");
+    ASSERT_TRUE(f != NULL);
+    char vline[64];
+    char csline[64];
+    ASSERT_TRUE(fgets(vline, sizeof(vline), f) != NULL);
+    ASSERT_TRUE(fgets(csline, sizeof(csline), f) != NULL);
+    ASSERT_EQ(atoi(vline), MANIFEST_VERSION);
+    ASSERT_EQ((int)strlen(csline), 17); /* 16 hex digits plus a newline */
+    fclose(f);
+
+    /* the checksum-verified reload must reproduce every field */
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m2 != NULL);
+    ASSERT_EQ(m2->sequence, 4242);
+    ASSERT_EQ(m2->num_entries, 2);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, 100));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 2, 200));
+    tidesdb_manifest_close(m2);
+    remove(test_path);
+}
+
+void test_manifest_v8_detects_body_corruption(void)
+{
+    const char *test_path = "." PATH_SEPARATOR "test_v8_corrupt_manifest";
+
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(manifest != NULL);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_update_sequence(manifest, 7777);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
+    tidesdb_manifest_close(manifest);
+
+    /* read the whole file, flip the first byte of the body (start of the sequence line, which
+     * sits just past the version and checksum lines) and write it back. the stored checksum no
+     * longer matches the body, so the manifest must refuse to open rather than serve stale data. */
+    FILE *f = tdb_fopen(test_path, "rb");
+    ASSERT_TRUE(f != NULL);
+    char buf[512];
+    const size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    ASSERT_TRUE(n > 0);
+
+    int newlines = 0;
+    size_t body_start = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        if (buf[i] == '\n' && ++newlines == 2)
+        {
+            body_start = i + 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(body_start > 0 && body_start < n);
+    buf[body_start] = (char)('0' + (((buf[body_start] - '0') + 1) % 10));
+
+    f = tdb_fopen(test_path, "wb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fwrite(buf, 1, n, f), n);
+    fclose(f);
+
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m2 == NULL);
+    remove(test_path);
+}
+
+void test_manifest_v7_legacy_opens(void)
+{
+    const char *test_path = "." PATH_SEPARATOR "test_v7_legacy_manifest";
+
+    /* a version 7 file has no checksum line and must still open. after a commit it is rewritten
+     * as the current version and gains a checksum. */
+    FILE *f = tdb_fopen(test_path, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f, "7\n5000\n1,100,1000,65536\n2,200,2000,131072\n");
+    fclose(f);
+
+    tidesdb_manifest_t *m = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m != NULL);
+    ASSERT_EQ(m->sequence, 5000);
+    ASSERT_EQ(m->num_entries, 2);
+    ASSERT_EQ(tidesdb_manifest_commit(m, test_path, 1), 0);
+    tidesdb_manifest_close(m);
+
+    FILE *vf = tdb_fopen(test_path, "r");
+    ASSERT_TRUE(vf != NULL);
+    char vline[64];
+    ASSERT_TRUE(fgets(vline, sizeof(vline), vf) != NULL);
+    ASSERT_EQ(atoi(vline), MANIFEST_VERSION);
+    fclose(vf);
+
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m2 != NULL);
+    ASSERT_EQ(m2->num_entries, 2);
+    tidesdb_manifest_close(m2);
+    remove(test_path);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -967,6 +1077,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_manifest_remove_to_zero, tests_passed);
     RUN_TEST(test_manifest_commit_empty, tests_passed);
     RUN_TEST(test_manifest_large_uint64_roundtrip, tests_passed);
+    RUN_TEST(test_manifest_v8_checksum_roundtrip, tests_passed);
+    RUN_TEST(test_manifest_v8_detects_body_corruption, tests_passed);
+    RUN_TEST(test_manifest_v7_legacy_opens, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

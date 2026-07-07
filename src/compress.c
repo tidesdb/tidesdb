@@ -47,6 +47,16 @@ _Static_assert(TDB_COMPRESS_ZSTD == 3, "compression_algorithm wire drift: ZSTD m
 _Static_assert(TDB_COMPRESS_LZ4_FAST == 4, "compression_algorithm wire drift: LZ4_FAST must be 4");
 #endif
 
+/* maximum plausible decompression expansion per backend. a valid compressed block cannot expand
+ * beyond these ratios of its compressed bytes, so a size prefix claiming more is corrupt and is
+ * rejected before the output buffer is allocated. LZ4's block format tops out near 255x (a long run
+ * encoded as one extended match) and snappy's copy operations near 64/3, so 64 leaves ample margin.
+ * these are over-estimates of the true maxima, so they reject impossible sizes without ever
+ * rejecting a valid stream. zstd's RLE mode can expand arbitrarily, so it keeps the UINT32_MAX cap
+ * rather than a ratio bound. */
+#define COMPRESS_LZ4_MAX_EXPANSION    255
+#define COMPRESS_SNAPPY_MAX_EXPANSION 64
+
 int tidesdb_compression_available(const compression_algorithm type)
 {
     switch (type)
@@ -76,7 +86,9 @@ uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *comp
 {
     uint8_t *compressed_data = NULL;
 
-    if (TDB_UNLIKELY(!data))
+    /* every backend branch writes *compressed_size, so a NULL out-param is a caller error rather
+     * than something to dereference blindly */
+    if (TDB_UNLIKELY(!data || !compressed_size))
     {
         return NULL;
     }
@@ -111,6 +123,14 @@ uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *comp
         case TDB_COMPRESS_LZ4:
         case TDB_COMPRESS_LZ4_FAST:
         {
+            /* LZ4's API takes int lengths. reject an input past LZ4_MAX_INPUT_SIZE before the cast
+             * so a value larger than INT_MAX cannot wrap to a negative length -- LZ4_compressBound
+             * would then return 0 and the compress call run with a bogus size. the decompress side
+             * already bounds the prefix, this closes the matching gap on the compress side. */
+            if (TDB_UNLIKELY(data_size > LZ4_MAX_INPUT_SIZE))
+            {
+                return NULL;
+            }
             *compressed_size = (size_t)LZ4_compressBound((int)data_size);
             const size_t total_size = *compressed_size + sizeof(uint64_t);
             compressed_data = malloc(total_size);
@@ -180,7 +200,8 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
 {
     uint8_t *decompressed_data = NULL;
 
-    if (TDB_UNLIKELY(!data)) return NULL;
+    /* every backend branch writes *decompressed_size, so a NULL out-param is a caller error */
+    if (TDB_UNLIKELY(!data || !decompressed_size)) return NULL;
 
     switch (type)
     {
@@ -194,7 +215,13 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
 
             const uint64_t original_size = decode_uint64_le_compat(data);
 
-            if (TDB_UNLIKELY(original_size > UINT32_MAX))
+            /* reject an implausible size prefix before allocating -- a valid snappy block cannot
+             * expand past COMPRESS_SNAPPY_MAX_EXPANSION times its compressed bytes, so a larger
+             * claim is corrupt (the prefix is otherwise trusted only because upstream frames are
+             * checksummed) */
+            if (TDB_UNLIKELY(original_size > UINT32_MAX ||
+                             original_size > (uint64_t)(data_size - sizeof(uint64_t)) *
+                                                 COMPRESS_SNAPPY_MAX_EXPANSION))
             {
                 return NULL;
             }
@@ -235,7 +262,13 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
 
             const uint64_t original_size = decode_uint64_le_compat(data);
 
-            if (TDB_UNLIKELY(original_size > UINT32_MAX))
+            /* reject an implausible size prefix before allocating -- a valid LZ4 block cannot
+             * expand past COMPRESS_LZ4_MAX_EXPANSION times its compressed bytes, so a larger claim
+             * is corrupt (the prefix is otherwise trusted only because upstream frames are
+             * checksummed) */
+            if (TDB_UNLIKELY(original_size > UINT32_MAX ||
+                             original_size > (uint64_t)(data_size - sizeof(uint64_t)) *
+                                                 COMPRESS_LZ4_MAX_EXPANSION))
             {
                 return NULL;
             }
@@ -267,6 +300,9 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
 
             const uint64_t original_size = decode_uint64_le_compat(data);
 
+            /* zstd's RLE mode can expand arbitrarily, so no ratio bound applies here -- the
+             * UINT32_MAX cap is the plausibility bound, and upstream frame checksums are what
+             * actually protect this prefix from corruption */
             if (TDB_UNLIKELY(original_size > UINT32_MAX))
             {
                 return NULL;

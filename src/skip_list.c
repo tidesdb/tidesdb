@@ -277,13 +277,22 @@ static inline void skip_list_dealloc(const skip_list_t *list, void *ptr)
 
 /**
  * skip_list_compare_keys_numeric_inline
- * fast inline comparison for 8-byte numeric keys
+ * fast inline comparison for 8-byte numeric keys interpreted as host-native uint64. the ordering is
+ * by machine-integer value and is therefore host-native, not portable across endianness. keys that
+ * are not exactly 8 bytes fall back to memcmp so a malformed key can never drive an out-of-bounds
+ * 8-byte read.
  * @param key1 first key
+ * @param key1_size size of first key
  * @param key2 second key
+ * @param key2_size size of second key
  * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
  */
-static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, const uint8_t *key2)
+static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, const size_t key1_size,
+                                                        const uint8_t *key2, const size_t key2_size)
 {
+    if (SKIP_LIST_UNLIKELY(key1_size != sizeof(uint64_t) || key2_size != sizeof(uint64_t)))
+        return skip_list_comparator_memcmp(key1, key1_size, key2, key2_size, NULL);
+
     uint64_t v1, v2;
     memcpy(&v1, key1, sizeof(uint64_t));
     memcpy(&v2, key2, sizeof(uint64_t));
@@ -493,7 +502,7 @@ static inline int skip_list_compare_keys_with_type(const skip_list_cmp_type_t cm
     switch (cmp_type)
     {
         case SKIP_LIST_CMP_NUMERIC:
-            return skip_list_compare_keys_numeric_inline(key1, key2);
+            return skip_list_compare_keys_numeric_inline(key1, key1_size, key2, key2_size);
 
         case SKIP_LIST_CMP_STRING:
             return skip_list_comparator_string(key1, key1_size, key2, key2_size, NULL);
@@ -679,9 +688,12 @@ int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uin
 int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                  size_t key2_size, void *ctx)
 {
-    (void)key1_size;
-    (void)key2_size;
     (void)ctx;
+    /* numeric keys are 8-byte host-native integers; anything else falls back to memcmp so a
+     * malformed key can never drive an out-of-bounds 8-byte read */
+    if (key1_size != sizeof(uint64_t) || key2_size != sizeof(uint64_t))
+        return skip_list_comparator_memcmp(key1, key1_size, key2, key2_size, NULL);
+
     uint64_t val1, val2;
     memcpy(&val1, key1, sizeof(uint64_t));
     memcpy(&val2, key2, sizeof(uint64_t));

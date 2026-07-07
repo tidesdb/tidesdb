@@ -302,6 +302,80 @@ void test_invalid_compression_algorithm()
     ASSERT_TRUE(result == NULL);
 }
 
+void test_compress_null_out_param()
+{
+    uint8_t data[] = "some data";
+    size_t data_size = sizeof(data);
+
+    /* a NULL size out-param must return NULL rather than dereferencing it */
+    ASSERT_TRUE(compress_data(data, data_size, NULL, TDB_COMPRESS_LZ4) == NULL);
+    ASSERT_TRUE(compress_data(data, data_size, NULL, TDB_COMPRESS_ZSTD) == NULL);
+    ASSERT_TRUE(decompress_data(data, data_size, NULL, TDB_COMPRESS_LZ4) == NULL);
+    ASSERT_TRUE(decompress_data(data, data_size, NULL, TDB_COMPRESS_ZSTD) == NULL);
+}
+
+void test_decompress_rejects_implausible_prefix()
+{
+    /* a size prefix within UINT32_MAX but far larger than any real block could expand to must be
+     * rejected by the ratio bound before allocating, not passed through to the codec */
+    uint8_t data[] = "a small buffer that will compress to a handful of bytes";
+    size_t data_size = sizeof(data);
+    size_t compressed_size;
+
+    uint8_t *compressed = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_LZ4);
+    ASSERT_TRUE(compressed != NULL);
+    /* 16 MB claimed output from a few compressed bytes is impossible for LZ4 (max ~255x) yet well
+     * under UINT32_MAX, so the old cap would have passed it */
+    encode_uint64_le_compat(compressed, 16u * 1024u * 1024u);
+    size_t decompressed_size;
+    ASSERT_TRUE(
+        decompress_data(compressed, compressed_size, &decompressed_size, TDB_COMPRESS_LZ4) == NULL);
+    free(compressed);
+
+#ifndef __sun
+    compressed = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_SNAPPY);
+    ASSERT_TRUE(compressed != NULL);
+    encode_uint64_le_compat(compressed, 16u * 1024u * 1024u);
+    ASSERT_TRUE(decompress_data(compressed, compressed_size, &decompressed_size,
+                                TDB_COMPRESS_SNAPPY) == NULL);
+    free(compressed);
+#endif
+}
+
+void test_highly_compressible_roundtrip()
+{
+    /* an all-zero block compresses near each codec's maximum ratio, so it is the worst legitimate
+     * case for the ratio bound -- it must still round-trip, proving the bound rejects only
+     * impossible sizes and never valid highly-compressible data */
+    const size_t n = 65536;
+    uint8_t *zeros = calloc(n, 1);
+    ASSERT_TRUE(zeros != NULL);
+
+    size_t compressed_size, decompressed_size;
+
+    uint8_t *c = compress_data(zeros, n, &compressed_size, TDB_COMPRESS_LZ4);
+    ASSERT_TRUE(c != NULL);
+    uint8_t *d = decompress_data(c, compressed_size, &decompressed_size, TDB_COMPRESS_LZ4);
+    ASSERT_TRUE(d != NULL);
+    ASSERT_EQ(decompressed_size, n);
+    ASSERT_EQ(memcmp(d, zeros, n), 0);
+    free(c);
+    free(d);
+
+#ifndef __sun
+    c = compress_data(zeros, n, &compressed_size, TDB_COMPRESS_SNAPPY);
+    ASSERT_TRUE(c != NULL);
+    d = decompress_data(c, compressed_size, &decompressed_size, TDB_COMPRESS_SNAPPY);
+    ASSERT_TRUE(d != NULL);
+    ASSERT_EQ(decompressed_size, n);
+    ASSERT_EQ(memcmp(d, zeros, n), 0);
+    free(c);
+    free(d);
+#endif
+
+    free(zeros);
+}
+
 /* ==================== Benchmark Helpers ==================== */
 
 typedef struct
@@ -693,6 +767,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_decompress_corrupted_size_header, tests_passed);
     RUN_TEST(test_decompress_insufficient_data, tests_passed);
     RUN_TEST(test_invalid_compression_algorithm, tests_passed);
+    RUN_TEST(test_compress_null_out_param, tests_passed);
+    RUN_TEST(test_decompress_rejects_implausible_prefix, tests_passed);
+    RUN_TEST(test_highly_compressible_roundtrip, tests_passed);
     RUN_TEST(test_size_encoding_portability, tests_passed);
     RUN_TEST(test_uint32_max_boundary, tests_passed);
     RUN_TEST(test_compressed_size_includes_header, tests_passed);

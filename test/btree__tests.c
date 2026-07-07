@@ -1167,6 +1167,26 @@ void test_btree_comparator_numeric(void)
     (void)remove(TEST_BTREE_FILE);
 }
 
+void test_btree_comparator_numeric_size_guard(void)
+{
+    /* 8-byte keys compare as host-native integers */
+    uint64_t a = 5, b = 9;
+    ASSERT_TRUE(btree_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&b, 8, NULL) < 0);
+    ASSERT_TRUE(btree_comparator_numeric((uint8_t *)&b, 8, (uint8_t *)&a, 8, NULL) > 0);
+    ASSERT_EQ(btree_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&a, 8, NULL), 0);
+
+    /* a key that is not 8 bytes must not drive an 8-byte read; it falls back to memcmp order */
+    const uint8_t short_key[3] = {'a', 'b', 'c'};
+    const uint8_t long_key[8] = {'a', 'b', 'c', 'd', 0, 0, 0, 0};
+    ASSERT_TRUE(btree_comparator_numeric(short_key, sizeof(short_key), long_key, sizeof(long_key),
+                                         NULL) < 0);
+    ASSERT_TRUE(btree_comparator_numeric(long_key, sizeof(long_key), short_key, sizeof(short_key),
+                                         NULL) > 0);
+    ASSERT_EQ(
+        btree_comparator_numeric(short_key, sizeof(short_key), short_key, sizeof(short_key), NULL),
+        0);
+}
+
 void test_btree_get_stats(void)
 {
     block_manager_t *bm = NULL;
@@ -2600,6 +2620,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_arena, tests_passed);
     RUN_TEST(test_btree_comparator_string, tests_passed);
     RUN_TEST(test_btree_comparator_numeric, tests_passed);
+    RUN_TEST(test_btree_comparator_numeric_size_guard, tests_passed);
     RUN_TEST(test_btree_get_stats, tests_passed);
     RUN_TEST(test_btree_cursor_seek_for_prev, tests_passed);
     RUN_TEST(test_btree_cursor_has_next_has_prev, tests_passed);

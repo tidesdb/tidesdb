@@ -61,6 +61,27 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
     return (queue_node_t *)malloc(sizeof(queue_node_t));
 }
 
+/* fill ts with an absolute deadline offset_ns from now, on the same clock the not_empty condvar was
+ * initialized with. on linux that is CLOCK_MONOTONIC, so a wall-clock step (an ntp correction or a
+ * manual clock change) cannot stretch or shorten a timed wait; elsewhere pthread_condattr_setclock
+ * is not portably available -- notably on macOS -- so the condvar and this deadline both use
+ * CLOCK_REALTIME to stay consistent, mirroring the pattern the engine uses for its own condvars.
+ * offset_ns is under one second, so a single carry normalizes tv_nsec. */
+static inline void queue_cond_deadline(struct timespec *ts, long offset_ns)
+{
+#if defined(__linux__)
+    clock_gettime(CLOCK_MONOTONIC, ts);
+#else
+    clock_gettime(CLOCK_REALTIME, ts);
+#endif
+    ts->tv_nsec += offset_ns;
+    if (ts->tv_nsec >= QUEUE_NS_PER_SEC)
+    {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= QUEUE_NS_PER_SEC;
+    }
+}
+
 /**
  * queue_free_node
  * return node to pool or free it
@@ -159,7 +180,22 @@ queue_t *queue_new(void)
         return NULL;
     }
 
+    /* initialize not_empty on CLOCK_MONOTONIC where supported so its timed waits are immune to a
+     * wall-clock step (see queue_cond_deadline). the clock chosen here must match the one the
+     * deadlines use. */
+#if defined(__linux__)
+    int cond_rc;
+    {
+        pthread_condattr_t cattr;
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+        cond_rc = pthread_cond_init(&queue->not_empty, &cattr);
+        pthread_condattr_destroy(&cattr);
+    }
+    if (cond_rc != 0)
+#else
     if (pthread_cond_init(&queue->not_empty, NULL) != 0)
+#endif
     {
         pthread_rwlock_destroy(&queue->read_lock);
         pthread_mutex_destroy(&queue->pool_lock);
@@ -292,13 +328,7 @@ void *queue_dequeue_wait(queue_t *queue)
            !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
     {
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
-        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
-        {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= QUEUE_NS_PER_SEC;
-        }
+        queue_cond_deadline(&ts, QUEUE_WAIT_TIMEOUT_NS);
         pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
     }
 
@@ -353,13 +383,7 @@ void *queue_dequeue_wait(queue_t *queue)
                !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
         {
             struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
-            if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
-            {
-                ts.tv_sec += 1;
-                ts.tv_nsec -= QUEUE_NS_PER_SEC;
-            }
+            queue_cond_deadline(&ts, QUEUE_WAIT_TIMEOUT_NS);
             pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
         }
 
@@ -597,13 +621,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     while (atomic_load_explicit(&queue->waiter_count, memory_order_acquire) > 0)
     {
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
-        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
-        {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= QUEUE_NS_PER_SEC;
-        }
+        queue_cond_deadline(&ts, QUEUE_WAIT_TIMEOUT_NS);
         pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
     }
 

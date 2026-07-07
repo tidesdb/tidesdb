@@ -85,6 +85,9 @@ int tdb_local_cache_init(tdb_local_cache_t *cache, const char *cache_dir, size_t
  * tdb_local_cache_destroy
  * free all tracking entries and destroy mutex.
  * does not delete cached files from disk (they persist for next startup).
+ * the caller must ensure no other thread is still using the cache -- it destroys the lock and frees
+ * every entry. tidesdb_close joins the replica-sync and object-store worker threads, and the caller
+ * must not issue API calls during close, before this runs.
  * @param cache cache to destroy
  */
 void tdb_local_cache_destroy(tdb_local_cache_t *cache);

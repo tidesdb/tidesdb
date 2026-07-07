@@ -20,9 +20,18 @@
 #define __MANIFEST_H__
 
 #define MANIFEST_INITIAL_CAPACITY 64
-#define MANIFEST_VERSION          7
-#define MANIFEST_PATH_LEN         4096
-#define MANIFEST_MAX_LINE_LEN     256
+/* current on-disk manifest version. version 8 carries an xxhash64 checksum of the body on the
+ * second line. version 7 and earlier are read as legacy without a checksum, so existing
+ * databases still open and gain integrity on their next commit, which rewrites them as the
+ * current version. */
+#define MANIFEST_VERSION        8
+#define MANIFEST_VERSION_LEGACY 7
+#define MANIFEST_PATH_LEN       4096
+#define MANIFEST_MAX_LINE_LEN   256
+/* upper bound on a serialized body line (an int level plus three uint64 fields and separators)
+ * and the initial capacity of the growable body buffer used to compute and verify the checksum */
+#define MANIFEST_BODY_LINE_MAX 128
+#define MANIFEST_BODY_INIT_CAP 4096
 /* microseconds to wait between checks */
 #define MANIFEST_CLOSE_WAIT_US 100
 /* max iterations (10000 × 100μs = 1 second) */
@@ -138,7 +147,10 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, int 
 
 /**
  * tidesdb_manifest_close
- * closes manifest and frees memory
+ * closes manifest and frees memory. the caller must ensure no other thread is still using the
+ * manifest -- it destroys the lock and frees the struct. a bounded drain waits for in-flight
+ * operations as a backstop and logs to stderr if any remain, but quiescing users is the caller's
+ * responsibility (tidesdb_close joins all worker threads before the owning column family frees it).
  * @param manifest manifest to close
  */
 void tidesdb_manifest_close(tidesdb_manifest_t *manifest);

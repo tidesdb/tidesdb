@@ -1445,38 +1445,11 @@ static inline int encode_varint(uint8_t *buf, uint64_t value)
  */
 static inline int decode_varint(const uint8_t *buf, uint64_t *value, const int max_bytes)
 {
+    /* thin adapter over the canonical bounded decoder in compat.h that keeps this call site's
+     * byte-count bound and bytes-read return. the guard keeps buf + max_bytes well-defined. */
     if (TDB_UNLIKELY(max_bytes <= 0)) return -1;
-
-    /* fast path for 1-byte varints (values < 128) -- most common case */
-    if (TDB_LIKELY(!(buf[0] & 0x80)))
-    {
-        *value = buf[0];
-        return 1;
-    }
-
-    /* slow path for multi-byte varints */
-    *value = (uint64_t)(buf[0] & 0x7F);
-    int shift = 7;
-    int pos = 1;
-
-    while (pos < max_bytes)
-    {
-        const uint8_t byte = buf[pos++];
-        *value |= (uint64_t)(byte & 0x7F) << shift;
-
-        if ((byte & 0x80) == 0)
-        {
-            return pos; /* success */
-        }
-
-        shift += 7;
-        if (shift >= 64)
-        {
-            return -1; /* oflow */
-        }
-    }
-
-    return -1; /* incomplete varint */
+    const uint8_t *next = decode_varint64_safe(buf, buf + max_bytes, value);
+    return next ? (int)(next - buf) : -1;
 }
 
 static inline void tdb_encode_be32(const uint32_t val, uint8_t *out)
@@ -6001,13 +5974,19 @@ static void tdb_objstore_prefetch_sstables(tidesdb_t *db, tidesdb_sstable_t **ss
         if (!ssts[i] || !ssts[i]->klog_path || !ssts[i]->vlog_path) continue;
 
         struct stat st;
-        if (stat(ssts[i]->klog_path, &st) != 0)
+        /* an open block manager holds an fd to the local file, so a non-NULL klog_bm/vlog_bm is an
+         * authoritative "resident locally" signal -- skip the stat syscall in that case. only a
+         * closed bm needs the filesystem check to tell resident-but-closed from not-downloaded,
+         * and the && short-circuits so the stat runs only then. */
+        if (!atomic_load_explicit(&ssts[i]->klog_bm, memory_order_acquire) &&
+            stat(ssts[i]->klog_path, &st) != 0)
         {
             args[num_missing].db = db;
             args[num_missing].local_path = ssts[i]->klog_path;
             num_missing++;
         }
-        if (stat(ssts[i]->vlog_path, &st) != 0)
+        if (!atomic_load_explicit(&ssts[i]->vlog_bm, memory_order_acquire) &&
+            stat(ssts[i]->vlog_path, &st) != 0)
         {
             args[num_missing].db = db;
             args[num_missing].local_path = ssts[i]->vlog_path;
@@ -6307,6 +6286,14 @@ static int tdb_replica_replay_single_wal(tidesdb_t *db, const char *wal_local,
                 if (block_manager_cursor_skip_corrupt(cursor) == 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN, "Replica WAL replay skipped partial write");
+                    continue;
+                }
+                /* a zero-filled reservation hole from a failed concurrent append can shadow later
+                 * committed blocks, so resync past it. genuine corruption leaves this a no-op. */
+                if (block_manager_cursor_resync_past_hole(cursor) == 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "Replica WAL replay resynced past a reservation hole");
                     continue;
                 }
                 break;
@@ -18860,7 +18847,18 @@ static int tidesdb_wal_replay_into(tidesdb_column_family_t *cf, block_manager_t 
                                   cf->name);
                     continue;
                 }
-                break; /* genuine corruption or zero-filled hole; stop replay */
+                /* not a partial write. a zero-filled reservation hole from a failed concurrent
+                 * append can shadow later committed blocks, so resync past it. genuine corruption
+                 * (nonzero size, bad checksum) leaves resync a no-op and we stop. */
+                if (block_manager_cursor_resync_past_hole(cursor) == 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "CF '%s' WAL recovery resynced past a reservation hole, resuming "
+                                  "replay",
+                                  cf->name);
+                    continue;
+                }
+                break; /* genuine corruption or end of data, stop replay */
             }
             block_count++;
 
@@ -24881,15 +24879,27 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
      * is_flushing CAS ensures only one flush runs per CF at a time. */
     if (queue_enqueue(cf->immutable_memtables, immutable) != 0)
     {
+        /* the enqueue failed on an allocation error. rather than drop old_mt (which would leave its
+         * committed data invisible until a restart replays the wal) we abort the rotation, free the
+         * new memtable we just built, and leave old_mt in place as the active memtable. the reaper
+         * retries the flush later. */
         TDB_DEBUG_LOG(
-            TDB_LOG_ERROR,
-            "CF '%s' CRITICAL, failed to enqueue immutable memtable - data in WAL for recovery",
+            TDB_LOG_WARN,
+            "CF '%s' failed to enqueue immutable memtable, aborting rotation to retry the "
+            "flush later",
             cf->name);
 
-        /* we free the skip_list and wal -- data is still in WAL for recovery on restart */
-        skip_list_free(old_memtable);
-        if (old_wal) block_manager_close(old_wal);
-        free(immutable);
+        skip_list_free(new_memtable);
+        if (new_wal)
+        {
+            /* close before unlink so the delete succeeds on windows, which cannot remove an open
+             * file. the new wal is a fresh empty file no reader can hold yet. */
+            char abandoned_wal_path[MAX_FILE_PATH_LENGTH];
+            snprintf(abandoned_wal_path, sizeof(abandoned_wal_path), "%s", new_wal->file_path);
+            block_manager_close(new_wal);
+            tdb_unlink(abandoned_wal_path);
+        }
+        free(new_mt);
         atomic_fetch_sub_explicit(&cf->db->active_flushes, 1, memory_order_release);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;

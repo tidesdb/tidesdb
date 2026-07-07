@@ -3280,6 +3280,115 @@ void test_cursor_skip_corrupt_refuses_data_corruption(void)
     (void)remove(test_file);
 }
 
+void test_cursor_resync_past_hole(void)
+{
+    const char *test_file = "test_resync_hole.db";
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload_a = "block_A_before_hole";
+    const char *payload_hole = "failed_concurrent_append_victim";
+    const char *payload_b = "block_B_after_hole_committed";
+
+    const uint32_t size_a = (uint32_t)(strlen(payload_a) + 1);
+    const uint32_t size_hole = (uint32_t)(strlen(payload_hole) + 1);
+    const uint32_t size_b = (uint32_t)(strlen(payload_b) + 1);
+
+    const int64_t offset_a = block_manager_write_raw(bm, payload_a, size_a);
+    const int64_t offset_hole = block_manager_write_raw(bm, payload_hole, size_hole);
+    const int64_t offset_b = block_manager_write_raw(bm, payload_b, size_b);
+    ASSERT_TRUE(offset_a >= 0);
+    ASSERT_TRUE(offset_hole >= 0);
+    ASSERT_TRUE(offset_b >= 0);
+
+    /* simulate a failed concurrent append that reserved space but wrote zero bytes -- zero the
+     * whole frame so the size field itself reads 0, the case skip_corrupt cannot advance past.
+     * block B sits at a higher offset and is the committed data the hole must not shadow. */
+    const size_t hole_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size_hole + BLOCK_MANAGER_FOOTER_SIZE;
+    uint8_t *zeros = (uint8_t *)calloc(1, hole_len);
+    ASSERT_TRUE(zeros != NULL);
+    ASSERT_TRUE(pwrite(bm->fd, zeros, hole_len, (off_t)offset_hole) == (ssize_t)hole_len);
+    free(zeros);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_a, size_a), 0);
+    block_manager_block_free(block);
+
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+
+    /* the hole reads back as a zero size field, and skip_corrupt cannot advance past it */
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block == NULL);
+    ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), -1);
+
+    /* resync finds the next committed block past the hole */
+    ASSERT_EQ(block_manager_cursor_resync_past_hole(cursor), 0);
+
+    block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_EQ(memcmp(block->data, payload_b, size_b), 0);
+    block_manager_block_free(block);
+
+    printf("  [resync] block B at offset %" PRId64
+           " recovered after resyncing past a zero hole at offset %" PRId64 "\n",
+           offset_b, offset_hole);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
+void test_cursor_resync_refuses_data_corruption(void)
+{
+    const char *test_file = "test_resync_genuine.db";
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    const char *payload = "fully_framed_then_corrupted";
+    const uint32_t size = (uint32_t)(strlen(payload) + 1);
+    const int64_t offset = block_manager_write_raw(bm, payload, size);
+    ASSERT_TRUE(offset >= 0);
+
+    /* flip a data byte so the block stays fully framed (valid footer magic) but fails its
+     * checksum -- the genuine-corruption case skip_corrupt deliberately halts on */
+    const off_t flip = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (off_t)(size / 2);
+    uint8_t byte_val;
+    ASSERT_TRUE(pread(bm->fd, &byte_val, 1, flip) == 1);
+    byte_val ^= 0xFFU;
+    ASSERT_TRUE(pwrite(bm->fd, &byte_val, 1, flip) == 1);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(block == NULL);
+
+    /* the corrupt block has a nonzero size field, so resync refuses it -- the tested policy of
+     * halting on real corruption stands untouched */
+    ASSERT_EQ(block_manager_cursor_resync_past_hole(cursor), -1);
+
+    printf("  [resync] correctly refused a genuine-corruption block at offset %" PRId64 "\n",
+           offset);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
 /* helper that returns file size or -1 on error */
 static int64_t test_file_size(const char *path)
 {
@@ -3656,6 +3765,8 @@ int main(int argc, char **argv)
 #endif
     RUN_TEST(test_cursor_skip_corrupt_partial_write, tests_passed);
     RUN_TEST(test_cursor_skip_corrupt_refuses_data_corruption, tests_passed);
+    RUN_TEST(test_cursor_resync_past_hole, tests_passed);
+    RUN_TEST(test_cursor_resync_refuses_data_corruption, tests_passed);
 
     RUN_TEST(test_block_manager_preallocation_extends_then_close_trims, tests_passed);
     RUN_TEST(test_block_manager_strict_validation_accepts_prealloc_tail, tests_passed);

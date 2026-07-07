@@ -1776,8 +1776,11 @@ int tidesdb_comparator_lexicographic(const uint8_t *key1, size_t key1_size, cons
 
 /**
  * tidesdb_comparator_uint64
- * compares keys as 64-bit unsigned integers (little-endian)
- * keys must be exactly 8 bytes
+ * compares keys as 64-bit unsigned integers in host-native byte order. the ordering is by
+ * machine-integer value, so it is host-native and not portable across hosts of differing
+ * endianness, and neither is a column family that uses it. for an ordering that survives a
+ * cross-endian move, store keys big-endian and use tidesdb_comparator_memcmp, which yields the same
+ * unsigned order portably. keys that are not exactly 8 bytes fall back to memcmp.
  * @param key1 first key (8 bytes)
  * @param key1_size size of first key (must be 8)
  * @param key2 second key (8 bytes)
@@ -1790,8 +1793,12 @@ int tidesdb_comparator_uint64(const uint8_t *key1, size_t key1_size, const uint8
 
 /**
  * tidesdb_comparator_int64
- * compares keys as 64-bit signed integers (little-endian)
- * keys must be exactly 8 bytes
+ * compares keys as 64-bit signed integers in host-native byte order. the ordering is by
+ * machine-integer value, so it is host-native and not portable across hosts of differing
+ * endianness, and neither is a column family that uses it. a portable signed order cannot be had
+ * from plain memcmp of two's-complement bytes without also flipping the sign bit, so a numeric
+ * signed comparator is host-native by nature. keys that are not exactly 8 bytes fall back to
+ * memcmp.
  * @param key1 first key (8 bytes)
  * @param key1_size size of first key (must be 8)
  * @param key2 second key (8 bytes)

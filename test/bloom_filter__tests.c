@@ -732,6 +732,19 @@ void test_bloom_filter_hash_key_sizes(void)
     bloom_filter_free(bf);
 }
 
+void test_bloom_filter_hash_endianness_stable(void)
+{
+    /* the base hash reads each 4-byte chunk little-endian, so a given key must hash to the same
+     * value on every host regardless of native byte order. these golden values pin the
+     * little-endian-canonical output. they guard against an accidental change to the hash, which
+     * would silently invalidate every existing on-disk bloom filter, and on a big-endian host
+     * against a regression to a host-order read. the keys span the 8-byte and 4-byte chunk loops
+     * and the trailing 1 and 3 byte tails. */
+    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"abcdefghijkl", 12, 0), 0x65ed3e40u);
+    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"abcdefghijklm", 13, 0), 0xd6ca9a03u);
+    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"tidesdb", 7, 1), 0x58cb34d3u);
+}
+
 void test_bloom_filter_deserialize_overflow_m(void)
 {
     /* we craft a payload with m near UINT32_MAX to test overflow check */
@@ -1008,9 +1021,73 @@ void test_bloom_filter_is_full_multiword(void)
     bloom_filter_free(bf2);
 }
 
+void test_varint_safe_bounds(void)
+{
+    uint8_t buf[VARINT64_MAX_BYTES];
+
+    /* a complete varint decodes and the returned pointer advances exactly past its bytes */
+    uint8_t *w = encode_varint32(buf, 300u); /* 300 needs 2 bytes */
+    uint32_t v32 = 0;
+    const uint8_t *r = decode_varint32_safe(buf, w, &v32);
+    ASSERT_TRUE(r == w);
+    ASSERT_EQ(v32, 300u);
+
+    uint8_t *w64 = encode_varint64(buf, 0x1234567890ABCDEFull);
+    uint64_t v64 = 0;
+    const uint8_t *r64 = decode_varint64_safe(buf, w64, &v64);
+    ASSERT_TRUE(r64 == w64);
+    ASSERT_TRUE(v64 == 0x1234567890ABCDEFull);
+
+    /* a buffer that ends mid-varint (last byte still has the continuation bit) must return NULL
+     * rather than read past end -- pass an end one byte short of the terminator */
+    ASSERT_TRUE(decode_varint32_safe(buf, w - 1, &v32) == NULL);
+    ASSERT_TRUE(decode_varint64_safe(buf, w64 - 1, &v64) == NULL);
+
+    /* an empty range returns NULL without dereferencing */
+    ASSERT_TRUE(decode_varint32_safe(buf, buf, &v32) == NULL);
+    ASSERT_TRUE(decode_varint64_safe(buf, buf, &v64) == NULL);
+
+    /* an overlong encoding (every byte carries the continuation bit) exhausts the byte budget and
+     * returns NULL instead of running off the buffer */
+    uint8_t overlong[VARINT64_MAX_BYTES];
+    for (int i = 0; i < VARINT64_MAX_BYTES; i++) overlong[i] = 0x80;
+    ASSERT_TRUE(decode_varint32_safe(overlong, overlong + VARINT32_MAX_BYTES, &v32) == NULL);
+    ASSERT_TRUE(decode_varint64_safe(overlong, overlong + VARINT64_MAX_BYTES, &v64) == NULL);
+}
+
+void test_bloom_filter_deserialize_rejects_oversized_h(void)
+{
+    /* a real filter round-trips fine -- its h is within the constructor cap, so the deserialize
+     * cap must not reject a legitimate filter */
+    bloom_filter_t *real = NULL;
+    ASSERT_EQ(bloom_filter_new(&real, 0.01, 1000), 0);
+    ASSERT_TRUE(real->h >= 1);
+    size_t slen = 0;
+    uint8_t *sbuf = bloom_filter_serialize(real, &slen);
+    ASSERT_TRUE(sbuf != NULL);
+    bloom_filter_t *rt = bloom_filter_deserialize(sbuf, slen);
+    ASSERT_TRUE(rt != NULL);
+    ASSERT_EQ(rt->h, real->h);
+    bloom_filter_free(rt);
+    free(sbuf);
+    bloom_filter_free(real);
+
+    /* a corrupt filter claiming a wildly out-of-range h is rejected rather than trusted -- h is the
+     * per-query probe count, so a multi-billion value would turn every contains() into a runaway
+     * loop. this is a legacy (no sentinel) header of varint32 m, varint32 h, varint32 count */
+    uint8_t crafted[32];
+    uint8_t *ptr = crafted;
+    ptr = encode_varint32(ptr, 1024);       /* m */
+    ptr = encode_varint32(ptr, UINT32_MAX); /* h -- far past any legitimate value */
+    ptr = encode_varint32(ptr, 0);          /* non_zero_count */
+    ASSERT_TRUE(bloom_filter_deserialize(crafted, (size_t)(ptr - crafted)) == NULL);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
+    RUN_TEST(test_varint_safe_bounds, tests_passed);
+    RUN_TEST(test_bloom_filter_deserialize_rejects_oversized_h, tests_passed);
     RUN_TEST(test_bloom_filter_new_failure_nulls_out, tests_passed);
     RUN_TEST(test_bloom_filter_new, tests_passed);
     RUN_TEST(test_bloom_filter_add_and_contains, tests_passed);
@@ -1037,6 +1114,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_bloom_filter_null_entry, tests_passed);
     RUN_TEST(test_bloom_filter_is_full_null_bitset, tests_passed);
     RUN_TEST(test_bloom_filter_hash_key_sizes, tests_passed);
+    RUN_TEST(test_bloom_filter_hash_endianness_stable, tests_passed);
     RUN_TEST(test_bloom_filter_deserialize_overflow_m, tests_passed);
     RUN_TEST(test_bloom_filter_dense_encoding, tests_passed);
     RUN_TEST(test_bloom_filter_sparse_encoding_unchanged, tests_passed);

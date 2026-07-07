@@ -58,7 +58,7 @@ typedef struct
  * @param payload atomic pointer to heap-allocated payload
  * @param key_len atomic key length
  * @param payload_len atomic payload length
- * @param ref_bit atomic ref bit (LSB) plus reader count in upper bits
+ * @param ref_bit atomic clock ref bit (LSB) plus a 31-bit reader count in the upper bits
  * @param state atomic state -- 0=empty, 1=writing, 2=valid, 3=deleting
  * @param cached_hash cached hash value for this entry
  * @param external_bytes caller-declared memory cost of pointed-to data
@@ -69,7 +69,7 @@ typedef struct
     _Atomic(void *) payload;
     atomic_size_t key_len;
     atomic_size_t payload_len;
-    _Atomic(uint8_t) ref_bit;
+    _Atomic(uint32_t) ref_bit;
     _Atomic(uint8_t) state;
     atomic_uint64_t cached_hash;
     atomic_size_t external_bytes;
@@ -150,9 +150,6 @@ struct clock_cache_partition_t
  * @param num_partitions number of partitions
  * @param partition_mask mask for fast modulo (num_partitions - 1)
  * @param max_bytes maximum total bytes
- * @param total_bytes total bytes across all partitions
- * @param hits cache hits
- * @param misses cache misses
  * @param shutdown shutdown flag -- prevents new operations
  * @param evict_callback optional callback for custom cleanup on eviction (can be NULL)
  * @param num_groups number of L3/CCX groups (1 on monolithic dies, 4 on Threadripper)
@@ -167,9 +164,6 @@ struct clock_cache_t
     size_t num_partitions;
     size_t partition_mask;
     size_t max_bytes;
-    atomic_size_t total_bytes;
-    atomic_uint64_t hits;
-    atomic_uint64_t misses;
     _Atomic(uint8_t) shutdown;
     clock_cache_evict_fn evict_callback;
     size_t num_groups;
@@ -218,7 +212,10 @@ clock_cache_t *clock_cache_create(const cache_config_t *config);
 
 /**
  * clock_cache_destroy
- * destroy the cache and free all resources
+ * destroy the cache and free all resources. the caller must ensure no other thread is still
+ * accessing the cache -- it frees every slot's key and payload without draining active readers, so
+ * a concurrent get or put would use freed memory. tidesdb_close joins all flush, compaction, and
+ * reaper threads, and the caller must not issue API calls during close, before this runs.
  * @param cache the cache to destroy
  */
 void clock_cache_destroy(clock_cache_t *cache);

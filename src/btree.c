@@ -139,27 +139,14 @@ static inline size_t btree_signed_varint_encode(uint8_t *buf, const int64_t val)
     return btree_varint_encode(buf, uval);
 }
 
-/* bounded LEB128 decode for parsing on-disk (untrusted) node bytes in which reads at most
- * the bytes remaining before `end` and at most 10. returns bytes consumed, or 0 on
- * truncation / overlong encoding so the caller can reject a malformed node. */
+/* bounded LEB128 decode for parsing on-disk (untrusted) node bytes -- a thin adapter over the
+ * canonical decoder in compat.h that keeps this module's bytes-consumed convention. returns bytes
+ * consumed, or 0 on truncation / overlong encoding so the caller can reject a malformed node. */
 static inline size_t btree_varint_decode_bounded(const uint8_t *buf, const uint8_t *end,
                                                  uint64_t *val)
 {
-    uint64_t result = 0;
-    size_t shift = 0;
-    for (size_t i = 0; i < 10; i++)
-    {
-        if (buf + i >= end) return 0;
-        const uint8_t b = buf[i];
-        result |= (uint64_t)(b & 0x7F) << shift;
-        if (!(b & 0x80))
-        {
-            *val = result;
-            return i + 1;
-        }
-        shift += 7;
-    }
-    return 0;
+    const uint8_t *next = decode_varint64_safe(buf, end, val);
+    return next ? (size_t)(next - buf) : 0;
 }
 
 static inline size_t btree_signed_varint_decode_bounded(const uint8_t *buf, const uint8_t *end,
@@ -351,7 +338,10 @@ void btree_arena_reset(btree_arena_t *arena)
 
 /**
  * btree_compare_keys_numeric_inline
- * fast inline comparison for 8-byte numeric keys
+ * fast inline comparison for 8-byte numeric keys interpreted as host-native uint64. the ordering is
+ * by machine-integer value and is therefore host-native, not portable across endianness. callers
+ * must have already confirmed both keys are 8 bytes; the dispatch in btree_compare_keys_inline does
+ * this and falls back to memcmp otherwise.
  * @param key1 first key (8 bytes)
  * @param key2 second key (8 bytes)
  * @return -1 if key1 < key2, 1 if key1 > key2, 0 if equal
@@ -471,9 +461,12 @@ int btree_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t
 int btree_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                              size_t key2_size, void *ctx)
 {
-    (void)key1_size;
-    (void)key2_size;
     (void)ctx;
+    /* numeric keys are 8-byte host-native integers; anything else falls back to memcmp so a
+     * malformed key can never drive an out-of-bounds 8-byte read */
+    if (key1_size != sizeof(uint64_t) || key2_size != sizeof(uint64_t))
+        return btree_comparator_memcmp(key1, key1_size, key2, key2_size, NULL);
+
     uint64_t val1, val2;
     memcpy(&val1, key1, sizeof(uint64_t));
     memcpy(&val2, key2, sizeof(uint64_t));
@@ -2063,7 +2056,12 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         off += btree_varint_decode(block_data + off, &num_entries);
         off += 8; /* skip prev_offset, now at next_offset position */
 
-        memcpy(block_data + off, &next_leaf_offset, sizeof(int64_t));
+        /* patch the next-sibling offset little-endian, matching the serializer and the
+         * deserializer. the same encoded bytes feed both the in-memory checksum recompute below
+         * and the disk write, so the stored checksum covers exactly the bytes on disk. */
+        uint8_t next_off_le[sizeof(int64_t)];
+        encode_int64_le_compat(next_off_le, next_leaf_offset);
+        memcpy(block_data + off, next_off_le, sizeof(next_off_le));
 
         const uint32_t new_checksum = XXH32(block->data, block->size, 0);
 
@@ -2077,7 +2075,7 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         }
 
         if (block_manager_write_at(builder->leaf_bm, leaf_offset + block_header_size + off,
-                                   (uint8_t *)&next_leaf_offset, sizeof(int64_t)) != 0)
+                                   next_off_le, sizeof(next_off_le)) != 0)
         {
             block_manager_block_free(block);
             return -1;
@@ -2173,10 +2171,14 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
             const int64_t prev_patch_offset = new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + 4;
             const int64_t next_patch_offset = new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + 12;
 
+            /* the header offsets are read back little-endian by btree_node_read_with_compression,
+             * so patch them little-endian too rather than in host byte order */
+
             /* we patch prev_offset (first leaf has prev=-1, others point to previous new offset) */
             int64_t prev_leaf_offset = (i == 0) ? -1 : new_offsets[i - 1];
-            if (block_manager_write_at(builder->bm, prev_patch_offset, (uint8_t *)&prev_leaf_offset,
-                                       8) != 0)
+            uint8_t prev_off_le[8];
+            encode_int64_le_compat(prev_off_le, prev_leaf_offset);
+            if (block_manager_write_at(builder->bm, prev_patch_offset, prev_off_le, 8) != 0)
             {
                 free(new_offsets);
                 return -1;
@@ -2185,8 +2187,9 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
             /* we patch next_offset (last leaf has next=-1, others point to next new offset) */
             int64_t next_leaf_offset =
                 (i + 1 < builder->num_leaf_offsets) ? new_offsets[i + 1] : -1;
-            if (block_manager_write_at(builder->bm, next_patch_offset, (uint8_t *)&next_leaf_offset,
-                                       8) != 0)
+            uint8_t next_off_le[8];
+            encode_int64_le_compat(next_off_le, next_leaf_offset);
+            if (block_manager_write_at(builder->bm, next_patch_offset, next_off_le, 8) != 0)
             {
                 free(new_offsets);
                 return -1;

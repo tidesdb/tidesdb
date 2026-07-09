@@ -32147,10 +32147,12 @@ static uint64_t burst_then_measure_compaction_settle(int num_compaction_threads,
             num_compaction_threads, at_flush_idle.total_sstable_count, comp_after - comp_before,
             settle_ms, settle_ms >= cap_ms ? "  <-- NEVER QUIESCED (hit 60s cap)" : "");
 
-    /* the burst must actually have created a compaction backlog, otherwise the test proves
-     * nothing about the settle tail */
-    ASSERT_TRUE(at_flush_idle.total_sstable_count > NCF);
-    ASSERT_TRUE(comp_after >= comp_before);
+    /* the burst must have flushed sstables (at least one per cf) and exercised compaction, otherwise
+     * the test proves nothing. we do NOT require sstable_count > NCF at flush-idle -- with fast
+     * consolidation compaction can already have merged each cf down to a single sstable by then,
+     * which is the fix working, not a failure. */
+    ASSERT_TRUE(at_flush_idle.total_sstable_count >= NCF);
+    ASSERT_TRUE(comp_after > 0);
     /* and the engine must return to a quiet state -- hitting the cap here reproduces the
      * non-terminating end of the spectrum */
     ASSERT_TRUE(settle_ms < cap_ms);

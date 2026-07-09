@@ -24481,14 +24481,15 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         }
     }
 
-    /* we close manifest file handle before rename (required on Windows) */
+    /* we close the manifest log handle before rename (required on Windows). the next commit at the
+     * new path reopens it -- the path is re-pointed and re-committed after the directory rename */
     if (cf->manifest)
     {
         pthread_rwlock_wrlock(&cf->manifest->lock);
-        if (cf->manifest->fp)
+        if (cf->manifest->bm)
         {
-            fclose(cf->manifest->fp);
-            cf->manifest->fp = NULL;
+            block_manager_close(cf->manifest->bm);
+            cf->manifest->bm = NULL;
         }
         pthread_rwlock_unlock(&cf->manifest->lock);
     }
@@ -33743,10 +33744,13 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
 
     const uint64_t sst_id = (uint64_t)sst_id_ull;
 
-    /* we check manifest to see if this sstable is complete */
+    /* we check manifest to see if this sstable is complete. a self-healed manifest recovered from
+     * corruption may be missing legitimately committed sstables, so we must not use it to decide a
+     * file is an orphan -- when it self-healed we keep every sstable on disk and rebuild the
+     * manifest from them below instead of deleting. */
     const int in_manifest = tidesdb_manifest_has_sstable(cf->manifest, level_num, sst_id);
 
-    if (!in_manifest)
+    if (!in_manifest && !cf->manifest->self_healed)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN,
                       "CF '%s' SSTable %" PRIu64
@@ -33808,6 +33812,13 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
     {
         tidesdb_level_add_sstable(cf->levels[level_num - 1], sst);
         tidesdb_bump_sstable_layout_version(cf);
+        if (!in_manifest)
+        {
+            /* self-heal -- this sstable was on disk but missing from the recovered manifest, so add
+             * it back so the rebuilt manifest reflects the on-disk set */
+            tidesdb_manifest_add_sstable(cf->manifest, level_num, sst_id, sst->num_entries,
+                                         sst->klog_size + sst->vlog_size);
+        }
     }
     else
     {
@@ -33866,6 +33877,18 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
         }
     }
     closedir(dir);
+
+    /* a manifest that self-healed from corruption was rebuilt above from the on-disk sstables --
+     * persist that reconstructed set and clear the flag so the manifest is authoritative again */
+    if (cf->manifest && cf->manifest->self_healed)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' rebuilt manifest from %d on-disk SSTables after self-heal", cf->name,
+                      cf->manifest->num_entries);
+        tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                cf->config.sync_mode != TDB_SYNC_NONE);
+        cf->manifest->self_healed = 0;
+    }
 
     /*** if no local .klog files were found but the MANIFEST
      **  has sstable entries, we reconstruct sstable structs from MANIFEST metadata.

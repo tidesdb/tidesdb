@@ -19,6 +19,7 @@
 
 #include "manifest.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -30,314 +31,44 @@
 #define MANIFEST_TMP_EXT     ".tmp."
 #define MANIFEST_TMP_EXT_LEN (sizeof(MANIFEST_TMP_EXT) - 1)
 
-/* forward declaration; documented at the definition below */
+static inline void manifest_put_u32(uint8_t *p, const uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static inline void manifest_put_u64(uint8_t *p, uint64_t v)
+{
+    for (int i = 7; i >= 0; i--)
+    {
+        p[i] = (uint8_t)v;
+        v >>= 8;
+    }
+}
+
+static inline uint32_t manifest_get_u32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static inline uint64_t manifest_get_u64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | (uint64_t)p[i];
+    return v;
+}
+
+/* forward declarations; documented at their definitions */
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
                                                  uint64_t id, uint64_t num_entries,
                                                  uint64_t size_bytes);
-
-/**
- * manifest_body_append
- * append a raw manifest line's bytes to the growable body buffer used to verify the version 8
- * checksum on read. grows the buffer by doubling.
- * @param body pointer to the buffer pointer (grown in place)
- * @param len pointer to the current byte length
- * @param cap pointer to the current allocated capacity
- * @param line the NUL-terminated line to append (its bytes, excluding the NUL)
- * @return 0 on success, -1 on allocation failure
- */
-static int manifest_body_append(char **body, size_t *len, size_t *cap, const char *line)
-{
-    const size_t ll = strlen(line);
-    if (*len + ll > *cap)
-    {
-        size_t new_cap = *cap ? *cap : MANIFEST_BODY_INIT_CAP;
-        while (new_cap < *len + ll) new_cap *= 2;
-        char *new_body = realloc(*body, new_cap);
-        if (!new_body) return -1;
-        *body = new_body;
-        *cap = new_cap;
-    }
-    memcpy(*body + *len, line, ll);
-    *len += ll;
-    return 0;
-}
-
-tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
-{
-    if (!path) return NULL;
-
-    tidesdb_manifest_t *manifest = malloc(sizeof(tidesdb_manifest_t));
-    if (!manifest) return NULL;
-
-    manifest->entries = malloc(sizeof(tidesdb_manifest_entry_t) * MANIFEST_INITIAL_CAPACITY);
-    if (!manifest->entries)
-    {
-        free(manifest);
-        return NULL;
-    }
-
-    manifest->num_entries = 0;
-    manifest->capacity = MANIFEST_INITIAL_CAPACITY;
-    atomic_init(&manifest->sequence, 0);
-    manifest->fp = NULL;
-    atomic_init(&manifest->active_ops, 0);
-    strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
-    manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
-
-    if (pthread_rwlock_init(&manifest->lock, NULL) != 0)
-    {
-        free(manifest->entries);
-        free(manifest);
-        return NULL;
-    }
-
-    /* we clean up orphaned temp files from incomplete commits
-     * temp files are named -- <path>MANIFEST_TMP_EXT<thread_id>.<pid>
-     * if main manifest exists, temp files are stale and can be removed */
-    char dir_path[MANIFEST_PATH_LEN];
-    const char *last_sep = strrchr(path, PATH_SEPARATOR[0]);
-    if (last_sep)
-    {
-        const size_t dir_len = last_sep - path;
-        if (dir_len < sizeof(dir_path))
-        {
-            memcpy(dir_path, path, dir_len);
-            dir_path[dir_len] = '\0';
-        }
-        else
-        {
-            strcpy(dir_path, ".");
-        }
-    }
-    else
-    {
-        strcpy(dir_path, ".");
-    }
-
-    /* base filename for pattern matching */
-    const char *base_name = last_sep ? last_sep + 1 : path;
-    const size_t base_len = strlen(base_name);
-
-    /* we scan directory looking for orphaned temp files */
-    DIR *dir = opendir(dir_path);
-    if (dir)
-    {
-        const size_t dir_path_len = strlen(dir_path);
-        const size_t sep_len = strlen(PATH_SEPARATOR);
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL)
-        {
-            /* we check if filename matches pattern -- <base_name>MANIFEST_TMP_EXT* */
-            const size_t entry_len = strlen(entry->d_name);
-            if (entry_len > base_len + MANIFEST_TMP_EXT_LEN &&
-                strncmp(entry->d_name, base_name, base_len) == 0 &&
-                strncmp(entry->d_name + base_len, MANIFEST_TMP_EXT, MANIFEST_TMP_EXT_LEN) == 0)
-            {
-                /* found orphaned temp file, we remove it */
-                char temp_full_path[MANIFEST_PATH_LEN];
-                /* we check if combined path fits in buffer (dir + separator + entry + null) */
-                if (dir_path_len + sep_len + entry_len + 1 <= MANIFEST_PATH_LEN)
-                {
-                    size_t offset = 0;
-                    memcpy(temp_full_path + offset, dir_path, dir_path_len);
-                    offset += dir_path_len;
-                    memcpy(temp_full_path + offset, PATH_SEPARATOR, sep_len);
-                    offset += sep_len;
-                    memcpy(temp_full_path + offset, entry->d_name, entry_len);
-                    offset += entry_len;
-                    temp_full_path[offset] = '\0';
-                    remove(temp_full_path);
-                }
-            }
-        }
-        closedir(dir);
-    }
-
-    FILE *fp = tdb_fopen(path, "r");
-    if (!fp)
-    {
-        /* the file doesnt exist, return empty manifest */
-        if (errno == ENOENT) return manifest;
-        /* other error */
-        pthread_rwlock_destroy(&manifest->lock);
-        free(manifest->entries);
-        free(manifest);
-        return NULL;
-    }
-
-    char line[MANIFEST_MAX_LINE_LEN];
-
-    int is_v8 = 0;
-    if (fgets(line, sizeof(line), fp))
-    {
-        char *endptr;
-        const long version = strtol(line, &endptr, 10);
-        if (endptr == line || (version != MANIFEST_VERSION && version != MANIFEST_VERSION_LEGACY))
-        {
-            fclose(fp);
-            pthread_rwlock_destroy(&manifest->lock);
-            free(manifest->entries);
-            free(manifest);
-            return NULL;
-        }
-        is_v8 = (version == MANIFEST_VERSION);
-    }
-    else
-    {
-        /* empty file, keep it open */
-        manifest->fp = fp;
-        return manifest;
-    }
-
-    /* version 8 carries an xxhash64 of the body (sequence + entries) on the next line. read it
-     * here, then accumulate the raw body bytes as we parse so we can verify at end of file and
-     * refuse to open a corrupted manifest rather than silently dropping entries. */
-    uint64_t expected_checksum = 0;
-    char *body = NULL;
-    size_t body_len = 0;
-    size_t body_cap = 0;
-    if (is_v8)
-    {
-        char *cs_endptr;
-        if (!fgets(line, sizeof(line), fp) ||
-            (expected_checksum = strtoull(line, &cs_endptr, 16), cs_endptr == line))
-        {
-            fclose(fp);
-            pthread_rwlock_destroy(&manifest->lock);
-            free(manifest->entries);
-            free(manifest);
-            return NULL;
-        }
-    }
-
-    if (fgets(line, sizeof(line), fp))
-    {
-        if (is_v8 && manifest_body_append(&body, &body_len, &body_cap, line) != 0)
-        {
-            free(body);
-            fclose(fp);
-            pthread_rwlock_destroy(&manifest->lock);
-            free(manifest->entries);
-            free(manifest);
-            return NULL;
-        }
-
-        char *seq_endptr;
-        const unsigned long long seq = strtoull(line, &seq_endptr, 10);
-        /* the sequence line must be a number terminated by end-of-line. reject junk
-         * (e.g. "123abc") rather than silently truncating it -- an under-parsed
-         * sequence under-seeds next_sstable_id on recovery and risks id collisions */
-        if (seq_endptr == line ||
-            (*seq_endptr != '\0' && *seq_endptr != '\n' && *seq_endptr != '\r'))
-        {
-            free(body);
-            fclose(fp);
-            pthread_rwlock_destroy(&manifest->lock);
-            free(manifest->entries);
-            free(manifest);
-            return NULL;
-        }
-        atomic_store(&manifest->sequence, seq);
-    }
-
-    int skipped_lines = 0;
-    while (fgets(line, sizeof(line), fp))
-    {
-        if (is_v8 && manifest_body_append(&body, &body_len, &body_cap, line) != 0)
-        {
-            free(body);
-            fclose(fp);
-            pthread_rwlock_destroy(&manifest->lock);
-            free(manifest->entries);
-            free(manifest);
-            return NULL;
-        }
-
-        const char *ptr = line;
-        char *endptr;
-
-        /* parse level */
-        const long level_val = strtol(ptr, &endptr, 10);
-        if (endptr == ptr || *endptr != ',')
-        {
-            skipped_lines++;
-            continue;
-        }
-        const int level = (int)level_val;
-        ptr = endptr + 1;
-
-        /* parse id */
-        const uint64_t id = strtoull(ptr, &endptr, 10);
-        if (endptr == ptr || *endptr != ',')
-        {
-            skipped_lines++;
-            continue;
-        }
-        ptr = endptr + 1;
-
-        /* parse num_entries */
-        const uint64_t num_entries = strtoull(ptr, &endptr, 10);
-        if (endptr == ptr || *endptr != ',')
-        {
-            skipped_lines++;
-            continue;
-        }
-        ptr = endptr + 1;
-
-        /* parse size_bytes */
-        const uint64_t size_bytes = strtoull(ptr, &endptr, 10);
-        if (endptr == ptr)
-        {
-            skipped_lines++;
-            continue;
-        }
-
-        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
-    }
-
-    /* version 8 -- verify the body checksum and refuse to open on a mismatch. a checksum-valid
-     * body has no corrupt lines to drop, so this replaces the silent line-skip with a hard fail
-     * that lets the operator restore the manifest instead of serving a damaged tree. */
-    if (is_v8)
-    {
-        const uint64_t actual_checksum = XXH64(body, body_len, 0);
-        free(body);
-        body = NULL;
-        if (actual_checksum != expected_checksum)
-        {
-            fprintf(stderr, "tidesdb manifest: checksum mismatch loading %s, refusing to open\n",
-                    manifest->path[0] ? manifest->path : "(unknown)");
-            fclose(fp);
-            pthread_rwlock_destroy(&manifest->lock);
-            free(manifest->entries);
-            free(manifest);
-            return NULL;
-        }
-    }
-
-    /* surface silent data loss, malformed entry lines were dropped. this leaf module has
-     * no access to the db log, so a single stderr line is the best signal available. */
-    if (skipped_lines > 0)
-    {
-        fprintf(stderr, "tidesdb manifest: skipped %d malformed entry line(s) while loading %s\n",
-                skipped_lines, manifest->path[0] ? manifest->path : "(unknown)");
-    }
-
-    /* we keep file open for future use */
-    manifest->fp = fp;
-
-    return manifest;
-}
+static int manifest_rollover_locked(tidesdb_manifest_t *manifest, int durable_sync);
 
 /**
  * tidesdb_manifest_add_sstable_unlocked
- * adds an sstable to the manifest
- * @param manifest manifest to add sstable to
- * @param level level of sstable
- * @param id id of sstable
- * @param num_entries number of entries in sstable
- * @param size_bytes size of sstable in bytes
- * @return 0 on success, -1 on error
+ * upsert an sstable into the in-memory entry array. updates in place on a matching (level,id).
  */
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, const int level,
                                                  const uint64_t id, const uint64_t num_entries,
@@ -358,11 +89,7 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, c
         const int new_capacity = manifest->capacity * 2;
         tidesdb_manifest_entry_t *new_entries =
             realloc(manifest->entries, sizeof(tidesdb_manifest_entry_t) * new_capacity);
-        if (!new_entries)
-        {
-            return -1;
-        }
-
+        if (!new_entries) return -1;
         manifest->entries = new_entries;
         manifest->capacity = new_capacity;
     }
@@ -372,8 +99,646 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, c
     manifest->entries[manifest->num_entries].num_entries = num_entries;
     manifest->entries[manifest->num_entries].size_bytes = size_bytes;
     manifest->num_entries++;
-
     return 0;
+}
+
+/**
+ * manifest_remove_entry_unlocked
+ * remove a matching (level,id) from the array with an O(1) swap. returns 1 if removed, 0 if absent.
+ */
+static int manifest_remove_entry_unlocked(tidesdb_manifest_t *manifest, const int level,
+                                          const uint64_t id)
+{
+    for (int i = 0; i < manifest->num_entries; i++)
+    {
+        if (manifest->entries[i].level == level && manifest->entries[i].id == id)
+        {
+            manifest->entries[i] = manifest->entries[manifest->num_entries - 1];
+            manifest->num_entries--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * manifest_pending_reset
+ * reset the pending buffer to a fresh batch containing only the format byte. allocates the buffer
+ * on first use. returns 0 on success, -1 on allocation failure.
+ */
+static int manifest_pending_reset(tidesdb_manifest_t *manifest)
+{
+    if (!manifest->pending)
+    {
+        manifest->pending = malloc(MANIFEST_BODY_INIT_CAP);
+        if (!manifest->pending) return -1;
+        manifest->pending_cap = MANIFEST_BODY_INIT_CAP;
+    }
+    manifest->pending[0] = (uint8_t)MANIFEST_BATCH_FORMAT;
+    manifest->pending_len = MANIFEST_BATCH_HDR_SIZE;
+    return 0;
+}
+
+/**
+ * manifest_pending_add_record
+ * append one record to the pending batch. for MANIFEST_OP_SEQ the sequence is passed in id. grows
+ * the buffer by doubling. returns 0 on success, -1 on allocation failure.
+ */
+static int manifest_pending_add_record(tidesdb_manifest_t *manifest, const uint8_t op,
+                                       const int level, const uint64_t id,
+                                       const uint64_t num_entries, const uint64_t size_bytes)
+{
+    size_t need;
+    switch (op)
+    {
+        case MANIFEST_OP_ADD:
+            need = MANIFEST_REC_ADD_SIZE;
+            break;
+        case MANIFEST_OP_REMOVE:
+            need = MANIFEST_REC_REMOVE_SIZE;
+            break;
+        case MANIFEST_OP_SEQ:
+            need = MANIFEST_REC_SEQ_SIZE;
+            break;
+        default:
+            return -1;
+    }
+
+    if (!manifest->pending && manifest_pending_reset(manifest) != 0) return -1;
+
+    if (manifest->pending_len + need > manifest->pending_cap)
+    {
+        size_t new_cap = manifest->pending_cap ? manifest->pending_cap : MANIFEST_BODY_INIT_CAP;
+        while (new_cap < manifest->pending_len + need) new_cap *= 2;
+        uint8_t *nb = realloc(manifest->pending, new_cap);
+        if (!nb) return -1;
+        manifest->pending = nb;
+        manifest->pending_cap = new_cap;
+    }
+
+    uint8_t *p = manifest->pending + manifest->pending_len;
+    *p++ = op;
+    if (op == MANIFEST_OP_SEQ)
+    {
+        manifest_put_u64(p, id);
+    }
+    else
+    {
+        manifest_put_u32(p, (uint32_t)level);
+        p += 4;
+        manifest_put_u64(p, id);
+        p += 8;
+        if (op == MANIFEST_OP_ADD)
+        {
+            manifest_put_u64(p, num_entries);
+            p += 8;
+            manifest_put_u64(p, size_bytes);
+        }
+    }
+    manifest->pending_len += need;
+    return 0;
+}
+
+/**
+ * manifest_apply_batch
+ * decode one committed block payload (format byte then self-delimiting records) and apply each
+ * record to the in-memory set. a record whose fields would overrun the payload marks the batch
+ * truncated. returns 0 on a clean batch, -1 if the batch was truncated (a torn final commit).
+ */
+static int manifest_apply_batch(tidesdb_manifest_t *manifest, const uint8_t *data,
+                                const size_t size)
+{
+    if (size < MANIFEST_BATCH_HDR_SIZE) return -1;
+    /* data[0] is the batch format byte; unknown formats are refused rather than misread */
+    if (data[0] != (uint8_t)MANIFEST_BATCH_FORMAT) return -1;
+
+    size_t off = MANIFEST_BATCH_HDR_SIZE;
+    while (off < size)
+    {
+        const uint8_t op = data[off];
+        switch (op)
+        {
+            case MANIFEST_OP_ADD:
+            {
+                if (off + MANIFEST_REC_ADD_SIZE > size) return -1;
+                const int level = (int)manifest_get_u32(data + off + 1);
+                const uint64_t id = manifest_get_u64(data + off + 5);
+                const uint64_t ne = manifest_get_u64(data + off + 13);
+                const uint64_t sz = manifest_get_u64(data + off + 21);
+                tidesdb_manifest_add_sstable_unlocked(manifest, level, id, ne, sz);
+                off += MANIFEST_REC_ADD_SIZE;
+                break;
+            }
+            case MANIFEST_OP_REMOVE:
+            {
+                if (off + MANIFEST_REC_REMOVE_SIZE > size) return -1;
+                const int level = (int)manifest_get_u32(data + off + 1);
+                const uint64_t id = manifest_get_u64(data + off + 5);
+                manifest_remove_entry_unlocked(manifest, level, id);
+                off += MANIFEST_REC_REMOVE_SIZE;
+                break;
+            }
+            case MANIFEST_OP_SEQ:
+            {
+                if (off + MANIFEST_REC_SEQ_SIZE > size) return -1;
+                const uint64_t seq = manifest_get_u64(data + off + 1);
+                atomic_store(&manifest->sequence, seq);
+                off += MANIFEST_REC_SEQ_SIZE;
+                break;
+            }
+            default:
+                return -1; /* unknown opcode -- we treat as corruption */
+        }
+    }
+    return 0;
+}
+
+/**
+ * manifest_replay_locked
+ * replay every committed block in the open log into the in-memory set. a torn tail (a crash mid
+ * append leaves the last block unreadable) is skipped so the last durable commit wins, but a
+ * corrupt block that is followed by valid blocks is genuine mid-file corruption -- an append-only
+ * log never writes past a torn tail -- so it fails loud rather than silently dropping entries. a
+ * batch payload that will not decode under a valid block frame is corruption too. returns 0 on a
+ * clean replay, -1 on mid-file corruption (the caller must refuse to open).
+ */
+static int manifest_replay_locked(tidesdb_manifest_t *manifest)
+{
+    block_manager_cursor_t *cursor = NULL;
+    if (block_manager_cursor_init(&cursor, manifest->bm) != 0) return 0;
+
+    int rc = 0;
+    int skipped = 0; /* we skipped an unreadable block; a later valid block means mid-file rot */
+    if (block_manager_cursor_goto_first(cursor) == 0)
+    {
+        while (1)
+        {
+            block_manager_block_t *block = block_manager_cursor_read(cursor);
+            if (!block)
+            {
+                if (block_manager_cursor_skip_corrupt(cursor) == 0)
+                {
+                    skipped = 1;
+                    continue;
+                }
+                if (block_manager_cursor_resync_past_hole(cursor) == 0)
+                {
+                    skipped = 1;
+                    continue;
+                }
+                break; /* nothing valid follows -- torn tail, tolerated */
+            }
+            if (skipped || manifest_apply_batch(manifest, (const uint8_t *)block->data,
+                                                (size_t)block->size) != 0)
+            {
+                block_manager_block_free(block);
+                rc = -1;
+                break;
+            }
+            block_manager_block_free(block);
+            if (block_manager_cursor_next(cursor) != 0) break;
+        }
+    }
+
+    block_manager_cursor_free(cursor);
+    return rc;
+}
+
+/**
+ * manifest_rollover_locked
+ * write the current set as one snapshot block (all live ADDs then the final SEQ) to a temp log,
+ * fsync it when durable, atomically rename it over the manifest path, and reopen the log handle.
+ * this bounds recovery replay and, on a path change, re-points the manifest to the new path.
+ * caller holds the write lock. returns 0 on success, -1 on error.
+ */
+static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int durable_sync)
+{
+    const size_t need = MANIFEST_BATCH_HDR_SIZE +
+                        (size_t)manifest->num_entries * MANIFEST_REC_ADD_SIZE +
+                        MANIFEST_REC_SEQ_SIZE;
+    uint8_t *buf = malloc(need);
+    if (!buf) return -1;
+
+    size_t off = 0;
+    buf[off++] = (uint8_t)MANIFEST_BATCH_FORMAT;
+    for (int i = 0; i < manifest->num_entries; i++)
+    {
+        buf[off] = MANIFEST_OP_ADD;
+        manifest_put_u32(buf + off + 1, (uint32_t)manifest->entries[i].level);
+        manifest_put_u64(buf + off + 5, manifest->entries[i].id);
+        manifest_put_u64(buf + off + 13, manifest->entries[i].num_entries);
+        manifest_put_u64(buf + off + 21, manifest->entries[i].size_bytes);
+        off += MANIFEST_REC_ADD_SIZE;
+    }
+    buf[off] = MANIFEST_OP_SEQ;
+    manifest_put_u64(buf + off + 1, atomic_load(&manifest->sequence));
+    off += MANIFEST_REC_SEQ_SIZE;
+
+    /* temp path is the manifest path plus a per-thread/pid suffix. a truncated temp path would
+     * rename over the wrong file, so bail if it would not fit rather than proceed with a clipped
+     * name */
+    char temp_path[MANIFEST_PATH_LEN + 64];
+    const int tp_written = snprintf(temp_path, sizeof(temp_path), "%s" MANIFEST_TMP_EXT "%lu.%d",
+                                    manifest->path, (unsigned long)TDB_THREAD_ID(), TDB_GETPID());
+    if (tp_written < 0 || (size_t)tp_written >= sizeof(temp_path)) return -1;
+
+    /* the log is opened SYNC_NONE and made durable by an explicit fdatasync so a non-durable commit
+     * pays no fsync; the snapshot uses the same discipline */
+    block_manager_t *tbm = NULL;
+    if (block_manager_open_pre(&tbm, temp_path, BLOCK_MANAGER_SYNC_NONE,
+                               0 /* preallocation disabled */) != 0)
+    {
+        free(buf);
+        return -1;
+    }
+
+    block_manager_block_t *blk = block_manager_block_create(off, buf);
+    free(buf);
+    if (!blk)
+    {
+        block_manager_close(tbm);
+        remove(temp_path);
+        return -1;
+    }
+    const int64_t woff = block_manager_block_write(tbm, blk);
+    block_manager_block_free(blk);
+    if (woff < 0)
+    {
+        block_manager_close(tbm);
+        remove(temp_path);
+        return -1;
+    }
+    if (durable_sync) block_manager_escalate_fsync(tbm);
+    block_manager_close(tbm);
+
+    if (atomic_rename_file(temp_path, manifest->path) != 0)
+    {
+        remove(temp_path);
+        return -1;
+    }
+
+    if (durable_sync)
+    {
+        char dir_buf[MANIFEST_PATH_LEN];
+        strncpy(dir_buf, manifest->path, sizeof(dir_buf) - 1);
+        dir_buf[sizeof(dir_buf) - 1] = '\0';
+        char *last_sep = strrchr(dir_buf, '/');
+#ifdef _WIN32
+        if (!last_sep) last_sep = strrchr(dir_buf, '\\');
+#endif
+        if (last_sep)
+        {
+            *last_sep = '\0';
+            tdb_sync_directory(dir_buf);
+        }
+    }
+
+    /* reopen the log on the (possibly new) path so subsequent commits append to the snapshot */
+    if (manifest->bm)
+    {
+        block_manager_close(manifest->bm);
+        manifest->bm = NULL;
+    }
+    if (block_manager_open_pre(&manifest->bm, manifest->path, BLOCK_MANAGER_SYNC_NONE,
+                               0 /* preallocation disabled */) != 0)
+    {
+        manifest->bm = NULL;
+        return -1;
+    }
+
+    manifest->records_since_snapshot = 0;
+    return manifest_pending_reset(manifest);
+}
+
+/**
+ * manifest_body_append
+ * append a raw text line's bytes to the growable body buffer used to verify the version 8 checksum.
+ */
+static int manifest_body_append(char **body, size_t *len, size_t *cap, const char *line)
+{
+    const size_t ll = strlen(line);
+    if (*len + ll > *cap)
+    {
+        size_t new_cap = *cap ? *cap : MANIFEST_BODY_INIT_CAP;
+        while (new_cap < *len + ll) new_cap *= 2;
+        char *new_body = realloc(*body, new_cap);
+        if (!new_body) return -1;
+        *body = new_body;
+        *cap = new_cap;
+    }
+    memcpy(*body + *len, line, ll);
+    *len += ll;
+    return 0;
+}
+
+/**
+ * manifest_parse_legacy_text
+ * parse an old text manifest (version 7 without a checksum, version 8 with an xxhash64 body
+ * checksum) into the in-memory set. returns 0 on success, -1 on a bad version or checksum mismatch.
+ */
+static int manifest_parse_legacy_text(tidesdb_manifest_t *manifest, FILE *fp)
+{
+    char line[MANIFEST_MAX_LINE_LEN];
+
+    int is_v8 = 0;
+    if (fgets(line, sizeof(line), fp))
+    {
+        char *endptr;
+        const long version = strtol(line, &endptr, 10);
+        if (endptr == line || (version != MANIFEST_VERSION && version != MANIFEST_VERSION_LEGACY))
+            return -1;
+        is_v8 = (version == MANIFEST_VERSION);
+    }
+    else
+    {
+        return 0; /* empty file -- empty set */
+    }
+
+    uint64_t expected_checksum = 0;
+    char *body = NULL;
+    size_t body_len = 0;
+    size_t body_cap = 0;
+    if (is_v8)
+    {
+        char *cs_endptr;
+        if (!fgets(line, sizeof(line), fp) ||
+            (expected_checksum = strtoull(line, &cs_endptr, 16), cs_endptr == line))
+            return -1;
+    }
+
+    if (fgets(line, sizeof(line), fp))
+    {
+        if (is_v8 && manifest_body_append(&body, &body_len, &body_cap, line) != 0)
+        {
+            free(body);
+            return -1;
+        }
+        char *seq_endptr;
+        const unsigned long long seq = strtoull(line, &seq_endptr, 10);
+        if (seq_endptr == line ||
+            (*seq_endptr != '\0' && *seq_endptr != '\n' && *seq_endptr != '\r'))
+        {
+            free(body);
+            return -1;
+        }
+        atomic_store(&manifest->sequence, seq);
+    }
+
+    int skipped_lines = 0;
+    while (fgets(line, sizeof(line), fp))
+    {
+        if (is_v8 && manifest_body_append(&body, &body_len, &body_cap, line) != 0)
+        {
+            free(body);
+            return -1;
+        }
+
+        const char *ptr = line;
+        char *endptr;
+        const long level_val = strtol(ptr, &endptr, 10);
+        if (endptr == ptr || *endptr != ',')
+        {
+            skipped_lines++;
+            continue;
+        }
+        const int level = (int)level_val;
+        ptr = endptr + 1;
+
+        const uint64_t id = strtoull(ptr, &endptr, 10);
+        if (endptr == ptr || *endptr != ',')
+        {
+            skipped_lines++;
+            continue;
+        }
+        ptr = endptr + 1;
+
+        const uint64_t num_entries = strtoull(ptr, &endptr, 10);
+        if (endptr == ptr || *endptr != ',')
+        {
+            skipped_lines++;
+            continue;
+        }
+        ptr = endptr + 1;
+
+        const uint64_t size_bytes = strtoull(ptr, &endptr, 10);
+        if (endptr == ptr)
+        {
+            skipped_lines++;
+            continue;
+        }
+
+        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+    }
+
+    if (is_v8)
+    {
+        const uint64_t actual_checksum = XXH64(body, body_len, 0);
+        free(body);
+        if (actual_checksum != expected_checksum)
+        {
+            fprintf(stderr, "tidesdb manifest: checksum mismatch loading %s, refusing to open\n",
+                    manifest->path[0] ? manifest->path : "(unknown)");
+            return -1;
+        }
+    }
+
+    if (skipped_lines > 0)
+    {
+        fprintf(stderr, "tidesdb manifest: skipped %d malformed entry line(s) while loading %s\n",
+                skipped_lines, manifest->path[0] ? manifest->path : "(unknown)");
+    }
+    return 0;
+}
+
+/**
+ * manifest_cleanup_orphaned_temps
+ * remove leftover temp files from an interrupted commit/rollover -- if the main manifest exists,
+ * any <base>.tmp.* is stale.
+ */
+static void manifest_cleanup_orphaned_temps(const char *path)
+{
+    char dir_path[MANIFEST_PATH_LEN];
+    const char *last_sep = strrchr(path, PATH_SEPARATOR[0]);
+    if (last_sep)
+    {
+        const size_t dir_len = last_sep - path;
+        if (dir_len < sizeof(dir_path))
+        {
+            memcpy(dir_path, path, dir_len);
+            dir_path[dir_len] = '\0';
+        }
+        else
+        {
+            strcpy(dir_path, ".");
+        }
+    }
+    else
+    {
+        strcpy(dir_path, ".");
+    }
+
+    const char *base_name = last_sep ? last_sep + 1 : path;
+    const size_t base_len = strlen(base_name);
+
+    DIR *dir = opendir(dir_path);
+    if (!dir) return;
+    const size_t dir_path_len = strlen(dir_path);
+    const size_t sep_len = strlen(PATH_SEPARATOR);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        const size_t entry_len = strlen(entry->d_name);
+        if (entry_len > base_len + MANIFEST_TMP_EXT_LEN &&
+            strncmp(entry->d_name, base_name, base_len) == 0 &&
+            strncmp(entry->d_name + base_len, MANIFEST_TMP_EXT, MANIFEST_TMP_EXT_LEN) == 0)
+        {
+            char temp_full_path[MANIFEST_PATH_LEN];
+            if (dir_path_len + sep_len + entry_len + 1 <= MANIFEST_PATH_LEN)
+            {
+                size_t offset = 0;
+                memcpy(temp_full_path + offset, dir_path, dir_path_len);
+                offset += dir_path_len;
+                memcpy(temp_full_path + offset, PATH_SEPARATOR, sep_len);
+                offset += sep_len;
+                memcpy(temp_full_path + offset, entry->d_name, entry_len);
+                offset += entry_len;
+                temp_full_path[offset] = '\0';
+                remove(temp_full_path);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
+{
+    if (!path) return NULL;
+
+    tidesdb_manifest_t *manifest = malloc(sizeof(tidesdb_manifest_t));
+    if (!manifest) return NULL;
+
+    manifest->entries = malloc(sizeof(tidesdb_manifest_entry_t) * MANIFEST_INITIAL_CAPACITY);
+    if (!manifest->entries)
+    {
+        free(manifest);
+        return NULL;
+    }
+
+    manifest->num_entries = 0;
+    manifest->capacity = MANIFEST_INITIAL_CAPACITY;
+    atomic_init(&manifest->sequence, 0);
+    manifest->bm = NULL;
+    manifest->pending = NULL;
+    manifest->pending_len = 0;
+    manifest->pending_cap = 0;
+    manifest->records_since_snapshot = 0;
+    manifest->self_healed = 0;
+    atomic_init(&manifest->active_ops, 0);
+    strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
+    manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
+
+    if (pthread_rwlock_init(&manifest->lock, NULL) != 0)
+    {
+        free(manifest->entries);
+        free(manifest);
+        return NULL;
+    }
+
+    manifest_cleanup_orphaned_temps(path);
+
+    /* format detection -- a legacy text manifest starts with its version digit ('7' or '8'); a
+     * new-format log starts with the block manager header magic (a non-digit byte). */
+    unsigned char sniff = 0;
+    int have_sniff = 0;
+    int file_empty = 0;
+    FILE *sf = tdb_fopen(path, "rb");
+    if (sf)
+    {
+        const size_t got = fread(&sniff, 1, 1, sf);
+        have_sniff = (got == 1);
+        file_empty = (got == 0); /* exists but has no bytes -- a stale zero-length file */
+        fclose(sf);
+    }
+
+    if (!sf && errno != ENOENT)
+    {
+        pthread_rwlock_destroy(&manifest->lock);
+        free(manifest->entries);
+        free(manifest);
+        return NULL;
+    }
+
+    /* an empty existing file has no block manager header, so drop it and let the log be created
+     * fresh below (matches the legacy behavior of opening an empty manifest as an empty set) */
+    if (file_empty) remove(path);
+
+    if (have_sniff && (sniff == '7' || sniff == '8'))
+    {
+        /* legacy text -- we parse then convert forward to the append-only format */
+        FILE *fp = tdb_fopen(path, "r");
+        if (!fp || manifest_parse_legacy_text(manifest, fp) != 0)
+        {
+            if (fp) fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
+        fclose(fp);
+        if (manifest_pending_reset(manifest) != 0 || manifest_rollover_locked(manifest, 1) != 0)
+        {
+            tidesdb_manifest_close(manifest);
+            return NULL;
+        }
+        return manifest;
+    }
+
+    /* new format (or a fresh/empty database) -- open the log and replay it */
+    if (block_manager_open_pre(&manifest->bm, path, BLOCK_MANAGER_SYNC_NONE,
+                               0 /* preallocation disabled */) != 0)
+    {
+        /* the file exists but its header will not validate (garbage / truncated header). the
+         * sstable files on disk are the ground truth that recovery reloads, so self-heal by
+         * discarding the unreadable manifest and starting a fresh log rather than failing the open
+         */
+        manifest->bm = NULL;
+        manifest->self_healed = 1;
+        fprintf(stderr, "tidesdb manifest: unreadable header in %s, self-healing to a fresh log\n",
+                path[0] ? path : "(unknown)");
+        remove(path);
+        if (block_manager_open_pre(&manifest->bm, path, BLOCK_MANAGER_SYNC_NONE,
+                                   0 /* preallocation disabled */) != 0)
+        {
+            manifest->bm = NULL;
+            pthread_rwlock_destroy(&manifest->lock);
+            free(manifest->entries);
+            free(manifest);
+            return NULL;
+        }
+    }
+    const int replay_rc = manifest_replay_locked(manifest);
+    if (manifest_pending_reset(manifest) != 0)
+    {
+        tidesdb_manifest_close(manifest);
+        return NULL;
+    }
+    if (replay_rc != 0)
+    {
+        /* mid-file corruption -- self-heal rather than refuse. the sstable files on disk are the
+         * ground truth and recovery reloads them, so keep the good prefix we replayed and rewrite
+         * the log as a clean snapshot, discarding the unreadable remainder */
+        manifest->self_healed = 1;
+        fprintf(stderr,
+                "tidesdb manifest: corruption in %s, self-healing from the recovered prefix\n",
+                manifest->path[0] ? manifest->path : "(unknown)");
+        if (manifest_rollover_locked(manifest, 1) != 0)
+        {
+            tidesdb_manifest_close(manifest);
+            return NULL;
+        }
+        return manifest;
+    }
+    return manifest;
 }
 
 int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, const int level, const uint64_t id,
@@ -383,8 +748,14 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, const int level, 
 
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
-    const int result =
+    int result =
         tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+    if (result == 0)
+    {
+        result = manifest_pending_add_record(manifest, MANIFEST_OP_ADD, level, id, num_entries,
+                                             size_bytes);
+        if (result == 0) manifest->records_since_snapshot++;
+    }
     pthread_rwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
@@ -397,23 +768,15 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, const int leve
 
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
-
-    for (int i = 0; i < manifest->num_entries; i++)
+    int result = -1;
+    if (manifest_remove_entry_unlocked(manifest, level, id))
     {
-        if (manifest->entries[i].level == level && manifest->entries[i].id == id)
-        {
-            /* we swap with last element for O(1) removal (order not required) */
-            manifest->entries[i] = manifest->entries[manifest->num_entries - 1];
-            manifest->num_entries--;
-            pthread_rwlock_unlock(&manifest->lock);
-            atomic_fetch_sub(&manifest->active_ops, 1);
-            return 0;
-        }
+        result = manifest_pending_add_record(manifest, MANIFEST_OP_REMOVE, level, id, 0, 0);
+        if (result == 0) manifest->records_since_snapshot++;
     }
-
     pthread_rwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
-    return -1;
+    return result;
 }
 
 int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, const int level, const uint64_t id)
@@ -422,29 +785,27 @@ int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, const int level, 
 
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_rdlock(&manifest->lock);
-
+    int found = 0;
     for (int i = 0; i < manifest->num_entries; i++)
     {
         if (manifest->entries[i].level == level && manifest->entries[i].id == id)
         {
-            pthread_rwlock_unlock(&manifest->lock);
-            atomic_fetch_sub(&manifest->active_ops, 1);
-            return 1;
+            found = 1;
+            break;
         }
     }
-
     pthread_rwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
-    return 0;
+    return found;
 }
 
 void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t sequence)
 {
     if (!manifest) return;
 
-    /* monotonic guard, the sequence seeds next_sstable_id on recovery, so it must never
-     * regress or recovery would re-hand-out live sstable ids and collide. cas loop so a
-     * concurrent larger store is never clobbered by a smaller one. */
+    /* monotonic guard -- the sequence seeds next_sstable_id on recovery, so it must never regress
+     * or recovery would re-hand-out live sstable ids and collide. the value is persisted by the
+     * next commit, which appends a SEQ record for the current sequence. */
     uint64_t cur = atomic_load(&manifest->sequence);
     while (sequence > cur && !atomic_compare_exchange_weak(&manifest->sequence, &cur, sequence))
     {
@@ -459,154 +820,79 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
 
-    /* we update stored path if it changed */
+    int result = 0;
+
+    /* a path change re-points the manifest and persists the whole set at the new path via a
+     * rollover, which reopens the log there */
     if (strcmp(manifest->path, path) != 0)
     {
         strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
         manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
-    }
-
-    if (manifest->fp)
-    {
-        fclose(manifest->fp);
-        manifest->fp = NULL;
-    }
-
-    char temp_path[MANIFEST_PATH_LEN];
-    snprintf(temp_path, sizeof(temp_path), "%s" MANIFEST_TMP_EXT "%lu.%d", path,
-             (unsigned long)TDB_THREAD_ID(), TDB_GETPID());
-
-    FILE *fp = tdb_fopen(temp_path, "w");
-    if (!fp)
-    {
+        result = manifest_rollover_locked(manifest, durable_sync);
         pthread_rwlock_unlock(&manifest->lock);
         atomic_fetch_sub(&manifest->active_ops, 1);
-        return -1;
+        return result;
     }
 
-    /* build the body (sequence then entries) in memory so we can checksum it before writing the
-     * header. each line is well under MANIFEST_BODY_LINE_MAX, so this buffer never has to grow. */
-    const size_t body_cap = (size_t)(manifest->num_entries + 2) * MANIFEST_BODY_LINE_MAX;
-    char *body = malloc(body_cap);
-    if (!body)
+    if (!manifest->bm)
     {
-        fclose(fp);
-        remove(temp_path);
-        pthread_rwlock_unlock(&manifest->lock);
-        atomic_fetch_sub(&manifest->active_ops, 1);
-        return -1;
-    }
-
-    size_t body_len = 0;
-    int n = snprintf(body, body_cap, "%" PRIu64 "\n", atomic_load(&manifest->sequence));
-    int body_ok = (n > 0 && (size_t)n < body_cap);
-    if (body_ok) body_len = (size_t)n;
-
-    for (int i = 0; body_ok && i < manifest->num_entries; i++)
-    {
-        n = snprintf(body + body_len, body_cap - body_len,
-                     "%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n", manifest->entries[i].level,
-                     manifest->entries[i].id, manifest->entries[i].num_entries,
-                     manifest->entries[i].size_bytes);
-        if (n <= 0 || (size_t)n >= body_cap - body_len)
+        if (block_manager_open_pre(&manifest->bm, manifest->path, BLOCK_MANAGER_SYNC_NONE,
+                                   0 /* preallocation disabled */) != 0)
         {
-            body_ok = 0;
-            break;
-        }
-        body_len += (size_t)n;
-    }
-
-    if (!body_ok)
-    {
-        free(body);
-        fclose(fp);
-        remove(temp_path);
-        pthread_rwlock_unlock(&manifest->lock);
-        atomic_fetch_sub(&manifest->active_ops, 1);
-        return -1;
-    }
-
-    /* header is the version then the xxhash64 of the body, then the body it covers */
-    const uint64_t body_checksum = XXH64(body, body_len, 0);
-    fprintf(fp, "%d\n", MANIFEST_VERSION);
-    fprintf(fp, "%016" PRIx64 "\n", body_checksum);
-    fwrite(body, 1, body_len, fp);
-    free(body);
-
-    if (fflush(fp) != 0)
-    {
-        fclose(fp);
-        remove(temp_path);
-        pthread_rwlock_unlock(&manifest->lock);
-        atomic_fetch_sub(&manifest->active_ops, 1);
-        return -1;
-    }
-
-    if (durable_sync)
-    {
-        const int fd = tdb_fileno(fp);
-        if (fd >= 0)
-        {
-            if (tdb_fsync(fd) != 0)
-            {
-                fclose(fp);
-                remove(temp_path);
-                pthread_rwlock_unlock(&manifest->lock);
-                atomic_fetch_sub(&manifest->active_ops, 1);
-                return -1;
-            }
+            manifest->bm = NULL;
+            pthread_rwlock_unlock(&manifest->lock);
+            atomic_fetch_sub(&manifest->active_ops, 1);
+            return -1;
         }
     }
 
-    fclose(fp);
+    /* close the batch with a SEQ record carrying the current sequence so replay's last SEQ wins */
+    if (manifest_pending_add_record(manifest, MANIFEST_OP_SEQ, 0, atomic_load(&manifest->sequence),
+                                    0, 0) != 0)
+        result = -1;
 
-    /* atomic rename -- this is the commit point */
-    if (atomic_rename_file(temp_path, path) != 0)
+    if (result == 0)
     {
-        remove(temp_path);
-        pthread_rwlock_unlock(&manifest->lock);
-        atomic_fetch_sub(&manifest->active_ops, 1);
-        return -1;
-    }
-
-    /* we sync the parent directory to ensure the rename is durable.
-     * without this, a crash after rename could lose the directory entry
-     * on POSIX systems that don't flush directory metadata automatically.
-     * skipped under TDB_SYNC_NONE (durable_sync clear) along with the file fsync above. */
-    if (durable_sync)
-    {
-        /* sized to the full manifest path length -- a 1024-byte buffer silently truncated
-         * paths > 1023 chars and synced the wrong directory */
-        char dir_buf[MANIFEST_PATH_LEN];
-        strncpy(dir_buf, path, sizeof(dir_buf) - 1);
-        dir_buf[sizeof(dir_buf) - 1] = '\0';
-        char *last_sep = strrchr(dir_buf, '/');
-#ifdef _WIN32
-        if (!last_sep) last_sep = strrchr(dir_buf, '\\');
-#endif
-        if (last_sep)
+        block_manager_block_t *blk =
+            block_manager_block_create(manifest->pending_len, manifest->pending);
+        if (!blk)
         {
-            *last_sep = '\0';
-            tdb_sync_directory(dir_buf);
+            result = -1;
+        }
+        else
+        {
+            const int64_t off = block_manager_block_write(manifest->bm, blk);
+            block_manager_block_free(blk);
+            if (off < 0)
+                result = -1;
+            else if (durable_sync)
+                block_manager_escalate_fsync(manifest->bm);
         }
     }
 
-    /* we reopen for reading */
-    manifest->fp = tdb_fopen(path, "r");
+    /* the SEQ record is one more log record regardless of whether the batch carried changes */
+    manifest->records_since_snapshot++;
+    manifest_pending_reset(manifest);
+
+    /* roll the log over once it grows past a small multiple of the live set, keeping replay bounded
+     */
+    if (result == 0)
+    {
+        int bound = manifest->num_entries * MANIFEST_ROLLOVER_LIVE_MULTIPLE;
+        if (bound < MANIFEST_ROLLOVER_MIN_RECORDS) bound = MANIFEST_ROLLOVER_MIN_RECORDS;
+        if (manifest->records_since_snapshot > bound)
+            result = manifest_rollover_locked(manifest, durable_sync);
+    }
 
     pthread_rwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
-    return 0;
+    return result;
 }
 
 void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
 {
     if (!manifest) return;
 
-    /* the caller is expected to have quiesced all manifest users before closing. tidesdb_close
-     * joins every flush, compaction, sync, and reaper thread before the owning column family is
-     * freed, so active_ops is normally already zero here. the bounded wait is a backstop for a
-     * caller that has not fully quiesced. */
     int wait_count = 0;
     while (atomic_load(&manifest->active_ops) > 0 && wait_count < MANIFEST_CLOSE_MAX_WAITS)
     {
@@ -614,10 +900,6 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
         wait_count++;
     }
 
-    /* if the drain expired with operations still in flight the close proceeds anyway rather than
-     * leaking the manifest on every shutdown, but that means a caller freed the manifest without
-     * quiescing its users -- a contract violation that risks a use-after-free, so surface it loudly
-     * rather than tearing down the lock and struct silently underneath a live operation. */
     if (atomic_load(&manifest->active_ops) > 0)
     {
         fprintf(stderr,
@@ -628,15 +910,14 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
     }
 
     pthread_rwlock_wrlock(&manifest->lock);
-
-    if (manifest->fp)
+    if (manifest->bm)
     {
-        fclose(manifest->fp);
-        manifest->fp = NULL;
+        block_manager_close(manifest->bm);
+        manifest->bm = NULL;
     }
-
     pthread_rwlock_unlock(&manifest->lock);
     pthread_rwlock_destroy(&manifest->lock);
+    free(manifest->pending);
     free(manifest->entries);
     free(manifest);
 }

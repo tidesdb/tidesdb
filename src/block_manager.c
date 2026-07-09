@@ -320,12 +320,15 @@ static inline void maybe_extend_allocation(block_manager_t *bm, const uint64_t r
     {
         const uint64_t prealloc =
             atomic_load_explicit(&bm->preallocated_size, memory_order_acquire);
-        if (BM_LIKELY(reservation_end + BLOCK_MANAGER_PREALLOC_LOWWATER <= prealloc)) return;
+        /* chunk is per-instance (block_manager_open_pre); lowwater derives as chunk >> 4 so the
+         * default 64 MB chunk keeps its 4 MB lowwater while a small manifest chunk scales down */
+        const uint64_t chunk = atomic_load_explicit(&bm->prealloc_chunk, memory_order_relaxed);
+        if (chunk == 0) return; /* preallocation disabled -- writes extend the file exactly */
+        const uint64_t lowwater = chunk >> BLOCK_MANAGER_PREALLOC_LOWWATER_SHIFT;
+        if (BM_LIKELY(reservation_end + lowwater <= prealloc)) return;
 
         /* we round up to the next CHUNK boundary so successive extends stay aligned */
-        const uint64_t target =
-            ((reservation_end + BLOCK_MANAGER_PREALLOC_CHUNK - 1) / BLOCK_MANAGER_PREALLOC_CHUNK) *
-            BLOCK_MANAGER_PREALLOC_CHUNK;
+        const uint64_t target = ((reservation_end + chunk - 1) / chunk) * chunk;
         if (target <= prealloc) return; /* another writer already extended past us */
 
         if (tdb_preallocate_extent(bm->fd, (off_t)prealloc, (off_t)(target - prealloc)) != 0)
@@ -469,7 +472,8 @@ static int truncate_to_header(block_manager_t *bm)
  * @return 0 if successful, -1 if not
  */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
-                                       const block_manager_sync_mode_t sync_mode)
+                                       const block_manager_sync_mode_t sync_mode,
+                                       const uint64_t prealloc_chunk)
 {
     block_manager_t *new_bm = malloc(sizeof(block_manager_t));
     if (!new_bm)
@@ -481,6 +485,10 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     /* we initialize atomic variable to prevent reading uninitialized memory */
     atomic_init(&new_bm->current_file_size, 0);
     atomic_init(&new_bm->preallocated_size, 0);
+    /* prealloc_chunk 0 disables preallocation -- the file grows to exactly what is written, so a
+     * copy of a live file carries no trailing reserved zeros. tiny append logs (the manifest) use
+     * this. block_manager_open always passes the non-zero default. */
+    atomic_init(&new_bm->prealloc_chunk, prealloc_chunk);
     atomic_init(&new_bm->group_durable_size, 0);
     atomic_init(&new_bm->group_sync_active, 0);
 
@@ -1984,5 +1992,13 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
 int block_manager_open(block_manager_t **bm, const char *file_path, const int sync_mode)
 {
     if (!bm || !file_path) return -1;
-    return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode));
+    return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode),
+                                       BLOCK_MANAGER_PREALLOC_CHUNK);
+}
+
+int block_manager_open_pre(block_manager_t **bm, const char *file_path, const int sync_mode,
+                           const uint64_t prealloc_chunk)
+{
+    if (!bm || !file_path) return -1;
+    return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode), prealloc_chunk);
 }

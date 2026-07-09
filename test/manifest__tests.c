@@ -601,14 +601,17 @@ void test_manifest_corrupted_recovery()
 {
     const char *test_path = "." PATH_SEPARATOR "test_corrupted_manifest";
 
-    /* test invalid version */
+    /* an unrecognized version is neither the legacy text format nor a valid binary header, so open
+     * self-heals to a fresh empty log rather than failing (the sstables on disk are the truth) */
     FILE *f = tdb_fopen(test_path, "w");
     ASSERT_TRUE(f != NULL);
     fprintf(f, "999\n1000\n1,100,1000,65536\n");
     fclose(f);
 
     tidesdb_manifest_t *m1 = tidesdb_manifest_open(test_path);
-    ASSERT_TRUE(m1 == NULL);
+    ASSERT_TRUE(m1 != NULL);
+    ASSERT_EQ(m1->num_entries, 0);
+    tidesdb_manifest_close(m1);
     remove(test_path);
 
     /* test malformed entry (missing comma) */
@@ -856,9 +859,12 @@ void test_manifest_corrupted_version_nonnumeric(void)
     fprintf(f, "abc\n1000\n1,100,1000,65536\n");
     fclose(f);
 
-    /* non-numeric version should fail to parse (endptr == line) */
+    /* a non-numeric version is not the legacy text format nor a valid binary header, so open
+     * self-heals to a fresh empty log rather than failing */
     tidesdb_manifest_t *m = tidesdb_manifest_open(test_path);
-    ASSERT_TRUE(m == NULL);
+    ASSERT_TRUE(m != NULL);
+    ASSERT_EQ(m->num_entries, 0);
+    tidesdb_manifest_close(m);
 
     remove(test_path);
 }
@@ -951,18 +957,16 @@ void test_manifest_v8_checksum_roundtrip(void)
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
-    /* the committed file must carry the current version and a 16-hex checksum on the next line */
-    FILE *f = tdb_fopen(test_path, "r");
+    /* the committed file is the append-only block-manager log, not the old text format -- it must
+     * not start with a legacy version digit, and per-block xxhash checksums give it integrity */
+    FILE *f = tdb_fopen(test_path, "rb");
     ASSERT_TRUE(f != NULL);
-    char vline[64];
-    char csline[64];
-    ASSERT_TRUE(fgets(vline, sizeof(vline), f) != NULL);
-    ASSERT_TRUE(fgets(csline, sizeof(csline), f) != NULL);
-    ASSERT_EQ(atoi(vline), MANIFEST_VERSION);
-    ASSERT_EQ((int)strlen(csline), 17); /* 16 hex digits plus a newline */
+    unsigned char first = 0;
+    ASSERT_TRUE(fread(&first, 1, 1, f) == 1);
+    ASSERT_FALSE(first == '7' || first == '8');
     fclose(f);
 
-    /* the checksum-verified reload must reproduce every field */
+    /* the reload must reproduce every field */
     tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(m2 != NULL);
     ASSERT_EQ(m2->sequence, 4242);
@@ -973,47 +977,61 @@ void test_manifest_v8_checksum_roundtrip(void)
     remove(test_path);
 }
 
-void test_manifest_v8_detects_body_corruption(void)
+void test_manifest_self_heals_on_corruption(void)
 {
-    const char *test_path = "." PATH_SEPARATOR "test_v8_corrupt_manifest";
+    const char *test_path = "." PATH_SEPARATOR "test_corrupt_manifest_bin";
 
+    /* build a two-commit log so there is a non-final block to corrupt */
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(manifest != NULL);
     tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
-    tidesdb_manifest_update_sequence(manifest, 7777);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
-    /* read the whole file, flip the first byte of the body (start of the sequence line, which
-     * sits just past the version and checksum lines) and write it back. the stored checksum no
-     * longer matches the body, so the manifest must refuse to open rather than serve stale data. */
+    unsigned char buf[1024];
     FILE *f = tdb_fopen(test_path, "rb");
     ASSERT_TRUE(f != NULL);
-    char buf[512];
     const size_t n = fread(buf, 1, sizeof(buf), f);
     fclose(f);
-    ASSERT_TRUE(n > 0);
+    ASSERT_TRUE(n > 24);
 
-    int newlines = 0;
-    size_t body_start = 0;
-    for (size_t i = 0; i < n; i++)
+    /* torn tail -- a crash mid-append leaves the final block truncated. open must not fail; the
+     * sstable files (not tested here) are the ground truth that recovery reloads. */
     {
-        if (buf[i] == '\n' && ++newlines == 2)
-        {
-            body_start = i + 1;
-            break;
-        }
+        FILE *w = tdb_fopen(test_path, "wb");
+        ASSERT_TRUE(w != NULL);
+        ASSERT_EQ(fwrite(buf, 1, n - 6, w), n - 6); /* cut into the last block */
+        fclose(w);
+
+        tidesdb_manifest_t *mt = tidesdb_manifest_open(test_path);
+        ASSERT_TRUE(mt != NULL);
+        tidesdb_manifest_close(mt);
     }
-    ASSERT_TRUE(body_start > 0 && body_start < n);
-    buf[body_start] = (char)('0' + (((buf[body_start] - '0') + 1) % 10));
 
-    f = tdb_fopen(test_path, "wb");
-    ASSERT_TRUE(f != NULL);
-    ASSERT_EQ(fwrite(buf, 1, n, f), n);
-    fclose(f);
+    /* unreadable manifest -- overwrite it with garbage (a corrupt header). open must self-heal to a
+     * fresh usable log rather than fail (the sstable files, not tested here, are the ground truth
+     * recovery reloads), and an add + commit + reopen must round-trip cleanly afterward. */
+    {
+        FILE *w = tdb_fopen(test_path, "wb");
+        ASSERT_TRUE(w != NULL);
+        const char garbage[] = "not a manifest at all -- pure garbage bytes \x01\x02\x03";
+        ASSERT_EQ(fwrite(garbage, 1, sizeof(garbage), w), sizeof(garbage));
+        fclose(w);
 
-    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
-    ASSERT_TRUE(m2 == NULL);
+        tidesdb_manifest_t *mc = tidesdb_manifest_open(test_path);
+        ASSERT_TRUE(mc != NULL);
+        ASSERT_EQ(tidesdb_manifest_add_sstable(mc, 5, 500, 5000, 4096), 0);
+        ASSERT_EQ(tidesdb_manifest_commit(mc, test_path, 1), 0);
+        tidesdb_manifest_close(mc);
+
+        tidesdb_manifest_t *mc2 = tidesdb_manifest_open(test_path);
+        ASSERT_TRUE(mc2 != NULL);
+        ASSERT_TRUE(tidesdb_manifest_has_sstable(mc2, 5, 500));
+        tidesdb_manifest_close(mc2);
+    }
+
     remove(test_path);
 }
 
@@ -1021,8 +1039,8 @@ void test_manifest_v7_legacy_opens(void)
 {
     const char *test_path = "." PATH_SEPARATOR "test_v7_legacy_manifest";
 
-    /* a version 7 file has no checksum line and must still open. after a commit it is rewritten
-     * as the current version and gains a checksum. */
+    /* a legacy version 7 text file must still open, and open converts it forward to the append-only
+     * block-manager format -- so after the open the file is no longer text */
     FILE *f = tdb_fopen(test_path, "w");
     ASSERT_TRUE(f != NULL);
     fprintf(f, "7\n5000\n1,100,1000,65536\n2,200,2000,131072\n");
@@ -1035,11 +1053,12 @@ void test_manifest_v7_legacy_opens(void)
     ASSERT_EQ(tidesdb_manifest_commit(m, test_path, 1), 0);
     tidesdb_manifest_close(m);
 
-    FILE *vf = tdb_fopen(test_path, "r");
+    /* the converted file is the binary log now, not a text version line */
+    FILE *vf = tdb_fopen(test_path, "rb");
     ASSERT_TRUE(vf != NULL);
-    char vline[64];
-    ASSERT_TRUE(fgets(vline, sizeof(vline), vf) != NULL);
-    ASSERT_EQ(atoi(vline), MANIFEST_VERSION);
+    unsigned char first = 0;
+    ASSERT_TRUE(fread(&first, 1, 1, vf) == 1);
+    ASSERT_FALSE(first == '7' || first == '8');
     fclose(vf);
 
     tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
@@ -1078,7 +1097,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_manifest_commit_empty, tests_passed);
     RUN_TEST(test_manifest_large_uint64_roundtrip, tests_passed);
     RUN_TEST(test_manifest_v8_checksum_roundtrip, tests_passed);
-    RUN_TEST(test_manifest_v8_detects_body_corruption, tests_passed);
+    RUN_TEST(test_manifest_self_heals_on_corruption, tests_passed);
     RUN_TEST(test_manifest_v7_legacy_opens, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

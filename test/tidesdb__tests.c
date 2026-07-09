@@ -32273,6 +32273,87 @@ static void test_burst_quiescence_default_pool_readback(void)
     cleanup_test_dir();
 }
 
+/* Manifest self-heal at the recovery layer. If a CF's MANIFEST is destroyed, reopening must NOT
+ * treat the on-disk sstables as orphans and delete them -- recovery rebuilds the manifest from the
+ * sstables, so every committed key survives. Guards the append-only manifest's self-heal against
+ * the recovery orphan-deletion path. */
+static void test_manifest_corruption_recovers_from_sstables(void)
+{
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    cc.write_buffer_size = 8192; /* small, so the writes land in real sstables */
+    ASSERT_EQ(tidesdb_create_column_family(db, "heal_cf", &cc), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "heal_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int N = 400;
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], val[64];
+        snprintf(key, sizeof(key), "hk_%05d", i);
+        snprintf(val, sizeof(val), "hv_%05d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                  strlen(val) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+    /* push everything to disk so the manifest is load-bearing for recovery */
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    wait_for_flush(db);
+    wait_for_compaction_idle(db, cf);
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* destroy the manifest -- overwrite it with garbage */
+    char manifest_path[512];
+    snprintf(manifest_path, sizeof(manifest_path), "%s%sheal_cf%sMANIFEST", TEST_DB_PATH,
+             PATH_SEPARATOR, PATH_SEPARATOR);
+    FILE *mf = fopen(manifest_path, "wb");
+    ASSERT_TRUE(mf != NULL);
+    const char junk[] = "total garbage, not a manifest at all \x01\x02\x03\x04";
+    ASSERT_EQ(fwrite(junk, 1, sizeof(junk), mf), sizeof(junk));
+    fclose(mf);
+
+    /* reopen -- recovery must rebuild the manifest from the on-disk sstables, not delete them */
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    cf = tidesdb_get_column_family(db, "heal_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < N; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], exp[64];
+        snprintf(key, sizeof(key), "hk_%05d", i);
+        snprintf(exp, sizeof(exp), "hv_%05d", i);
+        uint8_t *rv = NULL;
+        size_t rs = 0;
+        ASSERT_EQ(tdb_test_get_with_retry(txn, cf, (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+        ASSERT_TRUE(rv != NULL && rs == strlen(exp) + 1 && memcmp(rv, exp, rs) == 0);
+        free(rv);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     g_test_argv0 = argv[0];
@@ -32335,6 +32416,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_stats_per_cf_key_attribution, tests_passed);
     RUN_TEST(test_burst_then_quiescence_compaction_tail, tests_passed);
     RUN_TEST(test_burst_quiescence_default_pool_readback, tests_passed);
+    RUN_TEST(test_manifest_corruption_recovers_from_sstables, tests_passed);
     RUN_TEST(test_iterator_snapshot_complete_under_flush_compaction, tests_passed);
     RUN_TEST(test_get_stats_multi_cf_concurrent_under_flush, tests_passed);
     RUN_TEST(test_iterator_multi_cf_snapshot_under_churn, tests_passed);

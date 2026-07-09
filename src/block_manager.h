@@ -62,6 +62,9 @@
  * of disjoint offsets, so we preallocate in chunks and let pwrites land in-place. */
 #define BLOCK_MANAGER_PREALLOC_CHUNK    (64ull * 1024 * 1024) /* extend by 64 MB at a time */
 #define BLOCK_MANAGER_PREALLOC_LOWWATER (4ull * 1024 * 1024)  /* trigger extend when 4 MB left */
+/* the per-instance lowwater derives from the chunk by this shift (chunk >> 4 = chunk / 16), which
+ * reproduces the default 64 MB chunk / 4 MB lowwater ratio for any chunk size */
+#define BLOCK_MANAGER_PREALLOC_LOWWATER_SHIFT 4
 
 /* sstable-construction writeback pacing-- when smoothing is enabled, start async writeback
  * of the file each time this many bytes accumulate since the last hint, so the final
@@ -111,6 +114,12 @@ typedef struct
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;
+    /* per-instance preallocation chunk -- the on-disk extent grows by this many bytes at a time.
+     * block_manager_open uses BLOCK_MANAGER_PREALLOC_CHUNK; block_manager_open_pre may set a
+     * smaller value, or 0 to disable preallocation entirely (tiny append logs like the manifest, so
+     * a copy of the live file carries no trailing reserved zeros). lowwater derives as chunk >> 4
+     */
+    ATOMIC_ALIGN(8) _Atomic uint64_t prealloc_chunk;
     ATOMIC_ALIGN(8) _Atomic uint64_t group_durable_size;
     /* atomic so concurrent group-commit leaders don't race on this flag */
     _Atomic int group_sync_active;
@@ -159,6 +168,21 @@ typedef struct
  * @return 0 if successful, -1 if not
  */
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode);
+
+/**
+ * block_manager_open_pre
+ * like block_manager_open but with a caller-chosen preallocation chunk. pass a small chunk for a
+ * tiny file, or 0 to disable preallocation entirely so the file grows to exactly what is written
+ * (tiny append logs like the manifest, so a copy of the live file carries no trailing reserved
+ * zeros) rather than reserve a full BLOCK_MANAGER_PREALLOC_CHUNK extent.
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param sync_mode the sync mode (BLOCK_MANAGER_SYNC_NONE, BLOCK_MANAGER_SYNC_FULL)
+ * @param prealloc_chunk bytes to extend the on-disk extent by at a time; 0 disables preallocation
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_open_pre(block_manager_t **bm, const char *file_path, int sync_mode,
+                           uint64_t prealloc_chunk);
 
 /**
  * block_manager_close

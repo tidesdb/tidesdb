@@ -14736,6 +14736,55 @@ typedef struct
 static int tidesdb_full_preemptive_shard(void *vctx, int shard);
 
 /**
+ * tidesdb_coarsen_boundaries
+ * reduce a monotonic shard-boundary set so a merge writes roughly one output sstable per
+ * target_bytes of input rather than one per output level file. without this a merge of many small
+ * sstables rewrites them into just as many small sstables and the file count never shrinks, so
+ * every later round pays fixed per-output cost over a count that never drops. a strided subset of
+ * a monotonic tiling is still monotonic and still covers the whole key range (shard 0 starts
+ * unbounded and the last shard ends unbounded), so no key range is dropped. dropped boundary keys
+ * are freed here, the retained ones stay compacted in the prefix for the caller to free.
+ * @param boundaries malloc'd boundary keys, compacted in place
+ * @param boundary_sizes matching sizes, compacted in place
+ * @param num_boundaries current boundary count
+ * @param total_bytes total on-disk bytes of the merge inputs
+ * @param target_bytes desired output sstable size
+ * @return retained boundary count
+ */
+static int tidesdb_coarsen_boundaries(uint8_t **boundaries, size_t *boundary_sizes,
+                                      int num_boundaries, uint64_t total_bytes, size_t target_bytes)
+{
+    if (num_boundaries <= 0 || target_bytes == 0) return num_boundaries;
+
+    /* one output shard per target_bytes of input, at least one. shards = boundaries + 1, so we
+     * want want_shards - 1 boundaries; if we already have that few, keep them all */
+    uint64_t want_shards = total_bytes / target_bytes;
+    if (want_shards < 1) want_shards = 1;
+    if (want_shards >= (uint64_t)num_boundaries + 1) return num_boundaries;
+    const int want_boundaries = (int)(want_shards - 1);
+
+    int kept = 0;
+    for (int i = 0; i < num_boundaries; i++)
+    {
+        /* keep want_boundaries evenly spaced across the range, free the rest */
+        const int keep =
+            kept < want_boundaries &&
+            i >= (int)(((uint64_t)(kept + 1) * (uint64_t)num_boundaries) / want_shards);
+        if (keep)
+        {
+            boundaries[kept] = boundaries[i];
+            boundary_sizes[kept] = boundary_sizes[i];
+            kept++;
+        }
+        else
+        {
+            free(boundaries[i]);
+        }
+    }
+    return kept;
+}
+
+/**
  * tidesdb_full_preemptive_merge
  * perform a full preemptive merge on the column family
  * @param cf the column family
@@ -14891,6 +14940,19 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             }
         }
         atomic_fetch_sub_explicit(&out_lvl->array_readers, 1, memory_order_release);
+    }
+
+    /* coarsen the shard boundaries so the merge emits roughly one output sstable per
+     * write_buffer_size of input instead of one per output level file -- otherwise a merge of many
+     * small sstables reproduces the same file count and compaction never reduces it */
+    {
+        uint64_t fp_total_bytes = 0;
+        for (size_t i = 0; i < fp_del_n; i++)
+            if (fp_del_snap[i])
+                fp_total_bytes += fp_del_snap[i]->klog_size + fp_del_snap[i]->vlog_size;
+        fp_num_boundaries =
+            tidesdb_coarsen_boundaries(fp_boundaries, fp_boundary_sizes, fp_num_boundaries,
+                                       fp_total_bytes, cf->config.write_buffer_size);
     }
 
     tidesdb_full_preemptive_ctx_t fctx;
@@ -18661,9 +18723,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
         return result;
     }
 
-    /* we calculate X (dividing level) */
-    int X = num_levels - 1 - cf->config.dividing_level_offset;
-    if (X < 1) X = 1;
+    /* we calculate X (dividing level). a raw value below 1 means the tree is too shallow to carve
+     * a dividing level beneath the largest one, so x_clamped records that the floor fired and the
+     * dispatch below descends instead of rewriting the top level in place */
+    int x_raw = num_levels - 1 - cf->config.dividing_level_offset;
+    int x_clamped = x_raw < 1;
+    int X = x_clamped ? 1 : x_raw;
 
     int target_lvl = X; /* default to X if no suitable level found */
 
@@ -18714,8 +18779,27 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
     }
     else if (target_lvl == X)
     {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
-        result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
+        if (x_clamped)
+        {
+            /* the tree is too shallow to carve a dividing level, so a dividing merge at level 1
+             * would rewrite the top level in place without descending. ensure a level exists
+             * beneath the top and merge every level into the largest one so data moves down and the
+             * tree deepens, the same shape a full compaction uses. once the tree is deep enough for
+             * a real dividing level this branch is not taken and normal spooky resumes */
+            if (atomic_load_explicit(&cf->num_active_levels, memory_order_acquire) < 2)
+                tidesdb_add_level(cf);
+            int nl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' tree too shallow for a dividing level, full preemptive merge "
+                          "into largest level %d",
+                          cf->name, nl);
+            result = tidesdb_full_preemptive_merge(cf, 0, nl - 1, nl - 1);
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
+            result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
+        }
     }
     else
     {

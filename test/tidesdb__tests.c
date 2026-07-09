@@ -32034,6 +32034,245 @@ static void test_unified_stats_per_cf_key_attribution(void)
     cleanup_test_dir();
 }
 
+/* monotonic milliseconds, for measuring how long the engine takes to go quiet */
+static uint64_t test_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+/* poll until every cf's compaction has fully drained (pending==0 && !is_compacting) and the shared
+ * compaction queue is empty, or cap_ms elapses. compaction_pending_count is the reliable signal --
+ * it is bumped before the work item is enqueued and dropped only after the worker finishes, so it
+ * has no TOCTOU gap. returns elapsed ms, or cap_ms if it never quiesced. */
+static uint64_t wait_for_all_compaction_idle_ms(tidesdb_t *db, tidesdb_column_family_t **cfs, int n,
+                                                uint64_t cap_ms)
+{
+    const uint64_t start = test_monotonic_ms();
+    for (;;)
+    {
+        int busy = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (atomic_load_explicit(&cfs[i]->compaction_pending_count, memory_order_acquire) !=
+                    0 ||
+                atomic_load_explicit(&cfs[i]->is_compacting, memory_order_acquire))
+            {
+                busy = 1;
+                break;
+            }
+        }
+        tidesdb_db_stats_t st;
+        if (!busy && tidesdb_get_db_stats(db, &st) == 0 && st.compaction_queue_size == 0)
+            return test_monotonic_ms() - start;
+        if (test_monotonic_ms() - start >= cap_ms) return cap_ms;
+        usleep(20000);
+    }
+}
+
+/* run one burst-then-settle cycle with a given compaction pool size and return the compaction
+ * settle time. tiny write buffers are the trick -- a modest, unique key burst rotates the shared
+ * unified memtable many times, so it lands as many small per-cf L1 sstables (a large compaction
+ * debt) while the on-disk and memory footprint stays ~1.5 MB. after the burst the flush side is
+ * drained first, so what we time is purely the compaction tail. */
+static uint64_t burst_then_measure_compaction_settle(int num_compaction_threads, int report)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 16384; /* tiny -> many small flushes -> debt */
+    config.num_compaction_threads = num_compaction_threads;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    const int NCF = 8;
+    tidesdb_column_family_t *cfs[8];
+    for (int c = 0; c < NCF; c++)
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "burst_cf_%d", c);
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 16384;
+        ASSERT_EQ(tidesdb_create_column_family(db, name, &cf_config), 0);
+        cfs[c] = tidesdb_get_column_family(db, name);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    /* the write burst -- unique keys across every cf, small padded values */
+    const int PER_CF = 1500;
+    for (int i = 0; i < PER_CF; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int c = 0; c < NCF; c++)
+        {
+            char key[32], val[64];
+            snprintf(key, sizeof(key), "k_%d_%06d", c, i);
+            snprintf(val, sizeof(val), "v_%06d_padding_bytes_to_bulk_sstables", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+        }
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* writes have stopped. drain the flush side first so what remains is only compaction --
+     * this mirrors the observed shape where flush finishes fast and compaction is the long pole. */
+    for (int c = 0; c < NCF; c++) wait_for_cf_flush_idle(db, cfs[c]);
+
+    tidesdb_db_stats_t at_flush_idle;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &at_flush_idle), 0);
+    uint64_t comp_before = 0;
+    for (int c = 0; c < NCF; c++)
+        comp_before += atomic_load_explicit(&cfs[c]->compaction_count, memory_order_relaxed);
+
+    /* now time how long compaction takes to fully quiesce */
+    const uint64_t cap_ms = 60000;
+    const uint64_t settle_ms = wait_for_all_compaction_idle_ms(db, cfs, NCF, cap_ms);
+
+    uint64_t comp_after = 0;
+    for (int c = 0; c < NCF; c++)
+        comp_after += atomic_load_explicit(&cfs[c]->compaction_count, memory_order_relaxed);
+
+    if (report)
+        printf(
+            "\n    [compaction_threads=%d] sstables_after_flush=%d "
+            "compactions_after_flush_idle=%" PRIu64 " compaction_settle=%" PRIu64 "ms%s\n",
+            num_compaction_threads, at_flush_idle.total_sstable_count, comp_after - comp_before,
+            settle_ms, settle_ms >= cap_ms ? "  <-- NEVER QUIESCED (hit 60s cap)" : "");
+
+    /* the burst must actually have created a compaction backlog, otherwise the test proves
+     * nothing about the settle tail */
+    ASSERT_TRUE(at_flush_idle.total_sstable_count > NCF);
+    ASSERT_TRUE(comp_after >= comp_before);
+    /* and the engine must return to a quiet state -- hitting the cap here reproduces the
+     * non-terminating end of the spectrum */
+    ASSERT_TRUE(settle_ms < cap_ms);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+    return settle_ms;
+}
+
+static void test_burst_then_quiescence_compaction_tail(void)
+{
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
+    const uint64_t settle_default =
+        burst_then_measure_compaction_settle(2, 1); /* library default */
+    const uint64_t settle_wide = burst_then_measure_compaction_settle(8, 1);
+
+    printf("    compaction settle: 2 threads=%" PRIu64 "ms  8 threads=%" PRIu64 "ms\n",
+           settle_default, settle_wide);
+
+    /* the tail is throughput-bound, so a wider pool must not make it slower. one-sided and
+     * generous because absolute timings are runner-dependent; the printed numbers are the signal.
+     */
+    ASSERT_TRUE(settle_wide <= settle_default + 2000);
+}
+
+static void test_burst_quiescence_default_pool_readback(void)
+{
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 16384;
+    /* deliberately leaves num_compaction_threads at its default -- tamed compaction must keep pace
+     * without any thread tuning */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    const int NCF = 8;
+    const int PER_CF = 1500;
+    tidesdb_column_family_t *cfs[8];
+    for (int c = 0; c < NCF; c++)
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "rb_cf_%d", c);
+        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+        cc.write_buffer_size = 16384;
+        ASSERT_EQ(tidesdb_create_column_family(db, name, &cc), 0);
+        cfs[c] = tidesdb_get_column_family(db, name);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    /* burst -- deterministic keys and values so every one can be read back after settle */
+    for (int i = 0; i < PER_CF; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        for (int c = 0; c < NCF; c++)
+        {
+            char key[32], val[64];
+            snprintf(key, sizeof(key), "k_%d_%06d", c, i);
+            snprintf(val, sizeof(val), "v_%d_%06d", c, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                      strlen(val) + 1, 0),
+                      0);
+        }
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    for (int c = 0; c < NCF; c++) wait_for_cf_flush_idle(db, cfs[c]);
+
+    const uint64_t settle_ms = wait_for_all_compaction_idle_ms(db, cfs, NCF, 60000);
+
+    tidesdb_db_stats_t st;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &st), 0);
+    printf("\n    default-pool settle=%" PRIu64 "ms  final_sstables=%d%s\n", settle_ms,
+           st.total_sstable_count, settle_ms >= 60000 ? "  <-- DID NOT QUIESCE" : "");
+
+    /* correctness gate -- every committed key must read back with its exact value after all the
+     * compaction merges. a size-bounded merge that mis-tiled a shard would drop a key here. */
+    for (int c = 0; c < NCF; c++)
+    {
+        for (int i = 0; i < PER_CF; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], exp[64];
+            snprintf(key, sizeof(key), "k_%d_%06d", c, i);
+            snprintf(exp, sizeof(exp), "v_%d_%06d", c, i);
+            uint8_t *rv = NULL;
+            size_t rs = 0;
+            ASSERT_EQ(
+                tdb_test_get_with_retry(txn, cfs[c], (uint8_t *)key, strlen(key) + 1, &rv, &rs), 0);
+            ASSERT_EQ(rs, strlen(exp) + 1);
+            ASSERT_TRUE(rv != NULL && memcmp(rv, exp, rs) == 0);
+            free(rv);
+            tidesdb_txn_free(txn);
+        }
+    }
+
+    /* the engine must return to a quiet state at the default pool -- a cap hit means compaction is
+     * still lagging and the fix did not tame it */
+    ASSERT_TRUE(settle_ms < 60000);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(int argc, char **argv)
 {
     g_test_argv0 = argv[0];
@@ -32094,6 +32333,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_sstable_distinct_key_cardinality, tests_passed);
     RUN_TEST(test_distinct_key_count_collapses_versions, tests_passed);
     RUN_TEST(test_unified_stats_per_cf_key_attribution, tests_passed);
+    RUN_TEST(test_burst_then_quiescence_compaction_tail, tests_passed);
+    RUN_TEST(test_burst_quiescence_default_pool_readback, tests_passed);
     RUN_TEST(test_iterator_snapshot_complete_under_flush_compaction, tests_passed);
     RUN_TEST(test_get_stats_multi_cf_concurrent_under_flush, tests_passed);
     RUN_TEST(test_iterator_multi_cf_snapshot_under_churn, tests_passed);

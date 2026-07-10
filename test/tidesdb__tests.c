@@ -18172,77 +18172,85 @@ static void test_database_lock_multi_process(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
 
-    char signal_file[256];
-    snprintf(signal_file, sizeof(signal_file), "%s/.parent_ready", TEST_DB_PATH);
+    /* both children are forked from this pristine, single-threaded parent -- before it opens (and
+     * so before it spawns and later joins the flush/compaction/sync/reaper threads of) any
+     * database. forking a child that then opens a database from a parent that has already run
+     * threads is the fork-without-exec hazard macOS aborts on intermittently; forking both children
+     * up front removes the threaded-parent fork entirely. the two signal files coordinate ordering
+     * and live outside the db directory so they never appear in the directory the db scans. */
+    char ready_file[256];
+    char closed_file[256];
+    snprintf(ready_file, sizeof(ready_file), "%s_lockmp_ready", TEST_DB_PATH);
+    snprintf(closed_file, sizeof(closed_file), "%s_lockmp_closed", TEST_DB_PATH);
+    remove(ready_file); /* clear any stragglers from a crashed prior run */
+    remove(closed_file);
 
-    pid_t pid = fork();
-    ASSERT_TRUE(pid >= 0);
-
-    if (pid == 0)
+    /* child 1 -- opens while the parent holds the lock, expects TDB_ERR_LOCKED */
+    pid_t pid1 = fork();
+    ASSERT_TRUE(pid1 >= 0);
+    if (pid1 == 0)
     {
-        /* child process -- wait for parent to signal it has opened the database */
         int wait_count = 0;
-        while (access(signal_file, F_OK) != 0 && wait_count < 100)
+        while (access(ready_file, F_OK) != 0 && wait_count < 1000)
         {
             usleep(10000); /* 10ms */
             wait_count++;
         }
+        if (wait_count >= 1000) _exit(2); /* timeout waiting for the parent to open */
 
-        if (wait_count >= 100)
-        {
-            _exit(2); /* timeout waiting for parent */
-        }
-
-        /* we now try to open the locked database -- should fail */
         tidesdb_t *child_db = NULL;
         const int result = tidesdb_open(&config, &child_db);
         _exit(result == TDB_ERR_LOCKED ? 0 : 1);
     }
 
-    /* parent process -- open database first */
-    tidesdb_t *db = NULL;
-    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
-    ASSERT_TRUE(db != NULL);
-
-    /* signal child that database is open */
-    FILE *f = fopen(signal_file, "w");
-    ASSERT_TRUE(f != NULL);
-    fclose(f);
-
-    /* we wait for child */
-    int status;
-    waitpid(pid, &status, 0);
-    ASSERT_TRUE(WIFEXITED(status));
-    ASSERT_EQ(WEXITSTATUS(status), 0); /* child got TDB_ERR_LOCKED as expected */
-
-    /* remove signal file */
-    remove(signal_file);
-
-    /* parent closes database */
-    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
-
-    /* we test that a new process can now open the database */
-    pid = fork();
-    ASSERT_TRUE(pid >= 0);
-
-    if (pid == 0)
+    /* child 2 -- opens after the parent releases the lock, expects success */
+    pid_t pid2 = fork();
+    ASSERT_TRUE(pid2 >= 0);
+    if (pid2 == 0)
     {
-        /* child process -- should succeed now that parent released lock */
-        tidesdb_t *child_db = NULL;
-        int result = tidesdb_open(&config, &child_db);
-        if (result != TDB_SUCCESS || child_db == NULL)
+        int wait_count = 0;
+        while (access(closed_file, F_OK) != 0 && wait_count < 1000)
         {
-            _exit(1);
+            usleep(10000); /* 10ms */
+            wait_count++;
         }
+        if (wait_count >= 1000) _exit(2); /* timeout waiting for the parent to close */
+
+        tidesdb_t *child_db = NULL;
+        const int result = tidesdb_open(&config, &child_db);
+        if (result != TDB_SUCCESS || child_db == NULL) _exit(1);
         tidesdb_close(child_db);
         _exit(0);
     }
 
-    /* parent waits for child */
-    waitpid(pid, &status, 0);
-    ASSERT_TRUE(WIFEXITED(status));
-    ASSERT_EQ(WEXITSTATUS(status), 0); /* child opened successfully */
+    /* parent -- open the database first, then signal child 1 */
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
 
+    FILE *rf = fopen(ready_file, "w");
+    ASSERT_TRUE(rf != NULL);
+    fclose(rf);
+
+    int status1 = 0;
+    waitpid(pid1, &status1, 0);
+    ASSERT_TRUE(WIFEXITED(status1));
+    ASSERT_EQ(WEXITSTATUS(status1), 0); /* child 1 got TDB_ERR_LOCKED as expected */
+
+    /* release the lock, then signal child 2 that it may open */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    FILE *cf = fopen(closed_file, "w");
+    ASSERT_TRUE(cf != NULL);
+    fclose(cf);
+
+    int status2 = 0;
+    waitpid(pid2, &status2, 0);
+    ASSERT_TRUE(WIFEXITED(status2));
+    ASSERT_EQ(WEXITSTATUS(status2), 0); /* child 2 opened the released database successfully */
+
+    remove(ready_file);
+    remove(closed_file);
     cleanup_test_dir();
 }
 #endif

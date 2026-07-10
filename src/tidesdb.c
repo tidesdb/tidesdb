@@ -16399,38 +16399,44 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     tidesdb_level_t *target = cf->levels[target_level];
-    /** dividing merge
-     * we use boundaries from target_level+1 (the level we're merging into) */
-    tidesdb_level_t *next_level = cf->levels[target_level + 1];
+    /* spooky algorithm 2 -- a dividing merge partitions its output by the file boundaries at the
+     * largest level, not the adjacent level, so each output file overlaps at most one largest-level
+     * file and the later partitioned merge across levels X..L draws perfectly overlapping groups.
+     * the merge inputs are levels 0..target_level; the largest level is only the boundary source
+     * and is left untouched. (target_level < num_levels-1 is guaranteed by the largest-level branch
+     * above, so the largest level is always strictly below the merge target.) */
+    tidesdb_level_t *largest_level = cf->levels[num_levels - 1];
 
-    /* the boundaries come from next_level's per-sstable min_keys and the merge assumes they ascend
-     * so the partition ranges tile the key space. parallel sub-compaction commits can leave the
-     * level out of ascending order, which makes the boundaries non-monotonic, opens gaps between
-     * partitions, and silently drops every key in a gap. sort first; if the sort cannot run, fall
-     * back to the full merge, which does not partition by these boundaries. */
+    /* the boundaries come from the largest level's per-sstable min_keys and the merge assumes they
+     * ascend so the partition ranges tile the key space. parallel sub-compaction commits can leave
+     * the level out of ascending order, which makes the boundaries non-monotonic, opens gaps
+     * between partitions, and silently drops every key in a gap. sort first; if the sort cannot
+     * run, fall back to the full merge, which does not partition by these boundaries. */
     {
         skip_list_comparator_fn dm_cmp = NULL;
         void *dm_cmp_ctx = NULL;
         tidesdb_resolve_comparator(cf->db, &cf->config, &dm_cmp, &dm_cmp_ctx);
         if (!dm_cmp ||
-            tidesdb_level_sort_by_min_key(cf->db, next_level, dm_cmp, dm_cmp_ctx) != TDB_SUCCESS)
+            tidesdb_level_sort_by_min_key(cf->db, largest_level, dm_cmp, dm_cmp_ctx) != TDB_SUCCESS)
             return tidesdb_full_preemptive_merge(cf, 0, target_level, target_level);
     }
 
-    tidesdb_level_update_boundaries(target, next_level);
+    tidesdb_level_update_boundaries(target, largest_level);
 
-    int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Next level (L%d) has %d SSTables", next_level->level_num,
-                  next_level_num_ssts);
-    tidesdb_sstable_t **next_level_ssts =
-        atomic_load_explicit(&next_level->sstables, memory_order_acquire);
-    for (int i = 0; i < next_level_num_ssts; i++)
+    int boundary_src_num_ssts =
+        atomic_load_explicit(&largest_level->num_sstables, memory_order_acquire);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Boundary source largest level (L%d) has %d SSTables",
+                  largest_level->level_num, boundary_src_num_ssts);
+    tidesdb_sstable_t **boundary_src_ssts =
+        atomic_load_explicit(&largest_level->sstables, memory_order_acquire);
+    for (int i = 0; i < boundary_src_num_ssts; i++)
     {
-        const tidesdb_sstable_t *sst = next_level_ssts[i];
+        const tidesdb_sstable_t *sst = boundary_src_ssts[i];
         if (sst)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "Next level SSTable %" PRIu64 " (min_key_size=%zu, max_key_size=%zu)",
+                          "Boundary source SSTable %" PRIu64
+                          " (min_key_size=%zu, max_key_size=%zu)",
                           sst->id, sst->min_key_size, sst->max_key_size);
         }
     }
@@ -17605,10 +17611,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
         }
     }
 
-    /**** spooky paper algorithm 2 -- when merging into the largest level,
-     ***  cap output sstable size at file_max = C_X (capacity of the dividing level).
-     **   this bounds transient space-amp to 1/T. when not targeting the largest level,
-     *    file_max is 0 which disables splitting. */
+    /**** spooky paper algorithm 2 -- when merging into the largest level, cap output sstable size
+     *at
+     ***  file_max = C_X (capacity of the dividing level). this restricts the partitioned merge's
+     **   transient space-amp to file_max/N_L = 1/T^(L-X) (which is 1/T in the 2L case X=L-1, and
+     *    tighter for a deeper dividing level). when not targeting the largest level, file_max is 0
+     *    which disables splitting. */
     const int targeting_largest = (end_idx == num_levels - 1);
 
     /* a tombstone may be reaped only when no older version of its key can survive outside this

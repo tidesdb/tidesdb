@@ -949,7 +949,7 @@ void test_btree_seek_edge_cases()
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
 
-    /* we add keys with gaps: key10, key20, key30, key40, key50 */
+    /* we add keys with gaps key10, key20, key30, key40, key50 */
     for (int i = 1; i <= 5; i++)
     {
         char key[32];
@@ -1245,7 +1245,7 @@ void test_btree_cursor_seek_for_prev(void)
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
 
-    /* keys with gaps: key10, key20, key30, key40, key50 */
+    /* keys with gaps key10, key20, key30, key40, key50 */
     for (int i = 1; i <= 5; i++)
     {
         char key[32];
@@ -1319,7 +1319,7 @@ void test_btree_cursor_has_next_has_prev(void)
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
 
-    /* at first entry: has_prev=0, has_next=1 */
+    /* at first entry has_prev=0, has_next=1 */
     ASSERT_EQ(btree_cursor_has_prev(cursor), 0);
     ASSERT_EQ(btree_cursor_has_next(cursor), 1);
 

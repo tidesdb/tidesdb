@@ -1884,8 +1884,12 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
     if (stall < 1) stall = 1;
     if (cf->db)
     {
-        /* unified mode has a single shared immutable queue, so the per-CF
-         * memory-budget split below does not apply -- use the configured value */
+        /* unified mode has a single shared immutable queue, so the per-CF memory-budget split
+         * below does not apply -- use the configured value. its memory is unified_wbuf x depth
+         * regardless of CF count, so no division is needed. note apply_backpressure runs per
+         * committing CF, so this shared queue is paced by whichever CF is committing -- per-CF
+         * thresholds that differ pace it inconsistently (the depth is bounded by the largest of
+         * them); with the default threshold across CFs it stalls coherently at one depth. */
         if (cf->db->unified_mt.enabled) return stall;
 
         const int num_cfs = cf->db->num_column_families;
@@ -14736,6 +14740,55 @@ typedef struct
 static int tidesdb_full_preemptive_shard(void *vctx, int shard);
 
 /**
+ * tidesdb_coarsen_boundaries
+ * reduce a monotonic shard-boundary set so a merge writes roughly one output sstable per
+ * target_bytes of input rather than one per output level file. without this a merge of many small
+ * sstables rewrites them into just as many small sstables and the file count never shrinks, so
+ * every later round pays fixed per-output cost over a count that never drops. a strided subset of
+ * a monotonic tiling is still monotonic and still covers the whole key range (shard 0 starts
+ * unbounded and the last shard ends unbounded), so no key range is dropped. dropped boundary keys
+ * are freed here, the retained ones stay compacted in the prefix for the caller to free.
+ * @param boundaries malloc'd boundary keys, compacted in place
+ * @param boundary_sizes matching sizes, compacted in place
+ * @param num_boundaries current boundary count
+ * @param total_bytes total on-disk bytes of the merge inputs
+ * @param target_bytes desired output sstable size
+ * @return retained boundary count
+ */
+static int tidesdb_coarsen_boundaries(uint8_t **boundaries, size_t *boundary_sizes,
+                                      int num_boundaries, uint64_t total_bytes, size_t target_bytes)
+{
+    if (num_boundaries <= 0 || target_bytes == 0) return num_boundaries;
+
+    /* one output shard per target_bytes of input, at least one. shards = boundaries + 1, so we
+     * want want_shards - 1 boundaries; if we already have that few, keep them all */
+    uint64_t want_shards = total_bytes / target_bytes;
+    if (want_shards < 1) want_shards = 1;
+    if (want_shards >= (uint64_t)num_boundaries + 1) return num_boundaries;
+    const int want_boundaries = (int)(want_shards - 1);
+
+    int kept = 0;
+    for (int i = 0; i < num_boundaries; i++)
+    {
+        /* keep want_boundaries evenly spaced across the range, free the rest */
+        const int keep =
+            kept < want_boundaries &&
+            i >= (int)(((uint64_t)(kept + 1) * (uint64_t)num_boundaries) / want_shards);
+        if (keep)
+        {
+            boundaries[kept] = boundaries[i];
+            boundary_sizes[kept] = boundary_sizes[i];
+            kept++;
+        }
+        else
+        {
+            free(boundaries[i]);
+        }
+    }
+    return kept;
+}
+
+/**
  * tidesdb_full_preemptive_merge
  * perform a full preemptive merge on the column family
  * @param cf the column family
@@ -14891,6 +14944,19 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             }
         }
         atomic_fetch_sub_explicit(&out_lvl->array_readers, 1, memory_order_release);
+    }
+
+    /* coarsen the shard boundaries so the merge emits roughly one output sstable per
+     * write_buffer_size of input instead of one per output level file -- otherwise a merge of many
+     * small sstables reproduces the same file count and compaction never reduces it */
+    {
+        uint64_t fp_total_bytes = 0;
+        for (size_t i = 0; i < fp_del_n; i++)
+            if (fp_del_snap[i])
+                fp_total_bytes += fp_del_snap[i]->klog_size + fp_del_snap[i]->vlog_size;
+        fp_num_boundaries =
+            tidesdb_coarsen_boundaries(fp_boundaries, fp_boundary_sizes, fp_num_boundaries,
+                                       fp_total_bytes, cf->config.write_buffer_size);
     }
 
     tidesdb_full_preemptive_ctx_t fctx;
@@ -16337,38 +16403,44 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     tidesdb_level_t *target = cf->levels[target_level];
-    /** dividing merge
-     * we use boundaries from target_level+1 (the level we're merging into) */
-    tidesdb_level_t *next_level = cf->levels[target_level + 1];
+    /* spooky algorithm 2 -- a dividing merge partitions its output by the file boundaries at the
+     * largest level, not the adjacent level, so each output file overlaps at most one largest-level
+     * file and the later partitioned merge across levels X..L draws perfectly overlapping groups.
+     * the merge inputs are levels 0..target_level; the largest level is only the boundary source
+     * and is left untouched. (target_level < num_levels-1 is guaranteed by the largest-level branch
+     * above, so the largest level is always strictly below the merge target.) */
+    tidesdb_level_t *largest_level = cf->levels[num_levels - 1];
 
-    /* the boundaries come from next_level's per-sstable min_keys and the merge assumes they ascend
-     * so the partition ranges tile the key space. parallel sub-compaction commits can leave the
-     * level out of ascending order, which makes the boundaries non-monotonic, opens gaps between
-     * partitions, and silently drops every key in a gap. sort first; if the sort cannot run, fall
-     * back to the full merge, which does not partition by these boundaries. */
+    /* the boundaries come from the largest level's per-sstable min_keys and the merge assumes they
+     * ascend so the partition ranges tile the key space. parallel sub-compaction commits can leave
+     * the level out of ascending order, which makes the boundaries non-monotonic, opens gaps
+     * between partitions, and silently drops every key in a gap. sort first; if the sort cannot
+     * run, fall back to the full merge, which does not partition by these boundaries. */
     {
         skip_list_comparator_fn dm_cmp = NULL;
         void *dm_cmp_ctx = NULL;
         tidesdb_resolve_comparator(cf->db, &cf->config, &dm_cmp, &dm_cmp_ctx);
         if (!dm_cmp ||
-            tidesdb_level_sort_by_min_key(cf->db, next_level, dm_cmp, dm_cmp_ctx) != TDB_SUCCESS)
+            tidesdb_level_sort_by_min_key(cf->db, largest_level, dm_cmp, dm_cmp_ctx) != TDB_SUCCESS)
             return tidesdb_full_preemptive_merge(cf, 0, target_level, target_level);
     }
 
-    tidesdb_level_update_boundaries(target, next_level);
+    tidesdb_level_update_boundaries(target, largest_level);
 
-    int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Next level (L%d) has %d SSTables", next_level->level_num,
-                  next_level_num_ssts);
-    tidesdb_sstable_t **next_level_ssts =
-        atomic_load_explicit(&next_level->sstables, memory_order_acquire);
-    for (int i = 0; i < next_level_num_ssts; i++)
+    int boundary_src_num_ssts =
+        atomic_load_explicit(&largest_level->num_sstables, memory_order_acquire);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Boundary source largest level (L%d) has %d SSTables",
+                  largest_level->level_num, boundary_src_num_ssts);
+    tidesdb_sstable_t **boundary_src_ssts =
+        atomic_load_explicit(&largest_level->sstables, memory_order_acquire);
+    for (int i = 0; i < boundary_src_num_ssts; i++)
     {
-        const tidesdb_sstable_t *sst = next_level_ssts[i];
+        const tidesdb_sstable_t *sst = boundary_src_ssts[i];
         if (sst)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "Next level SSTable %" PRIu64 " (min_key_size=%zu, max_key_size=%zu)",
+                          "Boundary source SSTable %" PRIu64
+                          " (min_key_size=%zu, max_key_size=%zu)",
                           sst->id, sst->min_key_size, sst->max_key_size);
         }
     }
@@ -17543,10 +17615,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
         }
     }
 
-    /**** spooky paper algorithm 2 -- when merging into the largest level,
-     ***  cap output sstable size at file_max = C_X (capacity of the dividing level).
-     **   this bounds transient space-amp to 1/T. when not targeting the largest level,
-     *    file_max is 0 which disables splitting. */
+    /**** spooky paper algorithm 2 -- when merging into the largest level, cap output sstable size
+     *at
+     ***  file_max = C_X (capacity of the dividing level). this restricts the partitioned merge's
+     **   transient space-amp to file_max/N_L = 1/T^(L-X) (which is 1/T in the 2L case X=L-1, and
+     *    tighter for a deeper dividing level). when not targeting the largest level, file_max is 0
+     *    which disables splitting. */
     const int targeting_largest = (end_idx == num_levels - 1);
 
     /* a tombstone may be reaped only when no older version of its key can survive outside this
@@ -17643,6 +17717,74 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     }
     free(ssts_array);
 
+    /* spooky seamless adaptation (the merge half) -- when merging into the largest level, coalesce
+     * a run of adjacent under-full partitions into one sub-merge so their combined data lands as a
+     * single ~file_max sstable instead of several small ones. this is the lower-bound counterpart
+     * to the file_max split, which only bounds output size from above; together they keep the
+     * largest level's files near-equal-sized (between ~file_max/2 and file_max) under skewed
+     * deletes. a skipped (cold) partition stays its own group so its untouched file is preserved,
+     * and the driver's per-file skip accounting above keeps using the original partition arrays --
+     * only the sub-compaction dispatch below sees this coalesced view. disabled when file_max is 0
+     * (not targeting the largest level, where output stays partitioned by L for future alignment).
+     * the group boundaries alias the original boundary keys, so only the group container arrays are
+     * freed here. */
+    uint8_t **grp_boundaries = boundaries;
+    size_t *grp_boundary_sizes = boundary_sizes;
+    int *grp_skipped = partition_skipped;
+    int grp_num = num_partitions;
+    int grp_owned = 0;
+    if (file_max > 0 && num_partitions > 1)
+    {
+        uint8_t **gb = malloc((size_t)num_partitions * sizeof(uint8_t *));
+        size_t *gbs = malloc((size_t)num_partitions * sizeof(size_t));
+        int *gs = malloc((size_t)num_partitions * sizeof(int));
+        if (gb && gbs && gs)
+        {
+            int g = 0;
+            int i = 0;
+            while (i < num_partitions)
+            {
+                const int start = i;
+                const int start_skipped = (partition_skipped && partition_skipped[start]) ? 1 : 0;
+                if (start_skipped)
+                {
+                    i++; /* a skipped partition is always its own group -- file left in place */
+                }
+                else
+                {
+                    uint64_t acc = 0;
+                    /* accumulate adjacent non-skipped partitions until the next would push the
+                     * group past file_max; the first file is always taken so a single oversized
+                     * file still forms a group (the file_max split handles its output). */
+                    while (i < num_partitions && !(partition_skipped && partition_skipped[i]))
+                    {
+                        uint64_t sz = largest_sstables[i] ? largest_sstables[i]->klog_size +
+                                                                largest_sstables[i]->vlog_size
+                                                          : 0;
+                        if (acc != 0 && acc + sz > file_max) break;
+                        acc += sz;
+                        i++;
+                    }
+                }
+                gb[g] = boundaries[start]; /* alias -- owned by the original boundaries array */
+                gbs[g] = boundary_sizes[start];
+                gs[g] = start_skipped;
+                g++;
+            }
+            grp_boundaries = gb;
+            grp_boundary_sizes = gbs;
+            grp_skipped = gs;
+            grp_num = g;
+            grp_owned = 1;
+        }
+        else
+        {
+            free(gb);
+            free(gbs);
+            free(gs);
+        }
+    }
+
     int aborted = 0;
 
     tidesdb_partitioned_merge_ctx_t pctx;
@@ -17650,10 +17792,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     pctx.start_idx = start_idx;
     pctx.end_idx = end_idx;
     pctx.end_level = end_level;
-    pctx.num_partitions = num_partitions;
-    pctx.boundaries = boundaries;
-    pctx.boundary_sizes = boundary_sizes;
-    pctx.partition_skipped = partition_skipped;
+    pctx.num_partitions = grp_num;
+    pctx.boundaries = grp_boundaries;
+    pctx.boundary_sizes = grp_boundary_sizes;
+    pctx.partition_skipped = grp_skipped;
     pctx.file_max = file_max;
     pctx.reap_tombstones = reap_tombstones;
     pctx.oldest_unflushed_seq = pm_oldest_unflushed;
@@ -17661,9 +17803,19 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
 
     /* run the partition sub-merges across the sub-compaction helper pool (calling thread works
      * too); each partition commits its output(s) under cf->compaction_commit_lock */
-    tidesdb_run_subcompactions(cf->db, &pctx, tidesdb_partitioned_merge_partition, num_partitions);
+    tidesdb_run_subcompactions(cf->db, &pctx, tidesdb_partitioned_merge_partition, grp_num);
 
     if (atomic_load_explicit(&pctx.aborted, memory_order_acquire)) aborted = 1;
+
+    /* the group view was only needed for dispatch; the original boundary/skip arrays are freed by
+     * the cleanup paths below. the group boundaries alias the originals, so free containers only.
+     */
+    if (grp_owned)
+    {
+        free(grp_boundaries);
+        free(grp_boundary_sizes);
+        free(grp_skipped);
+    }
 
     if (aborted)
     {
@@ -18661,9 +18813,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
         return result;
     }
 
-    /* we calculate X (dividing level) */
-    int X = num_levels - 1 - cf->config.dividing_level_offset;
-    if (X < 1) X = 1;
+    /* we calculate X (dividing level). a raw value below 1 means the tree is too shallow to carve
+     * a dividing level beneath the largest one, so x_clamped records that the floor fired and the
+     * dispatch below descends instead of rewriting the top level in place */
+    int x_raw = num_levels - 1 - cf->config.dividing_level_offset;
+    int x_clamped = x_raw < 1;
+    int X = x_clamped ? 1 : x_raw;
 
     int target_lvl = X; /* default to X if no suitable level found */
 
@@ -18714,8 +18869,27 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
     }
     else if (target_lvl == X)
     {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
-        result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
+        if (x_clamped)
+        {
+            /* the tree is too shallow to carve a dividing level, so a dividing merge at level 1
+             * would rewrite the top level in place without descending. ensure a level exists
+             * beneath the top and merge every level into the largest one so data moves down and the
+             * tree deepens, the same shape a full compaction uses. once the tree is deep enough for
+             * a real dividing level this branch is not taken and normal spooky resumes */
+            if (atomic_load_explicit(&cf->num_active_levels, memory_order_acquire) < 2)
+                tidesdb_add_level(cf);
+            int nl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' tree too shallow for a dividing level, full preemptive merge "
+                          "into largest level %d",
+                          cf->name, nl);
+            result = tidesdb_full_preemptive_merge(cf, 0, nl - 1, nl - 1);
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
+            result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
+        }
     }
     else
     {
@@ -24397,14 +24571,15 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         }
     }
 
-    /* we close manifest file handle before rename (required on Windows) */
+    /* we close the manifest log handle before rename (required on Windows). the next commit at the
+     * new path reopens it -- the path is re-pointed and re-committed after the directory rename */
     if (cf->manifest)
     {
         pthread_rwlock_wrlock(&cf->manifest->lock);
-        if (cf->manifest->fp)
+        if (cf->manifest->bm)
         {
-            fclose(cf->manifest->fp);
-            cf->manifest->fp = NULL;
+            block_manager_close(cf->manifest->bm);
+            cf->manifest->bm = NULL;
         }
         pthread_rwlock_unlock(&cf->manifest->lock);
     }
@@ -33659,10 +33834,13 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
 
     const uint64_t sst_id = (uint64_t)sst_id_ull;
 
-    /* we check manifest to see if this sstable is complete */
+    /* we check manifest to see if this sstable is complete. a self-healed manifest recovered from
+     * corruption may be missing legitimately committed sstables, so we must not use it to decide a
+     * file is an orphan -- when it self-healed we keep every sstable on disk and rebuild the
+     * manifest from them below instead of deleting. */
     const int in_manifest = tidesdb_manifest_has_sstable(cf->manifest, level_num, sst_id);
 
-    if (!in_manifest)
+    if (!in_manifest && !cf->manifest->self_healed)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN,
                       "CF '%s' SSTable %" PRIu64
@@ -33724,6 +33902,13 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
     {
         tidesdb_level_add_sstable(cf->levels[level_num - 1], sst);
         tidesdb_bump_sstable_layout_version(cf);
+        if (!in_manifest)
+        {
+            /* self-heal -- this sstable was on disk but missing from the recovered manifest, so add
+             * it back so the rebuilt manifest reflects the on-disk set */
+            tidesdb_manifest_add_sstable(cf->manifest, level_num, sst_id, sst->num_entries,
+                                         sst->klog_size + sst->vlog_size);
+        }
     }
     else
     {
@@ -33782,6 +33967,18 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
         }
     }
     closedir(dir);
+
+    /* a manifest that self-healed from corruption was rebuilt above from the on-disk sstables --
+     * persist that reconstructed set and clear the flag so the manifest is authoritative again */
+    if (cf->manifest && cf->manifest->self_healed)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' rebuilt manifest from %d on-disk SSTables after self-heal", cf->name,
+                      cf->manifest->num_entries);
+        tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
+                                cf->config.sync_mode != TDB_SYNC_NONE);
+        cf->manifest->self_healed = 0;
+    }
 
     /*** if no local .klog files were found but the MANIFEST
      **  has sstable entries, we reconstruct sstable structs from MANIFEST metadata.

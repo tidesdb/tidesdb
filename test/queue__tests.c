@@ -863,7 +863,7 @@ void test_queue_remove_if_callback_invoked(void)
 
 void test_queue_remove_if_tail_match(void)
 {
-    /* exercise the tail-pointer fix-up path: remove the last item, ensure subsequent
+    /* exercise the tail-pointer fix-up path, we remove the last item, ensure subsequent
      * enqueues still land at the end */
     queue_t *queue = queue_new();
     int a = 1, b = 2, c = 3;

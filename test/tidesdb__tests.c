@@ -28026,26 +28026,51 @@ static void test_unified_concurrent_multi_cf_read_write(void)
     _Atomic(int) commits_ok = 0, commits_fail = 0, go = 0, stop = 0;
 
     pthread_t writers[4], readers[4];
+    int w_started[4] = {0}, r_started[4] = {0};
     unified_concurrent_data_t w_data[4], r_data[4];
+
+    /* cap the worker stacks well below the 8MB default -- on a 32-bit ASan runner the default
+     * stacks for these eight threads, on top of the db's own worker/compaction/reaper threads and
+     * ASan's shadow region, can exhaust the address space and make pthread_create fail (EAGAIN),
+     * leaving a zero handle that trips ASan's join check. a short retry rides out a transient
+     * failure, and the started flags ensure we never join a thread that was not created. */
+    pthread_attr_t tattr;
+    pthread_attr_init(&tattr);
+    pthread_attr_setstacksize(&tattr, 1024 * 1024);
 
     for (int i = 0; i < NUM_WRITERS; i++)
     {
         w_data[i] = (unified_concurrent_data_t){db,          cfs,           NUM_CFS, i,    W_OPS,
                                                 &commits_ok, &commits_fail, &go,     &stop};
-        pthread_create(&writers[i], NULL, unified_concurrent_writer, &w_data[i]);
+        for (int a = 0; a < 50 && !w_started[i]; a++)
+        {
+            if (pthread_create(&writers[i], &tattr, unified_concurrent_writer, &w_data[i]) == 0)
+                w_started[i] = 1;
+            else
+                usleep(10000);
+        }
     }
     for (int i = 0; i < NUM_READERS; i++)
     {
         r_data[i] = (unified_concurrent_data_t){db,          cfs,           NUM_CFS, 10 + i, R_OPS,
                                                 &commits_ok, &commits_fail, &go,     &stop};
-        pthread_create(&readers[i], NULL, unified_concurrent_reader, &r_data[i]);
+        for (int a = 0; a < 50 && !r_started[i]; a++)
+        {
+            if (pthread_create(&readers[i], &tattr, unified_concurrent_reader, &r_data[i]) == 0)
+                r_started[i] = 1;
+            else
+                usleep(10000);
+        }
     }
+    pthread_attr_destroy(&tattr);
 
     atomic_store(&go, 1);
 
-    for (int i = 0; i < NUM_WRITERS; i++) pthread_join(writers[i], NULL);
+    for (int i = 0; i < NUM_WRITERS; i++)
+        if (w_started[i]) pthread_join(writers[i], NULL);
     atomic_store(&stop, 1);
-    for (int i = 0; i < NUM_READERS; i++) pthread_join(readers[i], NULL);
+    for (int i = 0; i < NUM_READERS; i++)
+        if (r_started[i]) pthread_join(readers[i], NULL);
 
     int final_ok = atomic_load(&commits_ok);
     int final_fail = atomic_load(&commits_fail);

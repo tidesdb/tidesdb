@@ -31,7 +31,7 @@
  *   FLUSH               -> OK | ERR <code>          (flush the memtable, publishing a manifest)
  *   PROMOTE             -> OK <epoch> | ERR <code>
  *   STAT                -> replica_mode=<0|1> primary_epoch=<n> seq=<n> sstables=<n> walgen=<n>
- *   QUIT                -> closes the connection
+ * upload_queue=<n> total_uploads=<n> QUIT                -> closes the connection
  *
  * configuration is via environment:
  *   TDB_NODE_PORT                 TCP listen port (required)
@@ -323,11 +323,14 @@ static void handle_stat(int fd)
         reply(fd, "ERR -1");
         return;
     }
-    char buf[192];
-    snprintf(buf, sizeof(buf),
-             "replica_mode=%d primary_epoch=%llu seq=%llu sstables=%d walgen=%llu", st.replica_mode,
-             (unsigned long long)st.primary_epoch, (unsigned long long)st.global_seq,
-             st.total_sstable_count, (unsigned long long)st.unified_wal_generation);
+    char buf[256];
+    snprintf(
+        buf, sizeof(buf),
+        "replica_mode=%d primary_epoch=%llu seq=%llu sstables=%d walgen=%llu upload_queue=%llu "
+        "total_uploads=%llu",
+        st.replica_mode, (unsigned long long)st.primary_epoch, (unsigned long long)st.global_seq,
+        st.total_sstable_count, (unsigned long long)st.unified_wal_generation,
+        (unsigned long long)st.upload_queue_depth, (unsigned long long)st.total_uploads);
     reply(fd, buf);
 }
 

@@ -102,8 +102,34 @@ wait_val() {
     return 1
 }
 
+# block until the node's async upload pipeline has drained -- every rotated WAL generation, sstable
+# and manifest is in the bucket. under wal_sync=0 the uploads are asynchronous, so killing the
+# primary before this drains leaves the newest WAL generation only on local disk (lost on crash),
+# and the failover catch-up can then only reach what actually made it to the bucket.
+#
+# upload_queue alone is not enough, a job the worker has dequeued is off the queue but still
+# in-flight (not yet in the bucket), so the queue reads 0 while an upload is mid-transfer. we gate
+# on completions instead -- the queue must be empty AND total_uploads (a completion counter) must
+# stop advancing for several consecutive polls, i.e. no queued and no in-flight work remains.
+wait_uploads_drained() { # wait_uploads_drained port
+    local port=$1 i last=-1 stable=0 q t
+    for i in $(seq 1 300); do # up to ~30s
+        q=$(stat_field "$port" upload_queue)
+        t=$(stat_field "$port" total_uploads)
+        if [ "$q" = "0" ] && [ "$t" = "$last" ]; then
+            stable=$((stable + 1))
+            [ "$stable" -ge 3 ] && return 0
+        else
+            stable=0
+        fi
+        last="$t"
+        sleep 0.1
+    done
+    return 1
+}
+
 start_node() { # start_node port replica data_dir bucket sync_us id [wal_sync_on_commit]
-    # wal_sync defaults off: the failover/zombie scenarios get durability from flushed sstables +
+    # wal_sync defaults off, the failover/zombie scenarios get durability from flushed sstables +
     # the fenced manifest, so they avoid a synchronous WAL upload per put. the rpo_zero scenario
     # passes 1 to require that acked-but-unflushed writes reach the bucket and survive a crash.
     local wal_sync="${7:-0}"
@@ -128,7 +154,7 @@ scenario_failover_catchup() {
     pids=()
 
     start_node "$PORT_P" 0 "$dp" "$bucket" 500000 fc_primary
-    # replica with a 1h sync interval: it must rely on the promotion catch-up, not polling
+    # replica with a 1h sync interval, it must rely on the promotion catch-up, not polling
     start_node "$PORT_R" 1 "$dr" "$bucket" 3600000000 fc_replica
     wait_ready "$PORT_P" || { echo "  FAIL primary not ready"; fail=1; return; }
     wait_ready "$PORT_R" || { echo "  FAIL replica not ready"; fail=1; return; }
@@ -141,6 +167,12 @@ scenario_failover_catchup() {
 
     # the replica never polled (huge interval), so it should have none of the data
     check "replica behind before failover" "$(verify_range "$PORT_R" 1 "$VOLUME" k)" 0
+
+    # simulate a graceful-enough failover -- let the primary finish uploading so the bucket holds
+    # every committed write before it "crashes". without this the newest WAL generation is still
+    # in flight and the catch-up correctly recovers only what reached the bucket (a wal_sync=0
+    # RPO>0 crash), which is a harness race, not an engine fault
+    wait_uploads_drained "$PORT_P" || { echo "  FAIL primary uploads did not drain in time"; fail=1; }
 
     kill -9 "${pids[0]}" 2>/dev/null
     check "promote replica" "$(cmd "$PORT_R" PROMOTE)" "OK 2"
@@ -216,7 +248,7 @@ scenario_rpo_zero() {
     kill -9 "${pids[0]}" 2>/dev/null
     check "promote replica" "$(cmd "$PORT_R" PROMOTE)" "OK 2"
 
-    # RPO=0: the unflushed-but-acked writes must survive via WAL replay in the catch-up
+    # RPO=0 the unflushed-but-acked writes must survive via WAL replay in the catch-up
     check "unflushed acked writes survived (rpo=0)" "$(verify_range "$PORT_R" 1 40 rpo)" 40
     check "baseline preserved" "$(verify_range "$PORT_R" 1 20 base)" 20
     cleanup; pids=()

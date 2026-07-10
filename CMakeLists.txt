@@ -159,11 +159,13 @@ include_directories(external) # for external libraries linking internally
 set(TIDESDB_SOURCES
     src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c
     src/manifest.c src/clock_cache.c src/queue.c src/btree.c src/alloc.c
-    src/objstore_fs.c src/local_cache.c src/sha256.c src/hmac_sha256.c
+    src/objstore_fs.c src/local_cache.c
     external/xxhash.c external/ini.c)
 
+# sha256 / hmac_sha256 exist solely for AWS SigV4 in the S3 connector -- omit them
+# (and their ~7KB of object code) from non-S3 builds so they are not dead weight in libtidesdb.
 if(TIDESDB_WITH_S3)
-    list(APPEND TIDESDB_SOURCES src/objstore_s3.c)
+    list(APPEND TIDESDB_SOURCES src/objstore_s3.c src/sha256.c src/hmac_sha256.c)
 endif()
 
 add_library(tidesdb ${TIDESDB_SOURCES})
@@ -711,10 +713,11 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(btree_tests test/btree__tests.c)
     add_executable(local_cache_tests test/local_cache__tests.c)
     add_executable(objstore_tests test/objstore__tests.c)
-    add_executable(sha256_tests test/sha256__tests.c)
-    add_executable(hmac_sha256_tests test/hmac_sha256__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
+    # crypto unit tests only make sense when the S3 crypto sources are compiled in
     if(TIDESDB_WITH_S3)
+        add_executable(sha256_tests test/sha256__tests.c)
+        add_executable(hmac_sha256_tests test/hmac_sha256__tests.c)
         target_compile_definitions(tidesdb_tests PRIVATE TIDESDB_WITH_S3)
         target_compile_definitions(objstore_tests PRIVATE TIDESDB_WITH_S3)
     endif()
@@ -785,7 +788,14 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     endif()
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests sha256_tests hmac_sha256_tests tidesdb_tests tidesdb_bench)
+    set(TIDESDB_TEST_LINK_TARGETS
+            block_manager_tests skip_list_tests compress_tests bloom_filter_tests
+            manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests
+            objstore_tests tidesdb_tests tidesdb_bench)
+    if(TIDESDB_WITH_S3)
+        list(APPEND TIDESDB_TEST_LINK_TARGETS sha256_tests hmac_sha256_tests)
+    endif()
+    foreach(test_target ${TIDESDB_TEST_LINK_TARGETS})
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -800,8 +810,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME btree_tests COMMAND btree_tests)
     add_test(NAME local_cache_tests COMMAND local_cache_tests)
     add_test(NAME objstore_tests COMMAND objstore_tests)
-    add_test(NAME sha256_tests COMMAND sha256_tests)
-    add_test(NAME hmac_sha256_tests COMMAND hmac_sha256_tests)
+    if(TIDESDB_WITH_S3)
+        add_test(NAME sha256_tests COMMAND sha256_tests)
+        add_test(NAME hmac_sha256_tests COMMAND hmac_sha256_tests)
+    endif()
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)

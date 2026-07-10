@@ -1487,18 +1487,48 @@ static inline unsigned __stdcall tdb_win_thread_trampoline(void *p)
     t->retval = t->fn(t->arg);
     return 0;
 }
+
+/* thread attributes -- only the stack size is honored (the one attribute the engine and tests set),
+ * passed through to _beginthreadex. everything else is a no-op. a zero stack size means default. */
+typedef struct
+{
+    size_t stacksize;
+} pthread_attr_t;
+static inline int pthread_attr_init(pthread_attr_t *a)
+{
+    if (a) a->stacksize = 0;
+    return 0;
+}
+static inline int pthread_attr_destroy(pthread_attr_t *a)
+{
+    (void)a;
+    return 0;
+}
+static inline int pthread_attr_setstacksize(pthread_attr_t *a, size_t stacksize)
+{
+    if (!a) return EINVAL;
+    a->stacksize = stacksize;
+    return 0;
+}
+static inline int pthread_attr_getstacksize(const pthread_attr_t *a, size_t *stacksize)
+{
+    if (!a || !stacksize) return EINVAL;
+    *stacksize = a->stacksize;
+    return 0;
+}
+
 static inline int pthread_create(pthread_t *th, const void *attr, void *(*fn)(void *), void *arg)
 {
     tdb_win_thread_t *t;
     uintptr_t h;
+    unsigned stacksize = attr ? (unsigned)((const pthread_attr_t *)attr)->stacksize : 0;
 
-    (void)attr;
     t = (tdb_win_thread_t *)malloc(sizeof(*t));
     if (!t) return EAGAIN;
     t->fn = fn;
     t->arg = arg;
     t->retval = NULL;
-    h = _beginthreadex(NULL, 0, tdb_win_thread_trampoline, t, 0, NULL);
+    h = _beginthreadex(NULL, stacksize, tdb_win_thread_trampoline, t, 0, NULL);
     if (h == 0)
     {
         free(t);

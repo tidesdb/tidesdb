@@ -17713,6 +17713,74 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     }
     free(ssts_array);
 
+    /* spooky seamless adaptation (the merge half) -- when merging into the largest level, coalesce
+     * a run of adjacent under-full partitions into one sub-merge so their combined data lands as a
+     * single ~file_max sstable instead of several small ones. this is the lower-bound counterpart
+     * to the file_max split, which only bounds output size from above; together they keep the
+     * largest level's files near-equal-sized (between ~file_max/2 and file_max) under skewed
+     * deletes. a skipped (cold) partition stays its own group so its untouched file is preserved,
+     * and the driver's per-file skip accounting above keeps using the original partition arrays --
+     * only the sub-compaction dispatch below sees this coalesced view. disabled when file_max is 0
+     * (not targeting the largest level, where output stays partitioned by L for future alignment).
+     * the group boundaries alias the original boundary keys, so only the group container arrays are
+     * freed here. */
+    uint8_t **grp_boundaries = boundaries;
+    size_t *grp_boundary_sizes = boundary_sizes;
+    int *grp_skipped = partition_skipped;
+    int grp_num = num_partitions;
+    int grp_owned = 0;
+    if (file_max > 0 && num_partitions > 1)
+    {
+        uint8_t **gb = malloc((size_t)num_partitions * sizeof(uint8_t *));
+        size_t *gbs = malloc((size_t)num_partitions * sizeof(size_t));
+        int *gs = malloc((size_t)num_partitions * sizeof(int));
+        if (gb && gbs && gs)
+        {
+            int g = 0;
+            int i = 0;
+            while (i < num_partitions)
+            {
+                const int start = i;
+                const int start_skipped = (partition_skipped && partition_skipped[start]) ? 1 : 0;
+                if (start_skipped)
+                {
+                    i++; /* a skipped partition is always its own group -- file left in place */
+                }
+                else
+                {
+                    uint64_t acc = 0;
+                    /* accumulate adjacent non-skipped partitions until the next would push the
+                     * group past file_max; the first file is always taken so a single oversized
+                     * file still forms a group (the file_max split handles its output). */
+                    while (i < num_partitions && !(partition_skipped && partition_skipped[i]))
+                    {
+                        uint64_t sz = largest_sstables[i] ? largest_sstables[i]->klog_size +
+                                                                largest_sstables[i]->vlog_size
+                                                          : 0;
+                        if (acc != 0 && acc + sz > file_max) break;
+                        acc += sz;
+                        i++;
+                    }
+                }
+                gb[g] = boundaries[start]; /* alias -- owned by the original boundaries array */
+                gbs[g] = boundary_sizes[start];
+                gs[g] = start_skipped;
+                g++;
+            }
+            grp_boundaries = gb;
+            grp_boundary_sizes = gbs;
+            grp_skipped = gs;
+            grp_num = g;
+            grp_owned = 1;
+        }
+        else
+        {
+            free(gb);
+            free(gbs);
+            free(gs);
+        }
+    }
+
     int aborted = 0;
 
     tidesdb_partitioned_merge_ctx_t pctx;
@@ -17720,10 +17788,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
     pctx.start_idx = start_idx;
     pctx.end_idx = end_idx;
     pctx.end_level = end_level;
-    pctx.num_partitions = num_partitions;
-    pctx.boundaries = boundaries;
-    pctx.boundary_sizes = boundary_sizes;
-    pctx.partition_skipped = partition_skipped;
+    pctx.num_partitions = grp_num;
+    pctx.boundaries = grp_boundaries;
+    pctx.boundary_sizes = grp_boundary_sizes;
+    pctx.partition_skipped = grp_skipped;
     pctx.file_max = file_max;
     pctx.reap_tombstones = reap_tombstones;
     pctx.oldest_unflushed_seq = pm_oldest_unflushed;
@@ -17731,9 +17799,19 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, const int star
 
     /* run the partition sub-merges across the sub-compaction helper pool (calling thread works
      * too); each partition commits its output(s) under cf->compaction_commit_lock */
-    tidesdb_run_subcompactions(cf->db, &pctx, tidesdb_partitioned_merge_partition, num_partitions);
+    tidesdb_run_subcompactions(cf->db, &pctx, tidesdb_partitioned_merge_partition, grp_num);
 
     if (atomic_load_explicit(&pctx.aborted, memory_order_acquire)) aborted = 1;
+
+    /* the group view was only needed for dispatch; the original boundary/skip arrays are freed by
+     * the cleanup paths below. the group boundaries alias the originals, so free containers only.
+     */
+    if (grp_owned)
+    {
+        free(grp_boundaries);
+        free(grp_boundary_sizes);
+        free(grp_skipped);
+    }
 
     if (aborted)
     {

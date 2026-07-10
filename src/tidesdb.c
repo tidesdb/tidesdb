@@ -1884,8 +1884,12 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
     if (stall < 1) stall = 1;
     if (cf->db)
     {
-        /* unified mode has a single shared immutable queue, so the per-CF
-         * memory-budget split below does not apply -- use the configured value */
+        /* unified mode has a single shared immutable queue, so the per-CF memory-budget split
+         * below does not apply -- use the configured value. its memory is unified_wbuf x depth
+         * regardless of CF count, so no division is needed. note apply_backpressure runs per
+         * committing CF, so this shared queue is paced by whichever CF is committing -- per-CF
+         * thresholds that differ pace it inconsistently (the depth is bounded by the largest of
+         * them); with the default threshold across CFs it stalls coherently at one depth. */
         if (cf->db->unified_mt.enabled) return stall;
 
         const int num_cfs = cf->db->num_column_families;

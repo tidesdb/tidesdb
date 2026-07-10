@@ -159,14 +159,14 @@ scenario_cascading_failover() {
     kexec tdb-primary FLUSH >/dev/null
     wait_all_converge 40 c "${REPLICAS[@]}"
 
-    # first failover: primary -> replica-0 (epoch 2)
+    # first failover primary -> replica-0 (epoch 2)
     kubectl delete pod tdb-primary --wait=true >/dev/null 2>&1
     check "first promote (epoch 2)" "$(kexec tdb-replica-0 PROMOTE)" "OK 2"
     kbulk_put tdb-replica-0 1 20 d
     kexec tdb-replica-0 FLUSH >/dev/null
     wait_all_converge 20 d tdb-replica-1
 
-    # second failover: replica-0 -> replica-1 (epoch 3)
+    # second failover replica-0 -> replica-1 (epoch 3)
     kubectl delete pod tdb-replica-0 --wait=true >/dev/null 2>&1
     check "second promote (epoch 3)" "$(kexec tdb-replica-1 PROMOTE)" "OK 3"
     check "data from before both failovers" "$(kverify tdb-replica-1 1 40 c)" 40
@@ -190,7 +190,7 @@ scenario_partition_zombie() {
     # promote a replica while the primary is isolated and oblivious
     check "promote replica-0" "$(kexec tdb-replica-0 PROMOTE)" "OK 2"
 
-    # the isolated primary keeps taking writes: they commit locally but cannot reach the bucket
+    # the isolated primary keeps taking writes, they commit locally but cannot reach the bucket
     # (each blocks on the WAL-upload retry, so keep the count small)
     kbulk_put tdb-primary 1 3 q
 

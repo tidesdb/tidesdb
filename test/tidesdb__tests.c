@@ -32071,6 +32071,74 @@ static uint64_t wait_for_all_compaction_idle_ms(tidesdb_t *db, tidesdb_column_fa
     }
 }
 
+/* the per-cf stats fold caches each frozen unified immutable's key/byte breakdown so repeated polls
+ * skip the prefix walk. a tiny write buffer rotates the shared memtable into many frozen
+ * immutables, and hammering get_stats while they drain builds, publishes, reads back and (on free)
+ * releases the cache -- the path ASan would fault on if the lifecycle were wrong. the transient
+ * total cannot be pinned, unified flush adds a cf's sstable before clearing the immutable's flushed
+ * flag, so a key is briefly counted in both, and other windows undercount. so we only ceiling the
+ * transient against gross corruption and assert exact per-cf conservation once everything has
+ * settled onto disk. */
+static void test_unified_stats_immutable_count_cache(void)
+{
+    cleanup_test_dir();
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.unified_memtable = 1;
+    config.unified_memtable_write_buffer_size = 16384; /* tiny -> rotate into many immutables */
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "uicc_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "uicc_b", &cf_config), 0);
+    tidesdb_column_family_t *cfa = tidesdb_get_column_family(db, "uicc_a");
+    tidesdb_column_family_t *cfb = tidesdb_get_column_family(db, "uicc_b");
+    ASSERT_TRUE(cfa != NULL && cfb != NULL);
+
+    const int NA = 600, NB = 250;
+    put_n_keys(db, cfa, "ka", NA);
+    put_n_keys(db, cfb, "kb", NB);
+
+    /* poll hard while the immutables drain -- this is where the cache builds and is read back */
+    for (int r = 0; r < 300; r++)
+    {
+        tidesdb_stats_t *sa = NULL, *sb = NULL;
+        ASSERT_EQ(tidesdb_get_stats(cfa, &sa), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_get_stats(cfb, &sb), TDB_SUCCESS);
+        /* a garbage cache pointer or a mis-sized breakdown would return wild counts; a sane cache
+         * stays within a small multiple of the true totals through every flush window */
+        ASSERT_TRUE(sa->total_keys <= (uint64_t)(2 * (NA + NB)));
+        ASSERT_TRUE(sb->total_keys <= (uint64_t)(2 * (NA + NB)));
+        tidesdb_free_stats(sa);
+        tidesdb_free_stats(sb);
+    }
+
+    /* let flush and compaction settle to disk, then the counts are exact and cache-independent */
+    wait_for_flush(db);
+    tidesdb_column_family_t *cfs[2] = {cfa, cfb};
+    wait_for_all_compaction_idle_ms(db, cfs, 2, 10000);
+
+    tidesdb_stats_t *sa = NULL, *sb = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cfa, &sa), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_get_stats(cfb, &sb), TDB_SUCCESS);
+    ASSERT_EQ(sa->total_keys, (uint64_t)NA);
+    ASSERT_EQ(sb->total_keys, (uint64_t)NB);
+    tidesdb_free_stats(sa);
+    tidesdb_free_stats(sb);
+
+    uint64_t ea = 0, eb = 0;
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cfa, &ea), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_cf_estimate_cardinality(cfb, &eb), TDB_SUCCESS);
+    ASSERT_EQ(ea, (uint64_t)NA);
+    ASSERT_EQ(eb, (uint64_t)NB);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 /* run one burst-then-settle cycle with a given compaction pool size and return the compaction
  * settle time. tiny write buffers are the trick -- a modest, unique key burst rotates the shared
  * unified memtable many times, so it lands as many small per-cf L1 sstables (a large compaction
@@ -32147,10 +32215,10 @@ static uint64_t burst_then_measure_compaction_settle(int num_compaction_threads,
             num_compaction_threads, at_flush_idle.total_sstable_count, comp_after - comp_before,
             settle_ms, settle_ms >= cap_ms ? "  <-- NEVER QUIESCED (hit 60s cap)" : "");
 
-    /* the burst must have flushed sstables (at least one per cf) and exercised compaction, otherwise
-     * the test proves nothing. we do NOT require sstable_count > NCF at flush-idle -- with fast
-     * consolidation compaction can already have merged each cf down to a single sstable by then,
-     * which is the fix working, not a failure. */
+    /* the burst must have flushed sstables (at least one per cf) and exercised compaction,
+     * otherwise the test proves nothing. we do NOT require sstable_count > NCF at flush-idle --
+     * with fast consolidation compaction can already have merged each cf down to a single sstable
+     * by then, which is the fix working, not a failure. */
     ASSERT_TRUE(at_flush_idle.total_sstable_count >= NCF);
     ASSERT_TRUE(comp_after > 0);
     /* and the engine must return to a quiet state -- hitting the cap here reproduces the
@@ -32416,6 +32484,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_sstable_distinct_key_cardinality, tests_passed);
     RUN_TEST(test_distinct_key_count_collapses_versions, tests_passed);
     RUN_TEST(test_unified_stats_per_cf_key_attribution, tests_passed);
+    RUN_TEST(test_unified_stats_immutable_count_cache, tests_passed);
     RUN_TEST(test_burst_then_quiescence_compaction_tail, tests_passed);
     RUN_TEST(test_burst_quiescence_default_pool_readback, tests_passed);
     RUN_TEST(test_manifest_corruption_recovers_from_sstables, tests_passed);

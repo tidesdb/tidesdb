@@ -360,7 +360,7 @@ void test_bloom_filter_large_capacity_random_keys()
     }
     printf("All %d keys added.\n", n);
 
-    /* sanity check: count how many bits are set in bloom filter */
+    /* count how many bits are set in bloom filter */
     unsigned int bits_set = 0;
     for (unsigned int i = 0; i < bf->size_in_words; i++)
     {
@@ -582,7 +582,7 @@ void test_bloom_filter_deserialize_oob_index(void)
     uint8_t *data = bloom_filter_serialize(bf, &size);
     ASSERT_TRUE(data != NULL);
 
-    /* we craft a malicious payload: valid header but OOB word index
+    /* we craft a malicious payload -- valid header but OOB word index
      * first we deserialize to get baseline, then we'll manually build one */
     bloom_filter_free(bf);
 
@@ -767,14 +767,14 @@ void test_bloom_filter_deserialize_overflow_m(void)
     ASSERT_TRUE(bf == NULL);
 }
 
-/* exercises the hash-version logic: new filters are v2 and carry the sentinel;
+/* exercises the hash-version logic -- new filters are v2 and carry the sentinel;
  * a legacy v1 filter (no sentinel) round-trips back as v1 and stays correct,
  * proving a filter is always queried with the hash that built it (no FN). */
 void test_bloom_filter_hash_versioning()
 {
     const char *keys[] = {"alpha", "beta", "gamma", "delta", "epsilon"};
 
-    /* v2: a freshly built filter uses the current hash and serializes with the
+    /* v2 -- a freshly built filter uses the current hash and serializes with the
      * 0x00 version sentinel */
     bloom_filter_t *v2;
     (void)bloom_filter_new(&v2, 0.01, 1000);
@@ -795,7 +795,7 @@ void test_bloom_filter_hash_versioning()
     for (int i = 0; i < 5; i++)
         ASSERT_EQ(bloom_filter_contains(v2_rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
 
-    /* legacy v1: simulate an on-disk filter built with the old hash. force the
+    /* legacy v1 -- simulate an on-disk filter built with the old hash. force the
      * version to 1 before adding so the bits are set with the v1 hash. */
     bloom_filter_t *v1;
     (void)bloom_filter_new(&v1, 0.01, 1000);
@@ -806,7 +806,7 @@ void test_bloom_filter_hash_versioning()
     size_t v1_size;
     uint8_t *v1_blob = bloom_filter_serialize(v1, &v1_size);
     ASSERT_TRUE(v1_blob != NULL);
-    ASSERT_TRUE(v1_blob[0] != 0x00); /* legacy format: first byte is varint(m), never 0 */
+    ASSERT_TRUE(v1_blob[0] != 0x00); /* legacy format -- first byte is varint(m), never 0 */
 
     /* the legacy blob must come back as v1 and still find every key -- a
      * regression that queried v1 bits with the v2 hash would false-negative here */
@@ -844,12 +844,12 @@ void test_bloom_filter_hash_versioning()
  * post-malloc failure paths did free(*bf) without nulling, leaving callers
  * with a dangling pointer that produced a general protection fault inside
  * bloom_filter_add when subsequently used). exercises every post-malloc
- * failure path: m-overflow, h-overflow, size_in_words-overflow are covered
+ * failure path -- m-overflow, h-overflow, size_in_words-overflow are covered
  * by extreme parameter values
  */
 static void test_bloom_filter_new_failure_nulls_out(void)
 {
-    /* h_double > BF_MAX_HASH_FUNCTIONS (100): tiny p forces a very large h.
+    /* h_double > BF_MAX_HASH_FUNCTIONS (100) -- tiny p forces a very large h.
      * bloom_filter_new malloc()s the struct first then hits the h validator
      * and free()s it -- pre-fix this returned -1 with *bf pointing at the
      * freed struct */
@@ -858,7 +858,7 @@ static void test_bloom_filter_new_failure_nulls_out(void)
     ASSERT_EQ(rc, -1);
     ASSERT_EQ(bf, NULL);
 
-    /* size_in_words overflow path: very small p combined with n large enough
+    /* size_in_words overflow path -- very small p combined with n large enough
      * to push m past UINT32_MAX */
     bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
     rc = bloom_filter_new(&bf, 1e-9, INT_MAX);
@@ -884,7 +884,7 @@ static void test_bloom_filter_new_failure_nulls_out(void)
 }
 
 /* a densely filled filter (almost every 64-bit word non-zero) must serialize with
- * the dense encoding: smaller than the raw bitset plus a small header, never the
+ * the dense encoding -- smaller than the raw bitset plus a small header, never the
  * sparse bloat it used to produce. format byte high nibble == 1 marks dense. */
 void test_bloom_filter_dense_encoding(void)
 {
@@ -951,7 +951,7 @@ void test_bloom_filter_sparse_encoding_unchanged(void)
     bloom_filter_free(rt);
 }
 
-/* deserialize must reject malformed buffers without over-reading: a buffer ending
+/* deserialize must reject malformed buffers without over-reading, a buffer ending
  * mid-varint, a lone sentinel, an unknown hash version, an unknown encoding, and
  * a header that promises more bitset words than the buffer holds */
 void test_bloom_filter_deserialize_malformed(void)
@@ -972,7 +972,7 @@ void test_bloom_filter_deserialize_malformed(void)
     uint8_t bad_encoding[2] = {0x00, 0x22};
     ASSERT_TRUE(bloom_filter_deserialize(bad_encoding, 2) == NULL);
 
-    /* sparse: count claims 3 words but only one is present */
+    /* sparse -- count claims 3 words but only one is present */
     uint8_t trunc_sparse[16];
     uint8_t *p = trunc_sparse;
     p = encode_varint32(p, 128);  /* m = 128 -> 2 words */
@@ -982,7 +982,7 @@ void test_bloom_filter_deserialize_malformed(void)
     p = encode_varint64(p, 0xFF); /* value -- and then nothing more */
     ASSERT_TRUE(bloom_filter_deserialize(trunc_sparse, (size_t)(p - trunc_sparse)) == NULL);
 
-    /* dense: header says 2 words but the raw body is missing */
+    /* dense-- header says 2 words but the raw body is missing */
     uint8_t trunc_dense[8];
     p = trunc_dense;
     *p++ = 0x00;                    /* sentinel */
@@ -992,7 +992,7 @@ void test_bloom_filter_deserialize_malformed(void)
     ASSERT_TRUE(bloom_filter_deserialize(trunc_dense, (size_t)(p - trunc_dense)) == NULL);
 }
 
-/* is_full over a multi-word filter: the all-words-set return-1 path and both the
+/* is_full over a multi-word filter the all-words-set return-1 path and both the
  * partial-last-word (remaining_bits != 0) and exact-multiple (== 0) branches */
 void test_bloom_filter_is_full_multiword(void)
 {

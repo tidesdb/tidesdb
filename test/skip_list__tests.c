@@ -726,7 +726,7 @@ void *concurrent_writer(void *arg)
         snprintf(key_buf, sizeof(key_buf), "key%d", i % 10);
         snprintf(value_buf, sizeof(value_buf), "thread%d_value%d", ctx->thread_id, i);
 
-        /* retry loop: if write fails due to sequence conflict, get new seq and retry */
+        /* if write fails due to sequence conflict, get new seq and retry */
         int result = -1;
         int retry_count = 0;
         while (result != 0 && retry_count < 100)
@@ -1177,7 +1177,7 @@ void *lockfree_stress_writer(void *arg)
         snprintf(key_buf, sizeof(key_buf), "key%d", key_id);
         snprintf(value_buf, sizeof(value_buf), "t%d_v%d", ctx->thread_id, i);
 
-        /* retry loop: if write fails due to sequence conflict, get new seq and retry */
+        /* if write fails due to sequence conflict, get new seq and retry */
         int result = -1;
         int retry_count = 0;
         while (result != 0 && retry_count < 100)
@@ -1430,7 +1430,7 @@ void test_skip_list_lockfree_stress()
 
 static uint64_t zipfian_next(uint64_t *state, uint64_t n)
 {
-    /* simple zipfian approximation: 80% of accesses go to 20% of keys */
+    /* simple zipfian approximation at 80% of accesses go to 20% of keys */
     *state = (*state * 1103515245 + 12345) & 0x7fffffff;
     if ((*state % 100) < 80)
     {
@@ -1927,8 +1927,8 @@ static int reverse_memcmp_comparator(const uint8_t *key1, size_t key1_size, cons
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
     int result = memcmp(key1, key2, min_size);
     if (result != 0) return -result;      /* negate to reverse */
-    if (key1_size < key2_size) return 1;  /* reverse: shorter is greater */
-    if (key1_size > key2_size) return -1; /* reverse: longer is smaller */
+    if (key1_size < key2_size) return 1;  /* reverse shorter is greater */
+    if (key1_size > key2_size) return -1; /* reverse longer is smaller */
     return 0;
 }
 
@@ -1988,7 +1988,7 @@ void test_skip_list_prefix_seek_behavior()
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
-    /* common prefixes: user:100, user:200, user:300, user:400, user:500 */
+    /* common prefixes user:100, user:200, user:300, user:400, user:500 */
     const char *keys[] = {"user:100", "user:200", "user:300", "user:400", "user:500"};
     const char *values[] = {"alice", "bob", "charlie", "david", "eve"};
     const int num_keys = 5;
@@ -3141,7 +3141,7 @@ void test_skip_list_out_of_order_versions()
     ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
 
     uint8_t key[] = "ooo";
-    /* versions arrive out of seq order -- the chain must stay descending: 10 -> 6 -> 2 */
+    /* versions arrive out of seq order -- the chain must stay descending 10 -> 6 -> 2 */
     ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v10", 4, -1, 10, 0), 0);
     ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v2", 3, -1, 2, 0), 0);
     ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)"v6", 3, -1, 6, 0), 0);

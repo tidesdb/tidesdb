@@ -2969,7 +2969,7 @@ void test_write_raw_hole_stops_replay(void)
     ASSERT_EQ(block_manager_cursor_next(cursor), 0);
 
     /*
-     * cursor_read at B's offset now reads the size field: 0x00000000.
+     * cursor_read at B's offset now reads the size field-- 0x00000000.
      * block_manager_read_block_at_offset treats size=0 as invalid and returns
      * NULL.  This is the point where WAL replay must stop since it cannot
      * distinguish the hole from a genuine write boundary.
@@ -3012,8 +3012,8 @@ void test_write_raw_hole_stops_replay(void)
  * two zero-filled holes.  replay stops at the first hole, compounding data
  * loss for every block written after it.
  *
- * file layout:  [A (valid)] [hole B] [hole D] [E (valid)]
- * expected:     cursor reads A, cursor_next returns -1 at hole B, E is lost.
+ * file layout      [A (valid)] [hole B] [hole D] [E (valid)]
+ * expected         cursor reads A, cursor_next returns -1 at hole B, E is lost.
  */
 void test_write_raw_multiple_holes_stop_replay(void)
 {

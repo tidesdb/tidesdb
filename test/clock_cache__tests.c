@@ -2459,9 +2459,9 @@ void test_realistic_oltp_concurrent(void)
  * test_realistic_working_set_shift
  * simulates a workload where the hot working set shifts over time
  * (e.g., time-series ingestion where recent partitions are hot):
- *   -- epoch 0: blocks 0-999 are hot
- *   -- epoch 1: blocks 1000-1999 become hot, 0-999 cool off
- *   -- epoch 2: blocks 2000-2999 become hot
+ *   -- epoch 0   blocks 0-999 are hot
+ *   -- epoch 1   blocks 1000-1999 become hot, 0-999 cool off
+ *   -- epoch 2   blocks 2000-2999 become hot
  * after each epoch shift, verifies:
  *   -- new hot blocks achieve high hit rates after warm-up
  *   -- old cold blocks are mostly evicted

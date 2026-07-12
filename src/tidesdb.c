@@ -18871,19 +18871,46 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
     {
         if (x_clamped)
         {
-            /* the tree is too shallow to carve a dividing level, so a dividing merge at level 1
-             * would rewrite the top level in place without descending. ensure a level exists
-             * beneath the top and merge every level into the largest one so data moves down and the
-             * tree deepens, the same shape a full compaction uses. once the tree is deep enough for
-             * a real dividing level this branch is not taken and normal spooky resumes */
-            if (atomic_load_explicit(&cf->num_active_levels, memory_order_acquire) < 2)
-                tidesdb_add_level(cf);
-            int nl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "CF '%s' tree too shallow for a dividing level, full preemptive merge "
-                          "into largest level %d",
-                          cf->name, nl);
-            result = tidesdb_full_preemptive_merge(cf, 0, nl - 1, nl - 1);
+            /* the tree is too shallow to carve a dividing level. only deepen -- add a level beneath
+             * the top and merge every level into it so data descends -- when the largest level is
+             * genuinely at or over its capacity. if the data still fits under the largest level's
+             * capacity, deepening would create an underfull level that the collapse rule below
+             * removes on the very next pass; that add/collapse flip rewrites the whole cf every
+             * cycle and the tree never comes to rest (a cf whose data fits in one level, e.g. a
+             * small secondary index). when it fits, consolidate the top level in place if it is
+             * fragmented, otherwise there is nothing to compact and any shrink is left to the
+             * collapse rule. once the tree is deep enough for a real dividing level this branch is
+             * not taken and normal spooky resumes. */
+            const int nl_now = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+            tidesdb_level_t *lg = cf->levels[nl_now - 1];
+            const size_t lg_size = atomic_load_explicit(&lg->current_size, memory_order_relaxed);
+            const size_t lg_cap = atomic_load_explicit(&lg->capacity, memory_order_relaxed);
+            if (lg_size >= lg_cap)
+            {
+                if (nl_now < 2) tidesdb_add_level(cf);
+                int nl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+                TDB_DEBUG_LOG(
+                    TDB_LOG_INFO,
+                    "CF '%s' tree too shallow for a dividing level, full preemptive merge "
+                    "into largest level %d",
+                    cf->name, nl);
+                result = tidesdb_full_preemptive_merge(cf, 0, nl - 1, nl - 1);
+            }
+            else if (nl_now == 1)
+            {
+                const int nssts =
+                    atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+                if (nssts > 1 && nssts >= tdb_cf_effective_l1_trigger(cf))
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' fits one level, consolidating %d sstables in place",
+                                  cf->name, nssts);
+                    result = tidesdb_full_preemptive_merge(cf, 0, 0, 0);
+                }
+                /* else the single level, under capacity, already compact -- nothing to compact */
+            }
+            /* else multi-level but largest under capacity -- we leave the shrink to the collapse
+             * rule below rather than merging into an underfull largest and re-triggering */
         }
         else
         {

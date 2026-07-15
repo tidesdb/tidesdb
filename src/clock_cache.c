@@ -41,10 +41,14 @@
 #define CLOCK_CACHE_MAX_L3_GROUPS  64
 #define CLOCK_CACHE_SYSFS_PATH_MAX 128
 
-/* clock-evict scan limit -- we visit at most occupied * MULT slots per pass with a floor
- * of MIN, so sparsely populated partitions do not waste iterations on empty slots */
-#define CLOCK_CACHE_EVICT_SCAN_MULT 3
-#define CLOCK_CACHE_EVICT_SCAN_MIN  64
+/* the slot array plus its hash index is fixed metadata sized once at creation. rather than
+ * assume an average entry size, we cap that metadata at a fraction of the byte budget --
+ * slots = max_bytes * NUM / DEN / per-slot cost. entries larger than the resulting
+ * bytes-per-slot fill the budget before the slot count binds; smaller entries are
+ * count-capped, which only lowers utilization since byte-pressure eviction sweeps the whole
+ * ring regardless of how sparsely it is populated. */
+#define CLOCK_CACHE_SLOT_METADATA_NUM 1
+#define CLOCK_CACHE_SLOT_METADATA_DEN 8
 
 /**
  * detect_l3_groups
@@ -512,55 +516,42 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
 
 /**
  * evict_for_space
- * CLOCK eviction that targets VALID entries to free memory.
- * skips EMPTY slots (unlike clock_evict which returns them).
- * uses two passes -- first pass clears ref_bits, second pass evicts.
+ * CLOCK eviction that frees one VALID entry to reclaim memory. sweeps the hand a full
+ * revolution so it finds a victim wherever it sits, even when the slot array holds far fewer
+ * entries than it has slots. clears the ref bit on second-chance entries and evicts the first
+ * entry found with the bit already clear.
  * @param cache the cache
  * @param partition the partition
- * @return 1 if an entry was evicted, 0 if no evictable entry found
+ * @return 1 if an entry was evicted, 0 if none was evictable
  */
 static int evict_for_space(clock_cache_t *cache, clock_cache_partition_t *partition)
 {
     const size_t slots_mask = partition->slots_mask;
-    const size_t start =
-        atomic_fetch_add_explicit(&partition->clock_hand, 1, memory_order_relaxed) & slots_mask;
 
-    /* we limit scan distance based on occupied count rather than total slots.
-     * when the partition is sparsely populated (e.g., 128 entries in 8192 slots),
-     * scanning all slots wastes 98%+ of iterations on EMPTY slots.
-     * we scan at most occupied_count * CLOCK_CACHE_EVICT_SCAN_MULT slots (gives high
-     * probability of finding a victim even with clustering) with a minimum of
-     * CLOCK_CACHE_EVICT_SCAN_MIN. */
-    const size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
-    size_t scan_limit = occupied * CLOCK_CACHE_EVICT_SCAN_MULT;
-    if (scan_limit < CLOCK_CACHE_EVICT_SCAN_MIN) scan_limit = CLOCK_CACHE_EVICT_SCAN_MIN;
-    if (scan_limit > partition->num_slots) scan_limit = partition->num_slots;
+    /* two revolutions bound the work -- the first clears ref bits, the second evicts an entry
+     * whose bit is now clear. a victim is guaranteed unless every entry is pinned. */
+    const size_t max_scan = partition->num_slots * 2;
 
-    /* pass 0 clears ref_bits, pass 1 evicts entries with ref_bit=0 */
-    for (int pass = 0; pass < 2; pass++)
+    for (size_t i = 0; i < max_scan; i++)
     {
-        for (size_t i = 0; i < scan_limit; i++)
+        const size_t hand =
+            atomic_fetch_add_explicit(&partition->clock_hand, 1, memory_order_relaxed) & slots_mask;
+        clock_cache_entry_t *entry = &partition->slots[hand];
+
+        const uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+        if (state != ENTRY_VALID) continue;
+
+        const uint32_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+        if (CLOCK_CACHE_HAS_READERS(ref)) continue;
+
+        if ((ref & CLOCK_CACHE_REF_BIT) == 0)
         {
-            const size_t hand = (start + i) & slots_mask;
-            clock_cache_entry_t *entry = &partition->slots[hand];
-
-            const uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
-            if (state != ENTRY_VALID) continue;
-
-            const uint32_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
-            if (CLOCK_CACHE_HAS_READERS(ref)) continue;
-
-            if ((ref & CLOCK_CACHE_REF_BIT) == 0)
-            {
-                /* no ref_bit, no readers -- evict */
-                free_entry(cache, partition, entry);
-                atomic_store_explicit(&partition->clock_hand, hand + 1, memory_order_relaxed);
-                return 1;
-            }
-
-            /* ref_bit set -- clear it (second chance), will evict on next pass */
-            atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK, memory_order_relaxed);
+            free_entry(cache, partition, entry);
+            return 1;
         }
+
+        /* ref_bit set -- clear it for a second chance, evict on a later revolution */
+        atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK, memory_order_relaxed);
     }
 
     return 0;
@@ -749,17 +740,19 @@ void clock_cache_compute_config(const size_t max_bytes, cache_config_t *config)
     while (p < num_partitions) p <<= 1;
     num_partitions = p;
 
-    /* slot count is sized for hash table efficiency (low load factor), not for byte budget.
-     * when caller specifies avg_entry_size (e.g., btree 64KB nodes), use it to avoid
-     * creating vastly more slots than entries that will fit in the byte budget.
-     * otherwise use a small default so that many small entries probe efficiently. */
-    const size_t avg_entry_size =
-        (config->avg_entry_size > 0) ? config->avg_entry_size : CLOCK_CACHE_AVG_ENTRY_SIZE;
-    size_t total_entries = max_bytes / avg_entry_size;
-    if (total_entries < num_partitions) total_entries = num_partitions;
+    /* size the slot array from the byte budget alone by bounding its metadata cost, so no
+     * caller has to estimate entry size (see CLOCK_CACHE_SLOT_METADATA_NUM). per-slot cost is
+     * the entry struct plus its hash-index share. */
+    const size_t per_slot_bytes =
+        sizeof(clock_cache_entry_t) + (CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM * sizeof(int32_t)) /
+                                          CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN;
+    size_t total_slots =
+        (max_bytes / CLOCK_CACHE_SLOT_METADATA_DEN * CLOCK_CACHE_SLOT_METADATA_NUM) /
+        per_slot_bytes;
+    if (total_slots < num_partitions) total_slots = num_partitions;
 
-    /* we distribute entries across partitions */
-    size_t slots_per_partition = total_entries / num_partitions;
+    /* we distribute slots across partitions */
+    size_t slots_per_partition = total_slots / num_partitions;
 
     /* we clamp to reasonable range -- 64-8192 slots per partition */
     if (slots_per_partition < CLOCK_CACHE_MIN_SLOTS_PER_PARTITION)

@@ -3901,4 +3901,34 @@ static inline long tdb_raise_max_open_files(long desired)
     return tdb_max_open_files();
 }
 
+/**
+ * tdb_addressable_memory_limit
+ * report the largest span of memory this process could address, so callers can keep a budget
+ * derived from physical RAM from exceeding the virtual address space. on a 64-bit process the
+ * space dwarfs physical RAM and this never constrains anything; on an ILP32 process the whole
+ * space is at most 4 GiB, and less after the kernel split, code, thread stacks and any sanitizer
+ * shadow, so an unclamped budget can arm a memory-pressure valve above the ceiling that never
+ * fires before allocation fails. returns the smaller of the pointer-width ceiling and, when it is
+ * finite, the process address-space rlimit (on Windows, the top of the user-mode address range).
+ * @return the address-space ceiling in bytes
+ */
+static inline size_t tdb_addressable_memory_limit(void)
+{
+    size_t ceiling = SIZE_MAX; /* pointer-width max, which is 4 GiB on an ILP32 process */
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    /* lpMaximumApplicationAddress is the highest user-mode address; its magnitude is the size of
+     * the usable range (2 GiB on Win32, 3 GiB with /LARGEADDRESSAWARE, ~128 TiB on Win64) */
+    const uintptr_t hi = (uintptr_t)si.lpMaximumApplicationAddress;
+    if (hi > 0 && (size_t)hi < ceiling) ceiling = (size_t)hi;
+#else
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0 &&
+        (size_t)rl.rlim_cur < ceiling)
+        ceiling = (size_t)rl.rlim_cur;
+#endif
+    return ceiling;
+}
+
 #endif /* __COMPAT_H__ */

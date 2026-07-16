@@ -421,6 +421,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_MEMORY_PRESSURE_CRITICAL_RATIO 0.95 /* ratio threshold for critical */
 #define TDB_MEMORY_AUTO_LIMIT_RATIO        0.75 /* auto limit = 75% of total memory */
 #define TDB_MEMORY_MIN_LIMIT_RATIO         0.05 /* minimum limit = 5% of total memory */
+#define TDB_MEMORY_ADDRESS_SPACE_RATIO     0.50 /* cap the limit at 50% of the addressable space */
 #define TDB_MEMORY_OS_CHECK_INTERVAL       50
 #define TDB_MEMORY_OS_CRITICAL_RATIO       0.05 /* OS critically low if < N% free */
 
@@ -21193,6 +21194,21 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         {
             (*db)->resolved_memory_limit =
                 (size_t)((double)(*db)->total_memory * TDB_MEMORY_AUTO_LIMIT_RATIO);
+        }
+
+        /* keep the budget inside the virtual address space. it drives the memory-pressure
+         * valve, and on an ILP32 process a limit taken from physical RAM can exceed what the
+         * process can map, so the valve would never fire before an allocation fails. clamp to a
+         * share of the addressable ceiling, leaving room for code, stacks and allocator overhead.
+         * a no-op on a 64-bit process, where the ceiling dwarfs any physical-RAM budget. */
+        const size_t addr_cap =
+            (size_t)((double)tdb_addressable_memory_limit() * TDB_MEMORY_ADDRESS_SPACE_RATIO);
+        if ((*db)->resolved_memory_limit > addr_cap)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "Clamping resolved memory limit %zu bytes to addressable cap %zu bytes",
+                          (*db)->resolved_memory_limit, addr_cap);
+            (*db)->resolved_memory_limit = addr_cap;
         }
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Resolved memory limit %zu bytes (%.2f MB)",
                       (*db)->resolved_memory_limit,

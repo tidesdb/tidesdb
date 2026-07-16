@@ -24389,11 +24389,15 @@ static void test_memory_pressure_auto_limit(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
     ASSERT_TRUE(db != NULL);
 
-    /* resolved_memory_limit should be ~75% of total_memory (TDB_MEMORY_AUTO_LIMIT_RATIO) */
+    /* resolved_memory_limit should be ~75% of total_memory (TDB_MEMORY_AUTO_LIMIT_RATIO), but
+     * never above the addressable-space cap (TDB_MEMORY_ADDRESS_SPACE_RATIO of what the process
+     * can map) -- on a 32-bit process the auto value exceeds that ceiling and gets clamped */
     ASSERT_TRUE(db->resolved_memory_limit > 0);
     ASSERT_TRUE(db->total_memory > 0);
 
     size_t expected = (size_t)((double)db->total_memory * 0.75);
+    size_t addr_cap = (size_t)((double)tdb_addressable_memory_limit() * 0.50);
+    if (expected > addr_cap) expected = addr_cap;
     /* allow 1% tolerance for floating point */
     size_t diff = db->resolved_memory_limit > expected ? db->resolved_memory_limit - expected
                                                        : expected - db->resolved_memory_limit;

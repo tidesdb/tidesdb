@@ -461,11 +461,14 @@ jobs:
             echo "**Linux RISC-V 64-bit tests run via QEMU emulation"
           else
             if [ "${{ matrix.arch }}" == "x86" ]; then
-              # 32-bit ASan gives each thread an ~11MB FakeStack for
-              # detect_stack_use_after_return; the many-thread concurrent multi-CF
-              # tests exhaust the 32-bit address space and ASan OOMs. disable it on
-              # this lane only -- the x86-64 ASan job keeps that coverage.
-              export ASAN_OPTIONS="detect_stack_use_after_return=0"
+              # the 32-bit address space is only ~3 GiB, and ASan's own bookkeeping
+              # (per-thread FakeStack, redzones, the freed-allocation quarantine) claims
+              # most of it across a long single-process suite. cap that overhead so the
+              # many-thread concurrent multi-CF tests have room, keeping this lane's
+              # detection while the x86-64 ASan job runs the defaults. the engine also
+              # clamps its memory-pressure budget to the addressable space so its write
+              # backpressure engages before the address space is exhausted.
+              export ASAN_OPTIONS="detect_stack_use_after_return=0:quarantine_size_mb=64:max_redzone=256:allocator_release_to_os_interval_ms=0"
             fi
             ctest -V --output-on-failure --timeout 5400 --build-config Release
           fi

@@ -12,7 +12,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 9.3.14
+	VERSION 9.4.0
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -158,6 +158,7 @@ include_directories(external) # for external libraries linking internally
 # users can override with -DBUILD_SHARED_LIBS=ON/OFF
 set(TIDESDB_SOURCES
     src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c
+    src/blocked_bloom_filter.c src/blocked_index.c
     src/manifest.c src/clock_cache.c src/queue.c src/btree.c src/alloc.c
     src/objstore_fs.c src/local_cache.c src/sha256.c src/hmac_sha256.c
     external/xxhash.c external/ini.c)
@@ -661,12 +662,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_ENABLE_BLOCK_INDEXES)
         set(BENCH_ENABLE_BLOCK_INDEXES 1)
     endif()
-    if(NOT DEFINED BENCH_BLOCK_INDEX_SAMPLING_COUNT)
-        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 1)
-    endif()
-    if(NOT DEFINED BENCH_BLOCK_INDEX_PREFIX_LEN)
-        set(BENCH_BLOCK_INDEX_PREFIX_LEN 16)
-    endif()
     if(NOT DEFINED BENCH_SYNC_MODE)
         set(BENCH_SYNC_MODE TDB_SYNC_NONE)
     endif()
@@ -705,6 +700,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(skip_list_tests test/skip_list__tests.c)
     add_executable(compress_tests test/compress__tests.c)
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
+    add_executable(blocked_bloom_filter_tests test/blocked_bloom_filter__tests.c)
+    add_executable(blocked_index_tests test/blocked_index__tests.c)
     add_executable(clock_cache_tests test/clock_cache__tests.c)
     add_executable(manifest_tests test/manifest__tests.c)
     add_executable(queue_tests test/queue__tests.c)
@@ -743,8 +740,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
             BENCH_ENABLE_BLOOM_FILTER=${BENCH_ENABLE_BLOOM_FILTER}
             BENCH_BLOOM_FILTER_FP_RATE=${BENCH_BLOOM_FILTER_FP_RATE}
             BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
-            BENCH_BLOCK_INDEX_SAMPLING_COUNT=${BENCH_BLOCK_INDEX_SAMPLING_COUNT}
-            BENCH_BLOCK_INDEX_PREFIX_LEN=${BENCH_BLOCK_INDEX_PREFIX_LEN}
             BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
             BENCH_SYNC_INTERVAL_US=${BENCH_SYNC_INTERVAL_US}
             BENCH_COMPARATOR_NAME="${BENCH_COMPARATOR_NAME}"
@@ -785,7 +780,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     endif()
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests sha256_tests hmac_sha256_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests blocked_bloom_filter_tests blocked_index_tests manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests objstore_tests sha256_tests hmac_sha256_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -794,6 +789,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME skip_list_tests COMMAND skip_list_tests)
     add_test(NAME compress_tests COMMAND compress_tests)
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
+    add_test(NAME blocked_bloom_filter_tests COMMAND blocked_bloom_filter_tests)
+    add_test(NAME blocked_index_tests COMMAND blocked_index_tests)
     add_test(NAME manifest_tests COMMAND manifest_tests)
     add_test(NAME clock_cache_tests COMMAND clock_cache_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
@@ -808,7 +805,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(WIN32)
         set(TIDESDB_TEST_TARGETS
                 block_manager_tests skip_list_tests compress_tests bloom_filter_tests
-                manifest_tests queue_tests tidesdb_tests tidesdb_bench)
+                blocked_bloom_filter_tests blocked_index_tests manifest_tests queue_tests tidesdb_tests tidesdb_bench)
 
         if(MINGW)
             # On MinGW (MSYS2), the test exes link against shared snappy/zstd/lz4

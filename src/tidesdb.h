@@ -21,6 +21,8 @@
 
 #include "alloc.h"
 #include "block_manager.h"
+#include "blocked_bloom_filter.h"
+#include "blocked_index.h"
 #include "bloom_filter.h"
 #include "btree.h"
 #include "clock_cache.h"
@@ -224,8 +226,6 @@ typedef enum
 #define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE
 #define TDB_DEFAULT_BLOOM_FPR              0.01
 #define TDB_DEFAULT_KLOG_VALUE_THRESHOLD   512
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO     1
-#define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN 16
 #define TDB_DEFAULT_MIN_DISK_SPACE         (100 * 1024 * 1024)
 #if defined(__OpenBSD__)
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES 64 /* x2 OpenBSD has lower default fd limits */
@@ -300,7 +300,6 @@ typedef struct tidesdb_kv_pair_t tidesdb_kv_pair_t;
 typedef struct tidesdb_commit_status_t tidesdb_commit_status_t;
 typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
-typedef struct tidesdb_block_index_t tidesdb_block_index_t;
 typedef struct tidesdb_memtable_t tidesdb_memtable_t;
 typedef struct tidesdb_deferred_free_node_t tidesdb_deferred_free_node_t;
 typedef struct tidesdb_t tidesdb_t;
@@ -370,8 +369,6 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio index sample ratio
- * @param block_index_prefix_len block index prefix length
  * @param sync_mode sync mode
  * @param sync_interval_us sync interval in microseconds
  * @param comparator_name name of comparator
@@ -412,8 +409,6 @@ typedef struct tidesdb_column_family_config_t
     int enable_bloom_filter;
     double bloom_fpr;
     int enable_block_indexes;
-    int index_sample_ratio;
-    int block_index_prefix_len;
     int sync_mode;
     uint64_t sync_interval_us;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
@@ -709,8 +704,12 @@ struct tidesdb_sstable_t
     uint64_t klog_size;
     uint64_t vlog_size;
     uint64_t max_seq;
-    bloom_filter_t *bloom_filter;
-    tidesdb_block_index_t *block_indexes;
+    /* paged aux -- the blocked bloom filter and block index keep only a small directory resident
+     * and page their partitions through the block cache. present when the sstable was written in
+     * the blocked-aux format (SSTABLE_FLAG_BLOCKED_AUX); NULL for older sstables, whose reads fall
+     * back to a full scan until compaction rewrites them. */
+    blocked_bloom_reader_t *bloom_reader;
+    blocked_index_reader_t *index_reader;
     _Atomic(int) refcount;
     /* opened lazily by tidesdb_sstable_ensure_open and published by CAS, so the
      * pointers are _Atomic -- readers acquire-load them and so observe the fully
@@ -731,17 +730,14 @@ struct tidesdb_sstable_t
     void *cached_comparator_ctx;
     int is_reverse;
     uint64_t cache_key_prefix;
-    /* chunked footer aux blobs -- when a bloom filter or block index footer blob
-     * exceeds the single-block chunk size it is written as multiple consecutive
-     * blocks and located by explicit offset+size instead of trailing-block
-     * navigation. aux_chunked is set (and the offsets persisted in metadata) only
-     * for such sstables; legacy/small sstables leave it 0 and use the original
-     * trailing-block read path. */
-    int aux_chunked;
-    uint64_t bloom_blob_offset;
-    uint64_t bloom_blob_size;
-    uint64_t index_blob_offset;
-    uint64_t index_blob_size;
+    /* blocked-aux directory locators -- persisted in metadata under SSTABLE_FLAG_BLOCKED_AUX and
+     * handed to blocked_bloom_reader_open / blocked_index_reader_open at load. blocked_aux is set
+     * for sstables written in this format. */
+    int blocked_aux;
+    uint64_t bloom_dir_offset;
+    uint64_t bloom_dir_size;
+    uint64_t index_dir_offset;
+    uint64_t index_dir_size;
 };
 
 /**
@@ -821,10 +817,6 @@ struct tidesdb_level_t
  * @param total_memory total system memory in bytes
  * @param resolved_memory_limit resolved global memory limit in bytes
  * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
- * @param sstable_aux_memory_bytes running total of bloom filter + block index
- *                                 memory across every sstable currently in a
- *                                 level, maintained at level add and remove so
- *                                 the reaper does not rescan every sstable
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
@@ -912,7 +904,6 @@ struct tidesdb_t
     uint64_t total_memory;
     _Atomic(size_t) resolved_memory_limit;
     _Atomic(int64_t) cached_memtable_bytes;
-    _Atomic(int64_t) sstable_aux_memory_bytes;
     _Atomic(int64_t) txn_memory_bytes;
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;

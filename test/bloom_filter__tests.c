@@ -951,6 +951,104 @@ void test_bloom_filter_sparse_encoding_unchanged(void)
     bloom_filter_free(rt);
 }
 
+/* bloom_filter_contains_serialized must answer identically to deserialize + contains
+ * across both encodings and both hash versions, without materializing a filter. the
+ * dense path is probed in place over the buffer, the sparse path falls back to a full
+ * deserialize -- either way the answer has to match the in-memory filter exactly, and
+ * a malformed buffer or empty entry returns -1 */
+void test_bloom_filter_contains_serialized(void)
+{
+    /* dense v2 -- over-fill so the serialized form is dense, then every probe the
+     * in-place path gives must match the materialized filter */
+    bloom_filter_t *dense;
+    ASSERT_EQ(bloom_filter_new(&dense, 0.01, 2000), 0);
+    for (int i = 0; i < 4000; i++)
+    {
+        char key[24];
+        int n = snprintf(key, sizeof(key), "dense_%d", i);
+        bloom_filter_add(dense, (const uint8_t *)key, (size_t)n);
+    }
+    size_t dsize;
+    uint8_t *dblob = bloom_filter_serialize(dense, &dsize);
+    ASSERT_TRUE(dblob != NULL);
+    ASSERT_EQ(dblob[1] >> 4, 1); /* confirm dense so we exercise the in-place path */
+
+    for (int i = 0; i < 4000; i++)
+    {
+        char key[24];
+        int n = snprintf(key, sizeof(key), "dense_%d", i);
+        ASSERT_EQ(bloom_filter_contains_serialized(dblob, dsize, (const uint8_t *)key, (size_t)n),
+                  1);
+    }
+    int dmismatch = 0;
+    for (int i = 0; i < 8000; i++)
+    {
+        char probe[24];
+        int n = snprintf(probe, sizeof(probe), "absent_%d", i);
+        if (bloom_filter_contains_serialized(dblob, dsize, (const uint8_t *)probe, (size_t)n) !=
+            bloom_filter_contains(dense, (const uint8_t *)probe, (size_t)n))
+            dmismatch++;
+    }
+    ASSERT_EQ(dmismatch, 0);
+
+    /* sparse v2 -- a big filter with three keys serializes sparse, exercising the
+     * deserialize fallback */
+    bloom_filter_t *sparse;
+    ASSERT_EQ(bloom_filter_new(&sparse, 0.01, 100000), 0);
+    const char *skeys[] = {"alpha", "beta", "gamma"};
+    for (int i = 0; i < 3; i++)
+        bloom_filter_add(sparse, (const uint8_t *)skeys[i], strlen(skeys[i]));
+    size_t ssize;
+    uint8_t *sblob = bloom_filter_serialize(sparse, &ssize);
+    ASSERT_TRUE(sblob != NULL);
+    ASSERT_EQ(sblob[1], 0x02); /* confirm sparse so we exercise the fallback path */
+    for (int i = 0; i < 3; i++)
+        ASSERT_EQ(bloom_filter_contains_serialized(sblob, ssize, (const uint8_t *)skeys[i],
+                                                   strlen(skeys[i])),
+                  1);
+    ASSERT_EQ(
+        bloom_filter_contains_serialized(sblob, ssize, (const uint8_t *)"not_present_key_xyz", 19),
+        bloom_filter_contains(sparse, (const uint8_t *)"not_present_key_xyz", 19));
+
+    /* legacy v1 hash -- a dense filter built with the old hash must still probe
+     * consistently in place (a regression that assumed v2 would false-negative) */
+    bloom_filter_t *v1;
+    ASSERT_EQ(bloom_filter_new(&v1, 0.01, 2000), 0);
+    v1->hash_version = 1;
+    for (int i = 0; i < 4000; i++)
+    {
+        char key[24];
+        int n = snprintf(key, sizeof(key), "v1_%d", i);
+        bloom_filter_add(v1, (const uint8_t *)key, (size_t)n);
+    }
+    size_t v1size;
+    uint8_t *v1blob = bloom_filter_serialize(v1, &v1size);
+    ASSERT_TRUE(v1blob != NULL);
+    int v1mismatch = 0;
+    for (int i = 0; i < 8000; i++)
+    {
+        char probe[24];
+        int n = snprintf(probe, sizeof(probe), "v1_%d", i);
+        if (bloom_filter_contains_serialized(v1blob, v1size, (const uint8_t *)probe, (size_t)n) !=
+            bloom_filter_contains(v1, (const uint8_t *)probe, (size_t)n))
+            v1mismatch++;
+    }
+    ASSERT_EQ(v1mismatch, 0);
+
+    /* malformed and empty inputs return -1 */
+    ASSERT_EQ(bloom_filter_contains_serialized(NULL, 0, (const uint8_t *)"x", 1), -1);
+    ASSERT_EQ(bloom_filter_contains_serialized(dblob, dsize, NULL, 1), -1);
+    ASSERT_EQ(bloom_filter_contains_serialized(dblob, dsize, (const uint8_t *)"x", 0), -1);
+    ASSERT_EQ(bloom_filter_contains_serialized(dblob, 1, (const uint8_t *)"x", 1), -1);
+
+    free(dblob);
+    free(sblob);
+    free(v1blob);
+    bloom_filter_free(dense);
+    bloom_filter_free(sparse);
+    bloom_filter_free(v1);
+}
+
 /* deserialize must reject malformed buffers without over-reading, a buffer ending
  * mid-varint, a lone sentinel, an unknown hash version, an unknown encoding, and
  * a header that promises more bitset words than the buffer holds */
@@ -1118,6 +1216,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_bloom_filter_deserialize_overflow_m, tests_passed);
     RUN_TEST(test_bloom_filter_dense_encoding, tests_passed);
     RUN_TEST(test_bloom_filter_sparse_encoding_unchanged, tests_passed);
+    RUN_TEST(test_bloom_filter_contains_serialized, tests_passed);
     RUN_TEST(test_bloom_filter_deserialize_malformed, tests_passed);
     RUN_TEST(test_bloom_filter_is_full_multiword, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);

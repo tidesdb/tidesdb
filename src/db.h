@@ -230,8 +230,6 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio index sample ratio
- * @param block_index_prefix_len block index prefix length
  * @param sync_mode sync mode
  * @param sync_interval_us sync interval in microseconds
  * @param comparator_name name of comparator
@@ -270,8 +268,6 @@ typedef struct tidesdb_column_family_config_t
     int enable_bloom_filter;
     double bloom_fpr;
     int enable_block_indexes;
-    int index_sample_ratio;
-    int block_index_prefix_len;
     int sync_mode;
     uint64_t sync_interval_us;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];

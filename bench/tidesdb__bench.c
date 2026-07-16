@@ -847,7 +847,6 @@ int main()
     printf("  Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
     printf("  Bloom Filter FP Rate: %.4f\n", BENCH_BLOOM_FILTER_FP_RATE);
     printf("  Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
-    printf("  Block Index Prefix Length: %d\n", BENCH_BLOCK_INDEX_PREFIX_LEN);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));
     printf("  K-Log Value Threshold: %zu bytes (%.2f KB)\n", (size_t)BENCH_KLOG_VALUE_THRESHOLD,
@@ -1001,13 +1000,11 @@ int main()
     cf_config.enable_bloom_filter = BENCH_ENABLE_BLOOM_FILTER;
     cf_config.bloom_fpr = BENCH_BLOOM_FILTER_FP_RATE;
     cf_config.enable_block_indexes = BENCH_ENABLE_BLOCK_INDEXES;
-    cf_config.index_sample_ratio = BENCH_BLOCK_INDEX_SAMPLING_COUNT;
     cf_config.sync_mode = BENCH_SYNC_MODE;
     cf_config.sync_interval_us = BENCH_SYNC_INTERVAL_US;
     strncpy(cf_config.comparator_name, BENCH_COMPARATOR_NAME, TDB_MAX_COMPARATOR_NAME - 1);
     cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     cf_config.default_isolation_level = BENCH_ISOLATION_LEVEL;
-    cf_config.block_index_prefix_len = BENCH_BLOCK_INDEX_PREFIX_LEN;
     cf_config.klog_value_threshold = BENCH_KLOG_VALUE_THRESHOLD;
     cf_config.min_disk_space = BENCH_MIN_DISK_SPACE;
     cf_config.l1_file_count_trigger = BENCH_L1_FILE_COUNT_TRIGGER;

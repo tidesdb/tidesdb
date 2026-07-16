@@ -475,12 +475,14 @@ static int bf_get_varint64(const uint8_t **pp, const uint8_t *end, uint64_t *out
     return 0;
 }
 
-bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
+/* parse a serialized filter's header (optional version sentinel + format byte, then m and h) and
+ * point *out_body at the bitset body. shared by deserialize and contains_serialized so both read
+ * the framing identically. returns 0 on success, -1 on a truncated or invalid header. */
+static int bf_parse_header(const uint8_t *data, size_t len, unsigned int *out_encoding,
+                           unsigned int *out_hash_version, unsigned int *out_m, unsigned int *out_h,
+                           const uint8_t **out_body)
 {
-    if (data == NULL || len == 0)
-    {
-        return NULL;
-    }
+    if (data == NULL || len == 0) return -1;
 
     const uint8_t *ptr = data;
     const uint8_t *const end = data + len;
@@ -494,45 +496,44 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
     unsigned int encoding = BF_ENCODING_SPARSE;
     if (ptr[0] == BF_SERIALIZE_VERSION_SENTINEL)
     {
-        if (end - ptr < BF_SERIALIZE_VERSION_BYTES) return NULL; /* sentinel + format byte */
-        ptr++;                                                   /* skip sentinel */
+        if (end - ptr < BF_SERIALIZE_VERSION_BYTES) return -1; /* sentinel + format byte */
+        ptr++;                                                 /* skip sentinel */
         const uint8_t format = *ptr++;
         hash_version = BF_FORMAT_HASH_VERSION(format);
         encoding = BF_FORMAT_ENCODING(format);
         /* reject an unknown hash version (querying with an undefined scheme would
          * silently false-negative) or an unknown bitset encoding */
         if (hash_version < BF_HASH_VERSION_LEGACY || hash_version > BF_HASH_VERSION_CURRENT)
-        {
-            return NULL;
-        }
-        if (encoding != BF_ENCODING_SPARSE && encoding != BF_ENCODING_DENSE)
-        {
-            return NULL;
-        }
+            return -1;
+        if (encoding != BF_ENCODING_SPARSE && encoding != BF_ENCODING_DENSE) return -1;
     }
 
     /* we read header with bounded varint decoding */
     uint32_t m_u32, h_u32;
-    if (bf_get_varint32(&ptr, end, &m_u32) != 0) return NULL;
-    if (bf_get_varint32(&ptr, end, &h_u32) != 0) return NULL;
+    if (bf_get_varint32(&ptr, end, &m_u32) != 0) return -1;
+    if (bf_get_varint32(&ptr, end, &h_u32) != 0) return -1;
 
-    const unsigned int m = m_u32;
-    const unsigned int h = h_u32;
+    /* h is the per-query probe count, so an out-of-range h from a corrupt filter would turn every
+     * query into a multi-billion-iteration loop. reject it with the same cap the constructor
+     * enforces, which a valid filter can never exceed. */
+    if (m_u32 == 0 || h_u32 == 0 || h_u32 > BF_MAX_HASH_FUNCTIONS) return -1;
+    if (m_u32 > UINT32_MAX - BF_BITS_PER_WORD) return -1; /* size calculation overflow */
 
-    /* we validate deserialized values. h is the per-query probe count, so an out-of-range h from a
-     * corrupt filter would turn every contains() into a multi-billion-iteration loop. reject it
-     * with the same cap the constructor enforces, which a valid filter can never exceed. */
-    if (m == 0 || h == 0 || h > BF_MAX_HASH_FUNCTIONS)
-    {
-        return NULL;
-    }
+    *out_encoding = encoding;
+    *out_hash_version = hash_version;
+    *out_m = m_u32;
+    *out_h = h_u32;
+    *out_body = ptr;
+    return 0;
+}
 
-    /* we check for potential integer overflow in size calculation */
-    if (m > UINT32_MAX - BF_BITS_PER_WORD)
-    {
-        return NULL;
-    }
+bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
+{
+    unsigned int encoding, hash_version, m, h;
+    const uint8_t *ptr;
+    if (bf_parse_header(data, len, &encoding, &hash_version, &m, &h, &ptr) != 0) return NULL;
 
+    const uint8_t *const end = data + len;
     const unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
 
     /* we allocate and zero-initialize bitset */
@@ -610,6 +611,56 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data, const size_t len)
     bf->hash_version = hash_version;
 
     return bf;
+}
+
+int bloom_filter_contains_serialized(const uint8_t *data, const size_t len, const uint8_t *entry,
+                                     const size_t size)
+{
+    if (data == NULL || entry == NULL || size == 0) return -1;
+
+    unsigned int encoding, hash_version, m, h;
+    const uint8_t *body;
+    if (bf_parse_header(data, len, &encoding, &hash_version, &m, &h, &body) != 0) return -1;
+
+    /* the sparse encoding is rare for a well-filled filter; fall back to a full deserialize rather
+     * than re-scan its varint word list on every probe */
+    if (encoding != BF_ENCODING_DENSE)
+    {
+        bloom_filter_t *bf = bloom_filter_deserialize(data, len);
+        if (bf == NULL) return -1;
+        const int r = bloom_filter_contains(bf, entry, size);
+        bloom_filter_free(bf);
+        return r;
+    }
+
+    const uint8_t *const end = data + len;
+    const unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
+    if ((size_t)(end - body) < (size_t)size_in_words * BF_DENSE_WORD_BYTES) return -1;
+
+    /* a stack header carries only the fields the hash derivation reads; the raw bitset is probed in
+     * place, one little-endian word at a time, so no filter is materialized */
+    bloom_filter_t hdr;
+    hdr.m = m;
+    hdr.h = h;
+    hdr.size_in_words = size_in_words;
+    hdr.hash_version = hash_version;
+    hdr.bitset = NULL;
+
+    uint32_t h1, h2;
+    bf_derive_hashes(&hdr, entry, size, &h1, &h2);
+
+    for (unsigned int i = 0; i < h; i++)
+    {
+        const uint32_t index = bf_fast_range(h1 + i * h2, m);
+        const uint8_t *const w = body + (size_t)(index / BF_BITS_PER_WORD) * BF_DENSE_WORD_BYTES;
+        uint64_t word = 0;
+        for (int j = 0; j < BF_DENSE_WORD_BYTES; j++) word |= (uint64_t)w[j] << (8 * j);
+        if (BF_LIKELY(!((word >> (index % BF_BITS_PER_WORD)) & 1ULL)))
+        {
+            return 0; /* definitely not in set */
+        }
+    }
+    return 1; /* probably in set */
 }
 
 void bloom_filter_free(bloom_filter_t *bf)

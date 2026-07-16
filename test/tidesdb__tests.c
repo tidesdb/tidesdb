@@ -6036,7 +6036,6 @@ static void test_block_indexes(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 10;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bidx_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_cf");
@@ -6094,7 +6093,6 @@ static void test_block_indexes_sparse_sample_ratio(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 32;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bidx_sparse_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_sparse_cf");
@@ -13875,7 +13873,6 @@ void test_tidesdb_block_index_seek()
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 1;
     cf_config.write_buffer_size = 512 * 1024;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), TDB_SUCCESS);
@@ -21338,7 +21335,6 @@ static void test_full_merge_block_index_sampling(void)
     cf_config.write_buffer_size = 2048;
     cf_config.level_size_ratio = 10;
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 2;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "sample_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sample_cf");
@@ -28707,11 +28703,9 @@ static void test_perf_cached_iter_seek(void)
 
 static void test_block_index_shared_prefix(void)
 {
-    /* keys that share a prefix longer than block_index_prefix_len span multiple
-     * klog blocks whose min/max prefixes are all identical. the block index
-     * search must land on the leftmost such block and the lookup must scan the
-     * whole prefix-colliding run -- otherwise point lookups and seeks for keys
-     * in any but the overshot block return a false NOT_FOUND. */
+    /* many keys sharing a long common prefix span multiple klog blocks. the blocked index stores
+     * each block's full first-key, so a lookup routes to exactly the covering block -- this pins
+     * that point lookups and seeks for such keys never return a false NOT_FOUND. */
     cleanup_test_dir();
 
     tidesdb_config_t config = tidesdb_default_config();
@@ -28720,9 +28714,8 @@ static void test_block_index_shared_prefix(void)
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
 
-    /* default cf config -- block_index_prefix_len 16, index_sample_ratio 1,
-     * block indexes enabled. small write buffer + padded values force the
-     * shared-prefix keys across many blocks. */
+    /* block indexes enabled. small write buffer + padded values force the shared-prefix keys across
+     * many blocks. */
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 16 * 1024;
     cf_config.compression_algorithm = TDB_COMPRESS_NONE;
@@ -28732,7 +28725,7 @@ static void test_block_index_shared_prefix(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_prefix_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* 24 byte prefix -- longer than the 16 byte block_index_prefix_len */
+    /* a long shared prefix that spreads the keys across many blocks */
     static const char SHARED[] = "shared_prefix_blockidx__";
     const int SHARED_KEYS = 3000;
     const int UNIQUE_KEYS = 500;

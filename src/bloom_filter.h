@@ -81,6 +81,22 @@ void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, size_t siz
 int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, size_t size);
 
 /**
+ * bloom_filter_contains_serialized
+ * checks if an entry is in a serialized filter (as produced by bloom_filter_serialize) without
+ * materializing a bloom_filter_t. the common dense encoding is probed in place over the buffer, one
+ * word at a time, so no bitset is allocated or copied; the rare sparse encoding falls back to a
+ * full deserialize. accepts every framing bloom_filter_deserialize accepts.
+ * @param data serialized filter bytes
+ * @param len length of data
+ * @param entry the entry to check
+ * @param size the size of the entry
+ * @return 1 if probably present, 0 if definitely absent, -1 on a NULL/empty entry or a malformed
+ *         or truncated serialized filter
+ */
+int bloom_filter_contains_serialized(const uint8_t *data, size_t len, const uint8_t *entry,
+                                     size_t size);
+
+/**
  * bloom_filter_is_full
  * checks if every bit in the filter is set
  * @param bf the bloom filter to check

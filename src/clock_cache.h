@@ -38,7 +38,6 @@ typedef void (*clock_cache_evict_fn)(void *payload, size_t payload_len);
  * @param max_bytes maximum total bytes across all partitions
  * @param num_partitions number of partitions (power of 2 recommended)
  * @param slots_per_partition initial slots per partition
- * @param avg_entry_size expected average entry size in bytes (0 = use default 100)
  * @param evict_callback optional callback for custom cleanup on eviction (can be NULL)
  */
 typedef struct
@@ -46,7 +45,6 @@ typedef struct
     size_t max_bytes;
     size_t num_partitions;
     size_t slots_per_partition;
-    size_t avg_entry_size;
     clock_cache_evict_fn evict_callback;
 } cache_config_t;
 
@@ -88,7 +86,6 @@ typedef struct
 #define CLOCK_CACHE_PARTITIONS_PER_CPU      4    /* partitions per CPU core */
 #define CLOCK_CACHE_MIN_SLOTS_PER_PARTITION 64   /* minimum slots per partition */
 #define CLOCK_CACHE_MAX_SLOTS_PER_PARTITION 8192 /* maximum slots per partition */
-#define CLOCK_CACHE_AVG_ENTRY_SIZE          100  /* estimated average entry size in bytes */
 /* hash index size = slots * 2 (2x, low load factor for fast probing) */
 #define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM 2
 #define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN 1

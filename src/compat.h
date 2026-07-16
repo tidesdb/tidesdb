@@ -3922,7 +3922,9 @@ static inline size_t tdb_addressable_memory_limit(void)
      * the usable range (2 GiB on Win32, 3 GiB with /LARGEADDRESSAWARE, ~128 TiB on Win64) */
     const uintptr_t hi = (uintptr_t)si.lpMaximumApplicationAddress;
     if (hi > 0 && (size_t)hi < ceiling) ceiling = (size_t)hi;
-#else
+#elif defined(RLIMIT_AS)
+    /* RLIMIT_AS caps the process virtual size on most unices; openbsd and a few others omit it,
+     * where the pointer-width ceiling above already bounds what the process can map */
     struct rlimit rl;
     if (getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0 &&
         (size_t)rl.rlim_cur < ceiling)

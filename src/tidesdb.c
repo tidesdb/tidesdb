@@ -1746,8 +1746,11 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, size_t key_
 static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv);
 static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv);
 static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst);
-static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *sst);
-static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *sst);
+static int tidesdb_sstable_ensure_open_for_write(tidesdb_t *db, tidesdb_sstable_t *sst);
+static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                            int download_missing);
+static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                            int download_missing);
 static int wait_for_open(tidesdb_t *db);
 
 /**
@@ -4352,7 +4355,7 @@ static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
     /* the vlog is opened lazily on first non-inline value read. the const cast is safe:
      * opening the vlog mutates sst (not db's logical state) and does not touch
      * num_open_sstables, which is keyed on the klog. */
-    if (tidesdb_sstable_ensure_vlog_open((tidesdb_t *)db, sst) != 0)
+    if (tidesdb_sstable_ensure_vlog_open((tidesdb_t *)db, sst, 1) != 0)
     {
         return TDB_ERR_IO;
     }
@@ -6528,9 +6531,15 @@ static void tdb_objstore_delete_listed_cb(const char *key, const size_t size, vo
  * pinned sstable instead of two.
  * @param db database instance
  * @param sst sstable whose klog to ensure open
+ * @param download_missing pull the klog from the object store when it is not local. correct for a
+ *                         read re-opening an evicted sstable, but a fresh flush/merge output must
+ *                         pass 0 -- it is creating the file, and a same-named object left by a
+ *                         fenced peer (e.g. a zombie primary that reused the id) would otherwise be
+ *                         downloaded and the new blocks appended onto that stale content
  * @return 0 on success, -1 on error
  */
-static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *sst)
+static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                            int download_missing)
 {
     if (!db || !sst) return -1;
     if (!sst->config || !sst->klog_path) return -1;
@@ -6541,7 +6550,7 @@ static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *ss
         return 0; /* already open */
     }
 
-    if (db->object_store)
+    if (db->object_store && download_missing)
     {
         if (tdb_objstore_download_if_missing(db, sst->klog_path) != 0) return -1;
     }
@@ -6580,16 +6589,19 @@ static int tidesdb_sstable_ensure_klog_open(tidesdb_t *db, tidesdb_sstable_t *ss
  * (see tidesdb_sstable_ensure_klog_open) and is closed alongside the klog by the reaper.
  * @param db database instance
  * @param sst sstable whose vlog to ensure open
+ * @param download_missing pull the vlog from the object store when it is not local; a fresh
+ *                         flush/merge output passes 0 (see tidesdb_sstable_ensure_klog_open)
  * @return 0 on success, -1 on error
  */
-static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *sst)
+static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                            int download_missing)
 {
     if (!db || !sst) return -1;
     if (!sst->config || !sst->vlog_path) return -1;
 
     if (sst->vlog_bm) return 0; /* already open */
 
-    if (db->object_store)
+    if (db->object_store && download_missing)
     {
         if (tdb_objstore_download_if_missing(db, sst->vlog_path) != 0) return -1;
     }
@@ -6632,8 +6644,25 @@ static int tidesdb_sstable_ensure_vlog_open(tidesdb_t *db, tidesdb_sstable_t *ss
  */
 static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
-    if (tidesdb_sstable_ensure_klog_open(db, sst) != 0) return -1;
-    if (tidesdb_sstable_ensure_vlog_open(db, sst) != 0) return -1;
+    if (tidesdb_sstable_ensure_klog_open(db, sst, 1) != 0) return -1;
+    if (tidesdb_sstable_ensure_vlog_open(db, sst, 1) != 0) return -1;
+    return 0;
+}
+
+/**
+ * tidesdb_sstable_ensure_open_for_write
+ * open both block managers for a freshly created sstable that is about to be written (flush or
+ * merge output). identical to tidesdb_sstable_ensure_open except it never downloads from the object
+ * store -- the sstable is being created locally, so a same-named remote object is stale (a fenced
+ * peer that reused the id) and must not be pulled down and appended onto.
+ * @param db database instance
+ * @param sst sstable being created
+ * @return 0 on success, -1 on error
+ */
+static int tidesdb_sstable_ensure_open_for_write(tidesdb_t *db, tidesdb_sstable_t *sst)
+{
+    if (tidesdb_sstable_ensure_klog_open(db, sst, 0) != 0) return -1;
+    if (tidesdb_sstable_ensure_vlog_open(db, sst, 0) != 0) return -1;
     return 0;
 }
 
@@ -8055,7 +8084,7 @@ static int tidesdb_sstable_write_from_memtable_btree_ex(tidesdb_t *db, tidesdb_c
                   "SSTable %" PRIu64 " writing from memtable using B+tree (%d entries)", sst->id,
                   num_entries);
 
-    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    if (tidesdb_sstable_ensure_open_for_write(db, sst) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to ensure open", sst->id);
         return TDB_ERR_IO;
@@ -8711,7 +8740,7 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
                   sst->id, num_entries);
 
     /* we ensure sstable is open and get block managers */
-    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    if (tidesdb_sstable_ensure_open_for_write(db, sst) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to ensure open", sst->id);
         return TDB_ERR_IO;
@@ -11812,7 +11841,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t 
 
     /* scan sources open the klog only; the vlog is opened on demand by
      * tidesdb_vlog_read_value when a value misses the inline klog payload */
-    if (tidesdb_sstable_ensure_klog_open(db, sst) != 0)
+    if (tidesdb_sstable_ensure_klog_open(db, sst, 1) != 0)
     {
         tidesdb_sstable_unref(db, sst);
         free(source);
@@ -12236,7 +12265,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_lazy(tidesdb_t 
 
     /* scan sources open the klog only; the vlog is opened on demand by
      * tidesdb_vlog_read_value when a value misses the inline klog payload */
-    if (tidesdb_sstable_ensure_klog_open(db, sst) != 0)
+    if (tidesdb_sstable_ensure_klog_open(db, sst, 1) != 0)
     {
         tidesdb_sstable_unref(db, sst);
         free(source);

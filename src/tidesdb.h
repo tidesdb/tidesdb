@@ -685,6 +685,10 @@ struct tidesdb_column_family_t
 struct tidesdb_sstable_t
 {
     uint64_t id;
+    /* partition shard index parsed from the klog filename (L<level>P<partition>_<id>), or
+     * MANIFEST_NO_PARTITION for a non-partitioned flush output. recorded in the manifest so a
+     * node reconstructing the sstable from the manifest rebuilds the same filename. */
+    int partition;
     char *klog_path;
     const char *klog_filename;
     char *vlog_path;

@@ -5707,12 +5707,24 @@ static void tdb_replica_sync_manifests(tidesdb_t *db, uint64_t lease_epoch)
             tidesdb_manifest_entry_t *rme = &remote_manifest->entries[r];
             if (tidesdb_manifest_has_sstable(cf->manifest, rme->level, rme->id)) continue;
 
-            char sst_base[MAX_FILE_PATH_LENGTH];
-            snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
+            /* we ensure the level directory exists */
+            char level_dir[MAX_FILE_PATH_LENGTH];
+            snprintf(level_dir, sizeof(level_dir), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
                      cf->directory, rme->level);
+            mkdir(level_dir, TDB_DIR_PERMISSIONS);
 
-            /* we ensure level directory exists */
-            mkdir(sst_base, TDB_DIR_PERMISSIONS);
+            /* rebuild the filename the primary wrote and uploaded -- a partitioned merge output
+             * carries its shard (L<level>P<partition>), a flush output does not. reconstructing the
+             * non-partitioned name for a partitioned sstable would look for a file that is not in
+             * the bucket and leave an empty local sstable. */
+            char sst_base[MAX_FILE_PATH_LENGTH];
+            if (rme->partition >= 0)
+                snprintf(sst_base, sizeof(sst_base),
+                         "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX "%d",
+                         cf->directory, rme->level, rme->partition);
+            else
+                snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
+                         cf->directory, rme->level);
 
             tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_base, rme->id, &cf->config);
             if (!sst) continue;
@@ -5751,7 +5763,7 @@ static void tdb_replica_sync_manifests(tidesdb_t *db, uint64_t lease_epoch)
             {
                 tidesdb_level_add_sstable(cf->levels[level_idx], sst);
                 tidesdb_manifest_add_sstable(cf->manifest, rme->level, rme->id, rme->num_entries,
-                                             rme->size_bytes);
+                                             rme->size_bytes, rme->partition);
 
                 uint64_t cur_next =
                     atomic_load_explicit(&cf->next_sstable_id, memory_order_relaxed);
@@ -6704,6 +6716,18 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
         const char *last_back = strrchr(sst->klog_path, '\\');
         const char *last_sep = (last_fwd > last_back) ? last_fwd : last_back;
         sst->klog_filename = last_sep ? last_sep + 1 : sst->klog_path;
+    }
+
+    /* the partition shard is encoded in the filename for a partitioned merge output
+     * (L<level>P<partition>_<id>); a flush output has none. record it so the manifest can carry it
+     * and a manifest-driven rebuild reconstructs the same name. */
+    {
+        int parsed_level, parsed_partition;
+        unsigned long long parsed_id;
+        sst->partition = tdb_parse_sstable_partitioned(sst->klog_filename, &parsed_level,
+                                                       &parsed_partition, &parsed_id)
+                             ? parsed_partition
+                             : MANIFEST_NO_PARTITION;
     }
 
     return sst;
@@ -7944,6 +7968,12 @@ static void tidesdb_sstable_write_footer_aux(tidesdb_sstable_t *sst, block_manag
 
     blocked_index_builder_free(index_builder);
     blocked_bloom_builder_free(bloom_builder);
+
+    /* open the paged bloom and index readers on the freshly written sstable so reads route through
+     * the block index immediately. without this a just-flushed sstable has null readers until it is
+     * evicted and reloaded, forcing every lookup down the full-scan fallback (matching how load
+     * opens them via tidesdb_sstable_open_blocked_readers). */
+    tidesdb_sstable_open_blocked_readers(sst);
 }
 
 /**
@@ -14643,7 +14673,8 @@ static int tidesdb_full_preemptive_shard(void *vctx, int shard)
 
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
-                                             new_sst->klog_size + new_sst->vlog_size);
+                                             new_sst->klog_size + new_sst->vlog_size,
+                                             new_sst->partition);
                 atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
                 int manifest_result = tidesdb_manifest_commit(
                     cf->manifest, cf->manifest->path, cf->config.sync_mode != TDB_SYNC_NONE);
@@ -15252,9 +15283,9 @@ merge_complete:;
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
             tidesdb_bump_sstable_layout_version(cf);
 
-            tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
-                                         new_sst->id, new_sst->num_entries,
-                                         new_sst->klog_size + new_sst->vlog_size);
+            tidesdb_manifest_add_sstable(
+                cf->manifest, cf->levels[target_idx]->level_num, new_sst->id, new_sst->num_entries,
+                new_sst->klog_size + new_sst->vlog_size, new_sst->partition);
             atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
             tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
                                     cf->config.sync_mode != TDB_SYNC_NONE);
@@ -15802,9 +15833,9 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
             pthread_mutex_lock(&cf->compaction_commit_lock);
             tidesdb_level_add_sstable(cf->levels[target_level], new_sst);
             tidesdb_bump_sstable_layout_version(cf);
-            tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_level]->level_num,
-                                         new_sst->id, new_sst->num_entries,
-                                         new_sst->klog_size + new_sst->vlog_size);
+            tidesdb_manifest_add_sstable(
+                cf->manifest, cf->levels[target_level]->level_num, new_sst->id,
+                new_sst->num_entries, new_sst->klog_size + new_sst->vlog_size, new_sst->partition);
             pthread_mutex_unlock(&cf->compaction_commit_lock);
             tidesdb_sstable_unref(cf->db, new_sst);
             continue;
@@ -16217,7 +16248,8 @@ static int tidesdb_dividing_merge_partition(void *vctx, int partition)
 
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
-                                             new_sst->klog_size + new_sst->vlog_size);
+                                             new_sst->klog_size + new_sst->vlog_size,
+                                             new_sst->partition);
                 atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
                 int manifest_result = tidesdb_manifest_commit(
                     cf->manifest, cf->manifest->path, cf->config.sync_mode != TDB_SYNC_NONE);
@@ -16376,7 +16408,8 @@ static int tdb_partitioned_merge_finalize_sst(
         tidesdb_bump_sstable_layout_version(cf);
 
         tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num, sst->id,
-                                     sst->num_entries, sst->klog_size + sst->vlog_size);
+                                     sst->num_entries, sst->klog_size + sst->vlog_size,
+                                     sst->partition);
         atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
         const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
                                                             cf->config.sync_mode != TDB_SYNC_NONE);
@@ -17032,9 +17065,9 @@ static int tidesdb_partitioned_merge_partition(void *vctx, int partition)
                 pthread_mutex_lock(&cf->compaction_commit_lock);
                 tidesdb_level_add_sstable(cf->levels[end_idx], new_sst);
                 tidesdb_bump_sstable_layout_version(cf);
-                tidesdb_manifest_add_sstable(cf->manifest, cf->levels[end_idx]->level_num,
-                                             new_sst->id, new_sst->num_entries,
-                                             new_sst->klog_size + new_sst->vlog_size);
+                tidesdb_manifest_add_sstable(
+                    cf->manifest, cf->levels[end_idx]->level_num, new_sst->id, new_sst->num_entries,
+                    new_sst->klog_size + new_sst->vlog_size, new_sst->partition);
                 pthread_mutex_unlock(&cf->compaction_commit_lock);
                 tidesdb_sstable_unref(cf->db, new_sst);
                 continue;
@@ -18726,7 +18759,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * we must commit manifest before triggering compaction to avoid deadlock
          * where flush worker holds manifest lock while compaction worker waits for it */
         tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
-                                     sst->klog_size + sst->vlog_size);
+                                     sst->klog_size + sst->vlog_size, sst->partition);
         atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
         int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
                                                       cf->config.sync_mode != TDB_SYNC_NONE);
@@ -27963,7 +27996,7 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
     tidesdb_bump_sstable_layout_version(cf);
 
     tidesdb_manifest_add_sstable(cf->manifest, 1, sst_id, sst->num_entries,
-                                 sst->klog_size + sst->vlog_size);
+                                 sst->klog_size + sst->vlog_size, sst->partition);
     atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
     const int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
                                                         cf->config.sync_mode != TDB_SYNC_NONE);
@@ -32560,7 +32593,7 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
             /* self-heal -- this sstable was on disk but missing from the recovered manifest, so add
              * it back so the rebuilt manifest reflects the on-disk set */
             tidesdb_manifest_add_sstable(cf->manifest, level_num, sst_id, sst->num_entries,
-                                         sst->klog_size + sst->vlog_size);
+                                         sst->klog_size + sst->vlog_size, sst->partition);
         }
     }
     else
@@ -32669,10 +32702,17 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
             {
                 tidesdb_manifest_entry_t *me = &cf->manifest->entries[i];
 
-                /* we construct sst path from level + id */
+                /* we construct the sst path from level + id, restoring the partition shard for a
+                 * partitioned merge output so the download key matches the uploaded filename */
                 char sst_base[MAX_FILE_PATH_LENGTH];
-                snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
-                         cf->directory, me->level);
+                if (me->partition >= 0)
+                    snprintf(sst_base, sizeof(sst_base),
+                             "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX
+                             "%d",
+                             cf->directory, me->level, me->partition);
+                else
+                    snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
+                             cf->directory, me->level);
 
                 tidesdb_sstable_t *sst =
                     tidesdb_sstable_create(cf->db, sst_base, me->id, &cf->config);

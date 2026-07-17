@@ -45,7 +45,7 @@ void test_manifest_add_sstable()
     ASSERT_TRUE(manifest != NULL);
 
     /* add first sstable */
-    int result = tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    int result = tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
     ASSERT_EQ(result, 0);
     ASSERT_EQ(manifest->num_entries, 1);
     ASSERT_EQ(manifest->entries[0].level, 1);
@@ -54,14 +54,14 @@ void test_manifest_add_sstable()
     ASSERT_EQ(manifest->entries[0].size_bytes, 65536);
 
     /* add second sstable */
-    result = tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
+    result = tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
     ASSERT_EQ(result, 0);
     ASSERT_EQ(manifest->num_entries, 2);
     ASSERT_EQ(manifest->entries[1].level, 2);
     ASSERT_EQ(manifest->entries[1].id, 200);
 
     /* add third sstable at same level as first */
-    result = tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304);
+    result = tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304, MANIFEST_NO_PARTITION);
     ASSERT_EQ(result, 0);
     ASSERT_EQ(manifest->num_entries, 3);
 
@@ -75,11 +75,11 @@ void test_manifest_update_existing_sstable()
     ASSERT_TRUE(manifest != NULL);
 
     /* add sstable */
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
     ASSERT_EQ(manifest->num_entries, 1);
 
     /* update same sstable (same level and id) */
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 2000, 131072);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 2000, 131072, MANIFEST_NO_PARTITION);
     ASSERT_EQ(manifest->num_entries, 1);                /* should still be 1 */
     ASSERT_EQ(manifest->entries[0].num_entries, 2000);  /* updated */
     ASSERT_EQ(manifest->entries[0].size_bytes, 131072); /* updated */
@@ -94,9 +94,9 @@ void test_manifest_has_sstable()
     ASSERT_TRUE(manifest != NULL);
 
     /* add some sstables */
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
-    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
-    tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304, MANIFEST_NO_PARTITION);
 
     /* check existing sstables */
     ASSERT_TRUE(tidesdb_manifest_has_sstable(manifest, 1, 100));
@@ -118,9 +118,9 @@ void test_manifest_remove_sstable()
     ASSERT_TRUE(manifest != NULL);
 
     /* add sstables */
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
-    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
-    tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304, MANIFEST_NO_PARTITION);
     ASSERT_EQ(manifest->num_entries, 3);
 
     /* remove middle entry */
@@ -171,7 +171,8 @@ void test_manifest_capacity_growth()
     /* add more entries than initial capacity to trigger growth */
     for (int i = 0; i < MANIFEST_INITIAL_CAPACITY + 10; i++)
     {
-        int result = tidesdb_manifest_add_sstable(manifest, 1, i, 1000, 65536);
+        int result =
+            tidesdb_manifest_add_sstable(manifest, 1, i, 1000, 65536, MANIFEST_NO_PARTITION);
         ASSERT_EQ(result, 0);
     }
 
@@ -193,9 +194,9 @@ void test_manifest_commit_and_load()
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
-    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
-    tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(manifest, 54321);
 
     int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1);
@@ -251,7 +252,7 @@ void test_manifest_atomic_commit()
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
 
     int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1);
     ASSERT_EQ(result, 0);
@@ -276,7 +277,8 @@ void test_manifest_multiple_levels()
     {
         for (int id = 0; id < 3; id++)
         {
-            tidesdb_manifest_add_sstable(manifest, level, id, 1000 * level, 65536 * level);
+            tidesdb_manifest_add_sstable(manifest, level, id, 1000 * level, 65536 * level,
+                                         MANIFEST_NO_PARTITION);
         }
     }
 
@@ -325,8 +327,8 @@ void test_manifest_persistence_cycle()
 
     /* cycle create and commit */
     tidesdb_manifest_t *m1 = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    tidesdb_manifest_add_sstable(m1, 1, 0, 100, 1024);
-    tidesdb_manifest_add_sstable(m1, 1, 1, 200, 2048);
+    tidesdb_manifest_add_sstable(m1, 1, 0, 100, 1024, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(m1, 1, 1, 200, 2048, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(m1, 1000);
     ASSERT_EQ(tidesdb_manifest_commit(m1, TEST_MANIFEST_PATH, 1), 0);
     tidesdb_manifest_close(m1);
@@ -335,7 +337,7 @@ void test_manifest_persistence_cycle()
     tidesdb_manifest_t *m2 = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_EQ(m2->num_entries, 2);
     ASSERT_EQ(m2->sequence, 1000);
-    tidesdb_manifest_add_sstable(m2, 2, 0, 300, 4096);
+    tidesdb_manifest_add_sstable(m2, 2, 0, 300, 4096, MANIFEST_NO_PARTITION);
     tidesdb_manifest_remove_sstable(m2, 1, 0);
     tidesdb_manifest_update_sequence(m2, 2000);
     ASSERT_EQ(tidesdb_manifest_commit(m2, TEST_MANIFEST_PATH, 1), 0);
@@ -361,9 +363,9 @@ void test_manifest_auto_compaction()
         tidesdb_manifest_open("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest");
 
     /* add entries for ssts */
-    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
-    tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304);
-    tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
+    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
 
     /* create actual sst files for some entries */
     FILE *f1 = tdb_fopen("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "L1_100.klog", "w");
@@ -401,9 +403,9 @@ void test_manifest_crash_recovery()
     tidesdb_manifest_t *m1 = tidesdb_manifest_open(crash_test_path);
     ASSERT_TRUE(m1 != NULL);
 
-    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
-    tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304);
-    tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
+    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(m1, 5000);
 
     ASSERT_EQ(tidesdb_manifest_commit(m1, crash_test_path, 1), 0);
@@ -414,7 +416,7 @@ void test_manifest_crash_recovery()
     ASSERT_EQ(m2->num_entries, 3);
     ASSERT_EQ(m2->sequence, 5000);
 
-    tidesdb_manifest_add_sstable(m2, 3, 300, 3000, 196608);
+    tidesdb_manifest_add_sstable(m2, 3, 300, 3000, 196608, MANIFEST_NO_PARTITION);
     tidesdb_manifest_remove_sstable(m2, 1, 100);
     tidesdb_manifest_update_sequence(m2, 6000);
 
@@ -435,7 +437,7 @@ void test_manifest_crash_recovery()
     ASSERT_TRUE(tidesdb_manifest_has_sstable(m3, 2, 200));
     ASSERT_FALSE(tidesdb_manifest_has_sstable(m3, 3, 300));
 
-    tidesdb_manifest_add_sstable(m3, 3, 301, 3500, 200000);
+    tidesdb_manifest_add_sstable(m3, 3, 301, 3500, 200000, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(m3, 7000);
     ASSERT_EQ(tidesdb_manifest_commit(m3, crash_test_path, 1), 0);
     tidesdb_manifest_close(m3);
@@ -459,7 +461,7 @@ void test_manifest_orphaned_temp_cleanup()
 
     tidesdb_manifest_t *m1 = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(m1 != NULL);
-    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(m1, 1000);
     ASSERT_EQ(tidesdb_manifest_commit(m1, test_path, 1), 0);
     tidesdb_manifest_close(m1);
@@ -521,7 +523,8 @@ void *concurrent_add_thread(void *arg)
     for (int i = 0; i < data->operations; i++)
     {
         uint64_t id = data->thread_id * 1000 + i;
-        tidesdb_manifest_add_sstable(data->manifest, data->thread_id, id, i * 100, i * 65536);
+        tidesdb_manifest_add_sstable(data->manifest, data->thread_id, id, i * 100, i * 65536,
+                                     MANIFEST_NO_PARTITION);
     }
     return NULL;
 }
@@ -679,7 +682,9 @@ void test_manifest_large_stress()
         uint64_t id = i;
         uint64_t num_ents = i * 10;
         uint64_t size = i * 1024;
-        ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, level, id, num_ents, size), 0);
+        ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, level, id, num_ents, size,
+                                               MANIFEST_NO_PARTITION),
+                  0);
     }
 
     ASSERT_EQ(manifest->num_entries, num_entries);
@@ -718,11 +723,13 @@ void test_manifest_duplicate_id_handling()
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(manifest != NULL);
 
-    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536), 0);
+    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION),
+              0);
     ASSERT_EQ(manifest->num_entries, 1);
 
     /* we add same level+id with different values (should update, not add) */
-    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 100, 2000, 131072), 0);
+    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 100, 2000, 131072, MANIFEST_NO_PARTITION),
+              0);
     ASSERT_EQ(manifest->num_entries, 1);
 
     /* we verify updated values */
@@ -733,7 +740,9 @@ void test_manifest_duplicate_id_handling()
     /* we add multiple updates */
     for (int i = 0; i < 10; i++)
     {
-        ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 100, i * 1000, i * 65536), 0);
+        ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 100, i * 1000, i * 65536,
+                                               MANIFEST_NO_PARTITION),
+                  0);
         ASSERT_EQ(manifest->num_entries, 1);
     }
 
@@ -742,11 +751,13 @@ void test_manifest_duplicate_id_handling()
     ASSERT_EQ(manifest->entries[0].size_bytes, 9 * 65536);
 
     /* we add different id on same level */
-    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 101, 5000, 200000), 0);
+    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 101, 5000, 200000, MANIFEST_NO_PARTITION),
+              0);
     ASSERT_EQ(manifest->num_entries, 2);
 
     /* we add same id on different level (should add, not update) */
-    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 2, 100, 3000, 150000), 0);
+    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 2, 100, 3000, 150000, MANIFEST_NO_PARTITION),
+              0);
     ASSERT_EQ(manifest->num_entries, 3);
 
     /* we verify all entries exist */
@@ -784,7 +795,7 @@ void test_manifest_null_safety(void)
     ASSERT_TRUE(tidesdb_manifest_open(NULL) == NULL);
 
     /* tidesdb_manifest_add_sstable with NULL manifest */
-    ASSERT_EQ(tidesdb_manifest_add_sstable(NULL, 1, 100, 1000, 65536), -1);
+    ASSERT_EQ(tidesdb_manifest_add_sstable(NULL, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION), -1);
 
     /* tidesdb_manifest_remove_sstable with NULL manifest */
     ASSERT_EQ(tidesdb_manifest_remove_sstable(NULL, 1, 100), -1);
@@ -817,14 +828,14 @@ void test_manifest_commit_different_path(void)
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(path1);
     ASSERT_TRUE(manifest != NULL);
 
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(manifest, 5000);
 
     /* we commit to path1 first */
     ASSERT_EQ(tidesdb_manifest_commit(manifest, path1, 1), 0);
 
     /* we add more data and commit to a different path */
-    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(manifest, 6000);
     ASSERT_EQ(tidesdb_manifest_commit(manifest, path2, 1), 0);
 
@@ -874,7 +885,7 @@ void test_manifest_remove_to_zero(void)
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
     ASSERT_EQ(manifest->num_entries, 1);
 
     /* we remove the sole entry */
@@ -883,7 +894,8 @@ void test_manifest_remove_to_zero(void)
     ASSERT_FALSE(tidesdb_manifest_has_sstable(manifest, 1, 100));
 
     /* we verify we can still add after emptying */
-    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072), 0);
+    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION),
+              0);
     ASSERT_EQ(manifest->num_entries, 1);
     ASSERT_TRUE(tidesdb_manifest_has_sstable(manifest, 2, 200));
 
@@ -925,7 +937,8 @@ void test_manifest_large_uint64_roundtrip(void)
     const uint64_t large_entries = UINT64_MAX / 2;
     const uint64_t large_size = UINT64_MAX;
 
-    tidesdb_manifest_add_sstable(manifest, 1, large_id, large_entries, large_size);
+    tidesdb_manifest_add_sstable(manifest, 1, large_id, large_entries, large_size,
+                                 MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(manifest, UINT64_MAX);
 
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
@@ -951,8 +964,8 @@ void test_manifest_v8_checksum_roundtrip(void)
 
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(manifest != NULL);
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
-    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
     tidesdb_manifest_update_sequence(manifest, 4242);
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
@@ -984,9 +997,9 @@ void test_manifest_self_heals_on_corruption(void)
     /* build a two-commit log so there is a non-final block to corrupt */
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(manifest != NULL);
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
-    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072, MANIFEST_NO_PARTITION);
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 1), 0);
     tidesdb_manifest_close(manifest);
 
@@ -1022,7 +1035,7 @@ void test_manifest_self_heals_on_corruption(void)
 
         tidesdb_manifest_t *mc = tidesdb_manifest_open(test_path);
         ASSERT_TRUE(mc != NULL);
-        ASSERT_EQ(tidesdb_manifest_add_sstable(mc, 5, 500, 5000, 4096), 0);
+        ASSERT_EQ(tidesdb_manifest_add_sstable(mc, 5, 500, 5000, 4096, MANIFEST_NO_PARTITION), 0);
         ASSERT_EQ(tidesdb_manifest_commit(mc, test_path, 1), 0);
         tidesdb_manifest_close(mc);
 

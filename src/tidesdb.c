@@ -183,11 +183,6 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_ITER_STACK_KEY_SIZE     256
 #define TDB_BACKUP_COPY_BUFFER_SIZE (256 * 1024)
 
-/* shift used to combine two uint32_t halves (sq_hi, sq_lo) back into the original uint64_t
- * abs_seq stored in the block index. inverse of the (uint32_t)val / (uint32_t)(val >> 32)
- * split at write time. */
-#define TDB_U64_HI_LO_SHIFT 32
-
 /* initial capacity (and grow floor) for the iterator's double-buffered pop arena that
  * lets merge_heap_pop materialise borrowed kvs without malloc. capacity grows to fit
  * larger kvs but never shrinks below this. */
@@ -220,9 +215,6 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_RECOVER_IMM_SCAN_STACK 64 /* stack slots for the recovery max-seq immutable scan */
 #define TDB_STACK_COMMIT_HOOK_OPS  16 /* stack slots for commit hook operations */
 #define TDB_STACK_ITER_SOURCES     16 /* stack slots for iterator temp_sources */
-
-/* default column family config values */
-#define TDB_INITIAL_BLOCK_INDEX_CAPACITY 16
 
 /* worst-case bytes for a LEB128 varint encoding of a uint64_t -- 7 data bits per byte plus
  * a continuation bit, ceil(64/7) = 10 */
@@ -364,6 +356,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 /* default L0/L1 management configuration */
 #define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
 #define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD 10
+/* db-level L0 stall threshold for the shared unified immutable queue (unified mode) */
+#define TDB_DEFAULT_UNIFIED_L0_QUEUE_STALL_THRESHOLD 10
 
 /* default tombstone density trigger configuration -- 0.0 disables the check, an sstable
  * must hold at least TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES entries before its density
@@ -1810,13 +1804,16 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
     if (stall < 1) stall = 1;
     if (cf->db)
     {
-        /* unified mode has a single shared immutable queue, so the per-CF memory-budget split
-         * below does not apply -- use the configured value. its memory is unified_wbuf x depth
-         * regardless of CF count, so no division is needed. note apply_backpressure runs per
-         * committing CF, so this shared queue is paced by whichever CF is committing -- per-CF
-         * thresholds that differ pace it inconsistently (the depth is bounded by the largest of
-         * them); with the default threshold across CFs it stalls coherently at one depth. */
-        if (cf->db->unified_mt.enabled) return stall;
+        /* unified mode has a single shared immutable queue bounded by one db-level threshold, so
+         * every committing CF paces it against the same value -- no per-CF drift. its memory is
+         * unified_wbuf x depth regardless of CF count, so the per-CF memory-budget split below does
+         * not apply. */
+        if (cf->db->unified_mt.enabled)
+        {
+            size_t ustall = (size_t)cf->db->config.unified_memtable_l0_queue_stall_threshold;
+            if (ustall < 1) ustall = 1;
+            return ustall;
+        }
 
         const int num_cfs = cf->db->num_column_families;
         if (num_cfs > 1)
@@ -1848,6 +1845,22 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
 static inline size_t tdb_cf_immutable_hard_cap(const tidesdb_column_family_t *cf)
 {
     size_t stall = (size_t)cf->config.l0_queue_stall_threshold;
+    if (stall < 1) stall = 1;
+    return stall + TDB_IMM_QUEUE_HEADROOM;
+}
+
+/**
+ * tdb_unified_immutable_hard_cap
+ * last-resort ceiling on the shared unified immutable-queue depth, the db-level unified L0 stall
+ * threshold plus the same freeze headroom as the per-CF cap. the unified rotate path enforces this
+ * so the shared queue is bounded even when a rotation is driven from a path that bypasses the
+ * apply_backpressure ladder (the reaper's memory-pressure rotate, the ceiling-stall rotate).
+ * @param db database
+ * @return hard-cap depth, always greater than the unified stall threshold
+ */
+static inline size_t tdb_unified_immutable_hard_cap(const tidesdb_t *db)
+{
+    size_t stall = (size_t)db->config.unified_memtable_l0_queue_stall_threshold;
     if (stall < 1) stall = 1;
     return stall + TDB_IMM_QUEUE_HEADROOM;
 }
@@ -2914,7 +2927,6 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .use_btree = 0,
         .commit_hook_fn = NULL,
         .commit_hook_ctx = NULL,
-        .object_target_file_size = 0, /* reserved, not used */
         .object_lazy_compaction = 0,
         .object_prefetch_compaction = 1};
 
@@ -2949,6 +2961,7 @@ tidesdb_config_t tidesdb_default_config(void)
         .unified_memtable_skip_list_probability = 0,
         .unified_memtable_sync_mode = 0,
         .unified_memtable_sync_interval_us = 0,
+        .unified_memtable_l0_queue_stall_threshold = TDB_DEFAULT_UNIFIED_L0_QUEUE_STALL_THRESHOLD,
         .object_store = NULL,
         .object_store_config = NULL,
         .max_concurrent_flushes = 0,       /* 0 = pin to resolved num_flush_threads */
@@ -5110,7 +5123,11 @@ static int tdb_objstore_download_if_missing(const tidesdb_t *db, const char *loc
         }
     }
 
-    if (db->local_cache) tdb_local_cache_track(db->local_cache, local_path);
+    /* track the just-downloaded object in the bounded local cache (evict + re-fetch on a miss) only
+     * when cache_on_read is set; otherwise the local copy stays pinned on disk. */
+    if (db->local_cache &&
+        (!db->config.object_store_config || db->config.object_store_config->cache_on_read))
+        tdb_local_cache_track(db->local_cache, local_path);
     return 0;
 }
 
@@ -5493,6 +5510,11 @@ static void tdb_objstore_upload_manifest(tidesdb_t *db, tidesdb_column_family_t 
      * it would obsolete the primary's real-data sstables. mirrors the sstable-upload gate in
      * tidesdb_level_add_sstable; promotion clears replica_mode before any primary write. */
     if (atomic_load_explicit(&db->replica_mode, memory_order_acquire)) return;
+
+    /* the operator can opt out of publishing the manifest to the object store. sstables and WALs
+     * still upload; only the manifest object is withheld (e.g. an external process owns it). */
+    if (db->config.object_store_config && !db->config.object_store_config->sync_manifest_to_object)
+        return;
 
     if (tdb_objstore_fencing_enabled(db))
     {
@@ -10334,8 +10356,13 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
     {
         if (!atomic_load_explicit(&sst->db->replica_mode, memory_order_acquire))
         {
-            tdb_objstore_upload_file_sync(sst->db, sst->klog_path, 1);
-            tdb_objstore_upload_file_sync(sst->db, sst->vlog_path, 1);
+            /* track the freshly uploaded sstable in the bounded local cache (so it can be evicted
+             * and re-fetched on a miss) only when cache_on_write is set; otherwise the local copy
+             * stays pinned on disk. */
+            const int track = !sst->db->config.object_store_config ||
+                              sst->db->config.object_store_config->cache_on_write;
+            tdb_objstore_upload_file_sync(sst->db, sst->klog_path, track);
+            tdb_objstore_upload_file_sync(sst->db, sst->vlog_path, track);
         }
         else if (sst->db->local_cache)
         {
@@ -19930,12 +19957,21 @@ static void *tidesdb_reaper_thread(void *arg)
                 }
                 else if (level >= TDB_MEMORY_PRESSURE_CRITICAL)
                 {
-                    /* critical -- force-flush every CF that holds data. flushing an empty active
-                     * sheds nothing and only churns an immutable + a post-flush compaction, so skip
-                     * those; any CF with data is flushed so memory still drains across all of them.
+                    /* critical -- force-flush every CF that holds data. collect the victims under
+                     * the list lock and flush after releasing it, the same collect-then-release
+                     * shape the deferred-flush and HIGH-victim paths use, so a flush never runs
+                     * while holding cf_list_lock (which would block CF create/drop). flushing an
+                     * empty active sheds nothing and only churns an immutable + a post-flush
+                     * compaction, so skip those. bounded per cycle; sustained pressure re-fires and
+                     * drains the rest.
                      */
+                    tidesdb_column_family_t *crit_cfs[TDB_REAPER_DEFERRED_FLUSH_BATCH];
+                    size_t crit_sizes[TDB_REAPER_DEFERRED_FLUSH_BATCH];
+                    int crit_count = 0;
                     pthread_rwlock_rdlock(&db->cf_list_lock);
-                    for (int i = 0; i < db->num_column_families; i++)
+                    for (int i = 0; i < db->num_column_families &&
+                                    crit_count < TDB_REAPER_DEFERRED_FLUSH_BATCH;
+                         i++)
                     {
                         tidesdb_column_family_t *victim = db->column_families[i];
                         if (!victim) continue;
@@ -19952,14 +19988,27 @@ static void *tidesdb_reaper_thread(void *arg)
                         }
                         if (vsize == 0) continue;
 
+                        crit_cfs[crit_count] = victim;
+                        crit_sizes[crit_count] = vsize;
+                        crit_count++;
+                    }
+                    pthread_rwlock_unlock(&db->cf_list_lock);
+
+                    for (int i = 0; i < crit_count; i++)
+                    {
+                        /* skip a CF already at the immutable hard cap so flush_memtable_internal
+                         * does not usleep-block the reaper up to 5s waiting for it to drain -- a
+                         * later cycle retries once flushes have made room. */
+                        if (queue_size(crit_cfs[i]->immutable_memtables) >=
+                            tdb_cf_immutable_hard_cap(crit_cfs[i]))
+                            continue;
                         TDB_DEBUG_LOG(TDB_LOG_WARN,
                                       "Memory pressure CRITICAL flushing CF '%s' (%zu bytes, "
                                       "global %" PRId64 "/%zu bytes, %.1f%%)",
-                                      victim->name, vsize, total_mem_bytes, mem_limit,
+                                      crit_cfs[i]->name, crit_sizes[i], total_mem_bytes, mem_limit,
                                       ratio * 100.0);
-                        tidesdb_flush_memtable_internal(victim, 0, 1);
+                        tidesdb_flush_memtable_internal(crit_cfs[i], 0, 1);
                     }
-                    pthread_rwlock_unlock(&db->cf_list_lock);
                 }
                 else if (flush_victim && flush_victim_size > 0)
                 {
@@ -20113,10 +20162,17 @@ static void *tidesdb_reaper_thread(void *arg)
          * where the scan loop may take longer due to scheduler behavior */
         int shutdown_requested = 0;
         pthread_rwlock_rdlock(&db->cf_list_lock);
-        for (int i = 0; i < db->num_column_families && !shutdown_requested &&
-                        candidate_count < candidate_capacity;
-             i++)
+        /* resume from where the last scan left off and wrap, so eviction sweeps every CF across
+         * cycles instead of always restarting at CF 0 and starving later CFs of fd reclamation */
+        const int reap_num_cfs = db->num_column_families;
+        int reap_start_cf = db->reap_scan_cursor;
+        if (reap_start_cf < 0 || reap_start_cf >= reap_num_cfs) reap_start_cf = 0;
+        int reap_last_cf = reap_start_cf;
+        for (int c = 0;
+             c < reap_num_cfs && !shutdown_requested && candidate_count < candidate_capacity; c++)
         {
+            const int i = (reap_start_cf + c) % reap_num_cfs;
+            reap_last_cf = i;
             tidesdb_column_family_t *cf = db->column_families[i];
             if (!cf) continue;
 
@@ -20194,6 +20250,8 @@ static void *tidesdb_reaper_thread(void *arg)
                 atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
             }
         }
+        /* advance the resume cursor just past the last CF we started this scan */
+        if (reap_num_cfs > 0) db->reap_scan_cursor = (reap_last_cf + 1) % reap_num_cfs;
         pthread_rwlock_unlock(&db->cf_list_lock);
 
         /* if shutdown was requested during scan, release any acquired refs and exit */
@@ -21030,6 +21088,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         (*db)->unified_mt.write_buffer_size = config->unified_memtable_write_buffer_size > 0
                                                   ? config->unified_memtable_write_buffer_size
                                                   : TDB_DEFAULT_WRITE_BUFFER_SIZE;
+
+        /* resolve the shared-queue stall threshold once so the backpressure ladder and the rotate
+         * hard cap read one coherent db-level value */
+        if ((*db)->config.unified_memtable_l0_queue_stall_threshold <= 0)
+            (*db)->config.unified_memtable_l0_queue_stall_threshold =
+                TDB_DEFAULT_UNIFIED_L0_QUEUE_STALL_THRESHOLD;
 
         (*db)->unified_mt.immutables = queue_new();
         if (!(*db)->unified_mt.immutables)
@@ -25300,6 +25364,22 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
 }
 
 /**
+ * tidesdb_txn_begin_cf
+ * begins a transaction at a column family's configured default isolation level. the transaction
+ * is still database-scoped and may touch any column family; the cf only supplies the initial
+ * isolation level.
+ * @param db database handle
+ * @param cf column family whose default isolation level to use
+ * @param txn output transaction handle
+ * @return TDB_SUCCESS or error code
+ */
+int tidesdb_txn_begin_cf(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t **txn)
+{
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+    return tidesdb_txn_begin_with_isolation(db, cf->config.default_isolation_level, txn);
+}
+
+/**
  * tidesdb_txn_begin_with_isolation
  * begins a new transaction with specified isolation level
  *
@@ -28436,7 +28516,7 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     /* skip rotating an empty active -- some callers (the reaper's memory-pressure rotate, the
      * apply_backpressure ceiling path) invoke this without first checking that the active holds
      * data. when writes are blocked under sustained pressure the active is empty, and rotating it
-     * anyway churns empty immutables onto the unbounded unified immutable queue, allocates a fresh
+     * anyway churns empty immutables onto the shared unified immutable queue, allocates a fresh
      * arena and a new WAL file with a directory sync, and enqueues an empty flush -- all of which
      * sheds nothing. the caller holds the single-rotator is_flushing CAS, so old_mt cannot be
      * swapped/freed here; a concurrent writer appending one entry at most defers this rotate one
@@ -28497,6 +28577,31 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     atomic_init(&new_mt->refcount, 1);
     atomic_init(&new_mt->writers, 0);
     atomic_init(&new_mt->flushed, 0);
+
+    /* enforce a hard cap on the shared immutable queue so it cannot grow unbounded when a rotation
+     * is driven from a path that bypasses the apply_backpressure ladder. mirrors the per-CF cap in
+     * tidesdb_flush_memtable_internal -- block briefly to let the flush workers drain, a
+     * last-resort safety net above the graduated stall. */
+    {
+        const size_t hard_cap = tdb_unified_immutable_hard_cap(db);
+        if (queue_size(db->unified_mt.immutables) >= hard_cap)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Unified immutable queue at hard cap %zu, blocking until drained",
+                          hard_cap);
+            int wait_iters = 0;
+            while (queue_size(db->unified_mt.immutables) >= hard_cap &&
+                   wait_iters < TDB_IMMUTABLE_HARD_CAP_MAX_WAIT)
+            {
+                usleep(TDB_IMMUTABLE_HARD_CAP_WAIT_US);
+                wait_iters++;
+            }
+            if (wait_iters >= TDB_IMMUTABLE_HARD_CAP_MAX_WAIT)
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Unified immutable queue hard cap wait timeout after %d ms",
+                              wait_iters * (TDB_IMMUTABLE_HARD_CAP_WAIT_US / 1000));
+        }
+    }
 
     /* enqueue old onto the immutable queue before swapping the active pointer. this eliminates the
      * read visibility gap where a reader loads the new (empty) active and then walks the immutable
@@ -28747,7 +28852,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             if (!tidesdb_active_memtable_try_ref(&txn->db->unified_mt.active_mt_readers,
                                                  &txn->db->unified_mt.active, &umt))
             {
-                if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
+                if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_BUSY;
                 continue;
             }
             /* mark this writer in-flight before the revalidate, mirroring the
@@ -28760,7 +28865,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 break;
             atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
             atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
-            if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_UNKNOWN;
+            if (++umt_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS) return TDB_ERR_BUSY;
         }
 
         /* we serialize unified WAL batch */
@@ -29009,9 +29114,10 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
             if (++acquire_attempts >= TDB_ACTIVE_REF_MAX_ATTEMPTS)
             {
-                /* active is rotating faster than we can latch it -- fail the
-                 * commit; cleanup releases the memtables latched for earlier CFs */
-                result = TDB_ERR_UNKNOWN;
+                /* active is rotating faster than we can latch it -- give up this
+                 * commit with a retryable busy; cleanup releases the memtables
+                 * latched for earlier CFs. transient contention, not a failure */
+                result = TDB_ERR_BUSY;
                 goto cleanup;
             }
         }

@@ -90,6 +90,39 @@ static void test_basic_open_close(void)
     cleanup_test_dir();
 }
 
+/* tidesdb_txn_begin_cf opens a transaction at the column family's configured default isolation
+ * level, so a CF created with a non-default default_isolation_level yields a txn at that level
+ * while the plain tidesdb_txn_begin stays READ_COMMITTED regardless of the cf setting. */
+static void test_txn_begin_cf_uses_cf_default_isolation(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+    cfg.default_isolation_level = TDB_ISOLATION_SERIALIZABLE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "iso_cf", &cfg), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iso_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_cf(db, cf, &txn), 0);
+    ASSERT_EQ(txn->isolation_level, TDB_ISOLATION_SERIALIZABLE);
+    tidesdb_txn_commit(txn);
+
+    /* a NULL cf is rejected */
+    tidesdb_txn_t *null_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_cf(db, NULL, &null_txn), TDB_ERR_INVALID_ARGS);
+
+    /* the plain begin still uses READ_COMMITTED, unaffected by the cf's setting */
+    tidesdb_txn_t *rc_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &rc_txn), 0);
+    ASSERT_EQ(rc_txn->isolation_level, TDB_ISOLATION_READ_COMMITTED);
+    tidesdb_txn_commit(rc_txn);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 /* custom allocator test tracking variables */
 static atomic_int custom_malloc_count;
 static atomic_int custom_calloc_count;
@@ -32883,6 +32916,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_list_prefix, tests_passed);
     RUN_TEST(test_objstore_wal_sync_on_commit, tests_passed);
     RUN_TEST(test_btree_multi_cf_vlog_isolation, tests_passed);
+    RUN_TEST(test_txn_begin_cf_uses_cf_default_isolation, tests_passed);
     RUN_TEST(test_replica_mode, tests_passed);
     RUN_TEST(test_primary_replica_failover, tests_passed);
 #ifdef TIDESDB_WITH_S3

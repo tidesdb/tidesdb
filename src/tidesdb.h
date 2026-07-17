@@ -391,8 +391,6 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param use_btree use btree for klog, faster reads depending on workload
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size reserved for API compatibility, not used (file_max is derived from
- * level geometry per spooky algorithm 2)
  * @param object_lazy_compaction lazy compaction flag (1 = less aggressive, 0 = aggressive)
  * @param object_prefetch_compaction prefetch compaction flag (1 = download all inputs before merge,
  * 0 = stream)
@@ -426,7 +424,6 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
-    size_t object_target_file_size; /* reserved, not used */
     int object_lazy_compaction;
     int object_prefetch_compaction;
 } tidesdb_column_family_config_t;
@@ -468,6 +465,10 @@ typedef struct tidesdb_comparator_entry_t
  * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
  * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
+ * @param unified_memtable_l0_queue_stall_threshold immutable-queue depth at which writer
+ *                               backpressure hard-stalls in unified mode. the shared unified
+ *                               immutable queue is db-wide, so it is bounded by this one db-level
+ *                               value rather than a per-column-family threshold. 0 = default
  * @param object_store object store instance (NULL = local only, default)
  * @param object_store_config object store configuration (NULL = use defaults)
  * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
@@ -500,6 +501,7 @@ typedef struct tidesdb_config_t
     float unified_memtable_skip_list_probability;
     int unified_memtable_sync_mode;
     uint64_t unified_memtable_sync_interval_us;
+    int unified_memtable_l0_queue_stall_threshold;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
     int max_concurrent_flushes;
@@ -884,6 +886,9 @@ struct tidesdb_t
     _Atomic(int) reaper_active;
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
+    /* column-family index the next fd-eviction scan resumes from, so the scan sweeps every CF
+     * across cycles instead of always restarting at the front. reaper-thread-only, no atomic. */
+    int reap_scan_cursor;
     clock_cache_t *clock_cache;
     /* created lazily after worker threads are running, so the pointer is
      * _Atomic -- btree_cache_lock still serializes the one-time creation */
@@ -1498,6 +1503,19 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn);
  */
 int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t isolation,
                                      tidesdb_txn_t **txn);
+
+/**
+ * tidesdb_txn_begin_cf
+ * begins a transaction at a column family's configured default isolation level
+ * (tidesdb_column_family_config_t.default_isolation_level). the transaction is still
+ * database-scoped and may touch any column family; the cf only supplies the initial isolation
+ * level.
+ * @param db database handle
+ * @param cf column family whose default isolation level to use
+ * @param txn pointer to transaction handle
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_begin_cf(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t **txn);
 
 /**
  * tidesdb_txn_put

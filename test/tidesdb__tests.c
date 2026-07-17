@@ -108,6 +108,7 @@ static void test_txn_begin_cf_uses_cf_default_isolation(void)
     ASSERT_EQ(tidesdb_txn_begin_cf(db, cf, &txn), 0);
     ASSERT_EQ(txn->isolation_level, TDB_ISOLATION_SERIALIZABLE);
     tidesdb_txn_commit(txn);
+    tidesdb_txn_free(txn);
 
     /* a NULL cf is rejected */
     tidesdb_txn_t *null_txn = NULL;
@@ -118,6 +119,7 @@ static void test_txn_begin_cf_uses_cf_default_isolation(void)
     ASSERT_EQ(tidesdb_txn_begin(db, &rc_txn), 0);
     ASSERT_EQ(rc_txn->isolation_level, TDB_ISOLATION_READ_COMMITTED);
     tidesdb_txn_commit(rc_txn);
+    tidesdb_txn_free(rc_txn);
 
     ASSERT_EQ(tidesdb_close(db), 0);
     cleanup_test_dir();

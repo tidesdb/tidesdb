@@ -1802,6 +1802,11 @@ static inline FILE *tdb_fopen(const char *filename, const char *mode)
 {
     return fopen(filename, mode);
 }
+
+/* MinGW's ftell/fseek are 32-bit (long) even on 64-bit targets, so they fail with -1 on files
+ * >= 2 GiB. redirect to the 64-bit CRT entry points, mirroring the MSVC branch above. */
+#define ftell _ftelli64
+#define fseek _fseeki64
 #endif
 
 #if defined(__MINGW32__) || defined(__MINGW64__)

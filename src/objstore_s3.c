@@ -1270,7 +1270,7 @@ static int s3_multipart_abort(s3_ctx_t *s3, const char *key, const char *upload_
  * @param file_size size of the file in bytes
  * @return 0 on success, -1 on error
  */
-static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, long file_size)
+static int s3_put_single(s3_ctx_t *s3, const char *key, FILE *fp, int64_t file_size)
 {
     struct curl_slist *headers = s3_sign_request(s3, "PUT", key, "UNSIGNED-PAYLOAD", NULL, NULL);
 
@@ -1387,7 +1387,7 @@ static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb
         fclose(fp);
         return -1;
     }
-    long file_size = ftell(fp);
+    int64_t file_size = ftell(fp);
     if (file_size < 0)
     {
         fclose(fp);
@@ -1397,7 +1397,7 @@ static int s3_put_if(void *ctx, const char *key, const char *local_path, tidesdb
 
     /* upload only the logical length when asked, so a WAL's preallocated zero tail is not shipped.
      * curl uploads exactly INFILESIZE bytes from the read stream. */
-    if (max_bytes > 0 && (long)max_bytes < file_size) file_size = (long)max_bytes;
+    if (max_bytes > 0 && (int64_t)max_bytes < file_size) file_size = (int64_t)max_bytes;
 
     /* x-amz-* metadata must be signed; build the canonical (trailing newline preserves the
      * SigV4 separator line) and signed-header fragments. the epoch sorts after x-amz-date. */
@@ -1526,7 +1526,7 @@ static int s3_head(void *ctx, const char *key, char *etag_out, size_t etag_out_s
  * @param file_size size of the file in bytes
  * @return 0 on success, -1 on error
  */
-static int s3_put_multipart(s3_ctx_t *s3, const char *key, FILE *fp, long file_size)
+static int s3_put_multipart(s3_ctx_t *s3, const char *key, FILE *fp, int64_t file_size)
 {
     const size_t part_size = s3->multipart_part_size; /* resolved to a default at create time */
 
@@ -1607,7 +1607,7 @@ static int s3_put(void *ctx, const char *key, const char *local_path)
         fclose(fp);
         return -1;
     }
-    long file_size = ftell(fp);
+    int64_t file_size = ftell(fp);
     if (file_size < 0)
     {
         fclose(fp);

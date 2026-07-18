@@ -18859,6 +18859,10 @@ static int tidesdb_flush_write_l1_partitions(tidesdb_column_family_t *cf, skip_l
                                              int max_parts)
 {
     tidesdb_t *db = cf->db;
+    /* the flush worker only ever reaches here with an open cf, but stating it lets the optimizer
+     * see db is non-null when this inlines -- gcc otherwise assumes it may be address zero and
+     * warns that the num_open_sstables decrement below writes into a zero-sized region */
+    if (!db) return TDB_ERR_INVALID_ARGS;
     *out_count = 0;
 
     uint8_t **splits = NULL;
@@ -29319,6 +29323,25 @@ static int tidesdb_txn_reserve_writes(tidesdb_txn_t *txn)
     return TDB_SUCCESS;
 }
 
+/**
+ * tdb_commit_needs_durable_wal
+ * whether a commit must block until the flush thread has pwritten its wal record to the file. any
+ * sync mode above NONE needs it for the durability it promises. wal_sync_on_commit needs it too
+ * even under NONE, because its per-commit upload ships the file's bytes -- a record still staged in
+ * the buffered-append ring would be acked but absent from the object store, so a hard kill would
+ * lose an acked write and break the rpo=0 contract. plain NONE with no such upload skips the wait,
+ * since nothing reads the file before the sstable lands.
+ * @param db database instance
+ * @param sync_mode the wal's configured sync mode
+ * @return 1 when the commit must wait for durability, 0 when it may return immediately
+ */
+static inline int tdb_commit_needs_durable_wal(const tidesdb_t *db, const int sync_mode)
+{
+    if (sync_mode != TDB_SYNC_NONE) return 1;
+    return db && db->object_store && db->config.object_store_config &&
+           db->config.object_store_config->wal_sync_on_commit;
+}
+
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn || txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
@@ -29432,13 +29455,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                                       block_manager_framed_size((uint32_t)uwal_size),
                                       memory_order_relaxed);
 
-            /* buffered WAL -- for FULL/INTERVAL, block until the single flush thread has pwritten
-             * this record to the page cache before the commit returns, matching the process-crash
-             * durability the direct path provides synchronously. NONE means no sync, so the record
-             * is staged in the ring and the flush thread pwrites it asynchronously while the commit
-             * returns without waiting, and an acked write is durable only once its sstable lands.
-             * no-op on a non-buffered WAL. */
-            if (txn->db->config.unified_memtable_sync_mode != TDB_SYNC_NONE &&
+            /* buffered WAL -- block until the single flush thread has pwritten this record to the
+             * page cache before the commit returns, matching the process-crash durability the
+             * direct path provides synchronously. plain NONE skips the wait, so the record is
+             * staged in the ring and pwritten asynchronously while the commit returns, and an acked
+             * write is durable only once its sstable lands. wal_sync_on_commit still waits even
+             * under NONE because its upload ships the file's bytes, and a record left in the ring
+             * would be acked but missing from the object store. no-op on a non-buffered WAL. */
+            if (tdb_commit_needs_durable_wal(txn->db, txn->db->config.unified_memtable_sync_mode) &&
                 block_manager_wait_durable(umt->wal, uwal_end) != 0)
             {
                 if (uwal_batch != uwal_stack_buf) free(uwal_batch);
@@ -29703,13 +29727,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                                       block_manager_framed_size((uint32_t)wal_size),
                                       memory_order_relaxed);
 
-            /* buffered WAL -- for FULL/INTERVAL, wait for the single flush thread to make this
-             * record durable (page cache, and fdatasync'd when FULL) before applying to the
-             * memtable, matching the durability the direct path provides inline. NONE means no
-             * sync, so the record is staged in the ring and pwritten asynchronously while the
-             * commit returns without waiting, and an acked write is durable only once its sstable
-             * lands. no-op on a direct WAL. */
-            if (cf->config.sync_mode != TDB_SYNC_NONE &&
+            /* buffered WAL -- wait for the single flush thread to make this record durable (page
+             * cache, and fdatasync'd when FULL) before applying to the memtable, matching the
+             * durability the direct path provides inline. plain NONE skips the wait, so the record
+             * is staged in the ring and pwritten asynchronously while the commit returns, and an
+             * acked write is durable only once its sstable lands. wal_sync_on_commit still waits
+             * even under NONE because its upload ships the file's bytes, and a record left in the
+             * ring would be acked but missing from the object store. no-op on a direct WAL. */
+            if (tdb_commit_needs_durable_wal(cf->db, cf->config.sync_mode) &&
                 block_manager_wait_durable(
                     wal, (uint64_t)wal_result + block_manager_framed_size((uint32_t)wal_size)) != 0)
             {

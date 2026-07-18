@@ -371,24 +371,23 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_BACKPRESSURE_STALL_MAX_ITERATIONS                                                    \
     1000 /* ~10s poll budget at STALL_CHECK_INTERVAL_US; L0 stall counts consecutive no-progress \
             polls, memory-pressure stall counts total */
-#define TDB_BACKPRESSURE_HIGH_DELAY_US            2000 /* 2ms for high pressure */
-#define TDB_BACKPRESSURE_ELEVATED_DELAY_US        200 /* 0.2ms yield for elevated memory pressure */
-#define TDB_BACKPRESSURE_MODERATE_DELAY_US        500 /* 0.5ms for moderate pressure */
-#define TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO     0.8 /* 80% of stall threshold */
-#define TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO 0.5 /* 50% of stall threshold */
-#define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       4   /* 4x L1 trigger = high  */
-#define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   3   /* 3x L1 trigger = moderate */
+#define TDB_BACKPRESSURE_HIGH_DELAY_US     2000 /* 2ms yield for high memory pressure */
+#define TDB_BACKPRESSURE_ELEVATED_DELAY_US 200  /* 0.2ms yield for elevated memory pressure */
 /* active memtable hard ceiling as a multiple of write_buffer_size. the
  * commit-time threshold check allows up to 1.5x for batching headroom; this
  * leaves a small overshoot margin above that before apply_backpressure
  * stalls the writer until rotation completes */
 #define TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT 2
-/* proportional pre-throttle on the active-memtable ceiling. instead of a binary wall (no delay
- * below the ceiling, then a multi-second block at it) the writer is paced by a convex ramp once the
- * active passes RAMP_LO_RATIO of the ceiling, reaching RAMP_MAX_DELAY_US right at the ceiling. this
- * lets flush catch up before the hard stall, turning the latency cliff into a gentle rise. */
-#define TDB_BACKPRESSURE_RAMP_LO_RATIO     0.75
+/* proportional pre-throttle driven by a single normalized pressure scalar (the worse of the
+ * L0-queue and active-memtable fill fractions). instead of binary walls the writer is paced by one
+ * convex ramp that starts at RAMP_KNEE of the ceiling and reaches RAMP_MAX_DELAY_US of budget right
+ * at it, so flush catches up before the hard stall and the latency cliff becomes a gentle rise. the
+ * ramp wait is progress-coupled -- polled in RAMP_POLL_US quanta and cut short the moment a flush
+ * advances the heartbeat -- so a bursty writer barely pauses while a saturated one paces down to
+ * the drain rate. */
+#define TDB_BACKPRESSURE_RAMP_KNEE         0.5
 #define TDB_BACKPRESSURE_RAMP_MAX_DELAY_US 4000
+#define TDB_BACKPRESSURE_RAMP_POLL_US      100
 
 /* backpressure stall warnings (ceiling stall, immutable-queue-critical) are emitted from the
  * write/flush hot paths -- a per-event log floods under sustained backpressure (every stalling
@@ -24229,8 +24228,11 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
         }
     }
 
-    /* we sync CF directory to persist new WAL file entry */
-    if (new_wal) tdb_sync_directory(cf->directory);
+    /* persist the new WAL's directory entry so crash recovery can find it -- but only when the CF
+     * asks for durability. under TDB_SYNC_NONE a crash may lose recent writes anyway, so the
+     * synchronous directory fsync (on the rotation critical path, blocking every writer behind the
+     * single rotator) buys nothing and is skipped. */
+    if (new_wal && cf->config.sync_mode != TDB_SYNC_NONE) tdb_sync_directory(cf->directory);
 
     /* we create new tidesdb_memtable_t structure pairing skip_list and wal */
     tidesdb_memtable_t *new_mt = malloc(sizeof(tidesdb_memtable_t));
@@ -24815,23 +24817,85 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    /* L0 depth -- in unified mode every write lands in the shared unified
-     * memtable, so the per-CF immutable queue stays empty and the unified
-     * immutable queue is the one to watch */
-    queue_t *l0_queue = (cf->db && cf->db->unified_mt.enabled && cf->db->unified_mt.immutables)
-                            ? cf->db->unified_mt.immutables
-                            : cf->immutable_memtables;
+    const int unified = (cf->db && cf->db->unified_mt.enabled);
+
+    /* L0 depth -- in unified mode every write lands in the shared unified memtable, so the per-CF
+     * immutable queue stays empty and the unified immutable queue is the one to watch */
+    queue_t *l0_queue = (unified && cf->db->unified_mt.immutables) ? cf->db->unified_mt.immutables
+                                                                   : cf->immutable_memtables;
     const size_t l0_queue_depth = queue_size(l0_queue);
-
-    /* we check L1 file count */
-    int l1_file_count = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-
     const size_t effective_stall = tdb_cf_effective_stall(cf);
-    const int effective_l1_trigger = tdb_cf_effective_l1_trigger(cf);
 
-    /** l0 queue exceeds threshold -- force blocking flush of all immutables
-     *  this prevents unbounded memory growth when flush worker falls behind */
-    int l0_delayed = 0; /* track if L0/L1 already applied a delay */
+    /* active memtable fill against its ceiling (2x write_buffer_size), unified or per-CF. this and
+     * the L0 queue are the two memory backstops. L1 file count intentionally does not gate writes
+     * -- compaction is structurally slower than flush inflow, so L1 settles at a workload-dependent
+     * count and gating on it converts a compaction-throughput limit into a stop-start stall that
+     * starves flushing. */
+    size_t ceiling = 0;
+    size_t active_size = 0;
+    if (unified && cf->db->unified_mt.write_buffer_size > 0)
+    {
+        ceiling = TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT * cf->db->unified_mt.write_buffer_size;
+        tidesdb_memtable_t *umt = NULL;
+        if (tidesdb_active_memtable_try_ref(&cf->db->unified_mt.active_mt_readers,
+                                            &cf->db->unified_mt.active, &umt))
+        {
+            if (umt->skip_list) active_size = (size_t)skip_list_get_size(umt->skip_list);
+            tidesdb_immutable_memtable_unref(umt);
+        }
+    }
+    else if (!unified && cf->config.write_buffer_size > 0)
+    {
+        ceiling = TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT * cf->config.write_buffer_size;
+        tidesdb_memtable_t *amt = NULL;
+        if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &amt))
+        {
+            if (amt->skip_list) active_size = (size_t)skip_list_get_size(amt->skip_list);
+            tidesdb_immutable_memtable_unref(amt);
+        }
+    }
+
+    /* the immutable (L0) queue depth is the backpressure signal -- it grows only when flush falls
+     * behind, normalized so 1.0 is the stall threshold. the active memtable's fill is deliberately
+     * NOT part of it: the active always rises to its rotation point and back every cycle, so pacing
+     * on it would throttle normal operation. the active memtable keeps only its hard ceiling below,
+     * as a rotation-stalled backstop. */
+    const double p = effective_stall > 0 ? (double)l0_queue_depth / (double)effective_stall : 0.0;
+
+    int paced = 0;
+
+    /* graduated pacing below the stall threshold. the delay budget rises quadratically from the
+     * knee up to 1.0, and the wait is progress-coupled -- it returns the instant a flush advances
+     * the heartbeat, so a bursty writer barely pauses while a saturated one paces down to the drain
+     * rate. */
+    if (cf->db && p > TDB_BACKPRESSURE_RAMP_KNEE && p < 1.0)
+    {
+        const double f = (p - TDB_BACKPRESSURE_RAMP_KNEE) / (1.0 - TDB_BACKPRESSURE_RAMP_KNEE);
+        const unsigned int budget_us = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
+        if (budget_us > 0)
+        {
+            const uint64_t start_hb =
+                atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
+            unsigned int waited = 0;
+            while (waited < budget_us)
+            {
+                unsigned int quantum = budget_us - waited;
+                if (quantum > TDB_BACKPRESSURE_RAMP_POLL_US)
+                    quantum = TDB_BACKPRESSURE_RAMP_POLL_US;
+                usleep(quantum);
+                waited += quantum;
+                if (atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed) !=
+                    start_hb)
+                    break;
+            }
+            paced = 1;
+        }
+    }
+
+    /** L0 queue at or over its stall threshold -- hard block until the flush worker drains it
+     * below, bounding memtable memory. a saturated system paces here; only a genuinely wedged flush
+     * engine (no progress for TDB_BACKPRESSURE_STALL_MAX_ITERATIONS polls) fails the commit with
+     * BUSY. */
     if (l0_queue_depth >= effective_stall)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN,
@@ -24881,237 +24945,138 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' L0 queue stall resolved after %dms", cf->name,
                       total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-        l0_delayed = 1;
+        paced = 1;
     }
 
-    /* L1 file count does not gate writes. compaction (L1->L2+) is serialized per CF and is
-     * structurally slower than flush inflow, so L1 settles at a workload-dependent count; blocking
-     * the write/flush pipeline on it only converts a compaction-throughput limit into a stop-start
-     * stall and starves flushing (which is independent of compaction). the L1 graduated *delays*
-     * below pace writes gently without stopping them, memtable memory is bounded by the L0 queue
-     * stall and the active-memtable ceiling, and the open-fd working set is bounded by the reader
-     * fd reserve plus the reaper -- none of which need L1 file count as a write gate. */
-
-    /* per-cf active memtable ceiling. tidesdb_flush_memtable_internal silently
-     * defers the rotate when the active_flushes slot cap is reached, so the L0
-     * queue stall and L1 file-count delays above are not enough to bound the
-     * active memtable when writes outpace the flush slots. stall the writer
-     * here when the active exceeds ACTIVE_MT_CEILING_MULT x write_buffer_size
-     * until rotation completes. unified mode uses its own branch below */
-    if (cf->db && !cf->db->unified_mt.enabled && cf->config.write_buffer_size > 0)
+    /** per-CF active memtable at or over its ceiling. tidesdb_flush_memtable_internal silently
+     * defers the rotate when the active_flushes slot cap is reached, so the L0 queue stall alone
+     * does not bound the active memtable when writes outpace the flush slots -- stall the writer
+     * here until rotation completes. */
+    if (!unified && ceiling > 0 && active_size >= ceiling)
     {
-        const size_t ceiling =
-            TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT * cf->config.write_buffer_size;
-        size_t active_size = 0;
-        tidesdb_memtable_t *amt = NULL;
-        if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &amt))
+        if (tdb_log_throttle(cf->db, &cf->last_ceiling_stall_log_sec,
+                             TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' active memtable ceiling stall %zu bytes >= %zu (%dx wbuf)",
+                          cf->name, active_size, ceiling, TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
+
+        /* kick a force-flush so rotation runs as soon as a slot frees, instead of waiting for the
+         * reaper's deferred-flush retry cycle. if the slot cap is hit this returns SUCCESS after
+         * setting flush_deferred=1 */
+        if (!atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
+            tidesdb_flush_memtable_internal(cf, 0, 1);
+
+        int total_iterations = 0;
+        int no_progress = 0;
+        size_t best_size = active_size;
+        uint64_t last_heartbeat =
+            atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
+        while (1)
         {
-            if (amt->skip_list) active_size = (size_t)skip_list_get_size(amt->skip_list);
-            tidesdb_immutable_memtable_unref(amt);
-        }
-        const size_t ramp_lo = (size_t)((double)ceiling * TDB_BACKPRESSURE_RAMP_LO_RATIO);
-        if (active_size > ramp_lo && active_size < ceiling)
-        {
-            const double f = (double)(active_size - ramp_lo) / (double)(ceiling - ramp_lo);
-            const unsigned int d = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
-            if (d > 0)
+            size_t cur_size = 0;
+            tidesdb_memtable_t *cur_amt = NULL;
+            if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
+                                                &cur_amt))
             {
-                usleep(d);
-                l0_delayed = 1;
+                if (cur_amt->skip_list) cur_size = (size_t)skip_list_get_size(cur_amt->skip_list);
+                tidesdb_immutable_memtable_unref(cur_amt);
             }
-        }
-        if (active_size >= ceiling)
-        {
-            if (tdb_log_throttle(cf->db, &cf->last_ceiling_stall_log_sec,
-                                 TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
-                TDB_DEBUG_LOG(TDB_LOG_WARN,
-                              "CF '%s' active memtable ceiling stall %zu bytes >= %zu (%dx wbuf)",
-                              cf->name, active_size, ceiling,
-                              TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
+            if (cur_size < ceiling) break;
 
-            /* kick a force-flush so rotation runs as soon as a slot frees, instead
-             * of waiting for the reaper's deferred-flush retry cycle. if the slot
-             * cap is hit this returns SUCCESS after setting flush_deferred=1 */
-            if (!atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
-                tidesdb_flush_memtable_internal(cf, 0, 1);
+            usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
+            total_iterations++;
 
-            int total_iterations = 0;
-            int no_progress = 0;
-            size_t best_size = active_size;
-            uint64_t last_heartbeat =
+            const uint64_t cur_heartbeat =
                 atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
-            while (1)
+            if (cur_size < best_size || cur_heartbeat != last_heartbeat)
             {
-                size_t cur_size = 0;
-                tidesdb_memtable_t *cur_amt = NULL;
-                if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable,
-                                                    &cur_amt))
-                {
-                    if (cur_amt->skip_list)
-                        cur_size = (size_t)skip_list_get_size(cur_amt->skip_list);
-                    tidesdb_immutable_memtable_unref(cur_amt);
-                }
-                if (cur_size < ceiling) break;
-
-                usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
-                total_iterations++;
-
-                const uint64_t cur_heartbeat =
-                    atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
-                if (cur_size < best_size || cur_heartbeat != last_heartbeat)
-                {
-                    best_size = cur_size;
-                    last_heartbeat = cur_heartbeat;
-                    no_progress = 0;
-                }
-                else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                  "CF '%s' active memtable ceiling stall, no rotate progress for "
-                                  "%dms - flush engine appears wedged",
-                                  cf->name,
-                                  no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-                    return TDB_ERR_BUSY;
-                }
+                best_size = cur_size;
+                last_heartbeat = cur_heartbeat;
+                no_progress = 0;
             }
-
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' active memtable ceiling stall resolved after %dms",
-                          cf->name,
-                          total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-            l0_delayed = 1;
+            else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "CF '%s' active memtable ceiling stall, no rotate progress for "
+                              "%dms - flush engine appears wedged",
+                              cf->name,
+                              no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+                return TDB_ERR_BUSY;
+            }
         }
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' active memtable ceiling stall resolved after %dms",
+                      cf->name,
+                      total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+        paced = 1;
     }
 
-    /* unified active memtable ceiling. tidesdb_unified_memtable_rotate runs
-     * under a single-rotator CAS on unified_mt.is_flushing -- every writer
-     * that loses the CAS skips the rotate and proceeds, so a burst of writers
-     * crossing the threshold simultaneously can pile data into the active
-     * before the winner publishes the new one. same shape as the per-cf
-     * stall above but rotation is kicked through the same CAS+rotate path
-     * tidesdb_txn_commit uses, not through flush_memtable_internal */
-    if (cf->db && cf->db->unified_mt.enabled && cf->db->unified_mt.write_buffer_size > 0)
+    /** unified active memtable at or over its ceiling. rotation runs under the single-rotator CAS
+     * on unified_mt.is_flushing -- a writer that loses the CAS skips the rotate and blocks below
+     * until the winner publishes the new active, rather than through flush_memtable_internal. */
+    if (unified && ceiling > 0 && active_size >= ceiling)
     {
-        const size_t u_ceiling =
-            TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT * cf->db->unified_mt.write_buffer_size;
-        size_t u_size = 0;
-        tidesdb_memtable_t *umt = NULL;
-        if (tidesdb_active_memtable_try_ref(&cf->db->unified_mt.active_mt_readers,
-                                            &cf->db->unified_mt.active, &umt))
-        {
-            if (umt->skip_list) u_size = (size_t)skip_list_get_size(umt->skip_list);
-            tidesdb_immutable_memtable_unref(umt);
-        }
-        const size_t u_ramp_lo = (size_t)((double)u_ceiling * TDB_BACKPRESSURE_RAMP_LO_RATIO);
-        if (u_size > u_ramp_lo && u_size < u_ceiling)
-        {
-            const double f = (double)(u_size - u_ramp_lo) / (double)(u_ceiling - u_ramp_lo);
-            const unsigned int d = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
-            if (d > 0)
-            {
-                usleep(d);
-                l0_delayed = 1;
-            }
-        }
-        if (u_size >= u_ceiling)
-        {
-            if (tdb_log_throttle(cf->db, &cf->db->unified_mt.last_ceiling_stall_log_sec,
-                                 TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
-                TDB_DEBUG_LOG(TDB_LOG_WARN,
-                              "Unified active memtable ceiling stall %zu bytes >= %zu (%dx wbuf)",
-                              u_size, u_ceiling, TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
+        if (tdb_log_throttle(cf->db, &cf->db->unified_mt.last_ceiling_stall_log_sec,
+                             TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Unified active memtable ceiling stall %zu bytes >= %zu (%dx wbuf)",
+                          active_size, ceiling, TDB_BACKPRESSURE_ACTIVE_MT_CEILING_MULT);
 
-            int expected = 0;
-            if (atomic_compare_exchange_strong_explicit(&cf->db->unified_mt.is_flushing, &expected,
-                                                        1, memory_order_acquire,
-                                                        memory_order_relaxed))
-            {
-                tidesdb_unified_memtable_rotate(cf->db);
-                atomic_store_explicit(&cf->db->unified_mt.is_flushing, 0, memory_order_release);
-            }
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&cf->db->unified_mt.is_flushing, &expected, 1,
+                                                    memory_order_acquire, memory_order_relaxed))
+        {
+            tidesdb_unified_memtable_rotate(cf->db);
+            atomic_store_explicit(&cf->db->unified_mt.is_flushing, 0, memory_order_release);
+        }
 
-            int total_iterations = 0;
-            int no_progress = 0;
-            size_t best_size = u_size;
-            uint64_t last_heartbeat =
+        int total_iterations = 0;
+        int no_progress = 0;
+        size_t best_size = active_size;
+        uint64_t last_heartbeat =
+            atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
+        while (1)
+        {
+            size_t cur_size = 0;
+            tidesdb_memtable_t *cur_umt = NULL;
+            if (tidesdb_active_memtable_try_ref(&cf->db->unified_mt.active_mt_readers,
+                                                &cf->db->unified_mt.active, &cur_umt))
+            {
+                if (cur_umt->skip_list) cur_size = (size_t)skip_list_get_size(cur_umt->skip_list);
+                tidesdb_immutable_memtable_unref(cur_umt);
+            }
+            if (cur_size < ceiling) break;
+
+            usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
+            total_iterations++;
+
+            const uint64_t cur_heartbeat =
                 atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
-            while (1)
+            if (cur_size < best_size || cur_heartbeat != last_heartbeat)
             {
-                size_t cur_size = 0;
-                tidesdb_memtable_t *cur_umt = NULL;
-                if (tidesdb_active_memtable_try_ref(&cf->db->unified_mt.active_mt_readers,
-                                                    &cf->db->unified_mt.active, &cur_umt))
-                {
-                    if (cur_umt->skip_list)
-                        cur_size = (size_t)skip_list_get_size(cur_umt->skip_list);
-                    tidesdb_immutable_memtable_unref(cur_umt);
-                }
-                if (cur_size < u_ceiling) break;
-
-                usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
-                total_iterations++;
-
-                const uint64_t cur_heartbeat =
-                    atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
-                if (cur_size < best_size || cur_heartbeat != last_heartbeat)
-                {
-                    best_size = cur_size;
-                    last_heartbeat = cur_heartbeat;
-                    no_progress = 0;
-                }
-                else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                  "unified active memtable ceiling stall: no rotate progress for "
-                                  "%dms - flush engine appears wedged",
-                                  no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-                    return TDB_ERR_BUSY;
-                }
+                best_size = cur_size;
+                last_heartbeat = cur_heartbeat;
+                no_progress = 0;
             }
+            else if (++no_progress >= TDB_BACKPRESSURE_STALL_MAX_ITERATIONS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "unified active memtable ceiling stall: no rotate progress for "
+                              "%dms - flush engine appears wedged",
+                              no_progress * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+                return TDB_ERR_BUSY;
+            }
+        }
 
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified active memtable ceiling stall resolved after %dms",
-                          total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
-            l0_delayed = 1;
-        }
-    }
-
-    /* L0/L1 graduated delays. skip if any stall above already paced this
-     * commit */
-    if (!l0_delayed)
-    {
-        if (l0_queue_depth >=
-                (size_t)((double)effective_stall * TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO) ||
-            l1_file_count >= (effective_l1_trigger * TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER))
-        {
-            /** high pressure -- TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO of stall threshold or
-             *  TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER x effective L1 trigger */
-            usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
-            if (tdb_log_throttle(cf->db, &cf->last_backpressure_log_sec,
-                                 TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' high backpressure L0=%zu L1=%d - %dus delay",
-                              cf->name, l0_queue_depth, l1_file_count,
-                              TDB_BACKPRESSURE_HIGH_DELAY_US);
-            l0_delayed = 1;
-        }
-        else if (l0_queue_depth >= (size_t)((double)effective_stall *
-                                            TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO) ||
-                 l1_file_count >= (effective_l1_trigger * TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER))
-        {
-            /** moderate pressure -- TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO of stall threshold or
-             *  TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER x effective L1 trigger */
-            usleep(TDB_BACKPRESSURE_MODERATE_DELAY_US);
-            if (tdb_log_throttle(cf->db, &cf->last_backpressure_log_sec,
-                                 TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
-                TDB_DEBUG_LOG(TDB_LOG_INFO,
-                              "CF '%s' moderate backpressure L0=%zu L1=%d - %dus delay", cf->name,
-                              l0_queue_depth, l1_file_count, TDB_BACKPRESSURE_MODERATE_DELAY_US);
-            l0_delayed = 1;
-        }
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified active memtable ceiling stall resolved after %dms",
+                      total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
+        paced = 1;
     }
 
     /**** global memory pressure (computed by reaper every Nms, single atomic_load)
-     ***  critical blocking and self-help flushes always fire regardless of L0 delay.
-     **   high/elevated delays are skipped if L0/L1 already applied a delay to avoid
-     *    double-sleeping on the same commit (the L0 delay already throttled ingestion). */
+     ***  critical blocking and self-help flushes always fire regardless of the pressure curve.
+     **   high/elevated yields are skipped if the curve above already paced this commit, to avoid
+     *    double-sleeping on the same commit. */
     if (cf->db)
     {
         int pressure = atomic_load_explicit(&cf->db->memory_pressure_level, memory_order_relaxed);
@@ -25148,16 +25113,17 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         }
         else if (pressure >= TDB_MEMORY_PRESSURE_HIGH)
         {
-            /* high -- we force flush this CF; skip delay if L0 already throttled */
+            /* high -- we force flush this CF; skip delay if the pressure curve already throttled */
             tidesdb_flush_memtable_internal(cf, 0, 1);
-            if (!l0_delayed) usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
+            if (!paced) usleep(TDB_BACKPRESSURE_HIGH_DELAY_US);
         }
         else if (pressure >= TDB_MEMORY_PRESSURE_ELEVATED)
         {
-            /* elevated -- proactive flush + tiny yield (skip yield if L0 already throttled) */
+            /* elevated -- proactive flush + tiny yield (skip yield if the curve already throttled)
+             */
             if (!atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
                 tidesdb_flush_memtable_internal(cf, 0, 0);
-            if (!l0_delayed) usleep(TDB_BACKPRESSURE_ELEVATED_DELAY_US);
+            if (!paced) usleep(TDB_BACKPRESSURE_ELEVATED_DELAY_US);
         }
     }
 
@@ -28617,8 +28583,11 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
         return TDB_ERR_IO;
     }
 
-    /* we sync db directory to persist new unified WAL file entry */
-    tdb_sync_directory(db->db_path);
+    /* persist the new WAL's directory entry so crash recovery can find it -- but only when the
+     * unified WAL asks for durability. under TDB_SYNC_NONE a crash may lose recent writes anyway,
+     * so the synchronous directory fsync (held on the single-rotator path, stalling every committer
+     * behind the rotation) buys nothing and is skipped. */
+    if (db->config.unified_memtable_sync_mode != TDB_SYNC_NONE) tdb_sync_directory(db->db_path);
 
     tidesdb_memtable_t *new_mt = malloc(sizeof(tidesdb_memtable_t));
     if (!new_mt)
@@ -28635,30 +28604,17 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
     atomic_init(&new_mt->writers, 0);
     atomic_init(&new_mt->flushed, 0);
 
-    /* enforce a hard cap on the shared immutable queue so it cannot grow unbounded when a rotation
-     * is driven from a path that bypasses the apply_backpressure ladder. mirrors the per-CF cap in
-     * tidesdb_flush_memtable_internal -- block briefly to let the flush workers drain, a
-     * last-resort safety net above the graduated stall. */
-    {
-        const size_t hard_cap = tdb_unified_immutable_hard_cap(db);
-        if (queue_size(db->unified_mt.immutables) >= hard_cap)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "Unified immutable queue at hard cap %zu, blocking until drained",
-                          hard_cap);
-            int wait_iters = 0;
-            while (queue_size(db->unified_mt.immutables) >= hard_cap &&
-                   wait_iters < TDB_IMMUTABLE_HARD_CAP_MAX_WAIT)
-            {
-                usleep(TDB_IMMUTABLE_HARD_CAP_WAIT_US);
-                wait_iters++;
-            }
-            if (wait_iters >= TDB_IMMUTABLE_HARD_CAP_MAX_WAIT)
-                TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "Unified immutable queue hard cap wait timeout after %d ms",
-                              wait_iters * (TDB_IMMUTABLE_HARD_CAP_WAIT_US / 1000));
-        }
-    }
+    /* the graduated backpressure ladder in apply_backpressure already bounds the shared immutable
+     * queue for the commit path (it hard-blocks committers at the stall threshold, below this cap),
+     * so this is only reachable from a rotate that bypasses it -- the reaper's memory-pressure
+     * rotate or recovery. those are periodic or single-threaded and cannot run the queue away, so
+     * we log an overshoot rather than poll-sleep here: a wait held under the single-rotator CAS
+     * would stall every committer for no benefit. */
+    if (queue_size(db->unified_mt.immutables) >= tdb_unified_immutable_hard_cap(db) &&
+        tdb_log_throttle(db, &db->unified_mt.last_ceiling_stall_log_sec,
+                         TDB_BACKPRESSURE_STALL_LOG_INTERVAL_SEC))
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Unified immutable queue overshoot %zu >= soft cap %zu",
+                      queue_size(db->unified_mt.immutables), tdb_unified_immutable_hard_cap(db));
 
     /* enqueue old onto the immutable queue before swapping the active pointer. this eliminates the
      * read visibility gap where a reader loads the new (empty) active and then walks the immutable

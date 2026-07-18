@@ -611,6 +611,12 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     return 0;
 }
 
+/* buffered-append staging-buffer pool, defined below with the other buffered helpers */
+static int bm_buf_pool_acquire(uint64_t ring_size, uint8_t **ring,
+                               _Atomic unsigned char **done_ring);
+static void bm_buf_pool_release(uint8_t *ring, _Atomic unsigned char *done_ring,
+                                uint64_t ring_size);
+
 int block_manager_close(block_manager_t *bm)
 {
     if (!bm) return -1;
@@ -625,8 +631,16 @@ int block_manager_close(block_manager_t *bm)
         pthread_cond_signal(&bm->buf_work_cv);
         pthread_mutex_unlock(&bm->buf_mtx);
         pthread_join(bm->flush_tid, NULL);
-        free(bm->ring);
-        free((void *)bm->done_ring);
+        /* a clean drain left every done-ring flag cleared, so return the warm buffer pair to the
+         * pool for the next WAL. a flush error may have left flags set, so free that pair instead.
+         */
+        if (atomic_load_explicit(&bm->flush_error, memory_order_acquire))
+        {
+            free(bm->ring);
+            free((void *)bm->done_ring);
+        }
+        else
+            bm_buf_pool_release(bm->ring, bm->done_ring, bm->ring_size);
         bm->ring = NULL;
         bm->done_ring = NULL;
         pthread_mutex_destroy(&bm->buf_mtx);
@@ -717,13 +731,72 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
 
 /* buffered-append tunables */
 #define BM_BUF_DEFAULT_RING (8ull * 1024 * 1024) /* default staging ring size */
-#define BM_BUF_MIN_RING     (1ull * 1024 * 1024) /* ring floor; larger records use the oversized path \
-                                                  */
-#define BM_BUF_SPIN          2048                /* spin iterations before parking on a cond var */
+#define BM_BUF_MIN_RING                                                                \
+    (1ull * 1024 * 1024)          /* ring floor; larger records use the oversized path \
+                                   */
+#define BM_BUF_SPIN          2048 /* spin iterations before parking on a cond var */
 #define BM_BUF_FLUSH_PARK_US 500  /* flush-thread park timeout, a missed-signal safety net */
 #define BM_BUF_WAIT_PARK_US  2000 /* appender durability-wait park timeout */
 #define BM_NS_PER_US         1000L
 #define BM_NS_PER_SEC        1000000000L
+
+/* a rotating WAL opens a fresh buffered handle every generation; without pooling that mallocs and
+ * first-touches (page-faults) a new ring plus done-ring each time, on the rotation critical path. a
+ * small free-list hands a retired, already-resident buffer pair to the next open instead. a
+ * released done-ring is all-zero (the flush thread cleared every flag as it drained before close),
+ * so it is reusable as-is. bounded -- overflow is freed. */
+#define BM_BUF_POOL_MAX 8
+
+typedef struct
+{
+    uint8_t *ring;
+    _Atomic unsigned char *done_ring;
+    uint64_t ring_size;
+} bm_buf_pooled_t;
+
+static bm_buf_pooled_t bm_buf_pool[BM_BUF_POOL_MAX];
+static int bm_buf_pool_count = 0;
+static pthread_mutex_t bm_buf_pool_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* pop a pooled buffer pair of exactly ring_size bytes into *ring/*done_ring, returning 1, or 0 if
+ * the pool holds none of that size. */
+static int bm_buf_pool_acquire(uint64_t ring_size, uint8_t **ring,
+                               _Atomic unsigned char **done_ring)
+{
+    int got = 0;
+    pthread_mutex_lock(&bm_buf_pool_mtx);
+    for (int i = bm_buf_pool_count - 1; i >= 0; i--)
+    {
+        if (bm_buf_pool[i].ring_size == ring_size)
+        {
+            *ring = bm_buf_pool[i].ring;
+            *done_ring = bm_buf_pool[i].done_ring;
+            bm_buf_pool[i] = bm_buf_pool[--bm_buf_pool_count];
+            got = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&bm_buf_pool_mtx);
+    return got;
+}
+
+/* return a clean (all-zero done_ring) buffer pair to the pool, or free it if the pool is full. */
+static void bm_buf_pool_release(uint8_t *ring, _Atomic unsigned char *done_ring, uint64_t ring_size)
+{
+    pthread_mutex_lock(&bm_buf_pool_mtx);
+    if (bm_buf_pool_count < BM_BUF_POOL_MAX)
+    {
+        bm_buf_pool[bm_buf_pool_count].ring = ring;
+        bm_buf_pool[bm_buf_pool_count].done_ring = done_ring;
+        bm_buf_pool[bm_buf_pool_count].ring_size = ring_size;
+        bm_buf_pool_count++;
+        pthread_mutex_unlock(&bm_buf_pool_mtx);
+        return;
+    }
+    pthread_mutex_unlock(&bm_buf_pool_mtx);
+    free(ring);
+    free((void *)done_ring);
+}
 
 /**
  * bm_cpu_relax
@@ -2399,8 +2472,12 @@ int block_manager_open_buffered(block_manager_t **bm, const char *file_path, con
 
     uint64_t R = ring_size ? ring_size : BM_BUF_DEFAULT_RING;
     if (R < BM_BUF_MIN_RING) R = BM_BUF_MIN_RING;
-    b->ring = malloc(R);
-    b->done_ring = calloc(R, 1); /* per-ring-position completion flags, zeroed */
+    /* reuse a retired, warm buffer pair when one of this size is pooled; else allocate fresh */
+    if (!bm_buf_pool_acquire(R, &b->ring, &b->done_ring))
+    {
+        b->ring = malloc(R);
+        b->done_ring = calloc(R, 1); /* per-ring-position completion flags, zeroed */
+    }
     if (!b->ring || !b->done_ring)
     {
         free(b->ring);

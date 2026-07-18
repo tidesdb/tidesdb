@@ -31,7 +31,7 @@
 #define BBF_DIR_VERSION 1u
 /* magic + version + partition_count */
 #define BBF_DIR_HEADER_BYTES (3 * sizeof(uint32_t))
-/* per-record bytes before the variable first_key: disk_offset + blob_size + entry_count +
+/* per-record bytes before the variable first_key -- disk_offset + blob_size + entry_count +
  * first_key_len */
 #define BBF_DIR_ENTRY_FIXED (sizeof(uint64_t) + 3 * sizeof(uint32_t))
 

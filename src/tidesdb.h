@@ -576,6 +576,14 @@ struct tidesdb_column_family_t
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) sstable_layout_version;
+    /* cached L1 overlap depth (max sstables covering any one key = the point-read cost, the true
+     * read-amp signal backpressure paces on) with the layout version it was computed at. flush
+     * partitioning makes the raw L1 file count a poor read-amp proxy -- narrow tiling files inflate
+     * the count without raising per-key overlap -- so pacing keys on depth, recomputed only when
+     * the layout version moves. l1_overlap_ver starts at UINT64_MAX so the first read recomputes.
+     */
+    _Atomic(int) l1_overlap_depth;
+    _Atomic(uint64_t) l1_overlap_ver;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) flush_pending_count;

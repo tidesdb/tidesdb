@@ -9299,7 +9299,7 @@ static void test_read_write_conflict(void)
 
 /* a tracked read (tidesdb_txn_get) of a key records it into the read set, so a concurrent overwrite
  * of that key aborts the reader at commit even when the reader wrote only a disjoint key. the same
- * scenario through tidesdb_txn_get_notrack must NOT abort, because the untracked read never enters
+ * scenario through tidesdb_txn_get_notrack must not abort, because the untracked read never enters
  * the read set -- the whole point of the primitive for a PK-uniqueness probe. */
 static void test_txn_get_notrack_no_read_conflict(void)
 {
@@ -32284,7 +32284,7 @@ static uint64_t burst_then_measure_compaction_settle(int num_compaction_threads,
             settle_ms, settle_ms >= cap_ms ? "  <-- NEVER QUIESCED (hit 60s cap)" : "");
 
     /* the burst must have flushed sstables (at least one per cf) and exercised compaction,
-     * otherwise the test proves nothing. we do NOT require sstable_count > NCF at flush-idle --
+     * otherwise the test proves nothing. we do not require sstable_count > NCF at flush-idle --
      * with fast consolidation compaction can already have merged each cf down to a single sstable
      * by then, which is the fix working, not a failure. */
     ASSERT_TRUE(at_flush_idle.total_sstable_count >= NCF);

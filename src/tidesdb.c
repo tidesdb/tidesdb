@@ -359,6 +359,16 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 /* db-level L0 stall threshold for the shared unified immutable queue (unified mode) */
 #define TDB_DEFAULT_UNIFIED_L0_QUEUE_STALL_THRESHOLD 10
 
+/* flush-output partitioning -- a uniform-random memtable flush produces one keyspace-wide L1
+ * sstable that overlaps every largest-level partition, so the L1->largest merge re-reads it once
+ * per partition (the dominant read-amplification source). splitting a flush into narrow sstables
+ * aligned to the largest level's boundaries makes each L1 file overlap only a handful of
+ * partitions. the count is bounded so a flush emits a few reasonably sized files rather than one
+ * tiny file per boundary -- aim for roughly TDB_FLUSH_PARTITION_TARGET_BYTES per slice, capped at
+ * TDB_MAX_FLUSH_PARTITIONS. */
+#define TDB_FLUSH_PARTITION_TARGET_BYTES ((size_t)1 << 20)
+#define TDB_MAX_FLUSH_PARTITIONS         16
+
 /* default tombstone density trigger configuration -- 0.0 disables the check, an sstable
  * must hold at least TDB_DEFAULT_TOMBSTONE_DENSITY_MIN_ENTRIES entries before its density
  * counts toward the trigger so tiny sstables can't cause spurious compactions */
@@ -1857,7 +1867,7 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
 /**
  * tdb_cf_flush_backlog
  * the flush backlog backpressure throttles on -- memtables that have been frozen and enqueued for
- * flush but whose flush has not yet completed. this is deliberately NOT the immutable queue length:
+ * flush but whose flush has not yet completed. this is deliberately not the immutable queue length:
  * that queue also holds memtables already flushed (their data durable in an sstable) that a
  * concurrent reader's snapshot is pinning against reaper reclamation, and throttling writes on
  * those would stall for a reader-blocked GC backlog rather than real flush pressure. the
@@ -8787,18 +8797,29 @@ static int tidesdb_sstable_write_from_heap_btree(
  * single cf's run inside the unified skip list is written straight to its sstable with no
  * intermediate per-cf skip list. seg_entry_count sizes the bloom/index for the segment, since
  * skip_list_count_entries would count the whole unified skip list.
+ * range_start/range_end bound the walk to the half-open user-key interval [range_start, range_end)
+ * so a single flush can be split into narrow boundary-aligned partitions instead of one keyspace-
+ * wide sstable (which forces the L1 merge to re-read it once per partition). a NULL range_start is
+ * -infinity, a NULL range_end is +infinity; the bound is compared against the real user key after
+ * any seg_prefix strip. an empty slice writes a zero-entry sstable, which the caller must discard.
  * @param db database instance
  * @param sst sstable to write to
  * @param memtable memtable to write from
  * @param seg_prefix cf_index prefix to restrict to, or NULL for the whole memtable
  * @param seg_prefix_len length of seg_prefix in bytes (0 when seg_prefix is NULL)
  * @param seg_entry_count entry-count hint for sizing, used only when seg_prefix is non-NULL
+ * @param range_start inclusive lower key bound, or NULL for -infinity
+ * @param range_start_size length of range_start (0 when NULL)
+ * @param range_end exclusive upper key bound, or NULL for +infinity
+ * @param range_end_size length of range_end (0 when NULL)
  * @return 0 on success, -1 on error
  */
 static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_family_t *cf,
                                                   tidesdb_sstable_t *sst, skip_list_t *memtable,
                                                   const uint8_t *seg_prefix, size_t seg_prefix_len,
-                                                  int seg_entry_count)
+                                                  int seg_entry_count, const uint8_t *range_start,
+                                                  size_t range_start_size, const uint8_t *range_end,
+                                                  size_t range_end_size)
 {
     if (!db || !cf || !sst || !memtable) return TDB_ERR_INVALID_ARGS;
 
@@ -8898,10 +8919,12 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
     uint64_t max_seq = 0;
     size_t block_first_key_size = 0;
 
-    /* seek into the cf's prefix run for a unified segment, else start at the first key */
-    const int positioned = seg_prefix
-                               ? (skip_list_cursor_seek_ge(cursor, seg_prefix, seg_prefix_len) == 0)
-                               : (skip_list_cursor_goto_first(cursor) == 0);
+    /* seek into the cf's prefix run for a unified segment; else seek to the partition's lower key
+     * bound when this is a range slice, or the first key for a whole-memtable flush */
+    const int positioned =
+        seg_prefix    ? (skip_list_cursor_seek_ge(cursor, seg_prefix, seg_prefix_len) == 0)
+        : range_start ? (skip_list_cursor_seek_ge(cursor, range_start, range_start_size) == 0)
+                      : (skip_list_cursor_goto_first(cursor) == 0);
     if (positioned)
     {
         size_t block_first_key_capacity = 0;
@@ -8963,6 +8986,16 @@ static int tidesdb_sstable_write_from_memtable_ex(tidesdb_t *db, tidesdb_column_
                     }
                     key += seg_prefix_len;
                     key_size -= seg_prefix_len;
+                }
+
+                /* range slice -- keys ascend and we seeked to range_start, so the first key at or
+                 * past the exclusive upper bound ends this partition's run (reuse segment_done to
+                 * break both the version-chain loop and the node walk) */
+                if (range_end &&
+                    comparator_fn(key, key_size, range_end, range_end_size, comparator_ctx) >= 0)
+                {
+                    segment_done = 1;
+                    break;
                 }
 
                 /* we populate stack-allocated KV pair (no malloc needed) */
@@ -9152,7 +9185,8 @@ cleanup:
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_column_family_t *cf,
                                                tidesdb_sstable_t *sst, skip_list_t *memtable)
 {
-    return tidesdb_sstable_write_from_memtable_ex(db, cf, sst, memtable, NULL, 0, 0);
+    return tidesdb_sstable_write_from_memtable_ex(db, cf, sst, memtable, NULL, 0, 0, NULL, 0, NULL,
+                                                  0);
 }
 
 /**
@@ -10882,6 +10916,115 @@ static int tidesdb_level_sort_by_min_key(tidesdb_t *db, tidesdb_level_t *level,
 static void tidesdb_bump_sstable_layout_version(tidesdb_column_family_t *cf)
 {
     atomic_fetch_add_explicit(&cf->sstable_layout_version, 1, memory_order_release);
+}
+
+/* one endpoint of an L1 sstable's [min_key,max_key] interval for the overlap-depth sweep */
+typedef struct
+{
+    const uint8_t *key;
+    size_t size;
+    int delta; /* +1 at a min_key (interval opens), -1 at a max_key (interval closes) */
+} tidesdb_overlap_event_t;
+
+/**
+ * tidesdb_compute_l1_overlap_depth
+ * the maximum number of L1 sstables whose [min_key,max_key] covers a single key -- i.e. the number
+ * of files a point read must consult in the worst case, which is the real read-amplification. a
+ * sweep over the interval endpoints under array_readers; ties resolve opens before closes so
+ * intervals sharing a boundary count as overlapping (the ranges are closed). only ever called on a
+ * layout change via the cached accessor below.
+ * @return worst-case per-key L1 overlap (0 when L1 is empty)
+ */
+static int tidesdb_compute_l1_overlap_depth(tidesdb_column_family_t *cf)
+{
+    tidesdb_level_t *lvl = cf->levels ? cf->levels[0] : NULL;
+    if (!lvl) return 0;
+
+    skip_list_comparator_fn cmp = NULL;
+    void *ctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &cmp, &ctx);
+    if (!cmp) return 0;
+
+    /* array_readers pins the sstable array and its entries against a concurrent retire while we
+     * read their boundary keys (same guard the flush out-of-order scan uses) */
+    atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
+    const int n = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+    tidesdb_sstable_t **ssts = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+
+    tidesdb_overlap_event_t *ev = (n > 0) ? malloc((size_t)(2 * n) * sizeof(*ev)) : NULL;
+    int m = 0;
+    if (ev)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            tidesdb_sstable_t *s = ssts ? ssts[i] : NULL;
+            if (!s || !s->min_key || !s->max_key) continue;
+            ev[m].key = s->min_key;
+            ev[m].size = s->min_key_size;
+            ev[m].delta = 1;
+            m++;
+            ev[m].key = s->max_key;
+            ev[m].size = s->max_key_size;
+            ev[m].delta = -1;
+            m++;
+        }
+    }
+    atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
+
+    if (!ev || m == 0)
+    {
+        free(ev);
+        return (n > 0) ? 1 : 0; /* alloc failure -- fall back to a conservative depth of 1 */
+    }
+
+    /* insertion sort ascending by key; ties -> opens (delta 1) before closes (delta -1). m is 2x
+     * the L1 file count, small, and this runs only when the layout version moves. */
+    for (int i = 1; i < m; i++)
+    {
+        tidesdb_overlap_event_t e = ev[i];
+        int j = i - 1;
+        while (j >= 0)
+        {
+            const int c = cmp(ev[j].key, ev[j].size, e.key, e.size, ctx);
+            if (c > 0 || (c == 0 && ev[j].delta < e.delta))
+            {
+                ev[j + 1] = ev[j];
+                j--;
+            }
+            else
+                break;
+        }
+        ev[j + 1] = e;
+    }
+
+    int depth = 0, max_depth = 0;
+    for (int i = 0; i < m; i++)
+    {
+        depth += ev[i].delta;
+        if (depth > max_depth) max_depth = depth;
+    }
+    free(ev);
+    return max_depth;
+}
+
+/**
+ * tidesdb_l1_overlap_depth_cached
+ * the L1 overlap depth, recomputed only when the sstable layout version has moved since the last
+ * call and otherwise served from the cache -- so the per-commit backpressure path pays a full sweep
+ * only on a flush or compaction, not on every write.
+ * @return worst-case per-key L1 overlap
+ */
+static int tidesdb_l1_overlap_depth_cached(tidesdb_column_family_t *cf)
+{
+    const uint64_t ver = atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+    if (atomic_load_explicit(&cf->l1_overlap_ver, memory_order_acquire) != ver)
+    {
+        const int d = tidesdb_compute_l1_overlap_depth(cf);
+        atomic_store_explicit(&cf->l1_overlap_depth, d, memory_order_release);
+        atomic_store_explicit(&cf->l1_overlap_ver, ver, memory_order_release);
+        return d;
+    }
+    return atomic_load_explicit(&cf->l1_overlap_depth, memory_order_acquire);
 }
 
 /**
@@ -13346,7 +13489,7 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
      * the largest level is empty (data has not propagated down yet), and N_L ~ 0 would collapse
      * every capacity to the write-buffer floor -- which pins the compaction target-level selection
      * at X and self-merges the first level forever, never draining downward. use the largest
-     * NON-EMPTY level instead: once the tree has quiesced this is the largest level itself
+     * NON-EMPTY level instead,once the tree has quiesced this is the largest level itself
      * (matching the paper and preserving the durable space-amp bound), but while the tree fills it
      * tracks a populated level so capacities stay sized to real data and the target selection can
      * route data down. */
@@ -18512,6 +18655,266 @@ static void tidesdb_unified_immutable_drop_queue_ref(void *data, void *context)
 }
 
 /**
+ * tidesdb_flush_partition_splits
+ * choose ascending split keys that carve the key space into narrow flush partitions aligned to the
+ * largest non-empty level's per-sstable min_keys. the split count targets one partition per
+ * TDB_FLUSH_PARTITION_TARGET_BYTES of memtable data, bounded by max_parts and by the number of
+ * available boundaries. a btree cf, an empty tree, or too little data returns 0 (flush as a single
+ * whole-memtable sstable). the caller frees each returned key and the two arrays.
+ * @return number of split keys (0 => no partitioning)
+ */
+static int tidesdb_flush_partition_splits(tidesdb_column_family_t *cf, size_t memtable_bytes,
+                                          int max_parts, uint8_t ***out_keys, size_t **out_sizes)
+{
+    *out_keys = NULL;
+    *out_sizes = NULL;
+    if (cf->config.use_btree || max_parts < 2) return 0;
+
+    /* the largest non-empty level below L1 supplies the boundaries the L1->largest merge partitions
+     * by; aligning flush slices to them makes each slice overlap only its own target partition */
+    const int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    tidesdb_level_t *largest = NULL;
+    for (int i = num_levels - 1; i >= 1; i--)
+    {
+        if (atomic_load_explicit(&cf->levels[i]->current_size, memory_order_relaxed) > 0)
+        {
+            largest = cf->levels[i];
+            break;
+        }
+    }
+    if (!largest) return 0;
+
+    skip_list_comparator_fn cmp = NULL;
+    void *cctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &cmp, &cctx);
+    if (!cmp) return 0;
+
+    /* copy the min_keys out under array_readers so a concurrent compaction cannot retire the array
+     * or free a key while we read it -- we never mutate the level from the flush path */
+    atomic_fetch_add_explicit(&largest->array_readers, 1, memory_order_acq_rel);
+    const int n = atomic_load_explicit(&largest->num_sstables, memory_order_acquire);
+    tidesdb_sstable_t **ssts = atomic_load_explicit(&largest->sstables, memory_order_acquire);
+    uint8_t **keys = (n > 0) ? malloc((size_t)n * sizeof(*keys)) : NULL;
+    size_t *sizes = (n > 0) ? malloc((size_t)n * sizeof(*sizes)) : NULL;
+    int nk = 0;
+    if (keys && sizes)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            tidesdb_sstable_t *s = ssts ? ssts[i] : NULL;
+            if (!s || !s->min_key || s->min_key_size == 0) continue;
+            uint8_t *cp = malloc(s->min_key_size);
+            if (!cp) continue;
+            memcpy(cp, s->min_key, s->min_key_size);
+            keys[nk] = cp;
+            sizes[nk] = s->min_key_size;
+            nk++;
+        }
+    }
+    atomic_fetch_sub_explicit(&largest->array_readers, 1, memory_order_release);
+
+    if (nk < 2)
+    {
+        for (int i = 0; i < nk; i++) free(keys[i]);
+        free(keys);
+        free(sizes);
+        return 0;
+    }
+
+    /* insertion sort ascending (nk is the largest level's file count, small) */
+    for (int i = 1; i < nk; i++)
+    {
+        uint8_t *k = keys[i];
+        size_t ks = sizes[i];
+        int j = i - 1;
+        while (j >= 0 && cmp(keys[j], sizes[j], k, ks, cctx) > 0)
+        {
+            keys[j + 1] = keys[j];
+            sizes[j + 1] = sizes[j];
+            j--;
+        }
+        keys[j + 1] = k;
+        sizes[j + 1] = ks;
+    }
+
+    /* collapse duplicate min_keys so split points are strictly ascending */
+    int u = 1;
+    for (int i = 1; i < nk; i++)
+    {
+        if (cmp(keys[i], sizes[i], keys[u - 1], sizes[u - 1], cctx) != 0)
+        {
+            keys[u] = keys[i];
+            sizes[u] = sizes[i];
+            u++;
+        }
+        else
+            free(keys[i]);
+    }
+    nk = u;
+
+    int parts = (int)(memtable_bytes / TDB_FLUSH_PARTITION_TARGET_BYTES);
+    if (parts < 1) parts = 1;
+    if (parts > max_parts) parts = max_parts;
+    if (parts > nk) parts = nk; /* need parts-1 internal splits, each a distinct boundary */
+    if (parts < 2)
+    {
+        for (int i = 0; i < nk; i++) free(keys[i]);
+        free(keys);
+        free(sizes);
+        return 0;
+    }
+
+    const int want = parts - 1;
+    uint8_t **sk = malloc((size_t)want * sizeof(*sk));
+    size_t *ss = malloc((size_t)want * sizeof(*ss));
+    if (!sk || !ss)
+    {
+        free(sk);
+        free(ss);
+        for (int i = 0; i < nk; i++) free(keys[i]);
+        free(keys);
+        free(sizes);
+        return 0;
+    }
+
+    /* evenly spaced split points, forced strictly increasing so no slice is degenerate */
+    int prev = -1, m = 0;
+    for (int k = 1; k <= want; k++)
+    {
+        int idx = (int)(((int64_t)k * nk) / parts);
+        if (idx <= prev) idx = prev + 1;
+        if (idx >= nk) break;
+        sk[m] = keys[idx];
+        ss[m] = sizes[idx];
+        keys[idx] = NULL; /* ownership transferred to the split arrays */
+        prev = idx;
+        m++;
+    }
+
+    for (int i = 0; i < nk; i++) free(keys[i]); /* free the non-selected copies (NULLs skipped) */
+    free(keys);
+    free(sizes);
+
+    if (m == 0)
+    {
+        free(sk);
+        free(ss);
+        return 0;
+    }
+    *out_keys = sk;
+    *out_sizes = ss;
+    return m;
+}
+
+/**
+ * tidesdb_flush_write_l1_partitions
+ * write a memtable to disk as up to max_parts narrow L1 sstables aligned to the largest level's
+ * boundaries (see TDB_FLUSH_PARTITION_TARGET_BYTES). each output is synced and its write handles
+ * closed; the caller owns the returned refs, adds them to L1, and commits the manifest once. on any
+ * write error every file produced this attempt is removed and the error is returned so the caller
+ * retries the whole flush with fresh ids (the WAL is still intact). first_id names the first slice;
+ * later slices draw fresh ids. empty slices produce no sstable.
+ * @return TDB_SUCCESS with *out_count sstables, or an error with *out_count == 0
+ */
+static int tidesdb_flush_write_l1_partitions(tidesdb_column_family_t *cf, skip_list_t *memtable,
+                                             uint64_t first_id, size_t memtable_bytes,
+                                             tidesdb_sstable_t **out_ssts, int *out_count,
+                                             int max_parts)
+{
+    tidesdb_t *db = cf->db;
+    *out_count = 0;
+
+    uint8_t **splits = NULL;
+    size_t *split_sizes = NULL;
+    const int nsplits =
+        tidesdb_flush_partition_splits(cf, memtable_bytes, max_parts, &splits, &split_sizes);
+    const int nparts = nsplits + 1;
+
+    char sst_path[MAX_FILE_PATH_LENGTH];
+    snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1", cf->directory);
+
+    int rc = TDB_SUCCESS;
+    int produced = 0;
+    for (int i = 0; i < nparts; i++)
+    {
+        const uint8_t *lo = (i == 0) ? NULL : splits[i - 1];
+        const size_t lo_sz = (i == 0) ? 0 : split_sizes[i - 1];
+        const uint8_t *hi = (i == nparts - 1) ? NULL : splits[i];
+        const size_t hi_sz = (i == nparts - 1) ? 0 : split_sizes[i];
+
+        const uint64_t id = (i == 0) ? first_id : atomic_fetch_add(&cf->next_sstable_id, 1);
+        tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_path, id, &cf->config);
+        if (!sst)
+        {
+            rc = TDB_ERR_MEMORY;
+            break;
+        }
+
+        const int wr = tidesdb_sstable_write_from_memtable_ex(db, cf, sst, memtable, NULL, 0, 0, lo,
+                                                              lo_sz, hi, hi_sz);
+        if (wr != TDB_SUCCESS)
+        {
+            tidesdb_sstable_unref(db, sst);
+            rc = wr;
+            break;
+        }
+
+        /* an empty slice (no keys in [lo,hi)) leaves a zero-entry sstable -- discard its files */
+        if (sst->num_entries == 0)
+        {
+            remove(sst->klog_path);
+            remove(sst->vlog_path);
+            tidesdb_sstable_unref(db, sst);
+            continue;
+        }
+
+        atomic_fetch_add_explicit(&cf->flush_bytes_written, sst->klog_size + sst->vlog_size,
+                                  memory_order_relaxed);
+
+        /* durability barrier before the WAL is deleted, then close write handles so readers reopen
+         * on demand (mirrors the single-sstable flush path) */
+        tidesdb_block_managers_t bms;
+        if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
+            tidesdb_sstable_sync_barrier(cf->config.sync_mode, bms.klog_bm, bms.vlog_bm);
+        atomic_thread_fence(memory_order_seq_cst);
+
+        const int had_open_bms = (sst->klog_bm != NULL);
+        if (sst->klog_bm)
+        {
+            block_manager_close(sst->klog_bm);
+            sst->klog_bm = NULL;
+        }
+        if (sst->vlog_bm)
+        {
+            block_manager_close(sst->vlog_bm);
+            sst->vlog_bm = NULL;
+        }
+        if (had_open_bms) atomic_fetch_sub(&db->num_open_sstables, 1);
+
+        out_ssts[produced++] = sst;
+    }
+
+    for (int i = 0; i < nsplits; i++) free(splits[i]);
+    free(splits);
+    free(split_sizes);
+
+    if (rc != TDB_SUCCESS)
+    {
+        /* remove every file this attempt produced; the whole flush retries with fresh ids */
+        for (int i = 0; i < produced; i++)
+        {
+            remove(out_ssts[i]->klog_path);
+            remove(out_ssts[i]->vlog_path);
+            tidesdb_sstable_unref(db, out_ssts[i]);
+        }
+        return rc;
+    }
+
+    *out_count = produced;
+    return TDB_SUCCESS;
+}
+
+/**
  * tidesdb_flush_worker_thread
  * worker thread that processes flush work items from the queue
  */
@@ -18705,42 +19108,69 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        char sst_path[MAX_FILE_PATH_LENGTH];
-        snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
-                 cf->directory);
-
-        /* once we create the sstable, we must complete the flush to avoid leaking it */
-        tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_path, work->sst_id, &cf->config);
-        if (!sst)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "CF '%s' SSTable %" PRIu64 " creation failed", cf->name,
-                          work->sst_id);
-
-            tidesdb_immutable_memtable_unref(imm);
-            atomic_fetch_sub_explicit(&db->active_flushes, 1, memory_order_release);
-            free(work);
-            atomic_fetch_sub_explicit(&db->flush_pending_count, 1, memory_order_release);
-            atomic_fetch_sub_explicit(&cf->flush_pending_count, 1, memory_order_release);
-            continue;
-        }
-
-        /* we branch based on use_btree config */
+        /* partition the flush into narrow boundary-aligned L1 sstables so the L1->largest merge
+         * reads each one only within its own partition, instead of re-reading a single keyspace-
+         * wide flush file once per partition (the dominant compaction read-amplification source).
+         * a btree cf has no range-slice writer and an empty/shallow tree has no boundaries, so both
+         * fall back to a single whole-memtable sstable. all partitions are independent L1 sstables
+         * (base l1, partition -1), so recovery already reconstructs them with no changes. */
+        tidesdb_sstable_t *flush_ssts[TDB_MAX_FLUSH_PARTITIONS];
+        int num_flush_ssts = 0;
         int write_result;
+
         if (cf->config.use_btree)
         {
-            write_result = tidesdb_sstable_write_from_memtable_btree(db, cf, sst, memtable);
+            char sst_path[MAX_FILE_PATH_LENGTH];
+            snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
+                     cf->directory);
+            tidesdb_sstable_t *sst =
+                tidesdb_sstable_create(db, sst_path, work->sst_id, &cf->config);
+            if (!sst)
+                write_result = TDB_ERR_MEMORY;
+            else
+            {
+                write_result = tidesdb_sstable_write_from_memtable_btree(db, cf, sst, memtable);
+                if (write_result == TDB_SUCCESS)
+                {
+                    atomic_fetch_add_explicit(&cf->flush_bytes_written,
+                                              sst->klog_size + sst->vlog_size,
+                                              memory_order_relaxed);
+                    tidesdb_block_managers_t bms;
+                    if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
+                        tidesdb_sstable_sync_barrier(cf->config.sync_mode, bms.klog_bm,
+                                                     bms.vlog_bm);
+                    atomic_thread_fence(memory_order_seq_cst);
+                    const int had_open_bms = (sst->klog_bm != NULL);
+                    if (sst->klog_bm)
+                    {
+                        block_manager_close(sst->klog_bm);
+                        sst->klog_bm = NULL;
+                    }
+                    if (sst->vlog_bm)
+                    {
+                        block_manager_close(sst->vlog_bm);
+                        sst->vlog_bm = NULL;
+                    }
+                    if (had_open_bms) atomic_fetch_sub(&db->num_open_sstables, 1);
+                    flush_ssts[num_flush_ssts++] = sst;
+                }
+                else
+                    tidesdb_sstable_unref(db, sst);
+            }
         }
         else
         {
-            write_result = tidesdb_sstable_write_from_memtable(db, cf, sst, memtable);
+            write_result = tidesdb_flush_write_l1_partitions(
+                cf, memtable, work->sst_id, skip_list_get_size(memtable), flush_ssts,
+                &num_flush_ssts, TDB_MAX_FLUSH_PARTITIONS);
         }
+
         if (write_result != TDB_SUCCESS)
         {
+            /* the writer already removed any partial files and released their refs */
             TDB_DEBUG_LOG(TDB_LOG_INFO,
                           "CF '%s' SSTable %" PRIu64 " write failed (error: %d), will retry",
                           cf->name, work->sst_id, write_result);
-
-            tidesdb_sstable_unref(cf->db, sst);
 
             usleep(TDB_FLUSH_RETRY_DELAY_US);
 
@@ -18763,48 +19193,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        /* write-amplification -- on-disk bytes this flush produced (klog + vlog, framing,
-         * index and bloom blobs included). klog_size/vlog_size are finalized by the footer
-         * write inside the writer above. one flushed L1 sstable per flush on the per-cf path */
-        atomic_fetch_add_explicit(&cf->flush_bytes_written, sst->klog_size + sst->vlog_size,
-                                  memory_order_relaxed);
         atomic_fetch_add_explicit(&cf->flush_count, 1, memory_order_relaxed);
-
-        /* durability barrier before the WAL is deleted FULL/INTERVAL fsync the sstable here, so
-         * a crash can never lose flushed data that the WAL no longer holds. NONE skips (the WAL is
-         * likewise unsynced under NONE, so the contract is uniform) */
-        tidesdb_block_managers_t bms;
-        if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
-        {
-            tidesdb_sstable_sync_barrier(cf->config.sync_mode, bms.klog_bm, bms.vlog_bm);
-        }
-
-        /* we ensure all writes are visible before making sstable discoverable */
-        atomic_thread_fence(memory_order_seq_cst);
-
-        /* we close write handles before adding to level
-         * readers will reopen files on-demand through tidesdb_sstable_ensure_open
-         * this prevents file locking issues where readers cannot open files
-         * that are still held open by the flush worker */
-        {
-            /* num_open_sstables is keyed on the klog (the vlog is opened lazily and not
-             * separately counted), so the decrement fires iff the klog was open */
-            const int had_open_bms = (sst->klog_bm != NULL);
-            if (sst->klog_bm)
-            {
-                block_manager_close(sst->klog_bm);
-                sst->klog_bm = NULL;
-            }
-            if (sst->vlog_bm)
-            {
-                block_manager_close(sst->vlog_bm);
-                sst->vlog_bm = NULL;
-            }
-            if (had_open_bms)
-            {
-                atomic_fetch_sub(&db->num_open_sstables, 1);
-            }
-        }
 
         /* we re-check marked_for_deletion after I/O -- if the CF is being dropped,
          * skip level-add, manifest commit, and compaction trigger. the CF directory
@@ -18814,9 +19203,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO,
                           "CF '%s' marked for deletion after flush I/O, skipping level-add "
-                          "for SSTable %" PRIu64,
-                          cf->name, work->sst_id);
-            tidesdb_sstable_unref(cf->db, sst);
+                          "for %d SSTable(s)",
+                          cf->name, num_flush_ssts);
+            for (int i = 0; i < num_flush_ssts; i++) tidesdb_sstable_unref(cf->db, flush_ssts[i]);
             if (wal)
             {
                 block_manager_close(wal);
@@ -18831,64 +19220,33 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        /* out-of-order L1 insertion check. concurrent flush threads finish out of id order, so a
-         * lower-max_seq sstable can land after a higher one. this is benign, both point reads and
-         * the merge-heap iterators resolve versions by per-entry seq, never by L1 array position
-         * (the array is append-only and unsorted). logged at DEBUG as a flush-concurrency signal
-         * only -- it is not a correctness violation. one line per out-of-order add (not per pair)
-         * to avoid an O(n) burst when an old sstable lands behind many newer ones. */
-        if (atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire) > 0)
+        /* add every partition to L1 (array index 0) and record it in the manifest, then commit the
+         * manifest once for the whole flush so the crash window is a single commit -- identical to
+         * the single-sstable path. reads and the merge heap resolve versions by per-entry seq, so
+         * the append-only unsorted L1 array tolerates the partitions landing in any order. */
+        for (int i = 0; i < num_flush_ssts; i++)
         {
-            /* hold array_readers while scanning the lock-free sstable array so a concurrent
-             * level_add_sstable (flush or compaction) cannot retire and free it under us */
-            atomic_fetch_add_explicit(&cf->levels[0]->array_readers, 1, memory_order_acq_rel);
-            int num_existing =
-                atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-            tidesdb_sstable_t **existing_ssts =
-                atomic_load_explicit(&cf->levels[0]->sstables, memory_order_acquire);
-            for (int i = 0; existing_ssts && i < num_existing; i++)
-            {
-                if (existing_ssts[i] && existing_ssts[i]->max_seq >= sst->max_seq)
-                {
-                    TDB_DEBUG_LOG(TDB_LOG_DEBUG,
-                                  "CF '%s' SSTable %" PRIu64 " (max_seq=%" PRIu64
-                                  ") added to L1 out of seq order behind SSTable %" PRIu64
-                                  " (max_seq=%" PRIu64 ") -- benign, reads resolve by seq",
-                                  cf->name, work->sst_id, sst->max_seq, existing_ssts[i]->id,
-                                  existing_ssts[i]->max_seq);
-                    break;
-                }
-            }
-            atomic_fetch_sub_explicit(&cf->levels[0]->array_readers, 1, memory_order_release);
+            tidesdb_level_add_sstable(cf->levels[0], flush_ssts[i]);
+            tidesdb_manifest_add_sstable(
+                cf->manifest, 1, flush_ssts[i]->id, flush_ssts[i]->num_entries,
+                flush_ssts[i]->klog_size + flush_ssts[i]->vlog_size, flush_ssts[i]->partition);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' flushed SSTable %" PRIu64 " (max_seq=%" PRIu64
+                          ") to level %d (array index 0), partition %d/%d",
+                          cf->name, flush_ssts[i]->id, flush_ssts[i]->max_seq,
+                          cf->levels[0]->level_num, i + 1, num_flush_ssts);
         }
-
-        /* we add sstable to level 1 (array index 0) -- load levels atomically */
-
-        /* levels array is fixed, access directly */
-        tidesdb_level_add_sstable(cf->levels[0], sst);
         tidesdb_bump_sstable_layout_version(cf);
-
         atomic_thread_fence(memory_order_release);
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "CF '%s' flushed SSTable %" PRIu64 " (max_seq=%" PRIu64
-                      ") to level %d (array index 0)",
-                      cf->name, work->sst_id, sst->max_seq, cf->levels[0]->level_num);
-
-        /* we commit sstable to manifest before deleting WAL and before triggering compaction
-         * this ensures crash recovery knows which sstables are complete
-         * we must commit manifest before triggering compaction to avoid deadlock
-         * where flush worker holds manifest lock while compaction worker waits for it */
-        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
-                                     sst->klog_size + sst->vlog_size, sst->partition);
         atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
         int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path,
                                                       cf->config.sync_mode != TDB_SYNC_NONE);
         if (manifest_result != 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                          "CF '%s' failed to commit manifest for SSTable %" PRIu64 " (error: %d)",
-                          cf->name, work->sst_id, manifest_result);
+                          "CF '%s' failed to commit manifest for %d flushed SSTable(s) (error: %d)",
+                          cf->name, num_flush_ssts, manifest_result);
         }
         else
         {
@@ -18902,10 +19260,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to RocksDB's rLevel
          * 0 in the spooky paper -- where memtable flushes land as overlapping runs. when its data
          * exceeds its (DCA-adjusted) capacity we run the compaction workflow, which picks what to
-         * merge from the level capacities. the L1 *file count* is NOT a compaction trigger: it is
-         * the read-amplification signal that backpressure paces writes on via
-         * l1_file_count_trigger, so a flushed-file pileup bounds ingestion rather than kicking a
-         * redundant compaction. */
+         * merge from the level capacities. the L1 *file count* is not a compaction trigger, it is
+         * the read-amplification signal (as overlap depth) that backpressure paces writes on, so a
+         * flushed-file pileup bounds ingestion rather than kicking a redundant compaction. */
         int num_l1_sstables =
             atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
         size_t level1_size =
@@ -18997,8 +19354,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         free(density_min_key);
         free(density_max_key);
 
-        /* we release our reference -- the level now owns it */
-        tidesdb_sstable_unref(cf->db, sst);
+        /* we release our references -- the level now owns each partition */
+        for (int i = 0; i < num_flush_ssts; i++) tidesdb_sstable_unref(cf->db, flush_ssts[i]);
 
         /* delete the WAL only once the sstable is durably recorded in the manifest.
          * a failed commit leaves the sstable in-memory only (and not in the persisted
@@ -23134,6 +23491,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     atomic_init(&cf->next_sstable_id, 0);
     atomic_init(&cf->sstable_layout_version, 0);
+    atomic_init(&cf->l1_overlap_depth, 0);
+    atomic_init(&cf->l1_overlap_ver, UINT64_MAX);
     atomic_init(&cf->is_compacting, 0);
     atomic_init(&cf->is_flushing, 0);
     atomic_init(&cf->flush_pending_count, 0);
@@ -24854,7 +25213,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 
     const int unified = (cf->db && cf->db->unified_mt.enabled);
 
-    /* L0 depth is the flush backlog -- memtables frozen but not yet flushed. deliberately NOT the
+    /* L0 depth is the flush backlog -- memtables frozen but not yet flushed. deliberately not the
      * immutable queue length, which also counts already-flushed memtables a concurrent reader is
      * pinning against reaper reclamation; throttling on those stalls writes for a GC backlog, not
      * flush pressure. see tdb_cf_flush_backlog. */
@@ -24892,7 +25251,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 
     /* the immutable (L0) queue depth is the backpressure signal -- it grows only when flush falls
      * behind, normalized so 1.0 is the stall threshold. the active memtable's fill is deliberately
-     * NOT part of it: the active always rises to its rotation point and back every cycle, so pacing
+     * not part of it, the active always rises to its rotation point and back every cycle, so pacing
      * on it would throttle normal operation. the active memtable keeps only its hard ceiling below,
      * as a rotation-stalled backstop. */
     const double p = effective_stall > 0 ? (double)l0_queue_depth / (double)effective_stall : 0.0;
@@ -25108,23 +25467,24 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         paced = 1;
     }
 
-    /* overlapping first-level (L1) read-amplification pacing. l1_file_count_trigger bounds how many
-     * overlapping flushed files may accumulate at the first sorted level before writes are paced --
-     * a point/range read must consult every overlapping file, so this file count IS read-amp, and
-     * pacing on it keeps reads fast when compaction is transiently behind. compaction itself is
-     * capacity-driven (Spooky); the file count is purely this backpressure signal. the delay rises
+    /* overlapping first-level (L1) read-amplification pacing. l1_file_count_trigger bounds the L1
+     * overlap depth -- the number of overlapping flushed files a point/range read must consult for
+     * a single key -- before writes are paced, so reads stay fast when compaction is transiently
+     * behind. the raw file count is not the signal, flush partitioning splits one flush into
+     * several narrow tiling sstables that raise the count without raising per-key overlap, so
+     * pacing keys on the overlap depth (cached, recomputed only on a layout change). compaction
+     * itself is capacity-driven (Spooky); depth is purely this backpressure signal. the delay rises
      * monotonically with the overflow past the trigger, scaled by the trigger itself so it is the
      * only knob, and ingestion settles where it matches the compaction drain rate. it is not
      * flush-heartbeat coupled -- L1 drains via compaction, not flush. */
     if (cf->levels && cf->levels[0])
     {
         const int l1_trigger = tdb_cf_effective_l1_trigger(cf);
-        const int l1_count =
-            atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-        if (l1_trigger > 0 && l1_count > l1_trigger)
+        const int l1_depth = tidesdb_l1_overlap_depth_cached(cf);
+        if (l1_trigger > 0 && l1_depth > l1_trigger)
         {
             const double f =
-                1.0 - (double)l1_trigger / (double)l1_count; /* 0 at trigger, ->1 above */
+                1.0 - (double)l1_trigger / (double)l1_depth; /* 0 at trigger, ->1 above */
             const unsigned int d = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
             if (d > 0)
             {
@@ -25777,7 +26137,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
  * recorded into the transaction's read set. tidesdb_txn_get passes 1 (the tracking contract the
  * isolation levels rely on); tidesdb_txn_get_notrack / tidesdb_txn_contains pass 0 so an existence
  * probe -- a PK-uniqueness check on insert -- does not pollute the write-write reservation base or
- * add a rw-antidependency the caller never intended. visibility is unchanged either way: the read
+ * add a rw-antidependency the caller never intended. visibility is unchanged either way,the read
  * still resolves at the transaction's snapshot. */
 static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                                 const size_t key_size, uint8_t **value, size_t *value_size,
@@ -28115,7 +28475,8 @@ static int tidesdb_unified_write_cf_sstable(tidesdb_t *db, tidesdb_column_family
                                                           TDB_UNIFIED_CF_PREFIX_SIZE, entry_count);
     else
         wr = tidesdb_sstable_write_from_memtable_ex(db, cf, sst, unified_sl, seg_prefix,
-                                                    TDB_UNIFIED_CF_PREFIX_SIZE, entry_count);
+                                                    TDB_UNIFIED_CF_PREFIX_SIZE, entry_count, NULL,
+                                                    0, NULL, 0);
 
     if (wr != TDB_SUCCESS)
     {
@@ -28669,7 +29030,7 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
      * queue for the commit path (it hard-blocks committers at the stall threshold, below this cap),
      * so this is only reachable from a rotate that bypasses it -- the reaper's memory-pressure
      * rotate or recovery. those are periodic or single-threaded and cannot run the queue away, so
-     * we log an overshoot rather than poll-sleep here: a wait held under the single-rotator CAS
+     * we log an overshoot rather than poll-sleep here, a wait held under the single-rotator CAS
      * would stall every committer for no benefit. */
     if (queue_size(db->unified_mt.immutables) >= tdb_unified_immutable_hard_cap(db) &&
         tdb_log_throttle(db, &db->unified_mt.last_ceiling_stall_log_sec,

@@ -36,10 +36,10 @@
 #define BI_DIR_VERSION 1u
 /* magic + version + partition_count */
 #define BI_DIR_HEADER_BYTES (3 * sizeof(uint32_t))
-/* per-record bytes before the variable first_key: leaf_offset + leaf_size + block_count +
+/* per-record bytes before the variable first_key -- leaf_offset + leaf_size + block_count +
  * first_key_len */
 #define BI_DIR_ENTRY_FIXED (sizeof(uint64_t) + 3 * sizeof(uint32_t))
-/* per-leaf-record bytes around the variable key: first_key_len + block_offset */
+/* per-leaf-record bytes around the variable key -- first_key_len + block_offset */
 #define BI_LEAF_REC_FIXED (sizeof(uint32_t) + sizeof(uint64_t))
 
 /* little-endian byte codecs for the directory and leaves, endian-canonical so an index built on one

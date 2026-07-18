@@ -4570,7 +4570,10 @@ static void test_many_keys(void)
         ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                   strlen(value) + 1, 0),
                   0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* the 4KB write buffer keeps the active memtable pinned near its ceiling, so on a slow CI
+         * box (DragonFlyBSD) a commit can hit the 10s no-progress backpressure budget and return a
+         * retryable TDB_ERR_BUSY. retry it like the other stress tests rather than flake. */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         /* we periodic flush */

@@ -3920,12 +3920,13 @@ void test_block_manager_buffered_oversized_record(void)
     ASSERT_TRUE(big != NULL);
     for (uint32_t i = 0; i < big_size; i++) big[i] = (uint8_t)(i * 31 + 7);
 
-    char small[32];
+    /* 'small' is a macro in the MSVC RPC headers, so name the record buffer plainly */
+    char rec[32];
     /* three small records, then the oversized one, then three more */
     for (int i = 0; i < 3; i++)
     {
-        snprintf(small, sizeof(small), "pre_%d", i);
-        int64_t off = block_manager_write_raw(bm, small, (uint32_t)(strlen(small) + 1));
+        snprintf(rec, sizeof(rec), "pre_%d", i);
+        int64_t off = block_manager_write_raw(bm, rec, (uint32_t)(strlen(rec) + 1));
         ASSERT_TRUE(off >= 0);
     }
     int64_t big_off = block_manager_write_raw(bm, big, big_size);
@@ -3934,11 +3935,11 @@ void test_block_manager_buffered_oversized_record(void)
                     bm, (uint64_t)big_off + block_manager_framed_size(big_size)) == 0);
     for (int i = 0; i < 3; i++)
     {
-        snprintf(small, sizeof(small), "post_%d", i);
-        int64_t off = block_manager_write_raw(bm, small, (uint32_t)(strlen(small) + 1));
+        snprintf(rec, sizeof(rec), "post_%d", i);
+        int64_t off = block_manager_write_raw(bm, rec, (uint32_t)(strlen(rec) + 1));
         ASSERT_TRUE(off >= 0);
         ASSERT_TRUE(block_manager_wait_durable(
-                        bm, (uint64_t)off + block_manager_framed_size(strlen(small) + 1)) == 0);
+                        bm, (uint64_t)off + block_manager_framed_size(strlen(rec) + 1)) == 0);
     }
     ASSERT_TRUE(block_manager_close(bm) == 0);
 

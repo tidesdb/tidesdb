@@ -1855,6 +1855,29 @@ static inline size_t tdb_cf_effective_stall(const tidesdb_column_family_t *cf)
 }
 
 /**
+ * tdb_cf_flush_backlog
+ * the flush backlog backpressure throttles on -- memtables that have been frozen and enqueued for
+ * flush but whose flush has not yet completed. this is deliberately NOT the immutable queue length:
+ * that queue also holds memtables already flushed (their data durable in an sstable) that a
+ * concurrent reader's snapshot is pinning against reaper reclamation, and throttling writes on
+ * those would stall for a reader-blocked GC backlog rather than real flush pressure. the
+ * flush_pending_count is incremented when a memtable's flush is enqueued at rotation and
+ * decremented when its flush completes, independent of reclamation, so a flushed-but-pinned
+ * memtable does not count.
+ * @param cf column family
+ * @return unflushed backlog depth (0 if none)
+ */
+static inline size_t tdb_cf_flush_backlog(const tidesdb_column_family_t *cf)
+{
+    /* unified mode shares one flush queue db-wide; per-CF mode has its own per-CF counter */
+    const int backlog =
+        (cf->db && cf->db->unified_mt.enabled)
+            ? atomic_load_explicit(&cf->db->flush_pending_count, memory_order_acquire)
+            : atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire);
+    return backlog > 0 ? (size_t)backlog : 0;
+}
+
+/**
  * tdb_cf_immutable_hard_cap
  * last-resort ceiling on the immutable-queue depth, the configured L0 stall
  * threshold plus headroom for in-flight freezes. derived from config so that
@@ -13319,9 +13342,20 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
         return TDB_SUCCESS;
     }
 
-    /* we get data size at largest level */
-    tidesdb_level_t *largest = cf->levels[num_levels - 1];
-    size_t N_L = atomic_load(&largest->current_size);
+    /* DCA reference size. the paper uses the largest level's data size N_L. but during ingestion
+     * the largest level is empty (data has not propagated down yet), and N_L ~ 0 would collapse
+     * every capacity to the write-buffer floor -- which pins the compaction target-level selection
+     * at X and self-merges the first level forever, never draining downward. use the largest
+     * NON-EMPTY level instead: once the tree has quiesced this is the largest level itself
+     * (matching the paper and preserving the durable space-amp bound), but while the tree fills it
+     * tracks a populated level so capacities stay sized to real data and the target selection can
+     * route data down. */
+    size_t N_L = 0;
+    for (int i = num_levels - 1; i >= 0; i--)
+    {
+        N_L = atomic_load_explicit(&cf->levels[i]->current_size, memory_order_relaxed);
+        if (N_L > 0) break;
+    }
 
     /* we update capacities C_i = N_L / T^(L-i)
      * paper uses 1-based level numbering (level 1, 2, 3...)
@@ -15568,10 +15602,18 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     /* we get number of sstables being merged */
     size_t num_sstables_to_merge = queue_size(sstables_to_delete);
 
-    /* if no boundaries, do a simple full merge */
+    /* no boundaries means the largest level (the boundary source) is empty -- the tree cannot carve
+     * partition boundaries yet. depositing the merged run back at target_level (self-merging the
+     * first level in place) would leave the largest level empty forever, so data never descends and
+     * the boundaries never materialize -- a vicious cycle that pins read amplification. instead
+     * bootstrap the tree by full-merging every level down INTO the empty largest level, populating
+     * it as one run. the next flush's dividing merge then finds real boundaries and normal
+     * partitioned spooky resumes. this bootstrap only fires while the largest level is empty (right
+     * after a level is added), so it is rare. */
     if (num_boundaries == 0)
     {
-        int result = tidesdb_full_preemptive_merge(cf, 0, target_level, target_level);
+        const int nl = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+        int result = tidesdb_full_preemptive_merge(cf, 0, nl - 1, nl - 1);
 
         while (!queue_is_empty(sstables_to_delete))
         {
@@ -18856,12 +18898,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
             tdb_objstore_upload_manifest(db, cf);
         }
 
-        /* we check file count in addition to size
-         * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to
-         * RocksDB's rLevel 0 in the spooky paper. this is where memtable flushes land.
-         * files at this level have overlapping key ranges, so reads must check all files.
-         * trigger compaction at the α file-count trigger (configurable, default 4) to prevent
-         * read amplification. */
+        /* compaction is triggered the Spooky way -- capacity-driven, evaluated after each flush.
+         * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to RocksDB's rLevel
+         * 0 in the spooky paper -- where memtable flushes land as overlapping runs. when its data
+         * exceeds its (DCA-adjusted) capacity we run the compaction workflow, which picks what to
+         * merge from the level capacities. the L1 *file count* is NOT a compaction trigger: it is
+         * the read-amplification signal that backpressure paces writes on via
+         * l1_file_count_trigger, so a flushed-file pileup bounds ingestion rather than kicking a
+         * redundant compaction. */
         int num_l1_sstables =
             atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
         size_t level1_size =
@@ -18872,16 +18916,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         int should_compact = 0;
         const char *trigger_reason = NULL;
 
-        const int effective_file_trigger = tdb_cf_effective_l1_trigger(cf);
-
-        /* file count trigger at level 1 */
-        if (num_l1_sstables >= effective_file_trigger)
-        {
-            should_compact = 1;
-            trigger_reason = "file count";
-        }
-
-        else if (level1_size >= level1_capacity)
+        if (level1_size >= level1_capacity)
         {
             should_compact = 1;
             trigger_reason = "size";
@@ -18930,9 +18965,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "CF '%s' level %d (first disk level) triggering compaction (%s): "
-                              "files=%d (trigger=%d), size=%zu (capacity=%zu)",
-                              cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
-                              cf->config.l1_file_count_trigger, level1_size, level1_capacity);
+                              "size=%zu (capacity=%zu), files=%d (read-amp signal)",
+                              cf->name, cf->levels[0]->level_num, trigger_reason, level1_size,
+                              level1_capacity, num_l1_sstables);
             }
 
             /* if the density witness fired and the dense sstable is above the
@@ -24819,11 +24854,11 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
 
     const int unified = (cf->db && cf->db->unified_mt.enabled);
 
-    /* L0 depth -- in unified mode every write lands in the shared unified memtable, so the per-CF
-     * immutable queue stays empty and the unified immutable queue is the one to watch */
-    queue_t *l0_queue = (unified && cf->db->unified_mt.immutables) ? cf->db->unified_mt.immutables
-                                                                   : cf->immutable_memtables;
-    const size_t l0_queue_depth = queue_size(l0_queue);
+    /* L0 depth is the flush backlog -- memtables frozen but not yet flushed. deliberately NOT the
+     * immutable queue length, which also counts already-flushed memtables a concurrent reader is
+     * pinning against reaper reclamation; throttling on those stalls writes for a GC backlog, not
+     * flush pressure. see tdb_cf_flush_backlog. */
+    const size_t l0_queue_depth = tdb_cf_flush_backlog(cf);
     const size_t effective_stall = tdb_cf_effective_stall(cf);
 
     /* active memtable fill against its ceiling (2x write_buffer_size), unified or per-CF. this and
@@ -24913,15 +24948,15 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
          *  writer here instead of failing the commit. */
         int total_iterations = 0;
         int no_progress = 0;
-        size_t best_depth = queue_size(l0_queue);
+        size_t best_depth = tdb_cf_flush_backlog(cf);
         uint64_t last_heartbeat =
             atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
-        while (queue_size(l0_queue) >= effective_stall)
+        while (tdb_cf_flush_backlog(cf) >= effective_stall)
         {
             usleep(TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US);
             total_iterations++;
 
-            const size_t cur_depth = queue_size(l0_queue);
+            const size_t cur_depth = tdb_cf_flush_backlog(cf);
             const uint64_t cur_heartbeat =
                 atomic_load_explicit(&cf->db->flush_heartbeat, memory_order_relaxed);
 
@@ -25071,6 +25106,32 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Unified active memtable ceiling stall resolved after %dms",
                       total_iterations * (TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US / 1000));
         paced = 1;
+    }
+
+    /* overlapping first-level (L1) read-amplification pacing. l1_file_count_trigger bounds how many
+     * overlapping flushed files may accumulate at the first sorted level before writes are paced --
+     * a point/range read must consult every overlapping file, so this file count IS read-amp, and
+     * pacing on it keeps reads fast when compaction is transiently behind. compaction itself is
+     * capacity-driven (Spooky); the file count is purely this backpressure signal. the delay rises
+     * monotonically with the overflow past the trigger, scaled by the trigger itself so it is the
+     * only knob, and ingestion settles where it matches the compaction drain rate. it is not
+     * flush-heartbeat coupled -- L1 drains via compaction, not flush. */
+    if (cf->levels && cf->levels[0])
+    {
+        const int l1_trigger = tdb_cf_effective_l1_trigger(cf);
+        const int l1_count =
+            atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+        if (l1_trigger > 0 && l1_count > l1_trigger)
+        {
+            const double f =
+                1.0 - (double)l1_trigger / (double)l1_count; /* 0 at trigger, ->1 above */
+            const unsigned int d = (unsigned int)(TDB_BACKPRESSURE_RAMP_MAX_DELAY_US * f * f);
+            if (d > 0)
+            {
+                usleep(d);
+                paced = 1;
+            }
+        }
     }
 
     /**** global memory pressure (computed by reaper every Nms, single atomic_load)
@@ -33658,6 +33719,10 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
         tidesdb_immutable_memtable_unref(active_mt_struct);
     }
     (*stats)->memtable_size = active_mt_size;
+    /* per-cf L0 queue depth -- the frozen memtables awaiting flush that backpressure throttles on.
+     * empty in unified mode, where the shared queue is reported db-wide as unified_immutable_count.
+     */
+    (*stats)->immutable_count = (int)queue_size(cf->immutable_memtables);
 
     (*stats)->level_sizes = malloc((*stats)->num_levels * sizeof(size_t));
     (*stats)->level_num_sstables = malloc((*stats)->num_levels * sizeof(int));

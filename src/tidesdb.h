@@ -1142,6 +1142,10 @@ struct tidesdb_iter_t
  * statistics for database column family
  * @param num_levels number of levels
  * @param memtable_size size of memtable
+ * @param immutable_count number of immutable (frozen, awaiting-flush) memtables queued for this
+ *                        cf -- the per-cf L0 queue depth backpressure throttles on. always 0 in
+ *                        unified mode, where the shared queue is reported db-wide in
+ *                        tidesdb_db_stats_t.unified_immutable_count
  * @param level_sizes sizes of each level
  * @param level_num_sstables number of sstables in each level
  * @param config column family configuration
@@ -1173,6 +1177,7 @@ struct tidesdb_stats_t
 {
     int num_levels;
     size_t memtable_size;
+    int immutable_count;
     size_t *level_sizes;
     int *level_num_sstables;
     tidesdb_column_family_config_t *config;

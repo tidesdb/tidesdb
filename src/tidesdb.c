@@ -1106,6 +1106,30 @@ static int tidesdb_bm_open(tidesdb_t *db, block_manager_t **bm, const char *path
 }
 
 /**
+ * tidesdb_bm_open_buffered
+ * the buffered-append counterpart of tidesdb_bm_open, used for an active WAL whose committers copy
+ * their record into a staging ring and let a single flush thread do the pwrite. same EMFILE/ENFILE
+ * backpressure and retry policy.
+ * @param db database instance (for waking the reaper)
+ * @param bm out-- opened buffered block manager
+ * @param path file path
+ * @param sync_mode block-manager sync mode (already converted)
+ * @return 0 on success, -1 on failure (errno set)
+ */
+static int tidesdb_bm_open_buffered(tidesdb_t *db, block_manager_t **bm, const char *path,
+                                    int sync_mode)
+{
+    for (int attempt = 0;; attempt++)
+    {
+        if (block_manager_open_buffered(bm, path, sync_mode, 0) == 0) return 0;
+        if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)
+            return -1;
+        tidesdb_wake_reaper(db);
+        usleep(TDB_BM_OPEN_EMFILE_BACKOFF_US);
+    }
+}
+
+/**
  * tidesdb_sstable_sync_barrier
  * durability barrier for a freshly built sstable -- flushes the klog and vlog so they are on disk
  * before the manifest commit publishes them. honored only when sync is on FULL and INTERVAL both
@@ -21191,15 +21215,31 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                  "%s" PATH_SEPARATOR TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, (*db)->db_path,
                  TDB_U64_CAST(active_uwal_gen));
 
+        /* buffered append -- committers copy their WAL record into a staging ring in parallel and
+         * a single flush thread pwrites the released runs, so appends never serialize on the inode
+         * write lock the way per-commit pwritev on one file does */
         block_manager_t *uwal = NULL;
-        int uwal_open_failed = (block_manager_open(&uwal, uwal_path, umt_sync_mode) != 0);
+        int uwal_open_failed =
+            (block_manager_open_buffered(&uwal, uwal_path, umt_sync_mode, 0) != 0);
         if (!uwal_open_failed)
         {
             /* adopt an existing uwal -- validate (permissive) to trim the
              * preallocation tail; a fresh db's uwal_0.log gets truncated empty */
             if (have_existing_uwal)
+            {
                 uwal_open_failed = (block_manager_validate_last_block(
                                         uwal, BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION) != 0);
+                /* validate trimmed current_file_size to the logical end; realign the flush and
+                 * group-durability watermarks the flush thread and group sync read from (no
+                 * appends have started, so the flush thread is quiesced) */
+                if (!uwal_open_failed)
+                {
+                    const uint64_t sz =
+                        atomic_load_explicit(&uwal->current_file_size, memory_order_acquire);
+                    atomic_store_explicit(&uwal->buf_flushed, sz, memory_order_release);
+                    atomic_store_explicit(&uwal->group_durable_size, sz, memory_order_release);
+                }
+            }
             else
                 uwal_open_failed = (block_manager_truncate(uwal) != 0);
         }
@@ -22273,7 +22313,7 @@ int tidesdb_promote_to_primary(tidesdb_t *db)
                      db->db_path, TDB_U64_CAST(gen));
 
             block_manager_t *new_wal = NULL;
-            if (block_manager_open(&new_wal, uwal_path, TDB_SYNC_FULL) == 0)
+            if (block_manager_open_buffered(&new_wal, uwal_path, TDB_SYNC_FULL, 0) == 0)
             {
                 block_manager_truncate(new_wal);
                 umt->wal = new_wal;
@@ -22882,7 +22922,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                  "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, cf->directory,
                  TDB_U64_CAST(active_wal_id));
 
-        if (block_manager_open(&new_wal, wal_path, config->sync_mode) != 0)
+        /* buffered append -- committers stage their WAL record and one flush thread pwrites, so
+         * concurrent commits to this CF never serialize on the WAL file's inode write lock */
+        if (block_manager_open_buffered(&new_wal, wal_path, config->sync_mode, 0) != 0)
         {
             queue_free(cf->immutable_memtables);
             skip_list_free(new_memtable);
@@ -22909,6 +22951,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                 free(cf);
                 return TDB_ERR_IO;
             }
+            /* validate trimmed current_file_size to the logical end; realign the buffered flush and
+             * group-durability watermarks (no appends yet, so the flush thread is quiesced) */
+            const uint64_t sz =
+                atomic_load_explicit(&new_wal->current_file_size, memory_order_acquire);
+            atomic_store_explicit(&new_wal->buf_flushed, sz, memory_order_release);
+            atomic_store_explicit(&new_wal->group_durable_size, sz, memory_order_release);
         }
         else if (block_manager_truncate(new_wal) != 0)
         {
@@ -23648,7 +23696,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                      "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, cf->directory,
                      TDB_U64_CAST(old_wal_id));
             block_manager_t *reopened = NULL;
-            block_manager_open(&reopened, wal_path, cf->config.sync_mode);
+            block_manager_open_buffered(&reopened, wal_path, cf->config.sync_mode, 0);
             atomic_store_explicit(&active_mt->wal, reopened, memory_order_release);
         }
         atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
@@ -23666,7 +23714,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         if (wal_written > 0 && (size_t)wal_written < sizeof(new_wal_path))
         {
             block_manager_t *reopened = NULL;
-            if (block_manager_open(&reopened, new_wal_path, cf->config.sync_mode) != 0)
+            if (block_manager_open_buffered(&reopened, new_wal_path, cf->config.sync_mode, 0) != 0)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename",
                               new_wal_path);
@@ -24156,8 +24204,10 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                  "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, cf->directory,
                  TDB_U64_CAST(wal_id));
 
-        if (tidesdb_bm_open(cf->db, &new_wal, wal_path, convert_sync_mode(cf->config.sync_mode)) !=
-            0)
+        /* buffered append -- committers stage their WAL record and one flush thread pwrites, so
+         * concurrent commits to this CF never serialize on the WAL file's inode write lock */
+        if (tidesdb_bm_open_buffered(cf->db, &new_wal, wal_path,
+                                     convert_sync_mode(cf->config.sync_mode)) != 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL '%s', %s", cf->name,
                           wal_path, strerror(errno));
@@ -28477,10 +28527,14 @@ static int tidesdb_unified_wal_group_sync(tidesdb_t *db, block_manager_t *wal, u
             continue;
         }
 
-        /* leader -- capture the high-water, fsync once, publish */
+        /* leader -- capture the high-water, fsync once, publish. on a buffered WAL the
+         * fdatasync only makes durable what the flush thread has already pwritten, so the
+         * high-water is the flushed offset, not the reservation watermark -- records reserved
+         * but still sitting in the staging ring are not yet in the page cache. */
         wal->group_sync_active = 1;
         const uint64_t flush_to =
-            atomic_load_explicit(&wal->current_file_size, memory_order_acquire);
+            wal->buffered ? atomic_load_explicit(&wal->buf_flushed, memory_order_acquire)
+                          : atomic_load_explicit(&wal->current_file_size, memory_order_acquire);
         pthread_mutex_unlock(&db->unified_mt.wal_group_sync_lock);
 
         const int rc = block_manager_escalate_fsync(wal);
@@ -28551,8 +28605,11 @@ static int tidesdb_unified_memtable_rotate(tidesdb_t *db)
              "%s" PATH_SEPARATOR TDB_UNIFIED_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, db->db_path,
              TDB_U64_CAST(new_gen));
 
+    /* buffered append -- concurrent committers copy their WAL record into a staging ring in
+     * parallel and a single flush thread pwrites the released runs, so appends never contend the
+     * inode write lock the way per-commit pwritev on one file does */
     block_manager_t *new_wal = NULL;
-    if (block_manager_open(&new_wal, uwal_path, umt_sync_mode) != 0 ||
+    if (block_manager_open_buffered(&new_wal, uwal_path, umt_sync_mode, 0) != 0 ||
         block_manager_truncate(new_wal) != 0)
     {
         if (new_wal) block_manager_close(new_wal);
@@ -28882,19 +28939,32 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         /** we write to unified WAL using raw write to avoid malloc/memcpy/free
          *  per commit. the wal_batch buffer (stack or heap) is written directly. */
+        uint64_t uwal_end = 0;
         if (uwal_batch && umt->wal)
         {
-            int64_t wal_result = block_manager_write_raw(umt->wal, uwal_batch, (uint32_t)uwal_size);
-            if (wal_result < 0)
+            int64_t wal_off = block_manager_write_raw(umt->wal, uwal_batch, (uint32_t)uwal_size);
+            if (wal_off < 0)
             {
                 if (uwal_batch != uwal_stack_buf) free(uwal_batch);
                 atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
                 atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
                 return TDB_ERR_IO;
             }
+            uwal_end = (uint64_t)wal_off + block_manager_framed_size((uint32_t)uwal_size);
             atomic_fetch_add_explicit(&txn->db->uwal_bytes_written,
                                       block_manager_framed_size((uint32_t)uwal_size),
                                       memory_order_relaxed);
+
+            /* buffered WAL -- block until the single flush thread has pwritten this record to the
+             * page cache before the commit returns, matching the process-crash durability the
+             * direct path provides synchronously. no-op on a non-buffered WAL. */
+            if (block_manager_wait_durable(umt->wal, uwal_end) != 0)
+            {
+                if (uwal_batch != uwal_stack_buf) free(uwal_batch);
+                atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
+                atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
+                return TDB_ERR_IO;
+            }
         }
 
         if (uwal_batch && uwal_batch != uwal_stack_buf) free(uwal_batch);
@@ -28902,11 +28972,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         /* group-commit durability -- one fdatasync per batch of concurrent committers.
          * runs while writers is still held so a rotation cannot swap this WAL out from under
          * us. only when configured FULL; INTERVAL is handled by the sync worker, NONE skips. */
-        if (txn->db->config.unified_memtable_sync_mode == TDB_SYNC_FULL && umt->wal)
+        if (txn->db->config.unified_memtable_sync_mode == TDB_SYNC_FULL && umt->wal && uwal_end)
         {
-            const uint64_t my_end =
-                atomic_load_explicit(&umt->wal->current_file_size, memory_order_acquire);
-            if (tidesdb_unified_wal_group_sync(txn->db, umt->wal, my_end) != 0)
+            if (tidesdb_unified_wal_group_sync(txn->db, umt->wal, uwal_end) != 0)
             {
                 atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
                 atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
@@ -29153,6 +29221,17 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             atomic_fetch_add_explicit(&cf->wal_bytes_written,
                                       block_manager_framed_size((uint32_t)wal_size),
                                       memory_order_relaxed);
+
+            /* buffered WAL -- wait for the single flush thread to make this record durable (page
+             * cache, and fdatasync'd when the CF sync mode is FULL) before applying to the
+             * memtable, matching the durability the direct path provides inline. no-op on a direct
+             * WAL. */
+            if (block_manager_wait_durable(
+                    wal, (uint64_t)wal_result + block_manager_framed_size((uint32_t)wal_size)) != 0)
+            {
+                if (wal_is_heap) free(wal_batch);
+                goto cleanup_error_io;
+            }
         }
 
         if (wal_is_heap) free(wal_batch);

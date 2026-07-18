@@ -3702,6 +3702,293 @@ void test_block_manager_max_safe_block_bytes_refusal(void)
     (void)remove(path);
 }
 
+/* buffered-append mode -- write through block_manager_open_buffered (staging ring + flush thread),
+ * then reopen on the direct path to prove the on-disk bytes are identical and every record survives
+ */
+
+void test_block_manager_buffered_roundtrip(void)
+{
+    const char *path = "test_buffered_roundtrip.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 0) == 0);
+    ASSERT_TRUE(bm != NULL);
+    ASSERT_EQ(bm->buffered, 1);
+
+    const int num_records = 500;
+    for (int i = 0; i < num_records; i++)
+    {
+        char data[48];
+        snprintf(data, sizeof(data), "buffered_record_%d", i);
+        const uint32_t size = (uint32_t)(strlen(data) + 1);
+        int64_t off = block_manager_write_raw(bm, data, size);
+        ASSERT_TRUE(off >= 0);
+        /* wait for the flush thread to make this record durable before moving on */
+        ASSERT_TRUE(
+            block_manager_wait_durable(bm, (uint64_t)off + block_manager_framed_size(size)) == 0);
+    }
+
+    /* get_size reports the flushed extent on a buffered handle -- everything is durable here */
+    uint64_t flushed_size = 0;
+    ASSERT_TRUE(block_manager_get_size(bm, &flushed_size) == 0);
+    ASSERT_TRUE(flushed_size > BLOCK_MANAGER_HEADER_SIZE);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen on the direct path and read every record back */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_EQ(bm->buffered, 0);
+
+    uint64_t reopen_size = 0;
+    ASSERT_TRUE(block_manager_get_size(bm, &reopen_size) == 0);
+    ASSERT_EQ(reopen_size, flushed_size);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int read = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        char expected[48];
+        snprintf(expected, sizeof(expected), "buffered_record_%d", read);
+        ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        read++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_EQ(read, num_records);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+typedef struct
+{
+    block_manager_t *bm;
+    int thread_id;
+    int num_records;
+    int records_per_thread;
+} buffered_writer_args_t;
+
+static void *buffered_writer_thread(void *arg)
+{
+    buffered_writer_args_t *a = (buffered_writer_args_t *)arg;
+    for (int i = 0; i < a->records_per_thread; i++)
+    {
+        /* payload carries a globally unique index so read-back can prove exactly-once */
+        const uint32_t idx = (uint32_t)(a->thread_id * a->records_per_thread + i);
+        uint8_t data[32];
+        memset(data, 0, sizeof(data));
+        memcpy(data, &idx, sizeof(idx));
+        int64_t off = block_manager_write_raw(a->bm, data, (uint32_t)sizeof(data));
+        if (off < 0) continue;
+        (void)block_manager_wait_durable(a->bm,
+                                         (uint64_t)off + block_manager_framed_size(sizeof(data)));
+    }
+    return NULL;
+}
+
+void test_block_manager_buffered_concurrent(void)
+{
+    const char *path = "test_buffered_concurrent.db";
+    (void)remove(path);
+
+    const int num_threads = 8;
+    const int records_per_thread = 2000;
+    const int total = num_threads * records_per_thread;
+
+    block_manager_t *bm = NULL;
+    /* SYNC_FULL exercises the flush thread's fdatasync path under concurrency */
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_FULL, 0) == 0);
+
+    pthread_t threads[8];
+    buffered_writer_args_t args[8];
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].bm = bm;
+        args[i].thread_id = i;
+        args[i].num_records = total;
+        args[i].records_per_thread = records_per_thread;
+        ASSERT_TRUE(pthread_create(&threads[i], NULL, buffered_writer_thread, &args[i]) == 0);
+    }
+    for (int i = 0; i < num_threads; i++) ASSERT_TRUE(pthread_join(threads[i], NULL) == 0);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen direct and confirm every index appears exactly once */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    uint8_t *seen = calloc((size_t)total, 1);
+    ASSERT_TRUE(seen != NULL);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int count = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        ASSERT_EQ(block->size, (uint64_t)32);
+        uint32_t idx = 0;
+        memcpy(&idx, block->data, sizeof(idx));
+        ASSERT_TRUE(idx < (uint32_t)total);
+        ASSERT_EQ(seen[idx], 0); /* no duplicates */
+        seen[idx] = 1;
+        count++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_EQ(count, total);
+    for (int i = 0; i < total; i++) ASSERT_EQ(seen[i], 1); /* none missing */
+    free(seen);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+void test_block_manager_buffered_ring_wraparound(void)
+{
+    const char *path = "test_buffered_wrap.db";
+    (void)remove(path);
+
+    /* a 1 MB ring (the floor) with 4 KB records forces many full wraparounds */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 1) == 0);
+
+    const int num_records = 1500;
+    const uint32_t rec_size = 4096;
+    uint8_t *data = malloc(rec_size);
+    ASSERT_TRUE(data != NULL);
+
+    for (int i = 0; i < num_records; i++)
+    {
+        memset(data, 0, rec_size);
+        memcpy(data, &i, sizeof(i)); /* first 4 bytes = sequence number */
+        int64_t off = block_manager_write_raw(bm, data, rec_size);
+        ASSERT_TRUE(off >= 0);
+        ASSERT_TRUE(block_manager_wait_durable(
+                        bm, (uint64_t)off + block_manager_framed_size(rec_size)) == 0);
+    }
+    free(data);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int read = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        ASSERT_EQ(block->size, (uint64_t)rec_size);
+        int seq = 0;
+        memcpy(&seq, block->data, sizeof(seq));
+        ASSERT_EQ(seq, read); /* records land in append order */
+        read++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_EQ(read, num_records);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+void test_block_manager_buffered_oversized_record(void)
+{
+    const char *path = "test_buffered_oversized.db";
+    (void)remove(path);
+
+    /* 1 MB ring floor; a 1.5 MB record cannot be staged and takes the oversized direct-write path.
+     * bracket it with small records to prove ordering and the flushed watermark stay consistent. */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_FULL, 1) == 0);
+
+    const uint32_t big_size = 1536 * 1024;
+    uint8_t *big = malloc(big_size);
+    ASSERT_TRUE(big != NULL);
+    for (uint32_t i = 0; i < big_size; i++) big[i] = (uint8_t)(i * 31 + 7);
+
+    char small[32];
+    /* three small records, then the oversized one, then three more */
+    for (int i = 0; i < 3; i++)
+    {
+        snprintf(small, sizeof(small), "pre_%d", i);
+        int64_t off = block_manager_write_raw(bm, small, (uint32_t)(strlen(small) + 1));
+        ASSERT_TRUE(off >= 0);
+    }
+    int64_t big_off = block_manager_write_raw(bm, big, big_size);
+    ASSERT_TRUE(big_off >= 0);
+    ASSERT_TRUE(block_manager_wait_durable(
+                    bm, (uint64_t)big_off + block_manager_framed_size(big_size)) == 0);
+    for (int i = 0; i < 3; i++)
+    {
+        snprintf(small, sizeof(small), "post_%d", i);
+        int64_t off = block_manager_write_raw(bm, small, (uint32_t)(strlen(small) + 1));
+        ASSERT_TRUE(off >= 0);
+        ASSERT_TRUE(block_manager_wait_durable(
+                        bm, (uint64_t)off + block_manager_framed_size(strlen(small) + 1)) == 0);
+    }
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen direct, verify the seven records read back in order with intact contents */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int idx = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        if (idx < 3)
+        {
+            char expected[32];
+            snprintf(expected, sizeof(expected), "pre_%d", idx);
+            ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        }
+        else if (idx == 3)
+        {
+            ASSERT_EQ(block->size, (uint64_t)big_size);
+            int mismatch = 0;
+            for (uint32_t i = 0; i < big_size; i++)
+                if (((uint8_t *)block->data)[i] != (uint8_t)(i * 31 + 7))
+                {
+                    mismatch = 1;
+                    break;
+                }
+            ASSERT_EQ(mismatch, 0);
+        }
+        else
+        {
+            char expected[32];
+            snprintf(expected, sizeof(expected), "post_%d", idx - 4);
+            ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        }
+        idx++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+    free(big);
+
+    ASSERT_EQ(idx, 7);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -3774,6 +4061,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_permissive_validation_truncates_prealloc_tail, tests_passed);
     RUN_TEST(test_block_manager_large_block_read_roundtrip, tests_passed);
     RUN_TEST(test_block_manager_max_safe_block_bytes_refusal, tests_passed);
+
+    RUN_TEST(test_block_manager_buffered_roundtrip, tests_passed);
+    RUN_TEST(test_block_manager_buffered_concurrent, tests_passed);
+    RUN_TEST(test_block_manager_buffered_ring_wraparound, tests_passed);
+    RUN_TEST(test_block_manager_buffered_oversized_record, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

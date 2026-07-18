@@ -101,6 +101,20 @@ typedef enum
  * @param group_durable_size bytes of the file confirmed fdatasync'd, used by group-commit
  *                           callers to tell whether their write is already durable
  * @param group_sync_active set while a group-commit leader is mid-fdatasync on this file
+ * @param buffered 1 when buffered append mode is enabled, 0 on the direct path
+ * @param ring staging ring buffer of ring_size bytes that appenders copy their framed record into
+ * @param done_ring per-ring-position completion flags; an appender sets done_ring[off % ring_size]
+ *                  after copying its record and the flush thread advances over the contiguous run
+ * @param ring_size ring capacity in bytes
+ * @param buf_flushed contiguous file offset the flush thread has pwritten, the durability watermark
+ * @param flush_tid the single flush thread that owns every pwrite in buffered mode
+ * @param flush_stop set at close so the flush thread drains the ring and exits
+ * @param flush_error errno set if a flush-thread pwrite or fdatasync failed
+ * @param flush_sleeping 1 while the flush thread is parked waiting for work
+ * @param durable_waiters count of appenders parked waiting for buf_flushed to advance
+ * @param buf_mtx guards the buffered condition variables
+ * @param buf_work_cv the flush thread parks here when the ring has no released work
+ * @param buf_durable_cv appenders park here waiting for buf_flushed to advance
  */
 typedef struct
 {
@@ -123,6 +137,28 @@ typedef struct
     ATOMIC_ALIGN(8) _Atomic uint64_t group_durable_size;
     /* atomic so concurrent group-commit leaders don't race on this flag */
     _Atomic int group_sync_active;
+
+    /**** buffered append mode (Aether decoupled fill + single flush thread)
+     * when active, concurrent appenders reserve a file offset (current_file_size fetch-add), copy
+     * their framed block into the staging ring in parallel, and release in offset order; ONE flush
+     * thread pwrites contiguous released runs to the fd and advances buf_flushed. only the flush
+     * thread touches the fd, so concurrent appenders never serialize on the inode write lock. the
+     * on-disk bytes are byte-identical to the direct path, so recovery and readers are unchanged.
+     * enabled per-bm via block_manager_open_buffered; zero/NULL on the direct path.
+     * current_file_size doubles as the reservation watermark (the next file offset handed out). */
+    int buffered;
+    uint8_t *ring;
+    _Atomic unsigned char *done_ring;
+    uint64_t ring_size;
+    ATOMIC_ALIGN(8) _Atomic uint64_t buf_flushed;
+    pthread_t flush_tid;
+    _Atomic int flush_stop;
+    _Atomic int flush_error;
+    _Atomic int flush_sleeping;
+    _Atomic int durable_waiters;
+    pthread_mutex_t buf_mtx;
+    pthread_cond_t buf_work_cv;
+    pthread_cond_t buf_durable_cv;
 } block_manager_t;
 
 /**
@@ -183,6 +219,33 @@ int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mod
  */
 int block_manager_open_pre(block_manager_t **bm, const char *file_path, int sync_mode,
                            uint64_t prealloc_chunk);
+
+/**
+ * block_manager_open_buffered
+ * like block_manager_open but enables buffered append mode -- concurrent appenders stage into an
+ * in-memory ring and a single flush thread does all the pwrites, so many writers no longer
+ * serialize on the file inode write lock. use for the WAL, where many transactions append
+ * concurrently. reads, recovery, and the on-disk format are identical to the direct path.
+ * @param bm output block manager
+ * @param file_path path of the file
+ * @param sync_mode TDB_SYNC_NONE or TDB_SYNC_FULL
+ * @param ring_size staging ring capacity in bytes (0 = a sensible default); rounded up internally
+ * @return 0 on success, -1 on failure
+ */
+int block_manager_open_buffered(block_manager_t **bm, const char *file_path, int sync_mode,
+                                uint64_t ring_size);
+
+/**
+ * block_manager_wait_durable
+ * block until the buffered flush thread has written (and, in SYNC_FULL, fdatasync'd) every byte up
+ * to file offset `offset`. used by a committer that needs its WAL record durable before returning.
+ * on a non-buffered block manager this returns 0 immediately (the direct path is already durable
+ * per its sync mode).
+ * @param bm the block manager
+ * @param offset the file offset that must be durable
+ * @return 0 on success, -1 if the flush thread reported an I/O error
+ */
+int block_manager_wait_durable(block_manager_t *bm, uint64_t offset);
 
 /**
  * block_manager_close

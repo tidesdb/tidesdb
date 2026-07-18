@@ -734,7 +734,7 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
 #define BM_BUF_MIN_RING                                                                \
     (1ull * 1024 * 1024)          /* ring floor; larger records use the oversized path \
                                    */
-#define BM_BUF_SPIN          2048 /* spin iterations before parking on a cond var */
+#define BM_BUF_SPIN          128  /* spin iterations before parking on a cond var */
 #define BM_BUF_FLUSH_PARK_US 500  /* flush-thread park timeout, a missed-signal safety net */
 #define BM_BUF_WAIT_PARK_US  2000 /* appender durability-wait park timeout */
 #define BM_NS_PER_US         1000L

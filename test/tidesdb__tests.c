@@ -3471,7 +3471,7 @@ static void prefix_probe_once(int block_indexes, int bloom, int use_btree)
     {
         memcpy(keys[i], prefix, SHARED_LEN);
         for (int b = 0; b < KEY_LEN - SHARED_LEN; b++)
-            keys[i][SHARED_LEN + b] = (uint8_t)((unsigned)(i * 2654435761u) >> (b * 4));
+            keys[i][SHARED_LEN + b] = (uint8_t)((unsigned)(i * 2654435761u) >> ((b * 4) & 31));
     }
 
     for (int i = 0; i < NKEYS; i++)
@@ -8356,6 +8356,31 @@ static void test_boundary_partitioning(void)
     cleanup_test_dir();
 }
 
+/* settle/sample tuning for the capacity-adaptation check. the poll budget is deliberately generous
+ * because the settle loop breaks the moment the cf is quiet, so a high cap costs a fast box nothing
+ * while giving a sanitizer build, which runs an order of magnitude slower, room to finish
+ * compacting rather than sampling a tree that is still moving. */
+#define DCA_SETTLE_POLL_US  50000
+#define DCA_SETTLE_POLLS    6000
+#define DCA_SETTLE_STREAK   5
+#define DCA_SAMPLE_ATTEMPTS 20
+
+/* quiescence predicate for the capacity-adaptation check. compaction_pending_count is incremented
+ * before the work item is enqueued and decremented only after the worker fully finishes, so it has
+ * no TOCTOU gap the way is_compacting does (the worker sets is_compacting only after dequeuing, so
+ * the queue can be empty while it is still 0). compaction_armed catches a re-trigger that has been
+ * armed but not yet enqueued, which would otherwise let a fresh round start immediately after the
+ * predicate passes. */
+static int dca_cf_is_quiesced(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    return queue_size(db->flush_queue) == 0 &&
+           atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
+           atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
+           !atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
+           !atomic_load_explicit(&cf->is_compacting, memory_order_acquire) &&
+           !atomic_load_explicit(&cf->compaction_armed, memory_order_acquire);
+}
+
 static void test_dynamic_capacity_adjustment(void)
 {
     cleanup_test_dir();
@@ -8421,24 +8446,25 @@ static void test_dynamic_capacity_adjustment(void)
      * compaction that collapses every level into the largest and never adds a
      * level, which would cement the tree at min_levels. the stable counter
      * absorbs the flush completing then triggering one more compaction. */
-    for (int stable = 0, i = 0; i < 600 && stable < 5; i++)
+    int settled = 0;
+    for (int stable = 0, i = 0; i < DCA_SETTLE_POLLS && !settled; i++)
     {
-        usleep(50000);
-        if (queue_size(db->flush_queue) == 0 &&
-            atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
-            atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
-            !atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
-            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
-            stable++;
+        usleep(DCA_SETTLE_POLL_US);
+        if (dca_cf_is_quiesced(db, cf))
+        {
+            if (++stable >= DCA_SETTLE_STREAK) settled = 1;
+        }
         else
             stable = 0;
     }
 
     printf("Total keys written: %d\n", total_keys_written);
-
-    int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-    printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
-    ASSERT_TRUE(final_levels >= 2);
+    /* a settle timeout is its own failure. sampling a tree that is still compacting would assert
+     * the steady-state relation below against moving state and report a confusing capacity mismatch
+     * instead of the real problem, which is that the cf never came to rest. */
+    if (!settled) printf("CF did not quiesce within the settle budget\n");
+    fflush(stdout);
+    ASSERT_TRUE(settled);
 
     /*** dynamic capacity adaptation check. tidesdb_apply_dca runs at the end of
      **  every compaction cycle and recomputes each non-largest level capacity
@@ -8448,10 +8474,39 @@ static void test_dynamic_capacity_adjustment(void)
      **  on every platform regardless of how the compaction heuristics batched
      *   the work. asserting this invariant -- rather than a specific level
      **  count, which is an emergent outcome that flakes under os scheduling
-     *   differences -- is what makes the test deterministic. */
-    tidesdb_level_t *largest_level = cf->levels[final_levels - 1];
-    size_t n_l = atomic_load_explicit(&largest_level->current_size, memory_order_acquire);
+     *   differences -- is what makes the test deterministic.
+     *   N_L and the per-level capacities are separate atomic loads, so a compaction landing between
+     *   them would tear the sample apart and fail the assert for no real reason. bracket the reads
+     *   with the sstable layout version and a quiesce recheck, and retry until a sample is
+     *confirmed untorn before asserting on it. */
+    int final_levels = 0;
+    size_t n_l = 0;
+    size_t caps[TDB_MAX_LEVELS];
+    int sampled = 0;
+    for (int attempt = 0; attempt < DCA_SAMPLE_ATTEMPTS && !sampled; attempt++)
+    {
+        const uint64_t ver_before =
+            atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+        final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+        n_l =
+            atomic_load_explicit(&cf->levels[final_levels - 1]->current_size, memory_order_acquire);
+        for (int i = 0; i < final_levels - 1 && i < TDB_MAX_LEVELS; i++)
+            caps[i] = atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
+        const uint64_t ver_after =
+            atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+
+        if (ver_before == ver_after && dca_cf_is_quiesced(db, cf))
+            sampled = 1;
+        else
+            usleep(DCA_SETTLE_POLL_US);
+    }
+    if (!sampled) printf("could not obtain a consistent capacity sample\n");
+    fflush(stdout);
+    ASSERT_TRUE(sampled);
+
+    printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
     printf("Largest level L%d size N_L=%zu bytes\n", final_levels, n_l);
+    ASSERT_TRUE(final_levels >= 2);
 
     for (int i = 0; i < final_levels - 1; i++)
     {
@@ -8461,11 +8516,9 @@ static void test_dynamic_capacity_adjustment(void)
         if (expected_capacity < cf_config.write_buffer_size)
             expected_capacity = cf_config.write_buffer_size;
 
-        size_t actual_capacity =
-            atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
-        printf("  L%d capacity actual=%zu expected=%zu\n", i + 1, actual_capacity,
-               expected_capacity);
-        ASSERT_EQ(actual_capacity, expected_capacity);
+        printf("  L%d capacity actual=%zu expected=%zu\n", i + 1, caps[i], expected_capacity);
+        fflush(stdout);
+        ASSERT_EQ(caps[i], expected_capacity);
     }
 
     /* verify data is accessible (skip verification of keys that may still be in memtable) */

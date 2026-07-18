@@ -1072,6 +1072,17 @@ struct tidesdb_txn_t
     uint64_t txn_id;
     uint64_t snapshot_seq;
     uint64_t commit_seq;
+    /* the op array and the read set are written only by the owning thread but READ by other
+     * transactions -- the serializable rw-antidependency check walks a concurrent transaction's
+     * ops, and the dangerous-structure check walks its read set. both grow by realloc and are
+     * truncated on reset or savepoint rollback, so an unguarded reader can dereference a freed
+     * array, not merely read a torn count. conflict_lock makes that publication safe. the owner
+     * write-locks it across any mutation of ops/num_ops or the read set, a cross-transaction reader
+     * read-locks the transaction it is scanning. uncontended in the common case, since only the
+     * owner writes and readers appear only during a serializable commit's conflict check. the owner
+     * never takes the active-transaction registry lock while holding this, so there is no
+     * lock-order inversion with the reader, which holds the registry read lock first. */
+    pthread_rwlock_t conflict_lock;
     tidesdb_txn_op_t *ops;
     int num_ops;
     int ops_capacity;

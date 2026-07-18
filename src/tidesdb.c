@@ -10945,20 +10945,30 @@ static int tidesdb_compute_l1_overlap_depth(tidesdb_column_family_t *cf)
     tidesdb_resolve_comparator(cf->db, &cf->config, &cmp, &ctx);
     if (!cmp) return 0;
 
-    /* array_readers pins the sstable array and its entries against a concurrent retire while we
-     * read their boundary keys (same guard the flush out-of-order scan uses) */
+    /* array_readers only pins the sstable ARRAY against retire, it does not stop a concurrent
+     * compaction from unref'ing an individual sstable and freeing its boundary keys. the events
+     * below point straight at those key buffers and outlive the array_readers window, so take a
+     * real reference on each sstable first and hold it until the sweep is done. a failed try_ref
+     * means the sstable is already being reclaimed, so skip it. */
     atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_acq_rel);
     const int n = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
     tidesdb_sstable_t **ssts = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
     tidesdb_overlap_event_t *ev = (n > 0) ? malloc((size_t)(2 * n) * sizeof(*ev)) : NULL;
-    int m = 0;
-    if (ev)
+    tidesdb_sstable_t **pinned = (n > 0) ? malloc((size_t)n * sizeof(*pinned)) : NULL;
+    int m = 0, num_pinned = 0;
+    if (ev && pinned)
     {
         for (int i = 0; i < n; i++)
         {
             tidesdb_sstable_t *s = ssts ? ssts[i] : NULL;
-            if (!s || !s->min_key || !s->max_key) continue;
+            if (!s || !tidesdb_sstable_try_ref(s)) continue;
+            if (!s->min_key || !s->max_key)
+            {
+                tidesdb_sstable_unref(cf->db, s);
+                continue;
+            }
+            pinned[num_pinned++] = s;
             ev[m].key = s->min_key;
             ev[m].size = s->min_key_size;
             ev[m].delta = 1;
@@ -10971,8 +10981,10 @@ static int tidesdb_compute_l1_overlap_depth(tidesdb_column_family_t *cf)
     }
     atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
 
-    if (!ev || m == 0)
+    if (!ev || !pinned || m == 0)
     {
+        for (int i = 0; i < num_pinned; i++) tidesdb_sstable_unref(cf->db, pinned[i]);
+        free(pinned);
         free(ev);
         return (n > 0) ? 1 : 0; /* alloc failure -- fall back to a conservative depth of 1 */
     }
@@ -11004,6 +11016,9 @@ static int tidesdb_compute_l1_overlap_depth(tidesdb_column_family_t *cf)
         if (depth > max_depth) max_depth = depth;
     }
     free(ev);
+    /* the events pointed into these sstables' key buffers, so release the pins only now */
+    for (int i = 0; i < num_pinned; i++) tidesdb_sstable_unref(cf->db, pinned[i]);
+    free(pinned);
     return max_depth;
 }
 
@@ -13487,12 +13502,12 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
 
     /* DCA reference size. the paper uses the largest level's data size N_L. but during ingestion
      * the largest level is empty (data has not propagated down yet), and N_L ~ 0 would collapse
-     * every capacity to the write-buffer floor -- which pins the compaction target-level selection
-     * at X and self-merges the first level forever, never draining downward. use the largest
-     * NON-EMPTY level instead,once the tree has quiesced this is the largest level itself
-     * (matching the paper and preserving the durable space-amp bound), but while the tree fills it
-     * tracks a populated level so capacities stay sized to real data and the target selection can
-     * route data down. */
+     * every capacity to the write-buffer floor, which pins the compaction target-level selection at
+     * X and self-merges the first level forever, never draining downward. use the largest NON-EMPTY
+     * level instead. once the tree has quiesced this is the largest level itself, matching the
+     * paper and preserving the durable space-amp bound, and if the largest level holds only a
+     * sliver during a transition the collapsed capacities make the fuller shallower levels read as
+     * over-capacity and drain downward, which is the right response, not a stall. */
     size_t N_L = 0;
     for (int i = num_levels - 1; i >= 0; i--)
     {
@@ -18109,13 +18124,27 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf, int full_compaction)
             /* else multi-level but largest under capacity -- we leave the shrink to the collapse
              * rule below rather than merging into an underfull largest and re-triggering */
         }
-        else
+        else if (X > 1)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
             result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
         }
+        else
+        {
+            /* X==1 is a degenerate dividing level, the first sorted level itself. a dividing merge
+             * here just re-partitions L1 in place, spending I/O to keep the data at L1 while the
+             * partitioned merge below is what actually drains it to the largest level. that
+             * in-place churn holds data at L1 and lets it pile, so skip straight to the drain --
+             * the partitioned merge reads whatever L1 layout exists and needs no pre-consolidation.
+             */
+            TDB_DEBUG_LOG(
+                TDB_LOG_INFO,
+                "CF '%s' degenerate dividing level X=1, draining L1 to largest instead of "
+                "consolidating in place",
+                cf->name);
+        }
     }
-    else
+    else if (X > 1)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "Target_lvl > X, defaulting to dividing merge");
         result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
@@ -18689,8 +18718,10 @@ static int tidesdb_flush_partition_splits(tidesdb_column_family_t *cf, size_t me
     tidesdb_resolve_comparator(cf->db, &cf->config, &cmp, &cctx);
     if (!cmp) return 0;
 
-    /* copy the min_keys out under array_readers so a concurrent compaction cannot retire the array
-     * or free a key while we read it -- we never mutate the level from the flush path */
+    /* copy the min_keys out so we never mutate the level from the flush path. array_readers only
+     * pins the array against retire, not the individual sstables, so a concurrent compaction can
+     * unref one and free its min_key mid-copy -- take a real reference across each copy and drop it
+     * straight after. a failed try_ref means the sstable is already being reclaimed, so skip it. */
     atomic_fetch_add_explicit(&largest->array_readers, 1, memory_order_acq_rel);
     const int n = atomic_load_explicit(&largest->num_sstables, memory_order_acquire);
     tidesdb_sstable_t **ssts = atomic_load_explicit(&largest->sstables, memory_order_acquire);
@@ -18702,13 +18733,19 @@ static int tidesdb_flush_partition_splits(tidesdb_column_family_t *cf, size_t me
         for (int i = 0; i < n; i++)
         {
             tidesdb_sstable_t *s = ssts ? ssts[i] : NULL;
-            if (!s || !s->min_key || s->min_key_size == 0) continue;
-            uint8_t *cp = malloc(s->min_key_size);
-            if (!cp) continue;
-            memcpy(cp, s->min_key, s->min_key_size);
-            keys[nk] = cp;
-            sizes[nk] = s->min_key_size;
-            nk++;
+            if (!s || !tidesdb_sstable_try_ref(s)) continue;
+            if (s->min_key && s->min_key_size > 0)
+            {
+                uint8_t *cp = malloc(s->min_key_size);
+                if (cp)
+                {
+                    memcpy(cp, s->min_key, s->min_key_size);
+                    keys[nk] = cp;
+                    sizes[nk] = s->min_key_size;
+                    nk++;
+                }
+            }
+            tidesdb_sstable_unref(cf->db, s);
         }
     }
     atomic_fetch_sub_explicit(&largest->array_readers, 1, memory_order_release);
@@ -25664,40 +25701,47 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
             new_cap = txn->read_set_capacity + TDB_TXN_READ_SET_BATCH_GROW;
         }
 
+        /* growth reallocs arrays a cross-transaction dangerous-structure check may be walking, so
+         * swap the pointers under the write lock rather than out from under a reader. a partial
+         * failure keeps whichever arrays did grow and leaves the capacity unchanged, as before. */
+        pthread_rwlock_wrlock(&txn->conflict_lock);
+        int grow_failed = 0;
+
         uint8_t **new_keys = realloc(txn->read_keys, new_cap * sizeof(uint8_t *));
-        if (!new_keys) return -1;
-
-        size_t *new_sizes = realloc(txn->read_key_sizes, new_cap * sizeof(size_t));
-        if (!new_sizes)
+        if (!new_keys)
+            grow_failed = 1;
+        else
         {
-            /* new_keys succeeded, so we need to keep it */
-            txn->read_keys = new_keys;
-            return -1;
-        }
+            txn->read_keys = new_keys; /* keep it even if a later realloc fails */
 
-        uint64_t *new_seqs = realloc(txn->read_seqs, new_cap * sizeof(uint64_t));
-        if (!new_seqs)
-        {
-            txn->read_keys = new_keys;
-            txn->read_key_sizes = new_sizes;
-            return -1;
-        }
+            size_t *new_sizes = realloc(txn->read_key_sizes, new_cap * sizeof(size_t));
+            if (!new_sizes)
+                grow_failed = 1;
+            else
+            {
+                txn->read_key_sizes = new_sizes;
 
-        tidesdb_column_family_t **new_cfs =
-            realloc(txn->read_cfs, new_cap * sizeof(tidesdb_column_family_t *));
-        if (!new_cfs)
-        {
-            txn->read_keys = new_keys;
-            txn->read_key_sizes = new_sizes;
-            txn->read_seqs = new_seqs;
-            return -1;
-        }
+                uint64_t *new_seqs = realloc(txn->read_seqs, new_cap * sizeof(uint64_t));
+                if (!new_seqs)
+                    grow_failed = 1;
+                else
+                {
+                    txn->read_seqs = new_seqs;
 
-        txn->read_keys = new_keys;
-        txn->read_key_sizes = new_sizes;
-        txn->read_seqs = new_seqs;
-        txn->read_cfs = new_cfs;
-        txn->read_set_capacity = new_cap;
+                    tidesdb_column_family_t **new_cfs =
+                        realloc(txn->read_cfs, new_cap * sizeof(tidesdb_column_family_t *));
+                    if (!new_cfs)
+                        grow_failed = 1;
+                    else
+                    {
+                        txn->read_cfs = new_cfs;
+                        txn->read_set_capacity = new_cap;
+                    }
+                }
+            }
+        }
+        pthread_rwlock_unlock(&txn->conflict_lock);
+        if (grow_failed) return -1;
     }
 
     /* we utilize arena allocation for read keys to reduce malloc overhead */
@@ -25765,7 +25809,12 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
     txn->read_seqs[txn->read_set_count] = seq;
     txn->read_cfs[txn->read_set_count] = cf;
 
+    /* publish the new entry under the write lock so a concurrent dangerous-structure check never
+     * observes a count that outruns the initialized slots */
+    pthread_rwlock_wrlock(&txn->conflict_lock);
     txn->read_set_count++;
+    pthread_rwlock_unlock(&txn->conflict_lock);
+
     if (txn->read_set_count == TDB_TXN_READ_HASH_THRESHOLD && !txn->read_set_hash)
     {
         txn->read_set_hash = tidesdb_read_set_hash_create();
@@ -25876,10 +25925,18 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, const tidesdb_isolation_leve
 
     (*txn)->commit_seq = 0;
 
+    if (pthread_rwlock_init(&(*txn)->conflict_lock, NULL) != 0)
+    {
+        free(*txn);
+        *txn = NULL;
+        return TDB_ERR_MEMORY;
+    }
+
     (*txn)->ops_capacity = TDB_INITIAL_TXN_OPS_CAPACITY;
     (*txn)->ops = calloc((*txn)->ops_capacity, sizeof(tidesdb_txn_op_t));
     if (!(*txn)->ops)
     {
+        pthread_rwlock_destroy(&(*txn)->conflict_lock);
         free(*txn);
         *txn = NULL;
         return TDB_ERR_MEMORY;
@@ -26070,11 +26127,17 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
         if (new_capacity <= txn->ops_capacity) return TDB_ERR_TOO_LARGE;
 
+        /* the realloc moves the array a cross-transaction conflict check may be walking, so swap
+         * the pointer under the write lock rather than out from under a reader */
+        pthread_rwlock_wrlock(&txn->conflict_lock);
         tidesdb_txn_op_t *new_ops = realloc(txn->ops, new_capacity * sizeof(tidesdb_txn_op_t));
+        if (new_ops)
+        {
+            txn->ops = new_ops;
+            txn->ops_capacity = new_capacity;
+        }
+        pthread_rwlock_unlock(&txn->conflict_lock);
         if (!new_ops) return TDB_ERR_MEMORY;
-
-        txn->ops = new_ops;
-        txn->ops_capacity = new_capacity;
     }
 
     tidesdb_txn_op_t *op = &txn->ops[txn->num_ops];
@@ -26105,7 +26168,11 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     op->is_delete = 0;
     op->cf = cf;
 
+    /* publish the new op under the write lock so a concurrent serializable conflict check never
+     * observes a count that outruns the initialized entries */
+    pthread_rwlock_wrlock(&txn->conflict_lock);
     txn->num_ops++;
+    pthread_rwlock_unlock(&txn->conflict_lock);
 
     /* account this op's coalesced key+value buffer (threshold-batched, off the hot path) */
     txn->mem_bytes += (int64_t)(op->key_size + op->value_size);
@@ -26904,11 +26971,17 @@ static int tidesdb_txn_delete_internal(tidesdb_txn_t *txn, tidesdb_column_family
 
         if (new_capacity <= txn->ops_capacity) return TDB_ERR_TOO_LARGE;
 
+        /* the realloc moves the array a cross-transaction conflict check may be walking, so swap
+         * the pointer under the write lock rather than out from under a reader */
+        pthread_rwlock_wrlock(&txn->conflict_lock);
         tidesdb_txn_op_t *new_ops = realloc(txn->ops, new_capacity * sizeof(tidesdb_txn_op_t));
+        if (new_ops)
+        {
+            txn->ops = new_ops;
+            txn->ops_capacity = new_capacity;
+        }
+        pthread_rwlock_unlock(&txn->conflict_lock);
         if (!new_ops) return TDB_ERR_MEMORY;
-
-        txn->ops = new_ops;
-        txn->ops_capacity = new_capacity;
     }
 
     tidesdb_txn_op_t *op = &txn->ops[txn->num_ops];
@@ -26926,7 +26999,11 @@ static int tidesdb_txn_delete_internal(tidesdb_txn_t *txn, tidesdb_column_family
     op->is_single_delete = is_single_delete;
     op->cf = cf;
 
+    /* publish the new op under the write lock so a concurrent serializable conflict check never
+     * observes a count that outruns the initialized entries */
+    pthread_rwlock_wrlock(&txn->conflict_lock);
     txn->num_ops++;
+    pthread_rwlock_unlock(&txn->conflict_lock);
 
     /* account this op's key buffer (value_size is 0 for deletes) */
     txn->mem_bytes += (int64_t)(op->key_size + op->value_size);
@@ -27026,6 +27103,7 @@ void tidesdb_txn_free(tidesdb_txn_t *txn)
     free(txn->savepoint_names);
 
     free(txn->cfs);
+    pthread_rwlock_destroy(&txn->conflict_lock);
     free(txn);
 }
 
@@ -27055,19 +27133,27 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
         tidesdb_txn_remove_from_active_list(txn);
     }
 
-    /* we free op key/value data but keep the ops array itself */
-    for (int i = 0; i < txn->num_ops; i++)
+    /* we free op key/value data but keep the ops array itself. drop the count to zero before
+     * freeing so a cross-transaction conflict check can never walk into a buffer we are releasing,
+     * and hold the write lock across the whole retirement so one already scanning finishes first.
+     */
+    pthread_rwlock_wrlock(&txn->conflict_lock);
+    const int retired_ops = txn->num_ops;
+    txn->num_ops = 0;
+    for (int i = 0; i < retired_ops; i++)
     {
         free(txn->ops[i].key); /* coalesced buffer owns key+value */
         txn->ops[i].key = NULL;
         txn->ops[i].value = NULL;
     }
-    txn->num_ops = 0;
+    pthread_rwlock_unlock(&txn->conflict_lock);
 
-    /* we reset read set but keep arrays allocated, we also free arena buffers to avoid leaks */
+    /* we reset read set but keep arrays allocated, we also free arena buffers to avoid leaks. the
+     * read keys point into these arenas, so drop the count to zero and release the arenas under the
+     * write lock -- a cross-transaction dangerous-structure check must not be left walking keys
+     * that live in a buffer we are freeing. */
+    pthread_rwlock_wrlock(&txn->conflict_lock);
     txn->read_set_count = 0;
-
-    /* we free individual arena buffers but keep the pointer array for reuse */
     for (int i = 0; i < txn->read_key_arena_count; i++)
     {
         free(txn->read_key_arenas[i]);
@@ -27075,6 +27161,7 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
     }
     txn->read_key_arena_count = 0;
     txn->read_key_arena_used = 0;
+    pthread_rwlock_unlock(&txn->conflict_lock);
 
     /* return this txn's published memory to the global counter and reset the accumulator */
     if (txn->mem_published)
@@ -27499,6 +27586,11 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
         if (other == txn || other->is_committed || other->is_aborted) continue;
         if (other->isolation_level != TDB_ISOLATION_SERIALIZABLE) continue;
 
+        /* the peer's owner thread appends to, reallocs and truncates its own op array while we scan
+         * it, so hold its read lock. the active-list rdlock above keeps the transaction struct
+         * alive, but only this keeps the array itself from moving or its buffers from being freed
+         * mid-scan. */
+        pthread_rwlock_rdlock(&other->conflict_lock);
         if (txn->read_set_hash && txn->read_set_count >= TDB_TXN_READ_HASH_THRESHOLD)
         {
             for (int w = 0; w < other->num_ops && !txn->has_rw_conflict_out; w++)
@@ -27531,6 +27623,7 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
                 }
             }
         }
+        pthread_rwlock_unlock(&other->conflict_lock);
     }
 
     /* we check for dangerous structures */
@@ -27540,13 +27633,18 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
     {
         for (int i = 0; i < count && !conflict; i++)
         {
-            const tidesdb_txn_t *other = active[i];
+            /* not const -- we take this peer's conflict_lock to walk its read set safely */
+            tidesdb_txn_t *other = active[i];
             if (other == txn || other->is_committed || other->is_aborted ||
                 !other->has_rw_conflict_in || !other->has_rw_conflict_out)
             {
                 continue;
             }
 
+            /* the peer's owner grows its read set by realloc and frees the arenas its read keys
+             * point into, so hold its read lock while we walk them. our own ops need no guard --
+             * this thread owns them. */
+            pthread_rwlock_rdlock(&other->conflict_lock);
             for (int w = 0; w < txn->num_ops && !conflict; w++)
             {
                 const tidesdb_txn_op_t *op = &txn->ops[w];
@@ -27560,6 +27658,7 @@ static int tidesdb_txn_check_ssi_conflicts(tidesdb_txn_t *txn)
                     }
                 }
             }
+            pthread_rwlock_unlock(&other->conflict_lock);
         }
     }
 
@@ -29333,10 +29432,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                                       block_manager_framed_size((uint32_t)uwal_size),
                                       memory_order_relaxed);
 
-            /* buffered WAL -- block until the single flush thread has pwritten this record to the
-             * page cache before the commit returns, matching the process-crash durability the
-             * direct path provides synchronously. no-op on a non-buffered WAL. */
-            if (block_manager_wait_durable(umt->wal, uwal_end) != 0)
+            /* buffered WAL -- for FULL/INTERVAL, block until the single flush thread has pwritten
+             * this record to the page cache before the commit returns, matching the process-crash
+             * durability the direct path provides synchronously. NONE means no sync, so the record
+             * is staged in the ring and the flush thread pwrites it asynchronously while the commit
+             * returns without waiting, and an acked write is durable only once its sstable lands.
+             * no-op on a non-buffered WAL. */
+            if (txn->db->config.unified_memtable_sync_mode != TDB_SYNC_NONE &&
+                block_manager_wait_durable(umt->wal, uwal_end) != 0)
             {
                 if (uwal_batch != uwal_stack_buf) free(uwal_batch);
                 atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
@@ -29600,11 +29703,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                                       block_manager_framed_size((uint32_t)wal_size),
                                       memory_order_relaxed);
 
-            /* buffered WAL -- wait for the single flush thread to make this record durable (page
-             * cache, and fdatasync'd when the CF sync mode is FULL) before applying to the
-             * memtable, matching the durability the direct path provides inline. no-op on a direct
-             * WAL. */
-            if (block_manager_wait_durable(
+            /* buffered WAL -- for FULL/INTERVAL, wait for the single flush thread to make this
+             * record durable (page cache, and fdatasync'd when FULL) before applying to the
+             * memtable, matching the durability the direct path provides inline. NONE means no
+             * sync, so the record is staged in the ring and pwritten asynchronously while the
+             * commit returns without waiting, and an acked write is durable only once its sstable
+             * lands. no-op on a direct WAL. */
+            if (cf->config.sync_mode != TDB_SYNC_NONE &&
+                block_manager_wait_durable(
                     wal, (uint64_t)wal_result + block_manager_framed_size((uint32_t)wal_size)) != 0)
             {
                 if (wal_is_heap) free(wal_batch);
@@ -29875,18 +29981,24 @@ int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name)
     const int saved_num_ops = txn->savepoint_op_counts[savepoint_idx];
     const int saved_num_cfs = txn->savepoint_cf_counts[savepoint_idx];
 
-    /* we free ops appended after the savepoint */
+    /* we free ops appended after the savepoint. truncate the count first so a cross-transaction
+     * conflict check cannot walk into a buffer we are releasing, and hold the write lock across the
+     * whole retirement so one already scanning finishes before the frees land. */
     int64_t freed_bytes = 0;
-    for (int i = saved_num_ops; i < txn->num_ops; i++)
+    pthread_rwlock_wrlock(&txn->conflict_lock);
+    const int truncated_from = txn->num_ops;
+    txn->num_ops = saved_num_ops;
+    for (int i = saved_num_ops; i < truncated_from; i++)
     {
         freed_bytes += (int64_t)(txn->ops[i].key_size + txn->ops[i].value_size);
         free(txn->ops[i].key); /* coalesced buffer owns key+value */
+        txn->ops[i].key = NULL;
+        txn->ops[i].value = NULL;
     }
+    pthread_rwlock_unlock(&txn->conflict_lock);
     txn->mem_bytes -= freed_bytes;
     tidesdb_txn_mem_publish(txn);
 
-    /* we truncate back to savepoint */
-    txn->num_ops = saved_num_ops;
     txn->num_cfs = saved_num_cfs;
 
     /* the last-cf cache may point at a cf that the truncation just dropped from

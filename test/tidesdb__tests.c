@@ -8488,8 +8488,18 @@ static void test_dynamic_capacity_adjustment(void)
         const uint64_t ver_before =
             atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
         final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-        n_l =
-            atomic_load_explicit(&cf->levels[final_levels - 1]->current_size, memory_order_acquire);
+        /* mirror the reference tidesdb_apply_dca actually uses -- the largest NON-EMPTY level, not
+         * simply the largest one. during ingestion the bottom level can still be empty, and an N_L
+         * of 0 would collapse every capacity to the write-buffer floor, so the implementation walks
+         * down to the first populated level. asserting against the bottom level alone diverges
+         * whenever the tree quiesces with an empty bottom, which is exactly what a differently
+         * scheduled platform produces. */
+        n_l = 0;
+        for (int i = final_levels - 1; i >= 0; i--)
+        {
+            n_l = atomic_load_explicit(&cf->levels[i]->current_size, memory_order_acquire);
+            if (n_l > 0) break;
+        }
         for (int i = 0; i < final_levels - 1 && i < TDB_MAX_LEVELS; i++)
             caps[i] = atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
         const uint64_t ver_after =
@@ -8505,7 +8515,7 @@ static void test_dynamic_capacity_adjustment(void)
     ASSERT_TRUE(sampled);
 
     printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
-    printf("Largest level L%d size N_L=%zu bytes\n", final_levels, n_l);
+    printf("Largest non-empty level size N_L=%zu bytes (levels=%d)\n", n_l, final_levels);
     ASSERT_TRUE(final_levels >= 2);
 
     for (int i = 0; i < final_levels - 1; i++)
@@ -17696,7 +17706,10 @@ static void test_iter_next_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -17794,7 +17807,10 @@ static void test_iter_prev_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -17893,7 +17909,10 @@ static void test_get_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -17980,7 +17999,10 @@ static void test_range_iteration_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -31957,12 +31979,21 @@ static void sum_sstable_distinct(tidesdb_column_family_t *cf, uint64_t *out_dist
 /* drains the flush queue so all memtable data has landed on disk before the sstables are read */
 static void wait_for_flush(tidesdb_t *db)
 {
-    for (int i = 0; i < 200; i++)
+    /* the flush queue empties the moment a worker DEQUEUES an item, not when the flush finishes, so
+     * draining the queue and sleeping a fixed slice races the writer. that window is observable --
+     * the sstable is already in the level while the immutable is not yet marked flushed, so any
+     * view walking both counts those keys twice. flush_pending_count is decremented only after the
+     * worker sets imm->flushed, and active_flushes only once the slot is released, so together they
+     * are the real completion signal. the budget is generous because the loop returns as soon as it
+     * is clean, which costs a fast machine nothing and gives a slow one room to finish. */
+    for (int i = 0; i < 4000; i++)
     {
-        usleep(10000);
-        if (queue_size(db->flush_queue) == 0) break;
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&db->flush_pending_count, memory_order_acquire) == 0 &&
+            atomic_load_explicit(&db->active_flushes, memory_order_acquire) == 0)
+            return;
+        usleep(5000);
     }
-    usleep(50000);
 }
 
 /* a flush writes each distinct key once into the sstable's distinct-key summary, the estimate API

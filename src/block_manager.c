@@ -458,6 +458,15 @@ static int truncate_to_header(block_manager_t *bm)
     /** preallocation is invalidated by ftruncate; we reset to current size so the next
      *  write triggers a fresh extend */
     atomic_store(&bm->preallocated_size, BLOCK_MANAGER_HEADER_SIZE);
+    /* keep the buffered flush and group-durability watermarks in lockstep with the reset size;
+     * the caller must have quiesced the flush thread (no in-flight appends) before truncating a
+     * buffered handle. a stale-high group_durable_size would make the group sync skip an fdatasync
+     * a post-truncate commit actually needs. */
+    if (bm->buffered)
+    {
+        atomic_store(&bm->buf_flushed, BLOCK_MANAGER_HEADER_SIZE);
+        atomic_store(&bm->group_durable_size, BLOCK_MANAGER_HEADER_SIZE);
+    }
     return 0;
 }
 
@@ -491,6 +500,18 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     atomic_init(&new_bm->prealloc_chunk, prealloc_chunk);
     atomic_init(&new_bm->group_durable_size, 0);
     atomic_init(&new_bm->group_sync_active, 0);
+
+    /* buffered-append fields default to the direct path; block_manager_open_buffered turns them on.
+     * zero-init is mandatory -- a garbage `buffered` flag would misroute every append. */
+    new_bm->buffered = 0;
+    new_bm->ring = NULL;
+    new_bm->done_ring = NULL;
+    new_bm->ring_size = 0;
+    atomic_init(&new_bm->buf_flushed, 0);
+    atomic_init(&new_bm->flush_stop, 0);
+    atomic_init(&new_bm->flush_error, 0);
+    atomic_init(&new_bm->flush_sleeping, 0);
+    atomic_init(&new_bm->durable_waiters, 0);
 
     new_bm->sync_mode = sync_mode;
     atomic_init(&new_bm->sync_full_cached, sync_mode == BLOCK_MANAGER_SYNC_FULL);
@@ -590,9 +611,43 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     return 0;
 }
 
+/* buffered-append staging-buffer pool, defined below with the other buffered helpers */
+static int bm_buf_pool_acquire(uint64_t ring_size, uint8_t **ring,
+                               _Atomic unsigned char **done_ring);
+static void bm_buf_pool_release(uint8_t *ring, _Atomic unsigned char *done_ring,
+                                uint64_t ring_size);
+
 int block_manager_close(block_manager_t *bm)
 {
     if (!bm) return -1;
+
+    /* in buffered mode stop and join the flush thread, draining the ring, before touching the fd.
+     * callers quiesce appenders first (no reservation left outstanding), so every reserved record
+     * is completed and the flush thread drains to flushed == current_file_size then exits. */
+    if (bm->buffered)
+    {
+        atomic_store_explicit(&bm->flush_stop, 1, memory_order_release);
+        pthread_mutex_lock(&bm->buf_mtx);
+        pthread_cond_signal(&bm->buf_work_cv);
+        pthread_mutex_unlock(&bm->buf_mtx);
+        pthread_join(bm->flush_tid, NULL);
+        /* a clean drain left every done-ring flag cleared, so return the warm buffer pair to the
+         * pool for the next WAL. a flush error may have left flags set, so free that pair instead.
+         */
+        if (atomic_load_explicit(&bm->flush_error, memory_order_acquire))
+        {
+            free(bm->ring);
+            free((void *)bm->done_ring);
+        }
+        else
+            bm_buf_pool_release(bm->ring, bm->done_ring, bm->ring_size);
+        bm->ring = NULL;
+        bm->done_ring = NULL;
+        pthread_mutex_destroy(&bm->buf_mtx);
+        pthread_cond_destroy(&bm->buf_work_cv);
+        pthread_cond_destroy(&bm->buf_durable_cv);
+        bm->buffered = 0;
+    }
 
     /* preallocation advances logical EOF past actual data; trim back so next-open
      * validation sees the real tail block instead of trailing zeros. crash recovery
@@ -674,6 +729,403 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
     return block;
 }
 
+/* buffered-append tunables */
+#define BM_BUF_DEFAULT_RING (8ull * 1024 * 1024) /* default staging ring size */
+#define BM_BUF_MIN_RING                                                                \
+    (1ull * 1024 * 1024)          /* ring floor; larger records use the oversized path \
+                                   */
+#define BM_BUF_SPIN          128  /* spin iterations before parking on a cond var */
+#define BM_BUF_FLUSH_PARK_US 500  /* flush-thread park timeout, a missed-signal safety net */
+#define BM_BUF_WAIT_PARK_US  2000 /* appender durability-wait park timeout */
+#define BM_NS_PER_US         1000L
+#define BM_NS_PER_SEC        1000000000L
+
+/* a rotating WAL opens a fresh buffered handle every generation; without pooling that mallocs and
+ * first-touches (page-faults) a new ring plus done-ring each time, on the rotation critical path. a
+ * small free-list hands a retired, already-resident buffer pair to the next open instead. a
+ * released done-ring is all-zero (the flush thread cleared every flag as it drained before close),
+ * so it is reusable as-is. bounded -- overflow is freed. */
+#define BM_BUF_POOL_MAX 8
+
+typedef struct
+{
+    uint8_t *ring;
+    _Atomic unsigned char *done_ring;
+    uint64_t ring_size;
+} bm_buf_pooled_t;
+
+static bm_buf_pooled_t bm_buf_pool[BM_BUF_POOL_MAX];
+static int bm_buf_pool_count = 0;
+static pthread_mutex_t bm_buf_pool_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* pop a pooled buffer pair of exactly ring_size bytes into *ring/*done_ring, returning 1, or 0 if
+ * the pool holds none of that size. */
+static int bm_buf_pool_acquire(uint64_t ring_size, uint8_t **ring,
+                               _Atomic unsigned char **done_ring)
+{
+    int got = 0;
+    pthread_mutex_lock(&bm_buf_pool_mtx);
+    for (int i = bm_buf_pool_count - 1; i >= 0; i--)
+    {
+        if (bm_buf_pool[i].ring_size == ring_size)
+        {
+            *ring = bm_buf_pool[i].ring;
+            *done_ring = bm_buf_pool[i].done_ring;
+            bm_buf_pool[i] = bm_buf_pool[--bm_buf_pool_count];
+            got = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&bm_buf_pool_mtx);
+    return got;
+}
+
+/* return a clean (all-zero done_ring) buffer pair to the pool, or free it if the pool is full. */
+static void bm_buf_pool_release(uint8_t *ring, _Atomic unsigned char *done_ring, uint64_t ring_size)
+{
+    pthread_mutex_lock(&bm_buf_pool_mtx);
+    if (bm_buf_pool_count < BM_BUF_POOL_MAX)
+    {
+        bm_buf_pool[bm_buf_pool_count].ring = ring;
+        bm_buf_pool[bm_buf_pool_count].done_ring = done_ring;
+        bm_buf_pool[bm_buf_pool_count].ring_size = ring_size;
+        bm_buf_pool_count++;
+        pthread_mutex_unlock(&bm_buf_pool_mtx);
+        return;
+    }
+    pthread_mutex_unlock(&bm_buf_pool_mtx);
+    free(ring);
+    free((void *)done_ring);
+}
+
+/**
+ * bm_cpu_relax
+ * emit a CPU pause/yield hint inside a spin loop so a hyperthread sibling makes progress and the
+ * spin draws less power. a no-op on architectures without such a hint.
+ */
+static inline void bm_cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+/**
+ * bm_ring_copy
+ * copy n bytes of src into the staging ring at file offset off, wrapping at the ring boundary.
+ * @param ring the staging ring buffer
+ * @param R the ring capacity in bytes
+ * @param off the file offset whose ring slot (off % R) receives the copy
+ * @param src the bytes to copy in
+ * @param n the number of bytes to copy
+ */
+static inline void bm_ring_copy(uint8_t *ring, uint64_t R, uint64_t off, const void *src, size_t n)
+{
+    uint64_t pos = off % R;
+    if (pos + n <= R)
+    {
+        memcpy(ring + pos, src, n);
+    }
+    else
+    {
+        size_t part1 = (size_t)(R - pos);
+        memcpy(ring + pos, src, part1);
+        memcpy(ring, (const uint8_t *)src + part1, n - part1);
+    }
+}
+
+/**
+ * bm_deadline
+ * fill ts with an absolute CLOCK_REALTIME deadline us microseconds from now, for cond_timedwait.
+ * @param ts output timespec set to the deadline
+ * @param us microseconds from now until the deadline
+ */
+static inline void bm_deadline(struct timespec *ts, long us)
+{
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_nsec += us * BM_NS_PER_US;
+    if (ts->tv_nsec >= BM_NS_PER_SEC)
+    {
+        ts->tv_sec += ts->tv_nsec / BM_NS_PER_SEC;
+        ts->tv_nsec %= BM_NS_PER_SEC;
+    }
+}
+
+/**
+ * bm_ring_read_u32
+ * read a record's little-endian uint32 size field from the ring at file offset off, wrapping at the
+ * ring boundary. a plain (non-atomic) read -- the caller only reaches here after acquire-loading
+ * done_ring[off], which synchronizes-with the appender's release-store after it copied the record.
+ * @param ring the staging ring buffer
+ * @param R the ring capacity in bytes
+ * @param off the file offset of the size field to read
+ * @return the decoded size field
+ */
+static inline uint32_t bm_ring_read_u32(const uint8_t *ring, uint64_t R, uint64_t off)
+{
+    uint64_t pos = off % R;
+    uint8_t b[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pos + BLOCK_MANAGER_SIZE_FIELD_SIZE <= R)
+    {
+        memcpy(b, ring + pos, BLOCK_MANAGER_SIZE_FIELD_SIZE);
+    }
+    else
+    {
+        size_t p1 = (size_t)(R - pos);
+        memcpy(b, ring + pos, p1);
+        memcpy(b + p1, ring, (size_t)(BLOCK_MANAGER_SIZE_FIELD_SIZE - p1));
+    }
+    return decode_uint32_le_compat(b);
+}
+
+/**
+ * bm_done
+ * report whether the record starting at file offset off has been fully copied into the ring, by
+ * acquire-loading its completion flag in done_ring.
+ * @param bm the block manager
+ * @param off the record's start file offset
+ * @return non-zero if the record is fully copied, 0 otherwise
+ */
+static inline int bm_done(block_manager_t *bm, uint64_t off)
+{
+    return atomic_load_explicit(&bm->done_ring[off % bm->ring_size], memory_order_acquire) != 0;
+}
+
+/**
+ * bm_flush_thread
+ * the single writer for a buffered block manager. advances over the contiguous run of completed
+ * records starting at buf_flushed (each record's completion flag lives in done_ring, its size in
+ * its own header), pwrites the whole run in one call (wrapping as needed), clears the consumed
+ * flags, and advances buf_flushed. appenders never wait on each other -- they just set their flag,
+ * so there is no in-order release convoy under thread oversubscription. only this thread touches
+ * the fd.
+ * @param arg the block manager, passed as void* per the pthread start-routine signature
+ * @return always NULL; exits when flush_stop is set and the ring is drained, or on a flush error
+ */
+static void *bm_flush_thread(void *arg)
+{
+    block_manager_t *bm = (block_manager_t *)arg;
+    const uint64_t R = bm->ring_size;
+    for (;;)
+    {
+        /* exit on any flagged error -- our own (below) or one the oversized-record path set after a
+         * failed direct write. otherwise a gap left at the frontier would stall the join at close.
+         */
+        if (atomic_load_explicit(&bm->flush_error, memory_order_acquire)) break;
+
+        const uint64_t fl = atomic_load_explicit(&bm->buf_flushed, memory_order_relaxed);
+        const uint64_t reserved =
+            atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+
+        /* find the end of the contiguous completed run [fl, p) */
+        uint64_t p = fl;
+        while (p < reserved && bm_done(bm, p))
+            p += BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)bm_ring_read_u32(bm->ring, R, p) +
+                 BLOCK_MANAGER_FOOTER_SIZE;
+
+        if (p > fl)
+        {
+            const uint64_t sz = p - fl;
+            const uint64_t pos = fl % R;
+            int rc;
+            if (pos + sz <= R)
+                rc = pwrite_all(bm->fd, (const void *)(bm->ring + pos), (size_t)sz, (off_t)fl);
+            else
+            {
+                const uint64_t part1 = R - pos;
+                rc = pwrite_all(bm->fd, (const void *)(bm->ring + pos), (size_t)part1, (off_t)fl);
+                if (rc == 0)
+                    rc = pwrite_all(bm->fd, (const void *)bm->ring, (size_t)(sz - part1),
+                                    (off_t)(fl + part1));
+            }
+            if (rc != 0)
+            {
+                atomic_store_explicit(&bm->flush_error, errno ? errno : EIO, memory_order_release);
+                break;
+            }
+            if (is_sync_full(bm) && !odsync_available() && fdatasync(bm->fd) != 0)
+            {
+                atomic_store_explicit(&bm->flush_error, errno ? errno : EIO, memory_order_release);
+                break;
+            }
+            /* clear the consumed done flags so those ring slots can be reused after wrap */
+            for (uint64_t q = fl; q < p;)
+            {
+                const uint32_t rs = bm_ring_read_u32(bm->ring, R, q);
+                atomic_store_explicit(&bm->done_ring[q % R], 0, memory_order_relaxed);
+                q += BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)rs + BLOCK_MANAGER_FOOTER_SIZE;
+            }
+            atomic_store_explicit(&bm->buf_flushed, p, memory_order_release);
+            atomic_store_explicit(&bm->group_durable_size, p, memory_order_release);
+            /* always broadcast (per drain-batch) -- a lock-free waiter-count gate races the
+             * waiter's increment and drops wakeups, stalling backpressured appenders for a full
+             * cond timeout */
+            pthread_mutex_lock(&bm->buf_mtx);
+            pthread_cond_broadcast(&bm->buf_durable_cv);
+            pthread_mutex_unlock(&bm->buf_mtx);
+            continue;
+        }
+
+        /* nothing completed at the frontier, so exit if stopped and fully drained */
+        if (atomic_load_explicit(&bm->flush_stop, memory_order_acquire) && fl == reserved) break;
+
+        /* spin for the frontier record to complete, then park briefly (timeout = missed-signal net)
+         */
+        int got = 0;
+        for (int s = 0; s < BM_BUF_SPIN; s++)
+        {
+            if (fl < atomic_load_explicit(&bm->current_file_size, memory_order_acquire) &&
+                bm_done(bm, fl))
+            {
+                got = 1;
+                break;
+            }
+            bm_cpu_relax();
+        }
+        if (got) continue;
+        pthread_mutex_lock(&bm->buf_mtx);
+        atomic_store_explicit(&bm->flush_sleeping, 1, memory_order_seq_cst);
+        const uint64_t res2 = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+        if (!(fl < res2 && bm_done(bm, fl)) &&
+            !(atomic_load_explicit(&bm->flush_stop, memory_order_acquire) && fl == res2))
+        {
+            struct timespec ts;
+            bm_deadline(&ts, BM_BUF_FLUSH_PARK_US);
+            pthread_cond_timedwait(&bm->buf_work_cv, &bm->buf_mtx, &ts);
+        }
+        atomic_store_explicit(&bm->flush_sleeping, 0, memory_order_seq_cst);
+        pthread_mutex_unlock(&bm->buf_mtx);
+    }
+    pthread_mutex_lock(&bm->buf_mtx);
+    pthread_cond_broadcast(&bm->buf_durable_cv);
+    pthread_mutex_unlock(&bm->buf_mtx);
+    return NULL;
+}
+
+/**
+ * bm_wait_flushed
+ * block until the flush thread has advanced buf_flushed to at least need. serves both durability (a
+ * committer waiting for its record to reach the fd) and ring backpressure (an appender waiting for
+ * a slot to free). spins briefly, then parks on buf_durable_cv with a timeout as a missed-signal
+ * net.
+ * @param bm the block manager
+ * @param need the flushed offset to wait for
+ * @return 0 once buf_flushed >= need, -1 if the flush thread reported an I/O error
+ */
+static int bm_wait_flushed(block_manager_t *bm, uint64_t need)
+{
+    if (atomic_load_explicit(&bm->buf_flushed, memory_order_acquire) >= need) return 0;
+    for (int s = 0; s < BM_BUF_SPIN; s++)
+    {
+        if (atomic_load_explicit(&bm->buf_flushed, memory_order_acquire) >= need) return 0;
+        if (atomic_load_explicit(&bm->flush_error, memory_order_acquire)) return -1;
+        bm_cpu_relax();
+    }
+    pthread_mutex_lock(&bm->buf_mtx);
+    atomic_fetch_add_explicit(&bm->durable_waiters, 1, memory_order_acq_rel);
+    while (atomic_load_explicit(&bm->buf_flushed, memory_order_acquire) < need &&
+           !atomic_load_explicit(&bm->flush_error, memory_order_acquire))
+    {
+        struct timespec ts;
+        bm_deadline(&ts, BM_BUF_WAIT_PARK_US);
+        pthread_cond_timedwait(&bm->buf_durable_cv, &bm->buf_mtx, &ts);
+    }
+    atomic_fetch_sub_explicit(&bm->durable_waiters, 1, memory_order_acq_rel);
+    pthread_mutex_unlock(&bm->buf_mtx);
+    return atomic_load_explicit(&bm->flush_error, memory_order_acquire) ? -1 : 0;
+}
+
+/**
+ * bm_wake_flush
+ * signal the flush thread if it is parked, so it promptly picks up newly released work. the
+ * seq_cst load of flush_sleeping is StoreLoad-ordered against the appender's done_ring release so a
+ * wake is never lost against the flush thread's park decision.
+ * @param bm the block manager
+ */
+static inline void bm_wake_flush(block_manager_t *bm)
+{
+    if (atomic_load_explicit(&bm->flush_sleeping, memory_order_seq_cst))
+    {
+        pthread_mutex_lock(&bm->buf_mtx);
+        pthread_cond_signal(&bm->buf_work_cv);
+        pthread_mutex_unlock(&bm->buf_mtx);
+    }
+}
+
+/**
+ * bm_buffered_append
+ * append path for a buffered block manager. reserves a file offset lock-free (current_file_size
+ * fetch-add), waits for ring space if the slot is still unflushed (backpressure), copies the framed
+ * block into the ring in parallel with other appenders, and sets its done_ring flag -- it does NOT
+ * pwrite, the flush thread does. a record larger than the whole ring takes the oversized path,
+ * becoming the flush frontier and writing itself straight to the file.
+ * @param bm the block manager
+ * @param data the payload to frame and append
+ * @param size the payload size in bytes
+ * @return the reserved file offset the record was written at, or -1 on a flush I/O error
+ */
+static int64_t bm_buffered_append(block_manager_t *bm, const void *data, const uint32_t size)
+{
+    const size_t total = BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)size + BLOCK_MANAGER_FOOTER_SIZE;
+    const uint64_t R = bm->ring_size;
+    const uint32_t checksum = compute_checksum(data, size);
+
+    const uint64_t off = atomic_fetch_add(&bm->current_file_size, total);
+    const uint64_t end = off + total;
+
+    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
+    encode_uint32_le_compat(header, size);
+    encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
+    unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
+    encode_uint32_le_compat(footer, size);
+    encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
+
+    /* a record larger than the whole ring cannot be staged -- it would wrap onto itself. wait to
+     * become the flush frontier (buf_flushed == off means every prior record is written and the
+     * flush thread is parked at off), pwrite the framed record straight to the file, then publish
+     * the advanced flushed watermark ourselves. backpressure holds every later appender until we
+     * publish, so none reuses a ring slot our span aliases. rare -- only oversized commit batches.
+     */
+    if (total > R)
+    {
+        if (bm_wait_flushed(bm, off) != 0) return -1;
+        int rc = pwrite_all(bm->fd, header, BLOCK_MANAGER_BLOCK_HEADER_SIZE, (off_t)off);
+        if (rc == 0)
+            rc = pwrite_all(bm->fd, data, size, (off_t)(off + BLOCK_MANAGER_BLOCK_HEADER_SIZE));
+        if (rc == 0)
+            rc = pwrite_all(bm->fd, footer, BLOCK_MANAGER_FOOTER_SIZE,
+                            (off_t)(off + BLOCK_MANAGER_BLOCK_HEADER_SIZE + size));
+        if (rc == 0 && is_sync_full(bm) && !odsync_available() && fdatasync(bm->fd) != 0) rc = -1;
+        if (rc != 0)
+            atomic_store_explicit(&bm->flush_error, errno ? errno : EIO, memory_order_release);
+        else
+            atomic_store_explicit(&bm->buf_flushed, end, memory_order_release);
+        bm_wake_flush(bm);
+        pthread_mutex_lock(&bm->buf_mtx);
+        pthread_cond_broadcast(&bm->buf_durable_cv);
+        pthread_mutex_unlock(&bm->buf_mtx);
+        return rc != 0 ? -1 : (int64_t)off;
+    }
+
+    /* backpressure keeps us from clobbering unflushed data -- our ring slot last held bytes
+     * [off-R, end-R), so wait until they are flushed. a no-op on the first pass (end <= R). */
+    if (end > R && bm_wait_flushed(bm, end - R) != 0) return -1;
+
+    bm_ring_copy(bm->ring, R, off, header, BLOCK_MANAGER_BLOCK_HEADER_SIZE);
+    bm_ring_copy(bm->ring, R, off + BLOCK_MANAGER_BLOCK_HEADER_SIZE, data, size);
+    bm_ring_copy(bm->ring, R, off + BLOCK_MANAGER_BLOCK_HEADER_SIZE + size, footer,
+                 BLOCK_MANAGER_FOOTER_SIZE);
+
+    /* publish completion -- release-ordered so the flush thread, on seeing the flag, sees the whole
+     * framed record. no waiting on other appenders; the flush thread advances over the contiguous
+     * run of set flags itself. seq_cst pairs with the flush thread's sleeping-flag StoreLoad. */
+    atomic_store_explicit(&bm->done_ring[off % R], (unsigned char)1, memory_order_seq_cst);
+    bm_wake_flush(bm);
+    return (int64_t)off;
+}
+
 /**
  * bm_append_block
  * append one framed block [size][checksum][data][size][magic] at the atomically
@@ -687,6 +1139,8 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
  */
 static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint32_t size)
 {
+    if (bm->buffered) return bm_buffered_append(bm, data, size);
+
     const size_t total_size =
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)size + BLOCK_MANAGER_FOOTER_SIZE;
     const uint32_t checksum = compute_checksum(data, size);
@@ -1617,7 +2071,11 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 int block_manager_get_size(block_manager_t *bm, uint64_t *size)
 {
     if (!bm || !size) return -1;
-    *size = atomic_load(&bm->current_file_size);
+    /* on a buffered handle current_file_size is the reservation watermark -- records reserved but
+     * still in the staging ring are not yet in the file. report the flushed extent so a consumer
+     * reading the file (e.g. a sync-on-commit WAL upload) only sees bytes that are actually on
+     * disk. buffered handles are WAL-only, so sstable callers are unaffected. */
+    *size = atomic_load(bm->buffered ? &bm->buf_flushed : &bm->current_file_size);
     return 0;
 }
 
@@ -2001,4 +2459,68 @@ int block_manager_open_pre(block_manager_t **bm, const char *file_path, const in
 {
     if (!bm || !file_path) return -1;
     return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode), prealloc_chunk);
+}
+
+int block_manager_open_buffered(block_manager_t **bm, const char *file_path, const int sync_mode,
+                                const uint64_t ring_size)
+{
+    if (!bm || !file_path) return -1;
+    int rc = block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode),
+                                         BLOCK_MANAGER_PREALLOC_CHUNK);
+    if (rc != 0) return rc;
+    block_manager_t *b = *bm;
+
+    uint64_t R = ring_size ? ring_size : BM_BUF_DEFAULT_RING;
+    if (R < BM_BUF_MIN_RING) R = BM_BUF_MIN_RING;
+    /* reuse a retired, warm buffer pair when one of this size is pooled; else allocate fresh */
+    if (!bm_buf_pool_acquire(R, &b->ring, &b->done_ring))
+    {
+        b->ring = malloc(R);
+        b->done_ring = calloc(R, 1); /* per-ring-position completion flags, zeroed */
+    }
+    if (!b->ring || !b->done_ring)
+    {
+        free(b->ring);
+        free((void *)b->done_ring);
+        b->ring = NULL;
+        b->done_ring = NULL;
+        block_manager_close(b);
+        *bm = NULL;
+        return -1;
+    }
+    b->ring_size = R;
+
+    /* watermarks start at the current (post-header / post-recovery) file size -- reservations
+     * continue from there and the flush thread only ever writes newly-appended bytes. */
+    const uint64_t fsz = atomic_load(&b->current_file_size);
+    atomic_store(&b->buf_flushed, fsz);
+    atomic_store(&b->group_durable_size, fsz);
+
+    pthread_mutex_init(&b->buf_mtx, NULL);
+    pthread_cond_init(&b->buf_work_cv, NULL);
+    pthread_cond_init(&b->buf_durable_cv, NULL);
+    b->buffered = 1;
+
+    if (pthread_create(&b->flush_tid, NULL, bm_flush_thread, b) != 0)
+    {
+        b->buffered = 0;
+        pthread_mutex_destroy(&b->buf_mtx);
+        pthread_cond_destroy(&b->buf_work_cv);
+        pthread_cond_destroy(&b->buf_durable_cv);
+        free(b->ring);
+        free((void *)b->done_ring);
+        b->ring = NULL;
+        b->done_ring = NULL;
+        block_manager_close(b);
+        *bm = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int block_manager_wait_durable(block_manager_t *bm, const uint64_t offset)
+{
+    if (!bm) return -1;
+    if (!bm->buffered) return 0; /* direct path is already durable per its sync mode */
+    return bm_wait_flushed(bm, offset);
 }

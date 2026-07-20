@@ -67,12 +67,12 @@ typedef struct tidesdb_objstore_t tidesdb_objstore_t;
  * configuration for object store mode behavior
  * @param local_cache_path local directory for cached sstable files (NULL = use db_path)
  * @param local_cache_max_bytes max local cache size in bytes (0 = unlimited)
- * @param cache_on_read cache downloaded files locally (default 1)
- * @param cache_on_write keep local copy after upload (default 1)
+ * @param cache_on_read add a downloaded object to the bounded local cache so it can be evicted and
+ *                      re-fetched on a miss (default 1); when 0 the local copy stays pinned on disk
+ * @param cache_on_write add a flushed/uploaded sstable to the bounded local cache so it can be
+ *                       evicted and re-fetched on a miss (default 1); when 0 the copy stays pinned
  * @param max_concurrent_uploads parallel upload threads (default 4)
  * @param max_concurrent_downloads parallel download threads (default 8)
- * @param multipart_threshold use multipart upload above this size (default 64MB)
- * @param multipart_part_size multipart chunk size (default 8MB)
  * @param sync_manifest_to_object upload MANIFEST after each compaction (default 1)
  * @param replicate_wal upload closed WAL segments for node-failure recovery (default 1)
  * @param wal_upload_sync 0 = background WAL upload (default), 1 = block flush until uploaded
@@ -91,8 +91,6 @@ typedef struct
     int cache_on_write;
     int max_concurrent_uploads;
     int max_concurrent_downloads;
-    size_t multipart_threshold;
-    size_t multipart_part_size;
     int sync_manifest_to_object;
     int replicate_wal;
     int wal_upload_sync;
@@ -230,8 +228,6 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio index sample ratio
- * @param block_index_prefix_len block index prefix length
  * @param sync_mode sync mode
  * @param sync_interval_us sync interval in microseconds
  * @param comparator_name name of comparator
@@ -254,7 +250,6 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param use_btree whether btree is used
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size reserved for API compatibility, not used
  * @param object_lazy_compaction 1 = compact less aggressively in object store mode (default 0)
  * @param object_prefetch_compaction 1 = download all inputs before merge (default 1)
  */
@@ -270,8 +265,6 @@ typedef struct tidesdb_column_family_config_t
     int enable_bloom_filter;
     double bloom_fpr;
     int enable_block_indexes;
-    int index_sample_ratio;
-    int block_index_prefix_len;
     int sync_mode;
     uint64_t sync_interval_us;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
@@ -289,7 +282,6 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
-    size_t object_target_file_size; /* reserved, not used */
     int object_lazy_compaction;
     int object_prefetch_compaction;
 } tidesdb_column_family_config_t;
@@ -314,6 +306,10 @@ typedef struct tidesdb_column_family_config_t
  * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
  * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
+ * @param unified_memtable_l0_queue_stall_threshold immutable-queue depth at which writer
+ *                               backpressure hard-stalls in unified mode. the shared unified
+ *                               immutable queue is db-wide, so it is bounded by this one db-level
+ *                               value rather than a per-column-family threshold. 0 = default
  * @param object_store pluggable object store connector (NULL = local only, default)
  * @param object_store_config object store behavior configuration (NULL = use defaults)
  * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
@@ -343,6 +339,7 @@ typedef struct tidesdb_config_t
     float unified_memtable_skip_list_probability;
     int unified_memtable_sync_mode;
     uint64_t unified_memtable_sync_interval_us;
+    int unified_memtable_l0_queue_stall_threshold;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
     int max_concurrent_flushes;
@@ -649,6 +646,7 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
 int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn);
 int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t isolation,
                                      tidesdb_txn_t **txn);
+int tidesdb_txn_begin_cf(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t **txn);
 int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                     size_t key_size, const uint8_t *value, size_t value_size, time_t ttl);
 int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,

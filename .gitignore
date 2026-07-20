@@ -15,6 +15,7 @@
 *.a
 *.lib
 *.exe
+*.txt
 *.out
 *.app
 build-*

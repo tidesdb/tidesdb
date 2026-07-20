@@ -21,6 +21,8 @@
 
 #include "alloc.h"
 #include "block_manager.h"
+#include "blocked_bloom_filter.h"
+#include "blocked_index.h"
 #include "bloom_filter.h"
 #include "btree.h"
 #include "clock_cache.h"
@@ -224,8 +226,6 @@ typedef enum
 #define TDB_DEFAULT_MAX_CONCURRENT_FLUSHES TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE
 #define TDB_DEFAULT_BLOOM_FPR              0.01
 #define TDB_DEFAULT_KLOG_VALUE_THRESHOLD   512
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO     1
-#define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN 16
 #define TDB_DEFAULT_MIN_DISK_SPACE         (100 * 1024 * 1024)
 #if defined(__OpenBSD__)
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES 64 /* x2 OpenBSD has lower default fd limits */
@@ -300,7 +300,6 @@ typedef struct tidesdb_kv_pair_t tidesdb_kv_pair_t;
 typedef struct tidesdb_commit_status_t tidesdb_commit_status_t;
 typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
-typedef struct tidesdb_block_index_t tidesdb_block_index_t;
 typedef struct tidesdb_memtable_t tidesdb_memtable_t;
 typedef struct tidesdb_deferred_free_node_t tidesdb_deferred_free_node_t;
 typedef struct tidesdb_t tidesdb_t;
@@ -370,8 +369,6 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio index sample ratio
- * @param block_index_prefix_len block index prefix length
  * @param sync_mode sync mode
  * @param sync_interval_us sync interval in microseconds
  * @param comparator_name name of comparator
@@ -394,8 +391,6 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param use_btree use btree for klog, faster reads depending on workload
  * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
  * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
- * @param object_target_file_size reserved for API compatibility, not used (file_max is derived from
- * level geometry per spooky algorithm 2)
  * @param object_lazy_compaction lazy compaction flag (1 = less aggressive, 0 = aggressive)
  * @param object_prefetch_compaction prefetch compaction flag (1 = download all inputs before merge,
  * 0 = stream)
@@ -412,8 +407,6 @@ typedef struct tidesdb_column_family_config_t
     int enable_bloom_filter;
     double bloom_fpr;
     int enable_block_indexes;
-    int index_sample_ratio;
-    int block_index_prefix_len;
     int sync_mode;
     uint64_t sync_interval_us;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
@@ -431,7 +424,6 @@ typedef struct tidesdb_column_family_config_t
     int use_btree;
     tidesdb_commit_hook_fn commit_hook_fn;
     void *commit_hook_ctx;
-    size_t object_target_file_size; /* reserved, not used */
     int object_lazy_compaction;
     int object_prefetch_compaction;
 } tidesdb_column_family_config_t;
@@ -473,6 +465,10 @@ typedef struct tidesdb_comparator_entry_t
  * @param unified_memtable_skip_list_probability skip list probability (0 = default 0.25)
  * @param unified_memtable_sync_mode sync mode for unified WAL (default TDB_SYNC_NONE)
  * @param unified_memtable_sync_interval_us sync interval for unified WAL (0 = default)
+ * @param unified_memtable_l0_queue_stall_threshold immutable-queue depth at which writer
+ *                               backpressure hard-stalls in unified mode. the shared unified
+ *                               immutable queue is db-wide, so it is bounded by this one db-level
+ *                               value rather than a per-column-family threshold. 0 = default
  * @param object_store object store instance (NULL = local only, default)
  * @param object_store_config object store configuration (NULL = use defaults)
  * @param max_concurrent_flushes global semaphore on the number of in-flight memtable flushes
@@ -505,6 +501,7 @@ typedef struct tidesdb_config_t
     float unified_memtable_skip_list_probability;
     int unified_memtable_sync_mode;
     uint64_t unified_memtable_sync_interval_us;
+    int unified_memtable_l0_queue_stall_threshold;
     tidesdb_objstore_t *object_store;
     tidesdb_objstore_config_t *object_store_config;
     int max_concurrent_flushes;
@@ -579,6 +576,14 @@ struct tidesdb_column_family_t
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) sstable_layout_version;
+    /* cached L1 overlap depth (max sstables covering any one key = the point-read cost, the true
+     * read-amp signal backpressure paces on) with the layout version it was computed at. flush
+     * partitioning makes the raw L1 file count a poor read-amp proxy -- narrow tiling files inflate
+     * the count without raising per-key overlap -- so pacing keys on depth, recomputed only when
+     * the layout version moves. l1_overlap_ver starts at UINT64_MAX so the first read recomputes.
+     */
+    _Atomic(int) l1_overlap_depth;
+    _Atomic(uint64_t) l1_overlap_ver;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) flush_pending_count;
@@ -690,6 +695,10 @@ struct tidesdb_column_family_t
 struct tidesdb_sstable_t
 {
     uint64_t id;
+    /* partition shard index parsed from the klog filename (L<level>P<partition>_<id>), or
+     * MANIFEST_NO_PARTITION for a non-partitioned flush output. recorded in the manifest so a
+     * node reconstructing the sstable from the manifest rebuilds the same filename. */
+    int partition;
     char *klog_path;
     const char *klog_filename;
     char *vlog_path;
@@ -709,8 +718,12 @@ struct tidesdb_sstable_t
     uint64_t klog_size;
     uint64_t vlog_size;
     uint64_t max_seq;
-    bloom_filter_t *bloom_filter;
-    tidesdb_block_index_t *block_indexes;
+    /* paged aux -- the blocked bloom filter and block index keep only a small directory resident
+     * and page their partitions through the block cache. present when the sstable was written in
+     * the blocked-aux format (SSTABLE_FLAG_BLOCKED_AUX); NULL for older sstables, whose reads fall
+     * back to a full scan until compaction rewrites them. */
+    blocked_bloom_reader_t *bloom_reader;
+    blocked_index_reader_t *index_reader;
     _Atomic(int) refcount;
     /* opened lazily by tidesdb_sstable_ensure_open and published by CAS, so the
      * pointers are _Atomic -- readers acquire-load them and so observe the fully
@@ -731,17 +744,14 @@ struct tidesdb_sstable_t
     void *cached_comparator_ctx;
     int is_reverse;
     uint64_t cache_key_prefix;
-    /* chunked footer aux blobs -- when a bloom filter or block index footer blob
-     * exceeds the single-block chunk size it is written as multiple consecutive
-     * blocks and located by explicit offset+size instead of trailing-block
-     * navigation. aux_chunked is set (and the offsets persisted in metadata) only
-     * for such sstables; legacy/small sstables leave it 0 and use the original
-     * trailing-block read path. */
-    int aux_chunked;
-    uint64_t bloom_blob_offset;
-    uint64_t bloom_blob_size;
-    uint64_t index_blob_offset;
-    uint64_t index_blob_size;
+    /* blocked-aux directory locators -- persisted in metadata under SSTABLE_FLAG_BLOCKED_AUX and
+     * handed to blocked_bloom_reader_open / blocked_index_reader_open at load. blocked_aux is set
+     * for sstables written in this format. */
+    int blocked_aux;
+    uint64_t bloom_dir_offset;
+    uint64_t bloom_dir_size;
+    uint64_t index_dir_offset;
+    uint64_t index_dir_size;
 };
 
 /**
@@ -821,10 +831,6 @@ struct tidesdb_level_t
  * @param total_memory total system memory in bytes
  * @param resolved_memory_limit resolved global memory limit in bytes
  * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
- * @param sstable_aux_memory_bytes running total of bloom filter + block index
- *                                 memory across every sstable currently in a
- *                                 level, maintained at level add and remove so
- *                                 the reaper does not rescan every sstable
  * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param txn_memory_bytes bytes held by in-flight transactions
  * @param flush_pending_count number of pending flush operations (queued + in-flight)
@@ -888,6 +894,9 @@ struct tidesdb_t
     _Atomic(int) reaper_active;
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
+    /* column-family index the next fd-eviction scan resumes from, so the scan sweeps every CF
+     * across cycles instead of always restarting at the front. reaper-thread-only, no atomic. */
+    int reap_scan_cursor;
     clock_cache_t *clock_cache;
     /* created lazily after worker threads are running, so the pointer is
      * _Atomic -- btree_cache_lock still serializes the one-time creation */
@@ -912,7 +921,6 @@ struct tidesdb_t
     uint64_t total_memory;
     _Atomic(size_t) resolved_memory_limit;
     _Atomic(int64_t) cached_memtable_bytes;
-    _Atomic(int64_t) sstable_aux_memory_bytes;
     _Atomic(int64_t) txn_memory_bytes;
     _Atomic(int) memory_pressure_level;
     _Atomic(int) flush_pending_count;
@@ -1064,6 +1072,17 @@ struct tidesdb_txn_t
     uint64_t txn_id;
     uint64_t snapshot_seq;
     uint64_t commit_seq;
+    /* the op array and the read set are written only by the owning thread but READ by other
+     * transactions -- the serializable rw-antidependency check walks a concurrent transaction's
+     * ops, and the dangerous-structure check walks its read set. both grow by realloc and are
+     * truncated on reset or savepoint rollback, so an unguarded reader can dereference a freed
+     * array, not merely read a torn count. conflict_lock makes that publication safe. the owner
+     * write-locks it across any mutation of ops/num_ops or the read set, a cross-transaction reader
+     * read-locks the transaction it is scanning. uncontended in the common case, since only the
+     * owner writes and readers appear only during a serializable commit's conflict check. the owner
+     * never takes the active-transaction registry lock while holding this, so there is no
+     * lock-order inversion with the reader, which holds the registry read lock first. */
+    pthread_rwlock_t conflict_lock;
     tidesdb_txn_op_t *ops;
     int num_ops;
     int ops_capacity;
@@ -1142,6 +1161,10 @@ struct tidesdb_iter_t
  * statistics for database column family
  * @param num_levels number of levels
  * @param memtable_size size of memtable
+ * @param immutable_count number of immutable (frozen, awaiting-flush) memtables queued for this
+ *                        cf -- the per-cf L0 queue depth backpressure throttles on. always 0 in
+ *                        unified mode, where the shared queue is reported db-wide in
+ *                        tidesdb_db_stats_t.unified_immutable_count
  * @param level_sizes sizes of each level
  * @param level_num_sstables number of sstables in each level
  * @param config column family configuration
@@ -1173,6 +1196,7 @@ struct tidesdb_stats_t
 {
     int num_levels;
     size_t memtable_size;
+    int immutable_count;
     size_t *level_sizes;
     int *level_num_sstables;
     tidesdb_column_family_config_t *config;
@@ -1503,6 +1527,19 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn);
  */
 int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t isolation,
                                      tidesdb_txn_t **txn);
+
+/**
+ * tidesdb_txn_begin_cf
+ * begins a transaction at a column family's configured default isolation level
+ * (tidesdb_column_family_config_t.default_isolation_level). the transaction is still
+ * database-scoped and may touch any column family; the cf only supplies the initial isolation
+ * level.
+ * @param db database handle
+ * @param cf column family whose default isolation level to use
+ * @param txn pointer to transaction handle
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_begin_cf(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t **txn);
 
 /**
  * tidesdb_txn_put

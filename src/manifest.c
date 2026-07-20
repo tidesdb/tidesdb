@@ -63,7 +63,7 @@ static inline uint64_t manifest_get_u64(const uint8_t *p)
 /* forward declarations; documented at their definitions */
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
                                                  uint64_t id, uint64_t num_entries,
-                                                 uint64_t size_bytes);
+                                                 uint64_t size_bytes, int partition);
 static int manifest_rollover_locked(tidesdb_manifest_t *manifest, int durable_sync);
 
 /**
@@ -72,7 +72,7 @@ static int manifest_rollover_locked(tidesdb_manifest_t *manifest, int durable_sy
  */
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, const int level,
                                                  const uint64_t id, const uint64_t num_entries,
-                                                 const uint64_t size_bytes)
+                                                 const uint64_t size_bytes, const int partition)
 {
     for (int i = 0; i < manifest->num_entries; i++)
     {
@@ -80,6 +80,7 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, c
         {
             manifest->entries[i].num_entries = num_entries;
             manifest->entries[i].size_bytes = size_bytes;
+            manifest->entries[i].partition = partition;
             return 0;
         }
     }
@@ -98,6 +99,7 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, c
     manifest->entries[manifest->num_entries].id = id;
     manifest->entries[manifest->num_entries].num_entries = num_entries;
     manifest->entries[manifest->num_entries].size_bytes = size_bytes;
+    manifest->entries[manifest->num_entries].partition = partition;
     manifest->num_entries++;
     return 0;
 }
@@ -146,13 +148,14 @@ static int manifest_pending_reset(tidesdb_manifest_t *manifest)
  */
 static int manifest_pending_add_record(tidesdb_manifest_t *manifest, const uint8_t op,
                                        const int level, const uint64_t id,
-                                       const uint64_t num_entries, const uint64_t size_bytes)
+                                       const uint64_t num_entries, const uint64_t size_bytes,
+                                       const int partition)
 {
     size_t need;
     switch (op)
     {
-        case MANIFEST_OP_ADD:
-            need = MANIFEST_REC_ADD_SIZE;
+        case MANIFEST_OP_ADD_P:
+            need = MANIFEST_REC_ADD_P_SIZE;
             break;
         case MANIFEST_OP_REMOVE:
             need = MANIFEST_REC_REMOVE_SIZE;
@@ -188,11 +191,13 @@ static int manifest_pending_add_record(tidesdb_manifest_t *manifest, const uint8
         p += 4;
         manifest_put_u64(p, id);
         p += 8;
-        if (op == MANIFEST_OP_ADD)
+        if (op == MANIFEST_OP_ADD_P)
         {
             manifest_put_u64(p, num_entries);
             p += 8;
             manifest_put_u64(p, size_bytes);
+            p += 8;
+            manifest_put_u32(p, (uint32_t)partition);
         }
     }
     manifest->pending_len += need;
@@ -220,13 +225,28 @@ static int manifest_apply_batch(tidesdb_manifest_t *manifest, const uint8_t *dat
         {
             case MANIFEST_OP_ADD:
             {
+                /* legacy record with no partition -- a pre-partition-aware writer produced it, so
+                 * it is a non-partitioned sstable */
                 if (off + MANIFEST_REC_ADD_SIZE > size) return -1;
                 const int level = (int)manifest_get_u32(data + off + 1);
                 const uint64_t id = manifest_get_u64(data + off + 5);
                 const uint64_t ne = manifest_get_u64(data + off + 13);
                 const uint64_t sz = manifest_get_u64(data + off + 21);
-                tidesdb_manifest_add_sstable_unlocked(manifest, level, id, ne, sz);
+                tidesdb_manifest_add_sstable_unlocked(manifest, level, id, ne, sz,
+                                                      MANIFEST_NO_PARTITION);
                 off += MANIFEST_REC_ADD_SIZE;
+                break;
+            }
+            case MANIFEST_OP_ADD_P:
+            {
+                if (off + MANIFEST_REC_ADD_P_SIZE > size) return -1;
+                const int level = (int)manifest_get_u32(data + off + 1);
+                const uint64_t id = manifest_get_u64(data + off + 5);
+                const uint64_t ne = manifest_get_u64(data + off + 13);
+                const uint64_t sz = manifest_get_u64(data + off + 21);
+                const int partition = (int)manifest_get_u32(data + off + 29);
+                tidesdb_manifest_add_sstable_unlocked(manifest, level, id, ne, sz, partition);
+                off += MANIFEST_REC_ADD_P_SIZE;
                 break;
             }
             case MANIFEST_OP_REMOVE:
@@ -314,7 +334,7 @@ static int manifest_replay_locked(tidesdb_manifest_t *manifest)
 static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int durable_sync)
 {
     const size_t need = MANIFEST_BATCH_HDR_SIZE +
-                        (size_t)manifest->num_entries * MANIFEST_REC_ADD_SIZE +
+                        (size_t)manifest->num_entries * MANIFEST_REC_ADD_P_SIZE +
                         MANIFEST_REC_SEQ_SIZE;
     uint8_t *buf = malloc(need);
     if (!buf) return -1;
@@ -323,12 +343,13 @@ static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int dura
     buf[off++] = (uint8_t)MANIFEST_BATCH_FORMAT;
     for (int i = 0; i < manifest->num_entries; i++)
     {
-        buf[off] = MANIFEST_OP_ADD;
+        buf[off] = MANIFEST_OP_ADD_P;
         manifest_put_u32(buf + off + 1, (uint32_t)manifest->entries[i].level);
         manifest_put_u64(buf + off + 5, manifest->entries[i].id);
         manifest_put_u64(buf + off + 13, manifest->entries[i].num_entries);
         manifest_put_u64(buf + off + 21, manifest->entries[i].size_bytes);
-        off += MANIFEST_REC_ADD_SIZE;
+        manifest_put_u32(buf + off + 29, (uint32_t)manifest->entries[i].partition);
+        off += MANIFEST_REC_ADD_P_SIZE;
     }
     buf[off] = MANIFEST_OP_SEQ;
     manifest_put_u64(buf + off + 1, atomic_load(&manifest->sequence));
@@ -527,7 +548,9 @@ static int manifest_parse_legacy_text(tidesdb_manifest_t *manifest, FILE *fp)
             continue;
         }
 
-        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+        /* legacy text manifest predates partition tracking -- non-partitioned */
+        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes,
+                                              MANIFEST_NO_PARTITION);
     }
 
     if (is_v8)
@@ -742,18 +765,19 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 }
 
 int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, const int level, const uint64_t id,
-                                 const uint64_t num_entries, const uint64_t size_bytes)
+                                 const uint64_t num_entries, const uint64_t size_bytes,
+                                 const int partition)
 {
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
-    int result =
-        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+    int result = tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes,
+                                                       partition);
     if (result == 0)
     {
-        result = manifest_pending_add_record(manifest, MANIFEST_OP_ADD, level, id, num_entries,
-                                             size_bytes);
+        result = manifest_pending_add_record(manifest, MANIFEST_OP_ADD_P, level, id, num_entries,
+                                             size_bytes, partition);
         if (result == 0) manifest->records_since_snapshot++;
     }
     pthread_rwlock_unlock(&manifest->lock);
@@ -771,7 +795,8 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, const int leve
     int result = -1;
     if (manifest_remove_entry_unlocked(manifest, level, id))
     {
-        result = manifest_pending_add_record(manifest, MANIFEST_OP_REMOVE, level, id, 0, 0);
+        result = manifest_pending_add_record(manifest, MANIFEST_OP_REMOVE, level, id, 0, 0,
+                                             MANIFEST_NO_PARTITION);
         if (result == 0) manifest->records_since_snapshot++;
     }
     pthread_rwlock_unlock(&manifest->lock);
@@ -848,7 +873,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
 
     /* close the batch with a SEQ record carrying the current sequence so replay's last SEQ wins */
     if (manifest_pending_add_record(manifest, MANIFEST_OP_SEQ, 0, atomic_load(&manifest->sequence),
-                                    0, 0) != 0)
+                                    0, 0, MANIFEST_NO_PARTITION) != 0)
         result = -1;
 
     if (result == 0)

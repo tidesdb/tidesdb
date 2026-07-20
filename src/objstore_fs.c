@@ -49,8 +49,6 @@
 #define TDB_OBJSTORE_DEFAULT_CACHE_ON_WRITE        1
 #define TDB_OBJSTORE_DEFAULT_MAX_UPLOADS           4
 #define TDB_OBJSTORE_DEFAULT_MAX_DOWNLOADS         8
-#define TDB_OBJSTORE_DEFAULT_MULTIPART_THRESHOLD   (64 * 1024 * 1024)
-#define TDB_OBJSTORE_DEFAULT_MULTIPART_PART_SIZE   (8 * 1024 * 1024)
 #define TDB_OBJSTORE_DEFAULT_SYNC_MANIFEST         1
 #define TDB_OBJSTORE_DEFAULT_REPLICATE_WAL         1
 #define TDB_OBJSTORE_DEFAULT_WAL_UPLOAD_SYNC       0
@@ -712,8 +710,6 @@ tidesdb_objstore_config_t tidesdb_objstore_default_config(void)
         .cache_on_write = TDB_OBJSTORE_DEFAULT_CACHE_ON_WRITE,
         .max_concurrent_uploads = TDB_OBJSTORE_DEFAULT_MAX_UPLOADS,
         .max_concurrent_downloads = TDB_OBJSTORE_DEFAULT_MAX_DOWNLOADS,
-        .multipart_threshold = TDB_OBJSTORE_DEFAULT_MULTIPART_THRESHOLD,
-        .multipart_part_size = TDB_OBJSTORE_DEFAULT_MULTIPART_PART_SIZE,
         .sync_manifest_to_object = TDB_OBJSTORE_DEFAULT_SYNC_MANIFEST,
         .replicate_wal = TDB_OBJSTORE_DEFAULT_REPLICATE_WAL,
         .wal_upload_sync = TDB_OBJSTORE_DEFAULT_WAL_UPLOAD_SYNC,

@@ -44,12 +44,17 @@
 #define MANIFEST_OP_ADD       0x01
 #define MANIFEST_OP_REMOVE    0x02
 #define MANIFEST_OP_SEQ       0x03
+#define MANIFEST_OP_ADD_P     0x04 /* like ADD but records the sstable's partition shard */
 #define MANIFEST_BATCH_FORMAT 1
+/* partition value for a non-partitioned sstable (a flush output); a partitioned merge output
+ * records its shard index instead. a legacy ADD record carries no partition and reads as this. */
+#define MANIFEST_NO_PARTITION (-1)
 /* on-disk record sizes (opcode byte + fields); a batch is a single format byte then self-delimiting
  * records (each record's opcode fixes its length, so no count is needed). all integers big-endian
  */
 #define MANIFEST_BATCH_HDR_SIZE  1  /* u8 format */
 #define MANIFEST_REC_ADD_SIZE    29 /* u8 op + i32 level + u64 id + u64 num_entries + u64 size */
+#define MANIFEST_REC_ADD_P_SIZE  33 /* ADD_SIZE + i32 partition */
 #define MANIFEST_REC_REMOVE_SIZE 13 /* u8 op + i32 level + u64 id */
 #define MANIFEST_REC_SEQ_SIZE    9  /* u8 op + u64 sequence */
 /* roll the log over into a fresh single snapshot block when records since the last snapshot exceed
@@ -68,6 +73,10 @@
  * @param id sstable ID
  * @param num_entries number of entries in sstable
  * @param size_bytes total size in bytes
+ * @param partition partition shard index for a partitioned merge output, or MANIFEST_NO_PARTITION
+ *                  for a non-partitioned flush output. reconstructing the sstable filename from the
+ *                  manifest (replica sync, object-store cold start) needs it so the local name
+ *                  mirrors what was written and uploaded
  */
 typedef struct
 {
@@ -75,6 +84,7 @@ typedef struct
     uint64_t id;
     uint64_t num_entries;
     uint64_t size_bytes;
+    int partition;
 } tidesdb_manifest_entry_t;
 
 /**
@@ -132,10 +142,11 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path);
  * @param id sstable ID
  * @param num_entries number of entries
  * @param size_bytes size in bytes
+ * @param partition partition shard for a partitioned merge output, MANIFEST_NO_PARTITION otherwise
  * @return 0 on success, -1 on error
  */
 int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id,
-                                 uint64_t num_entries, uint64_t size_bytes);
+                                 uint64_t num_entries, uint64_t size_bytes, int partition);
 
 /**
  * tidesdb_manifest_remove_sstable

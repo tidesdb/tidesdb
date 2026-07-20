@@ -90,6 +90,41 @@ static void test_basic_open_close(void)
     cleanup_test_dir();
 }
 
+/* tidesdb_txn_begin_cf opens a transaction at the column family's configured default isolation
+ * level, so a CF created with a non-default default_isolation_level yields a txn at that level
+ * while the plain tidesdb_txn_begin stays READ_COMMITTED regardless of the cf setting. */
+static void test_txn_begin_cf_uses_cf_default_isolation(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+
+    tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
+    cfg.default_isolation_level = TDB_ISOLATION_SERIALIZABLE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "iso_cf", &cfg), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iso_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_cf(db, cf, &txn), 0);
+    ASSERT_EQ(txn->isolation_level, TDB_ISOLATION_SERIALIZABLE);
+    tidesdb_txn_commit(txn);
+    tidesdb_txn_free(txn);
+
+    /* a NULL cf is rejected */
+    tidesdb_txn_t *null_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_cf(db, NULL, &null_txn), TDB_ERR_INVALID_ARGS);
+
+    /* the plain begin still uses READ_COMMITTED, unaffected by the cf's setting */
+    tidesdb_txn_t *rc_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &rc_txn), 0);
+    ASSERT_EQ(rc_txn->isolation_level, TDB_ISOLATION_READ_COMMITTED);
+    tidesdb_txn_commit(rc_txn);
+    tidesdb_txn_free(rc_txn);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 /* custom allocator test tracking variables */
 static atomic_int custom_malloc_count;
 static atomic_int custom_calloc_count;
@@ -3436,7 +3471,7 @@ static void prefix_probe_once(int block_indexes, int bloom, int use_btree)
     {
         memcpy(keys[i], prefix, SHARED_LEN);
         for (int b = 0; b < KEY_LEN - SHARED_LEN; b++)
-            keys[i][SHARED_LEN + b] = (uint8_t)((unsigned)(i * 2654435761u) >> (b * 4));
+            keys[i][SHARED_LEN + b] = (uint8_t)((unsigned)(i * 2654435761u) >> ((b * 4) & 31));
     }
 
     for (int i = 0; i < NKEYS; i++)
@@ -4535,7 +4570,10 @@ static void test_many_keys(void)
         ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                   strlen(value) + 1, 0),
                   0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* the 4KB write buffer keeps the active memtable pinned near its ceiling, so on a slow CI
+         * box (DragonFlyBSD) a commit can hit the 10s no-progress backpressure budget and return a
+         * retryable TDB_ERR_BUSY. retry it like the other stress tests rather than flake. */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         /* we periodic flush */
@@ -6036,7 +6074,6 @@ static void test_block_indexes(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 10;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bidx_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_cf");
@@ -6094,7 +6131,6 @@ static void test_block_indexes_sparse_sample_ratio(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 32;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bidx_sparse_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_sparse_cf");
@@ -8320,6 +8356,31 @@ static void test_boundary_partitioning(void)
     cleanup_test_dir();
 }
 
+/* settle/sample tuning for the capacity-adaptation check. the poll budget is deliberately generous
+ * because the settle loop breaks the moment the cf is quiet, so a high cap costs a fast box nothing
+ * while giving a sanitizer build, which runs an order of magnitude slower, room to finish
+ * compacting rather than sampling a tree that is still moving. */
+#define DCA_SETTLE_POLL_US  50000
+#define DCA_SETTLE_POLLS    6000
+#define DCA_SETTLE_STREAK   5
+#define DCA_SAMPLE_ATTEMPTS 20
+
+/* quiescence predicate for the capacity-adaptation check. compaction_pending_count is incremented
+ * before the work item is enqueued and decremented only after the worker fully finishes, so it has
+ * no TOCTOU gap the way is_compacting does (the worker sets is_compacting only after dequeuing, so
+ * the queue can be empty while it is still 0). compaction_armed catches a re-trigger that has been
+ * armed but not yet enqueued, which would otherwise let a fresh round start immediately after the
+ * predicate passes. */
+static int dca_cf_is_quiesced(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    return queue_size(db->flush_queue) == 0 &&
+           atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
+           atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
+           !atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
+           !atomic_load_explicit(&cf->is_compacting, memory_order_acquire) &&
+           !atomic_load_explicit(&cf->compaction_armed, memory_order_acquire);
+}
+
 static void test_dynamic_capacity_adjustment(void)
 {
     cleanup_test_dir();
@@ -8385,24 +8446,25 @@ static void test_dynamic_capacity_adjustment(void)
      * compaction that collapses every level into the largest and never adds a
      * level, which would cement the tree at min_levels. the stable counter
      * absorbs the flush completing then triggering one more compaction. */
-    for (int stable = 0, i = 0; i < 600 && stable < 5; i++)
+    int settled = 0;
+    for (int stable = 0, i = 0; i < DCA_SETTLE_POLLS && !settled; i++)
     {
-        usleep(50000);
-        if (queue_size(db->flush_queue) == 0 &&
-            atomic_load_explicit(&cf->flush_pending_count, memory_order_acquire) == 0 &&
-            atomic_load_explicit(&cf->compaction_pending_count, memory_order_acquire) == 0 &&
-            !atomic_load_explicit(&cf->is_flushing, memory_order_acquire) &&
-            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
-            stable++;
+        usleep(DCA_SETTLE_POLL_US);
+        if (dca_cf_is_quiesced(db, cf))
+        {
+            if (++stable >= DCA_SETTLE_STREAK) settled = 1;
+        }
         else
             stable = 0;
     }
 
     printf("Total keys written: %d\n", total_keys_written);
-
-    int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-    printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
-    ASSERT_TRUE(final_levels >= 2);
+    /* a settle timeout is its own failure. sampling a tree that is still compacting would assert
+     * the steady-state relation below against moving state and report a confusing capacity mismatch
+     * instead of the real problem, which is that the cf never came to rest. */
+    if (!settled) printf("CF did not quiesce within the settle budget\n");
+    fflush(stdout);
+    ASSERT_TRUE(settled);
 
     /*** dynamic capacity adaptation check. tidesdb_apply_dca runs at the end of
      **  every compaction cycle and recomputes each non-largest level capacity
@@ -8412,10 +8474,49 @@ static void test_dynamic_capacity_adjustment(void)
      **  on every platform regardless of how the compaction heuristics batched
      *   the work. asserting this invariant -- rather than a specific level
      **  count, which is an emergent outcome that flakes under os scheduling
-     *   differences -- is what makes the test deterministic. */
-    tidesdb_level_t *largest_level = cf->levels[final_levels - 1];
-    size_t n_l = atomic_load_explicit(&largest_level->current_size, memory_order_acquire);
-    printf("Largest level L%d size N_L=%zu bytes\n", final_levels, n_l);
+     *   differences -- is what makes the test deterministic.
+     *   N_L and the per-level capacities are separate atomic loads, so a compaction landing between
+     *   them would tear the sample apart and fail the assert for no real reason. bracket the reads
+     *   with the sstable layout version and a quiesce recheck, and retry until a sample is
+     *confirmed untorn before asserting on it. */
+    int final_levels = 0;
+    size_t n_l = 0;
+    size_t caps[TDB_MAX_LEVELS];
+    int sampled = 0;
+    for (int attempt = 0; attempt < DCA_SAMPLE_ATTEMPTS && !sampled; attempt++)
+    {
+        const uint64_t ver_before =
+            atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+        final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+        /* mirror the reference tidesdb_apply_dca actually uses -- the largest NON-EMPTY level, not
+         * simply the largest one. during ingestion the bottom level can still be empty, and an N_L
+         * of 0 would collapse every capacity to the write-buffer floor, so the implementation walks
+         * down to the first populated level. asserting against the bottom level alone diverges
+         * whenever the tree quiesces with an empty bottom, which is exactly what a differently
+         * scheduled platform produces. */
+        n_l = 0;
+        for (int i = final_levels - 1; i >= 0; i--)
+        {
+            n_l = atomic_load_explicit(&cf->levels[i]->current_size, memory_order_acquire);
+            if (n_l > 0) break;
+        }
+        for (int i = 0; i < final_levels - 1 && i < TDB_MAX_LEVELS; i++)
+            caps[i] = atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
+        const uint64_t ver_after =
+            atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+
+        if (ver_before == ver_after && dca_cf_is_quiesced(db, cf))
+            sampled = 1;
+        else
+            usleep(DCA_SETTLE_POLL_US);
+    }
+    if (!sampled) printf("could not obtain a consistent capacity sample\n");
+    fflush(stdout);
+    ASSERT_TRUE(sampled);
+
+    printf("Final levels: %d (initial %d)\n", final_levels, initial_levels);
+    printf("Largest non-empty level size N_L=%zu bytes (levels=%d)\n", n_l, final_levels);
+    ASSERT_TRUE(final_levels >= 2);
 
     for (int i = 0; i < final_levels - 1; i++)
     {
@@ -8425,11 +8526,9 @@ static void test_dynamic_capacity_adjustment(void)
         if (expected_capacity < cf_config.write_buffer_size)
             expected_capacity = cf_config.write_buffer_size;
 
-        size_t actual_capacity =
-            atomic_load_explicit(&cf->levels[i]->capacity, memory_order_acquire);
-        printf("  L%d capacity actual=%zu expected=%zu\n", i + 1, actual_capacity,
-               expected_capacity);
-        ASSERT_EQ(actual_capacity, expected_capacity);
+        printf("  L%d capacity actual=%zu expected=%zu\n", i + 1, caps[i], expected_capacity);
+        fflush(stdout);
+        ASSERT_EQ(caps[i], expected_capacity);
     }
 
     /* verify data is accessible (skip verification of keys that may still be in memtable) */
@@ -9263,7 +9362,7 @@ static void test_read_write_conflict(void)
 
 /* a tracked read (tidesdb_txn_get) of a key records it into the read set, so a concurrent overwrite
  * of that key aborts the reader at commit even when the reader wrote only a disjoint key. the same
- * scenario through tidesdb_txn_get_notrack must NOT abort, because the untracked read never enters
+ * scenario through tidesdb_txn_get_notrack must not abort, because the untracked read never enters
  * the read set -- the whole point of the primitive for a PK-uniqueness probe. */
 static void test_txn_get_notrack_no_read_conflict(void)
 {
@@ -13875,7 +13974,6 @@ void test_tidesdb_block_index_seek()
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 1;
     cf_config.write_buffer_size = 512 * 1024;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), TDB_SUCCESS);
@@ -17608,7 +17706,10 @@ static void test_iter_next_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -17706,7 +17807,10 @@ static void test_iter_prev_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -17805,7 +17909,10 @@ static void test_get_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -17892,7 +17999,10 @@ static void test_range_iteration_large_values_many_sstables(void)
         ASSERT_EQ(
             tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
             0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        /* large values against a small write buffer make nearly every commit a flush trigger,
+         * so a slow runner can legitimately hit the backpressure stall budget and get
+         * TDB_ERR_BUSY, which is retryable pressure rather than a failure */
+        ASSERT_EQ(tdb_test_commit_with_retry(txn, 20), 0);
         tidesdb_txn_free(txn);
 
         if ((i + 1) % KEYS_PER_FLUSH == 0)
@@ -21338,7 +21448,6 @@ static void test_full_merge_block_index_sampling(void)
     cf_config.write_buffer_size = 2048;
     cf_config.level_size_ratio = 10;
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 2;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "sample_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "sample_cf");
@@ -28707,11 +28816,9 @@ static void test_perf_cached_iter_seek(void)
 
 static void test_block_index_shared_prefix(void)
 {
-    /* keys that share a prefix longer than block_index_prefix_len span multiple
-     * klog blocks whose min/max prefixes are all identical. the block index
-     * search must land on the leftmost such block and the lookup must scan the
-     * whole prefix-colliding run -- otherwise point lookups and seeks for keys
-     * in any but the overshot block return a false NOT_FOUND. */
+    /* many keys sharing a long common prefix span multiple klog blocks. the blocked index stores
+     * each block's full first-key, so a lookup routes to exactly the covering block -- this pins
+     * that point lookups and seeks for such keys never return a false NOT_FOUND. */
     cleanup_test_dir();
 
     tidesdb_config_t config = tidesdb_default_config();
@@ -28720,9 +28827,8 @@ static void test_block_index_shared_prefix(void)
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
 
-    /* default cf config -- block_index_prefix_len 16, index_sample_ratio 1,
-     * block indexes enabled. small write buffer + padded values force the
-     * shared-prefix keys across many blocks. */
+    /* block indexes enabled. small write buffer + padded values force the shared-prefix keys across
+     * many blocks. */
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 16 * 1024;
     cf_config.compression_algorithm = TDB_COMPRESS_NONE;
@@ -28732,7 +28838,7 @@ static void test_block_index_shared_prefix(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "bidx_prefix_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* 24 byte prefix -- longer than the 16 byte block_index_prefix_len */
+    /* a long shared prefix that spreads the keys across many blocks */
     static const char SHARED[] = "shared_prefix_blockidx__";
     const int SHARED_KEYS = 3000;
     const int UNIQUE_KEYS = 500;
@@ -31873,12 +31979,21 @@ static void sum_sstable_distinct(tidesdb_column_family_t *cf, uint64_t *out_dist
 /* drains the flush queue so all memtable data has landed on disk before the sstables are read */
 static void wait_for_flush(tidesdb_t *db)
 {
-    for (int i = 0; i < 200; i++)
+    /* the flush queue empties the moment a worker DEQUEUES an item, not when the flush finishes, so
+     * draining the queue and sleeping a fixed slice races the writer. that window is observable --
+     * the sstable is already in the level while the immutable is not yet marked flushed, so any
+     * view walking both counts those keys twice. flush_pending_count is decremented only after the
+     * worker sets imm->flushed, and active_flushes only once the slot is released, so together they
+     * are the real completion signal. the budget is generous because the loop returns as soon as it
+     * is clean, which costs a fast machine nothing and gives a slow one room to finish. */
+    for (int i = 0; i < 4000; i++)
     {
-        usleep(10000);
-        if (queue_size(db->flush_queue) == 0) break;
+        if (queue_size(db->flush_queue) == 0 &&
+            atomic_load_explicit(&db->flush_pending_count, memory_order_acquire) == 0 &&
+            atomic_load_explicit(&db->active_flushes, memory_order_acquire) == 0)
+            return;
+        usleep(5000);
     }
-    usleep(50000);
 }
 
 /* a flush writes each distinct key once into the sstable's distinct-key summary, the estimate API
@@ -32253,7 +32368,7 @@ static uint64_t burst_then_measure_compaction_settle(int num_compaction_threads,
             settle_ms, settle_ms >= cap_ms ? "  <-- NEVER QUIESCED (hit 60s cap)" : "");
 
     /* the burst must have flushed sstables (at least one per cf) and exercised compaction,
-     * otherwise the test proves nothing. we do NOT require sstable_count > NCF at flush-idle --
+     * otherwise the test proves nothing. we do not require sstable_count > NCF at flush-idle --
      * with fast consolidation compaction can already have merged each cf down to a single sstable
      * by then, which is the fix working, not a failure. */
     ASSERT_TRUE(at_flush_idle.total_sstable_count >= NCF);
@@ -32890,6 +33005,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_objstore_list_prefix, tests_passed);
     RUN_TEST(test_objstore_wal_sync_on_commit, tests_passed);
     RUN_TEST(test_btree_multi_cf_vlog_isolation, tests_passed);
+    RUN_TEST(test_txn_begin_cf_uses_cf_default_isolation, tests_passed);
     RUN_TEST(test_replica_mode, tests_passed);
     RUN_TEST(test_primary_replica_failover, tests_passed);
 #ifdef TIDESDB_WITH_S3

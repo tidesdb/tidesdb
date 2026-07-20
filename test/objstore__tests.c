@@ -516,8 +516,6 @@ void test_objstore_default_config(void)
     ASSERT_EQ(cfg.cache_on_write, 1);
     ASSERT_EQ(cfg.max_concurrent_uploads, 4);
     ASSERT_EQ(cfg.max_concurrent_downloads, 8);
-    ASSERT_TRUE(cfg.multipart_threshold > 0);
-    ASSERT_TRUE(cfg.multipart_part_size > 0);
     ASSERT_EQ(cfg.sync_manifest_to_object, 1);
     ASSERT_EQ(cfg.replicate_wal, 1);
     ASSERT_EQ(cfg.wal_upload_sync, 0);

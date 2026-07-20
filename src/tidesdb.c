@@ -18994,8 +18994,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
             break;
         }
 
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker has received work for SSTable %" PRIu64,
-                      work->sst_id);
+        /* a unified split task carries the WAL generation in sst_id, not an sstable id -- the
+         * sstable id is drawn later by the unified writer. logging it as an sstable id makes the
+         * two id spaces look like they collide when reading a failure log, so name it correctly. */
+        if (work->unified_sl || work->unified_barrier)
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "Flush worker has received unified work for WAL gen %" PRIu64,
+                          work->sst_id);
+        else
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker has received work for SSTable %" PRIu64,
+                          work->sst_id);
 
         /* flush progress heartbeat -- a picked-up work item is forward progress */
         atomic_fetch_add_explicit(&db->flush_heartbeat, 1, memory_order_relaxed);

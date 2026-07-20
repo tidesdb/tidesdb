@@ -39,27 +39,70 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential liblz4-dev libzstd-dev libsnappy-dev \
-            libcurl4-openssl-dev
+            libcurl4-openssl-dev gdb
 
       - name: Build TidesDB with S3 connector
         run: |
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_S3=ON -DTIDESDB_WITH_SANITIZER=OFF
+          # -g keeps the Release optimisation level (a rare fault here has only ever reproduced
+          # under full optimisation) while giving crash backtraces symbols and line numbers
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_S3=ON -DTIDESDB_WITH_SANITIZER=OFF \
+            -DCMAKE_C_FLAGS="-g"
           cmake --build . -j$(nproc)
+
+      # run every test binary through gdb so a fault leaves a stack behind instead of just exit 139.
+      # gdb -batch exits 0 even when the child dies on a signal, so the signal is detected in the
+      # captured output and turned back into a step failure.
+      - name: Install crash-capturing test runner
+        run: |
+          cat > "$RUNNER_TEMP/run_with_bt.sh" <<'EOS'
+          #!/usr/bin/env bash
+          # usage: run_with_bt.sh <log-name> <binary> [args...]
+          set -uo pipefail
+          log_name="$1"; shift
+          log="$RUNNER_TEMP/crashlogs/${log_name}.log"
+          mkdir -p "$RUNNER_TEMP/crashlogs"
+          ulimit -c unlimited || true
+          # quit with the child's own exit code so an ordinary non-zero exit still fails the step --
+          # gdb -batch otherwise reports success no matter how the program ended. on a signal
+          # $_exitcode is unset, that quit errors, and the signal grep below catches it anyway.
+          gdb -batch \
+            -ex "handle SIGPIPE nostop noprint pass" \
+            -ex run \
+            -ex "echo \n===== CRASH BACKTRACE =====\n" \
+            -ex "thread apply all bt full" \
+            -ex "info registers" \
+            -ex "quit \$_exitcode" \
+            --args "$@" 2>&1 | tee "$log"
+          gdb_rc=${PIPESTATUS[0]}
+          if grep -qE "SIGSEGV|SIGBUS|SIGILL|SIGFPE|SIGABRT" "$log"; then
+            echo "::error::$* crashed on a signal -- backtrace above and in the crashlogs artifact"
+            exit 1
+          fi
+          if grep -q "FAILED:" "$log" && ! grep -q "FAILED: 0" "$log"; then
+            echo "::error::$* reported test failures"
+            exit 1
+          fi
+          if [ "$gdb_rc" -ne 0 ]; then
+            echo "::error::$* exited with status $gdb_rc"
+            exit "$gdb_rc"
+          fi
+          EOS
+          chmod +x "$RUNNER_TEMP/run_with_bt.sh"
 
       - name: Run standard test suite
         run: |
           cd build
-          ./tidesdb_tests
+          "$RUNNER_TEMP/run_with_bt.sh" standard-suite ./tidesdb_tests
 
       - name: Run object store tests (filesystem connector)
         run: |
           cd build
-          ./objstore_tests test_objstore_fs
-          ./tidesdb_tests test_objstore_fs_roundtrip
-          ./tidesdb_tests test_objstore_cold_start
-          ./tidesdb_tests test_objstore_compaction_and_iterators
-          ./tidesdb_tests test_unified_iterator_consistency
+          "$RUNNER_TEMP/run_with_bt.sh" objstore-fs ./objstore_tests test_objstore_fs
+          "$RUNNER_TEMP/run_with_bt.sh" fs-roundtrip ./tidesdb_tests test_objstore_fs_roundtrip
+          "$RUNNER_TEMP/run_with_bt.sh" cold-start ./tidesdb_tests test_objstore_cold_start
+          "$RUNNER_TEMP/run_with_bt.sh" compaction-iterators ./tidesdb_tests test_objstore_compaction_and_iterators
+          "$RUNNER_TEMP/run_with_bt.sh" unified-iterator ./tidesdb_tests test_unified_iterator_consistency
 
       - name: Run object store tests (MinIO S3 connector)
         env:
@@ -69,8 +112,22 @@ jobs:
           TIDESDB_S3_SECRET_KEY: minioadmin
         run: |
           cd build
-          ./objstore_tests test_objstore_s3_minio
-          ./tidesdb_tests test_objstore_s3_minio
+          "$RUNNER_TEMP/run_with_bt.sh" objstore-s3 ./objstore_tests test_objstore_s3_minio
+          "$RUNNER_TEMP/run_with_bt.sh" s3-minio ./tidesdb_tests test_objstore_s3_minio
+
+      # keep the gdb output and the symbolised binaries so a fault can be dug into offline
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: objstore-crash-artifacts
+          path: |
+            ${{ runner.temp }}/crashlogs/
+            build/tidesdb_tests
+            build/objstore_tests
+            build/libtidesdb.so*
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Stop MinIO
         if: always()

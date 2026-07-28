@@ -27446,7 +27446,8 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
 
         if (batch_idx > 0)
         {
-            if (skip_list_put_batch(memtable, stack_batch, batch_idx) < 0)
+            const int inserted = skip_list_put_batch(memtable, stack_batch, batch_idx);
+            if (inserted != batch_idx)
             {
                 return TDB_ERR_MEMORY;
             }
@@ -27596,7 +27597,8 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
             }
         }
 
-        if (skip_list_put_batch(memtable, batch_entries, batch_idx) < 0)
+        const int inserted = skip_list_put_batch(memtable, batch_entries, batch_idx);
+        if (inserted != batch_idx)
         {
             result = TDB_ERR_MEMORY;
         }
@@ -27924,7 +27926,8 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
 
         if (batch_idx > 0)
         {
-            if (skip_list_put_batch(memtable, stack_batch, batch_idx) < 0) return TDB_ERR_MEMORY;
+            const int inserted = skip_list_put_batch(memtable, stack_batch, batch_idx);
+            if (inserted != batch_idx) return TDB_ERR_MEMORY;
         }
         return TDB_SUCCESS;
     }
@@ -28065,25 +28068,9 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
     {
         free(batch_entries);
         free(pk_arena);
-        /* individual puts */
-        if (used_slots && used_slot_count > 0)
-        {
-            for (int i = 0; i < used_slot_count; i++)
-            {
-                const tidesdb_txn_op_t *op = &txn->ops[dedup_hash[used_slots[i]].op_idx];
-                const size_t pk_total = TDB_UNIFIED_CF_PREFIX_SIZE + op->key_size;
-                TDB_PREFIXED_KEY_ALLOC(prefixed, pk_total, _pk_stack_fb2);
-                if (!prefixed) continue;
-                size_t pk_size = tdb_build_prefixed_key(op->cf->unified_cf_index, op->key,
-                                                        op->key_size, prefixed);
-                (void)skip_list_put_with_seq(memtable, prefixed, pk_size, op->value, op->value_size,
-                                             op->ttl, txn->commit_seq, tidesdb_txn_op_sl_flags(op));
-                TDB_PREFIXED_KEY_FREE(prefixed, _pk_stack_fb2);
-            }
-        }
         free(dedup_hash);
         free(used_slots);
-        return TDB_SUCCESS;
+        return TDB_ERR_MEMORY;
     }
 
     int batch_idx = 0;
@@ -28138,7 +28125,8 @@ static int tidesdb_txn_apply_ops_to_unified_memtable(const tidesdb_txn_t *txn,
 
     if (batch_idx > 0)
     {
-        if (skip_list_put_batch(memtable, batch_entries, batch_idx) < 0) result = TDB_ERR_MEMORY;
+        const int inserted = skip_list_put_batch(memtable, batch_entries, batch_idx);
+        if (inserted != batch_idx) result = TDB_ERR_MEMORY;
     }
 
     free(batch_entries);

@@ -453,6 +453,89 @@ static void test_basic_txn_put_get(void)
     cleanup_test_dir();
 }
 
+/* force a deterministic short batch at the transaction's commit sequence */
+static void run_txn_short_batch_rejection(const int unified, const int num_ops)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.log_level = TDB_LOG_FATAL;
+    config.block_cache_size = 0;
+    config.unified_memtable = unified;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "short_batch_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "short_batch_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    char keys[16][32];
+    const uint8_t txn_value[] = "transaction-value";
+    for (int i = 0; i < num_ops; i++)
+    {
+        snprintf(keys[i], sizeof(keys[i]), "short-batch-key-%02d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)keys[i], strlen(keys[i]) + 1, txn_value,
+                                  sizeof(txn_value), -1),
+                  TDB_SUCCESS);
+    }
+
+    tidesdb_memtable_t *active =
+        unified ? atomic_load_explicit(&db->unified_mt.active, memory_order_acquire)
+                : atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    ASSERT_TRUE(active != NULL);
+    ASSERT_TRUE(active->skip_list != NULL);
+
+    const int duplicate_index = num_ops / 2;
+    const uint8_t seeded_value[] = "seeded-value";
+    const uint64_t commit_seq = atomic_load_explicit(&db->global_seq, memory_order_acquire);
+    if (unified)
+    {
+        enum
+        {
+            unified_prefix_size = 4
+        };
+        uint8_t prefixed_key[unified_prefix_size + sizeof(keys[0])];
+        const uint32_t cf_index = cf->unified_cf_index;
+        prefixed_key[0] = (uint8_t)(cf_index >> 24);
+        prefixed_key[1] = (uint8_t)(cf_index >> 16);
+        prefixed_key[2] = (uint8_t)(cf_index >> 8);
+        prefixed_key[3] = (uint8_t)cf_index;
+        const size_t raw_key_size = strlen(keys[duplicate_index]) + 1;
+        memcpy(prefixed_key + unified_prefix_size, keys[duplicate_index], raw_key_size);
+        ASSERT_EQ(skip_list_put_with_seq(active->skip_list, prefixed_key,
+                                         unified_prefix_size + raw_key_size, seeded_value,
+                                         sizeof(seeded_value), -1, commit_seq, 0),
+                  0);
+    }
+    else
+    {
+        ASSERT_EQ(skip_list_put_with_seq(active->skip_list, (const uint8_t *)keys[duplicate_index],
+                                         strlen(keys[duplicate_index]) + 1, seeded_value,
+                                         sizeof(seeded_value), -1, commit_seq, 0),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_ERR_MEMORY);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_txn_short_batch_is_rejected(void)
+{
+    run_txn_short_batch_rejection(0, 7);  /* classic stack batch */
+    run_txn_short_batch_rejection(0, 16); /* classic heap batch */
+    run_txn_short_batch_rejection(1, 7);  /* unified stack batch */
+    run_txn_short_batch_rejection(1, 16); /* unified heap batch */
+}
+
 static void test_txn_delete(void)
 {
     cleanup_test_dir();
@@ -23965,9 +24048,18 @@ static void test_commit_hook_sequence_monotonic(void)
  * successfully, we're done. otherwise increment i and retry. */
 static _Atomic(int64_t) oom_alloc_count;
 static _Atomic(int64_t) oom_fail_after; /* -1 = never fail */
+static _Thread_local size_t oom_malloc_fail_size;
+static _Thread_local int oom_malloc_fail_armed;
+static _Thread_local int oom_malloc_fail_fired;
 
 static void *oom_malloc(size_t size)
 {
+    if (oom_malloc_fail_armed && !oom_malloc_fail_fired && size == oom_malloc_fail_size)
+    {
+        oom_malloc_fail_fired = 1;
+        return NULL;
+    }
+
     int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
     if (limit >= 0)
     {
@@ -24002,6 +24094,76 @@ static void *oom_realloc(void *ptr, size_t size)
 static void oom_free(void *ptr)
 {
     saved_free(ptr);
+}
+
+/* reject an allocation failure before the 1,024-op unified batch is applied */
+static void test_unified_batch_allocation_failure_is_rejected(void)
+{
+    if (is_running_under_qemu())
+    {
+        printf("  SKIPPED (QEMU emulation)\n");
+        return;
+    }
+
+    enum
+    {
+        num_keys = 1024
+    };
+
+    tidesdb_ensure_initialized();
+    if (!saved_malloc)
+    {
+        saved_malloc = tidesdb_allocator.malloc_fn;
+        saved_calloc = tidesdb_allocator.calloc_fn;
+        saved_realloc = tidesdb_allocator.realloc_fn;
+        saved_free = tidesdb_allocator.free_fn;
+    }
+    tidesdb_finalize();
+    atomic_init(&oom_alloc_count, 0);
+    atomic_init(&oom_fail_after, (int64_t)-1);
+    ASSERT_EQ(tidesdb_init(oom_malloc, oom_calloc, oom_realloc, oom_free), TDB_SUCCESS);
+
+    cleanup_test_dir();
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.log_level = TDB_LOG_FATAL;
+    config.block_cache_size = 0;
+    config.unified_memtable = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    ASSERT_EQ(tidesdb_create_column_family(db, "batch_alloc_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "batch_alloc_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    char keys[num_keys][32];
+    const uint8_t value[] = "value";
+    for (int i = 0; i < num_keys; i++)
+    {
+        snprintf(keys[i], sizeof(keys[i]), "batch-alloc-key-%04d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)keys[i], strlen(keys[i]) + 1, value,
+                                  sizeof(value), -1),
+                  TDB_SUCCESS);
+    }
+
+    oom_malloc_fail_size = num_keys * sizeof(skip_list_batch_entry_t);
+    oom_malloc_fail_fired = 0;
+    oom_malloc_fail_armed = 1;
+    const int commit_result = tidesdb_txn_commit(txn);
+    oom_malloc_fail_armed = 0;
+
+    ASSERT_TRUE(oom_malloc_fail_fired);
+    ASSERT_EQ(commit_result, TDB_ERR_MEMORY);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+
+    tidesdb_finalize();
+    ASSERT_EQ(tidesdb_init(NULL, NULL, NULL, NULL), TDB_SUCCESS);
 }
 
 static void test_oom_exhaustion(void)
@@ -32494,6 +32656,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_column_family_creation, tests_passed);
     RUN_TEST(test_list_column_families, tests_passed);
     RUN_TEST(test_basic_txn_put_get, tests_passed);
+    RUN_TEST(test_txn_short_batch_is_rejected, tests_passed);
+    RUN_TEST(test_unified_batch_allocation_failure_is_rejected, tests_passed);
     RUN_TEST(test_txn_delete, tests_passed);
     RUN_TEST(test_txn_rollback, tests_passed);
     RUN_TEST(test_multiple_column_families, tests_passed);

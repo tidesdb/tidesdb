@@ -26082,6 +26082,11 @@ static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
     /** we cache current time once for consistent TTL checks throughout this read.
      *  declared here so both the unified goto path and the normal path see it. */
     const int64_t now = (int64_t)atomic_load(&txn->db->cached_current_time);
+    uint64_t imm_best_seq = 0;
+    uint8_t *imm_best_value = NULL;
+    size_t imm_best_value_size = 0;
+    int imm_best_is_dead = 0;
+    int imm_best_found = 0;
 
     /* unified memtable read pat, we search shared skip list with prefixed key */
     if (txn->db->unified_mt.enabled)
@@ -26176,8 +26181,7 @@ static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                 pthread_rwlock_unlock(&uimm_q->read_lock);
 
                 /* we search the pinned snapshot (newest first) */
-                int found = 0;
-                for (size_t qi = snap_count; qi > 0 && !found; qi--)
+                for (size_t qi = snap_count; qi > 0; qi--)
                 {
                     tidesdb_memtable_t *imm_mt = uimm_ptrs[qi - 1];
                     if (!imm_mt || !imm_mt->skip_list) continue;
@@ -26189,31 +26193,19 @@ static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                         visibility_check ? txn->db->commit_status : NULL);
                     if (mr != 0) continue;
 
-                    found = 1;
-                    if (deleted_u)
+                    if (!imm_best_found || found_seq_u > imm_best_seq)
                     {
-                        unified_rc = TDB_ERR_NOT_FOUND;
-                    }
-                    else if (ttl_u <= 0 || ttl_u > now)
-                    {
-                        *value = malloc(temp_val_size);
-                        if (!*value)
+                        if (imm_best_value) free(imm_best_value);
+                        imm_best_seq = found_seq_u;
+                        imm_best_value = NULL;
+                        imm_best_value_size = temp_val_size;
+                        imm_best_is_dead = deleted_u || (ttl_u > 0 && ttl_u <= now);
+                        imm_best_found = 1;
+                        if (!imm_best_is_dead)
                         {
-                            unified_rc = TDB_ERR_MEMORY;
+                            imm_best_value = malloc(temp_val_size);
+                            if (imm_best_value) memcpy(imm_best_value, temp_val, temp_val_size);
                         }
-                        else
-                        {
-                            memcpy(*value, temp_val, temp_val_size);
-                            *value_size = temp_val_size;
-                            PROFILE_INC(txn->db, immutable_hits);
-                            if (record_read)
-                                tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq_u, 1);
-                            unified_rc = TDB_SUCCESS;
-                        }
-                    }
-                    else
-                    {
-                        unified_rc = TDB_ERR_NOT_FOUND;
                     }
                 }
 
@@ -26223,8 +26215,6 @@ static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                     if (uimm_ptrs[i]) tidesdb_immutable_memtable_unref(uimm_ptrs[i]);
                 }
                 if (uimm_ptrs != uimm_stack) free(uimm_ptrs);
-
-                if (found) goto unified_memtable_done;
             }
         }
 
@@ -26307,7 +26297,6 @@ static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
     if (imm_snap)
     {
         const size_t immutable_count = atomic_load_explicit(&imm_snap->count, memory_order_acquire);
-        int result = TDB_ERR_UNKNOWN;
 
         /* we search in reverse order (newest first) to find most recent version */
         for (int i = (int)immutable_count - 1; i >= 0; i--)
@@ -26329,42 +26318,35 @@ static int tidesdb_txn_get_impl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                         &deleted, &found_seq, snapshot_seq, visibility_check,
                         visibility_check ? txn->db->commit_status : NULL) == 0)
                 {
-                    if (deleted)
+                    if (!imm_best_found || found_seq > imm_best_seq)
                     {
-                        result = TDB_ERR_NOT_FOUND;
-                        break;
-                    }
-
-                    if (ttl <= 0 || ttl > now)
-                    {
-                        *value = malloc(temp_value_size);
-                        if (*value == NULL)
+                        if (imm_best_value) free(imm_best_value);
+                        imm_best_seq = found_seq;
+                        imm_best_value = NULL;
+                        imm_best_value_size = temp_value_size;
+                        imm_best_is_dead = deleted || (ttl > 0 && ttl <= now);
+                        imm_best_found = 1;
+                        if (!imm_best_is_dead)
                         {
-                            result = TDB_ERR_MEMORY;
-                            break;
+                            imm_best_value = malloc(temp_value_size);
+                            if (imm_best_value) memcpy(imm_best_value, temp_value, temp_value_size);
                         }
-                        memcpy(*value, temp_value, temp_value_size);
-                        *value_size = temp_value_size;
-                        PROFILE_INC(txn->db, immutable_hits);
-                        if (record_read)
-                            tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq, 1);
-                        result = TDB_SUCCESS;
-                        break;
                     }
-                    result = TDB_ERR_NOT_FOUND;
-                    break;
                 }
             }
         }
 
         tidesdb_imm_snap_release(imm_snap);
-
-        if (result != TDB_ERR_UNKNOWN) return result;
     }
 
 unified_sst_search:;
     sst_scan_layout_v = atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    uint64_t sst_best_seq = 0;
+    uint8_t *sst_best_value = NULL;
+    size_t sst_best_value_size = 0;
+    int sst_best_is_dead = 0;
+    int sst_best_found = 0;
 
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
@@ -26484,9 +26466,11 @@ unified_sst_search:;
                 break;
             }
 
-            /** we use per-sstable max_seq as upper bound, essentially if the highest seq in this
-             *  sstable cannot beat our current best, skip the expensive lookup */
-            if (best_found && sst->max_seq <= best_seq)
+            /** we use per-sstable max_seq as an upper bound. if this sstable cannot beat the best
+             *  immutable, earlier-level, or current-level candidate, skip the expensive lookup. */
+            if ((imm_best_found && sst->max_seq <= imm_best_seq) ||
+                (sst_best_found && sst->max_seq <= sst_best_seq) ||
+                (best_found && sst->max_seq <= best_seq))
             {
                 tidesdb_sstable_unref(cf->db, sst);
                 continue;
@@ -26564,66 +26548,88 @@ unified_sst_search:;
         if (scan_error)
         {
             if (best_value) free(best_value);
+            if (sst_best_value) free(sst_best_value);
+            if (imm_best_value) free(imm_best_value);
             return scan_error;
         }
 
         if (best_found)
         {
-            /* a match is not final while the layout is moving. an add swaps the level array, but
-             * the swap can land after our one-time array-swap recheck above, leaving us scanning a
-             * retired snapshot that holds an older put without the newer tombstone a concurrent
-             * compaction just committed into another overlapping first-disk-level sstable -- the
-             * per-level early return would then surface the stale put for a deleted key. if the
-             * layout version moved since we snapshotted it, retry the whole scan, then fall back to
-             * a retryable BUSY. mirrors the not-found guard below. */
-            if (atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire) !=
-                sst_scan_layout_v)
+            /* a per-level match is not final even in a stable layout. compaction publishes its
+             * destination before retiring every source, so an older put can temporarily remain in
+             * a shallower level while its newer tombstone is already visible in a deeper level.
+             * retain the highest sequence across all levels before resolving the read. */
+            if (!sst_best_found || best_seq > sst_best_seq)
             {
-                if (best_value)
-                {
-                    free(best_value);
-                    best_value = NULL;
-                }
-                if (sst_scan_restarts < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
-                {
-                    sst_scan_restarts++;
-                    goto unified_sst_search;
-                }
-                return TDB_ERR_BUSY;
+                if (sst_best_value) free(sst_best_value);
+                sst_best_seq = best_seq;
+                sst_best_value = best_value;
+                sst_best_value_size = best_value_size;
+                sst_best_is_dead = best_is_dead;
+                sst_best_found = 1;
+                best_value = NULL;
             }
-
-            PROFILE_INC(txn->db, sstable_hits);
-
-            if (!best_is_dead && best_value)
-            {
-                *value = best_value;
-                *value_size = best_value_size;
-                if (record_read) tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq, 1);
-                return TDB_SUCCESS;
-            }
-
-            if (!best_is_dead) return TDB_ERR_MEMORY;
-            /* absent because the newest version in range is a tombstone -- record it so the
-             * reservation rejects a concurrent re-insert at the same key (snapshot/serializable) */
-            if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
-                if (record_read) tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq, 1);
-            return TDB_ERR_NOT_FOUND;
         }
+        if (best_value) free(best_value);
     }
 
-    /* nothing matched in any level. if the layout moved while we scanned, a compaction may have
-     * carried the key past our cursor -- retry the whole scan rather than report a false miss, and
-     * once the restart budget is spent return a retryable BUSY instead of a definitive NOT_FOUND.
-     */
+    /* a match is not final while the layout is moving. an add swaps a level array, but the swap can
+     * land after its one-time array-swap recheck above, leaving the scan on a retired snapshot. a
+     * compaction can likewise carry the key past our cursor when nothing matched. retry the whole
+     * scan while the layout version differs, then surface a retryable BUSY once the budget is
+     * spent. */
     if (atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire) !=
         sst_scan_layout_v)
     {
+        if (sst_best_value) free(sst_best_value);
         if (sst_scan_restarts < TDB_SST_RETRY_MAX_LEVEL_RETRIES)
         {
             sst_scan_restarts++;
             goto unified_sst_search;
         }
+        if (imm_best_value) free(imm_best_value);
         return TDB_ERR_BUSY;
+    }
+
+    int winner_is_immutable = 0;
+    if (imm_best_found && (!sst_best_found || imm_best_seq >= sst_best_seq))
+    {
+        if (sst_best_value) free(sst_best_value);
+        sst_best_seq = imm_best_seq;
+        sst_best_value = imm_best_value;
+        sst_best_value_size = imm_best_value_size;
+        sst_best_is_dead = imm_best_is_dead;
+        sst_best_found = 1;
+        imm_best_value = NULL;
+        winner_is_immutable = 1;
+    }
+    if (imm_best_value) free(imm_best_value);
+
+    if (sst_best_found)
+    {
+        if (winner_is_immutable)
+        {
+            if (!sst_best_is_dead && sst_best_value) PROFILE_INC(txn->db, immutable_hits);
+        }
+        else
+        {
+            PROFILE_INC(txn->db, sstable_hits);
+        }
+
+        if (!sst_best_is_dead && sst_best_value)
+        {
+            *value = sst_best_value;
+            *value_size = sst_best_value_size;
+            if (record_read) tidesdb_txn_add_to_read_set(txn, cf, key, key_size, sst_best_seq, 1);
+            return TDB_SUCCESS;
+        }
+
+        if (!sst_best_is_dead) return TDB_ERR_MEMORY;
+        /* absent because the newest version in range is a tombstone -- record it so the
+         * reservation rejects a concurrent re-insert at the same key (snapshot/serializable) */
+        if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
+            if (record_read) tidesdb_txn_add_to_read_set(txn, cf, key, key_size, sst_best_seq, 1);
+        return TDB_ERR_NOT_FOUND;
     }
 
     /* nothing existed for this key in our snapshot -- record the absent read at seq 0 so the

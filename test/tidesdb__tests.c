@@ -6930,7 +6930,15 @@ static void test_read_own_writes_in_transaction(void)
 static void test_alternating_puts_deletes(void)
 {
     cleanup_test_dir();
-    tidesdb_t *db = create_test_db();
+
+    /* two flush workers let a newer tombstone reach disk before an older put finishes flushing;
+     * point reads must still resolve the highest sequence across immutables and sstables */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 2;
+    config.num_compaction_threads = 1;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;
 
@@ -6967,7 +6975,7 @@ static void test_alternating_puts_deletes(void)
         tidesdb_txn_free(txn);
     }
 
-    /* we verify only odd keys exist (even keys were deleted) */
+    /* verify every key is absent: even keys were deleted and odd keys were never put */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -6987,7 +6995,7 @@ static void test_alternating_puts_deletes(void)
         }
         else
         {
-            /* odd keys should exist (they were never put) */
+            /* odd keys should be absent because they were never put */
             ASSERT_TRUE(result != 0);
         }
 

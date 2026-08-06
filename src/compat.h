@@ -2316,6 +2316,373 @@ static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void 
 }
 #endif
 
+#define TDB_CGROUP_MEMORY_INVALID   -1
+#define TDB_CGROUP_MEMORY_UNLIMITED 0
+#define TDB_CGROUP_MEMORY_FINITE    1
+#define TDB_CGROUP_PATH_CAPACITY    8192
+
+typedef struct
+{
+    int limit_state;
+    size_t limit;
+    int available_state;
+    size_t available;
+} tdb_cgroup_memory_bounds_t;
+
+static inline int tdb_ascii_space(const char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+/* parse memory.max/memory.current text without accepting signs, suffixes, or overflow */
+static inline int tdb_parse_cgroup_memory_value(const char *text, size_t *value)
+{
+    if (!text || !value) return TDB_CGROUP_MEMORY_INVALID;
+
+    while (tdb_ascii_space(*text)) text++;
+    if (strncmp(text, "max", 3) == 0)
+    {
+        text += 3;
+        while (tdb_ascii_space(*text)) text++;
+        return *text == '\0' ? TDB_CGROUP_MEMORY_UNLIMITED : TDB_CGROUP_MEMORY_INVALID;
+    }
+    if (*text < '0' || *text > '9') return TDB_CGROUP_MEMORY_INVALID;
+
+    errno = 0;
+    char *end = NULL;
+    const unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text ||
+        (sizeof(size_t) < sizeof(unsigned long long) && parsed > (unsigned long long)SIZE_MAX))
+        return TDB_CGROUP_MEMORY_INVALID;
+
+    while (tdb_ascii_space(*end)) end++;
+    if (*end != '\0') return TDB_CGROUP_MEMORY_INVALID;
+
+    *value = (size_t)parsed;
+    return TDB_CGROUP_MEMORY_FINITE;
+}
+
+static inline size_t tdb_cgroup_effective_total(const size_t host_total, const int limit_state,
+                                                const size_t limit)
+{
+    if (limit_state != TDB_CGROUP_MEMORY_FINITE) return host_total;
+    if (host_total == 0 || limit < host_total) return limit;
+    return host_total;
+}
+
+static inline size_t tdb_cgroup_effective_available(const size_t host_available,
+                                                    const int limit_state,
+                                                    const int available_state,
+                                                    const size_t cgroup_available)
+{
+    if (limit_state == TDB_CGROUP_MEMORY_FINITE && available_state != TDB_CGROUP_MEMORY_FINITE)
+        return 0;
+    if (available_state != TDB_CGROUP_MEMORY_FINITE) return host_available;
+    if (host_available == 0 || cgroup_available < host_available) return cgroup_available;
+    return host_available;
+}
+
+static inline int tdb_parse_cgroup_v2_path(const char *contents, char *path, const size_t path_size)
+{
+    if (!contents || !path || path_size == 0) return -1;
+
+    const char *line = contents;
+    while (*line != '\0')
+    {
+        const char *line_end = strchr(line, '\n');
+        if (!line_end) line_end = line + strlen(line);
+
+        if (line_end - line >= 4 && line[0] == '0' && line[1] == ':' && line[2] == ':' &&
+            line[3] == '/')
+        {
+            const char *value = line + 3;
+            size_t length = (size_t)(line_end - value);
+            if (length > 0 && value[length - 1] == '\r') length--;
+            if (length == 0 || length >= path_size) return -1;
+            memcpy(path, value, length);
+            path[length] = '\0';
+            return 0;
+        }
+
+        if (*line_end == '\0') break;
+        line = line_end + 1;
+    }
+    return -1;
+}
+
+static inline int tdb_decode_mountinfo_path(const char *encoded, const size_t encoded_size,
+                                            char *decoded, const size_t decoded_size)
+{
+    if (!encoded || !decoded || decoded_size == 0) return -1;
+
+    size_t output = 0;
+    for (size_t input = 0; input < encoded_size; input++)
+    {
+        unsigned char value = (unsigned char)encoded[input];
+        if (value == '\\')
+        {
+            if (input + 3 >= encoded_size || encoded[input + 1] < '0' || encoded[input + 1] > '7' ||
+                encoded[input + 2] < '0' || encoded[input + 2] > '7' || encoded[input + 3] < '0' ||
+                encoded[input + 3] > '7')
+                return -1;
+            value = (unsigned char)(((encoded[input + 1] - '0') << 6) |
+                                    ((encoded[input + 2] - '0') << 3) | (encoded[input + 3] - '0'));
+            if (value == 0) return -1;
+            input += 3;
+        }
+        if (output + 1 >= decoded_size) return -1;
+        decoded[output++] = (char)value;
+    }
+    if (output == 0 || decoded[0] != '/') return -1;
+    while (output > 1 && decoded[output - 1] == '/') output--;
+    decoded[output] = '\0';
+    return 0;
+}
+
+static inline int tdb_parse_cgroup2_mountinfo_line(const char *line, const size_t line_size,
+                                                   char *root, const size_t root_size,
+                                                   char *mountpoint, const size_t mountpoint_size)
+{
+    if (!line || !root || !mountpoint) return -1;
+
+    const char *line_end = line + line_size;
+    const char *separator = NULL;
+    for (const char *cursor = line; cursor + 3 <= line_end; cursor++)
+    {
+        if (cursor[0] == ' ' && cursor[1] == '-' && cursor[2] == ' ')
+        {
+            separator = cursor;
+            break;
+        }
+    }
+    if (!separator) return 1;
+
+    const char *filesystem = separator + 3;
+    const char *filesystem_end = filesystem;
+    while (filesystem_end < line_end && *filesystem_end != ' ' && *filesystem_end != '\n' &&
+           *filesystem_end != '\r')
+        filesystem_end++;
+    if ((size_t)(filesystem_end - filesystem) != sizeof("cgroup2") - 1 ||
+        memcmp(filesystem, "cgroup2", sizeof("cgroup2") - 1) != 0)
+        return 1;
+
+    const char *fields[5];
+    size_t field_sizes[5];
+    const char *cursor = line;
+    for (int field = 0; field < 5; field++)
+    {
+        while (cursor < separator && *cursor == ' ') cursor++;
+        if (cursor >= separator) return -1;
+        fields[field] = cursor;
+        while (cursor < separator && *cursor != ' ') cursor++;
+        field_sizes[field] = (size_t)(cursor - fields[field]);
+    }
+
+    if (tdb_decode_mountinfo_path(fields[3], field_sizes[3], root, root_size) != 0 ||
+        tdb_decode_mountinfo_path(fields[4], field_sizes[4], mountpoint, mountpoint_size) != 0)
+        return -1;
+    return 0;
+}
+
+static inline int tdb_parse_cgroup2_mountinfo(const char *contents, char *root,
+                                              const size_t root_size, char *mountpoint,
+                                              const size_t mountpoint_size)
+{
+    if (!contents || !root || !mountpoint) return -1;
+
+    const char *line = contents;
+    while (*line != '\0')
+    {
+        const char *line_end = strchr(line, '\n');
+        if (!line_end) line_end = line + strlen(line);
+        const int result = tdb_parse_cgroup2_mountinfo_line(line, (size_t)(line_end - line), root,
+                                                            root_size, mountpoint, mountpoint_size);
+        if (result <= 0) return result;
+        if (*line_end == '\0') break;
+        line = line_end + 1;
+    }
+    return -1;
+}
+
+static inline int tdb_resolve_cgroup2_directory(const char *mountpoint, const char *mount_root,
+                                                const char *group, char *directory,
+                                                const size_t directory_size)
+{
+    if (!mountpoint || !mount_root || !group || !directory || directory_size == 0 ||
+        mountpoint[0] != '/' || mount_root[0] != '/' || group[0] != '/')
+        return -1;
+
+    const char *relative = group;
+    const size_t root_length = strlen(mount_root);
+    if (strcmp(group, "/") == 0 || strcmp(group, mount_root) == 0)
+        relative = "";
+    else if (strcmp(mount_root, "/") != 0 && strncmp(group, mount_root, root_length) == 0 &&
+             group[root_length] == '/')
+        relative = group + root_length;
+
+    int length;
+    if (*relative == '\0')
+        length = snprintf(directory, directory_size, "%s", mountpoint);
+    else if (strcmp(mountpoint, "/") == 0)
+        length = snprintf(directory, directory_size, "%s", relative);
+    else
+        length = snprintf(directory, directory_size, "%s%s", mountpoint, relative);
+    return length >= 0 && (size_t)length < directory_size ? 0 : -1;
+}
+
+static inline int tdb_read_small_text_file(const char *path, char *text, const size_t text_size)
+{
+    if (!path || !text || text_size < 2) return -1;
+    FILE *file = fopen(path, "r");
+    if (!file) return -1;
+
+    const size_t bytes = fread(text, 1, text_size - 1, file);
+    const int truncated = bytes == text_size - 1 && fgetc(file) != EOF;
+    const int failed = ferror(file);
+    fclose(file);
+    if (failed || truncated) return -1;
+
+    text[bytes] = '\0';
+    return 0;
+}
+
+static inline int tdb_cgroup_memory_bounds_at(const char *mountpoint, const char *start_directory,
+                                              tdb_cgroup_memory_bounds_t *bounds)
+{
+    if (!mountpoint || !start_directory || !bounds) return -1;
+
+    char directory[TDB_CGROUP_PATH_CAPACITY];
+    char path[TDB_CGROUP_PATH_CAPACITY + 128];
+    char text[128];
+
+    size_t mountpoint_length = strlen(mountpoint);
+    while (mountpoint_length > 1 && mountpoint[mountpoint_length - 1] == '/') mountpoint_length--;
+    const int directory_length = snprintf(directory, sizeof(directory), "%s", start_directory);
+    if (directory_length < 0 || (size_t)directory_length >= sizeof(directory)) return -1;
+    size_t directory_size = strlen(directory);
+    while (directory_size > 1 && directory[directory_size - 1] == '/')
+        directory[--directory_size] = '\0';
+    const int mountpoint_is_root = mountpoint_length == 1 && mountpoint[0] == '/';
+    if (directory_size < mountpoint_length ||
+        strncmp(directory, mountpoint, mountpoint_length) != 0 ||
+        (!mountpoint_is_root && directory_size > mountpoint_length &&
+         directory[mountpoint_length] != '/'))
+        return -1;
+
+    int found_hierarchy = 0;
+    int found_limit = 0;
+    int available_known = 1;
+    bounds->limit_state = TDB_CGROUP_MEMORY_INVALID;
+    bounds->limit = 0;
+    bounds->available_state = TDB_CGROUP_MEMORY_INVALID;
+    bounds->available = 0;
+
+    while (1)
+    {
+        const int max_path_length = snprintf(path, sizeof(path), "%s/memory.max", directory);
+        size_t current_limit = 0;
+        int limit_state = TDB_CGROUP_MEMORY_INVALID;
+        if (max_path_length >= 0 && (size_t)max_path_length < sizeof(path) &&
+            tdb_read_small_text_file(path, text, sizeof(text)) == 0)
+        {
+            limit_state = tdb_parse_cgroup_memory_value(text, &current_limit);
+            if (limit_state != TDB_CGROUP_MEMORY_INVALID) found_hierarchy = 1;
+        }
+
+        if (limit_state == TDB_CGROUP_MEMORY_FINITE)
+        {
+            if (!found_limit || current_limit < bounds->limit) bounds->limit = current_limit;
+            found_limit = 1;
+
+            size_t current = 0;
+            int current_state = TDB_CGROUP_MEMORY_INVALID;
+            const int current_path_length =
+                snprintf(path, sizeof(path), "%s/memory.current", directory);
+            if (current_path_length >= 0 && (size_t)current_path_length < sizeof(path) &&
+                tdb_read_small_text_file(path, text, sizeof(text)) == 0)
+                current_state = tdb_parse_cgroup_memory_value(text, &current);
+
+            if (current_state != TDB_CGROUP_MEMORY_FINITE)
+            {
+                available_known = 0;
+            }
+            else
+            {
+                const size_t headroom = current >= current_limit ? 0 : current_limit - current;
+                if (bounds->available_state != TDB_CGROUP_MEMORY_FINITE ||
+                    headroom < bounds->available)
+                    bounds->available = headroom;
+                bounds->available_state = TDB_CGROUP_MEMORY_FINITE;
+            }
+        }
+
+        if (strlen(directory) == mountpoint_length &&
+            strncmp(directory, mountpoint, mountpoint_length) == 0)
+            break;
+        char *separator = strrchr(directory, '/');
+        if (!separator) return -1;
+        if (separator == directory)
+            directory[1] = '\0';
+        else
+            *separator = '\0';
+    }
+
+    if (!found_hierarchy) return -1;
+    if (!found_limit)
+    {
+        bounds->limit_state = TDB_CGROUP_MEMORY_UNLIMITED;
+        bounds->available_state = TDB_CGROUP_MEMORY_UNLIMITED;
+    }
+    else
+    {
+        bounds->limit_state = TDB_CGROUP_MEMORY_FINITE;
+        if (!available_known) bounds->available_state = TDB_CGROUP_MEMORY_INVALID;
+    }
+    return 0;
+}
+
+#if defined(__linux__)
+static inline int tdb_linux_cgroup2_mount(char *root, const size_t root_size, char *mountpoint,
+                                          const size_t mountpoint_size)
+{
+    FILE *file = fopen("/proc/self/mountinfo", "r");
+    if (!file) return -1;
+
+    char line[TDB_CGROUP_PATH_CAPACITY];
+    int result = -1;
+    while (fgets(line, sizeof(line), file))
+    {
+        const size_t line_size = strlen(line);
+        if (line_size == sizeof(line) - 1 && line[line_size - 1] != '\n') break;
+        const int parsed = tdb_parse_cgroup2_mountinfo_line(line, line_size, root, root_size,
+                                                            mountpoint, mountpoint_size);
+        if (parsed == 0)
+        {
+            result = 0;
+            break;
+        }
+        if (parsed < 0) break;
+    }
+    fclose(file);
+    return result;
+}
+
+static inline int tdb_linux_cgroup_memory_bounds(tdb_cgroup_memory_bounds_t *bounds)
+{
+    char cgroup[4096];
+    char group[4096];
+    char root[TDB_CGROUP_PATH_CAPACITY];
+    char mountpoint[TDB_CGROUP_PATH_CAPACITY];
+    char directory[TDB_CGROUP_PATH_CAPACITY];
+    if (tdb_read_small_text_file("/proc/self/cgroup", cgroup, sizeof(cgroup)) != 0 ||
+        tdb_parse_cgroup_v2_path(cgroup, group, sizeof(group)) != 0 ||
+        tdb_linux_cgroup2_mount(root, sizeof(root), mountpoint, sizeof(mountpoint)) != 0 ||
+        tdb_resolve_cgroup2_directory(mountpoint, root, group, directory, sizeof(directory)) != 0)
+        return -1;
+    return tdb_cgroup_memory_bounds_at(mountpoint, directory, bounds);
+}
+#endif
+
 /*
  * get_available_memory
  * gets available system memory in bytes
@@ -2384,32 +2751,36 @@ static inline size_t get_available_memory(void)
      * buffers/cache + reclaimable slab). sysinfo.freeram only reports truly free
      * pages which is typically very low on a busy system and triggers false
      * critical memory pressure */
+    size_t available = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f)
     {
-        FILE *f = fopen("/proc/meminfo", "r");
-        if (f)
+        char line[256];
+        while (fgets(line, sizeof(line), f))
         {
-            char line[256];
-            while (fgets(line, sizeof(line), f))
+            unsigned long long val;
+            if (sscanf(line, "MemAvailable: %llu kB", &val) == 1)
             {
-                unsigned long long val;
-                if (sscanf(line, "MemAvailable: %llu kB", &val) == 1)
-                {
-                    fclose(f);
-                    return (size_t)(val * 1024ULL);
-                }
+                available = (size_t)(val * 1024ULL);
+                break;
             }
-            fclose(f);
         }
+        fclose(f);
     }
     /* fallback to sysinfo.freeram if /proc/meminfo is unavailable */
+    if (available == 0)
     {
         struct sysinfo si;
         if (sysinfo(&si) == 0)
         {
-            return (size_t)si.freeram * (size_t)si.mem_unit;
+            available = (size_t)si.freeram * (size_t)si.mem_unit;
         }
     }
-    return 0;
+
+    tdb_cgroup_memory_bounds_t bounds;
+    if (tdb_linux_cgroup_memory_bounds(&bounds) != 0) return available;
+    return tdb_cgroup_effective_available(available, bounds.limit_state, bounds.available_state,
+                                          bounds.available);
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
     /* BSD systems use sysctl.. */
     unsigned long free_pages = 0;
@@ -2484,7 +2855,10 @@ static inline size_t get_total_memory(void)
     struct sysinfo si;
     if (sysinfo(&si) == 0)
     {
-        return (size_t)si.totalram * (size_t)si.mem_unit;
+        const size_t total = (size_t)si.totalram * (size_t)si.mem_unit;
+        tdb_cgroup_memory_bounds_t bounds;
+        if (tdb_linux_cgroup_memory_bounds(&bounds) != 0) return total;
+        return tdb_cgroup_effective_total(total, bounds.limit_state, bounds.limit);
     }
     return 0;
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)

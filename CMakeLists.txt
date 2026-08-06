@@ -704,6 +704,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
+    add_executable(compat_tests test/compat__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)
     add_executable(compress_tests test/compress__tests.c)
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
@@ -789,7 +790,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # add include and link directories for test executables
     set(TIDESDB_TEST_LINK_TARGETS
-            block_manager_tests skip_list_tests compress_tests bloom_filter_tests
+            block_manager_tests compat_tests skip_list_tests compress_tests bloom_filter_tests
             manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests
             objstore_tests tidesdb_tests tidesdb_bench)
     if(TIDESDB_WITH_S3)
@@ -801,6 +802,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     endforeach()
 
     add_test(NAME block_manager_tests COMMAND block_manager_tests)
+    add_test(NAME compat_tests COMMAND compat_tests)
     add_test(NAME skip_list_tests COMMAND skip_list_tests)
     add_test(NAME compress_tests COMMAND compress_tests)
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)

@@ -7510,7 +7510,7 @@ static void tidesdb_imm_snap_publish_locked(tidesdb_column_family_t *cf)
     for (size_t i = 0; i < raw; i++)
     {
         tidesdb_memtable_t *m = next->items[i];
-        if (m && m->skip_list) imm_bytes += (int64_t)skip_list_get_size(m->skip_list);
+        if (m && m->skip_list) imm_bytes += (int64_t)skip_list_get_resident_size(m->skip_list);
         if (m && atomic_load_explicit(&m->flushed, memory_order_acquire)) continue;
         next->items[count++] = m;
     }
@@ -20054,7 +20054,7 @@ static void *tidesdb_reaper_thread(void *arg)
                 {
                     if (mt->skip_list)
                     {
-                        size_t mt_size = skip_list_get_size(mt->skip_list);
+                        size_t mt_size = skip_list_get_resident_size(mt->skip_list);
                         total_mem_bytes += (int64_t)mt_size;
                         if (mt_size > flush_victim_size &&
                             !atomic_load_explicit(&cf->is_flushing, memory_order_relaxed))
@@ -20114,7 +20114,7 @@ static void *tidesdb_reaper_thread(void *arg)
                     atomic_load_explicit(&db->unified_mt.active, memory_order_acquire);
                 if (umt && umt->skip_list)
                 {
-                    total_mem_bytes += (int64_t)skip_list_get_size(umt->skip_list);
+                    total_mem_bytes += (int64_t)skip_list_get_resident_size(umt->skip_list);
                 }
 
                 /* we sum each immutable's actual skip list size. a flushed
@@ -20129,7 +20129,8 @@ static void *tidesdb_reaper_thread(void *arg)
                     {
                         tidesdb_memtable_t *uimm = (tidesdb_memtable_t *)n->data;
                         if (uimm && uimm->skip_list)
-                            total_mem_bytes += (int64_t)skip_list_get_size(uimm->skip_list);
+                            total_mem_bytes +=
+                                (int64_t)skip_list_get_resident_size(uimm->skip_list);
                     }
                     pthread_rwlock_unlock(&uimm_q->read_lock);
                 }
@@ -20245,7 +20246,7 @@ static void *tidesdb_reaper_thread(void *arg)
                         if (tidesdb_active_memtable_try_ref(&victim->active_mt_readers,
                                                             &victim->active_memtable, &vmt))
                         {
-                            if (vmt->skip_list) vsize = skip_list_get_size(vmt->skip_list);
+                            if (vmt->skip_list) vsize = skip_list_get_resident_size(vmt->skip_list);
                             tidesdb_immutable_memtable_unref(vmt);
                         }
                         if (vsize == 0) continue;
@@ -24307,7 +24308,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
 
     tidesdb_memtable_t *old_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     skip_list_t *old_memtable = old_mt ? old_mt->skip_list : NULL;
-    size_t current_size = old_memtable ? (size_t)skip_list_get_size(old_memtable) : 0;
+    size_t current_size = old_memtable ? skip_list_get_resident_size(old_memtable) : 0;
     int current_entries = old_memtable ? skip_list_count_entries(old_memtable) : 0;
 
     if (current_entries == 0)
@@ -25103,7 +25104,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         tidesdb_memtable_t *amt = NULL;
         if (tidesdb_active_memtable_try_ref(&cf->active_mt_readers, &cf->active_memtable, &amt))
         {
-            if (amt->skip_list) active_size = (size_t)skip_list_get_size(amt->skip_list);
+            if (amt->skip_list) active_size = skip_list_get_resident_size(amt->skip_list);
             tidesdb_immutable_memtable_unref(amt);
         }
         const size_t ramp_lo = (size_t)((double)ceiling * TDB_BACKPRESSURE_RAMP_LO_RATIO);
@@ -25145,7 +25146,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                                                     &cur_amt))
                 {
                     if (cur_amt->skip_list)
-                        cur_size = (size_t)skip_list_get_size(cur_amt->skip_list);
+                        cur_size = skip_list_get_resident_size(cur_amt->skip_list);
                     tidesdb_immutable_memtable_unref(cur_amt);
                 }
                 if (cur_size < ceiling) break;
@@ -25195,7 +25196,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
         if (tidesdb_active_memtable_try_ref(&cf->db->unified_mt.active_mt_readers,
                                             &cf->db->unified_mt.active, &umt))
         {
-            if (umt->skip_list) u_size = (size_t)skip_list_get_size(umt->skip_list);
+            if (umt->skip_list) u_size = skip_list_get_resident_size(umt->skip_list);
             tidesdb_immutable_memtable_unref(umt);
         }
         const size_t u_ramp_lo = (size_t)((double)u_ceiling * TDB_BACKPRESSURE_RAMP_LO_RATIO);
@@ -25239,7 +25240,7 @@ static int tidesdb_apply_backpressure(tidesdb_column_family_t *cf)
                                                     &cf->db->unified_mt.active, &cur_umt))
                 {
                     if (cur_umt->skip_list)
-                        cur_size = (size_t)skip_list_get_size(cur_umt->skip_list);
+                        cur_size = skip_list_get_resident_size(cur_umt->skip_list);
                     tidesdb_immutable_memtable_unref(cur_umt);
                 }
                 if (cur_size < u_ceiling) break;
@@ -29128,7 +29129,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 
         /* we check if unified memtable needs rotation */
-        const size_t umt_size = (size_t)skip_list_get_size(umt->skip_list);
+        const size_t umt_size = skip_list_get_resident_size(umt->skip_list);
         atomic_fetch_sub_explicit(&umt->writers, 1, memory_order_release);
         atomic_fetch_sub_explicit(&umt->refcount, 1, memory_order_release);
 
@@ -29376,7 +29377,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
-        const size_t memtable_size = (size_t)skip_list_get_size(memtable);
+        const size_t memtable_size = skip_list_get_resident_size(memtable);
 
         /****** we use adaptive flush headroom based on L0 queue pressure and global memory pressure
          *****  idle (queue empty)              50% headroom for max batching

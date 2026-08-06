@@ -31,6 +31,11 @@ static int tests_failed = 0;
 #define NODE_IS_DELETED(node) \
     (VERSION_IS_DELETED(atomic_load_explicit(&(node)->versions, memory_order_acquire)))
 
+static size_t aligned_resident_size(const size_t size)
+{
+    return (size + (SKIP_LIST_ARENA_ALIGNMENT - 1)) & ~(size_t)(SKIP_LIST_ARENA_ALIGNMENT - 1);
+}
+
 void test_skip_list_create_node()
 {
     uint8_t key[] = "test_key";
@@ -102,6 +107,7 @@ void test_skip_list_clear()
     int result = skip_list_clear(list);
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(skip_list_count_entries(list) == 0);
+    ASSERT_EQ(skip_list_get_resident_size(list), (size_t)0);
     (void)skip_list_free(list);
 }
 
@@ -912,9 +918,17 @@ void test_skip_list_duplicate_key_update()
 
     /* insert first value */
     ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value1, sizeof(value1), -1, 1, 0), 0);
+    const size_t first_logical_size = skip_list_get_size(list);
+    const size_t first_resident_size = skip_list_get_resident_size(list);
 
     /* insert second value with same key (LSM tree allows duplicates) */
     ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value2, sizeof(value2), -1, 2, 0), 0);
+
+    /* logical stats describe the newest value while resident bytes include both MVCC versions */
+    ASSERT_EQ(skip_list_get_size(list), first_logical_size - sizeof(value1) + sizeof(value2));
+    ASSERT_EQ(
+        skip_list_get_resident_size(list),
+        first_resident_size + aligned_resident_size(sizeof(skip_list_version_t) + sizeof(value2)));
 
     /* verify we get the first matching value (search finds first occurrence) */
     uint8_t *retrieved_value = NULL;
@@ -935,6 +949,125 @@ void test_skip_list_duplicate_key_update()
     ASSERT_EQ(skip_list_count_entries(list), 1);
 
     free(retrieved_value);
+    skip_list_free(list);
+}
+
+void test_skip_list_zero_byte_and_tombstone_resident_size()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t key[] = "resident_key";
+    uint8_t value[] = "value";
+    uint8_t empty = 0;
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+
+    const size_t version_header = aligned_resident_size(sizeof(skip_list_version_t));
+    size_t resident = skip_list_get_resident_size(list);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), &empty, 0, -1, 2, 0), 0);
+    ASSERT_EQ(skip_list_get_resident_size(list), resident + version_header);
+    ASSERT_EQ(skip_list_get_size(list), sizeof(key));
+
+    resident = skip_list_get_resident_size(list);
+    ASSERT_EQ(skip_list_delete(list, key, sizeof(key), 3), 0);
+    ASSERT_EQ(skip_list_delete(list, key, sizeof(key), 4), 0);
+    ASSERT_EQ(skip_list_get_resident_size(list), resident + 2 * version_header);
+    ASSERT_EQ(skip_list_get_size(list), sizeof(key));
+
+    skip_list_free(list);
+}
+
+void test_skip_list_resident_size_overflow()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t byte = 0;
+    ASSERT_EQ(skip_list_put_with_seq(list, &byte, SIZE_MAX, &byte, 1, -1, 1, 0), -1);
+    ASSERT_EQ(skip_list_put_with_seq(list, &byte, 1, &byte, SIZE_MAX, -1, 2, 0), -1);
+    ASSERT_EQ(skip_list_get_size(list), (size_t)0);
+    ASSERT_EQ(skip_list_get_resident_size(list), (size_t)0);
+    ASSERT_EQ(skip_list_count_entries(list), 0);
+
+    skip_list_free(list);
+}
+
+typedef struct
+{
+    skip_list_t *list;
+    _Atomic(uint64_t) *sequence;
+    int operations;
+    int completed;
+} resident_writer_ctx_t;
+
+static void *resident_writer(void *arg)
+{
+    resident_writer_ctx_t *ctx = (resident_writer_ctx_t *)arg;
+    const uint8_t key[] = "contended_key";
+    const uint8_t value[16] = {0};
+
+    for (int i = 0; i < ctx->operations; i++)
+    {
+        const uint64_t seq = atomic_fetch_add_explicit(ctx->sequence, 1, memory_order_relaxed) + 2;
+        if (skip_list_put_with_seq(ctx->list, key, sizeof(key), value, sizeof(value), -1, seq, 0) !=
+            0)
+            return NULL;
+        ctx->completed++;
+    }
+    return NULL;
+}
+
+void test_skip_list_contended_duplicate_resident_accounting()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.25f, skip_list_comparator_memcmp, NULL, NULL,
+                                       1024 * 1024),
+              0);
+
+    const uint8_t key[] = "contended_key";
+    const uint8_t value[16] = {0};
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+    const size_t resident_before = skip_list_get_resident_size(list);
+
+    enum
+    {
+        writer_count = 8,
+        operations_per_writer = 512
+    };
+    pthread_t writers[writer_count];
+    resident_writer_ctx_t contexts[writer_count];
+    _Atomic(uint64_t) sequence = 0;
+
+    for (int i = 0; i < writer_count; i++)
+    {
+        contexts[i] = (resident_writer_ctx_t){list, &sequence, operations_per_writer, 0};
+        ASSERT_EQ(pthread_create(&writers[i], NULL, resident_writer, &contexts[i]), 0);
+    }
+
+    int completed = 0;
+    for (int i = 0; i < writer_count; i++)
+    {
+        ASSERT_EQ(pthread_join(writers[i], NULL), 0);
+        completed += contexts[i].completed;
+    }
+    ASSERT_EQ(completed, writer_count * operations_per_writer);
+
+    const size_t version_size = aligned_resident_size(sizeof(skip_list_version_t) + sizeof(value));
+    ASSERT_EQ(skip_list_get_resident_size(list),
+              resident_before + (size_t)completed * version_size);
+
+    size_t arena_used = 0;
+    skip_list_arena_block_t *block =
+        atomic_load_explicit(&list->arena->all_blocks_head, memory_order_acquire);
+    while (block != NULL)
+    {
+        const size_t used = atomic_load_explicit(&block->used, memory_order_relaxed);
+        ASSERT_TRUE(used <= block->capacity);
+        arena_used += used;
+        block = block->prev;
+    }
+    ASSERT_EQ(skip_list_get_resident_size(list), arena_used);
+
     skip_list_free(list);
 }
 
@@ -2292,6 +2425,27 @@ void test_skip_list_arena_put_get()
     skip_list_free(list);
 }
 
+void test_skip_list_arena_clear_retains_resident_size()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
+                                       1024 * 1024),
+              0);
+
+    const uint8_t key[] = "arena_clear";
+    const uint8_t value[] = "value";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+    const size_t retained = skip_list_get_resident_size(list);
+    ASSERT_TRUE(retained > 0);
+
+    ASSERT_EQ(skip_list_clear(list), 0);
+    ASSERT_EQ(skip_list_count_entries(list), 0);
+    ASSERT_EQ(skip_list_get_size(list), (size_t)0);
+    ASSERT_EQ(skip_list_get_resident_size(list), retained);
+
+    skip_list_free(list);
+}
+
 void test_skip_list_arena_batch()
 {
     /* test batch put with arena-backed skip list */
@@ -3466,6 +3620,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
     RUN_TEST(test_skip_list_large_value_updates, tests_passed);
     RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
+    RUN_TEST(test_skip_list_zero_byte_and_tombstone_resident_size, tests_passed);
+    RUN_TEST(test_skip_list_resident_size_overflow, tests_passed);
+    RUN_TEST(test_skip_list_contended_duplicate_resident_accounting, tests_passed);
     RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
     RUN_TEST(test_skip_list_concurrent_duplicate_keys, tests_passed);
@@ -3475,6 +3632,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_put_batch, tests_passed);
     RUN_TEST(test_skip_list_put_batch_sorted, tests_passed);
     RUN_TEST(test_skip_list_arena_put_get, tests_passed);
+    RUN_TEST(test_skip_list_arena_clear_retains_resident_size, tests_passed);
     RUN_TEST(test_skip_list_arena_batch, tests_passed);
     RUN_TEST(test_skip_list_arena_cursor, tests_passed);
     RUN_TEST(test_skip_list_arena_delete, tests_passed);

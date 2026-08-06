@@ -165,6 +165,7 @@ static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
 static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
 {
     /* align up to SKIP_LIST_ARENA_ALIGNMENT */
+    if (size == 0 || size > SIZE_MAX - (SKIP_LIST_ARENA_ALIGNMENT - 1)) return NULL;
     size = (size + (SKIP_LIST_ARENA_ALIGNMENT - 1)) & ~(size_t)(SKIP_LIST_ARENA_ALIGNMENT - 1);
 
     int slot = skip_list_arena_get_slot(arena);
@@ -264,13 +265,23 @@ static void skip_list_arena_destroy(skip_list_arena_t *arena)
  * @param size number of bytes
  * @return pointer to memory, or NULL on failure
  */
-static inline void *skip_list_alloc(const skip_list_t *list, size_t size)
+static inline size_t skip_list_allocation_size(const size_t size)
 {
-    if (list != NULL && list->arena != NULL)
-    {
-        return skip_list_arena_alloc(list->arena, size);
-    }
-    return malloc(size);
+    if (size == 0 || size > SIZE_MAX - (SKIP_LIST_ARENA_ALIGNMENT - 1)) return 0;
+    return (size + (SKIP_LIST_ARENA_ALIGNMENT - 1)) & ~(size_t)(SKIP_LIST_ARENA_ALIGNMENT - 1);
+}
+
+static inline void *skip_list_alloc(skip_list_t *list, const size_t size)
+{
+    const size_t allocation_size = skip_list_allocation_size(size);
+    if (allocation_size == 0) return NULL;
+
+    void *allocation = list != NULL && list->arena != NULL
+                           ? skip_list_arena_alloc(list->arena, allocation_size)
+                           : malloc(allocation_size);
+    if (allocation != NULL && list != NULL)
+        atomic_fetch_add_explicit(&list->resident_size, allocation_size, memory_order_relaxed);
+    return allocation;
 }
 
 /**
@@ -278,11 +289,29 @@ static inline void *skip_list_alloc(const skip_list_t *list, size_t size)
  * frees memory -- no-op when arena is active (bulk free on arena destroy)
  * @param list skip list (used to check for arena)
  * @param ptr pointer to free
+ * @param size requested allocation size
  */
-static inline void skip_list_dealloc(const skip_list_t *list, void *ptr)
+static inline void skip_list_dealloc(skip_list_t *list, void *ptr, const size_t size)
 {
-    if (list != NULL && list->arena != NULL) return; /* no-op */
+    if (ptr == NULL || (list != NULL && list->arena != NULL)) return; /* no-op */
     free(ptr);
+    if (list != NULL)
+        atomic_fetch_sub_explicit(&list->resident_size, skip_list_allocation_size(size),
+                                  memory_order_relaxed);
+}
+
+static inline int skip_list_node_allocation_size(const int level, const size_t key_size,
+                                                 size_t *pointers_size, size_t *allocation_size)
+{
+    if (level < 0 || !pointers_size || !allocation_size) return -1;
+    const size_t levels = (size_t)level + 1;
+    if (levels > SIZE_MAX / (2 * sizeof(_Atomic(skip_list_node_t *)))) return -1;
+    *pointers_size = levels * 2 * sizeof(_Atomic(skip_list_node_t *));
+    if (*pointers_size > SIZE_MAX - sizeof(skip_list_node_t) ||
+        key_size > SIZE_MAX - sizeof(skip_list_node_t) - *pointers_size)
+        return -1;
+    *allocation_size = sizeof(skip_list_node_t) + *pointers_size + key_size;
+    return 0;
 }
 
 /**
@@ -467,7 +496,7 @@ static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_
  * @param list skip list (used to check for arena)
  * @param version version to free
  */
-static void skip_list_free_version(const skip_list_t *list, skip_list_version_t *version);
+static void skip_list_free_version(skip_list_t *list, skip_list_version_t *version);
 
 /**
  * skip_list_compare_keys_with_type
@@ -607,7 +636,7 @@ static int skip_list_insert_version_cas(_Atomic(skip_list_version_t *) *versions
             if (atomic_compare_exchange_weak_explicit(versions_ptr, &old_head, new_version,
                                                       memory_order_release, memory_order_acquire))
             {
-                /* head prepend succeeded -- update total_size, subtract old head, add new */
+                /* head prepend succeeded -- update logical total_size to the new head value */
                 if (old_head && old_head->value_size > 0)
                 {
                     atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
@@ -723,14 +752,15 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
  * @param seq sequence number for MVCC
  * @return pointer to new version, NULL on failure
  */
-static skip_list_version_t *skip_list_create_version(const skip_list_t *list, const uint8_t *value,
+static skip_list_version_t *skip_list_create_version(skip_list_t *list, const uint8_t *value,
                                                      const size_t value_size, const int64_t ttl,
                                                      const uint8_t flags, uint64_t seq)
 {
     /* we combine version struct + value data into a single allocation
      * this halves malloc calls and improves cache locality */
-    const size_t alloc_size =
-        sizeof(skip_list_version_t) + ((value != NULL && value_size > 0) ? value_size : 0);
+    const size_t payload_size = value != NULL && value_size > 0 ? value_size : 0;
+    if (payload_size > SIZE_MAX - sizeof(skip_list_version_t)) return NULL;
+    const size_t alloc_size = sizeof(skip_list_version_t) + payload_size;
     skip_list_version_t *version = (skip_list_version_t *)skip_list_alloc(list, alloc_size);
     if (version == NULL) return NULL;
 
@@ -759,11 +789,11 @@ static skip_list_version_t *skip_list_create_version(const skip_list_t *list, co
  * @param list skip list (for arena deallocation)
  * @param version version to free
  */
-static void skip_list_free_version(const skip_list_t *list, skip_list_version_t *version)
+static void skip_list_free_version(skip_list_t *list, skip_list_version_t *version)
 {
     if (version == NULL) return;
     /* value is embedded in same allocation as version struct -- single free */
-    skip_list_dealloc(list, version);
+    skip_list_dealloc(list, version, sizeof(skip_list_version_t) + version->value_size);
 }
 
 /**
@@ -772,7 +802,7 @@ static void skip_list_free_version(const skip_list_t *list, skip_list_version_t 
  * @param list skip list (for arena deallocation)
  * @param head head of version list
  */
-static void skip_list_free_version_list(const skip_list_t *list, skip_list_version_t *head)
+static void skip_list_free_version_list(skip_list_t *list, skip_list_version_t *head)
 {
     while (head != NULL)
     {
@@ -790,8 +820,11 @@ static void skip_list_free_version_list(const skip_list_t *list, skip_list_versi
  */
 static skip_list_node_t *skip_list_create_sentinel(const int level)
 {
-    size_t pointers_size = (level + 1) * 2 * sizeof(_Atomic(skip_list_node_t *));
-    skip_list_node_t *node = (skip_list_node_t *)malloc(sizeof(skip_list_node_t) + pointers_size);
+    size_t pointers_size;
+    size_t allocation_size;
+    if (skip_list_node_allocation_size(level, 0, &pointers_size, &allocation_size) != 0)
+        return NULL;
+    skip_list_node_t *node = (skip_list_node_t *)malloc(allocation_size);
     if (node == NULL) return NULL;
 
     node->key = NULL;
@@ -817,9 +850,11 @@ skip_list_node_t *skip_list_create_node(const int level, const uint8_t *key, siz
 
     /* we combine node struct + forward/backward pointers + key into a single allocation
      * this eliminates one malloc per node and co-locates key data for cache locality */
-    size_t pointers_size = (level + 1) * 2 * sizeof(_Atomic(skip_list_node_t *));
-    skip_list_node_t *node =
-        (skip_list_node_t *)malloc(sizeof(skip_list_node_t) + pointers_size + key_size);
+    size_t pointers_size;
+    size_t allocation_size;
+    if (skip_list_node_allocation_size(level, key_size, &pointers_size, &allocation_size) != 0)
+        return NULL;
+    skip_list_node_t *node = (skip_list_node_t *)malloc(allocation_size);
     if (node == NULL) return NULL;
 
     node->key = (uint8_t *)node + sizeof(skip_list_node_t) + pointers_size;
@@ -859,13 +894,18 @@ skip_list_node_t *skip_list_create_node(const int level, const uint8_t *key, siz
  * skip_list_free_node_internal
  * arena-aware node free -- simply no-op when arena is active
  */
-static int skip_list_free_node_internal(const skip_list_t *list, skip_list_node_t *node)
+static int skip_list_free_node_internal(skip_list_t *list, skip_list_node_t *node)
 {
     if (node == NULL) return -1;
     skip_list_version_t *versions = atomic_load_explicit(&node->versions, memory_order_acquire);
     skip_list_free_version_list(list, versions);
     /* key is embedded in same allocation as node -- single free */
-    skip_list_dealloc(list, node);
+    size_t pointers_size;
+    size_t allocation_size;
+    if (skip_list_node_allocation_size(node->level, node->key_size, &pointers_size,
+                                       &allocation_size) != 0)
+        return -1;
+    skip_list_dealloc(list, node, allocation_size);
     return 0;
 }
 
@@ -941,6 +981,7 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int 
     }
 
     atomic_init(&new_list->total_size, 0);
+    atomic_init(&new_list->resident_size, 0);
     atomic_init(&new_list->entry_count, 0);
     atomic_init(&new_list->min_seq, UINT64_MAX);
 
@@ -1360,7 +1401,7 @@ int skip_list_clear(skip_list_t *list)
         {
             skip_list_node_t *next =
                 atomic_load_explicit(&current->forward[0], memory_order_acquire);
-            skip_list_free_node(current);
+            skip_list_free_node_internal(list, current);
             current = next;
         }
     }
@@ -1415,6 +1456,12 @@ size_t skip_list_get_size(skip_list_t *list)
 {
     if (list == NULL) return 0;
     return atomic_load_explicit(&list->total_size, memory_order_acquire);
+}
+
+size_t skip_list_get_resident_size(skip_list_t *list)
+{
+    if (list == NULL) return 0;
+    return atomic_load_explicit(&list->resident_size, memory_order_acquire);
 }
 
 int skip_list_count_entries(skip_list_t *list)
@@ -2125,9 +2172,15 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     }
 
     /* we combine node + pointers + key into single allocation for cache locality */
-    const size_t pointers_size = (2 * (new_level + 1)) * sizeof(_Atomic(skip_list_node_t *));
-    skip_list_node_t *new_node =
-        skip_list_alloc(list, sizeof(skip_list_node_t) + pointers_size + key_size);
+    size_t pointers_size;
+    size_t node_allocation_size;
+    if (skip_list_node_allocation_size(new_level, key_size, &pointers_size,
+                                       &node_allocation_size) != 0)
+    {
+        if (!use_stack) free(update);
+        return -1;
+    }
+    skip_list_node_t *new_node = skip_list_alloc(list, node_allocation_size);
     if (new_node == NULL)
     {
         if (!use_stack) free(update);
@@ -2144,7 +2197,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         skip_list_create_version(list, value, value_size, ttl, flags, seq);
     if (initial_version == NULL)
     {
-        skip_list_dealloc(list, new_node);
+        skip_list_dealloc(list, new_node, node_allocation_size);
         if (!use_stack) free(update);
         return -1;
     }
@@ -2481,9 +2534,12 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         }
 
         /* we combine node + pointers + key into single allocation for cache locality */
-        const size_t batch_ptrs_size = (2 * (new_level + 1)) * sizeof(_Atomic(skip_list_node_t *));
-        skip_list_node_t *new_node =
-            skip_list_alloc(list, sizeof(skip_list_node_t) + batch_ptrs_size + entry->key_size);
+        size_t batch_ptrs_size;
+        size_t node_allocation_size;
+        if (skip_list_node_allocation_size(new_level, entry->key_size, &batch_ptrs_size,
+                                           &node_allocation_size) != 0)
+            continue;
+        skip_list_node_t *new_node = skip_list_alloc(list, node_allocation_size);
         if (new_node == NULL)
         {
             continue;
@@ -2499,7 +2555,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
             list, entry->value, entry->value_size, entry->ttl, entry->flags, entry->seq);
         if (initial_version == NULL)
         {
-            skip_list_dealloc(list, new_node);
+            skip_list_dealloc(list, new_node, node_allocation_size);
             continue;
         }
         atomic_init(&new_node->versions, initial_version);

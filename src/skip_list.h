@@ -190,7 +190,8 @@ struct skip_list_node_t
  * @param probability probability for level generation
  * @param header sentinel header node (compares less than all keys)
  * @param tail sentinel tail node (compares greater than all keys)
- * @param total_size total size of all entries
+ * @param total_size logical size of all entries
+ * @param resident_size aligned bytes retained by node and version allocations
  * @param entry_count track entry count atomically to avoid O(n) traversals
  * @param cmp_type comparator type enum (memcmp, string, numeric, custom)
  * @param comparator key comparison function
@@ -206,6 +207,7 @@ typedef struct skip_list_t
     _Atomic(skip_list_node_t *) header;
     _Atomic(skip_list_node_t *) tail;
     _Atomic(size_t) total_size;
+    _Atomic(size_t) resident_size;
     _Atomic(int) entry_count;
     skip_list_cmp_type_t cmp_type;
     skip_list_comparator_fn comparator;
@@ -790,6 +792,14 @@ int skip_list_check_and_update_ttl(const skip_list_t *list, skip_list_node_t *no
  * @return total size in bytes
  */
 size_t skip_list_get_size(skip_list_t *list);
+
+/**
+ * skip_list_get_resident_size
+ * gets aligned bytes retained by node and version allocations
+ * @param list skip list
+ * @return retained size in bytes
+ */
+size_t skip_list_get_resident_size(skip_list_t *list);
 
 /**
  * skip_list_count_entries

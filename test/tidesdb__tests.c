@@ -2914,6 +2914,87 @@ static void test_iterator_next_prev_zigzag_multi_source(void)
     cleanup_test_dir();
 }
 
+static void test_repeated_overwrite_rotates_before_wal_growth(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.log_level = TDB_LOG_FATAL;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    ASSERT_EQ(tidesdb_create_column_family(db, "overwrite_cf", &cf_config), TDB_SUCCESS);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "overwrite_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const uint8_t key[] = "snapshot";
+    uint8_t value[1024];
+    for (int version = 0; version < 64; version++)
+    {
+        memset(value, version, sizeof(value));
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    for (int wait = 0; tidesdb_is_flushing(cf) && wait < 200; wait++)
+    {
+        usleep(10000);
+    }
+    ASSERT_FALSE(tidesdb_is_flushing(cf));
+
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    ASSERT_TRUE(stats->flush_count > 0);
+    tidesdb_free_stats(stats);
+
+    tidesdb_memtable_t *active = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    ASSERT_TRUE(active != NULL);
+    block_manager_t *active_wal = atomic_load_explicit(&active->wal, memory_order_acquire);
+    ASSERT_TRUE(active_wal != NULL);
+    const uint64_t active_wal_bytes =
+        atomic_load_explicit(&active_wal->current_file_size, memory_order_acquire);
+    ASSERT_TRUE(active_wal_bytes < cf_config.write_buffer_size * 4);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), TDB_SUCCESS);
+    ASSERT_EQ(retrieved_size, sizeof(value));
+    memset(value, 63, sizeof(value));
+    ASSERT_EQ(memcmp(retrieved, value, sizeof(value)), 0);
+    free(retrieved);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "overwrite_cf");
+    ASSERT_TRUE(cf != NULL);
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    retrieved = NULL;
+    retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), TDB_SUCCESS);
+    ASSERT_EQ(retrieved_size, sizeof(value));
+    ASSERT_EQ(memcmp(retrieved, value, sizeof(value)), 0);
+    free(retrieved);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
 static void test_amplification_counters_classic(void)
 {
     cleanup_test_dir();
@@ -32697,6 +32778,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_unified_rotation_no_read_visibility_gap, tests_passed);
     RUN_TEST(test_iterator_reverse_after_partial_forward_multi_source, tests_passed);
     RUN_TEST(test_iterator_next_prev_zigzag_multi_source, tests_passed);
+    RUN_TEST(test_repeated_overwrite_rotates_before_wal_growth, tests_passed);
     RUN_TEST(test_amplification_counters_classic, tests_passed);
     RUN_TEST(test_amplification_counters_unified, tests_passed);
     RUN_TEST(test_amplification_compaction_btree, tests_passed);

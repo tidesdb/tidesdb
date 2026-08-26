@@ -1,27 +1,19 @@
 /**
  *
- * Copyright (C) TidesDB
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
  *
- * Original Author: Alex Gaetano Padula
- *
- * Licensed under the Mozilla Public License, v. 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.mozilla.org/en-US/MPL/2.0/
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-
-#include "../src/skip_list.h"
+#include "../src/datastructures/skip_list/skip_list.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+/* a shared chunk pool the arena-backed test lists draw from */
+static arena_pool_t *g_arena_pool = NULL;
 
 #define BENCH_N 1000000 /* number of entries to write and retrieve */
 
@@ -132,15 +124,170 @@ void test_skip_list_get_size()
         printf(RED "Failed to create skip list\n" RESET);
         return;
     }
-    ASSERT_TRUE(skip_list_get_size(list) == 0);
+    ASSERT_TRUE(skip_list_get_data_bytes(list) == 0);
+    ASSERT_TRUE(skip_list_get_memory_bytes(list) == 0);
 
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
     ASSERT_TRUE(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0) ==
                 0);
-    ASSERT_TRUE(skip_list_get_size(list) > 0);
+
+    /* the data counter is exactly the bytes handed in, and the memory counter is larger because
+     * the node, its two pointer arrays and the version struct are resident too */
+    ASSERT_EQ((int)skip_list_get_data_bytes(list), (int)(sizeof(key) + sizeof(value)));
+    ASSERT_TRUE(skip_list_get_memory_bytes(list) > skip_list_get_data_bytes(list));
 
     (void)skip_list_free(list);
+}
+
+/* the memtable's rotation threshold is a memory budget, so what it reads has to be the memory an
+ * entry occupies rather than the key and value bytes alone. at the entry sizes a memtable actually
+ * holds the difference is several times over, which is the whole reason the two are counted apart
+ */
+/* a value the caller already put in the value log is held as an id and a logical length. the
+ * version keeps no bytes, so every getter has to report the id or a reader sees an empty value
+ * where a large one belongs */
+void test_skip_list_reference_is_reported_by_every_getter(void)
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    const uint8_t key[] = "referenced";
+    const uint64_t id = 0x0123456789abcdefull;
+    const size_t logical = 4096;
+
+    ASSERT_EQ(skip_list_put_reference_with_seq(list, key, sizeof(key), id, logical, -1, 1, 0, NULL),
+              0);
+
+    /* the point read reports the id and the logical length, and hands back no bytes */
+    uint8_t *value = (uint8_t *)1;
+    size_t value_size = 0;
+    uint64_t got_id = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    uint64_t seq = 0;
+    ASSERT_EQ(skip_list_get_with_seq(list, key, sizeof(key), &value, &value_size, &got_id, &ttl,
+                                     &deleted, &seq, UINT64_MAX, NULL, NULL),
+              0);
+    ASSERT_TRUE(value == NULL);
+    ASSERT_EQ((int)value_size, (int)logical);
+    ASSERT_TRUE(got_id == id);
+    ASSERT_EQ((int)deleted, 0);
+    ASSERT_EQ((int)seq, 1);
+
+    /* and so does the cursor, which is what a flush and a scan read through */
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+    ASSERT_EQ(skip_list_cursor_goto_first(cursor), 0);
+    uint8_t *ckey = NULL, *cvalue = (uint8_t *)1;
+    size_t ckey_size = 0, cvalue_size = 0;
+    uint64_t cursor_id = 0, cseq = 0;
+    int64_t cttl = 0;
+    uint8_t cflags = 0;
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &ckey, &ckey_size, &cvalue, &cvalue_size,
+                                            &cursor_id, &cttl, &cflags, &cseq),
+              0);
+    ASSERT_TRUE(cvalue == NULL);
+    ASSERT_EQ((int)cvalue_size, (int)logical);
+    ASSERT_TRUE(cursor_id == id);
+    skip_list_cursor_free(cursor);
+
+    /* the getters with nowhere to report an id refuse rather than report an empty value */
+    uint8_t *plain = NULL;
+    size_t plain_size = 0;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &plain, &plain_size, &ttl, &deleted), -1);
+
+    skip_list_free(list);
+}
+
+/* a referenced version holds eight bytes of id where an inline one holds the value, so the memory
+ * a memtable of references occupies does not move with how large those values are. that is the
+ * whole point of separating them */
+void test_skip_list_reference_costs_an_id_not_a_value(void)
+{
+    skip_list_t *inline_list = NULL, *ref_list = NULL;
+    ASSERT_EQ(skip_list_new(&inline_list, 12, 0.24f), 0);
+    ASSERT_EQ(skip_list_new(&ref_list, 12, 0.24f), 0);
+
+    const int entries = 500;
+    const size_t logical = 4096;
+    uint8_t *big = malloc(logical);
+    ASSERT_TRUE(big != NULL);
+    memset(big, 'V', logical);
+
+    for (int i = 0; i < entries; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "k%08d", i);
+        const size_t ks = strlen(key);
+        ASSERT_EQ(skip_list_put_with_seq(inline_list, (uint8_t *)key, ks, big, logical, -1,
+                                         (uint64_t)(i + 1), 0),
+                  0);
+        ASSERT_EQ(skip_list_put_reference_with_seq(ref_list, (uint8_t *)key, ks, (uint64_t)(i + 1),
+                                                   logical, -1, (uint64_t)(i + 1), 0, NULL),
+                  0);
+    }
+    free(big);
+
+    /* both report the same logical data, since the value log holds the same bytes either way */
+    ASSERT_TRUE(skip_list_get_data_bytes(ref_list) == skip_list_get_data_bytes(inline_list));
+
+    /* but the referenced list occupies a small fraction of the memory, because it holds ids */
+    ASSERT_TRUE(skip_list_get_memory_bytes(ref_list) * 20 <
+                skip_list_get_memory_bytes(inline_list));
+
+    skip_list_free(inline_list);
+    skip_list_free(ref_list);
+}
+
+/* a reference to a tombstone points at bytes that were never written, so it is refused */
+void test_skip_list_reference_rejects_a_tombstone_and_a_zero_id(void)
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    const uint8_t key[] = "k";
+    ASSERT_EQ(skip_list_put_reference_with_seq(list, key, sizeof(key), 7, 10, -1, 1,
+                                               SKIP_LIST_FLAG_DELETED, NULL),
+              -1);
+    ASSERT_EQ(skip_list_put_reference_with_seq(list, key, sizeof(key), 0, 10, -1, 1, 0, NULL), -1);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_memory_bytes_counts_structural_overhead(void)
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    const int entries = 1000;
+    const uint8_t value[8] = {0};
+    for (int i = 0; i < entries; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "k%08d", i);
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                         sizeof(value), -1, (uint64_t)(i + 1), 0),
+                  0);
+    }
+
+    const size_t data = skip_list_get_data_bytes(list);
+    const size_t memory = skip_list_get_memory_bytes(list);
+
+    /* nine byte keys and eight byte values, so seventeen bytes of data an entry */
+    ASSERT_EQ((int)data, entries * 17);
+
+    /* a node header, two pointer arrays and a version struct are the bulk of an entry this small,
+     * so the memory a run of them occupies is several times the data in it. the exact multiple
+     * moves with the levels the coin flips hand out, which is why this is a floor rather than an
+     * equality */
+    ASSERT_TRUE(memory > data * 4);
+
+    /* and it cannot be unbounded either -- there is no per-entry allocation beyond the node and
+     * the one version */
+    ASSERT_TRUE(memory < data * 12);
+
+    skip_list_free(list);
 }
 
 void test_skip_list_cursor_init()
@@ -750,6 +897,113 @@ void *concurrent_writer(void *arg)
     return NULL;
 }
 
+/* how many keys the no-false-miss test seeds, and how many neighbours each writer splices around
+ * them; the writers' keys sort between the seeded ones, which is what puts nodes in the gap a
+ * lookup's level-0 walk has to cross */
+#define SL_MISS_SEEDED   64
+#define SL_MISS_WRITERS  4
+#define SL_MISS_READERS  4
+#define SL_MISS_READ_OPS 4000
+
+typedef struct
+{
+    skip_list_t *list;
+    _Atomic(int) *stop;
+    int id;
+    int misses;
+} sl_miss_ctx_t;
+
+/* look up only keys that were seeded before any writer started, so every one of them is present for
+ * the whole run and a NOT_FOUND is unambiguously a false miss rather than a race with a writer */
+static void *sl_miss_reader(void *arg)
+{
+    sl_miss_ctx_t *c = (sl_miss_ctx_t *)arg;
+    for (int i = 0; i < SL_MISS_READ_OPS; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "k%04d", i % SL_MISS_SEEDED);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+        int64_t ttl = 0;
+        const int rc = skip_list_get(c->list, (uint8_t *)key, strlen(key) + 1, &value, &value_size,
+                                     &ttl, &deleted);
+        if (rc != 0 || value == NULL)
+            c->misses++;
+        else
+            free(value);
+    }
+    atomic_store(c->stop, 1);
+    return NULL;
+}
+
+/* splice keys that sort strictly between the seeded ones, so each insert lands in the gap between a
+ * predecessor a reader's descent just settled on and the key it is looking for */
+static void *sl_miss_writer(void *arg)
+{
+    sl_miss_ctx_t *c = (sl_miss_ctx_t *)arg;
+    uint64_t seq = 1000 + (uint64_t)c->id * 100000;
+    for (int round = 0; !atomic_load(c->stop); round++)
+    {
+        for (int i = 0; i < SL_MISS_SEEDED; i++)
+        {
+            char key[48];
+            snprintf(key, sizeof(key), "k%04d.%d.%d", i, c->id, round);
+            const char *v = "x";
+            skip_list_put_with_seq(c->list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)v, 2, -1,
+                                   seq++, 0);
+        }
+        if (round > 64) break; /* bounded so the test cannot run away if a reader finishes early */
+    }
+    return NULL;
+}
+
+/* a key present before any writer ran must never read as absent, however many nodes are spliced in
+ * around it. this is a general guard on lookups under heavy splicing rather than a reproducer for
+ * the narrow window the level-0 walk protects -- reinstating a single-load hop still passes here,
+ * because landing an insert between a descent finishing and its next load takes an interleaving
+ * this cannot force. what it does catch is any coarser regression that makes a present key read
+ * absent while the list is being written */
+void test_skip_list_lookup_never_misses_a_present_key_under_splicing(void)
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    for (int i = 0; i < SL_MISS_SEEDED; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "k%04d", i);
+        const char *v = "seeded";
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)v, 7, -1,
+                                         (uint64_t)i + 1, 0),
+                  0);
+    }
+
+    _Atomic(int) stop;
+    atomic_init(&stop, 0);
+
+    pthread_t rt[SL_MISS_READERS], wt[SL_MISS_WRITERS];
+    sl_miss_ctx_t rc_ctx[SL_MISS_READERS], wc_ctx[SL_MISS_WRITERS];
+    for (int i = 0; i < SL_MISS_WRITERS; i++)
+    {
+        wc_ctx[i] = (sl_miss_ctx_t){list, &stop, i, 0};
+        ASSERT_EQ(pthread_create(&wt[i], NULL, sl_miss_writer, &wc_ctx[i]), 0);
+    }
+    for (int i = 0; i < SL_MISS_READERS; i++)
+    {
+        rc_ctx[i] = (sl_miss_ctx_t){list, &stop, i, 0};
+        ASSERT_EQ(pthread_create(&rt[i], NULL, sl_miss_reader, &rc_ctx[i]), 0);
+    }
+
+    for (int i = 0; i < SL_MISS_READERS; i++) pthread_join(rt[i], NULL);
+    atomic_store(&stop, 1);
+    for (int i = 0; i < SL_MISS_WRITERS; i++) pthread_join(wt[i], NULL);
+
+    for (int i = 0; i < SL_MISS_READERS; i++) ASSERT_EQ(rc_ctx[i].misses, 0);
+
+    skip_list_free(list);
+}
+
 void test_skip_list_concurrent_read_write()
 {
     skip_list_t *list = NULL;
@@ -821,6 +1075,138 @@ void test_skip_list_concurrent_read_write()
     free(writers);
     free(reader_ctx);
     free(writer_ctx);
+
+    skip_list_free(list);
+}
+
+/* the level-0 chain is spliced under a key comparison, but levels 1 and up are spliced blind at
+ * whatever predecessor the traversal captured before the level-0 insert. a concurrent insert
+ * landing between those two moments leaves the upper chain out of key order, and a search
+ * descending through it must still land on the right level-0 predecessor.
+ *
+ * the configuration is chosen to drive that path as hard as it can go -- a level probability near 1
+ * makes almost every node tall, so nearly every insert splices through the upper levels, and the
+ * readers run concurrently with the writers rather than after them, which is the shape a stale or
+ * missed read actually takes */
+#define SL_STRESS_PROBABILITY 0.9f
+#define SL_STRESS_MAX_LEVEL   16
+#define SL_STRESS_THREADS     8
+#define SL_STRESS_KEYS        600
+
+typedef struct
+{
+    skip_list_t *list;
+    int thread_id;
+    _Atomic(uint64_t) *shared_seq;
+    _Atomic(int) *missing;
+    _Atomic(int) *put_failures;
+    _Atomic(int) *miss_resolved;
+} sl_stress_ctx_t;
+
+/* insert this thread's keys and, after each one, read back an earlier key of its own -- a key it
+ * has already seen succeed, so a miss is a structural fault and not a visibility question */
+static void *sl_stress_worker(void *arg)
+{
+    sl_stress_ctx_t *ctx = (sl_stress_ctx_t *)arg;
+    for (int i = 0; i < SL_STRESS_KEYS; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "t%02d-k%05d", ctx->thread_id, i);
+        const uint64_t seq =
+            atomic_fetch_add_explicit(ctx->shared_seq, 1, memory_order_relaxed) + 1;
+        if (skip_list_put_with_seq(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1,
+                                   (uint8_t *)"v", 2, -1, seq, 0) != 0)
+            atomic_fetch_add_explicit(ctx->put_failures, 1, memory_order_relaxed);
+
+        char probe[32];
+        snprintf(probe, sizeof(probe), "t%02d-k%05d", ctx->thread_id, i / 2);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        if (skip_list_get(ctx->list, (uint8_t *)probe, strlen(probe) + 1, &value, &value_size, &ttl,
+                          &deleted) != 0)
+        {
+            atomic_fetch_add_explicit(ctx->missing, 1, memory_order_relaxed);
+            /* an immediate retry separates a descent that raced a concurrent link from a node that
+             * is genuinely not in the list at this instant */
+            int resolved = 0;
+            for (int r = 0; r < 100 && !resolved; r++)
+            {
+                uint8_t *v2 = NULL;
+                size_t vs2 = 0;
+                if (skip_list_get(ctx->list, (uint8_t *)probe, strlen(probe) + 1, &v2, &vs2, &ttl,
+                                  &deleted) == 0)
+                {
+                    free(v2);
+                    resolved = 1;
+                }
+            }
+            if (resolved) atomic_fetch_add_explicit(ctx->miss_resolved, 1, memory_order_relaxed);
+        }
+        else
+            free(value);
+    }
+    return NULL;
+}
+
+void test_skip_list_concurrent_disjoint_inserts_all_findable(void)
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, SL_STRESS_MAX_LEVEL, SL_STRESS_PROBABILITY), 0);
+
+    _Atomic(uint64_t) shared_seq;
+    atomic_init(&shared_seq, 0);
+    _Atomic(int) missing_during;
+    atomic_init(&missing_during, 0);
+    _Atomic(int) put_failures;
+    atomic_init(&put_failures, 0);
+    _Atomic(int) miss_resolved;
+    atomic_init(&miss_resolved, 0);
+
+    pthread_t threads[SL_STRESS_THREADS];
+    sl_stress_ctx_t ctx[SL_STRESS_THREADS];
+    for (int t = 0; t < SL_STRESS_THREADS; t++)
+    {
+        ctx[t].list = list;
+        ctx[t].thread_id = t;
+        ctx[t].shared_seq = &shared_seq;
+        ctx[t].missing = &missing_during;
+        ctx[t].put_failures = &put_failures;
+        ctx[t].miss_resolved = &miss_resolved;
+        ASSERT_EQ(pthread_create(&threads[t], NULL, sl_stress_worker, &ctx[t]), 0);
+    }
+    for (int t = 0; t < SL_STRESS_THREADS; t++) pthread_join(threads[t], NULL);
+
+    /* a write must not be dropped just because its position was contended */
+    ASSERT_EQ(atomic_load(&put_failures), 0);
+
+    if (atomic_load(&missing_during) != 0)
+        fprintf(stderr, "[diag] misses=%d resolved_on_retry=%d\n", atomic_load(&missing_during),
+                atomic_load(&miss_resolved));
+
+    /* a key that read back once must never stop reading back while other threads insert around it
+     */
+    ASSERT_EQ(atomic_load(&missing_during), 0);
+
+    /* and every key inserted must be present once the writers are done */
+    int missing = 0;
+    for (int t = 0; t < SL_STRESS_THREADS; t++)
+        for (int i = 0; i < SL_STRESS_KEYS; i++)
+        {
+            char key_buf[32];
+            snprintf(key_buf, sizeof(key_buf), "t%02d-k%05d", t, i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            int64_t ttl = 0;
+            uint8_t deleted = 0;
+            if (skip_list_get(list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value, &value_size,
+                              &ttl, &deleted) != 0)
+                missing++;
+            else
+                free(value);
+        }
+    ASSERT_EQ(missing, 0);
 
     skip_list_free(list);
 }
@@ -1919,70 +2305,6 @@ void test_skip_list_seek_for_prev_nonexistent()
     skip_list_free(list);
 }
 
-/* reverse comparator for testing */
-static int reverse_memcmp_comparator(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
-                                     size_t key2_size, void *ctx)
-{
-    (void)ctx;
-    size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    int result = memcmp(key1, key2, min_size);
-    if (result != 0) return -result;      /* negate to reverse */
-    if (key1_size < key2_size) return 1;  /* reverse shorter is greater */
-    if (key1_size > key2_size) return -1; /* reverse longer is smaller */
-    return 0;
-}
-
-void test_skip_list_reverse_comparator()
-{
-    skip_list_t *list = NULL;
-    ASSERT_EQ(skip_list_new_with_comparator(&list, 12, 0.25, reverse_memcmp_comparator, NULL), 0);
-    ASSERT_TRUE(list != NULL);
-
-    /* insert keys 0-9 */
-    for (int i = 0; i < 10; i++)
-    {
-        char key[32], value[32];
-        snprintf(key, sizeof(key), "key_%03d", i);
-        snprintf(value, sizeof(value), "value_%03d", i);
-        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                         strlen(value) + 1, -1, i + 1, 0),
-                  0);
-    }
-
-    /* iterate forward -- should get keys in reverse order (9, 8, 7, ..., 0) */
-    skip_list_cursor_t *cursor = NULL;
-    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
-    ASSERT_EQ(skip_list_cursor_goto_first(cursor), 0);
-
-    int expected = 9;
-    while (skip_list_cursor_valid(cursor))
-    {
-        uint8_t *key = NULL;
-        size_t key_size = 0;
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        int64_t ttl = 0;
-        uint8_t deleted = 0;
-
-        ASSERT_EQ(
-            skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted), 0);
-
-        char expected_key[32];
-        snprintf(expected_key, sizeof(expected_key), "key_%03d", expected);
-
-        printf("  Expected: %s, Got: %s\n", expected_key, (char *)key);
-        ASSERT_EQ(strcmp((char *)key, expected_key), 0);
-
-        expected--;
-        if (skip_list_cursor_next(cursor) != 0) break;
-    }
-
-    ASSERT_EQ(expected, -1); /* should have iterated through all 10 keys */
-
-    skip_list_cursor_free(cursor);
-    skip_list_free(list);
-}
-
 void test_skip_list_prefix_seek_behavior()
 {
     skip_list_t *list = NULL;
@@ -2268,9 +2590,7 @@ void test_skip_list_arena_put_get()
 {
     /* test basic put/get with arena-backed skip list */
     skip_list_t *list = NULL;
-    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
-                                       1024 * 1024),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, NULL, g_arena_pool), 0);
     ASSERT_TRUE(list != NULL);
     ASSERT_TRUE(list->arena != NULL);
 
@@ -2296,9 +2616,7 @@ void test_skip_list_arena_batch()
 {
     /* test batch put with arena-backed skip list */
     skip_list_t *list = NULL;
-    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
-                                       4 * 1024 * 1024),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, NULL, g_arena_pool), 0);
 
     const int batch_size = 1000;
     skip_list_batch_entry_t *entries = malloc(batch_size * sizeof(skip_list_batch_entry_t));
@@ -2361,9 +2679,7 @@ void test_skip_list_arena_cursor()
 {
     /* test cursor iteration with arena-backed skip list */
     skip_list_t *list = NULL;
-    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
-                                       1024 * 1024),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, NULL, g_arena_pool), 0);
 
     for (int i = 0; i < 100; i++)
     {
@@ -2396,9 +2712,7 @@ void test_skip_list_arena_delete()
 {
     /* test tombstone creation with arena-backed skip list */
     skip_list_t *list = NULL;
-    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
-                                       1024 * 1024),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, NULL, g_arena_pool), 0);
 
     uint8_t key[] = "delete_me";
     uint8_t value[] = "some_value";
@@ -2414,23 +2728,6 @@ void test_skip_list_arena_delete()
     uint8_t del = 0;
     ASSERT_EQ(skip_list_get(list, key, sizeof(key), &rv, &rvs, &ttl, &del), 0);
     ASSERT_EQ(del, 1);
-
-    skip_list_free(list);
-}
-
-void test_skip_list_arena_zero_capacity()
-{
-    /* arena_initial_capacity=0 should create a normal (non-arena) skip list */
-    skip_list_t *list = NULL;
-    ASSERT_EQ(
-        skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL, 0), 0);
-    ASSERT_TRUE(list != NULL);
-    ASSERT_TRUE(list->arena == NULL);
-
-    uint8_t key[] = "no_arena";
-    uint8_t value[] = "fallback";
-    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
-    ASSERT_EQ(skip_list_count_entries(list), 1);
 
     skip_list_free(list);
 }
@@ -2482,9 +2779,7 @@ void benchmark_skip_list_arena_vs_malloc()
 
     /* benchmark arena-backed skip list (write) */
     skip_list_t *list_arena = NULL;
-    size_t arena_size = (size_t)num_entries * (key_size + value_size + 128);
-    skip_list_new_with_arena(&list_arena, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
-                             arena_size);
+    skip_list_new_with_arena(&list_arena, 12, 0.24f, NULL, g_arena_pool);
 
     start = clock();
     for (int i = 0; i < num_entries; i++)
@@ -2641,23 +2936,23 @@ void test_skip_list_cursor_advance_in_node()
     uint64_t seq;
 
     /* head of kA is the newest version */
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
-                                            &deleted, &seq),
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, NULL,
+                                            &ttl, &deleted, &seq),
               0);
     ASSERT_TRUE(memcmp(key, ka, sizeof(ka)) == 0);
     ASSERT_EQ(seq, 9);
 
     /* advance through the chain -- seq 9 -> 5 -> 1 */
     ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
-                                            &deleted, &seq),
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, NULL,
+                                            &ttl, &deleted, &seq),
               0);
     ASSERT_TRUE(memcmp(key, ka, sizeof(ka)) == 0);
     ASSERT_EQ(seq, 5);
 
     ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
-                                            &deleted, &seq),
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, NULL,
+                                            &ttl, &deleted, &seq),
               0);
     ASSERT_TRUE(memcmp(key, ka, sizeof(ka)) == 0);
     ASSERT_EQ(seq, 1);
@@ -2667,8 +2962,8 @@ void test_skip_list_cursor_advance_in_node()
 
     /* moving to the next key resets the version pointer back to the head */
     ASSERT_EQ(skip_list_cursor_next(cursor), 0);
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
-                                            &deleted, &seq),
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, NULL,
+                                            &ttl, &deleted, &seq),
               0);
     ASSERT_TRUE(memcmp(key, kb, sizeof(kb)) == 0);
     ASSERT_EQ(seq, 3);
@@ -2738,11 +3033,7 @@ void test_skip_list_arena_aba()
     aba_ctx_t ctx = {0};
     ctx.sync_state = &sync_state;
 
-    size_t arena_cap = 16 * 1024 * 1024; /* 16MB */
-
-    ASSERT_EQ(skip_list_new_with_arena(&ctx.list1, 12, 0.25f, skip_list_comparator_memcmp, NULL,
-                                       NULL, arena_cap),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&ctx.list1, 12, 0.25f, NULL, g_arena_pool), 0);
     void *arena_1_ptr = ctx.list1->arena;
 
     pthread_t thread_a;
@@ -2754,9 +3045,7 @@ void test_skip_list_arena_aba()
 
     skip_list_free(ctx.list1);
 
-    ASSERT_EQ(skip_list_new_with_arena(&ctx.list2, 12, 0.25f, skip_list_comparator_memcmp, NULL,
-                                       NULL, arena_cap),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&ctx.list2, 12, 0.25f, NULL, g_arena_pool), 0);
     void *arena_2_ptr = ctx.list2->arena;
 
     if (arena_1_ptr != arena_2_ptr)
@@ -2965,9 +3254,7 @@ static void run_rw_contention_ratio(int num_readers, int num_writers, int ops_pe
     skip_list_t *list = NULL;
     if (use_arena)
     {
-        ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.25f, skip_list_comparator_memcmp, NULL,
-                                           NULL, 128 * 1024 * 1024),
-                  0);
+        ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.25f, NULL, g_arena_pool), 0);
     }
     else
     {
@@ -3135,6 +3422,72 @@ void test_skip_list_get_with_seq_ref()
     skip_list_free(list);
 }
 
+/* every version of a key stays resident until the whole list is freed, so each one has to stay
+ * counted. accounting a prepend as an overwrite made a repeatedly written key grow the chain
+ * without moving the reported size, and the memtable that reads this size to decide when to seal
+ * never did */
+void test_skip_list_size_counts_every_version()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    uint8_t key[] = "hot";
+    const uint8_t value[64] = {0};
+    const int versions = 200;
+
+    ASSERT_EQ(
+        skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)value, sizeof(value), -1, 1, 0),
+        0);
+    const size_t after_first = skip_list_get_memory_bytes(list);
+    ASSERT_TRUE(after_first >= sizeof(value));
+
+    for (uint64_t seq = 2; seq <= (uint64_t)versions; seq++)
+        ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)value, sizeof(value),
+                                         -1, seq, 0),
+                  0);
+
+    /* one key, many versions -- the size must reflect all of them, not just the newest */
+    const size_t after_all = skip_list_get_memory_bytes(list);
+    ASSERT_TRUE(after_all >= after_first + (size_t)(versions - 1) * sizeof(value));
+
+    skip_list_free(list);
+}
+
+/* a tombstone carries no value but is still a resident version, so it has to move the size the
+ * rotation threshold reads. accounting only value bytes made a repeatedly deleted key grow its
+ * chain for free, which is the same defect the put path had in a different disguise */
+void test_skip_list_size_counts_tombstone_versions()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    uint8_t key[] = "churn";
+    const uint8_t value[32] = {0};
+    const int cycles = 100;
+
+    ASSERT_EQ(
+        skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)value, sizeof(value), -1, 1, 0),
+        0);
+    const size_t after_first = skip_list_get_memory_bytes(list);
+
+    /* alternate tombstone and put on the one key, the shape a delete-heavy workload produces */
+    uint64_t seq = 2;
+    for (int i = 0; i < cycles; i++)
+    {
+        ASSERT_EQ(skip_list_delete(list, key, sizeof(key), seq++), 0);
+        ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), (uint8_t *)value, sizeof(value),
+                                         -1, seq++, 0),
+                  0);
+    }
+
+    /* every tombstone is an allocation, so the size must have grown by more than the puts alone */
+    const size_t after_churn = skip_list_get_memory_bytes(list);
+    const size_t puts_only = after_first + (size_t)cycles * sizeof(value);
+    ASSERT_TRUE(after_churn > puts_only);
+
+    skip_list_free(list);
+}
+
 void test_skip_list_out_of_order_versions()
 {
     skip_list_t *list = NULL;
@@ -3159,21 +3512,24 @@ void test_skip_list_out_of_order_versions()
     uint8_t deleted;
     uint64_t seq;
 
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, NULL, &ttl, &deleted, &seq),
+              0);
     ASSERT_EQ(seq, 10);
     ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, NULL, &ttl, &deleted, &seq),
+              0);
     ASSERT_EQ(seq, 6);
     ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), 0);
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vsz, NULL, &ttl, &deleted, &seq),
+              0);
     ASSERT_EQ(seq, 2);
     ASSERT_EQ(skip_list_cursor_advance_in_node(cursor), -1);
 
     /* a snapshot resolves to the right version across the reordered chain */
     uint8_t *val = NULL;
     size_t val_size = 0;
-    ASSERT_EQ(skip_list_get_with_seq(list, key, sizeof(key), &val, &val_size, &ttl, &deleted, &seq,
-                                     5, NULL, NULL),
+    ASSERT_EQ(skip_list_get_with_seq(list, key, sizeof(key), &val, &val_size, NULL, &ttl, &deleted,
+                                     &seq, 5, NULL, NULL),
               0);
     ASSERT_EQ(seq, 2);
     ASSERT_EQ(memcmp(val, "v2", 3), 0);
@@ -3240,7 +3596,8 @@ void test_skip_list_single_delete_flag()
     int64_t ttl;
     uint8_t deleted;
     uint64_t seq;
-    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vs, &ttl, &deleted, &seq), 0);
+    ASSERT_EQ(skip_list_cursor_get_with_seq(cursor, &k, &ks, &v, &vs, NULL, &ttl, &deleted, &seq),
+              0);
     ASSERT_EQ(seq, 2);
     ASSERT_TRUE(deleted & SKIP_LIST_FLAG_DELETED);
     ASSERT_TRUE(deleted & SKIP_LIST_FLAG_SINGLE_DELETE);
@@ -3322,13 +3679,11 @@ void test_skip_list_tall_heap_update()
 
 void test_skip_list_cached_time_ttl()
 {
-    _Atomic(time_t) clock_val;
+    _Atomic(int64_t) clock_val;
     skip_list_t *list = NULL;
-    ASSERT_EQ(skip_list_new_with_comparator_and_cached_time(
-                  &list, 12, 0.24f, skip_list_comparator_memcmp, NULL, &clock_val),
-              0);
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, &clock_val, NULL), 0);
 
-    time_t base = atomic_load_explicit(&clock_val, memory_order_relaxed);
+    int64_t base = atomic_load_explicit(&clock_val, memory_order_relaxed);
 
     uint8_t key[] = "ttlk";
     uint8_t value[] = "v";
@@ -3418,29 +3773,10 @@ void test_skip_list_new_validation()
     ASSERT_EQ(skip_list_new(&list, 12, 1.5f), -1);
 }
 
-void test_skip_list_comparator_numeric_size_guard()
-{
-    /* 8-byte keys compare as host-native integers */
-    uint64_t a = 5, b = 9;
-    ASSERT_TRUE(skip_list_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&b, 8, NULL) < 0);
-    ASSERT_TRUE(skip_list_comparator_numeric((uint8_t *)&b, 8, (uint8_t *)&a, 8, NULL) > 0);
-    ASSERT_EQ(skip_list_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&a, 8, NULL), 0);
-
-    /* a key that is not 8 bytes must not drive an 8-byte read; it falls back to memcmp order */
-    const uint8_t short_key[3] = {'a', 'b', 'c'};
-    const uint8_t long_key[8] = {'a', 'b', 'c', 'd', 0, 0, 0, 0};
-    ASSERT_TRUE(skip_list_comparator_numeric(short_key, sizeof(short_key), long_key,
-                                             sizeof(long_key), NULL) < 0);
-    ASSERT_TRUE(skip_list_comparator_numeric(long_key, sizeof(long_key), short_key,
-                                             sizeof(short_key), NULL) > 0);
-    ASSERT_EQ(skip_list_comparator_numeric(short_key, sizeof(short_key), short_key,
-                                           sizeof(short_key), NULL),
-              0);
-}
-
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
+    g_arena_pool = arena_pool_create(0, 0);
     RUN_TEST(test_skip_list_create_node, tests_passed);
     RUN_TEST(test_skip_list_put_get, tests_passed);
     RUN_TEST(test_skip_list_destroy, tests_passed);
@@ -3448,6 +3784,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_min_max_key, tests_passed);
     RUN_TEST(test_skip_list_count_entries, tests_passed);
     RUN_TEST(test_skip_list_get_size, tests_passed);
+    RUN_TEST(test_skip_list_memory_bytes_counts_structural_overhead, tests_passed);
+    RUN_TEST(test_skip_list_reference_is_reported_by_every_getter, tests_passed);
+    RUN_TEST(test_skip_list_reference_costs_an_id_not_a_value, tests_passed);
+    RUN_TEST(test_skip_list_reference_rejects_a_tombstone_and_a_zero_id, tests_passed);
     RUN_TEST(test_skip_list_cursor_init, tests_passed);
     RUN_TEST(test_skip_list_cursor_next, tests_passed);
     RUN_TEST(test_skip_list_cursor_prev, tests_passed);
@@ -3468,9 +3808,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
     RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
+    RUN_TEST(test_skip_list_lookup_never_misses_a_present_key_under_splicing, tests_passed);
+    RUN_TEST(test_skip_list_concurrent_disjoint_inserts_all_findable, tests_passed);
     RUN_TEST(test_skip_list_concurrent_duplicate_keys, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
-    RUN_TEST(test_skip_list_reverse_comparator, tests_passed);
     RUN_TEST(test_skip_list_prefix_seek_behavior, tests_passed);
     RUN_TEST(test_skip_list_put_batch, tests_passed);
     RUN_TEST(test_skip_list_put_batch_sorted, tests_passed);
@@ -3478,7 +3819,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_arena_batch, tests_passed);
     RUN_TEST(test_skip_list_arena_cursor, tests_passed);
     RUN_TEST(test_skip_list_arena_delete, tests_passed);
-    RUN_TEST(test_skip_list_arena_zero_capacity, tests_passed);
     RUN_TEST(test_skip_list_get_ref, tests_passed);
     RUN_TEST(test_skip_list_cursor_next_get, tests_passed);
     RUN_TEST(test_skip_list_cursor_advance_in_node, tests_passed);
@@ -3492,10 +3832,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_cached_time_ttl, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek_ge, tests_passed);
     RUN_TEST(test_skip_list_new_validation, tests_passed);
-    RUN_TEST(test_skip_list_comparator_numeric_size_guard, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
+    RUN_TEST(test_skip_list_size_counts_every_version, tests_passed);
+    RUN_TEST(test_skip_list_size_counts_tombstone_versions, tests_passed);
     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
     RUN_TEST(benchmark_skip_list_deletions, tests_passed);
     RUN_TEST(benchmark_skip_list_batch_vs_single, tests_passed);
@@ -3503,6 +3844,7 @@ int main(int argc, char **argv)
     RUN_TEST(benchmark_skip_list_read_path, tests_passed);
     RUN_TEST(benchmark_skip_list_rw_contention, tests_passed);
 
+    arena_pool_destroy(g_arena_pool);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

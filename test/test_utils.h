@@ -1,20 +1,10 @@
 /**
  *
- * Copyright (C) TidesDB
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
  *
- * Original Author: Alex Gaetano Padula
- *
- * Licensed under the Mozilla Public License, v. 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.mozilla.org/en-US/MPL/2.0/
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #ifndef __TEST_UTILS_H__
 #define __TEST_UTILS_H__
@@ -23,7 +13,6 @@
 #include <string.h>
 
 #include "../src/compat.h"
-#include "../src/tidesdb.h"
 #include "test_macros.h"
 
 /* global test filter -- set via argv[1] for running specific tests */
@@ -69,6 +58,33 @@ static UNUSED int tests_skipped = 0;
         tests_passed++;                                      \
     } while (0)
 
+/* a test that closes its database owns no sstables afterwards, so the live handle count has to come
+ * back to what it stood at before the test ran. asserting that around every test is what turns a
+ * dropped sstable reference into a named, deterministic failure rather than something only a long
+ * concurrent run happens to notice thousands of operations after the fact */
+int64_t sstable_live_handles(void);
+int64_t level_live_layouts(void);
+
+#define RUN_TEST_HANDLE_BALANCED(test_func, test_passed)                           \
+    do                                                                             \
+    {                                                                              \
+        const int64_t handles_before = sstable_live_handles();                     \
+        const int64_t layouts_before = level_live_layouts();                       \
+        RUN_TEST(test_func, test_passed);                                          \
+        if (sstable_live_handles() != handles_before)                              \
+        {                                                                          \
+            printf(BOLDRED "  %s leaked %lld sstable handles\n" RESET, #test_func, \
+                   (long long)(sstable_live_handles() - handles_before));          \
+            tests_failed++;                                                        \
+        }                                                                          \
+        if (level_live_layouts() != layouts_before)                                \
+        {                                                                          \
+            printf(BOLDRED "  %s leaked %lld level layouts\n" RESET, #test_func,   \
+                   (long long)(level_live_layouts() - layouts_before));            \
+            tests_failed++;                                                        \
+        }                                                                          \
+    } while (0)
+
 /* print test results summary */
 #define PRINT_TEST_RESULTS(test_passed, test_failed)                                        \
     do                                                                                      \
@@ -95,53 +111,6 @@ static inline void cleanup_test_dir(void)
 }
 
 /*
- * tdb_test_commit_with_retry
- * commit a txn, retrying on TDB_ERR_BUSY (backpressure stall timeout) so that
- * stress tests don't flake on slow CI boxes where the 10s no-progress budget
- * can be reached under sustained load. caller still observes any real error
- * (TDB_ERR_IO, TDB_ERR_NOT_FOUND, TDB_ERR_UNKNOWN, ...) as the final return.
- * @param txn         transaction to commit (caller still owns the txn handle)
- * @param max_retries upper bound on retry attempts. 0 disables retry
- * @return 0 on success, or the last commit error code
- */
-static inline int tdb_test_commit_with_retry(tidesdb_txn_t *txn, int max_retries)
-{
-    int rc;
-    for (int attempt = 0; attempt <= max_retries; attempt++)
-    {
-        rc = tidesdb_txn_commit(txn);
-        if (rc != TDB_ERR_BUSY) return rc;
-        usleep(50000); /* 50ms backoff between attempts */
-    }
-    return rc;
-}
-
-/*
- * tdb_test_iter_new_with_retry
- * create an iterator, retrying on TDB_ERR_BUSY. a full-scan iterator opens its whole source set
- * at once, so under a tight max_open fd budget iter creation can transiently exceed the reader
- * reserve; the reaper frees idle fds between attempts, so a bounded retry succeeds. caller still
- * observes any real error as the final return.
- * @param txn         transaction the iterator reads under
- * @param cf          column family to iterate
- * @param iter        out -- created iterator on success
- * @param max_retries upper bound on retry attempts. 0 disables retry
- * @return 0 on success, or the last iter_new error code
- */
-static inline int tdb_test_iter_new_with_retry(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
-                                               tidesdb_iter_t **iter, int max_retries)
-{
-    int rc;
-    for (int attempt = 0; attempt <= max_retries; attempt++)
-    {
-        rc = tidesdb_iter_new(txn, cf, iter);
-        if (rc != TDB_ERR_BUSY) return rc;
-        usleep(10000); /* 10ms backoff between attempts */
-    }
-    return rc;
-}
-
-/*
  * generate_random_key_value
  * @brief generate random key-value pairs for testing
  */
@@ -159,6 +128,63 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
     {
         value[i] = (uint8_t)charset[rand() % (int)charset_size];
     }
+}
+
+/* the two primitives a crash test needs that have no common spelling. unlike a guard that compiles
+ * a test away, both arms here do the same thing, so nothing is hidden from either platform -- the
+ * difference is only in which call spells it */
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+/* re-run this test binary as a child process and wait for it to finish. a crash test needs a real
+ * process to lose, and fork is not portable -- so the child re-enters main and dispatches on the
+ * arguments it was given rather than inheriting the parent's address space. that is also the
+ * sturdier shape where threads are involved, since a forked child of a threaded process inherits
+ * only the forking thread
+ * @param exe this binary's path, as main received it in argv[0]
+ * @param flag the argument that puts the child into its child mode
+ * @param phase which crash phase the child should run
+ * @param nth the crash point within that phase, as a decimal string
+ * @return 0 once the child has exited, or -1 if it could not be started
+ */
+static UNUSED int test_spawn_self(const char *exe, const char *flag, const char *phase,
+                                  const char *nth)
+{
+#ifdef _WIN32
+    const char *const args[] = {exe, flag, phase, nth, NULL};
+    return _spawnv(_P_WAIT, exe, args) == -1 ? -1 : 0;
+#else
+    const pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0)
+    {
+        char *const args[] = {(char *)exe, (char *)flag, (char *)phase, (char *)nth, NULL};
+        execv(exe, args);
+        _exit(127); /* only reached when the exec itself failed */
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    return 0;
+#endif
+}
+
+/* push a stdio stream all the way to the device, so what it holds survives the process being lost
+ * rather than sitting in a buffer that dies with it
+ * @param f the stream to flush and sync
+ */
+static UNUSED void test_fsync_file(FILE *f)
+{
+    (void)fflush(f);
+#ifdef _WIN32
+    (void)_commit(_fileno(f));
+#else
+    (void)fsync(fileno(f));
+#endif
 }
 
 #if defined(__GNUC__) && !defined(__clang__)

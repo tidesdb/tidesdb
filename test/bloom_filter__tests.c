@@ -1,1226 +1,176 @@
 /**
  *
- * Copyright (C) TidesDB
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
  *
- * Original Author: Alex Gaetano Padula
- *
- * Licensed under the Mozilla Public License, v. 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.mozilla.org/en-US/MPL/2.0/
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include <stdlib.h>
+#include <string.h>
 
-#include <limits.h>
-
-#include "../src/bloom_filter.h"
+#include "../src/sstable/bloom_filter.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-void test_bloom_filter_new()
+/* build a filter, add each key, and return its serialized form; the in-memory filter is freed since
+ * the engine only ever queries the serialized bytes */
+static uint8_t *build_serialized(double p, int n, const char *const *keys, int key_count,
+                                 size_t *out_size)
 {
-    bloom_filter_t *bf;
-    int result = bloom_filter_new(&bf, 0.01, 1000);
-    ASSERT_EQ(result, 0);
-    ASSERT_TRUE(bf != NULL);
-    ASSERT_TRUE(bf->m > 0);
-    ASSERT_TRUE(bf->h > 0);
-    (void)bloom_filter_free(bf);
-}
-
-void test_bloom_filter_add_and_contains()
-{
-    bloom_filter_t *bf;
-    (void)bloom_filter_new(&bf, 0.01, 1000);
-
-    const char *key = "test_key";
-    (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)), 1);
-
-    const char *non_existent_key = "non_existent_key";
-    ASSERT_EQ(
-        bloom_filter_contains(bf, (const uint8_t *)non_existent_key, strlen(non_existent_key)), 0);
-
-    (void)bloom_filter_free(bf);
-}
-
-void test_bloom_filter_is_full()
-{
-    bloom_filter_t *bf;
-    (void)bloom_filter_new(&bf, 0.01, 10);
-
-    const char *key = "test_key";
-    for (int i = 0; i < 10; i++)
-    {
-        (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
-    }
-    ASSERT_EQ(bloom_filter_is_full(bf), 0);
-
-    (void)bloom_filter_free(bf);
-}
-
-void test_bloom_filter_serialize_deserialize()
-{
-    bloom_filter_t *bf;
-    (void)bloom_filter_new(&bf, 0.01, 1000);
-
-    const char *keys[] = {"key1", "key2", "key3", "key4", "key5"};
-    for (int i = 0; i < 5; i++)
-    {
-        (void)bloom_filter_add(bf, (const uint8_t *)keys[i], strlen(keys[i]));
-    }
-
-    size_t serialized_size;
-    uint8_t *serialized_data = bloom_filter_serialize(bf, &serialized_size);
-    ASSERT_TRUE(serialized_data != NULL);
-
-    bloom_filter_t *deserialized_bf = bloom_filter_deserialize(serialized_data, serialized_size);
-    ASSERT_TRUE(deserialized_bf != NULL);
-
-    ASSERT_EQ(deserialized_bf->m, bf->m);
-    ASSERT_EQ(deserialized_bf->h, bf->h);
-
-    for (int i = 0; i < 5; i++)
-    {
-        ASSERT_EQ(bloom_filter_contains(deserialized_bf, (const uint8_t *)keys[i], strlen(keys[i])),
-                  1);
-    }
-
-    ASSERT_EQ(bloom_filter_contains(deserialized_bf, (const uint8_t *)"nonexistent", 10), 0);
-
-    free(serialized_data);
-    (void)bloom_filter_free(bf);
-    (void)bloom_filter_free(deserialized_bf);
-}
-
-void test_false_positive_rate()
-{
-    double p = 0.01;
-    int n = 10000;
-    bloom_filter_t *bf;
-    (void)bloom_filter_new(&bf, p, n);
-
-    for (int i = 0; i < n; i++)
-    {
-        char key[20];
-        snprintf(key, sizeof(key), "inserted_key_%d", i);
-        (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
-    }
-
-    /* with m different elements that were not inserted */
-    int m = 10000;
-    int false_positives = 0;
-    for (int i = 0; i < m; i++)
-    {
-        char key[20];
-        snprintf(key, sizeof(key), "test_key_%d", i + n); /** different from inserted keys */
-        if (bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)))
-        {
-            false_positives++;
-        }
-    }
-
-    double actual_fp_rate = (double)false_positives / m;
-    printf("Expected false positive rate: %f\n", p);
-    printf("Actual false positive rate: %f\n", actual_fp_rate);
-
-    /* some deviation since its a probabilistic data structure */
-    ASSERT_TRUE(tdb_fabs(actual_fp_rate - p) < 0.01);
-
-    (void)bloom_filter_free(bf);
-}
-
-void test_boundary_conditions()
-{
-    bloom_filter_t *bf;
-
-    /* very low false positive rate */
-    (void)bloom_filter_new(&bf, 0.0001, 1000);
-    ASSERT_TRUE(bf != NULL);
-    ASSERT_TRUE(bf->m > 0);
-    ASSERT_TRUE(bf->h > 0);
-    (void)bloom_filter_free(bf);
-
-    /* very high false positive rate */
-    (void)bloom_filter_new(&bf, 0.9, 1000);
-    ASSERT_TRUE(bf != NULL);
-    ASSERT_TRUE(bf->m > 0);
-    ASSERT_TRUE(bf->h > 0);
-    (void)bloom_filter_free(bf);
-
-    /* empty key */
-    (void)bloom_filter_new(&bf, 0.01, 1000);
-    const char *empty_key = "";
-    (void)bloom_filter_add(bf, (const uint8_t *)empty_key, strlen(empty_key));
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)empty_key, strlen(empty_key)), -1);
-    (void)bloom_filter_free(bf);
-}
-
-void test_bloom_filter_edge_cases()
-{
-    bloom_filter_t *bf;
-
-    /* empty key */
-    bloom_filter_new(&bf, 0.01, 100);
-    bloom_filter_add(bf, (uint8_t *)"", 0);
-    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"", 0), -1);
-
-    /* fairly large key */
-    uint8_t large_key[10000];
-    memset(large_key, 'A', sizeof(large_key));
-    bloom_filter_add(bf, large_key, sizeof(large_key));
-    ASSERT_EQ(bloom_filter_contains(bf, large_key, sizeof(large_key)), 1);
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_boundary_values()
-{
-    bloom_filter_t *bf;
-
-    /* min n (1 element) */
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 1), 0);
-    bloom_filter_add(bf, (uint8_t *)"key", 3);
-    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"key", 3), 1);
-    bloom_filter_free(bf);
-
-    /* very high false positive rate (0.99) */
-    ASSERT_EQ(bloom_filter_new(&bf, 0.99, 100), 0);
-    bloom_filter_free(bf);
-
-    /** very low false positive rate (0.0001) */
-    ASSERT_EQ(bloom_filter_new(&bf, 0.0001, 100), 0);
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_serialize_empty()
-{
-    bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 100);
-
-    /* attempt to serialize without adding any keys */
-    size_t size;
-    uint8_t *data = bloom_filter_serialize(bf, &size);
-    ASSERT_TRUE(data != NULL);
-
-    /* deserialize and verify it's still empty */
-    bloom_filter_t *bf2 = bloom_filter_deserialize(data, size);
-    ASSERT_TRUE(bf2 != NULL);
-    ASSERT_EQ(bloom_filter_contains(bf2, (uint8_t *)"anything", 8), 0);
-
-    free(data);
-    bloom_filter_free(bf);
-    bloom_filter_free(bf2);
-}
-
-void test_bloom_filter_duplicate_keys()
-{
-    bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 100);
-
-    /* we add the same key many times, we are testing to see if key still found */
-    for (int i = 0; i < 10; i++)
-    {
-        bloom_filter_add(bf, (uint8_t *)"duplicate", 9);
-    }
-
-    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"duplicate", 9), 1);
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_invalid_inputs()
-{
-    bloom_filter_t *bf;
-
-    /** invalid p values */
-    ASSERT_EQ(bloom_filter_new(&bf, 0.0, 100), -1);  /** p = 0 */
-    ASSERT_EQ(bloom_filter_new(&bf, 1.0, 100), -1);  /** p = 1 */
-    ASSERT_EQ(bloom_filter_new(&bf, -0.5, 100), -1); /** negative p */
-    ASSERT_EQ(bloom_filter_new(&bf, 1.5, 100), -1);  /**  p > 1 */
-
-    /* invalid n*/
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 0), -1);   /* n = 0 */
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, -10), -1); /* negative n */
-}
-
-void test_bloom_filter_hash_distribution()
-{
-    bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 1000);
-
-    /* we add keys with similar patterns to test hash distribution */
-    for (int i = 0; i < 100; i++)
-    {
-        char key[20];
-        snprintf(key, sizeof(key), "key_%d", i);
-        bloom_filter_add(bf, (uint8_t *)key, strlen(key));
-    }
-
-    /* all should be found is the expectation */
-    for (int i = 0; i < 100; i++)
-    {
-        char key[20];
-        snprintf(key, sizeof(key), "key_%d", i);
-        ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)key, strlen(key)), 1);
-    }
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_deserialize_corrupted()
-{
-    bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 100);
-    bloom_filter_add(bf, (uint8_t *)"test", 4);
-
-    size_t size;
-    uint8_t *data = bloom_filter_serialize(bf, &size);
-
-    /* corrupt it!! */
-    data[0] = 0xFF;
-    data[1] = 0xFF;
-    data[2] = 0xFF;
-    data[3] = 0xFF;
-
-    bloom_filter_t *bf2 = bloom_filter_deserialize(data, size);
-
-    free(data);
-    bloom_filter_free(bf);
-    if (bf2) bloom_filter_free(bf2);
-}
-
-void test_bloom_filter_binary_keys()
-{
-    bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 100);
-
-    /* binary keys with null bytes */
-    uint8_t binary_key[] = {0x00, 0xFF, 0x00, 0xAA, 0x55};
-    bloom_filter_add(bf, binary_key, sizeof(binary_key));
-    ASSERT_EQ(bloom_filter_contains(bf, binary_key, sizeof(binary_key)), 1);
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_free_null()
-{
-    bloom_filter_free(NULL);
-}
-
-void test_bloom_filter_large_capacity_random_keys()
-{
-    int n = 2892624;
-    double p = 0.01;
     bloom_filter_t *bf = NULL;
-
-    printf("Creating bloom filter with n=%d, p=%.4f...\n", n, p);
-    int result = bloom_filter_new(&bf, p, n);
-
-    if (result != 0)
-    {
-        printf("ERROR: bloom_filter_new failed with result=%d\n", result);
-    }
-    ASSERT_EQ(result, 0);
-
-    if (bf == NULL)
-    {
-        printf("ERROR: bloom filter is NULL after creation!\n");
-        return;
-    }
-
-    printf("Bloom filter created: m=%u bits, h=%u hashes, size=%u words\n", bf->m, bf->h,
-           bf->size_in_words);
-
-    /* add 2.9M random 16-byte keys (simulating PUT phase) */
-    printf("Adding %d random 16-byte keys...\n", n);
-    srand(12345); /* fixed seed for reproducibility */
-
-    for (int i = 0; i < n; i++)
-    {
-        uint8_t key[16];
-        for (int j = 0; j < 16; j++)
-        {
-            key[j] = (uint8_t)(rand() % 256);
-        }
-        bloom_filter_add(bf, key, 16);
-
-        if (i % 500000 == 0 && i > 0)
-        {
-            printf("  Added %d keys...\n", i);
-        }
-    }
-    printf("All %d keys added.\n", n);
-
-    /* count how many bits are set in bloom filter */
-    unsigned int bits_set = 0;
-    for (unsigned int i = 0; i < bf->size_in_words; i++)
-    {
-        if (bf->bitset[i] != 0)
-        {
-            bits_set++;
-        }
-    }
-    printf("Sanity check: %u/%u words have non-zero bits\n", bits_set, bf->size_in_words);
-
-    /* verify we can find a key we just added */
-    srand(12345); /* same seed as add phase */
-    uint8_t test_key[16];
-    for (int j = 0; j < 16; j++)
-    {
-        test_key[j] = (uint8_t)(rand() % 256);
-    }
-    int found = bloom_filter_contains(bf, test_key, 16);
-    printf("Sanity check: first added key found = %d (should be 1)\n", found);
-    if (!found)
-    {
-        printf("ERROR: Bloom filter cannot find key that was just added!\n");
-    }
-
-    /* now test with different random keys (simulating GET phase with non-existent keys) */
-    printf("Testing with 100K DIFFERENT random keys...\n");
-    srand(99999);
-
-    int test_count = 100000;
-    int false_positives = 0;
-
-    for (int i = 0; i < test_count; i++)
-    {
-        uint8_t key[16];
-        for (int j = 0; j < 16; j++)
-        {
-            key[j] = (uint8_t)(rand() % 256);
-        }
-
-        if (bloom_filter_contains(bf, key, 16))
-        {
-            false_positives++;
-        }
-    }
-
-    double actual_fpr = (double)false_positives / test_count;
-    printf("Expected FPR: %.4f\n", p);
-    printf("Actual FPR: %.4f (%d false positives out of %d tests)\n", actual_fpr, false_positives,
-           test_count);
-
-    /* FPR should be close to 1% but can vary due to randomness and platform differences
-     * the critical check is that it's not too high (< 3%)
-     * low FPR is actually good -- it means the test keys happened to have low collision
-     * different rand() implementations on win vs posix can produce different sequences */
-    ASSERT_TRUE(actual_fpr < 0.03); /* should be < 3% - this is the important check */
-
-    /* warn if FPR is unusually low, but don't fail -- its just statistical variance */
-    if (actual_fpr < 0.001)
-    {
-        printf(
-            "Note: FPR is unusually low (%.4f%%). This can happen with different rand() "
-            "implementations.\n",
-            actual_fpr * 100);
-    }
-
-    printf("✓ Bloom filter FPR is within expected range!\n");
-
-    /* test serialization/deserialization with large filter */
-    printf("Testing serialization...\n");
-    size_t serialized_size;
-    uint8_t *serialized = bloom_filter_serialize(bf, &serialized_size);
-    ASSERT_TRUE(serialized != NULL);
-    printf("Serialized size: %.2f MB\n", (double)serialized_size / (1024 * 1024));
-
-    printf("Testing deserialization...\n");
-    bloom_filter_t *bf2 = bloom_filter_deserialize(serialized, serialized_size);
-    ASSERT_TRUE(bf2 != NULL);
-    ASSERT_EQ(bf2->m, bf->m);
-    ASSERT_EQ(bf2->h, bf->h);
-
-    /* verify deserialized filter has same FPR */
-    printf("Verifying deserialized filter...\n");
-    srand(99999); /* same seed as before */
-    int false_positives2 = 0;
-    for (int i = 0; i < test_count; i++)
-    {
-        uint8_t key[16];
-        for (int j = 0; j < 16; j++)
-        {
-            key[j] = (uint8_t)(rand() % 256);
-        }
-
-        if (bloom_filter_contains(bf2, key, 16))
-        {
-            false_positives2++;
-        }
-    }
-
-    /* allow small tolerance due to platform/hash differences
-     * the counts should be very close, but not necessarily identical */
-    int diff = abs(false_positives - false_positives2);
-    int tolerance = test_count / 100; /* 1% tolerance */
-    if (diff > tolerance)
-    {
-        printf("ERROR: False positive counts differ too much: %d vs %d (diff=%d, tolerance=%d)\n",
-               false_positives, false_positives2, diff, tolerance);
-        ASSERT_TRUE(0);
-    }
-    printf("✓ Deserialized filter matches original (fp1=%d, fp2=%d, diff=%d)!\n", false_positives,
-           false_positives2, diff);
-
-    free(serialized);
+    ASSERT_EQ(bloom_filter_new(&bf, p, n), 0);
+    ASSERT_TRUE(bf != NULL);
+    ASSERT_TRUE(bf->m > 0 && bf->h > 0);
+    for (int i = 0; i < key_count; i++)
+        bloom_filter_add(bf, (const uint8_t *)keys[i], strlen(keys[i]));
+    uint8_t *blob = bloom_filter_serialize(bf, out_size);
     bloom_filter_free(bf);
-    bloom_filter_free(bf2);
+    return blob;
 }
 
-void benchmark_bloom_filter()
+/* new rejects a bad rate or count without leaking */
+void test_bloom_filter_new_invalid_args(void)
 {
-    bloom_filter_t *bf;
-    (void)bloom_filter_new(&bf, 0.01, 1000000);
-
-    clock_t start_add = clock();
-    for (int i = 0; i < 1000000; i++)
-    {
-        char key[20];
-        snprintf(key, sizeof(key), "key_%d", i);
-        (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
-    }
-    clock_t end_add = clock();
-    double time_spent_add = (double)(end_add - start_add) / CLOCKS_PER_SEC;
-    printf(CYAN "Adding 1,000,000 elements took %f seconds\n" RESET, time_spent_add);
-
-    size_t serialized_bf_size = 0;
-    uint8_t *serialized_bf = bloom_filter_serialize(bf, &serialized_bf_size);
-    ASSERT_TRUE(serialized_bf != NULL);
-    free(serialized_bf);
-
-    printf(BOLDWHITE "Bloom filter size: %f MB\n" RESET, (float)serialized_bf_size / 1000000);
-
-    clock_t start_check = clock();
-    for (int i = 0; i < 1000000; i++)
-    {
-        char key[20];
-        snprintf(key, sizeof(key), "key_%d", i);
-        ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)), 1);
-    }
-    clock_t end_check = clock();
-    double time_spent_check = (double)(end_check - start_check) / CLOCKS_PER_SEC;
-    printf(CYAN "Checking 1,000,000 elements took %f seconds\n" RESET, time_spent_check);
-
-    (void)bloom_filter_free(bf);
+    bloom_filter_t *bf = NULL;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.0, 100), -1);
+    ASSERT_EQ(bloom_filter_new(&bf, 1.0, 100), -1);
+    ASSERT_EQ(bloom_filter_new(&bf, -0.5, 100), -1);
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 0), -1);
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, -5), -1);
+    ASSERT_EQ(bloom_filter_new(NULL, 0.01, 100), -1);
 }
 
-void test_bloom_filter_hash_direct(void)
-{
-    /* we test the public bloom_filter_hash function directly */
-    unsigned int h1 = bloom_filter_hash((const uint8_t *)"hello", 5, 0);
-    unsigned int h2 = bloom_filter_hash((const uint8_t *)"hello", 5, 0);
-    ASSERT_EQ(h1, h2); /* deterministic */
-
-    /* different seeds produce different hashes */
-    unsigned int h3 = bloom_filter_hash((const uint8_t *)"hello", 5, 1);
-    ASSERT_TRUE(h1 != h3);
-
-    /* different keys produce different hashes */
-    unsigned int h4 = bloom_filter_hash((const uint8_t *)"world", 5, 0);
-    ASSERT_TRUE(h1 != h4);
-
-    /* NULL entry returns 0 */
-    ASSERT_EQ(bloom_filter_hash(NULL, 5, 0), 0);
-
-    /* size 0 returns 0 */
-    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"hello", 0, 0), 0);
-}
-
-void test_bloom_filter_is_full_true(void)
-{
-    /* we create a tiny bloom filter and force all bits set */
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.5, 1), 0);
-
-    /* we force all words to all-ones */
-    for (unsigned int i = 0; i < bf->size_in_words; i++)
-    {
-        bf->bitset[i] = UINT64_MAX;
-    }
-
-    ASSERT_EQ(bloom_filter_is_full(bf), 1);
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_null_safety(void)
-{
-    /* bloom_filter_is_full with NULL */
-    ASSERT_EQ(bloom_filter_is_full(NULL), -1);
-
-    /* bloom_filter_contains with NULL bf */
-    ASSERT_EQ(bloom_filter_contains(NULL, (const uint8_t *)"key", 3), -1);
-
-    /* bloom_filter_add with NULL bf should not crash */
-    bloom_filter_add(NULL, (const uint8_t *)"key", 3);
-
-    /* bloom_filter_serialize with NULL */
-    size_t out_size;
-    ASSERT_TRUE(bloom_filter_serialize(NULL, &out_size) == NULL);
-
-    /* bloom_filter_deserialize with NULL */
-    ASSERT_TRUE(bloom_filter_deserialize(NULL, 0) == NULL);
-}
-
-void test_bloom_filter_deserialize_oob_index(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
-    bloom_filter_add(bf, (const uint8_t *)"test", 4);
-
-    size_t size;
-    uint8_t *data = bloom_filter_serialize(bf, &size);
-    ASSERT_TRUE(data != NULL);
-
-    /* we craft a malicious payload -- valid header but OOB word index
-     * first we deserialize to get baseline, then we'll manually build one */
-    bloom_filter_free(bf);
-
-    /* we build a minimal serialized payload with an OOB index
-     * header    m=64 (1 word), h=1, non_zero_count=1
-     * then      index=9999 (way out of bounds), value=0xFF */
-    uint8_t crafted[32];
-    uint8_t *ptr = crafted;
-    ptr = encode_varint32(ptr, 64);   /* m = 64 bits = 1 word */
-    ptr = encode_varint32(ptr, 1);    /* h = 1 */
-    ptr = encode_varint32(ptr, 1);    /* non_zero_count = 1 */
-    ptr = encode_varint32(ptr, 9999); /* index = 9999 (OOB) */
-    ptr = encode_varint64(ptr, 0xFF); /* value */
-
-    bloom_filter_t *bad_bf = bloom_filter_deserialize(crafted, (size_t)(ptr - crafted));
-    ASSERT_TRUE(bad_bf == NULL); /* should fail due to OOB index */
-
-    free(data);
-}
-
-void test_bloom_filter_serialize_roundtrip_size_in_words(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 500), 0);
-
-    for (int i = 0; i < 50; i++)
-    {
-        char key[16];
-        snprintf(key, sizeof(key), "roundtrip_%d", i);
-        bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
-    }
-
-    size_t size;
-    uint8_t *data = bloom_filter_serialize(bf, &size);
-    ASSERT_TRUE(data != NULL);
-
-    bloom_filter_t *bf2 = bloom_filter_deserialize(data, size);
-    ASSERT_TRUE(bf2 != NULL);
-
-    /* we verify all fields match, including size_in_words */
-    ASSERT_EQ(bf2->m, bf->m);
-    ASSERT_EQ(bf2->h, bf->h);
-    ASSERT_EQ(bf2->size_in_words, bf->size_in_words);
-
-    /* we verify bitsets are identical */
-    for (unsigned int i = 0; i < bf->size_in_words; i++)
-    {
-        ASSERT_EQ(bf2->bitset[i], bf->bitset[i]);
-    }
-
-    free(data);
-    bloom_filter_free(bf);
-    bloom_filter_free(bf2);
-}
-
-void test_bloom_filter_deserialize_corrupted_assertions(void)
-{
-    /* we test that m=0 in header causes deserialize to return NULL */
-    uint8_t crafted_m0[16];
-    uint8_t *ptr = crafted_m0;
-    ptr = encode_varint32(ptr, 0); /* m = 0 */
-    ptr = encode_varint32(ptr, 1); /* h = 1 */
-    ptr = encode_varint32(ptr, 0); /* non_zero_count = 0 */
-    ASSERT_TRUE(bloom_filter_deserialize(crafted_m0, (size_t)(ptr - crafted_m0)) == NULL);
-
-    /* we test that h=0 in header causes deserialize to return NULL */
-    uint8_t crafted_h0[16];
-    ptr = crafted_h0;
-    ptr = encode_varint32(ptr, 64); /* m = 64 */
-    ptr = encode_varint32(ptr, 0);  /* h = 0 */
-    ptr = encode_varint32(ptr, 0);  /* non_zero_count = 0 */
-    ASSERT_TRUE(bloom_filter_deserialize(crafted_h0, (size_t)(ptr - crafted_h0)) == NULL);
-}
-
-void test_bloom_filter_null_entry(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
-
-    /* add with NULL entry on valid bf should not crash */
-    bloom_filter_add(bf, NULL, 5);
-
-    /* contains with NULL entry on valid bf should return -1 */
-    ASSERT_EQ(bloom_filter_contains(bf, NULL, 5), -1);
-
-    /* add with valid entry but size 0 should not crash */
-    bloom_filter_add(bf, (const uint8_t *)"hello", 0);
-
-    /* contains with valid entry but size 0 should return -1 */
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"hello", 0), -1);
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_is_full_null_bitset(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
-
-    /* we save and null out the bitset */
-    uint64_t *saved_bitset = bf->bitset;
-    bf->bitset = NULL;
-
-    ASSERT_EQ(bloom_filter_is_full(bf), -1);
-
-    /* we restore before free */
-    bf->bitset = saved_bitset;
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_hash_key_sizes(void)
-{
-    /* we test key sizes 1-8 to exercise all hash code paths:
-     * 8-byte word loop, 4-byte word loop, and trailing 1/2/3 byte switch cases */
-    uint8_t key[8] = {0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48};
-    unsigned int hashes[8];
-
-    for (int sz = 1; sz <= 8; sz++)
-    {
-        hashes[sz - 1] = bloom_filter_hash(key, sz, 0);
-        ASSERT_TRUE(hashes[sz - 1] != 0);
-    }
-
-    /* different sizes should produce different hashes */
-    for (int i = 0; i < 7; i++)
-    {
-        ASSERT_NE(hashes[i], hashes[i + 1]);
-    }
-
-    /* we also test determinism for each size */
-    for (int sz = 1; sz <= 8; sz++)
-    {
-        unsigned int h = bloom_filter_hash(key, sz, 0);
-        ASSERT_EQ(h, hashes[sz - 1]);
-    }
-
-    /* we verify all sizes work correctly with add/contains */
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
-
-    for (int sz = 1; sz <= 8; sz++)
-    {
-        bloom_filter_add(bf, key, sz);
-        ASSERT_EQ(bloom_filter_contains(bf, key, sz), 1);
-    }
-
-    bloom_filter_free(bf);
-}
-
-void test_bloom_filter_hash_endianness_stable(void)
-{
-    /* the base hash reads each 4-byte chunk little-endian, so a given key must hash to the same
-     * value on every host regardless of native byte order. these golden values pin the
-     * little-endian-canonical output. they guard against an accidental change to the hash, which
-     * would silently invalidate every existing on-disk bloom filter, and on a big-endian host
-     * against a regression to a host-order read. the keys span the 8-byte and 4-byte chunk loops
-     * and the trailing 1 and 3 byte tails. */
-    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"abcdefghijkl", 12, 0), 0x65ed3e40u);
-    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"abcdefghijklm", 13, 0), 0xd6ca9a03u);
-    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"tidesdb", 7, 1), 0x58cb34d3u);
-}
-
-void test_bloom_filter_deserialize_overflow_m(void)
-{
-    /* we craft a payload with m near UINT32_MAX to test overflow check */
-    uint8_t crafted[32];
-    uint8_t *ptr = crafted;
-    ptr = encode_varint32(ptr, UINT32_MAX); /* m near overflow */
-    ptr = encode_varint32(ptr, 1);          /* h = 1 */
-    ptr = encode_varint32(ptr, 0);          /* non_zero_count = 0 */
-
-    bloom_filter_t *bf = bloom_filter_deserialize(crafted, (size_t)(ptr - crafted));
-    ASSERT_TRUE(bf == NULL);
-
-    /* also test m = UINT32_MAX - 63 (exactly at the boundary) */
-    ptr = crafted;
-    ptr = encode_varint32(ptr, UINT32_MAX - 63); /* m = UINT32_MAX - BF_BITS_PER_WORD + 1 */
-    ptr = encode_varint32(ptr, 1);
-    ptr = encode_varint32(ptr, 0);
-
-    bf = bloom_filter_deserialize(crafted, (size_t)(ptr - crafted));
-    ASSERT_TRUE(bf == NULL);
-}
-
-/* exercises the hash-version logic -- new filters are v2 and carry the sentinel;
- * a legacy v1 filter (no sentinel) round-trips back as v1 and stays correct,
- * proving a filter is always queried with the hash that built it (no FN). */
-void test_bloom_filter_hash_versioning()
+/* every added key is reported present through the serialized form */
+void test_bloom_filter_present_keys(void)
 {
     const char *keys[] = {"alpha", "beta", "gamma", "delta", "epsilon"};
+    const int n = (int)(sizeof(keys) / sizeof(keys[0]));
+    size_t size = 0;
+    uint8_t *blob = build_serialized(0.01, n, keys, n, &size);
+    ASSERT_TRUE(blob != NULL);
 
-    /* v2 -- a freshly built filter uses the current hash and serializes with the
-     * 0x00 version sentinel */
-    bloom_filter_t *v2;
-    (void)bloom_filter_new(&v2, 0.01, 1000);
-    ASSERT_EQ(v2->hash_version, 2);
-    for (int i = 0; i < 5; i++)
-        (void)bloom_filter_add(v2, (const uint8_t *)keys[i], strlen(keys[i]));
-
-    size_t v2_size;
-    uint8_t *v2_blob = bloom_filter_serialize(v2, &v2_size);
-    ASSERT_TRUE(v2_blob != NULL);
-    ASSERT_EQ(v2_blob[0], 0x00); /* v2 leads with the version sentinel */
-
-    bloom_filter_t *v2_rt = bloom_filter_deserialize(v2_blob, v2_size);
-    ASSERT_TRUE(v2_rt != NULL);
-    ASSERT_EQ(v2_rt->hash_version, 2);
-    ASSERT_EQ(v2_rt->m, v2->m);
-    ASSERT_EQ(v2_rt->h, v2->h);
-    for (int i = 0; i < 5; i++)
-        ASSERT_EQ(bloom_filter_contains(v2_rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
-
-    /* legacy v1 -- simulate an on-disk filter built with the old hash. force the
-     * version to 1 before adding so the bits are set with the v1 hash. */
-    bloom_filter_t *v1;
-    (void)bloom_filter_new(&v1, 0.01, 1000);
-    v1->hash_version = 1;
-    for (int i = 0; i < 5; i++)
-        (void)bloom_filter_add(v1, (const uint8_t *)keys[i], strlen(keys[i]));
-
-    size_t v1_size;
-    uint8_t *v1_blob = bloom_filter_serialize(v1, &v1_size);
-    ASSERT_TRUE(v1_blob != NULL);
-    ASSERT_TRUE(v1_blob[0] != 0x00); /* legacy format -- first byte is varint(m), never 0 */
-
-    /* the legacy blob must come back as v1 and still find every key -- a
-     * regression that queried v1 bits with the v2 hash would false-negative here */
-    bloom_filter_t *v1_rt = bloom_filter_deserialize(v1_blob, v1_size);
-    ASSERT_TRUE(v1_rt != NULL);
-    ASSERT_EQ(v1_rt->hash_version, 1);
-    for (int i = 0; i < 5; i++)
-        ASSERT_EQ(bloom_filter_contains(v1_rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
-
-    /* v1 round-trip must answer identically to the original v1 filter on a probe
-     * set, proving consistent hash routing across serialize */
-    int mismatch = 0;
-    char probe[32];
-    for (int i = 0; i < 5000; i++)
-    {
-        int n = snprintf(probe, sizeof(probe), "probe-%d", i);
-        if (bloom_filter_contains(v1, (const uint8_t *)probe, (size_t)n) !=
-            bloom_filter_contains(v1_rt, (const uint8_t *)probe, (size_t)n))
-            mismatch++;
-    }
-    ASSERT_EQ(mismatch, 0);
-
-    free(v2_blob);
-    free(v1_blob);
-    (void)bloom_filter_free(v2);
-    (void)bloom_filter_free(v2_rt);
-    (void)bloom_filter_free(v1);
-    (void)bloom_filter_free(v1_rt);
+    for (int i = 0; i < n; i++)
+        ASSERT_EQ(
+            bloom_filter_contains_serialized(blob, size, (const uint8_t *)keys[i], strlen(keys[i])),
+            1);
+    free(blob);
 }
 
-/*
- * test_bloom_filter_new_failure_nulls_out
- * any failure return from bloom_filter_new must leave *bf as NULL so a caller
- * that forgets to check the return value is safe (in older versions the
- * post-malloc failure paths did free(*bf) without nulling, leaving callers
- * with a dangling pointer that produced a general protection fault inside
- * bloom_filter_add when subsequently used). exercises every post-malloc
- * failure path -- m-overflow, h-overflow, size_in_words-overflow are covered
- * by extreme parameter values
- */
-static void test_bloom_filter_new_failure_nulls_out(void)
+/* absent keys stay near the target false-positive rate */
+void test_bloom_filter_false_positive_rate(void)
 {
-    /* h_double > BF_MAX_HASH_FUNCTIONS (100) -- tiny p forces a very large h.
-     * bloom_filter_new malloc()s the struct first then hits the h validator
-     * and free()s it -- pre-fix this returned -1 with *bf pointing at the
-     * freed struct */
-    bloom_filter_t *bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
-    int rc = bloom_filter_new(&bf, 1e-300, 100);
-    ASSERT_EQ(rc, -1);
-    ASSERT_EQ(bf, NULL);
-
-    /* size_in_words overflow path -- very small p combined with n large enough
-     * to push m past UINT32_MAX */
-    bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
-    rc = bloom_filter_new(&bf, 1e-9, INT_MAX);
-    ASSERT_EQ(rc, -1);
-    ASSERT_EQ(bf, NULL);
-
-    /* invalid args path (returns before malloc, *bf untouched) -- the
-     * sentinel must still be observable */
-    bf = (bloom_filter_t *)(uintptr_t)0xdeadbeef;
-    rc = bloom_filter_new(&bf, 0.0, 100);
-    ASSERT_EQ(rc, -1);
-    /* this path does not malloc so it leaves *bf alone -- documented
-     * carve-out from the contract above */
-    ASSERT_EQ(bf, (bloom_filter_t *)(uintptr_t)0xdeadbeef);
-
-    /* and a caller that ignores the return code must not UAF. with the
-     * contract fix bf is NULL after a failed new() and bloom_filter_add
-     * early-returns on NULL */
-    bloom_filter_t *bf2 = NULL;
-    rc = bloom_filter_new(&bf2, 1e-300, 100);
-    ASSERT_EQ(rc, -1);
-    bloom_filter_add(bf2, (const uint8_t *)"x", 1); /* must not crash */
-}
-
-/* a densely filled filter (almost every 64-bit word non-zero) must serialize with
- * the dense encoding -- smaller than the raw bitset plus a small header, never the
- * sparse bloat it used to produce. format byte high nibble == 1 marks dense. */
-void test_bloom_filter_dense_encoding(void)
-{
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 1000), 0);
-
-    /* over-fill so essentially every word has a bit set */
-    for (int i = 0; i < 2000; i++)
+    const int n = 1000;
+    char(*keys)[16] = malloc((size_t)n * sizeof(*keys));
+    const char *kptrs[1000];
+    for (int i = 0; i < n; i++)
     {
-        char key[24];
-        int n = snprintf(key, sizeof(key), "dense_key_%d", i);
-        bloom_filter_add(bf, (const uint8_t *)key, (size_t)n);
+        snprintf(keys[i], sizeof(keys[i]), "key-%d", i);
+        kptrs[i] = keys[i];
     }
 
-    size_t size;
-    uint8_t *data = bloom_filter_serialize(bf, &size);
-    ASSERT_TRUE(data != NULL);
+    size_t size = 0;
+    uint8_t *blob = build_serialized(0.01, n, kptrs, n, &size);
+    ASSERT_TRUE(blob != NULL);
 
-    /* versioned + dense framing */
-    ASSERT_EQ(data[0], 0x00);
-    ASSERT_EQ(data[1] >> 4, 1);   /* encoding nibble == dense */
-    ASSERT_EQ(data[1] & 0x0F, 2); /* hash version 2 */
+    int false_positives = 0;
+    const int probes = 10000;
+    for (int i = 0; i < probes; i++)
+    {
+        char absent[24];
+        snprintf(absent, sizeof(absent), "absent-%d", i);
+        if (bloom_filter_contains_serialized(blob, size, (const uint8_t *)absent, strlen(absent)) ==
+            1)
+            false_positives++;
+    }
+    /* target is 1%, allow generous slack for a finite sample */
+    ASSERT_TRUE(false_positives < probes / 20); /* under 5% */
 
-    /* dense output must not exceed the raw bitset plus a tiny header -- the whole
-     * point of the encoding is that it never bloats past raw */
-    ASSERT_TRUE(size <= (size_t)bf->size_in_words * 8 + 16);
+    free(blob);
+    free(keys);
+}
 
-    bloom_filter_t *rt = bloom_filter_deserialize(data, size);
-    ASSERT_TRUE(rt != NULL);
-    ASSERT_EQ(rt->m, bf->m);
-    ASSERT_EQ(rt->h, bf->h);
-    ASSERT_EQ(rt->size_in_words, bf->size_in_words);
-    ASSERT_EQ(rt->hash_version, bf->hash_version);
-    for (unsigned int i = 0; i < bf->size_in_words; i++) ASSERT_EQ(rt->bitset[i], bf->bitset[i]);
+/* binary keys with embedded NULs round-trip */
+void test_bloom_filter_binary_keys(void)
+{
+    bloom_filter_t *bf = NULL;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 8), 0);
+    const uint8_t key1[] = {0x00, 0x01, 0x00, 0xFF, 0x00};
+    const uint8_t key2[] = {0xFF, 0x00, 0xAB, 0x00, 0xCD};
+    bloom_filter_add(bf, key1, sizeof(key1));
+    bloom_filter_add(bf, key2, sizeof(key2));
 
-    free(data);
+    size_t size = 0;
+    uint8_t *blob = bloom_filter_serialize(bf, &size);
     bloom_filter_free(bf);
-    bloom_filter_free(rt);
+    ASSERT_TRUE(blob != NULL);
+
+    ASSERT_EQ(bloom_filter_contains_serialized(blob, size, key1, sizeof(key1)), 1);
+    ASSERT_EQ(bloom_filter_contains_serialized(blob, size, key2, sizeof(key2)), 1);
+    free(blob);
 }
 
-/* a sparsely filled filter keeps the sparse encoding, and its framing is the
- * byte-identical legacy v2 form (0x00, 0x02) so older binaries still read it */
-void test_bloom_filter_sparse_encoding_unchanged(void)
+/* contains_serialized rejects bad arguments and malformed buffers rather than over-reading */
+void test_bloom_filter_contains_serialized_guards(void)
 {
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100000), 0);
+    const char *keys[] = {"one", "two"};
+    size_t size = 0;
+    uint8_t *blob = build_serialized(0.01, 2, keys, 2, &size);
+    ASSERT_TRUE(blob != NULL && size > 8);
 
-    const char *keys[] = {"a", "b", "c"};
-    for (int i = 0; i < 3; i++) bloom_filter_add(bf, (const uint8_t *)keys[i], strlen(keys[i]));
+    /* null/empty entry */
+    ASSERT_EQ(bloom_filter_contains_serialized(blob, size, NULL, 3), -1);
+    ASSERT_EQ(bloom_filter_contains_serialized(blob, size, (const uint8_t *)"x", 0), -1);
+    /* null data */
+    ASSERT_EQ(bloom_filter_contains_serialized(NULL, size, (const uint8_t *)"x", 1), -1);
+    /* a buffer shorter than the header */
+    ASSERT_EQ(bloom_filter_contains_serialized(blob, 4, (const uint8_t *)"one", 3), -1);
+    /* a truncated bitset body */
+    ASSERT_EQ(bloom_filter_contains_serialized(blob, size - 1, (const uint8_t *)"one", 3), -1);
+    /* a corrupt header (m = 0) */
+    uint8_t corrupt[16] = {0};
+    ASSERT_EQ(bloom_filter_contains_serialized(corrupt, sizeof(corrupt), (const uint8_t *)"x", 1),
+              -1);
 
-    size_t size;
-    uint8_t *data = bloom_filter_serialize(bf, &size);
-    ASSERT_TRUE(data != NULL);
-    ASSERT_EQ(data[0], 0x00);
-    ASSERT_EQ(data[1], 0x02); /* sparse + hash version 2, unchanged from legacy v2 */
-
-    bloom_filter_t *rt = bloom_filter_deserialize(data, size);
-    ASSERT_TRUE(rt != NULL);
-    for (int i = 0; i < 3; i++)
-        ASSERT_EQ(bloom_filter_contains(rt, (const uint8_t *)keys[i], strlen(keys[i])), 1);
-
-    free(data);
-    bloom_filter_free(bf);
-    bloom_filter_free(rt);
+    free(blob);
 }
 
-/* bloom_filter_contains_serialized must answer identically to deserialize + contains
- * across both encodings and both hash versions, without materializing a filter. the
- * dense path is probed in place over the buffer, the sparse path falls back to a full
- * deserialize -- either way the answer has to match the in-memory filter exactly, and
- * a malformed buffer or empty entry returns -1 */
-void test_bloom_filter_contains_serialized(void)
+/* a filter holding many keys reports them all present after serialization */
+void test_bloom_filter_many_keys(void)
 {
-    /* dense v2 -- over-fill so the serialized form is dense, then every probe the
-     * in-place path gives must match the materialized filter */
-    bloom_filter_t *dense;
-    ASSERT_EQ(bloom_filter_new(&dense, 0.01, 2000), 0);
-    for (int i = 0; i < 4000; i++)
+    const int n = 5000;
+    char(*keys)[16] = malloc((size_t)n * sizeof(*keys));
+    const char *kptrs[5000];
+    for (int i = 0; i < n; i++)
     {
-        char key[24];
-        int n = snprintf(key, sizeof(key), "dense_%d", i);
-        bloom_filter_add(dense, (const uint8_t *)key, (size_t)n);
+        snprintf(keys[i], sizeof(keys[i]), "k%d", i);
+        kptrs[i] = keys[i];
     }
-    size_t dsize;
-    uint8_t *dblob = bloom_filter_serialize(dense, &dsize);
-    ASSERT_TRUE(dblob != NULL);
-    ASSERT_EQ(dblob[1] >> 4, 1); /* confirm dense so we exercise the in-place path */
 
-    for (int i = 0; i < 4000; i++)
-    {
-        char key[24];
-        int n = snprintf(key, sizeof(key), "dense_%d", i);
-        ASSERT_EQ(bloom_filter_contains_serialized(dblob, dsize, (const uint8_t *)key, (size_t)n),
+    size_t size = 0;
+    uint8_t *blob = build_serialized(0.001, n, kptrs, n, &size);
+    ASSERT_TRUE(blob != NULL);
+
+    for (int i = 0; i < n; i++)
+        ASSERT_EQ(bloom_filter_contains_serialized(blob, size, (const uint8_t *)kptrs[i],
+                                                   strlen(kptrs[i])),
                   1);
-    }
-    int dmismatch = 0;
-    for (int i = 0; i < 8000; i++)
-    {
-        char probe[24];
-        int n = snprintf(probe, sizeof(probe), "absent_%d", i);
-        if (bloom_filter_contains_serialized(dblob, dsize, (const uint8_t *)probe, (size_t)n) !=
-            bloom_filter_contains(dense, (const uint8_t *)probe, (size_t)n))
-            dmismatch++;
-    }
-    ASSERT_EQ(dmismatch, 0);
 
-    /* sparse v2 -- a big filter with three keys serializes sparse, exercising the
-     * deserialize fallback */
-    bloom_filter_t *sparse;
-    ASSERT_EQ(bloom_filter_new(&sparse, 0.01, 100000), 0);
-    const char *skeys[] = {"alpha", "beta", "gamma"};
-    for (int i = 0; i < 3; i++)
-        bloom_filter_add(sparse, (const uint8_t *)skeys[i], strlen(skeys[i]));
-    size_t ssize;
-    uint8_t *sblob = bloom_filter_serialize(sparse, &ssize);
-    ASSERT_TRUE(sblob != NULL);
-    ASSERT_EQ(sblob[1], 0x02); /* confirm sparse so we exercise the fallback path */
-    for (int i = 0; i < 3; i++)
-        ASSERT_EQ(bloom_filter_contains_serialized(sblob, ssize, (const uint8_t *)skeys[i],
-                                                   strlen(skeys[i])),
-                  1);
-    ASSERT_EQ(
-        bloom_filter_contains_serialized(sblob, ssize, (const uint8_t *)"not_present_key_xyz", 19),
-        bloom_filter_contains(sparse, (const uint8_t *)"not_present_key_xyz", 19));
-
-    /* legacy v1 hash -- a dense filter built with the old hash must still probe
-     * consistently in place (a regression that assumed v2 would false-negative) */
-    bloom_filter_t *v1;
-    ASSERT_EQ(bloom_filter_new(&v1, 0.01, 2000), 0);
-    v1->hash_version = 1;
-    for (int i = 0; i < 4000; i++)
-    {
-        char key[24];
-        int n = snprintf(key, sizeof(key), "v1_%d", i);
-        bloom_filter_add(v1, (const uint8_t *)key, (size_t)n);
-    }
-    size_t v1size;
-    uint8_t *v1blob = bloom_filter_serialize(v1, &v1size);
-    ASSERT_TRUE(v1blob != NULL);
-    int v1mismatch = 0;
-    for (int i = 0; i < 8000; i++)
-    {
-        char probe[24];
-        int n = snprintf(probe, sizeof(probe), "v1_%d", i);
-        if (bloom_filter_contains_serialized(v1blob, v1size, (const uint8_t *)probe, (size_t)n) !=
-            bloom_filter_contains(v1, (const uint8_t *)probe, (size_t)n))
-            v1mismatch++;
-    }
-    ASSERT_EQ(v1mismatch, 0);
-
-    /* malformed and empty inputs return -1 */
-    ASSERT_EQ(bloom_filter_contains_serialized(NULL, 0, (const uint8_t *)"x", 1), -1);
-    ASSERT_EQ(bloom_filter_contains_serialized(dblob, dsize, NULL, 1), -1);
-    ASSERT_EQ(bloom_filter_contains_serialized(dblob, dsize, (const uint8_t *)"x", 0), -1);
-    ASSERT_EQ(bloom_filter_contains_serialized(dblob, 1, (const uint8_t *)"x", 1), -1);
-
-    free(dblob);
-    free(sblob);
-    free(v1blob);
-    bloom_filter_free(dense);
-    bloom_filter_free(sparse);
-    bloom_filter_free(v1);
-}
-
-/* deserialize must reject malformed buffers without over-reading, a buffer ending
- * mid-varint, a lone sentinel, an unknown hash version, an unknown encoding, and
- * a header that promises more bitset words than the buffer holds */
-void test_bloom_filter_deserialize_malformed(void)
-{
-    /* buffer ends inside a varint (legacy framing, first byte is varint(m)) */
-    uint8_t trunc_varint[1] = {0x80};
-    ASSERT_TRUE(bloom_filter_deserialize(trunc_varint, 1) == NULL);
-
-    /* lone sentinel with no format byte */
-    uint8_t lone_sentinel[1] = {0x00};
-    ASSERT_TRUE(bloom_filter_deserialize(lone_sentinel, 1) == NULL);
-
-    /* unknown hash version (low nibble 3 > current) */
-    uint8_t bad_version[2] = {0x00, 0x03};
-    ASSERT_TRUE(bloom_filter_deserialize(bad_version, 2) == NULL);
-
-    /* unknown encoding (high nibble 2), valid hash version */
-    uint8_t bad_encoding[2] = {0x00, 0x22};
-    ASSERT_TRUE(bloom_filter_deserialize(bad_encoding, 2) == NULL);
-
-    /* sparse -- count claims 3 words but only one is present */
-    uint8_t trunc_sparse[16];
-    uint8_t *p = trunc_sparse;
-    p = encode_varint32(p, 128);  /* m = 128 -> 2 words */
-    p = encode_varint32(p, 1);    /* h = 1 */
-    p = encode_varint32(p, 3);    /* non_zero_count = 3 */
-    p = encode_varint32(p, 0);    /* index 0 */
-    p = encode_varint64(p, 0xFF); /* value -- and then nothing more */
-    ASSERT_TRUE(bloom_filter_deserialize(trunc_sparse, (size_t)(p - trunc_sparse)) == NULL);
-
-    /* dense-- header says 2 words but the raw body is missing */
-    uint8_t trunc_dense[8];
-    p = trunc_dense;
-    *p++ = 0x00;                    /* sentinel */
-    *p++ = (uint8_t)((1 << 4) | 2); /* dense + hash version 2 */
-    p = encode_varint32(p, 128);    /* m = 128 -> 2 words = 16 raw bytes expected */
-    p = encode_varint32(p, 1);      /* h = 1, then 0 body bytes */
-    ASSERT_TRUE(bloom_filter_deserialize(trunc_dense, (size_t)(p - trunc_dense)) == NULL);
-}
-
-/* is_full over a multi-word filter the all-words-set return-1 path and both the
- * partial-last-word (remaining_bits != 0) and exact-multiple (== 0) branches */
-void test_bloom_filter_is_full_multiword(void)
-{
-    /* m = 96 -> 2 words, last word holds 32 valid bits (remaining_bits != 0) */
-    bloom_filter_t *bf;
-    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 10), 0);
-    ASSERT_TRUE(bf->size_in_words >= 2);
-    for (unsigned int i = 0; i < bf->size_in_words; i++) bf->bitset[i] = UINT64_MAX;
-    ASSERT_EQ(bloom_filter_is_full(bf), 1);
-
-    /* not full once a valid bit in the last word is cleared */
-    bf->bitset[bf->size_in_words - 1] &= ~1ULL;
-    ASSERT_EQ(bloom_filter_is_full(bf), 0);
-    bloom_filter_free(bf);
-
-    /* exact multiple of 64 bits -> remaining_bits == 0 branch */
-    bloom_filter_t *bf2;
-    ASSERT_EQ(bloom_filter_new(&bf2, 0.01, 10), 0);
-    bf2->m = 128; /* 2 full words, no partial tail */
-    ASSERT_EQ(bf2->size_in_words, 2u);
-    bf2->bitset[0] = UINT64_MAX;
-    bf2->bitset[1] = UINT64_MAX;
-    ASSERT_EQ(bloom_filter_is_full(bf2), 1);
-    bf2->bitset[1] = UINT64_MAX - 1;
-    ASSERT_EQ(bloom_filter_is_full(bf2), 0);
-    bloom_filter_free(bf2);
-}
-
-void test_varint_safe_bounds(void)
-{
-    uint8_t buf[VARINT64_MAX_BYTES];
-
-    /* a complete varint decodes and the returned pointer advances exactly past its bytes */
-    uint8_t *w = encode_varint32(buf, 300u); /* 300 needs 2 bytes */
-    uint32_t v32 = 0;
-    const uint8_t *r = decode_varint32_safe(buf, w, &v32);
-    ASSERT_TRUE(r == w);
-    ASSERT_EQ(v32, 300u);
-
-    uint8_t *w64 = encode_varint64(buf, 0x1234567890ABCDEFull);
-    uint64_t v64 = 0;
-    const uint8_t *r64 = decode_varint64_safe(buf, w64, &v64);
-    ASSERT_TRUE(r64 == w64);
-    ASSERT_TRUE(v64 == 0x1234567890ABCDEFull);
-
-    /* a buffer that ends mid-varint (last byte still has the continuation bit) must return NULL
-     * rather than read past end -- pass an end one byte short of the terminator */
-    ASSERT_TRUE(decode_varint32_safe(buf, w - 1, &v32) == NULL);
-    ASSERT_TRUE(decode_varint64_safe(buf, w64 - 1, &v64) == NULL);
-
-    /* an empty range returns NULL without dereferencing */
-    ASSERT_TRUE(decode_varint32_safe(buf, buf, &v32) == NULL);
-    ASSERT_TRUE(decode_varint64_safe(buf, buf, &v64) == NULL);
-
-    /* an overlong encoding (every byte carries the continuation bit) exhausts the byte budget and
-     * returns NULL instead of running off the buffer */
-    uint8_t overlong[VARINT64_MAX_BYTES];
-    for (int i = 0; i < VARINT64_MAX_BYTES; i++) overlong[i] = 0x80;
-    ASSERT_TRUE(decode_varint32_safe(overlong, overlong + VARINT32_MAX_BYTES, &v32) == NULL);
-    ASSERT_TRUE(decode_varint64_safe(overlong, overlong + VARINT64_MAX_BYTES, &v64) == NULL);
-}
-
-void test_bloom_filter_deserialize_rejects_oversized_h(void)
-{
-    /* a real filter round-trips fine -- its h is within the constructor cap, so the deserialize
-     * cap must not reject a legitimate filter */
-    bloom_filter_t *real = NULL;
-    ASSERT_EQ(bloom_filter_new(&real, 0.01, 1000), 0);
-    ASSERT_TRUE(real->h >= 1);
-    size_t slen = 0;
-    uint8_t *sbuf = bloom_filter_serialize(real, &slen);
-    ASSERT_TRUE(sbuf != NULL);
-    bloom_filter_t *rt = bloom_filter_deserialize(sbuf, slen);
-    ASSERT_TRUE(rt != NULL);
-    ASSERT_EQ(rt->h, real->h);
-    bloom_filter_free(rt);
-    free(sbuf);
-    bloom_filter_free(real);
-
-    /* a corrupt filter claiming a wildly out-of-range h is rejected rather than trusted -- h is the
-     * per-query probe count, so a multi-billion value would turn every contains() into a runaway
-     * loop. this is a legacy (no sentinel) header of varint32 m, varint32 h, varint32 count */
-    uint8_t crafted[32];
-    uint8_t *ptr = crafted;
-    ptr = encode_varint32(ptr, 1024);       /* m */
-    ptr = encode_varint32(ptr, UINT32_MAX); /* h -- far past any legitimate value */
-    ptr = encode_varint32(ptr, 0);          /* non_zero_count */
-    ASSERT_TRUE(bloom_filter_deserialize(crafted, (size_t)(ptr - crafted)) == NULL);
+    free(blob);
+    free(keys);
 }
 
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
-    RUN_TEST(test_varint_safe_bounds, tests_passed);
-    RUN_TEST(test_bloom_filter_deserialize_rejects_oversized_h, tests_passed);
-    RUN_TEST(test_bloom_filter_new_failure_nulls_out, tests_passed);
-    RUN_TEST(test_bloom_filter_new, tests_passed);
-    RUN_TEST(test_bloom_filter_add_and_contains, tests_passed);
-    RUN_TEST(test_bloom_filter_serialize_deserialize, tests_passed);
-    RUN_TEST(test_bloom_filter_hash_versioning, tests_passed);
-    RUN_TEST(test_false_positive_rate, tests_passed);
-    RUN_TEST(test_boundary_conditions, tests_passed);
-    RUN_TEST(test_bloom_filter_edge_cases, tests_passed);
-    RUN_TEST(test_bloom_filter_boundary_values, tests_passed);
-    RUN_TEST(test_bloom_filter_serialize_empty, tests_passed);
-    RUN_TEST(test_bloom_filter_duplicate_keys, tests_passed);
-    RUN_TEST(test_bloom_filter_invalid_inputs, tests_passed);
-    RUN_TEST(test_bloom_filter_hash_distribution, tests_passed);
-    RUN_TEST(test_bloom_filter_deserialize_corrupted, tests_passed);
+    RUN_TEST(test_bloom_filter_new_invalid_args, tests_passed);
+    RUN_TEST(test_bloom_filter_present_keys, tests_passed);
+    RUN_TEST(test_bloom_filter_false_positive_rate, tests_passed);
     RUN_TEST(test_bloom_filter_binary_keys, tests_passed);
-    RUN_TEST(test_bloom_filter_free_null, tests_passed);
-    RUN_TEST(test_bloom_filter_large_capacity_random_keys, tests_passed);
-    RUN_TEST(test_bloom_filter_hash_direct, tests_passed);
-    RUN_TEST(test_bloom_filter_is_full_true, tests_passed);
-    RUN_TEST(test_bloom_filter_null_safety, tests_passed);
-    RUN_TEST(test_bloom_filter_deserialize_oob_index, tests_passed);
-    RUN_TEST(test_bloom_filter_serialize_roundtrip_size_in_words, tests_passed);
-    RUN_TEST(test_bloom_filter_deserialize_corrupted_assertions, tests_passed);
-    RUN_TEST(test_bloom_filter_null_entry, tests_passed);
-    RUN_TEST(test_bloom_filter_is_full_null_bitset, tests_passed);
-    RUN_TEST(test_bloom_filter_hash_key_sizes, tests_passed);
-    RUN_TEST(test_bloom_filter_hash_endianness_stable, tests_passed);
-    RUN_TEST(test_bloom_filter_deserialize_overflow_m, tests_passed);
-    RUN_TEST(test_bloom_filter_dense_encoding, tests_passed);
-    RUN_TEST(test_bloom_filter_sparse_encoding_unchanged, tests_passed);
-    RUN_TEST(test_bloom_filter_contains_serialized, tests_passed);
-    RUN_TEST(test_bloom_filter_deserialize_malformed, tests_passed);
-    RUN_TEST(test_bloom_filter_is_full_multiword, tests_passed);
-    RUN_TEST(benchmark_bloom_filter, tests_passed);
-
+    RUN_TEST(test_bloom_filter_contains_serialized_guards, tests_passed);
+    RUN_TEST(test_bloom_filter_many_keys, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

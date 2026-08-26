@@ -30,13 +30,13 @@ process.
     - Agreement to the CLA (individual) or CCLA (corporate).
 
 The CLA and CCLA do **not** change the open source license of TidesDB.
-All contributions remain distributed under the Mozilla Public License v2.0 (MPLv2).
+All contributions remain distributed under the Mozilla Public version 2.0.0 license.
 
 ---
 
 ### Developer Certificate of Origin
 
-By contributing to TidesDB, you certify that your contribution was created in whole or in part by you, that you have the right to submit it under the Mozilla Public License Version 2.0, and that you understand and agree that the project and your contribution are public and that a record of the contribution (including all personal information you submit with it) is maintained indefinitely and may be redistributed consistent with the project and the license.
+By contributing to TidesDB, you certify that your contribution was created in whole or in part by you, that you have the right to submit it under the Mozilla Public Version 2.0 license, and that you understand and agree that the project and your contribution are public and that a record of the contribution (including all personal information you submit with it) is maintained indefinitely and may be redistributed consistent with the project and the license.
 
 All contributions must include a "Signed-off-by" line in the commit message. This certifies that you agree to the Developer Certificate of Origin (see [Developer Certificate of Origin (DCO)](DCO) file for the full text).
 

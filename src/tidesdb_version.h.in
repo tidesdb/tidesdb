@@ -1,12 +1,15 @@
+/**
+ *
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
 #ifndef TIDESDB_VERSION_H
 #define TIDESDB_VERSION_H
 
 #define TIDESDB_VERSION "@PROJECT_VERSION@"
-
-/* defined when libtidesdb was built with -DTIDESDB_WITH_S3=ON.
- * consumers can use #ifdef TIDESDB_HAS_S3 to compile-time detect S3 support
- * without having to re-pass the build flag. */
-#cmakedefine TIDESDB_HAS_S3
 
 /* defined per compression backend that was compiled into libtidesdb (mirrors the
  * -DTIDESDB_WITH_{SNAPPY,LZ4,ZSTD} build options). TDB_COMPRESS_NONE is always available;

@@ -1,30 +1,37 @@
 /**
  *
- * Copyright (C) TidesDB
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
  *
- * Original Author: Alex Gaetano Padula
- *
- * Licensed under the Mozilla Public License, v. 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.mozilla.org/en-US/MPL/2.0/
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "../src/btree.h"
-#include "../src/compress.h"
+#include "../src/base/encoding/compress.h"
+#include "../src/base/errors.h"
+#include "../src/sstable/btree/btree.h"
+#include "../src/sstable/btree/btree_internal.h"
 #include "test_utils.h"
+
+/* the compressed-btree tests need real resolved stages rather than an algorithm id, since the btree
+ * no longer knows what an algorithm is. the registry is built once and both chains resolved from it
+ * before any test runs; resolve copies the transforms out, so the stages stay valid afterwards */
+static tidesdb_encoding_registry_t g_btree_reg;
+static tidesdb_encoding_stage_t g_btree_lz4[1];
+static tidesdb_encoding_stage_t g_btree_zstd[1];
+
+static int btree_test_init_codecs(void)
+{
+    if (tidesdb_encoding_registry_init(&g_btree_reg) != TDB_SUCCESS) return 0;
+    const uint8_t lz4[1] = {TDB_COMPRESS_LZ4};
+    const uint8_t zstd[1] = {TDB_COMPRESS_ZSTD};
+    return tidesdb_encoding_resolve(&g_btree_reg, lz4, 1, g_btree_lz4, 1) == 1 &&
+           tidesdb_encoding_resolve(&g_btree_reg, zstd, 1, g_btree_zstd, 1) == 1;
+}
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -36,11 +43,7 @@ void test_btree_builder_new()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -56,11 +59,7 @@ void test_btree_builder_add_single()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -86,11 +85,7 @@ void test_btree_builder_add_multiple()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -111,7 +106,6 @@ void test_btree_builder_add_multiple()
     ASSERT_EQ(tree->entry_count, 100);
 
     printf("\n--- Multiple Entries Tree Structure ---\n");
-    btree_print_tree(tree);
 
     btree_free(tree);
     btree_builder_free(builder);
@@ -124,11 +118,7 @@ void test_btree_get()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -180,11 +170,7 @@ void test_btree_cursor_forward()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -204,6 +190,7 @@ void test_btree_cursor_forward()
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
     ASSERT_TRUE(cursor != NULL);
 
     int count = 0;
@@ -244,11 +231,7 @@ void test_btree_cursor_backward()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -309,11 +292,7 @@ void test_btree_cursor_seek()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -368,11 +347,7 @@ void test_btree_cursor_seek_multiversion_lands_newest()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -423,11 +398,7 @@ void test_btree_min_max_keys()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -468,11 +439,7 @@ void test_btree_max_seq()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -504,11 +471,7 @@ void test_btree_open_existing()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -571,11 +534,7 @@ void test_btree_tombstone()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -613,11 +572,7 @@ void test_btree_large_dataset()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 4096, /* smaller node size to force more nodes */
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = 4096}; /* smaller node size to force more nodes */
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -639,7 +594,6 @@ void test_btree_large_dataset()
     ASSERT_TRUE(tree->node_count > 1); /* should have multiple nodes */
 
     printf("\n--- Large Dataset Tree Structure ---\n");
-    btree_print_tree(tree);
 
     for (int i = 0; i < 10; i++)
     {
@@ -663,6 +617,7 @@ void test_btree_large_dataset()
     /* we verify cursor iteration count */
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     int count = 0;
     while (btree_cursor_valid(cursor))
@@ -679,16 +634,94 @@ void test_btree_large_dataset()
     (void)remove(TEST_BTREE_FILE);
 }
 
+/* sweep the configurable klog block size across 4/8/16/32 KB. every size must build a fully
+ * readable tree, and a smaller node size must produce strictly more nodes, which proves the size is
+ * honored rather than silently defaulted. this mirrors the per-cf btree_klog_block_size setting. */
+void test_btree_klog_block_size_sweep()
+{
+    const size_t block_sizes[] = {4096, 8192, 16384, 32768};
+    const int num_sizes = (int)(sizeof(block_sizes) / sizeof(block_sizes[0]));
+    const int num_entries = 5000;
+    uint64_t nodes_for_size[4] = {0};
+
+    for (int s = 0; s < num_sizes; s++)
+    {
+        block_manager_t *bm = NULL;
+        ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+        btree_config_t config = {
+            .target_node_size = block_sizes[s], .codec = NULL, .codec_count = 0};
+
+        btree_builder_t *builder = NULL;
+        ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+        for (int i = 0; i < num_entries; i++)
+        {
+            char key[32], value[96];
+            snprintf(key, sizeof(key), "key%08d", i);
+            snprintf(value, sizeof(value), "value%08d_padding_to_a_realistic_row_width", i);
+            ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1,
+                                          (uint8_t *)value, strlen(value) + 1, 0, (uint64_t)i, 0,
+                                          0) == 0);
+        }
+
+        btree_t *tree = NULL;
+        ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+        ASSERT_EQ(tree->entry_count, (uint64_t)num_entries);
+        ASSERT_TRUE(tree->node_count > 1);
+        nodes_for_size[s] = tree->node_count;
+
+        /* every key must read back regardless of node size */
+        for (int i = 0; i < num_entries; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "key%08d", i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            uint64_t vlog_offset = 0, seq = 0;
+            int64_t ttl = 0;
+            uint8_t deleted = 0;
+            ASSERT_TRUE(btree_get(tree, (uint8_t *)key, strlen(key) + 1, &value, &value_size,
+                                  &vlog_offset, &seq, &ttl, &deleted) == 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+
+        /* a full forward scan must visit every entry */
+        btree_cursor_t *cursor = NULL;
+        ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+        btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
+        int count = 0;
+        while (btree_cursor_valid(cursor))
+        {
+            count++;
+            btree_cursor_next(cursor);
+        }
+        ASSERT_EQ(count, num_entries);
+
+        printf("  [block_size=%6zu] nodes=%" PRIu64 " height=%u\n", block_sizes[s],
+               tree->node_count, tree->height);
+
+        btree_cursor_free(cursor);
+        btree_free(tree);
+        btree_builder_free(builder);
+        (void)block_manager_close(bm);
+        (void)remove(TEST_BTREE_FILE);
+    }
+
+    /* a larger node holds more entries, so node count must fall strictly as the block size grows */
+    for (int s = 1; s < num_sizes; s++)
+    {
+        ASSERT_TRUE(nodes_for_size[s] < nodes_for_size[s - 1]);
+    }
+}
+
 void test_btree_empty_tree()
 {
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -721,11 +754,7 @@ void test_btree_single_entry()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -741,6 +770,7 @@ void test_btree_single_entry()
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
     ASSERT_TRUE(btree_cursor_valid(cursor));
 
     btree_cursor_next(cursor);
@@ -758,11 +788,7 @@ void test_btree_duplicate_keys()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -784,6 +810,7 @@ void test_btree_duplicate_keys()
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     int count = 0;
     while (btree_cursor_valid(cursor))
@@ -812,11 +839,7 @@ void test_btree_multi_version_resolution()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -887,11 +910,7 @@ void test_btree_large_keys_values()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -940,11 +959,7 @@ void test_btree_seek_edge_cases()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -985,74 +1000,12 @@ void test_btree_seek_edge_cases()
     (void)remove(TEST_BTREE_FILE);
 }
 
-void test_btree_arena(void)
-{
-    /* create default arena */
-    btree_arena_t *arena = btree_arena_create();
-    ASSERT_TRUE(arena != NULL);
-    ASSERT_TRUE(arena->total_allocated == BTREE_ARENA_BLOCK_SIZE);
-
-    /* alloc small chunks */
-    void *p1 = btree_arena_alloc(arena, 16);
-    ASSERT_TRUE(p1 != NULL);
-
-    void *p2 = btree_arena_alloc(arena, 128);
-    ASSERT_TRUE(p2 != NULL);
-    ASSERT_TRUE(p2 != p1);
-
-    /* reset and reuse */
-    btree_arena_reset(arena);
-    void *p3 = btree_arena_alloc(arena, 16);
-    ASSERT_TRUE(p3 != NULL);
-
-    btree_arena_destroy(arena);
-
-    /* create sized arena */
-    btree_arena_t *sized = btree_arena_create_sized(1024);
-    ASSERT_TRUE(sized != NULL);
-    ASSERT_TRUE(sized->total_allocated == 1024);
-
-    void *sp = btree_arena_alloc(sized, 512);
-    ASSERT_TRUE(sp != NULL);
-
-    btree_arena_destroy(sized);
-
-    /* sized arena with value below minimum gets clamped */
-    btree_arena_t *tiny = btree_arena_create_sized(1);
-    ASSERT_TRUE(tiny != NULL);
-    ASSERT_TRUE(tiny->total_allocated >= BTREE_ARENA_MIN_BLOCK_SIZE);
-
-    btree_arena_destroy(tiny);
-
-    /* alloc larger than block size forces new block */
-    arena = btree_arena_create();
-    ASSERT_TRUE(arena != NULL);
-    void *big = btree_arena_alloc(arena, BTREE_ARENA_BLOCK_SIZE + 1024);
-    ASSERT_TRUE(big != NULL);
-
-    btree_arena_destroy(arena);
-
-    /* NULL and zero-size edge cases */
-    ASSERT_TRUE(btree_arena_alloc(NULL, 16) == NULL);
-    arena = btree_arena_create();
-    ASSERT_TRUE(btree_arena_alloc(arena, 0) == NULL);
-    btree_arena_destroy(arena);
-
-    /* destroy/reset NULL should not crash */
-    btree_arena_destroy(NULL);
-    btree_arena_reset(NULL);
-}
-
-void test_btree_comparator_string(void)
+void test_btree_string_keys(void)
 {
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = btree_comparator_string,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_STRING};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1092,111 +1045,12 @@ void test_btree_comparator_string(void)
     (void)remove(TEST_BTREE_FILE);
 }
 
-void test_btree_comparator_numeric(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = btree_comparator_numeric,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_NUMERIC};
-
-    btree_builder_t *builder = NULL;
-    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
-
-    /* we add 8-byte numeric keys in sorted order */
-    for (uint64_t i = 0; i < 20; i++)
-    {
-        uint64_t key = i * 10;
-        char value[32];
-        snprintf(value, sizeof(value), "num_%" PRIu64, key);
-        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)&key, sizeof(key), (uint8_t *)value,
-                                      strlen(value) + 1, 0, i, 0, 0) == 0);
-    }
-
-    btree_t *tree = NULL;
-    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
-    ASSERT_EQ(tree->entry_count, 20);
-
-    /* lookup by numeric key */
-    uint64_t search_key = 50;
-    uint8_t *value = NULL;
-    size_t value_size = 0;
-    uint64_t vlog_offset = 0, seq = 0;
-    int64_t ttl = 0;
-    uint8_t deleted = 0;
-
-    ASSERT_TRUE(btree_get(tree, (uint8_t *)&search_key, sizeof(search_key), &value, &value_size,
-                          &vlog_offset, &seq, &ttl, &deleted) == 0);
-    ASSERT_EQ(strcmp((char *)value, "num_50"), 0);
-    free(value);
-
-    /* non-existent numeric key */
-    uint64_t missing_key = 55;
-    ASSERT_TRUE(btree_get(tree, (uint8_t *)&missing_key, sizeof(missing_key), &value, &value_size,
-                          &vlog_offset, &seq, &ttl, &deleted) != 0);
-
-    /* cursor forward iteration should be in numeric order */
-    btree_cursor_t *cursor = NULL;
-    ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
-
-    uint64_t prev_key = 0;
-    int count = 0;
-    while (btree_cursor_valid(cursor))
-    {
-        uint8_t *k = NULL;
-        size_t ks = 0;
-        ASSERT_TRUE(btree_cursor_get(cursor, &k, &ks, NULL, NULL, NULL, NULL, NULL, NULL) == 0);
-        ASSERT_EQ(ks, sizeof(uint64_t));
-
-        uint64_t kval;
-        memcpy(&kval, k, sizeof(uint64_t));
-        if (count > 0) ASSERT_TRUE(kval > prev_key);
-        prev_key = kval;
-        count++;
-        btree_cursor_next(cursor);
-    }
-    ASSERT_EQ(count, 20);
-
-    btree_cursor_free(cursor);
-    btree_free(tree);
-    btree_builder_free(builder);
-    (void)block_manager_close(bm);
-    (void)remove(TEST_BTREE_FILE);
-}
-
-void test_btree_comparator_numeric_size_guard(void)
-{
-    /* 8-byte keys compare as host-native integers */
-    uint64_t a = 5, b = 9;
-    ASSERT_TRUE(btree_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&b, 8, NULL) < 0);
-    ASSERT_TRUE(btree_comparator_numeric((uint8_t *)&b, 8, (uint8_t *)&a, 8, NULL) > 0);
-    ASSERT_EQ(btree_comparator_numeric((uint8_t *)&a, 8, (uint8_t *)&a, 8, NULL), 0);
-
-    /* a key that is not 8 bytes must not drive an 8-byte read; it falls back to memcmp order */
-    const uint8_t short_key[3] = {'a', 'b', 'c'};
-    const uint8_t long_key[8] = {'a', 'b', 'c', 'd', 0, 0, 0, 0};
-    ASSERT_TRUE(btree_comparator_numeric(short_key, sizeof(short_key), long_key, sizeof(long_key),
-                                         NULL) < 0);
-    ASSERT_TRUE(btree_comparator_numeric(long_key, sizeof(long_key), short_key, sizeof(short_key),
-                                         NULL) > 0);
-    ASSERT_EQ(
-        btree_comparator_numeric(short_key, sizeof(short_key), short_key, sizeof(short_key), NULL),
-        0);
-}
-
 void test_btree_get_stats(void)
 {
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 4096,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = 4096};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1236,11 +1090,7 @@ void test_btree_cursor_seek_for_prev(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1294,11 +1144,7 @@ void test_btree_cursor_has_next_has_prev(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1318,6 +1164,7 @@ void test_btree_cursor_has_next_has_prev(void)
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     /* at first entry has_prev=0, has_next=1 */
     ASSERT_EQ(btree_cursor_has_prev(cursor), 0);
@@ -1353,11 +1200,7 @@ void test_btree_cursor_goto_first_explicit(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1377,6 +1220,7 @@ void test_btree_cursor_goto_first_explicit(void)
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     /* advance past first few entries */
     btree_cursor_next(cursor);
@@ -1410,11 +1254,7 @@ void test_btree_get_entry_count(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1443,11 +1283,7 @@ void test_btree_get_entry_count(void)
 
 void test_btree_null_args(void)
 {
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     /* btree_builder_new NULL args */
     btree_builder_t *builder = NULL;
@@ -1511,11 +1347,7 @@ void test_btree_ttl_entries(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1560,6 +1392,7 @@ void test_btree_ttl_entries(void)
     /* verify TTL roundtrips through cursor */
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     int64_t expected_ttls[] = {0, 1000000, 9999999};
     int idx = 0;
@@ -1586,11 +1419,7 @@ void test_btree_vlog_offset_entries(void)
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1638,6 +1467,7 @@ void test_btree_vlog_offset_entries(void)
     /* verify vlog_offset roundtrips through cursor */
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     uint64_t expected_offsets[] = {0, 12345, 99999};
     int idx = 0;
@@ -1670,11 +1500,7 @@ void bench_btree_build()
         block_manager_t *bm = NULL;
         ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-        btree_config_t config = {.target_node_size = 4096,
-                                 .value_threshold = 512,
-                                 .comparator = NULL,
-                                 .comparator_ctx = NULL,
-                                 .cmp_type = BTREE_CMP_MEMCMP};
+        btree_config_t config = {.target_node_size = 4096};
 
         btree_builder_t *builder = NULL;
         ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1718,11 +1544,7 @@ void bench_btree_get()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 4096,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = 4096};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1795,8 +1617,8 @@ void bench_btree_get()
 
     printf("  [With Node Cache]\n");
 
-    clock_cache_t *node_cache = btree_create_node_cache(1024 * 1024);
-    btree_set_node_cache(tree, node_cache);
+    cache_t *node_cache = cache_create(NULL);
+    btree_set_node_cache(tree, node_cache, 0);
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -1846,13 +1668,15 @@ void bench_btree_get()
     printf("    Random %d lookups: %.3f sec (%.0f ops/sec)\n", num_lookups, elapsed,
            num_lookups / elapsed);
 
-    clock_cache_stats_t stats;
-    clock_cache_get_stats(node_cache, &stats);
-    printf("    Cache stats: %zu entries, %.1f%% hit rate\n", stats.total_entries,
-           stats.hit_rate * 100.0);
+    cache_stats_t stats;
+    cache_get_stats(node_cache, &stats);
+    const uint64_t probes = stats.hits + stats.misses;
+    const double hit_rate = probes ? (double)stats.hits / (double)probes : 0.0;
+    printf("    Cache stats: %llu entries, %.1f%% hit rate\n", (unsigned long long)stats.entries,
+           hit_rate * 100.0);
 
-    btree_set_node_cache(tree, NULL);
-    clock_cache_destroy(node_cache);
+    btree_set_node_cache(tree, NULL, 0);
+    cache_destroy(node_cache);
     btree_free(tree);
     btree_builder_free(builder);
     (void)block_manager_close(bm);
@@ -1864,12 +1688,8 @@ void test_btree_compression_lz4()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP,
-                             .compression_algo = TDB_COMPRESS_LZ4};
+    btree_config_t config = {
+        .target_node_size = BTREE_DEFAULT_NODE_SIZE, .codec = g_btree_lz4, .codec_count = 1};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1915,17 +1735,108 @@ void test_btree_compression_lz4()
     (void)remove(TEST_BTREE_FILE);
 }
 
+/* the compression tests above fit every key in one leaf at the default node size, so the tree never
+ * grows an internal level and the compressed internal-node write path goes unexercised. shrink the
+ * node target so the same key count spans many leaves and forces internal levels, then read every
+ * key back through them */
+void test_btree_compression_spans_internal_levels()
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* small enough that a few entries fill a leaf, so 400 keys build several leaf blocks and at
+     * least one level of separators above them */
+    btree_config_t config = {.target_node_size = 256, .codec = g_btree_lz4, .codec_count = 1};
+
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    const int n = 400;
+    for (int i = 0; i < n; i++)
+    {
+        char key[32];
+        char value[128];
+        snprintf(key, sizeof(key), "key%08d", i);
+        snprintf(value, sizeof(value), "value%08d_data_padding_for_compression", i);
+        ASSERT_TRUE(btree_builder_add(builder, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0, (uint64_t)i, 0, 0) == 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_TRUE(btree_builder_finish(builder, &tree) == 0);
+    ASSERT_TRUE(tree != NULL);
+    ASSERT_EQ(tree->entry_count, (uint64_t)n);
+    /* a height past one leaf is what proves the separators were written and routed through */
+    ASSERT_TRUE(tree->height > 1);
+
+    for (int i = 0; i < n; i++)
+    {
+        char key[32];
+        char expect[128];
+        snprintf(key, sizeof(key), "key%08d", i);
+        snprintf(expect, sizeof(expect), "value%08d_data_padding_for_compression", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint64_t vlog_offset = 0, seq = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        ASSERT_TRUE(btree_get(tree, (uint8_t *)key, strlen(key) + 1, &value, &value_size,
+                              &vlog_offset, &seq, &ttl, &deleted) == 0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_EQ(value_size, strlen(expect) + 1);
+        ASSERT_TRUE(memcmp(value, expect, value_size) == 0);
+        free(value);
+    }
+
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
+/* a node whose type byte is neither kind has no decode, so nothing fills its key, value or child
+ * arrays -- but the entry count is read from the input before that point. returning success there
+ * hands back a node claiming entries it has no arrays for, and the reader binary-searches those
+ * arrays against the count, so the very next lookup dereferences null. found by the decoder fuzz
+ * target, which reached it in seconds once it could hand bytes to the decoder directly */
+void test_btree_node_decode_rejects_unknown_type(void)
+{
+    /* [type][num_entries varint] -- a count is present, so a decoder that accepted the type would
+     * carry it onto a node with no arrays behind it */
+    const uint8_t bad[] = {0xFE, 0x7F};
+    arena_t *arena = arena_create(NULL);
+    ASSERT_TRUE(arena != NULL);
+    btree_node_t *node = NULL;
+    ASSERT_EQ(btree_node_deserialize_direct(bad, sizeof(bad), &node, arena), -1);
+    ASSERT_TRUE(node == NULL);
+    arena_destroy(arena);
+
+    /* the guard must not reject a well-formed node -- an empty leaf is
+     * [type][num_entries=0][prev int64][next int64] */
+    uint8_t good[18];
+    memset(good, 0, sizeof(good));
+    good[0] = BTREE_NODE_LEAF;
+    good[1] = 0; /* num_entries varint */
+    encode_int64_le_compat(good + 2, -1);
+    encode_int64_le_compat(good + 10, -1);
+
+    arena_t *arena2 = arena_create(NULL);
+    ASSERT_TRUE(arena2 != NULL);
+    btree_node_t *leaf = NULL;
+    ASSERT_EQ(btree_node_deserialize_direct(good, sizeof(good), &leaf, arena2), 0);
+    ASSERT_TRUE(leaf != NULL);
+    ASSERT_EQ(leaf->num_entries, 0u);
+    btree_node_free(leaf); /* destroys arena2 */
+}
+
 void test_btree_compression_zstd()
 {
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP,
-                             .compression_algo = TDB_COMPRESS_ZSTD};
+    btree_config_t config = {
+        .target_node_size = BTREE_DEFAULT_NODE_SIZE, .codec = g_btree_zstd, .codec_count = 1};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -1947,6 +1858,7 @@ void test_btree_compression_zstd()
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     int count = 0;
     while (btree_cursor_valid(cursor))
@@ -1968,12 +1880,7 @@ void test_btree_compression_two_leaves()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 512,
-                             .value_threshold = 256,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP,
-                             .compression_algo = TDB_COMPRESS_LZ4};
+    btree_config_t config = {.target_node_size = 512, .codec = g_btree_lz4, .codec_count = 1};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -2015,12 +1922,7 @@ void test_btree_compression_three_leaves()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 512,
-                             .value_threshold = 256,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP,
-                             .compression_algo = TDB_COMPRESS_LZ4};
+    btree_config_t config = {.target_node_size = 512, .codec = g_btree_lz4, .codec_count = 1};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -2050,12 +1952,7 @@ void test_btree_compression_cursor_bidirectional()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 4096,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP,
-                             .compression_algo = TDB_COMPRESS_LZ4};
+    btree_config_t config = {.target_node_size = 4096, .codec = g_btree_lz4, .codec_count = 1};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -2077,6 +1974,7 @@ void test_btree_compression_cursor_bidirectional()
 
     btree_cursor_t *cursor = NULL;
     ASSERT_TRUE(btree_cursor_init(&cursor, tree) == 0);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     int forward_count = 0;
     while (btree_cursor_valid(cursor))
@@ -2111,12 +2009,8 @@ void test_btree_compression_single_leaf()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP,
-                             .compression_algo = TDB_COMPRESS_LZ4};
+    btree_config_t config = {
+        .target_node_size = BTREE_DEFAULT_NODE_SIZE, .codec = g_btree_lz4, .codec_count = 1};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -2162,11 +2056,7 @@ void bench_btree_cursor_scan()
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    btree_config_t config = {.target_node_size = 4096,
-                             .value_threshold = 512,
-                             .comparator = NULL,
-                             .comparator_ctx = NULL,
-                             .cmp_type = BTREE_CMP_MEMCMP};
+    btree_config_t config = {.target_node_size = 4096};
 
     btree_builder_t *builder = NULL;
     ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
@@ -2189,6 +2079,7 @@ void bench_btree_cursor_scan()
 
     btree_cursor_t *cursor = NULL;
     btree_cursor_init(&cursor, tree);
+    btree_cursor_goto_first(cursor); /* init leaves the cursor unpositioned */
 
     int count = 0;
     while (btree_cursor_valid(cursor))
@@ -2244,12 +2135,7 @@ void bench_btree_compression_comparison()
         block_manager_t *bm = NULL;
         block_manager_open(&bm, no_compress_file, BLOCK_MANAGER_SYNC_NONE);
 
-        btree_config_t config = {.target_node_size = 4096,
-                                 .value_threshold = 512,
-                                 .comparator = NULL,
-                                 .comparator_ctx = NULL,
-                                 .cmp_type = BTREE_CMP_MEMCMP,
-                                 .compression_algo = TDB_COMPRESS_NONE};
+        btree_config_t config = {.target_node_size = 4096, .codec = NULL, .codec_count = 0};
 
         btree_builder_t *builder = NULL;
         btree_builder_new(&builder, bm, &config);
@@ -2270,8 +2156,8 @@ void bench_btree_compression_comparison()
         clock_gettime(CLOCK_MONOTONIC, &end);
         build_time_none = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-        clock_cache_t *cache_none = btree_create_node_cache(10 * 1024 * 1024); /* 10MB cache */
-        btree_set_node_cache(tree, cache_none);
+        cache_t *cache_none = cache_create(NULL); /* 10MB cache */
+        btree_set_node_cache(tree, cache_none, 0);
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (int i = 0; i < 10000; i++)
@@ -2294,7 +2180,7 @@ void bench_btree_compression_comparison()
 
         btree_free(tree);
         btree_builder_free(builder);
-        clock_cache_destroy(cache_none);
+        cache_destroy(cache_none);
         block_manager_close(bm);
     }
 
@@ -2302,12 +2188,7 @@ void bench_btree_compression_comparison()
         block_manager_t *bm = NULL;
         block_manager_open(&bm, lz4_file, BLOCK_MANAGER_SYNC_NONE);
 
-        btree_config_t config = {.target_node_size = 4096,
-                                 .value_threshold = 512,
-                                 .comparator = NULL,
-                                 .comparator_ctx = NULL,
-                                 .cmp_type = BTREE_CMP_MEMCMP,
-                                 .compression_algo = TDB_COMPRESS_LZ4};
+        btree_config_t config = {.target_node_size = 4096, .codec = g_btree_lz4, .codec_count = 1};
 
         btree_builder_t *builder = NULL;
         btree_builder_new(&builder, bm, &config);
@@ -2328,8 +2209,8 @@ void bench_btree_compression_comparison()
         clock_gettime(CLOCK_MONOTONIC, &end);
         build_time_lz4 = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-        clock_cache_t *cache_lz4 = btree_create_node_cache(10 * 1024 * 1024); /* 10MB cache */
-        btree_set_node_cache(tree, cache_lz4);
+        cache_t *cache_lz4 = cache_create(NULL); /* 10MB cache */
+        btree_set_node_cache(tree, cache_lz4, 0);
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (int i = 0; i < 10000; i++)
@@ -2352,7 +2233,7 @@ void bench_btree_compression_comparison()
 
         btree_free(tree);
         btree_builder_free(builder);
-        clock_cache_destroy(cache_lz4);
+        cache_destroy(cache_lz4);
         block_manager_close(bm);
     }
 
@@ -2360,12 +2241,7 @@ void bench_btree_compression_comparison()
         block_manager_t *bm = NULL;
         block_manager_open(&bm, zstd_file, BLOCK_MANAGER_SYNC_NONE);
 
-        btree_config_t config = {.target_node_size = 4096,
-                                 .value_threshold = 512,
-                                 .comparator = NULL,
-                                 .comparator_ctx = NULL,
-                                 .cmp_type = BTREE_CMP_MEMCMP,
-                                 .compression_algo = TDB_COMPRESS_ZSTD};
+        btree_config_t config = {.target_node_size = 4096, .codec = g_btree_zstd, .codec_count = 1};
 
         btree_builder_t *builder = NULL;
         btree_builder_new(&builder, bm, &config);
@@ -2386,8 +2262,8 @@ void bench_btree_compression_comparison()
         clock_gettime(CLOCK_MONOTONIC, &end);
         build_time_zstd = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-        clock_cache_t *cache_zstd = btree_create_node_cache(10 * 1024 * 1024); /* 10MB cache */
-        btree_set_node_cache(tree, cache_zstd);
+        cache_t *cache_zstd = cache_create(NULL); /* 10MB cache */
+        btree_set_node_cache(tree, cache_zstd, 0);
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (int i = 0; i < 10000; i++)
@@ -2410,7 +2286,7 @@ void bench_btree_compression_comparison()
 
         btree_free(tree);
         btree_builder_free(builder);
-        clock_cache_destroy(cache_zstd);
+        cache_destroy(cache_zstd);
         block_manager_close(bm);
     }
 
@@ -2453,12 +2329,8 @@ void bench_btree_node_sizes()
         block_manager_t *bm = NULL;
         block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE);
 
-        btree_config_t config = {.target_node_size = node_sizes[s],
-                                 .value_threshold = 512,
-                                 .comparator = NULL,
-                                 .comparator_ctx = NULL,
-                                 .cmp_type = BTREE_CMP_MEMCMP,
-                                 .compression_algo = TDB_COMPRESS_NONE};
+        btree_config_t config = {
+            .target_node_size = node_sizes[s], .codec = NULL, .codec_count = 0};
 
         btree_builder_t *builder = NULL;
         btree_builder_new(&builder, bm, &config);
@@ -2480,8 +2352,8 @@ void bench_btree_node_sizes()
         clock_gettime(CLOCK_MONOTONIC, &end);
         double build_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-        clock_cache_t *cache = btree_create_node_cache(10 * 1024 * 1024);
-        btree_set_node_cache(tree, cache);
+        cache_t *cache = cache_create(NULL);
+        btree_set_node_cache(tree, cache, 0);
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (int i = 0; i < 10000; i++)
@@ -2508,7 +2380,7 @@ void bench_btree_node_sizes()
 
         btree_free(tree);
         btree_builder_free(builder);
-        clock_cache_destroy(cache);
+        cache_destroy(cache);
         block_manager_close(bm);
         remove(test_file);
     }
@@ -2528,12 +2400,8 @@ void bench_btree_node_sizes()
         block_manager_t *bm = NULL;
         block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE);
 
-        btree_config_t config = {.target_node_size = node_sizes[s],
-                                 .value_threshold = 512,
-                                 .comparator = NULL,
-                                 .comparator_ctx = NULL,
-                                 .cmp_type = BTREE_CMP_MEMCMP,
-                                 .compression_algo = TDB_COMPRESS_LZ4};
+        btree_config_t config = {
+            .target_node_size = node_sizes[s], .codec = g_btree_lz4, .codec_count = 1};
 
         btree_builder_t *builder = NULL;
         btree_builder_new(&builder, bm, &config);
@@ -2555,8 +2423,8 @@ void bench_btree_node_sizes()
         clock_gettime(CLOCK_MONOTONIC, &end);
         double build_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-        clock_cache_t *cache = btree_create_node_cache(10 * 1024 * 1024);
-        btree_set_node_cache(tree, cache);
+        cache_t *cache = cache_create(NULL);
+        btree_set_node_cache(tree, cache, 0);
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (int i = 0; i < 10000; i++)
@@ -2583,7 +2451,7 @@ void bench_btree_node_sizes()
 
         btree_free(tree);
         btree_builder_free(builder);
-        clock_cache_destroy(cache);
+        cache_destroy(cache);
         block_manager_close(bm);
         remove(test_file);
     }
@@ -2592,6 +2460,7 @@ void bench_btree_node_sizes()
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
+    ASSERT_TRUE(btree_test_init_codecs());
     RUN_TEST(test_btree_builder_new, tests_passed);
     RUN_TEST(test_btree_builder_add_single, tests_passed);
     RUN_TEST(test_btree_builder_add_multiple, tests_passed);
@@ -2605,6 +2474,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_open_existing, tests_passed);
     RUN_TEST(test_btree_tombstone, tests_passed);
     RUN_TEST(test_btree_large_dataset, tests_passed);
+    RUN_TEST(test_btree_klog_block_size_sweep, tests_passed);
     RUN_TEST(test_btree_empty_tree, tests_passed);
     RUN_TEST(test_btree_single_entry, tests_passed);
     RUN_TEST(test_btree_duplicate_keys, tests_passed);
@@ -2614,13 +2484,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_compression_single_leaf, tests_passed);
     RUN_TEST(test_btree_compression_lz4, tests_passed);
     RUN_TEST(test_btree_compression_zstd, tests_passed);
+    RUN_TEST(test_btree_compression_spans_internal_levels, tests_passed);
+    RUN_TEST(test_btree_node_decode_rejects_unknown_type, tests_passed);
     RUN_TEST(test_btree_compression_two_leaves, tests_passed);
     RUN_TEST(test_btree_compression_three_leaves, tests_passed);
     RUN_TEST(test_btree_compression_cursor_bidirectional, tests_passed);
-    RUN_TEST(test_btree_arena, tests_passed);
-    RUN_TEST(test_btree_comparator_string, tests_passed);
-    RUN_TEST(test_btree_comparator_numeric, tests_passed);
-    RUN_TEST(test_btree_comparator_numeric_size_guard, tests_passed);
+    RUN_TEST(test_btree_string_keys, tests_passed);
     RUN_TEST(test_btree_get_stats, tests_passed);
     RUN_TEST(test_btree_cursor_seek_for_prev, tests_passed);
     RUN_TEST(test_btree_cursor_has_next_has_prev, tests_passed);

@@ -499,9 +499,12 @@ jobs:
           echo "=== database directory structure ==="
           ls -laR build/testdb/
           echo ""
-          # a v10 database is a db-level MANIFEST and VLOG plus per-family klogs and the wal
+          # a v10 database is a db-level MANIFEST and value log plus per-family klogs and the
+          # wal. the value log is segmented, so it is one NNNNNNN.vlog file per segment rather
+          # than a single one named VLOG -- naming that under bash -e fails the whole step
           echo "=== manifest and value log ==="
-          ls -l build/testdb/MANIFEST build/testdb/VLOG
+          ls -l build/testdb/MANIFEST
+          ls -l build/testdb/*.vlog
           echo ""
           echo "=== key logs ==="
           find build/testdb -name "*.klog" | head -20
@@ -570,9 +573,12 @@ jobs:
           echo "=== downloaded database structure ==="
           ls -laR testdb/
           echo ""
-          # a v10 database is a db-level MANIFEST and VLOG plus per-family klogs and the wal
+          # a v10 database is a db-level MANIFEST and value log plus per-family klogs and the
+          # wal. the value log is segmented, so it is one NNNNNNN.vlog file per segment rather
+          # than a single one named VLOG -- naming that under bash -e fails the whole step
           echo "=== manifest and value log ==="
-          ls -l testdb/MANIFEST testdb/VLOG
+          ls -l testdb/MANIFEST
+          ls -l testdb/*.vlog
           echo ""
           echo "=== key logs ==="
           find testdb -name "*.klog" | head -20

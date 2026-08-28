@@ -58,8 +58,13 @@ static int tests_failed = 0;
 
 #define ENGINE_TEST_LOCKED_RETRIES    100
 #define ENGINE_TEST_LOCKED_BACKOFF_US 1000
-#define ENGINE_TEST_COMPACT_KEYS      400
-#define ENGINE_TEST_PATH_MAX          512
+
+/* how many of those backoffs to spend waiting for the wal's flush thread to put staged records on
+ * the device. under the default sync mode a commit stages its record and returns without waiting
+ * for that thread, so the io counters move a moment after the commits rather than during them */
+#define ENGINE_TEST_IO_WAIT_ATTEMPTS 500
+#define ENGINE_TEST_COMPACT_KEYS     400
+#define ENGINE_TEST_PATH_MAX         512
 /* the first family's directory, named for its id, so a test can name its files by literal */
 /* a family's key logs sit in the database directory, their names carrying which family they belong
  * to, so the first family's files are found by prefix rather than by a directory of its own */
@@ -2936,10 +2941,22 @@ void test_engine_io_stats_attribute_device_work(void)
 
     for (int i = 0; i < ENGINE_TEST_COMPACT_KEYS; i++) engine_put(db, cf, i);
 
-    /* every commit writes its record to the log, so that class must have moved */
+    /* every commit writes its record to the log, so that class must have moved -- but the log is
+     * a buffered append, where committers stage into a ring and one flush thread does every write,
+     * and the default sync mode has a commit return without waiting for it. so the class moves a
+     * moment after the commits rather than during them, and sampling once calls a thread that has
+     * not been scheduled yet a write that never happened */
     tidesdb_io_stats_t after;
-    ASSERT_EQ(tidesdb_get_io_stats(db, &after), TDB_SUCCESS);
-    ASSERT_TRUE(after.classes[TDB_IO_WAL].ops > 0);
+    int wal_moved = 0;
+    for (int attempt = 0; attempt < ENGINE_TEST_IO_WAIT_ATTEMPTS && !wal_moved; attempt++)
+    {
+        ASSERT_EQ(tidesdb_get_io_stats(db, &after), TDB_SUCCESS);
+        if (after.classes[TDB_IO_WAL].ops > 0)
+            wal_moved = 1;
+        else
+            usleep(ENGINE_TEST_LOCKED_BACKOFF_US);
+    }
+    ASSERT_TRUE(wal_moved);
     ASSERT_TRUE(after.classes[TDB_IO_WAL].bytes > 0);
 
     /* a flush lands the data in a key log, so that class moves too */

@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* how long a committer waits before looking again at whether the exclusive commit it is holding
+ * off for has got in. an interval delete is rare, so this is paid almost never */
+#define TDB_MVCC_GATE_YIELD_US 100
+
 /* commit-ring slot states */
 #define TDB_MVCC_IN_PROGRESS 0
 #define TDB_MVCC_COMMITTED   1
@@ -71,6 +75,7 @@ struct tidesdb_mvcc
     _Atomic(uint64_t) stat_res_won;
     _Atomic(uint64_t) stat_res_lost;
     pthread_rwlock_t commit_gate;
+    _Atomic(int) gate_writer_waiting;
     mvcc_range_reservation_t range_res[TDB_MVCC_MAX_RANGE_RESERVATIONS];
     _Atomic(int) range_res_count;
     pthread_mutex_t range_lock;
@@ -81,22 +86,8 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     tidesdb_mvcc_t *m = malloc(sizeof(*m));
     if (!m) return NULL;
 
-    /* writer-preferring, because the exclusive side is the rare one -- a range delete waiting
-     * behind an unbroken stream of point writes would never run under the default reader
-     * preference. a platform without the attribute falls back to the default, which is still
-     * correct and only risks that starvation */
-    pthread_rwlockattr_t gate_attr;
-    if (pthread_rwlockattr_init(&gate_attr) == 0)
-    {
-#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
-        (void)pthread_rwlockattr_setkind_np(&gate_attr,
-                                            PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif
-        (void)pthread_rwlock_init(&m->commit_gate, &gate_attr);
-        (void)pthread_rwlockattr_destroy(&gate_attr);
-    }
-    else
-        (void)pthread_rwlock_init(&m->commit_gate, NULL);
+    (void)pthread_rwlock_init(&m->commit_gate, NULL);
+    atomic_init(&m->gate_writer_waiting, 0);
 
     memset(m->range_res, 0, sizeof(m->range_res));
     atomic_init(&m->range_res_count, 0);
@@ -245,9 +236,22 @@ void tidesdb_mvcc_commit_gate_lock(tidesdb_mvcc_t *m, const int exclusive)
 {
     if (!m) return;
     if (exclusive)
+    {
+        /* the exclusive side is the rare one and it must not be starved -- a range delete waiting
+         * behind an unbroken stream of point writes would never run. every rwlock admits an
+         * arriving reader while a writer waits unless told otherwise, and the kind that says
+         * otherwise is a glibc extension, so the writer announces itself instead and the shared
+         * side below holds off. that is one relaxed load added to a commit, and it is the same
+         * guarantee on every platform rather than on one */
+        atomic_fetch_add_explicit(&m->gate_writer_waiting, 1, memory_order_release);
         pthread_rwlock_wrlock(&m->commit_gate);
-    else
-        pthread_rwlock_rdlock(&m->commit_gate);
+        atomic_fetch_sub_explicit(&m->gate_writer_waiting, 1, memory_order_release);
+        return;
+    }
+
+    while (atomic_load_explicit(&m->gate_writer_waiting, memory_order_acquire) > 0)
+        usleep(TDB_MVCC_GATE_YIELD_US);
+    pthread_rwlock_rdlock(&m->commit_gate);
 }
 
 void tidesdb_mvcc_commit_gate_unlock(tidesdb_mvcc_t *m)

@@ -1289,8 +1289,8 @@ void test_manifest_hold_keeps_the_log_still(void)
     uint64_t held_len = 0;
     ASSERT_EQ(tidesdb_manifest_hold(manifest, &held_len), 0);
     ASSERT_TRUE(held_len > 0);
-    struct stat held;
-    ASSERT_EQ(stat(test_path, &held), 0);
+    unsigned long long held_id = 0;
+    ASSERT_EQ(test_file_identity(test_path, &held_id), 0);
 
     manifest_hold_committer_t c = {.manifest = manifest, .path = test_path};
     atomic_init(&c.committed, 0);
@@ -1301,9 +1301,11 @@ void test_manifest_hold_keeps_the_log_still(void)
      * describes is still the file at the path */
     usleep(TEST_MANIFEST_HOLD_WAIT_US);
     ASSERT_EQ(atomic_load(&c.committed), 0);
+    unsigned long long during_id = 0;
+    ASSERT_EQ(test_file_identity(test_path, &during_id), 0);
+    ASSERT_EQ((int)(during_id == held_id), 1);
     struct stat during;
     ASSERT_EQ(stat(test_path, &during), 0);
-    ASSERT_EQ((int)(during.st_ino == held.st_ino), 1);
     ASSERT_EQ((long long)during.st_size, (long long)held_len);
 
     tidesdb_manifest_release(manifest);
@@ -1311,10 +1313,10 @@ void test_manifest_hold_keeps_the_log_still(void)
 
     /* and the commits the hold was holding back do replace the file, which is the thing a length
      * measured outside a hold would have been applied to */
-    struct stat after;
-    ASSERT_EQ(stat(test_path, &after), 0);
+    unsigned long long after_id = 0;
+    ASSERT_EQ(test_file_identity(test_path, &after_id), 0);
     ASSERT_EQ(atomic_load(&c.committed), TEST_MANIFEST_HOLD_COMMITS);
-    ASSERT_EQ((int)(after.st_ino != held.st_ino), 1);
+    ASSERT_EQ((int)(after_id != held_id), 1);
 
     tidesdb_manifest_close(manifest);
     remove(test_path);

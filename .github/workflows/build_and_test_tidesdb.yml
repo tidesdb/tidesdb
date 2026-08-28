@@ -451,6 +451,13 @@ jobs:
             # job is impractical. build verification is the realistic ceiling here
             echo "macOS PowerPC (G5): build verified, no execution path on a Linux runner"
           elif [ "${{ matrix.arch }}" == "riscv64" ]; then
+            # ctest runs each binary through the emulator command, which carries -L to the sysroot
+            # holding the riscv loader. a test that re-execs itself does not go through that command
+            # -- the kernel hands the exec to qemu through binfmt, which has no -L and looks for the
+            # loader under the host's own /lib, where there is none. QEMU_LD_PREFIX is the same
+            # setting by another name and binfmt-invoked qemu reads it, so the child resolves its
+            # loader the way its parent already does
+            export QEMU_LD_PREFIX=/usr/riscv64-linux-gnu
             # emulation is reliable enough here that a failure is treated as a real failure
             ctest --output-on-failure --timeout 5400 --build-config Release
           else

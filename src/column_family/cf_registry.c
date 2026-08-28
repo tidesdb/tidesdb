@@ -13,10 +13,16 @@
 
 #include "base/errors.h"   /* TDB_SUCCESS and the TDB_ERR_* result codes */
 #include "base/lockfree.h" /* the reader epoch and retire list guarding the published view */
+#include "compat.h"        /* usleep, for the reader hold-off */
 
 /* the registry starts small and doubles; column families are few, so a linear array keyed by name
  * and id is simpler and cache-friendlier than a hash map */
 #define CF_REGISTRY_INIT_CAP 8
+
+/* how long a reader waits before looking again at whether the writer it is holding off for has got
+ * in. only the engine's background sweeps take this lock, so a short sleep costs one of them a
+ * little latency where a spin would cost a core */
+#define CF_REGISTRY_WRITER_YIELD_US 200
 
 /* an immutable published view of the registry, swapped whole on every membership change and read
  * without a lock. lookups are on the read path -- every transaction resolves its column family --
@@ -38,6 +44,9 @@ struct cf_registry
     int capacity;
     _Atomic(uint64_t) next_cf_id;
     pthread_rwlock_t lock;
+    /* how many writers are waiting on that lock, which is what holds new readers off long enough
+     * for one of them to get in */
+    _Atomic(int) writer_waiting;
     /* the published view, its reader guard, and the retire list superseded views wait on */
     _Atomic(cf_registry_view_t *) view;
     tdb_epoch_t view_epoch;
@@ -75,30 +84,25 @@ static int cf_registry_publish_locked(cf_registry_t *reg)
     return TDB_SUCCESS;
 }
 
-/* initialize the registry lock, preferring a waiting writer over arriving readers where the
- * platform offers it.
+/* initialize the registry lock. a waiting writer is preferred over arriving readers, but by the
+ * announcement in cf_registry_wrlock rather than by the lock's own kind.
  *
  * the readers are the engine's own background work -- every flush install, every compaction claim,
  * every reaper sweep -- and they arrive continuously under load. the writers are the caller's
- * create, drop, rename and clone. under the default reader preference a new reader is admitted
- * while a writer waits, so a database that never stops flushing never lets the writer in at all,
+ * create, drop, rename and clone. every rwlock admits an arriving reader while a writer waits
+ * unless told otherwise, so a database that never stops flushing never lets the writer in at all,
  * and a create appears to hang while the process stays busy.
  *
- * this is safe only because no reader takes the lock again while holding it; the nonrecursive
- * attribute deadlocks a reader that does. where the attribute is unavailable the default stands,
- * and the create waits for a gap between readers */
+ * the kind that says otherwise is a glibc extension, which left the guarantee holding on one
+ * platform and the hang reachable on every other. announcing the writer instead is portable, so
+ * this is a plain rwlock now and the preference lives in the two accessors.
+ *
+ * either way it is safe only because no reader takes the lock again while holding it. a reader that
+ * did would wait on its own writer announcement and never reach the acquire that would have
+ * completed, which is the same deadlock the nonrecursive attribute gave and for the same reason */
 static int cf_registry_lock_init(pthread_rwlock_t *lock)
 {
-#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
-    pthread_rwlockattr_t attr;
-    if (pthread_rwlockattr_init(&attr) != 0) return -1;
-    (void)pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-    const int rc = pthread_rwlock_init(lock, &attr);
-    (void)pthread_rwlockattr_destroy(&attr);
-    return rc;
-#else
     return pthread_rwlock_init(lock, NULL);
-#endif
 }
 
 cf_registry_t *cf_registry_create(uint64_t next_cf_id)
@@ -114,6 +118,7 @@ cf_registry_t *cf_registry_create(uint64_t next_cf_id)
     reg->capacity = CF_REGISTRY_INIT_CAP;
     reg->count = 0;
     atomic_init(&reg->next_cf_id, next_cf_id);
+    atomic_init(&reg->writer_waiting, 0);
     atomic_init(&reg->view, NULL);
     atomic_init(&reg->view_epoch, 0);
     if (cf_registry_lock_init(&reg->lock) != 0)
@@ -158,17 +163,17 @@ int cf_registry_add(cf_registry_t *reg, cf_t *cf)
 {
     if (!reg || !cf) return TDB_ERR_INVALID_ARGS;
 
-    pthread_rwlock_wrlock(&reg->lock);
+    cf_registry_wrlock(reg);
 
     if (cf_registry_index_of_name(reg, cf->name) >= 0)
     {
-        pthread_rwlock_unlock(&reg->lock);
+        cf_registry_wrunlock(reg);
         return TDB_ERR_EXISTS;
     }
     for (int i = 0; i < reg->count; i++)
         if (reg->cfs[i]->cf_id == cf->cf_id)
         {
-            pthread_rwlock_unlock(&reg->lock);
+            cf_registry_wrunlock(reg);
             return TDB_ERR_EXISTS;
         }
 
@@ -178,7 +183,7 @@ int cf_registry_add(cf_registry_t *reg, cf_t *cf)
         cf_t **grown = realloc(reg->cfs, (size_t)cap * sizeof(*grown));
         if (!grown)
         {
-            pthread_rwlock_unlock(&reg->lock);
+            cf_registry_wrunlock(reg);
             return TDB_ERR_MEMORY;
         }
         reg->cfs = grown;
@@ -191,7 +196,7 @@ int cf_registry_add(cf_registry_t *reg, cf_t *cf)
      * half-applied */
     const int published = cf_registry_publish_locked(reg);
     if (published != TDB_SUCCESS) reg->count--;
-    pthread_rwlock_unlock(&reg->lock);
+    cf_registry_wrunlock(reg);
     return published;
 }
 
@@ -240,11 +245,11 @@ int cf_registry_remove(cf_registry_t *reg, const char *name, cf_t **out)
 {
     if (!reg || !name) return TDB_ERR_INVALID_ARGS;
 
-    pthread_rwlock_wrlock(&reg->lock);
+    cf_registry_wrlock(reg);
     const int idx = cf_registry_index_of_name(reg, name);
     if (idx < 0)
     {
-        pthread_rwlock_unlock(&reg->lock);
+        cf_registry_wrunlock(reg);
         return TDB_ERR_NOT_FOUND;
     }
     cf_t *detached = reg->cfs[idx];
@@ -258,10 +263,10 @@ int cf_registry_remove(cf_registry_t *reg, const char *name, cf_t **out)
         memmove(&reg->cfs[idx + 1], &reg->cfs[idx], (size_t)(reg->count - idx) * sizeof(*reg->cfs));
         reg->cfs[idx] = detached;
         reg->count++;
-        pthread_rwlock_unlock(&reg->lock);
+        cf_registry_wrunlock(reg);
         return published;
     }
-    pthread_rwlock_unlock(&reg->lock);
+    cf_registry_wrunlock(reg);
 
     if (out)
         *out = detached;
@@ -291,7 +296,14 @@ uint64_t cf_registry_next_cf_id(cf_registry_t *reg)
 
 void cf_registry_rdlock(cf_registry_t *reg)
 {
-    if (reg) pthread_rwlock_rdlock(&reg->lock);
+    if (!reg) return;
+
+    /* hold off while a writer is waiting, so the gap it needs actually arrives. a reader that
+     * slipped through between this load and the acquire below costs that writer one more reader
+     * hold and nothing else, which is why an announcement is enough and a handoff is not needed */
+    while (atomic_load_explicit(&reg->writer_waiting, memory_order_acquire) > 0)
+        usleep(CF_REGISTRY_WRITER_YIELD_US);
+    pthread_rwlock_rdlock(&reg->lock);
 }
 
 void cf_registry_rdunlock(cf_registry_t *reg)
@@ -301,7 +313,13 @@ void cf_registry_rdunlock(cf_registry_t *reg)
 
 void cf_registry_wrlock(cf_registry_t *reg)
 {
-    if (reg) pthread_rwlock_wrlock(&reg->lock);
+    if (!reg) return;
+
+    /* announced before the acquire and withdrawn after it, so the readers held off are exactly the
+     * ones that would otherwise have arrived while this writer waited */
+    atomic_fetch_add_explicit(&reg->writer_waiting, 1, memory_order_release);
+    pthread_rwlock_wrlock(&reg->lock);
+    atomic_fetch_sub_explicit(&reg->writer_waiting, 1, memory_order_release);
 }
 
 void cf_registry_wrunlock(cf_registry_t *reg)

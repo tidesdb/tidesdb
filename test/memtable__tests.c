@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -850,8 +851,17 @@ void test_l0_wal_ack_on_stage_survives_close(void)
     const char *wal_path = "./l0_test_ack_stage.wal";
     (void)remove(wal_path);
 
+    /* the reason is reported rather than only the failure. this is the one buffered open in the
+     * suite, and it asks for a staging ring pair of several megabytes on top of opening the file,
+     * so a refusal here can come from the allocation as easily as from the path -- and a bare
+     * comparison against zero says which of them only by leaving it out */
     block_manager_t *wal = NULL;
-    ASSERT_EQ(block_manager_open_buffered(&wal, wal_path, BLOCK_MANAGER_SYNC_NONE, 0), 0);
+    errno = 0;
+    const int wal_rc = block_manager_open_buffered(&wal, wal_path, BLOCK_MANAGER_SYNC_NONE, 0);
+    if (wal_rc != 0)
+        fprintf(stderr, "buffered wal open of %s failed, errno %d (%s)\n", wal_path, errno,
+                strerror(errno));
+    ASSERT_EQ(wal_rc, 0);
     tidesdb_l0_t *l0 =
         tidesdb_l0_create(L0_BUFFER_SIZE, L0_QUEUE_SIZE, MT_MAX_LEVEL, MT_PROBABILITY, NULL, NULL);
     ASSERT_TRUE(l0 != NULL);

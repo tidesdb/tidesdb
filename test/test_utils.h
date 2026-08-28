@@ -187,6 +187,38 @@ static UNUSED int test_spawn_self(const char *exe, const char *flag, const char 
 #endif
 }
 
+/* the identity of whatever file is at a path, so a test can tell one replaced by a rename from one
+ * rewritten in place.
+ *
+ * st_ino carries this on posix. on windows it is always zero, whatever file is there, so a test
+ * comparing it finds every file identical to every other -- which reads as "not replaced" and
+ * passes an equality check for a reason that has nothing to do with the property under test. the
+ * identity there is the volume file id, and it takes a handle to read
+ * @param path the path to identify
+ * @param out set to the identity on success
+ * @return 0 on success, -1 when the path could not be opened or queried
+ */
+static UNUSED int test_file_identity(const char *path, unsigned long long *out)
+{
+#ifdef _WIN32
+    /* every share mode, since the point is to identify a file another thread is committing to */
+    HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    BY_HANDLE_FILE_INFORMATION info;
+    const BOOL ok = GetFileInformationByHandle(h, &info);
+    CloseHandle(h);
+    if (!ok) return -1;
+    *out = ((unsigned long long)info.nFileIndexHigh << 32) | (unsigned long long)info.nFileIndexLow;
+    return 0;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    *out = (unsigned long long)st.st_ino;
+    return 0;
+#endif
+}
+
 /* push a stdio stream all the way to the device, so what it holds survives the process being lost
  * rather than sitting in a buffer that dies with it
  * @param f the stream to flush and sync

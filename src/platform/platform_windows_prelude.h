@@ -16,6 +16,47 @@
 #include <sys/stat.h>
 #include <windows.h>
 
+/* ===== the posix types msvc has none of its own =====
+ *
+ * first in the file, ahead of everything that names one. this header is first among the windows
+ * headers for exactly this reason, and the io below is written against these three, so declaring
+ * them further down leaves the io block naming types that do not exist yet. mingw takes none of
+ * this -- its own headers supply all three -- so the order only ever fails on msvc, and it fails on
+ * the first function that returns an ssize_t.
+ *
+ * the _DEFINED guards are msvc's own, so a later system header that declares one of these agrees
+ * with what is here rather than clashing with it. max_align_t has no such guard, being C11 rather
+ * than a msvc type, so it carries one of ours */
+#if defined(_MSC_VER)
+#ifndef _OFF_T_DEFINED
+#define _OFF_T_DEFINED
+typedef __int64 off_t;
+#endif
+
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef __int64 ssize_t;
+#endif
+
+#ifndef _MODE_T_DEFINED
+#define _MODE_T_DEFINED
+typedef int mode_t;
+#endif
+
+/* the strictest alignment any scalar type needs, which C11 puts in stddef.h and msvc declares only
+ * for c++. the union names the three candidates for the widest, and asking its alignment gives the
+ * same answer the type would */
+#ifndef TDB_MAX_ALIGN_T_DEFINED
+#define TDB_MAX_ALIGN_T_DEFINED
+typedef union
+{
+    long double ld;
+    void *p;
+    long long ll;
+} max_align_t;
+#endif
+#endif
+
 /* ===== shared Win32 file io =====
  *
  * pread, pwrite, fsync and fdatasync are pure Win32 -- overlapped ReadFile/WriteFile and
@@ -24,7 +65,9 @@
  * mingw fsync returned -1 without setting errno, so a caller reading errno after a failed sync got
  * whatever was there before. this is the version that sets it.
  *
- * placed after the windows.h and io.h includes above, which is everything they need. */
+ * placed after the includes above and after the type block, which together are everything they
+ * need. the type block is the half that is easy to forget, since only msvc reads it and only the
+ * signatures here name what it declares. */
 
 /* fsync for windows */
 /*
@@ -240,21 +283,6 @@ struct timeval
 #endif
 
 #if defined(_MSC_VER)
-#ifndef _OFF_T_DEFINED
-#define _OFF_T_DEFINED
-typedef __int64 off_t;
-#endif
-
-#ifndef _SSIZE_T_DEFINED
-#define _SSIZE_T_DEFINED
-typedef __int64 ssize_t;
-#endif
-
-#ifndef _MODE_T_DEFINED
-#define _MODE_T_DEFINED
-typedef int mode_t;
-#endif
-
 /* ftruncate for windows */
 /*
  * ftruncate

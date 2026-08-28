@@ -15,7 +15,8 @@ typedef int block_manager_fault_translation_unit;
 #include "block_manager_fault.h"
 
 #include <stdatomic.h>
-#include <unistd.h>
+
+#include "compat.h" /* usleep, which msvc has only as a shim and no unistd.h to declare */
 
 /* the target write to tear, 0 when disarmed */
 static _Atomic(uint64_t) g_fault_nth = 0;

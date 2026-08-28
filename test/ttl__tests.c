@@ -59,6 +59,22 @@ static void ttl_put(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key,
     tidesdb_txn_free(txn);
 }
 
+/* wait out the rest of the current second and return the one the caller's puts will be timed from.
+ *
+ * the deadline a put is given is built on a clock counting whole seconds, so one made late in a
+ * second is given a deadline less than its lifetime away, and a liveness check before that deadline
+ * races it rather than testing it. how much headroom there is depends on where in the second the
+ * test happened to start, which is nothing the test controls -- waiting for the tick first hands it
+ * the whole lifetime every time
+ * @return the second to measure the lifetime from
+ */
+static time_t ttl_wait_for_tick(void)
+{
+    const time_t tick = time(NULL);
+    while (time(NULL) == tick) usleep(TTL_POLL_US);
+    return time(NULL);
+}
+
 /* read a key in its own transaction and report the engine's result code */
 static int ttl_get(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
 {
@@ -96,8 +112,10 @@ void test_ttl_expires_across_memtable_flush_and_reopen(void)
     ASSERT_TRUE(cf != NULL);
 
     /* the deadline is computed from the lifetime at put time, so note when that was in order to
-     * wait past it below */
-    const time_t written_at = time(NULL);
+     * wait past it below.
+     *
+     * started at the top of a second, for the reason ttl_wait_for_tick gives */
+    const time_t written_at = ttl_wait_for_tick();
     ttl_put(db, cf, "soon", TTL_SHORT_SECS);
     ttl_put(db, cf, "later", TTL_LONG_SECS);
     ttl_put(db, cf, "forever", TTL_FOREVER);
@@ -142,7 +160,7 @@ void test_ttl_expires_after_reaching_an_sstable(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, TTL_CF);
     ASSERT_TRUE(cf != NULL);
 
-    const time_t written_at = time(NULL);
+    const time_t written_at = ttl_wait_for_tick();
     ttl_put(db, cf, "lapses_on_disk", TTL_ON_DISK_SECS);
     ttl_put(db, cf, "forever", TTL_FOREVER);
 
@@ -193,7 +211,7 @@ void test_ttl_expired_entry_is_collected_by_compaction(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, TTL_CF);
     ASSERT_TRUE(cf != NULL);
 
-    const time_t written_at = time(NULL);
+    const time_t written_at = ttl_wait_for_tick();
     ttl_put(db, cf, "lapses_on_disk", TTL_ON_DISK_SECS);
     for (int i = 0; i < TTL_FILLER_KEYS; i++)
     {

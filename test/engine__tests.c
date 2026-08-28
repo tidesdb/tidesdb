@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+#include "../src/base/waitstat.h" /* tdb_monotonic_us, for a duration the wall clock cannot give */
 #include "../src/column_family/column_family.h" /* cf_t, for level inspection */
 #include "../src/column_family/level/level_set.h"
 #include "../src/engine/engine.h"          /* engine_vlog_gc, for a direct value-log reclaim */
@@ -3302,9 +3303,13 @@ void test_engine_create_completes_under_sustained_flush(void)
     while (atomic_load(&w.commits) < ENGINE_TEST_CREATE_MIN_COMMITS)
         usleep(ENGINE_TEST_LOCKED_BACKOFF_US);
 
-    const time_t started = time(NULL);
+    /* measured on the monotonic clock because the deadline below is a duration, and the wall clock
+     * is not one. a runner whose wall clock steps -- an ntp correction, a host resuming a suspended
+     * guest -- reports a duration that never elapsed, and this test has already produced one longer
+     * than the run that contained it */
+    const uint64_t started_us = tdb_monotonic_us();
     const int rc = tidesdb_create_column_family(db, "late", &cc);
-    const time_t elapsed = time(NULL) - started;
+    const long long elapsed = (long long)((tdb_monotonic_us() - started_us) / 1000000ull);
 
     atomic_store(&w.stop, 1);
     for (int i = 0; i < ENGINE_TEST_CREATE_WRITERS; i++) pthread_join(writers[i], NULL);
@@ -3321,7 +3326,7 @@ void test_engine_create_completes_under_sustained_flush(void)
         /* what the create itself cost, which is the number this test is about. without it the only
          * timing to hand is the one the runner prints for the whole binary, and reading that as
          * this call is how a slow create becomes a hung one */
-        fprintf(stderr, "  create took %lld s against a deadline of %d s\n", (long long)elapsed,
+        fprintf(stderr, "  create took %lld s against a deadline of %d s\n", elapsed,
                 ENGINE_TEST_CREATE_DEADLINE_SECS);
         tidesdb_stall_stats_t stalls;
         if (tidesdb_get_stall_stats(db, &stalls) == TDB_SUCCESS)

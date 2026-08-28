@@ -15,7 +15,9 @@
  * thread, and counts what it did. the two are apart because the policy is a pure function over
  * numbers and is tested as one, while everything here touches the live queue */
 
-#define TDB_L0_BACKPRESSURE_POLL_US 200
+/* how long a blocked writer parks before looking again on its own. it is woken when the backlog
+ * moves, so this only bounds the cost of a wake lost to the race between deciding and waiting */
+#define TDB_L0_BACKPRESSURE_PARK_US 20000
 
 /* how long a writer waits for the queue to drain before it is admitted anyway. this is wall clock
  * rather than a count of polls, because a poll does not reliably sleep for as long as it asks: on
@@ -78,9 +80,33 @@ static void l0_admission_note_block(tidesdb_l0_t *l0, const tidesdb_l0_pressure_
                       pressure->queue_depth, pressure->queue_limit, pressure->flush_in_progress);
 }
 
+/**
+ * l0_admission_park
+ * wait for the backlog to move, or for the fallback interval, whichever comes first
+ *
+ * the drain is done by another thread and it says so, so this sleeps until told rather than waking
+ * on a timer to find nothing changed. the timeout is a backstop, not the mechanism -- a wake that
+ * arrives between this caller's decision and its wait is lost, and the cost of losing one has to be
+ * one interval rather than the whole ceiling. it is far longer than the poll it replaces because it
+ * is no longer how the caller learns anything, only how it bounds a lost wake
+ * @param l0 the subsystem whose waiters share the condition
+ */
+static void l0_admission_park(tidesdb_l0_t *l0)
+{
+    struct timespec ts;
+    tdb_wait_deadline(&ts, TDB_L0_BACKPRESSURE_PARK_US);
+    pthread_mutex_lock(&l0->admit_mtx);
+    (void)pthread_cond_timedwait(&l0->admit_cv, &l0->admit_mtx, &ts);
+    pthread_mutex_unlock(&l0->admit_mtx);
+}
+
 void tidesdb_l0_set_tier_depth(tidesdb_l0_t *l0, const int depth)
 {
-    if (l0) atomic_store_explicit(&l0->tier_depth, depth, memory_order_relaxed);
+    if (!l0) return;
+    const int was = atomic_exchange_explicit(&l0->tier_depth, depth, memory_order_relaxed);
+    /* a shallower tier is the other thing a blocked writer waits on, and the compaction that made
+     * it shallower is the only one in a position to say so */
+    if (depth < was) tidesdb_l0_admit_wake(l0);
 }
 
 int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
@@ -127,7 +153,7 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
             counted_block = 1;
             l0_admission_note_block(l0, &pressure);
         }
-        usleep(TDB_L0_BACKPRESSURE_POLL_US);
+        l0_admission_park(l0);
         stalled_us = tdb_monotonic_us() - wait_started_us;
 
         /* the queue never drained inside the ceiling, so flush is not making progress; admitting

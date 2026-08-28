@@ -3318,6 +3318,11 @@ void test_engine_create_completes_under_sustained_flush(void)
      * one wrong diagnosis */
     if (elapsed >= ENGINE_TEST_CREATE_DEADLINE_SECS)
     {
+        /* what the create itself cost, which is the number this test is about. without it the only
+         * timing to hand is the one the runner prints for the whole binary, and reading that as
+         * this call is how a slow create becomes a hung one */
+        fprintf(stderr, "  create took %lld s against a deadline of %d s\n", (long long)elapsed,
+                ENGINE_TEST_CREATE_DEADLINE_SECS);
         tidesdb_stall_stats_t stalls;
         if (tidesdb_get_stall_stats(db, &stalls) == TDB_SUCCESS)
             for (int i = 0; i < TDB_STALL_COUNT; i++)

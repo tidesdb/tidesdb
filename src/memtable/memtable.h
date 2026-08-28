@@ -171,6 +171,13 @@ typedef struct
     _Atomic(int) aborted_count;
     pthread_mutex_t aborted_lock;
     _Atomic(void *) pending_reclaim;
+    /* a writer held by backpressure waits here rather than waking on a timer. the backlog it waits
+     * on is drained by another thread, so that thread can say when to look again -- and polling it
+     * instead costs a wakeup every couple of hundred microseconds per blocked writer, which on a
+     * machine with fewer cores than it has blocked writers is the scheduler's whole budget spent
+     * on threads discovering nothing has changed */
+    pthread_mutex_t admit_mtx;
+    pthread_cond_t admit_cv;
 } tidesdb_l0_t;
 
 /**
@@ -491,6 +498,17 @@ int tidesdb_l0_active_full(tidesdb_l0_t *l0);
  * @return the oldest queued immutable, or NULL when the queue is empty
  */
 tidesdb_memtable_t *tidesdb_l0_dequeue_immutable(tidesdb_l0_t *l0);
+
+/**
+ * tidesdb_l0_admit_wake
+ * wake every writer parked by backpressure so each re-decides against the current backlog
+ *
+ * called by whichever thread made the backlog shallower, since it is the only one that knows. a
+ * writer parks rather than polling, so without this it waits out its fallback interval for a
+ * change that already happened
+ * @param l0 the subsystem, may be NULL
+ */
+void tidesdb_l0_admit_wake(tidesdb_l0_t *l0);
 
 /**
  * tidesdb_l0_claim_immutable

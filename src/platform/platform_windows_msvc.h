@@ -184,8 +184,17 @@ static inline int sem_post(sem_t *sem)
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m)&S_IFMT) == S_IFDIR)
 #endif
-#define sleep(seconds)       Sleep((seconds)*1000)
-#define usleep(microseconds) Sleep((microseconds) / 1000) /* usleep for Windows */
+#define sleep(seconds) Sleep((seconds)*1000)
+
+/* usleep for windows, rounded up so a sub millisecond request still sleeps.
+ *
+ * Sleep takes milliseconds, so dividing rounds every request under one down to zero and the caller
+ * spins where it meant to pace. that is not only a lost sleep -- write admission asks for two
+ * hundred microseconds between polls, its throttle is two hundred microseconds a slot and its ring
+ * dwell caps at a hundred and fifty, so every figure the backpressure policy produces rounded to
+ * nothing and the whole of it did nothing on this platform. rounding up costs a caller asking for
+ * two hundred microseconds a full millisecond instead, which is the direction that paces */
+#define usleep(microseconds) Sleep((DWORD)(((microseconds) + 999) / 1000))
 #define access               _access
 #define ftell                _ftelli64
 #define fseek                _fseeki64

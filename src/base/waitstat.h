@@ -42,6 +42,30 @@ static inline uint64_t tdb_monotonic_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
 
+/* nanoseconds in a microsecond and in a second, for building a deadline out of a duration */
+#define TDB_NS_PER_US  1000L
+#define TDB_NS_PER_SEC 1000000000L
+
+/**
+ * tdb_wait_deadline
+ * an absolute deadline this many microseconds from now, for a timed condition wait
+ *
+ * built on the realtime clock rather than the monotonic one because that is the clock a condition
+ * variable measures against unless its attribute says otherwise, and none here does
+ * @param ts filled with the deadline
+ * @param us how far ahead to place it
+ */
+static inline void tdb_wait_deadline(struct timespec *ts, long us)
+{
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_nsec += us * TDB_NS_PER_US;
+    if (ts->tv_nsec >= TDB_NS_PER_SEC)
+    {
+        ts->tv_sec += ts->tv_nsec / TDB_NS_PER_SEC;
+        ts->tv_nsec %= TDB_NS_PER_SEC;
+    }
+}
+
 /**
  * tdb_wait_note
  * fold one observed wait into a wait point's totals

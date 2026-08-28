@@ -150,6 +150,8 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
     atomic_init(&l0->admit_ceiling_hits, 0);
     atomic_init(&l0->aborted_count, 0);
     pthread_mutex_init(&l0->aborted_lock, NULL);
+    pthread_mutex_init(&l0->admit_mtx, NULL);
+    pthread_cond_init(&l0->admit_cv, NULL);
     return l0;
 }
 
@@ -158,6 +160,8 @@ void tidesdb_l0_destroy(tidesdb_l0_t *l0)
     if (!l0) return;
 
     pthread_mutex_destroy(&l0->aborted_lock);
+    pthread_mutex_destroy(&l0->admit_mtx);
+    pthread_cond_destroy(&l0->admit_cv);
 
     /* every reader is gone by the time the subsystem is destroyed, so anything still deferred is
      * freed outright rather than checked */
@@ -550,9 +554,14 @@ static void l0_pace_against_ring(tidesdb_l0_t *l0, block_manager_t *wal)
         tidesdb_backpressure_decide(l0->backpressure, &pressure);
     if (decision.action != TDB_BACKPRESSURE_THROTTLE || decision.throttle_us == 0) return;
 
+    /* measured rather than the figure asked for, because the other contributor to this counter is
+     * measured and a total mixing the two describes neither. a sleep is not the length it was
+     * asked for on any platform, and on the ones that round it up it is not close */
+    const uint64_t paced_from = tdb_monotonic_us();
     usleep((unsigned int)decision.throttle_us);
+    const uint64_t paced_us = tdb_monotonic_us() - paced_from;
     atomic_fetch_add_explicit(&l0->admits_throttled, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&l0->admit_stall_us, decision.throttle_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&l0->admit_stall_us, paced_us, memory_order_relaxed);
 }
 
 int tidesdb_l0_sync_active_wal(tidesdb_l0_t *l0)
@@ -719,10 +728,24 @@ size_t tidesdb_l0_active_bytes(tidesdb_l0_t *l0)
     return bytes;
 }
 
+void tidesdb_l0_admit_wake(tidesdb_l0_t *l0)
+{
+    if (!l0) return;
+    /* taken so a waiter cannot be between its check and its wait and miss this. broadcast rather
+     * than signal because every blocked writer is waiting on the same backlog and one slot may
+     * admit several of them, and each re-decides for itself on waking */
+    pthread_mutex_lock(&l0->admit_mtx);
+    pthread_cond_broadcast(&l0->admit_cv);
+    pthread_mutex_unlock(&l0->admit_mtx);
+}
+
 tidesdb_memtable_t *tidesdb_l0_dequeue_immutable(tidesdb_l0_t *l0)
 {
     if (!l0) return NULL;
-    return (tidesdb_memtable_t *)queue_dequeue(l0->queue);
+    tidesdb_memtable_t *mt = (tidesdb_memtable_t *)queue_dequeue(l0->queue);
+    /* the queue just got shallower, which is the thing a blocked writer is waiting on */
+    if (mt) tidesdb_l0_admit_wake(l0);
+    return mt;
 }
 
 tidesdb_memtable_t *tidesdb_l0_claim_immutable(tidesdb_l0_t *l0)

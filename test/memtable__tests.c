@@ -603,6 +603,11 @@ typedef struct
     tidesdb_l0_t *l0;
     _Atomic(uint64_t) *seq;
     _Atomic(int) *running;
+    /* the rotator stops on its own flag, ahead of the one the flusher stops on. the flusher leaves
+     * when it finds the queue empty and the run over, and that is only a drained queue if nothing
+     * can still enqueue -- a rotator that read its flag as set, then lost the cpu, seals and
+     * enqueues a memtable after the flusher has gone home */
+    _Atomic(int) *rotating;
     int ops;
 } stress_ctx_t;
 
@@ -648,7 +653,7 @@ static void *stress_rotator(void *arg)
 {
     stress_ctx_t *c = arg;
     uint64_t id = 1;
-    while (atomic_load(c->running))
+    while (atomic_load(c->rotating))
     {
         tidesdb_memtable_t *mt = fresh_mt(id++);
         if (mt) tidesdb_l0_rotate(c->l0, mt);
@@ -686,7 +691,9 @@ void test_l0_concurrent_rotate_read_reclaim(void)
 
     _Atomic(uint64_t) seq = 0;
     _Atomic(int) running = 1;
-    stress_ctx_t ctx = {.l0 = l0, .seq = &seq, .running = &running, .ops = 0};
+    _Atomic(int) rotating = 1;
+    stress_ctx_t ctx = {
+        .l0 = l0, .seq = &seq, .running = &running, .rotating = &rotating, .ops = 0};
 
     pthread_t writers[STRESS_WRITERS], readers[STRESS_READERS], rotator, flusher;
     stress_ctx_t wctx = ctx;
@@ -704,9 +711,13 @@ void test_l0_concurrent_rotate_read_reclaim(void)
     for (int i = 0; i < STRESS_WRITERS; i++) pthread_join(writers[i], NULL);
     for (int i = 0; i < STRESS_READERS; i++) pthread_join(readers[i], NULL);
 
-    /* stop the background threads; the flusher drains the remaining queue before it returns */
-    atomic_store(&running, 0);
+    /* the rotator goes first and is joined before the flusher is told to stop, so that nothing can
+     * enqueue once the flusher starts looking for an empty queue to leave on. stopping both at once
+     * lets a rotation that already passed its check land a sealed memtable behind a flusher that
+     * has already gone, and the drain below then reads as a flusher that failed to do its work */
+    atomic_store(&rotating, 0);
     pthread_join(rotator, NULL);
+    atomic_store(&running, 0);
     pthread_join(flusher, NULL);
 
     ASSERT_EQ((int)tidesdb_l0_queue_depth(l0), 0); /* the flusher drained every sealed immutable */

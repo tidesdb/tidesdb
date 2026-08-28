@@ -16,14 +16,14 @@ int tidesdb_manifest_add_cf(tidesdb_manifest_t *manifest, const uint64_t cf_id, 
     if (config_blob_len > MANIFEST_CF_BLOB_MAX) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
+    tdb_wprwlock_wrlock(&manifest->lock);
     int result = manifest_cf_upsert_unlocked(manifest, cf_id, name, config_blob, config_blob_len);
     if (result == 0)
     {
         result = manifest_pending_add_cf_add(manifest, cf_id, name, config_blob, config_blob_len);
         if (result == 0) manifest->records_since_snapshot++;
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     /* raising the high-water here rather than at the call site means no path that assigns an id can
      * forget to, including a recovery that replays this family back in */
     if (result == 0) tidesdb_manifest_update_next_cf_id(manifest, cf_id + 1);
@@ -36,14 +36,14 @@ int tidesdb_manifest_drop_cf(tidesdb_manifest_t *manifest, const uint64_t cf_id)
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
+    tdb_wprwlock_wrlock(&manifest->lock);
     int result = -1;
     if (manifest_cf_drop_unlocked(manifest, cf_id))
     {
         result = manifest_pending_add_cf_drop(manifest, cf_id);
         if (result == 0) manifest->records_since_snapshot++;
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
@@ -53,7 +53,7 @@ int tidesdb_manifest_cf_id_by_name(tidesdb_manifest_t *manifest, const char *nam
     if (!manifest || !name || !out_id) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_rdlock(&manifest->lock);
+    tdb_wprwlock_rdlock(&manifest->lock);
     int result = -1;
     for (int i = 0; i < manifest->num_cfs; i++)
     {
@@ -64,7 +64,7 @@ int tidesdb_manifest_cf_id_by_name(tidesdb_manifest_t *manifest, const char *nam
             break;
         }
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
@@ -75,14 +75,14 @@ int tidesdb_manifest_copy_cfs(tidesdb_manifest_t *manifest, tidesdb_manifest_cf_
     if (!manifest) return 0;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_rdlock(&manifest->lock);
+    tdb_wprwlock_rdlock(&manifest->lock);
     const int total = manifest->num_cfs;
     int copied = 0;
     if (out)
     {
         for (int i = 0; i < total && copied < max; i++) out[copied++] = manifest->cfs[i];
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return out ? copied : total;
 }
@@ -99,7 +99,7 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, const uint64_t cf
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
+    tdb_wprwlock_wrlock(&manifest->lock);
     /* a fresh add is born at this level, so birth_level equals level; only a move diverges them */
     int result = tidesdb_manifest_add_sstable_unlocked(manifest, cf_id, level, id, num_entries,
                                                        size_bytes, partition, level);
@@ -109,7 +109,7 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, const uint64_t cf
                                              num_entries, size_bytes, partition);
         if (result == 0) manifest->records_since_snapshot++;
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
@@ -120,7 +120,7 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, const uint64_t
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
+    tdb_wprwlock_wrlock(&manifest->lock);
     int result = -1;
     if (manifest_remove_entry_unlocked(manifest, cf_id, level, id))
     {
@@ -128,7 +128,7 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, const uint64_t
                                              MANIFEST_NO_PARTITION);
         if (result == 0) manifest->records_since_snapshot++;
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
@@ -139,7 +139,7 @@ int tidesdb_manifest_copy_entries(tidesdb_manifest_t *manifest, const uint64_t c
     if (!manifest) return 0;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_rdlock(&manifest->lock);
+    tdb_wprwlock_rdlock(&manifest->lock);
     const int total = manifest->num_entries;
     int matched = 0;
     for (int i = 0; i < total; i++)
@@ -148,7 +148,7 @@ int tidesdb_manifest_copy_entries(tidesdb_manifest_t *manifest, const uint64_t c
         if (out && matched < max) out[matched] = manifest->entries[i];
         matched++;
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return matched;
 }
@@ -159,7 +159,7 @@ int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, const uint64_t cf
     if (!manifest) return 0;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_rdlock(&manifest->lock);
+    tdb_wprwlock_rdlock(&manifest->lock);
     int found = 0;
     for (int i = 0; i < manifest->num_entries; i++)
     {
@@ -170,7 +170,7 @@ int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, const uint64_t cf
             break;
         }
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return found;
 }
@@ -181,7 +181,7 @@ int tidesdb_manifest_find_level_by_id(tidesdb_manifest_t *manifest, const uint64
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_rdlock(&manifest->lock);
+    tdb_wprwlock_rdlock(&manifest->lock);
     int level = -1;
     for (int i = 0; i < manifest->num_entries; i++)
     {
@@ -191,7 +191,7 @@ int tidesdb_manifest_find_level_by_id(tidesdb_manifest_t *manifest, const uint64
             break;
         }
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return level;
 }
@@ -202,7 +202,7 @@ int tidesdb_manifest_move_sstable(tidesdb_manifest_t *manifest, const uint64_t c
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
+    tdb_wprwlock_wrlock(&manifest->lock);
     int result = -1;
     for (int i = 0; i < manifest->num_entries; i++)
     {
@@ -219,7 +219,7 @@ int tidesdb_manifest_move_sstable(tidesdb_manifest_t *manifest, const uint64_t c
                                              MANIFEST_NO_PARTITION);
         if (result == 0) manifest->records_since_snapshot++;
     }
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
@@ -260,10 +260,10 @@ int tidesdb_manifest_hold(tidesdb_manifest_t *manifest, uint64_t *out_len)
     atomic_fetch_add(&manifest->active_ops, 1);
     /* the read lock is what a rollover's rename waits on, so the file the length describes is still
      * the file at the path for as long as the hold lasts */
-    pthread_rwlock_rdlock(&manifest->lock);
+    tdb_wprwlock_rdlock(&manifest->lock);
     if (manifest->bm && block_manager_get_size(manifest->bm, out_len) == 0) return 0;
 
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return -1;
 }
@@ -272,6 +272,6 @@ void tidesdb_manifest_release(tidesdb_manifest_t *manifest)
 {
     if (!manifest) return;
 
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
 }

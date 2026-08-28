@@ -189,4 +189,95 @@ void tdb_retire_sweep(tdb_retire_list_t *list);
  */
 void tdb_retire_drain(tdb_retire_list_t *list, tdb_retire_match_fn match, void *ctx);
 
+/* ===== writer-preferring reader-writer lock =====
+ *
+ * every rwlock admits an arriving reader while a writer waits unless it is told otherwise, so a
+ * structure read continuously by the engine's own background work never lets a writer in at all.
+ * the kind that says otherwise is a glibc extension, which leaves the guarantee holding on one
+ * platform and a hang reachable on every other -- and the hang is not theoretical, a column family
+ * create having waited seven minutes on a netbsd runner behind a compaction reading the manifest
+ * once per input file per merge.
+ *
+ * announcing the writer is portable. an arriving reader holds off while one waits, which bounds the
+ * writer by a single reader hold. a reader that slips through between the load and the acquire
+ * costs that writer one more hold and nothing else, so an announcement is enough and a handoff is
+ * not needed.
+ *
+ * safe only where no reader takes the lock again while holding it. such a reader would wait on its
+ * own writer announcement and never reach the acquire that would have completed, which is the same
+ * deadlock the nonrecursive attribute gives and for the same reason. */
+
+/* how long a reader waits before looking again at whether the writer it is holding off for has got
+ * in. short enough that a writer is not left waiting on a sleeping reader, long enough that the
+ * hold-off is not a spin */
+#define TDB_WPRW_YIELD_US 100
+
+/**
+ * tdb_wprwlock_t
+ * a reader-writer lock that prefers a waiting writer on every platform
+ * @field lock the underlying lock, taken with default attributes
+ * @field writer_waiting how many writers are waiting on it, which is what holds new readers off
+ */
+typedef struct
+{
+    pthread_rwlock_t lock;
+    _Atomic(int) writer_waiting;
+} tdb_wprwlock_t;
+
+/**
+ * tdb_wprwlock_init
+ * bring the lock up
+ * @param l the lock
+ * @return 0 on success, non-zero from the underlying init
+ */
+static inline int tdb_wprwlock_init(tdb_wprwlock_t *l)
+{
+    atomic_init(&l->writer_waiting, 0);
+    return pthread_rwlock_init(&l->lock, NULL);
+}
+
+/**
+ * tdb_wprwlock_destroy
+ * tear the lock down; no thread may be holding or waiting on it
+ * @param l the lock
+ */
+static inline void tdb_wprwlock_destroy(tdb_wprwlock_t *l)
+{
+    (void)pthread_rwlock_destroy(&l->lock);
+}
+
+/**
+ * tdb_wprwlock_rdlock
+ * take the lock shared, holding off while a writer waits
+ * @param l the lock
+ */
+static inline void tdb_wprwlock_rdlock(tdb_wprwlock_t *l)
+{
+    while (atomic_load_explicit(&l->writer_waiting, memory_order_acquire) > 0)
+        usleep(TDB_WPRW_YIELD_US);
+    (void)pthread_rwlock_rdlock(&l->lock);
+}
+
+/**
+ * tdb_wprwlock_wrlock
+ * take the lock exclusively, announced so arriving readers hold off
+ * @param l the lock
+ */
+static inline void tdb_wprwlock_wrlock(tdb_wprwlock_t *l)
+{
+    atomic_fetch_add_explicit(&l->writer_waiting, 1, memory_order_release);
+    (void)pthread_rwlock_wrlock(&l->lock);
+    atomic_fetch_sub_explicit(&l->writer_waiting, 1, memory_order_release);
+}
+
+/**
+ * tdb_wprwlock_unlock
+ * release the lock, taken either way
+ * @param l the lock
+ */
+static inline void tdb_wprwlock_unlock(tdb_wprwlock_t *l)
+{
+    (void)pthread_rwlock_unlock(&l->lock);
+}
+
 #endif /* __TIDESDB_BASE_LOCKFREE_H__ */

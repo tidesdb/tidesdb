@@ -315,11 +315,17 @@ void engine_maybe_rotate(tidesdb_t *db)
 {
     if (!tidesdb_l0_active_full(db->l0)) return;
 
-    /* a rotation runs on whichever committing thread found the memtable full, and every other
-     * committer that agrees waits on this lock, so a slow one lands directly in the write latency
-     * tail. it is worth a line when it happens */
+    /* a rotation runs on whichever committing thread found the memtable full. the others do not
+     * queue behind it -- a rotation is work that has to happen rather than work this caller must
+     * personally do, and the thread holding the lock is doing it right now. queueing is what a
+     * mutex that hands off by barging turns into starvation, one waiter losing every race for
+     * minutes while the rest stream through, and a waiter here gains nothing by waiting that it
+     * does not get from the holder finishing.
+     *
+     * the caller's write has already landed by this point, so declining costs it nothing. the
+     * memtable stays full until the holder seals it, which is what admission paces against */
     const uint64_t started_us = engine_monotonic_us();
-    pthread_mutex_lock(&db->rotate_lock);
+    if (pthread_mutex_trylock(&db->rotate_lock) != 0) return;
     const uint64_t acquired_us = engine_monotonic_us();
     if (tidesdb_l0_active_full(db->l0)) (void)engine_rotate_locked(db);
     pthread_mutex_unlock(&db->rotate_lock);
@@ -329,13 +335,15 @@ void engine_maybe_rotate(tidesdb_t *db)
     const uint64_t done_us = engine_monotonic_us();
 
     /* retained rather than only logged: a slow rotation shows up in a caller's write latency, and
-     * the totals are what say whether the tail it measured came from here or from the log */
+     * the totals are what say whether the tail it measured came from here or from the log. the
+     * lock figure is the cost of taking an uncontended mutex now that a contended one is declined
+     * rather than waited on, so a tail that used to appear there appears as rotation work instead
+     */
     tdb_wait_note(&db->rotate_lock_wait, acquired_us - started_us);
     tdb_wait_note(&db->rotate_work_wait, done_us - acquired_us);
 
     if (done_us - started_us >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG(TDB_LOG_WARN,
-                      "slow memtable rotation %llu us, %llu of it waiting on the lock",
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow memtable rotation %llu us, %llu of it taking the lock",
                       (unsigned long long)(done_us - started_us),
                       (unsigned long long)(acquired_us - started_us));
 

@@ -71,6 +71,7 @@
 #define MANIFEST_ROLLOVER_MIN_RECORDS   512
 #define MANIFEST_ROLLOVER_LIVE_MULTIPLE 2
 
+#include "base/lockfree.h" /* the writer-preferring rwlock the manifest is guarded by */
 #include "compat.h"
 #include "io/block_manager.h"
 
@@ -139,7 +140,11 @@ typedef struct
  * @self_healed set when open discarded a corrupt or unreadable log. the set it carries is then
  *              incomplete or empty, which is why recovery readopts the sstables on disk rather
  *              than trusting it
- * @lock reader-writer lock for thread safety
+ * @lock reader-writer lock for thread safety. writer-preferring, because the readers are the
+ * engine's own background work -- a compaction asks it the level of every input file of every
+ * merge -- and under sustained flush a plain rwlock never lets a writer in at all. a column family
+ * create takes it exclusively twice, to name the family and to commit, so it is the writer that
+ * starves
  * @active_ops count of active operations (for safe shutdown)
  */
 typedef struct
@@ -159,7 +164,7 @@ typedef struct
     size_t pending_cap;
     int records_since_snapshot;
     int self_healed;
-    pthread_rwlock_t lock;
+    tdb_wprwlock_t lock;
     _Atomic(int) active_ops;
 } tidesdb_manifest_t;
 

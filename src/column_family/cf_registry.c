@@ -19,11 +19,6 @@
  * and id is simpler and cache-friendlier than a hash map */
 #define CF_REGISTRY_INIT_CAP 8
 
-/* how long a reader waits before looking again at whether the writer it is holding off for has got
- * in. only the engine's background sweeps take this lock, so a short sleep costs one of them a
- * little latency where a spin would cost a core */
-#define CF_REGISTRY_WRITER_YIELD_US 200
-
 /* an immutable published view of the registry, swapped whole on every membership change and read
  * without a lock. lookups are on the read path -- every transaction resolves its column family --
  * and a reader lock there would put an atomic read-modify-write on the shared lock word into every
@@ -43,10 +38,7 @@ struct cf_registry
     int count;
     int capacity;
     _Atomic(uint64_t) next_cf_id;
-    pthread_rwlock_t lock;
-    /* how many writers are waiting on that lock, which is what holds new readers off long enough
-     * for one of them to get in */
-    _Atomic(int) writer_waiting;
+    tdb_wprwlock_t lock;
     /* the published view, its reader guard, and the retire list superseded views wait on */
     _Atomic(cf_registry_view_t *) view;
     tdb_epoch_t view_epoch;
@@ -100,9 +92,9 @@ static int cf_registry_publish_locked(cf_registry_t *reg)
  * either way it is safe only because no reader takes the lock again while holding it. a reader that
  * did would wait on its own writer announcement and never reach the acquire that would have
  * completed, which is the same deadlock the nonrecursive attribute gave and for the same reason */
-static int cf_registry_lock_init(pthread_rwlock_t *lock)
+static int cf_registry_lock_init(tdb_wprwlock_t *lock)
 {
-    return pthread_rwlock_init(lock, NULL);
+    return tdb_wprwlock_init(lock);
 }
 
 cf_registry_t *cf_registry_create(uint64_t next_cf_id)
@@ -118,7 +110,6 @@ cf_registry_t *cf_registry_create(uint64_t next_cf_id)
     reg->capacity = CF_REGISTRY_INIT_CAP;
     reg->count = 0;
     atomic_init(&reg->next_cf_id, next_cf_id);
-    atomic_init(&reg->writer_waiting, 0);
     atomic_init(&reg->view, NULL);
     atomic_init(&reg->view_epoch, 0);
     if (cf_registry_lock_init(&reg->lock) != 0)
@@ -130,7 +121,7 @@ cf_registry_t *cf_registry_create(uint64_t next_cf_id)
     /* publish an empty view up front so a lookup before the first family never sees a null one */
     if (cf_registry_publish_locked(reg) != TDB_SUCCESS)
     {
-        pthread_rwlock_destroy(&reg->lock);
+        tdb_wprwlock_destroy(&reg->lock);
         free(reg->cfs);
         free(reg);
         return NULL;
@@ -147,7 +138,7 @@ void cf_registry_destroy(cf_registry_t *reg)
     tdb_retire_drain(&reg->view_retire, NULL, NULL);
     cf_registry_view_t *v = atomic_load_explicit(&reg->view, memory_order_acquire);
     if (v) cf_registry_view_reclaim(v, NULL);
-    pthread_rwlock_destroy(&reg->lock);
+    tdb_wprwlock_destroy(&reg->lock);
     free(reg);
 }
 
@@ -296,35 +287,22 @@ uint64_t cf_registry_next_cf_id(cf_registry_t *reg)
 
 void cf_registry_rdlock(cf_registry_t *reg)
 {
-    if (!reg) return;
-
-    /* hold off while a writer is waiting, so the gap it needs actually arrives. a reader that
-     * slipped through between this load and the acquire below costs that writer one more reader
-     * hold and nothing else, which is why an announcement is enough and a handoff is not needed */
-    while (atomic_load_explicit(&reg->writer_waiting, memory_order_acquire) > 0)
-        usleep(CF_REGISTRY_WRITER_YIELD_US);
-    pthread_rwlock_rdlock(&reg->lock);
+    if (reg) tdb_wprwlock_rdlock(&reg->lock);
 }
 
 void cf_registry_rdunlock(cf_registry_t *reg)
 {
-    if (reg) pthread_rwlock_unlock(&reg->lock);
+    if (reg) tdb_wprwlock_unlock(&reg->lock);
 }
 
 void cf_registry_wrlock(cf_registry_t *reg)
 {
-    if (!reg) return;
-
-    /* announced before the acquire and withdrawn after it, so the readers held off are exactly the
-     * ones that would otherwise have arrived while this writer waited */
-    atomic_fetch_add_explicit(&reg->writer_waiting, 1, memory_order_release);
-    pthread_rwlock_wrlock(&reg->lock);
-    atomic_fetch_sub_explicit(&reg->writer_waiting, 1, memory_order_release);
+    if (reg) tdb_wprwlock_wrlock(&reg->lock);
 }
 
 void cf_registry_wrunlock(cf_registry_t *reg)
 {
-    if (reg) pthread_rwlock_unlock(&reg->lock);
+    if (reg) tdb_wprwlock_unlock(&reg->lock);
 }
 
 int cf_registry_count_locked(const cf_registry_t *reg)

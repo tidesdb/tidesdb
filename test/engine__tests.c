@@ -1887,11 +1887,12 @@ void test_engine_compaction_converges_an_interleaved_store(void)
             engine_put(db, cf, band * ENGINE_CONVERGE_ROUNDS + round);
 
     ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    /* each pass has to do its work rather than be allowed to report locked and do none. a locked
+     * compact is the background scheduler holding the family's claim, so tolerating it here is the
+     * race the passes exist to avoid -- and with a budget of six, a few no-ops leave the store
+     * short of the merges convergence is then asserted on */
     for (int pass = 0; pass < ENGINE_CONVERGE_PASSES; pass++)
-    {
-        const int rc = tidesdb_compact(db, cf);
-        ASSERT_TRUE(rc == TDB_SUCCESS || rc == TDB_ERR_LOCKED);
-    }
+        ASSERT_EQ(engine_test_compact(db, cf), TDB_SUCCESS);
 
     /* a narrow band, one thirty-second of the key space */
     char lo[16], hi[16];
@@ -3310,6 +3311,22 @@ void test_engine_create_completes_under_sustained_flush(void)
     for (int i = 0; i < ENGINE_TEST_CREATE_READERS; i++) pthread_join(readers[i], NULL);
 
     ASSERT_EQ(rc, TDB_SUCCESS);
+
+    /* a create that overran its deadline waited on something, and the engine already counts where.
+     * printing the breakdown here is the difference between a failure that names the lock and one
+     * that leaves the reader inferring it from log timestamps -- which has cost this test more than
+     * one wrong diagnosis */
+    if (elapsed >= ENGINE_TEST_CREATE_DEADLINE_SECS)
+    {
+        tidesdb_stall_stats_t stalls;
+        if (tidesdb_get_stall_stats(db, &stalls) == TDB_SUCCESS)
+            for (int i = 0; i < TDB_STALL_COUNT; i++)
+                fprintf(stderr, "  stall %-12s count %llu total %llu us longest %llu us\n",
+                        tidesdb_stall_reason_name((tidesdb_stall_reason_t)i),
+                        (unsigned long long)stalls.reasons[i].count,
+                        (unsigned long long)stalls.reasons[i].total_us,
+                        (unsigned long long)stalls.reasons[i].max_us);
+    }
     ASSERT_TRUE(elapsed < ENGINE_TEST_CREATE_DEADLINE_SECS);
     ASSERT_TRUE(tidesdb_get_column_family(db, "late") != NULL);
 

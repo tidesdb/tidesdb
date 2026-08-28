@@ -379,7 +379,7 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
     strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
     manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
 
-    if (pthread_rwlock_init(&manifest->lock, NULL) != 0)
+    if (tdb_wprwlock_init(&manifest->lock) != 0)
     {
         free(manifest->entries);
         free(manifest);
@@ -395,7 +395,7 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
  */
 static void manifest_free_unopened(tidesdb_manifest_t *manifest)
 {
-    pthread_rwlock_destroy(&manifest->lock);
+    tdb_wprwlock_destroy(&manifest->lock);
     free(manifest->entries);
     free(manifest);
 }
@@ -494,7 +494,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
     if (!manifest || !path) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
+    tdb_wprwlock_wrlock(&manifest->lock);
 
     int result = 0;
 
@@ -505,7 +505,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
         strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
         manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
         result = manifest_rollover_locked(manifest, durable_sync);
-        pthread_rwlock_unlock(&manifest->lock);
+        tdb_wprwlock_unlock(&manifest->lock);
         atomic_fetch_sub(&manifest->active_ops, 1);
         return result;
     }
@@ -516,7 +516,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
                                    0 /* preallocation disabled */) != 0)
         {
             manifest->bm = NULL;
-            pthread_rwlock_unlock(&manifest->lock);
+            tdb_wprwlock_unlock(&manifest->lock);
             atomic_fetch_sub(&manifest->active_ops, 1);
             return -1;
         }
@@ -571,7 +571,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
             result = manifest_rollover_locked(manifest, durable_sync);
     }
 
-    pthread_rwlock_unlock(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
@@ -596,14 +596,14 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
             manifest->path[0] ? manifest->path : "(unknown)", atomic_load(&manifest->active_ops));
     }
 
-    if (manifest->pending_len > 0) pthread_rwlock_wrlock(&manifest->lock);
+    if (manifest->pending_len > 0) tdb_wprwlock_wrlock(&manifest->lock);
     if (manifest->bm)
     {
         (void)block_manager_close(manifest->bm);
         manifest->bm = NULL;
     }
-    pthread_rwlock_unlock(&manifest->lock);
-    pthread_rwlock_destroy(&manifest->lock);
+    tdb_wprwlock_unlock(&manifest->lock);
+    tdb_wprwlock_destroy(&manifest->lock);
     free(manifest->pending);
     free(manifest->cfs);
     free(manifest->entries);

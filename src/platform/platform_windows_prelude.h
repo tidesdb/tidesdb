@@ -16,6 +16,12 @@
 #include <sys/stat.h>
 #include <windows.h>
 
+/* windows.h reaches rpcndr.h, which defines small as a keyword for the midl compiler's benefit.
+ * nothing here speaks midl, and every declaration of a variable named small becomes a declaration
+ * of one named char, which fails somewhere that names no macro and reads as a stray type. undone
+ * once here rather than left for each caller to avoid the word */
+#undef small
+
 /* ===== the posix types msvc has none of its own =====
  *
  * first in the file, ahead of everything that names one. this header is first among the windows

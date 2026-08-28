@@ -6,7 +6,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-#include <dirent.h> /* opendir, for counting the klog files a compaction leaves behind */
 
 #include "../src/column_family/column_family.h" /* cf_t, for level inspection */
 #include "../src/column_family/level/level_set.h"
@@ -294,6 +293,23 @@ static int engine_test_compact(tidesdb_t *db, tidesdb_column_family_t *cf)
     return rc;
 }
 
+/* reconfigure a family, retrying while it is claimed. the update takes the family's claim so that
+ * no two reconfigures or ddl operations run on it at once, and reports locked rather than waiting
+ * when it cannot have it -- and the compaction scheduler's backstop tick claims every idle family
+ * while it plans. so a reconfigure meets that claim for reasons that have nothing to do with what
+ * it is changing, and on a busy runner it meets it often. the caller's contract is to retry */
+static int engine_test_update_config(tidesdb_t *db, tidesdb_column_family_t *cf,
+                                     const tidesdb_column_family_config_t *cc, int persist)
+{
+    int rc = TDB_ERR_LOCKED;
+    for (int attempt = 0; attempt < ENGINE_TEST_LOCKED_RETRIES && rc == TDB_ERR_LOCKED; attempt++)
+    {
+        rc = tidesdb_cf_update_runtime_config(db, cf, cc, persist);
+        if (rc == TDB_ERR_LOCKED) usleep(ENGINE_TEST_LOCKED_BACKOFF_US);
+    }
+    return rc;
+}
+
 static void engine_open_with_cf(char *db_path, tidesdb_t **db, tidesdb_column_family_t **cf)
 {
     tidesdb_config_t cfg = engine_test_config(db_path);
@@ -570,7 +586,13 @@ void test_engine_flush_rotation(void)
 }
 
 /* enough flushes accumulate L1 files to trip the compaction trigger; the scheduler plans and a
- * worker merges them down, so data reaches L2 while every key stays readable throughout */
+ * worker merges them down, so data leaves L1 while every key stays readable throughout.
+ *
+ * which level it comes to rest in is the scheduler's business rather than this test's. a merge into
+ * a level reads every level at and below it, and the planner targets the largest live one, so with
+ * the minimum level count above two the tier goes straight past L2 and nothing ever rests there.
+ * naming L2 turned this into a race on a level that may hold something for no time at all, which
+ * one allocator's timing happened to lose every run and the others happened to win */
 void test_engine_compaction(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -600,17 +622,16 @@ void test_engine_compaction(void)
         tidesdb_txn_free(t);
     }
 
-    /* wait for a compaction to land data at L2 (the grow merge of the L1 tier) */
+    /* wait for a compaction to land data anywhere below L1 (the grow merge of the L1 tier) */
     cf_t *icf = (cf_t *)cf;
     int compacted = 0;
     for (int t = 0; t < 500 && !compacted; t++)
     {
-        if (level_set_count(icf->levels, 2) > 0)
-            compacted = 1;
-        else
-            usleep(10000); /* 10ms */
+        for (int lvl = LEVEL_SET_L1 + 1; lvl <= LEVEL_SET_MAX_LEVELS && !compacted; lvl++)
+            if (level_set_count(icf->levels, lvl) > 0) compacted = 1;
+        if (!compacted) usleep(10000); /* 10ms */
     }
-    ASSERT_TRUE(compacted); /* the scheduler planned and a worker merged L1 down to L2 */
+    ASSERT_TRUE(compacted); /* the scheduler planned and a worker merged the L1 tier down */
 
     /* every key is still readable across the flush + compaction churn */
     for (int i = 0; i < n; i++)
@@ -2162,17 +2183,7 @@ void test_engine_cf_update_runtime_config(void)
     tidesdb_column_family_config_t updated = st.config;
     updated.l1_file_count_trigger = 99; /* a distinctive persisted planner knob */
     snprintf(updated.name, sizeof(updated.name), "ignored"); /* name change must be ignored */
-    /* the update claims the family against the compaction scheduler and reports locked rather
-     * than waiting, so a background compaction that happens to be running makes this a retry
-     * rather than a failure -- the same contract a caller has to honour */
-    int update_rc = TDB_ERR_LOCKED;
-    for (int attempt = 0; attempt < ENGINE_TEST_LOCKED_RETRIES && update_rc == TDB_ERR_LOCKED;
-         attempt++)
-    {
-        update_rc = tidesdb_cf_update_runtime_config(db, cf, &updated, 1);
-        if (update_rc == TDB_ERR_LOCKED) usleep(ENGINE_TEST_LOCKED_BACKOFF_US);
-    }
-    ASSERT_EQ(update_rc, TDB_SUCCESS);
+    ASSERT_EQ(engine_test_update_config(db, cf, &updated, 1), TDB_SUCCESS);
 
     ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
     ASSERT_EQ(st.config.l1_file_count_trigger, 99);
@@ -2426,10 +2437,12 @@ void test_engine_runtime_config_rejects_an_unbacked_encoding(void)
         ASSERT_EQ(tidesdb_cf_update_runtime_config(db, cf, &cc, 0), TDB_ERR_INVALID_ARGS);
     }
 
-    /* a backed id is accepted, so the check is discriminating rather than rejecting everything */
+    /* a backed id is accepted, so the check is discriminating rather than rejecting everything.
+     * through the retry, since this one has to reach the claim to succeed where the rejection
+     * above is refused by validation before the claim is ever attempted */
     cc.encoding_pipeline[0] = (uint8_t)TDB_COMPRESS_NONE;
     cc.encoding_count = 1;
-    ASSERT_EQ(tidesdb_cf_update_runtime_config(db, cf, &cc, 0), TDB_SUCCESS);
+    ASSERT_EQ(engine_test_update_config(db, cf, &cc, 0), TDB_SUCCESS);
 
     /* the family still flushes, which is the property the rejection protects */
     engine_put(db, cf, 1);

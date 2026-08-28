@@ -842,6 +842,18 @@ void test_l0_admit_write_blocks_until_the_queue_drains(void)
 /* how many records the staging-ack test appends, enough to span several ring reservations */
 #define ACK_STAGE_RECORDS 256
 
+/* the staging ring this test opens its wal with. the ring only has to hold what is in flight
+ * between an append and the flush thread draining it, and this test stages a few kilobytes in
+ * total, so this is already generous. it matters because passing zero asks for the default
+ * instead, which is several megabytes and carries a completion flag array of the same size beside
+ * it -- and a 32 bit address space, this far into a run of small allocations, has nothing
+ * contiguous left that large. the block manager raises anything under its own minimum, so what is
+ * asked for here is the intent rather than the exact figure.
+ *
+ * nothing outside a test asks for the default. the engine sizes a wal's ring from the configured
+ * write buffer and clamps it, so a ring this small is also the shape the engine actually opens */
+#define ACK_STAGE_RING (64u * 1024)
+
 /* acknowledging on staging returns before the flush thread has written anything, so the records
  * only reach the file because closing the WAL drains the ring. that drain is what makes the weakest
  * durability mode lose nothing to a clean shutdown, so assert every appended record is readable
@@ -851,13 +863,13 @@ void test_l0_wal_ack_on_stage_survives_close(void)
     const char *wal_path = "./l0_test_ack_stage.wal";
     (void)remove(wal_path);
 
-    /* the reason is reported rather than only the failure. this is the one buffered open in the
-     * suite, and it asks for a staging ring pair of several megabytes on top of opening the file,
-     * so a refusal here can come from the allocation as easily as from the path -- and a bare
-     * comparison against zero says which of them only by leaving it out */
+    /* the reason is reported rather than only the failure. this open allocates its staging ring on
+     * top of opening the file, so a refusal can come from the allocation as readily as from the
+     * path, and a bare comparison against zero tells them apart only by leaving both out */
     block_manager_t *wal = NULL;
     errno = 0;
-    const int wal_rc = block_manager_open_buffered(&wal, wal_path, BLOCK_MANAGER_SYNC_NONE, 0);
+    const int wal_rc =
+        block_manager_open_buffered(&wal, wal_path, BLOCK_MANAGER_SYNC_NONE, ACK_STAGE_RING);
     if (wal_rc != 0)
         fprintf(stderr, "buffered wal open of %s failed, errno %d (%s)\n", wal_path, errno,
                 strerror(errno));

@@ -121,6 +121,10 @@ typedef struct
     sstable_builder_t *cur_builder;
     int cur_open;
     int cur_partition; /* index of the boundary partition the current output holds */
+    /* the intervals this merge's inputs carried, borrowed, written into every output it produces.
+     * an interval lives as long as a table holding it, so a merge that retires its inputs has to
+     * hand what they carried to what replaces them or the deletes go with the files */
+    const range_tombstone_set_t *carried;
 } ce_sink_t;
 
 /* fill a builder config from the cf's persisted config and the compaction's shared services */
@@ -134,10 +138,6 @@ static void ce_builder_config(const compaction_ctx_t *cx, uint64_t id, const cha
     memset(config, 0, sizeof(*config));
     config->target_node_size = cc->btree_klog_block_size;
     config->value_threshold = cf_config_value_threshold(cc, cx->value_threshold);
-    /* the emit loop drops every version a range tombstone at or below the floor covers, so the
-     * output records the newest tombstone it could see -- a sequence it actually applied, not the
-     * floor, which would claim tombstones written after this build */
-    config->range_del_applied_seq = cf_range_tombstones_applied_through(cx->cf, cx->gc_floor);
     config->enable_bloom = cc->enable_bloom_filter;
     config->bloom_fpr = cc->bloom_fpr;
     config->sync_mode = cx->sync_mode;
@@ -181,6 +181,7 @@ static int ce_sink_open(ce_sink_t *s)
     sstable_builder_config_t config;
     tidesdb_column_family_config_t cc;
     ce_builder_config(s->cx, id, klog_path, &cc, &config);
+    config.range_tombstones = s->carried;
     if (sstable_builder_new(&s->cur_builder, s->cur_bm, s->cx->cf->vlog, &config) != TDB_SUCCESS)
     {
         /* the klog was never adopted, so it was not counted; close it without a note_close, and
@@ -797,7 +798,113 @@ static int ce_commit(const compaction_ctx_t *cx, const compaction_job_t *job,
      * failed leaves the inputs as the live data, and a mark taken before that would send their
      * files with them the moment the level set let go */
     for (int i = 0; i < n_inputs; i++) sstable_mark_for_deletion(inputs[i]);
+
     return TDB_SUCCESS;
+}
+
+/**
+ * ce_interval_contained
+ * whether every sstable reaching into a fragment's range is one this merge is consuming, so no key
+ * the interval covers survives outside what the merge has just read
+ *
+ * asked once per fragment rather than once per sequence, since the answer is a property of the
+ * range and every sequence on the fragment shares it
+ * @param cf the family being compacted
+ * @param frag the fragment whose range is being asked about
+ * @param inputs the ids of the tables this merge is consuming
+ * @param n_inputs how many
+ * @return 1 when nothing outside the merge reaches the range, 0 when something does or might
+ */
+static int ce_interval_contained(cf_t *cf, const rt_fragment_t *frag, const uint64_t *inputs,
+                                 const int n_inputs)
+{
+    /* an unbounded end, or a lower bound of no bytes, names a range the overlap scan cannot be
+     * asked about, and an interval that is only ever carried costs space rather than correctness */
+    if (frag->lo_size == 0 || frag->hi_size == RT_UNBOUNDED_ABOVE) return 0;
+
+    for (int lvl = 1; lvl <= LEVEL_SET_MAX_LEVELS; lvl++)
+    {
+        sstable_t *out[CE_TOMB_SIBLING_MAX];
+        /* the scan's upper bound is inclusive where the interval's is not, so a table beginning
+         * exactly at the interval's end is counted as reaching in when it does not. that keeps an
+         * interval a merge could have dropped, which is the direction to be wrong in */
+        const int nn = level_set_overlapping(cf->levels, lvl, frag->lo, frag->lo_size, frag->hi,
+                                             frag->hi_size, out, CE_TOMB_SIBLING_MAX);
+        if (nn < 0) return 0; /* the level could not be read, so nothing is ruled out */
+
+        const int stored = nn < CE_TOMB_SIBLING_MAX ? nn : CE_TOMB_SIBLING_MAX;
+        int reaches = nn >= CE_TOMB_SIBLING_MAX; /* a truncated level leaves a table unseen */
+        for (int i = 0; i < stored; i++)
+        {
+            int is_input = 0;
+            for (int q = 0; q < n_inputs; q++)
+                if (out[i]->id == inputs[q])
+                {
+                    is_input = 1;
+                    break;
+                }
+            /* a table carrying only intervals holds no key the merge could have missed, and it is
+             * the one kind of table the overlap scan returns for every range it is asked about */
+            if (!is_input && out[i]->min_key && out[i]->min_key_size != 0) reaches = 1;
+        }
+        for (int i = 0; i < stored; i++)
+            if (sstable_unref(out[i])) sstable_close(out[i]);
+        if (reaches) return 0;
+    }
+    return 1;
+}
+
+/**
+ * ce_union_intervals
+ * the union of the intervals this merge's inputs carry, for its outputs to carry in their place
+ *
+ * an interval lives as long as a table holding it. the inputs are retired by this merge, so what
+ * they carried has to reach what replaces them or every delete they held is lost with their files.
+ * one this merge has finished the work of is left behind instead, which is the only thing that
+ * bounds what a table accumulates
+ * @param cx the compaction context, for the family and the reclamation floor
+ * @param job the job being run, for its input ids and whether it writes the largest level
+ * @param inputs the tables being merged
+ * @param n_inputs how many
+ * @return a set the caller frees, or NULL when no input carries any
+ */
+static range_tombstone_set_t *ce_union_intervals(const compaction_ctx_t *cx,
+                                                 const compaction_job_t *job,
+                                                 sstable_t *const *inputs, int n_inputs)
+{
+    range_tombstone_set_t *set = NULL;
+    for (int i = 0; i < n_inputs; i++)
+    {
+        if (!inputs[i] || !inputs[i]->range_tombstones) continue;
+        const size_t n = range_tombstone_set_count(inputs[i]->range_tombstones);
+        for (size_t f = 0; f < n; f++)
+        {
+            const rt_fragment_t *frag = NULL;
+            if (range_tombstone_set_fragment_at(inputs[i]->range_tombstones, f, &frag) !=
+                TDB_SUCCESS)
+                continue;
+
+            /* the merge has finished a sequence's work when it writes the largest level, nothing
+             * below it holding an older version, when every table the range reaches is one it has
+             * just read, and when the sequence is at or below the floor -- which is what says every
+             * reader that can still exist already sees it applied, and is the same ceiling the
+             * per-entry drop ran under, so the keys it covered really are gone rather than carried
+             * past. what is finished is left behind, and that is the only thing bounding what a
+             * table accumulates */
+            const int finished = job->is_largest_level &&
+                                 ce_interval_contained(cx->cf, frag, job->input_ids, job->n_inputs);
+
+            for (size_t k = 0; k < frag->seq_count; k++)
+            {
+                if (finished && frag->seqs[k] <= cx->gc_floor) continue;
+                if (!set && !(set = range_tombstone_set_new())) return NULL;
+                (void)range_tombstone_set_add(set, frag->lo, frag->lo_size,
+                                              frag->hi_size ? frag->hi : NULL, frag->hi_size,
+                                              frag->seqs[k]);
+            }
+        }
+    }
+    return set;
 }
 
 int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
@@ -828,6 +935,9 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     ce_sink_t sink;
     memset(&sink, 0, sizeof(sink));
     sink.cx = cx;
+    /* borrowed by the sink for the length of the merge; every output clones what it is given */
+    range_tombstone_set_t *carried = ce_union_intervals(cx, job, inputs, n_inputs);
+    sink.carried = carried;
     const int k = ce_subdivisions(cx, job);
     int rc = k > 1 ? ce_merge_subdivided(cx, job, inputs, n_inputs, k, &sink)
                    : ce_merge_inputs(cx, job, inputs, n_inputs, &sink, NULL, 0, NULL, 0);
@@ -863,6 +973,7 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     }
     for (int i = 0; i < n_inputs; i++)
         if (sstable_unref(inputs[i])) sstable_close(inputs[i]);
+    range_tombstone_set_free(carried);
     free(inputs);
     free(in_sizes);
     return rc;

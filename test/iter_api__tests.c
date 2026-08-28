@@ -243,13 +243,14 @@ void test_iter_skips_keys_a_range_tombstone_covers(void)
     iterapi_put(db, cf, "user:2", "v2");
     iterapi_put(db, cf, "z", "vz");
 
-    /* delete the prefix at a sequence above every key written so far and at or below the snapshot a
-     * scan will draw, so the tombstone is both newer than the data and visible to the scan */
-    const uint64_t tomb_seq = tidesdb_mvcc_current_seq(db->clock);
-    ASSERT_TRUE(tomb_seq > 0);
-    ASSERT_EQ(cf_range_tombstone_add((cf_t *)cf, (const uint8_t *)"user:", 5,
-                                     (const uint8_t *)"user;", 5, tomb_seq),
-              TDB_SUCCESS);
+    /* delete the prefix through a transaction, so it is written the way the engine writes one and
+     * lands at a sequence above every key above. it stays in the memtable, which the scan consults
+     * alongside the tables */
+    tidesdb_txn_t *deleter = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &deleter), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_delete_prefix(deleter, cf, (const uint8_t *)"user:", 5), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(deleter), TDB_SUCCESS);
+    tidesdb_txn_free(deleter);
 
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);

@@ -9,6 +9,7 @@
 #include "fuzz_harness.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -229,6 +230,10 @@ void fx_commit_txn(fx_state_t *s)
     tidesdb_txn_free(s->txn);
     s->txn = NULL;
     fuzz_model_txn_commit(s->model);
+    /* checking after every commit costs the run its speed and buys the exact operation a
+     * divergence appeared at, rather than whichever scan happened to notice it later */
+    if (getenv("TIDESDB_FUZZ_VERIFY_EACH"))
+        for (int i = 0; i < s->cf_count; i++) fx_verify_cf(s, s->db, s->cf_names[i]);
 }
 
 static void fx_rollback_txn(fx_state_t *s)
@@ -286,6 +291,40 @@ static int fx_get_retry(fx_state_t *s, const char *cf, const uint8_t *key, size_
     return rc;
 }
 
+/* what a scan of the same key returns, at the moment a point get disagreed with the model. the two
+ * read paths resolve differently -- a get walks the source stack and takes the first source holding
+ * the key, a scan merges every source and takes the highest sequence -- so a scan that returns the
+ * value the get did not is the source ordering having been broken rather than the version being
+ * lost. the mirror of the point get fx_dump_divergence already runs when a scan is the one that
+ * diverges */
+static void fx_scan_says(fx_state_t *s, const char *cf, const uint8_t *key, size_t klen)
+{
+    tidesdb_txn_t *rt = NULL;
+    if (tidesdb_txn_begin(s->db, &rt) != TDB_SUCCESS) return;
+    tidesdb_iter_t *it = NULL;
+    if (tidesdb_iter_new(rt, fx_cf_handle(s->db, cf), &it) == TDB_SUCCESS)
+    {
+        if (tidesdb_iter_seek(it, key, klen) == TDB_SUCCESS && tidesdb_iter_valid(it))
+        {
+            uint8_t *k = NULL, *v = NULL;
+            size_t kl = 0, vl = 0;
+            if (tidesdb_iter_key_value(it, &k, &kl, &v, &vl) == TDB_SUCCESS)
+            {
+                const int same = kl == klen && memcmp(k, key, kl) == 0;
+                fprintf(stderr, "  scan  len %zu first %02x%s\n", same ? vl : (size_t)0,
+                        same && vl ? v[0] : 0, same ? "" : " (scan landed on a different key)");
+                free(k);
+                free(v);
+            }
+        }
+        else
+            fprintf(stderr, "  scan  found no key at or past this one\n");
+        tidesdb_iter_free(it);
+    }
+    (void)tidesdb_txn_rollback(rt);
+    tidesdb_txn_free(rt);
+}
+
 static void fx_op_get(fx_state_t *s)
 {
     fx_ensure_txn(s);
@@ -304,6 +343,14 @@ static void fx_op_get(fx_state_t *s)
     if (rc == TDB_SUCCESS)
     {
         FUZZ_CHECK(present, "get: db found a key the model does not have");
+        if (!fuzz_value_eq(dbv, dbvlen, mv, mvlen))
+        {
+            fprintf(stderr, "\nget mismatch cf %s key %.*s\n  db    len %zu first %02x\n", cf,
+                    (int)klen, (const char *)key, dbvlen, dbvlen ? dbv[0] : 0);
+            fprintf(stderr, "  model len %zu first %02x\n", mvlen, mvlen ? mv[0] : 0);
+            fx_scan_says(s, cf, key, klen);
+            fx_op_history_dump();
+        }
         FUZZ_CHECK(fuzz_value_eq(dbv, dbvlen, mv, mvlen), "get: value mismatch");
         free(dbv);
     }
@@ -357,6 +404,8 @@ static void fx_op_delete_range(fx_state_t *s)
     FUZZ_CHECK(rc == TDB_SUCCESS, "delete_range rc %d", rc);
     FUZZ_CHECK(fuzz_model_delete_range(s->model, cf, lo, lo_size, hi_size ? hi : NULL, hi_size),
                "model delete_range");
+    fx_op_history_record("  delete_range cf %s lo %.*s hi %.*s", cf, (int)lo_size, (const char *)lo,
+                         (int)hi_size, hi_size ? (const char *)hi : "");
     if (s->verbose)
         fprintf(stderr, "    delete_range cf %s lo %.*s hi %.*s\n", cf, (int)lo_size,
                 (const char *)lo, (int)hi_size, hi_size ? (const char *)hi : "");
@@ -371,6 +420,8 @@ static void fx_op_delete_prefix(fx_state_t *s)
     const int rc = tidesdb_txn_delete_prefix(s->txn, fx_cf_handle(s->db, cf), prefix, prefix_size);
     FUZZ_CHECK(rc == TDB_SUCCESS, "delete_prefix rc %d", rc);
     FUZZ_CHECK(fuzz_model_delete_prefix(s->model, cf, prefix, prefix_size), "model delete_prefix");
+    fx_op_history_record("  delete_prefix cf %s prefix %.*s", cf, (int)prefix_size,
+                         (const char *)prefix);
     if (s->verbose)
         fprintf(stderr, "    delete_prefix cf %s prefix %.*s\n", cf, (int)prefix_size,
                 (const char *)prefix);
@@ -696,6 +747,58 @@ static void fx_op_cf_clone(fx_state_t *s)
     fx_refresh_cf_names(s);
 }
 
+/* ===== operation history =====
+ *
+ * the last operations dispatched, kept in memory. a run that traces to stderr as it goes is slowed
+ * enough by the writing to change how it interleaves with the flush and compaction threads, and a
+ * divergence that only appears at full speed then stops appearing at all. so the history costs a
+ * formatted copy into a fixed slot and is read only once something has already gone wrong */
+#define FX_OP_HISTORY      64
+#define FX_OP_HISTORY_TEXT 96
+
+static char fx_op_history_text[FX_OP_HISTORY][FX_OP_HISTORY_TEXT];
+static uint64_t fx_op_history_count;
+
+void fx_op_history_record(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    (void)vsnprintf(fx_op_history_text[fx_op_history_count % FX_OP_HISTORY], FX_OP_HISTORY_TEXT,
+                    fmt, args);
+    va_end(args);
+    fx_op_history_count++;
+}
+
+void fx_op_history_dump(void)
+{
+    const uint64_t have = fx_op_history_count < FX_OP_HISTORY ? fx_op_history_count : FX_OP_HISTORY;
+    fprintf(stderr, "\nlast %llu operations, oldest first\n", (unsigned long long)have);
+    for (uint64_t i = fx_op_history_count - have; i < fx_op_history_count; i++)
+        fprintf(stderr, "  %6llu  %s\n", (unsigned long long)i,
+                fx_op_history_text[i % FX_OP_HISTORY]);
+    fflush(stderr);
+}
+
+/* operations named in TIDESDB_FUZZ_SKIP are not dispatched, so a divergence can be bisected over
+ * the operation stream rather than reasoned about. a run that stops diverging once a class of
+ * operation is withheld has named the class that has to be involved, which is a far cheaper
+ * question to answer than what the mechanism is */
+static int fx_op_skipped(const char *name)
+{
+    const char *skip = getenv("TIDESDB_FUZZ_SKIP");
+    if (!skip || !*skip) return 0;
+    const size_t n = strlen(name);
+    for (const char *p = skip; *p;)
+    {
+        const char *end = strchr(p, ',');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) return 1;
+        if (!end) break;
+        p = end + 1;
+    }
+    return 0;
+}
+
 /* ===== dispatch and run ===== */
 
 static void fx_dispatch(fx_state_t *s, fx_op_t op)
@@ -837,6 +940,9 @@ int fuzz_run(const uint8_t *data, size_t size, int sync_mode)
         else
             s.log_level = TDB_LOG_WARN;
     }
+    /* the level is drawn from the input, which silences the engine on most runs -- fine for a
+     * fuzzer and useless for diagnosing one, so it can be pinned from the environment */
+    if (getenv("TIDESDB_FUZZ_LOG_WARN")) s.log_level = TDB_LOG_WARN;
     atomic_store(&_tidesdb_log_level, s.log_level);
     /* fuzz_run is called once per iteration, so the sink is opened once per process rather than
      * reopened (and leaked) on every one */
@@ -883,7 +989,9 @@ int fuzz_run(const uint8_t *data, size_t size, int sync_mode)
     for (int n = 0; n < FX_MAX_OPS && !fx_exhausted(&s); n++)
     {
         const fx_op_t op = FX_OP_TABLE[fx_byte(&s) % FX_OP_TABLE_LEN];
+        if (fx_op_skipped(FX_OP_NAMES[op])) continue;
         if (s.verbose) fprintf(stderr, "op %d: %s\n", n, FX_OP_NAMES[op]);
+        fx_op_history_record("op %d %s", n, FX_OP_NAMES[op]);
         fx_dispatch(&s, op);
     }
 

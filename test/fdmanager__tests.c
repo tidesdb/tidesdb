@@ -103,10 +103,12 @@ void test_fd_manager_reader_budget(void)
     fd_manager_destroy(&fdm);
 }
 
-/* the slowest the gate may take, as a multiple of its own bound. generous because the wait is
- * built from usleep and a loaded machine oversleeps; the property under test is that it terminates
- * at all, not that it is punctual */
-#define TEST_FDM_WAIT_SLACK 4
+/* the slowest the gate may take, as a multiple of its own bound. the property under test is that it
+ * terminates at all, not that it is punctual, and a loop that never terminated would not return to
+ * be measured -- nothing here ever frees a descriptor, so it would hang rather than overshoot. the
+ * figure is therefore set by how far a shared build machine oversleeps a usleep, which on a busy
+ * one is far past a small multiple, and not by anything the gate itself promises */
+#define TEST_FDM_WAIT_SLACK 50
 
 /* elapsed microseconds since start on the monotonic clock */
 static uint64_t test_fdm_elapsed_us(const struct timespec *start)

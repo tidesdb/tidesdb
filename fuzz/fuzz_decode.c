@@ -140,12 +140,9 @@ static void fzd_manifest(const uint8_t *data, size_t size)
     memset(&m, 0, sizeof(m));
     (void)manifest_apply_batch(&m, data, size);
 
-    /* a column family and an sstable each land in a fixed-size slot, but a range tombstone set owns
-     * a copy of its blob, so those go back one at a time */
+    /* a column family and an sstable each land in a fixed-size slot */
     free(m.cfs);
     free(m.entries);
-    for (int i = 0; i < m.num_range_dels; i++) free(m.range_dels[i].blob);
-    free(m.range_dels);
 }
 
 /* the decoders this target rotates through, selected by the first input byte */

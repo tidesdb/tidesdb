@@ -135,15 +135,11 @@ typedef int (*tidesdb_replay_superseded_fn)(void *ctx, uint32_t cf_index, const 
  * what replay needs to leave out an entry a durable later write has already retired
  * @param superseded the probe above, or NULL to apply every entry the log holds
  * @param ctx passed to superseded
- * @param durable_seq the highest sequence any sstable holds. an entry above it cannot be on disk,
- * so it skips the probe entirely -- which is every entry of an ordinary recovery, where the only
- * surviving log is the one the active memtable was never flushed from
  */
 typedef struct
 {
     tidesdb_replay_superseded_fn superseded;
     void *ctx;
-    uint64_t durable_seq;
 } tidesdb_replay_filter_t;
 
 /**
@@ -171,6 +167,7 @@ typedef struct
  */
 int tidesdb_l0_replay_wal(tidesdb_l0_t *l0, block_manager_t *wal, uint64_t generation,
                           const tidesdb_l0_aborted_set_t *aborted, uint64_t *out_max_seq,
-                          tdb_prepare_stage_t *stage, const tidesdb_replay_filter_t *filter);
+                          tdb_prepare_stage_t *stage, const tidesdb_replay_filter_t *filter,
+                          int data_already_durable);
 
 #endif /* __TIDESDB_TXN_L0_ADAPTER_H__ */

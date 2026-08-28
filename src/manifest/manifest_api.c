@@ -48,55 +48,6 @@ int tidesdb_manifest_drop_cf(tidesdb_manifest_t *manifest, const uint64_t cf_id)
     return result;
 }
 
-int tidesdb_manifest_set_range_dels(tidesdb_manifest_t *manifest, const uint64_t cf_id,
-                                    const uint8_t *blob, const uint32_t blob_len)
-{
-    if (!manifest) return -1;
-    if (blob_len > MANIFEST_RANGE_DEL_BLOB_MAX) return -1;
-
-    atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
-    int result = manifest_range_del_upsert_unlocked(manifest, cf_id, blob, blob_len);
-    if (result == 0)
-    {
-        result = manifest_pending_add_range_del(manifest, cf_id, blob, blob_len);
-        if (result == 0) manifest->records_since_snapshot++;
-    }
-    pthread_rwlock_unlock(&manifest->lock);
-    atomic_fetch_sub(&manifest->active_ops, 1);
-    return result;
-}
-
-int tidesdb_manifest_get_range_dels(tidesdb_manifest_t *manifest, const uint64_t cf_id,
-                                    uint8_t **out_blob, uint32_t *out_len)
-{
-    if (!manifest || !out_blob || !out_len) return -1;
-    *out_blob = NULL;
-    *out_len = 0;
-
-    atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_rdlock(&manifest->lock);
-    int result = 0;
-    for (int i = 0; i < manifest->num_range_dels; i++)
-    {
-        if (manifest->range_dels[i].cf_id != cf_id || manifest->range_dels[i].blob_len == 0)
-            continue;
-        uint8_t *copy = malloc(manifest->range_dels[i].blob_len);
-        if (!copy)
-        {
-            result = -1;
-            break;
-        }
-        memcpy(copy, manifest->range_dels[i].blob, manifest->range_dels[i].blob_len);
-        *out_blob = copy;
-        *out_len = manifest->range_dels[i].blob_len;
-        break;
-    }
-    pthread_rwlock_unlock(&manifest->lock);
-    atomic_fetch_sub(&manifest->active_ops, 1);
-    return result;
-}
-
 int tidesdb_manifest_cf_id_by_name(tidesdb_manifest_t *manifest, const char *name, uint64_t *out_id)
 {
     if (!manifest || !name || !out_id) return -1;

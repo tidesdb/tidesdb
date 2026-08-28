@@ -302,7 +302,6 @@ One framed block per commit, holding a batch:
 | `MANIFEST_OP_ADD_P` | op + cf(8) + level(4) + id(8) + entries(8) + bytes(8) + partition(4) + birth level(4) | 45 |
 | `MANIFEST_OP_MOVE` | op + cf(8) + id(8) + new level(4) | 21 |
 | `MANIFEST_OP_REMOVE` | op + cf(8) + level(4) + id(8) | 21 |
-| `MANIFEST_OP_RANGE_DEL` | op + cf(8) + blob len(4), then the blob | 13 + variable |
 | `MANIFEST_OP_SEQ` | op + sequence(8) | 9 |
 | `MANIFEST_OP_CF_SEQ` | op + next family id(8) | 9 |
 

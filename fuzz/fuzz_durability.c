@@ -150,6 +150,20 @@ tidesdb_config_t fx_db_config(fx_state_t *s, char *path)
     cfg.memtable_write_buffer_size = FX_WRITE_BUFFER;
     cfg.memtable_sync_mode = s->sync_mode == FUZZ_SYNC_FULL ? TDB_SYNC_FULL : TDB_SYNC_NONE;
     cfg.log_level = (tidesdb_log_level_t)s->log_level;
+
+    /* the worker pools are where a run's timing comes from, and a failure that only appears at one
+     * interleaving cannot be told apart from one a change fixed. pinning both pools makes the
+     * background work serial, so a run that fails does so for a reason the next run repeats */
+    const char *threads = getenv("TIDESDB_FUZZ_THREADS");
+    if (threads)
+    {
+        const int n = (int)strtol(threads, NULL, 10);
+        if (n > 0)
+        {
+            cfg.num_flush_threads = n;
+            cfg.num_compaction_threads = n;
+        }
+    }
     return cfg;
 }
 

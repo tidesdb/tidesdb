@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "base/log.h"
+#include "base/waitstat.h" /* tdb_monotonic_us, for a wait bounded by real time */
 #include "memtable/memtable.h"
 
 /* the L0 side of backpressure. backpressure.c decides -- given a pressure snapshot it returns
@@ -14,9 +15,15 @@
  * thread, and counts what it did. the two are apart because the policy is a pure function over
  * numbers and is tested as one, while everything here touches the live queue */
 
-#define TDB_L0_BACKPRESSURE_POLL_US   200
-#define TDB_L0_BACKPRESSURE_MAX_POLLS 10000
-#define TDB_L0_BACKPRESSURE_LOG_EVERY 1000
+#define TDB_L0_BACKPRESSURE_POLL_US 200
+
+/* how long a writer waits for the queue to drain before it is admitted anyway. this is wall clock
+ * rather than a count of polls, because a poll does not reliably sleep for as long as it asks: on
+ * windows the wait is rounded to the millisecond, so a sub-millisecond one can return at once and a
+ * counted bound would expire in the time it takes to spin the loop rather than in the seconds it
+ * was meant to describe */
+#define TDB_L0_BACKPRESSURE_CEILING_US 2000000ull
+#define TDB_L0_BACKPRESSURE_LOG_EVERY  1000
 
 /* runs in the flush tier at which a writer starts dwelling, and at which it waits for the tier to
  * drain. the compaction trigger sits below both, so merging is already underway before ingestion is
@@ -92,7 +99,8 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
 
     uint64_t stalled_us = 0;
     int counted_block = 0;
-    for (int poll = 0; poll < TDB_L0_BACKPRESSURE_MAX_POLLS; poll++)
+    const uint64_t wait_started_us = tdb_monotonic_us();
+    for (;;)
     {
         tidesdb_l0_pressure_t pressure;
         l0_admission_snapshot(l0, &pressure);
@@ -106,7 +114,9 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
             if (decision.throttle_us > 0)
             {
                 usleep((unsigned int)decision.throttle_us);
-                stalled_us += decision.throttle_us;
+                /* measured rather than assumed, for the same reason the ceiling below is: what a
+                 * sleep was asked for is not what the caller was actually held for */
+                stalled_us = tdb_monotonic_us() - wait_started_us;
             }
             atomic_fetch_add_explicit(&l0->admits_throttled, 1, memory_order_relaxed);
             break;
@@ -118,17 +128,18 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
             l0_admission_note_block(l0, &pressure);
         }
         usleep(TDB_L0_BACKPRESSURE_POLL_US);
-        stalled_us += TDB_L0_BACKPRESSURE_POLL_US;
+        stalled_us = tdb_monotonic_us() - wait_started_us;
 
         /* the queue never drained inside the ceiling, so flush is not making progress; admitting
          * keeps ingestion degraded instead of hanging this writer on it forever */
-        if (poll + 1 == TDB_L0_BACKPRESSURE_MAX_POLLS)
+        if (stalled_us >= TDB_L0_BACKPRESSURE_CEILING_US)
         {
             atomic_fetch_add_explicit(&l0->admit_ceiling_hits, 1, memory_order_relaxed);
             TDB_DEBUG_LOG(TDB_LOG_WARN,
                           "l0 admission ceiling reached after %llu us at depth %d, flush is not "
                           "keeping up",
                           (unsigned long long)stalled_us, pressure.queue_depth);
+            break;
         }
     }
 

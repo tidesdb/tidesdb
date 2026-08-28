@@ -417,39 +417,71 @@ int engine_recover_cfs(tidesdb_t *db)
 
 /* whether name is exactly a NNNNNNN.log WAL file, decoding its generation into out_gen when it is
  */
-static int engine_parse_wal_name(const char *name, uint64_t *out_gen)
+/* one write-ahead log found on disk. flushed marks the form kept only for an undecided prepare,
+ * whose data records reached L1 already and must not be replayed a second time */
+typedef struct
 {
-    const size_t ext_len = strlen(TDB_WAL_EXT);
-    if (strlen(name) != (size_t)TDB_WAL_ID_DIGITS + ext_len) return 0;
+    uint64_t gen;
+    int flushed;
+} engine_wal_gen_t;
+
+static int engine_parse_wal_name(const char *name, uint64_t *out_gen, int *out_flushed)
+{
+    /* checked before the digits are read, since a shorter name would be walked past its end */
+    const size_t len = strlen(name);
+    if (len != (size_t)TDB_WAL_ID_DIGITS + strlen(TDB_WAL_EXT) &&
+        len != (size_t)TDB_WAL_ID_DIGITS + strlen(TDB_WAL_FLUSHED_EXT))
+        return 0;
     for (int i = 0; i < TDB_WAL_ID_DIGITS; i++)
         if (name[i] < '0' || name[i] > '9') return 0;
-    if (strcmp(name + TDB_WAL_ID_DIGITS, TDB_WAL_EXT) != 0) return 0;
+
+    /* a log carries one of two names -- the plain one, whose data is durable nowhere else, and the
+     * flushed one, kept only for an undecided prepare after its memtable reached L1 */
+    const char *ext = name + TDB_WAL_ID_DIGITS;
+    int flushed;
+    if (strcmp(ext, TDB_WAL_EXT) == 0)
+        flushed = 0;
+    else if (strcmp(ext, TDB_WAL_FLUSHED_EXT) == 0)
+        flushed = 1;
+    else
+        return 0;
+
     char digits[TDB_WAL_ID_DIGITS + 1];
     memcpy(digits, name, TDB_WAL_ID_DIGITS);
     digits[TDB_WAL_ID_DIGITS] = '\0';
     *out_gen = strtoull(digits, NULL, 10);
+    if (out_flushed) *out_flushed = flushed;
     return 1;
 }
 
-/* collect the WAL generations present under db_path as NNNNNNN.log files into a sorted-ascending
- * array; returns the count and sets *out_gens (caller frees), or -1 on error */
-static int engine_scan_wal_generations(const char *db_dir, uint64_t **out_gens)
+/* the log name a generation carries, which says whether its data records still matter */
+static int engine_wal_gen_name(const engine_wal_gen_t *g, char *out, size_t out_size)
+{
+    return g->flushed ? tidesdb_wal_flushed_filename(g->gen, out, out_size)
+                      : tidesdb_wal_filename(g->gen, out, out_size);
+}
+
+/* collect the WAL generations present under db_path into a sorted-ascending array, each carrying
+ * whether its memtable was already flushed; returns the count and sets *out_gens (caller frees),
+ * or -1 on error */
+static int engine_scan_wal_generations(const char *db_dir, engine_wal_gen_t **out_gens)
 {
     *out_gens = NULL;
     DIR *dir = opendir(db_dir);
     if (!dir) return -1;
 
-    uint64_t *gens = NULL;
+    engine_wal_gen_t *gens = NULL;
     int count = 0, cap = 0;
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL)
     {
         uint64_t gen = 0;
-        if (!engine_parse_wal_name(ent->d_name, &gen)) continue;
+        int flushed = 0;
+        if (!engine_parse_wal_name(ent->d_name, &gen, &flushed)) continue;
         if (count == cap)
         {
             const int nc = cap ? cap * 2 : ENGINE_WAL_GEN_LIST_INIT;
-            uint64_t *grown = realloc(gens, (size_t)nc * sizeof(*grown));
+            engine_wal_gen_t *grown = realloc(gens, (size_t)nc * sizeof(*grown));
             if (!grown)
             {
                 free(gens);
@@ -459,15 +491,17 @@ static int engine_scan_wal_generations(const char *db_dir, uint64_t **out_gens)
             gens = grown;
             cap = nc;
         }
-        gens[count++] = gen;
+        gens[count].gen = gen;
+        gens[count].flushed = flushed;
+        count++;
     }
     closedir(dir);
 
     for (int i = 1; i < count; i++) /* insertion sort ascending; generations are few */
     {
-        const uint64_t v = gens[i];
+        const engine_wal_gen_t v = gens[i];
         int j = i - 1;
-        while (j >= 0 && gens[j] > v)
+        while (j >= 0 && gens[j].gen > v.gen)
         {
             gens[j + 1] = gens[j];
             j--;
@@ -481,10 +515,14 @@ static int engine_scan_wal_generations(const char *db_dir, uint64_t **out_gens)
 /* mint the WAL for a generation and install its memtable -- as the active one when is_first, else
  * by rotating it in, which seals the current active into the immutable queue. repoints wal_bm and
  * the generation counter at the new active */
-static int engine_install_generation(tidesdb_t *db, uint64_t gen, int is_first, int sealed)
+static int engine_install_generation(tidesdb_t *db, uint64_t gen, int is_first, int sealed,
+                                     int flushed)
 {
     char wal_name[ENGINE_WAL_NAME_MAX], wal_path[ENGINE_PATH_BUF_SIZE];
-    if (tidesdb_wal_filename(gen, wal_name, sizeof(wal_name)) != TDB_SUCCESS)
+    /* a generation kept only for its prepare carries the flushed name, and opening it under the
+     * plain one would make an empty log beside it and lose the prepare the file was kept for */
+    if ((flushed ? tidesdb_wal_flushed_filename(gen, wal_name, sizeof(wal_name))
+                 : tidesdb_wal_filename(gen, wal_name, sizeof(wal_name))) != TDB_SUCCESS)
         return TDB_ERR_INVALID_ARGS;
     if (engine_build_path(db->db_path, wal_name, wal_path, sizeof(wal_path)) != TDB_SUCCESS)
         return TDB_ERR_INVALID_ARGS;
@@ -527,16 +565,16 @@ int engine_recover_wal(tidesdb_t *db, int *out_recovered, uint64_t *out_max_seq,
     *out_recovered = 0;
     *out_max_seq = 0;
 
-    uint64_t *gens = NULL;
+    engine_wal_gen_t *gens = NULL;
     const int n = engine_scan_wal_generations(db->db_path, &gens);
     if (n < 0) return TDB_ERR_IO;
     if (n == 0)
     {
         free(gens);
-        return engine_install_generation(db, ENGINE_FIRST_WAL_GENERATION, 1, 0);
+        return engine_install_generation(db, ENGINE_FIRST_WAL_GENERATION, 1, 0, 0);
     }
 
-    const uint64_t max_gen = gens[n - 1];
+    const uint64_t max_gen = gens[n - 1].gen;
     int rc = TDB_SUCCESS;
 
     /* collect every cancelled commit before applying anything. a commit that failed after its batch
@@ -547,7 +585,7 @@ int engine_recover_wal(tidesdb_t *db, int *out_recovered, uint64_t *out_max_seq,
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
         char scan_name[ENGINE_WAL_NAME_MAX], scan_path[ENGINE_PATH_BUF_SIZE];
-        if (tidesdb_wal_filename(gens[i], scan_name, sizeof(scan_name)) != TDB_SUCCESS ||
+        if (engine_wal_gen_name(&gens[i], scan_name, sizeof(scan_name)) != TDB_SUCCESS ||
             engine_build_path(db->db_path, scan_name, scan_path, sizeof(scan_path)) != TDB_SUCCESS)
         {
             rc = TDB_ERR_IO;
@@ -575,22 +613,25 @@ int engine_recover_wal(tidesdb_t *db, int *out_recovered, uint64_t *out_max_seq,
      * reader takes a memtable as newer than any sstable, so a deleted key would come back. the
      * filter drops exactly those entries, asking the sstables directly rather than the read stack,
      * which at this point is reading the memtables being rebuilt */
-    const tidesdb_replay_filter_t filter = {.superseded = engine_replay_superseded,
-                                            .ctx = db,
-                                            .durable_seq = engine_recovered_max_sstable_seq(db)};
-
+    const tidesdb_replay_filter_t filter = {.superseded = engine_replay_superseded, .ctx = db};
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
         /* every replayed generation is sealed; only the fresh active below takes writes */
-        rc = engine_install_generation(db, gens[i], i == 0, 1);
+        rc = engine_install_generation(db, gens[i].gen, i == 0, 1, gens[i].flushed);
         if (rc != TDB_SUCCESS) break;
         uint64_t m = 0;
-        rc = tidesdb_l0_replay_wal(db->l0, db->wal_bm, gens[i], &aborted, &m, stage, &filter);
+        /* a generation whose memtable already reached L1 keeps its log only for the prepare in it,
+         * so its data records are replayed as nothing. they are durable in an sstable, and a
+         * compaction may since have retired versions they still name -- putting those back above
+         * the sstables is what resurrects a deleted key */
+        rc = tidesdb_l0_replay_wal(db->l0, db->wal_bm, gens[i].gen, &aborted, &m, stage, &filter,
+                                   gens[i].flushed);
         /* replay carries a record's cf index verbatim and cannot tell a retired one from a live
          * one, so the generation and its high sequence are traced to place a replayed key in time
          */
-        TDB_DEBUG_LOG(TDB_LOG_TRACE, "replayed wal generation %llu up to seq %llu",
-                      (unsigned long long)gens[i], (unsigned long long)m);
+        TDB_DEBUG_LOG(TDB_LOG_TRACE, "replayed wal generation %llu%s up to seq %llu",
+                      (unsigned long long)gens[i].gen,
+                      gens[i].flushed ? " (data already in l1)" : "", (unsigned long long)m);
         if (m > *out_max_seq) *out_max_seq = m;
     }
     tidesdb_l0_aborted_set_free(&aborted);
@@ -598,7 +639,7 @@ int engine_recover_wal(tidesdb_t *db, int *out_recovered, uint64_t *out_max_seq,
     if (rc != TDB_SUCCESS) return rc;
 
     /* seal the last recovered generation by installing a fresh empty active above it */
-    rc = engine_install_generation(db, max_gen + 1, 0, 0);
+    rc = engine_install_generation(db, max_gen + 1, 0, 0, 0);
     if (rc != TDB_SUCCESS) return rc;
     *out_recovered = n;
     return TDB_SUCCESS;

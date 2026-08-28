@@ -98,6 +98,40 @@ void test_source_newest_wins(void)
     free(v.value);
 }
 
+/* the stack does not compare sequences. it takes the first source that hits, so every read rests on
+ * the caller having ordered the stack such that a shallower source can only ever hold a newer
+ * version of a key than a deeper one. this pins that contract from the side that is not otherwise
+ * covered -- with the ordering violated, the stale version is what a read gets, and the newer one
+ * below it is never consulted. anything that breaks the ordering is therefore a silent wrong answer
+ * rather than a detected error, which is why the invariant belongs to whoever builds the stack */
+void test_source_stack_takes_the_first_hit_not_the_highest_seq(void)
+{
+    mock_src wb = {0, 0, 1, "k", 0, NULL};
+    mock_src l0 = {0, 1, 0, "k", 5, "stale"};
+    mock_src sst = {0, 1, 0, "k", 10, "newer"};
+    tidesdb_source_t stack[3] = {src("wb", &wb), src("l0", &l0), src("sst", &sst)};
+
+    tidesdb_source_version_t v;
+    ASSERT_EQ(tidesdb_source_stack_get(stack, 3, 0, (const uint8_t *)"k", 1, 50, &v),
+              TDB_SOURCE_FOUND);
+    ASSERT_TRUE(v.seq == 5 && val_is(&v, "stale"));
+    free(v.value);
+}
+
+/* the conflict probe shares the ordering assumption -- the first source holding the key decides,
+ * even when a deeper one holds a version above the floor and the shallower one does not */
+void test_source_stack_has_newer_takes_the_first_source_holding_the_key(void)
+{
+    mock_src l0 = {0, 1, 0, "k", 5, "stale"};
+    mock_src sst = {0, 1, 0, "k", 10, "newer"};
+    tidesdb_source_t stack[2] = {src("l0", &l0), src("sst", &sst)};
+
+    int newer = -1;
+    ASSERT_EQ(tidesdb_source_stack_has_newer(stack, 2, 0, (const uint8_t *)"k", 1, 7, &newer),
+              TDB_SOURCE_FOUND);
+    ASSERT_EQ(newer, 0); /* sst holds 10, above the floor of 7, and is never asked */
+}
+
 /* a read falls through empty newer sources to an older one that has the key */
 void test_source_fallthrough(void)
 {
@@ -181,6 +215,8 @@ int main(int argc, char **argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_source_ryow_wins, tests_passed);
     RUN_TEST(test_source_newest_wins, tests_passed);
+    RUN_TEST(test_source_stack_takes_the_first_hit_not_the_highest_seq, tests_passed);
+    RUN_TEST(test_source_stack_has_newer_takes_the_first_source_holding_the_key, tests_passed);
     RUN_TEST(test_source_fallthrough, tests_passed);
     RUN_TEST(test_source_snapshot_fallthrough, tests_passed);
     RUN_TEST(test_source_not_found, tests_passed);

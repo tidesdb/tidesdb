@@ -13,6 +13,15 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+/* compare two doubles by their bits rather than by value. a 32-bit x86 build evaluates a floating
+ * expression in the x87's extended precision, so the literal can be held to more precision than the
+ * double it is compared against and an exact round-trip still tests unequal. the blob stores the
+ * ieee-754 bits verbatim, so the bits are what the round-trip actually promises */
+static int cf_config_same_double(const double a, const double b)
+{
+    return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
 /* a config with a distinct value in every persisted field, so a round-trip that drops one is caught
  */
 static tidesdb_column_family_config_t make_config(void)
@@ -58,10 +67,10 @@ void test_cf_config_roundtrip(void)
     ASSERT_EQ(out.keep_values_inline, 1);
     ASSERT_EQ((int)out.btree_klog_block_size, 8192);
     ASSERT_EQ(out.enable_bloom_filter, 1);
-    ASSERT_TRUE(out.bloom_fpr == 0.01);
+    ASSERT_TRUE(cf_config_same_double(out.bloom_fpr, 0.01));
     ASSERT_EQ((int)out.default_isolation_level, TDB_ISOLATION_SNAPSHOT);
     ASSERT_EQ(out.l1_file_count_trigger, 4);
-    ASSERT_TRUE(out.tombstone_density_trigger == 0.25);
+    ASSERT_TRUE(cf_config_same_double(out.tombstone_density_trigger, 0.25));
     ASSERT_EQ((int)out.tombstone_density_min_entries, 1000);
     ASSERT_EQ(out.encoding_count, 2);
     ASSERT_EQ(out.encoding_pipeline[0], TDB_COMPRESS_SNAPPY);
@@ -150,6 +159,10 @@ void test_cf_config_validate(void)
     ASSERT_EQ(tidesdb_encoding_registry_init(&reg), 0);
 
     tidesdb_column_family_config_t c = make_config();
+    /* every case below that validates against the real registry has to name a codec this build
+     * actually registered, and the only one guaranteed to be there is the one that does nothing.
+     * naming an optional backend here made this whole test a check of how the runner was built */
+    c.encoding_pipeline[0] = TDB_COMPRESS_NONE;
     ASSERT_EQ(cf_config_validate(&c, &reg), 0);
 
     /* a pipeline id naming no algorithm is rejected whether or not a registry is supplied. the
@@ -179,7 +192,6 @@ void test_cf_config_validate(void)
     ASSERT_EQ(cf_config_validate(&c, &bare), -1);
     c.encoding_pipeline[0] = TDB_COMPRESS_NONE;
     ASSERT_EQ(cf_config_validate(&c, &bare), 0);
-    c.encoding_pipeline[0] = TDB_COMPRESS_SNAPPY;
 
     /* an out-of-range bloom fpr is rejected only when the filter is enabled */
     c.bloom_fpr = 1.5;

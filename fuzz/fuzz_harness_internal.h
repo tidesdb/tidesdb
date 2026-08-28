@@ -206,4 +206,14 @@ void fx_settle_prepared(fx_state_t *s);
 void fx_op_reopen(fx_state_t *s);
 void fx_op_backup(fx_state_t *s);
 
+/**
+ * fx_op_history_record / fx_op_history_dump
+ * keep the last operations in memory and print them only when something diverges. tracing every
+ * operation to stderr as it runs perturbs the timing enough to hide a race from the very run that
+ * is meant to catch it, so the history is written where it costs nothing and read where it matters
+ * @param fmt printf-style description of the operation just dispatched
+ */
+void fx_op_history_record(const char *fmt, ...);
+void fx_op_history_dump(void);
+
 #endif /* __TIDESDB_FUZZ_HARNESS_INTERNAL_H__ */

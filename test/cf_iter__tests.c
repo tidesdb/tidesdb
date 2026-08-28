@@ -9,6 +9,8 @@
 #include "../src/base/errors.h"
 #include "../src/column_family/cf_iter.h"
 #include "../src/flush/flush.h"
+#include "../src/txn/cf_source.h"
+#include "../src/txn/l0_adapter.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -597,6 +599,86 @@ void test_cf_iter_spilled_value_reports_offset_not_stale_bytes(void)
     cfi_db_close(&db);
 }
 
+/* the two read paths resolve a key by different rules. a point get walks the source stack and takes
+ * the first source that holds the key, trusting that a shallower source can only ever carry a newer
+ * version; a scan builds one merge over every memtable and every sstable at once and takes the
+ * highest sequence among them. while the ordering holds the two agree, and this is what they do
+ * when it does not -- the scan reports the newer version, the get reports the older one.
+ *
+ * that disagreement is the cheapest detector of a broken ordering there is. it needs no knowledge
+ * of how the break happened, only that the same key be asked for twice */
+void test_cf_iter_scan_resolves_by_sequence_where_a_point_get_resolves_by_position(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+
+    tidesdb_l0_t *l0 =
+        tidesdb_l0_create(CFI_BUFFER, CFI_QDEPTH, CFI_MAX_LEVEL, CFI_PROB, NULL, NULL);
+    tidesdb_l0_set_active(l0,
+                          tidesdb_memtable_create(NULL, 0, 0, CFI_MAX_LEVEL, CFI_PROB, NULL, NULL));
+    cf_t *cfs[1] = {cf};
+    _Atomic(uint64_t) next_id;
+    atomic_init(&next_id, 100);
+    const flush_ctx_t fx = {.l0 = l0,
+                            .cfs = cfs,
+                            .n_cfs = 1,
+                            .manifest = db.manifest,
+                            .manifest_path = db.manifest_path,
+                            .next_sstable_id = &next_id,
+                            .fdm = &db.fdm,
+                            .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                            .value_threshold = db.value_threshold};
+
+    /* the newer version reaches an sstable */
+    ASSERT_EQ(
+        tidesdb_l0_apply(l0, 0, (const uint8_t *)"K", 1, (const uint8_t *)"newer", 5, -1, 10, 0),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(
+                  l0, tidesdb_memtable_create(NULL, 1, 1, CFI_MAX_LEVEL, CFI_PROB, NULL, NULL)),
+              TDB_SUCCESS);
+    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(l0);
+    ASSERT_TRUE(immutable != NULL);
+    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
+    ASSERT_EQ(level_set_count(cf->levels, LEVEL_SET_L1), 1);
+
+    /* and the older one is left sitting above it in L0 */
+    ASSERT_EQ(
+        tidesdb_l0_apply(l0, 0, (const uint8_t *)"K", 1, (const uint8_t *)"stale", 5, -1, 5, 0),
+        TDB_SUCCESS);
+
+    tidesdb_l0_txn_ctx_t actx;
+    ASSERT_EQ(tidesdb_l0_adapter_init(&actx, l0, db.vlog), 0);
+    tidesdb_source_t stack[2];
+    tidesdb_l0_source(&actx, &stack[0]);
+    cf_source(cf, &stack[1]);
+
+    tidesdb_source_version_t v;
+    memset(&v, 0, sizeof(v));
+    ASSERT_EQ(tidesdb_source_stack_get(stack, 2, 0, (const uint8_t *)"K", 1, UINT64_MAX, &v),
+              TDB_SOURCE_FOUND);
+    ASSERT_EQ((int)v.seq, 5); /* the get stops at L0 */
+    free(v.value);
+
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new(cf, l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
+    ASSERT_EQ(cf_iter_seek(it, (const uint8_t *)"K", 1), TDB_SUCCESS);
+    const uint8_t *key = NULL, *value = NULL;
+    size_t key_size = 0, value_size = 0;
+    uint64_t seq = 0, vlog_offset = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(
+        cf_iter_get(it, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl, &deleted),
+        TDB_SUCCESS);
+    ASSERT_EQ((int)seq, 10); /* the scan resolves across both and takes the newer */
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -606,6 +688,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_cf_iter_seek_hides_tombstones, tests_passed);
     RUN_TEST(test_cf_iter_direction_flip_across_sources, tests_passed);
     RUN_TEST(test_cf_iter_spilled_value_reports_offset_not_stale_bytes, tests_passed);
+    RUN_TEST(test_cf_iter_scan_resolves_by_sequence_where_a_point_get_resolves_by_position,
+             tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

@@ -106,6 +106,15 @@ int tidesdb_wal_filename(uint64_t generation, char *out, size_t out_size)
     return TDB_SUCCESS;
 }
 
+int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return TDB_ERR_INVALID_ARGS;
+    const int n = snprintf(out, out_size, "%0*llu%s", TDB_WAL_ID_DIGITS,
+                           (unsigned long long)generation, TDB_WAL_FLUSHED_EXT);
+    if (n <= 0 || (size_t)n >= out_size) return TDB_ERR_INVALID_ARGS;
+    return TDB_SUCCESS;
+}
+
 tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int max_level,
                                 float probability, tidesdb_backpressure_policy_fn policy,
                                 void *policy_ctx)

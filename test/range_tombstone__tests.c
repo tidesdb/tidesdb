@@ -70,6 +70,19 @@ static void add_interval(range_tombstone_set_t *set, const char *lo, const char 
               TDB_SUCCESS);
 }
 
+/* lay a prefix delete over the set the way a transaction does, by turning the prefix into the
+ * half-open interval up to its successor -- there is no second mechanism for a prefix, so the tests
+ * for what one covers go through the conversion the write path itself uses */
+static void add_prefix(range_tombstone_set_t *set, const uint8_t *prefix, const size_t prefix_size,
+                       const uint64_t seq)
+{
+    uint8_t *hi = NULL;
+    size_t hi_size = RT_UNBOUNDED_ABOVE;
+    ASSERT_EQ(range_tombstone_prefix_successor(prefix, prefix_size, &hi, &hi_size), TDB_SUCCESS);
+    ASSERT_EQ(range_tombstone_set_add(set, prefix, prefix_size, hi, hi_size, seq), TDB_SUCCESS);
+    free(hi);
+}
+
 static int covering(const range_tombstone_set_t *set, const char *key, const uint64_t snapshot_seq,
                     uint64_t *out_seq)
 {
@@ -364,7 +377,7 @@ void test_range_tombstone_prefix_covers_every_key_under_it(void)
     ASSERT_TRUE(set != NULL);
 
     const uint8_t prefix[] = {'u', 's', 'e', 'r', ':'};
-    ASSERT_EQ(range_tombstone_set_add_prefix(set, prefix, sizeof(prefix), 10), TDB_SUCCESS);
+    add_prefix(set, prefix, sizeof(prefix), 10);
 
     uint64_t seq = 0;
     ASSERT_EQ(covering(set, "user:", 10, &seq), 1);
@@ -387,7 +400,7 @@ void test_range_tombstone_max_byte_prefix_covers_its_own_keys(void)
     ASSERT_TRUE(set != NULL);
 
     const uint8_t prefix[] = {'a', 0xff};
-    ASSERT_EQ(range_tombstone_set_add_prefix(set, prefix, sizeof(prefix), 10), TDB_SUCCESS);
+    add_prefix(set, prefix, sizeof(prefix), 10);
 
     const uint8_t under[] = {'a', 0xff, 0x00};
     const uint8_t outside[] = {'a', 0xfe};
@@ -409,7 +422,7 @@ void test_range_tombstone_empty_prefix_covers_every_key(void)
 {
     range_tombstone_set_t *set = range_tombstone_set_new();
     ASSERT_TRUE(set != NULL);
-    ASSERT_EQ(range_tombstone_set_add_prefix(set, NULL, 0, 10), TDB_SUCCESS);
+    add_prefix(set, NULL, 0, 10);
     ASSERT_EQ(range_tombstone_set_count(set), 1);
 
     uint64_t seq = 0;
@@ -448,8 +461,6 @@ void test_range_tombstone_null_arguments_are_refused(void)
     ASSERT_EQ(range_tombstone_set_add(set, NULL, 1, (const uint8_t *)"b", 1, 1),
               TDB_ERR_INVALID_ARGS);
     ASSERT_EQ(range_tombstone_set_add(set, (const uint8_t *)"a", 1, NULL, 1, 1),
-              TDB_ERR_INVALID_ARGS);
-    ASSERT_EQ(range_tombstone_set_add_prefix(NULL, (const uint8_t *)"a", 1, 1),
               TDB_ERR_INVALID_ARGS);
     ASSERT_EQ(range_tombstone_max_covering(NULL, (const uint8_t *)"a", 1, 1, &seq),
               TDB_ERR_INVALID_ARGS);
@@ -535,62 +546,6 @@ void test_range_tombstone_covering_fragment_carries_every_sequence(void)
     ASSERT_EQ(range_tombstone_covering_fragment(set, NULL, 1, &frag), TDB_ERR_INVALID_ARGS);
     ASSERT_EQ(range_tombstone_covering_fragment(set, (const uint8_t *)"d", 1, NULL),
               TDB_ERR_INVALID_ARGS);
-
-    range_tombstone_set_free(set);
-}
-
-/* forgetting through a sequence drops it from every fragment and takes with it any fragment left
- * covered by nothing, which is how a spent tombstone leaves the set */
-void test_range_tombstone_forget_through_retires_spent_sequences(void)
-{
-    range_tombstone_set_t *set = range_tombstone_set_new();
-    ASSERT_TRUE(set != NULL);
-    add_interval(set, "a", "z", 10);
-    add_interval(set, "c", "e", 20);
-    ASSERT_EQ(range_tombstone_set_count(set), 3);
-
-    /* below every sequence, nothing goes */
-    ASSERT_EQ(range_tombstone_set_forget_through(set, 9), 0);
-    ASSERT_EQ(range_tombstone_set_count(set), 3);
-
-    /* forgetting the older one leaves only the overlap, still covered by the newer */
-    ASSERT_EQ(range_tombstone_set_forget_through(set, 10), 3);
-    ASSERT_EQ(range_tombstone_set_count(set), 1);
-
-    uint64_t seq = 0;
-    ASSERT_EQ(covering(set, "d", UINT64_MAX, &seq), 1);
-    ASSERT_EQ(seq, 20);
-    ASSERT_EQ(covering(set, "b", UINT64_MAX, &seq), 0);
-    assert_set_invariants(set);
-
-    /* and forgetting the last of them empties the set */
-    ASSERT_EQ(range_tombstone_set_forget_through(set, 20), 1);
-    ASSERT_EQ(range_tombstone_set_count(set), 0);
-    ASSERT_EQ(covering(set, "d", UINT64_MAX, &seq), 0);
-
-    ASSERT_EQ(range_tombstone_set_forget_through(NULL, 1), 0);
-    range_tombstone_set_free(set);
-}
-
-/* the watermark a build records is the newest sequence it could actually see at or below its
- * ceiling, never the ceiling itself */
-void test_range_tombstone_max_seq_through_reports_what_is_there(void)
-{
-    range_tombstone_set_t *set = range_tombstone_set_new();
-    ASSERT_TRUE(set != NULL);
-
-    /* an empty set has applied nothing, whatever ceiling it is asked about */
-    ASSERT_EQ(range_tombstone_set_max_seq_through(set, UINT64_MAX), 0);
-    ASSERT_EQ(range_tombstone_set_max_seq_through(NULL, UINT64_MAX), 0);
-
-    add_interval(set, "a", "z", 10);
-    add_interval(set, "c", "e", 20);
-    add_interval(set, "m", "p", 30);
-
-    ASSERT_EQ(range_tombstone_set_max_seq_through(set, UINT64_MAX), 30);
-    ASSERT_EQ(range_tombstone_set_max_seq_through(set, 25), 20);
-    ASSERT_EQ(range_tombstone_set_max_seq_through(set, 10), 10);
-    ASSERT_EQ(range_tombstone_set_max_seq_through(set, 9), 0);
 
     range_tombstone_set_free(set);
 }
@@ -731,8 +686,6 @@ int main(void)
     RUN_TEST(test_range_tombstone_clone_is_independent, tests_passed);
     RUN_TEST(test_range_tombstone_clone_of_an_empty_set_is_empty, tests_passed);
     RUN_TEST(test_range_tombstone_covering_fragment_carries_every_sequence, tests_passed);
-    RUN_TEST(test_range_tombstone_forget_through_retires_spent_sequences, tests_passed);
-    RUN_TEST(test_range_tombstone_max_seq_through_reports_what_is_there, tests_passed);
     RUN_TEST(test_range_tombstone_matches_a_linear_scan_over_every_tombstone, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

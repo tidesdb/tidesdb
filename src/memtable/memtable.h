@@ -79,6 +79,17 @@ void tidesdb_memtable_free(tidesdb_memtable_t *mt);
  */
 int tidesdb_wal_filename(uint64_t generation, char *out, size_t out_size);
 
+/**
+ * tidesdb_wal_flushed_filename
+ * the name a generation's log takes once its memtable is flushed and the file is kept only for an
+ * undecided prepare, so recovery replays the two-phase records in it and not the data ones
+ * @param generation the memtable generation naming the file
+ * @param out receives the name
+ * @param out_size capacity of out
+ * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS when the name would not fit
+ */
+int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size);
+
 /* ===== the shared L0 subsystem ===== */
 
 /**

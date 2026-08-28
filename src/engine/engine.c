@@ -418,7 +418,10 @@ static int engine_open_stores(tidesdb_t *db)
         return TDB_ERR_INVALID_ARGS;
     int lock_rc = TDB_LOCK_ERROR;
     db->lock_fd = tdb_open_lock_file(path, &lock_rc);
-    if (db->lock_fd < 0) return TDB_ERR_IO;
+    /* the open is what refuses a second handle in this same process, on the platforms whose locks
+     * belong to the process rather than to the descriptor and so would grant it one. it reports
+     * that by failing, so the reason has to be read here rather than assumed to be the disk */
+    if (db->lock_fd < 0) return lock_rc == TDB_LOCK_HELD ? TDB_ERR_LOCKED : TDB_ERR_IO;
     lock_rc = tdb_file_lock_exclusive(db->lock_fd, 0);
     if (lock_rc != TDB_LOCK_SUCCESS)
     {

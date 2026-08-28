@@ -243,4 +243,21 @@ typedef struct
 int fuzz_model_scan(const fuzz_model_t *m, const char *cf, fuzz_model_kv_t **out,
                     size_t *out_count);
 
+/**
+ * fuzz_model_debug_entry
+ * what the model holds for a key, including the versions a scan does not show. a divergence needs
+ * to tell a key the model deleted apart from one it never had, since those point at different
+ * faults -- an interval that should not have covered it, against a write that never reached the
+ * family the harness thought it was writing to
+ * @param m the model
+ * @param cf the column family name
+ * @param key the key bytes
+ * @param klen the key length
+ * @param out_tombstone receives 1 when the version held is a delete
+ * @param out_seq receives the sequence of the version held
+ * @return 1 when the model holds any version of the key, 0 when it holds none
+ */
+int fuzz_model_debug_entry(const fuzz_model_t *m, const char *cf, const uint8_t *key, size_t klen,
+                           int *out_tombstone, uint64_t *out_seq);
+
 #endif /* __TIDESDB_FUZZ_MODEL_H__ */

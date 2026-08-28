@@ -226,113 +226,6 @@ void test_manifest_commit_and_load()
     remove(TEST_MANIFEST_PATH);
 }
 
-/* a family's range tombstone set survives a commit and a reopen, and a later set replaces the
- * earlier one rather than adding to it */
-void test_manifest_range_dels_persist_and_replace()
-{
-    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(manifest != NULL);
-
-    const uint8_t first[] = {1, 2, 3, 4};
-    const uint8_t second[] = {9, 8, 7, 6, 5};
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 7, first, sizeof(first)), 0);
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 7, second, sizeof(second)), 0);
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 8, first, sizeof(first)), 0);
-    ASSERT_EQ(manifest->num_range_dels, 2);
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1), 0);
-    tidesdb_manifest_close(manifest);
-
-    tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(loaded != NULL);
-    ASSERT_EQ(loaded->num_range_dels, 2);
-
-    uint8_t *blob = NULL;
-    uint32_t len = 0;
-    ASSERT_EQ(tidesdb_manifest_get_range_dels(loaded, 7, &blob, &len), 0);
-    ASSERT_EQ(len, sizeof(second));
-    ASSERT_TRUE(blob != NULL && memcmp(blob, second, len) == 0);
-    free(blob);
-
-    blob = NULL;
-    ASSERT_EQ(tidesdb_manifest_get_range_dels(loaded, 8, &blob, &len), 0);
-    ASSERT_EQ(len, sizeof(first));
-    free(blob);
-
-    /* a family that never carried one reports none rather than failing */
-    blob = NULL;
-    len = 1;
-    ASSERT_EQ(tidesdb_manifest_get_range_dels(loaded, 99, &blob, &len), 0);
-    ASSERT_TRUE(blob == NULL);
-    ASSERT_EQ(len, 0);
-
-    tidesdb_manifest_close(loaded);
-    remove(TEST_MANIFEST_PATH);
-}
-
-/* an empty set clears the family's record, and dropping a family takes its set with the rest of its
- * bookkeeping */
-void test_manifest_range_dels_clear_and_follow_a_cf_drop()
-{
-    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(manifest != NULL);
-
-    const uint8_t blob[] = {1, 2, 3};
-    ASSERT_EQ(tidesdb_manifest_add_cf(manifest, 4, "cf4", NULL, 0), 0);
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 4, blob, sizeof(blob)), 0);
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 5, blob, sizeof(blob)), 0);
-    ASSERT_EQ(manifest->num_range_dels, 2);
-
-    /* clearing one leaves the other */
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 5, NULL, 0), 0);
-    ASSERT_EQ(manifest->num_range_dels, 1);
-
-    ASSERT_EQ(tidesdb_manifest_drop_cf(manifest, 4), 0);
-    ASSERT_EQ(manifest->num_range_dels, 0);
-
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1), 0);
-    tidesdb_manifest_close(manifest);
-
-    tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(loaded != NULL);
-    ASSERT_EQ(loaded->num_range_dels, 0);
-    tidesdb_manifest_close(loaded);
-    remove(TEST_MANIFEST_PATH);
-}
-
-/* a set has to survive the rollover that rewrites the log as a single snapshot block, which is the
- * one place a record kind left out of the snapshot writer would silently vanish */
-void test_manifest_range_dels_survive_a_rollover()
-{
-    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(manifest != NULL);
-
-    const uint8_t blob[] = {0xaa, 0xbb, 0xcc};
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 3, blob, sizeof(blob)), 0);
-
-    /* push past the rollover threshold so the next commit writes a snapshot rather than appending
-     */
-    for (int i = 0; i < MANIFEST_ROLLOVER_MIN_RECORDS + 1; i++)
-    {
-        ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 3, 1, (uint64_t)i + 1, 1, 1,
-                                               MANIFEST_NO_PARTITION),
-                  0);
-    }
-    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1), 0);
-    tidesdb_manifest_close(manifest);
-
-    tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(loaded != NULL);
-    uint8_t *out = NULL;
-    uint32_t len = 0;
-    ASSERT_EQ(tidesdb_manifest_get_range_dels(loaded, 3, &out, &len), 0);
-    ASSERT_EQ(len, sizeof(blob));
-    ASSERT_TRUE(out != NULL && memcmp(out, blob, len) == 0);
-    free(out);
-
-    tidesdb_manifest_close(loaded);
-    remove(TEST_MANIFEST_PATH);
-}
-
 void test_manifest_birth_level_persists()
 {
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
@@ -1292,11 +1185,11 @@ void test_manifest_an_abandoned_half_batch_lands_on_the_next_commit(void)
 
 /* comfortably past MANIFEST_INITIAL_CAPACITY, so the registry, the tombstone sets and the entry
  * array all have to grow, and enough records with it to force a rollover through the snapshot */
-#define TEST_MANIFEST_GROWTH_CFS 200
+#define TEST_MANIFEST_GROWTH_CFS 300
 
 /* every growable array in the set outgrows the capacity it was created with, and the whole thing
  * survives the snapshot a rollover writes. the arrays start empty or at one fixed size and double,
- * so a wrong first step reads back as a set that is short, holds the wrong blob, or is not there */
+ * so a wrong first step reads back as a set that is short or is not there */
 void test_manifest_arrays_grow_past_their_initial_capacity(void)
 {
     const char *test_path = "." PATH_SEPARATOR "test_growth_manifest";
@@ -1312,20 +1205,18 @@ void test_manifest_arrays_grow_past_their_initial_capacity(void)
         const uint8_t config[] = {(uint8_t)i, (uint8_t)(i >> 8), 0xEE};
         ASSERT_EQ(tidesdb_manifest_add_cf(manifest, (uint64_t)i, name, config, sizeof(config)), 0);
 
-        const uint8_t blob[] = {(uint8_t)(i + 1), 0xAB};
-        ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, (uint64_t)i, blob, sizeof(blob)), 0);
         ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, (uint64_t)i, 1, (uint64_t)i, 10, 100,
                                                MANIFEST_NO_PARTITION),
                   0);
     }
     ASSERT_EQ(manifest->num_cfs, TEST_MANIFEST_GROWTH_CFS);
-    ASSERT_EQ(manifest->num_range_dels, TEST_MANIFEST_GROWTH_CFS);
     ASSERT_EQ(manifest->num_entries, TEST_MANIFEST_GROWTH_CFS);
     ASSERT_TRUE(manifest->cfs_capacity >= TEST_MANIFEST_GROWTH_CFS);
-    ASSERT_TRUE(manifest->range_dels_capacity >= TEST_MANIFEST_GROWTH_CFS);
     ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path, 0), 0);
     /* the counter resets only on a rollover, so this is what says the reload below reads a snapshot
-     * holding all three arrays rather than a log of the records that built them */
+     * rather than a log of the records that built it. each family adds one cf record and one
+     * sstable record, and the commit itself one more, which is what carries the count past twice
+     * the live entries */
     ASSERT_EQ(manifest->records_since_snapshot, 0);
     tidesdb_manifest_close(manifest);
 
@@ -1333,7 +1224,6 @@ void test_manifest_arrays_grow_past_their_initial_capacity(void)
     tidesdb_manifest_t *reloaded = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(reloaded != NULL);
     ASSERT_EQ(reloaded->num_cfs, TEST_MANIFEST_GROWTH_CFS);
-    ASSERT_EQ(reloaded->num_range_dels, TEST_MANIFEST_GROWTH_CFS);
     ASSERT_EQ(reloaded->num_entries, TEST_MANIFEST_GROWTH_CFS);
 
     for (int i = 0; i < TEST_MANIFEST_GROWTH_CFS; i++)
@@ -1344,15 +1234,6 @@ void test_manifest_arrays_grow_past_their_initial_capacity(void)
         ASSERT_EQ(tidesdb_manifest_cf_id_by_name(reloaded, name, &id), 0);
         ASSERT_EQ((int)id, i);
         ASSERT_TRUE(tidesdb_manifest_has_sstable(reloaded, (uint64_t)i, 1, (uint64_t)i));
-
-        /* each family's own blob, not a neighbour's -- a growth that copied the array short would
-         * leave the tail holding whatever the fresh allocation happened to contain */
-        uint8_t *blob = NULL;
-        uint32_t len = 0;
-        ASSERT_EQ(tidesdb_manifest_get_range_dels(reloaded, (uint64_t)i, &blob, &len), 0);
-        ASSERT_EQ((int)len, 2);
-        ASSERT_TRUE(blob != NULL && blob[0] == (uint8_t)(i + 1) && blob[1] == 0xAB);
-        free(blob);
     }
 
     tidesdb_manifest_close(reloaded);
@@ -1448,15 +1329,11 @@ void test_manifest_cf_drop_cascade(void)
     ASSERT_EQ(tidesdb_manifest_add_cf(manifest, 2, "drop", NULL, 0), 0);
     ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 1, 1, 10, 1, 1, MANIFEST_NO_PARTITION), 0);
     ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 2, 1, 20, 1, 1, MANIFEST_NO_PARTITION), 0);
-    const uint8_t blob[] = {0xAB, 0xCD};
-    ASSERT_EQ(tidesdb_manifest_set_range_dels(manifest, 2, blob, sizeof(blob)), 0);
 
-    /* dropping cf 2 removes its cf entry, its sstables and its range tombstone set, leaving cf 1
-     * untouched */
+    /* dropping cf 2 removes its cf entry and its sstables, leaving cf 1 untouched */
     ASSERT_EQ(tidesdb_manifest_drop_cf(manifest, 2), 0);
     ASSERT_EQ(manifest->num_cfs, 1);
     ASSERT_EQ(manifest->num_entries, 1);
-    ASSERT_EQ(manifest->num_range_dels, 0);
     ASSERT_EQ(tidesdb_manifest_has_sstable(manifest, 1, 1, 10), 1);
 
     /* dropping an absent cf is a no-op error */
@@ -1592,9 +1469,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_manifest_update_sequence, tests_passed);
     RUN_TEST(test_manifest_capacity_growth, tests_passed);
     RUN_TEST(test_manifest_commit_and_load, tests_passed);
-    RUN_TEST(test_manifest_range_dels_persist_and_replace, tests_passed);
-    RUN_TEST(test_manifest_range_dels_clear_and_follow_a_cf_drop, tests_passed);
-    RUN_TEST(test_manifest_range_dels_survive_a_rollover, tests_passed);
     RUN_TEST(test_manifest_birth_level_persists, tests_passed);
     RUN_TEST(test_manifest_move_sstable, tests_passed);
     RUN_TEST(test_manifest_load_nonexistent, tests_passed);

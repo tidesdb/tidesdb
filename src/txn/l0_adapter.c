@@ -272,9 +272,23 @@ int tidesdb_l0_scan_aborts(block_manager_t *wal, tidesdb_l0_aborted_set_t *out)
 /* fold one two-phase record into the staging map, applying a COMMIT's batch inline. a COMMIT
  * carries the write set at the sequence phase two drew when it decided, so it replays exactly like
  * an ordinary write batch and lands in this generation, in sequence order with everything around
- * it. only a PREPARE is held back, since an undecided batch has nowhere to land yet */
+ * it. only a PREPARE is held back, since an undecided batch has nowhere to land yet.
+ *
+ * replaying exactly like a write batch means being filtered like one. the log holding a COMMIT is
+ * kept for as long as any prepare in its generation is undecided, which is unbounded, so the record
+ * outlives the flush that made its batch durable and every reopen in between replays it again. a
+ * key some later write superseded then comes back above the sstable holding that newer version, and
+ * the read path takes a memtable as newer than any sstable.
+ *
+ * a generation whose memtable already reached L1 carries that in its name, and a COMMIT decided
+ * while it was the active one applied into that same memtable -- so its batch is durable in L1 with
+ * everything else the generation held, and re-applying it puts back versions the sstables have
+ * since moved on from. the record is still staged, since deciding the prepare is the whole reason
+ * the log was kept; only the apply is what the flush already did */
 static int l0_replay_two_phase(tidesdb_l0_t *l0, tidesdb_wal_cursor_t *wc, uint64_t generation,
-                               uint64_t *max_seq, tdb_prepare_stage_t *stage)
+                               uint64_t *max_seq, tdb_prepare_stage_t *stage,
+                               const tidesdb_replay_filter_t *filter,
+                               const int data_already_durable)
 {
     if (!wc->xid || wc->xid_size == 0)
     {
@@ -316,16 +330,32 @@ static int l0_replay_two_phase(tidesdb_l0_t *l0, tidesdb_wal_cursor_t *wc, uint6
     }
 
     int rc = TDB_SUCCESS;
-    if (wc->kind == TDB_WAL_KIND_COMMIT)
+    if (wc->kind == TDB_WAL_KIND_COMMIT && !data_already_durable)
         for (int i = 0; i < count && rc == TDB_SUCCESS; i++)
         {
             const tidesdb_wal_entry_t *pe = &entries[i];
             const int64_t ttl = (pe->flags & TDB_WAL_ENTRY_HAS_TTL) ? pe->ttl : -1;
+            /* the sequence still advances the clock whether or not the entry lands, so nothing
+             * later reuses it. an interval delete is exempt for the same reason it is in a write
+             * batch -- its key is a bound rather than a key, so the probe answers about the wrong
+             * thing, and re-applying one costs nothing */
+            if (!(pe->flags & TDB_WAL_ENTRY_RANGE_DELETE) && filter && filter->superseded &&
+                filter->superseded(filter->ctx, pe->cf_index, pe->key, pe->key_size, pe->seq))
+            {
+                if (pe->seq > *max_seq) *max_seq = pe->seq;
+                continue;
+            }
             /* phase two carries its batch in the COMMIT record, so an entry whose value the
              * prepare separated arrives here as a reference like any other */
             rc = l0_apply_one(l0, pe, ttl);
             if (pe->seq > *max_seq) *max_seq = pe->seq;
         }
+
+    /* a batch the flush already made durable still advances the clock, so nothing later reuses the
+     * sequences it holds */
+    if (wc->kind == TDB_WAL_KIND_COMMIT && data_already_durable)
+        for (int i = 0; i < count; i++)
+            if (entries[i].seq > *max_seq) *max_seq = entries[i].seq;
 
     /* the stage still hears about it, so a decided transaction stops being listed as in doubt */
     if (rc == TDB_SUCCESS && stage)
@@ -339,7 +369,8 @@ static int l0_replay_two_phase(tidesdb_l0_t *l0, tidesdb_wal_cursor_t *wc, uint6
  * raising *max_seq to the highest sequence applied */
 static int l0_replay_block(tidesdb_l0_t *l0, uint64_t generation, const uint8_t *buf, size_t size,
                            const tidesdb_l0_aborted_set_t *aborted, uint64_t *max_seq,
-                           tdb_prepare_stage_t *stage, const tidesdb_replay_filter_t *filter)
+                           tdb_prepare_stage_t *stage, const tidesdb_replay_filter_t *filter,
+                           const int data_already_durable)
 {
     tidesdb_wal_cursor_t wc;
     if (tidesdb_wal_cursor_init(&wc, buf, size) != 0)
@@ -355,7 +386,22 @@ static int l0_replay_block(tidesdb_l0_t *l0, uint64_t generation, const uint8_t 
     if (wc.kind == TDB_WAL_KIND_ABORT_SEQ) return TDB_SUCCESS;
 
     if (wc.kind != TDB_WAL_KIND_WRITE_BATCH)
-        return l0_replay_two_phase(l0, &wc, generation, max_seq, stage);
+        return l0_replay_two_phase(l0, &wc, generation, max_seq, stage, filter,
+                                   data_already_durable);
+
+    /* this log's memtable reached L1 before the file was kept, so every version in this batch is
+     * durable in an sstable. re-applying it would put those versions back above the sstables,
+     * where every reader takes them as newer -- and a compaction that has since retired one would
+     * hand back a key the caller deleted. the sequences still advance the clock, so nothing later
+     * reuses them */
+    if (data_already_durable)
+    {
+        tidesdb_wal_entry_t durable;
+        int d;
+        while ((d = tidesdb_wal_cursor_next(&wc, &durable)) == 1)
+            if (durable.seq > *max_seq) *max_seq = durable.seq;
+        return d == 0 ? TDB_SUCCESS : TDB_ERR_CORRUPTION;
+    }
 
     tidesdb_wal_entry_t e;
     int r;
@@ -382,7 +428,6 @@ static int l0_replay_block(tidesdb_l0_t *l0, uint64_t generation, const uint8_t 
          * covers. re-applying a range tombstone costs nothing, since the same interval at the same
          * sequence folds back into the fragment already holding it */
         if (!(e.flags & TDB_WAL_ENTRY_RANGE_DELETE) && filter && filter->superseded &&
-            e.seq <= filter->durable_seq &&
             filter->superseded(filter->ctx, e.cf_index, e.key, e.key_size, e.seq))
         {
             if (e.seq > *max_seq) *max_seq = e.seq;
@@ -398,7 +443,8 @@ static int l0_replay_block(tidesdb_l0_t *l0, uint64_t generation, const uint8_t 
 
 int tidesdb_l0_replay_wal(tidesdb_l0_t *l0, block_manager_t *wal, const uint64_t generation,
                           const tidesdb_l0_aborted_set_t *aborted, uint64_t *out_max_seq,
-                          tdb_prepare_stage_t *stage, const tidesdb_replay_filter_t *filter)
+                          tdb_prepare_stage_t *stage, const tidesdb_replay_filter_t *filter,
+                          const int data_already_durable)
 {
     if (!l0 || !wal) return TDB_ERR_INVALID_ARGS;
 
@@ -411,7 +457,7 @@ int tidesdb_l0_replay_wal(tidesdb_l0_t *l0, block_manager_t *wal, const uint64_t
     while (rc == TDB_SUCCESS && (block = block_manager_cursor_read_and_advance(&cursor)) != NULL)
     {
         rc = l0_replay_block(l0, generation, block->data, block->size, aborted, &max_seq, stage,
-                             filter);
+                             filter, data_already_durable);
         block_manager_block_free(block);
     }
     if (out_max_seq) *out_max_seq = max_seq;

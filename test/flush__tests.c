@@ -326,6 +326,73 @@ void test_flush_empty_immutable(void)
 /* a prefix delete that wrote no keys of its own still has to survive its memtable. this is the case
  * that decides where range tombstones can live at all -- the family produces no sstable, so
  * anything that hung them off one would lose them here */
+/* the table a flush builds carries the intervals its memtable held, in a block of its own, with
+ * the family prefix taken off. that is what lets an interval live exactly as long as a table
+ * holding it rather than as long as a claim the family has to verify, and it has to be the family's
+ * own key space in the block since a reader of the table knows nothing about prefixes */
+void test_flush_output_carries_its_memtable_intervals(void)
+{
+    flush_db_t db;
+    flush_db_open(&db);
+    cf_t *cf0 = flush_make_cf(&db, 0, "cf0");
+
+    tidesdb_l0_t *l0 =
+        tidesdb_l0_create(FLUSH_BUFFER, FLUSH_QDEPTH, FLUSH_MAX_LEVEL, FLUSH_PROB, NULL, NULL);
+    ASSERT_TRUE(l0 != NULL);
+    tidesdb_l0_set_active(
+        l0, tidesdb_memtable_create(NULL, 0, 0, FLUSH_MAX_LEVEL, FLUSH_PROB, NULL, NULL));
+
+    ASSERT_EQ(tidesdb_l0_apply(l0, 0, (const uint8_t *)"aa", 2, (const uint8_t *)"v", 1, -1, 10, 0),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(l0, 0, (const uint8_t *)"b", 1, (const uint8_t *)"f",
+                                               1, 20),
+              TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_l0_rotate(
+                  l0, tidesdb_memtable_create(NULL, 1, 1, FLUSH_MAX_LEVEL, FLUSH_PROB, NULL, NULL)),
+              TDB_SUCCESS);
+    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(l0);
+    ASSERT_TRUE(immutable != NULL);
+
+    _Atomic(uint64_t) next_id;
+    atomic_init(&next_id, FLUSH_FIRST_ID);
+    cf_t *cfs[1] = {cf0};
+    flush_ctx_t fx = {.l0 = l0,
+                      .cfs = cfs,
+                      .n_cfs = 1,
+                      .manifest = db.manifest,
+                      .manifest_path = db.manifest_path,
+                      .next_sstable_id = &next_id,
+                      .fdm = &db.fdm,
+                      .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                      .value_threshold = FLUSH_NO_SPILL};
+    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
+    ASSERT_EQ(level_set_count(cf0->levels, LEVEL_SET_L1), 1);
+
+    sstable_t *out[4];
+    const int n = level_set_overlapping(cf0->levels, LEVEL_SET_L1, (const uint8_t *)"aa", 2,
+                                        (const uint8_t *)"aa", 2, out, 4);
+    ASSERT_EQ(n, 1);
+
+    /* the interval reached the table, keyed by the family's own key space */
+    ASSERT_TRUE(out[0]->range_tombstones != NULL);
+    ASSERT_TRUE(out[0]->range_del_offset != 0 && out[0]->range_del_size != 0);
+    uint64_t seq = 0;
+    ASSERT_EQ(range_tombstone_max_covering(out[0]->range_tombstones, (const uint8_t *)"cc", 2,
+                                           UINT64_MAX, &seq),
+              1);
+    ASSERT_EQ((int)seq, 20);
+    /* and a key outside it is covered by nothing */
+    ASSERT_EQ(range_tombstone_max_covering(out[0]->range_tombstones, (const uint8_t *)"aa", 2,
+                                           UINT64_MAX, &seq),
+              0);
+    if (sstable_unref(out[0])) sstable_close(out[0]);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf0);
+    flush_db_close(&db);
+}
+
 void test_flush_carries_a_prefix_delete_that_wrote_no_keys(void)
 {
     flush_db_t db;
@@ -369,11 +436,23 @@ void test_flush_carries_a_prefix_delete_that_wrote_no_keys(void)
 
     ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
 
-    /* no sstable was built, and none was needed */
-    ASSERT_EQ(level_set_count(cf0->levels, LEVEL_SET_L1), 0);
-    ASSERT_EQ((int)atomic_load(&next_id), FLUSH_FIRST_ID);
+    /* a table was built for it even though it holds no key. an interval lives in a table, so a
+     * family reached only by a delete still needs one or the delete has nowhere to live and the
+     * keys it covered in older tables come back */
+    ASSERT_EQ(level_set_count(cf0->levels, LEVEL_SET_L1), 1);
 
-    /* the family holds it, over its own unprefixed keys */
+    sstable_t *only[2];
+    ASSERT_EQ(level_set_collect_all(cf0->levels, only, 2), 1);
+    ASSERT_EQ(only[0]->distinct_key_count, 0u);
+    ASSERT_TRUE(only[0]->range_tombstones != NULL);
+    uint64_t table_seq = 0;
+    ASSERT_EQ(range_tombstone_max_covering(only[0]->range_tombstones, (const uint8_t *)"user:1", 6,
+                                           UINT64_MAX, &table_seq),
+              1);
+    ASSERT_EQ(table_seq, 42);
+    if (sstable_unref(only[0])) sstable_close(only[0]);
+
+    /* and the family answers a covering query from that table, over its own unprefixed keys */
     uint64_t seq = 0;
     ASSERT_EQ(cf_range_tombstone_covering(cf0, (const uint8_t *)"user:1", 6, UINT64_MAX, &seq), 1);
     ASSERT_EQ(seq, 42);
@@ -382,21 +461,8 @@ void test_flush_carries_a_prefix_delete_that_wrote_no_keys(void)
     /* and a reader below the delete still sees nothing of it */
     ASSERT_EQ(cf_range_tombstone_covering(cf0, (const uint8_t *)"user:1", 6, 41, &seq), 0);
 
-    /* the manifest carries it, so a reopen would rebuild the same set */
-    uint8_t *blob = NULL;
-    uint32_t blob_len = 0;
-    ASSERT_EQ(tidesdb_manifest_get_range_dels(db.manifest, 0, &blob, &blob_len), 0);
-    ASSERT_TRUE(blob != NULL && blob_len > 0);
-
-    range_tombstone_set_t *rebuilt = NULL;
-    ASSERT_EQ(range_tombstone_set_deserialize(blob, blob_len, &rebuilt), TDB_SUCCESS);
-    free(blob);
-    uint64_t rebuilt_seq = 0;
-    ASSERT_EQ(range_tombstone_max_covering(rebuilt, (const uint8_t *)"user:9", 6, UINT64_MAX,
-                                           &rebuilt_seq),
-              1);
-    ASSERT_EQ(rebuilt_seq, 42);
-    range_tombstone_set_free(rebuilt);
+    /* the table is what a reopen brings back, and it carries the interval in its own block, so
+     * nothing about this delete depends on the catalogue holding a copy of it */
 
     cf_free(cf0);
     tidesdb_l0_destroy(l0);
@@ -497,6 +563,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_flush_demux_two_cfs, tests_passed);
     RUN_TEST(test_flush_carries_a_memtable_reference_without_rewriting_it, tests_passed);
     RUN_TEST(test_flush_empty_immutable, tests_passed);
+    RUN_TEST(test_flush_output_carries_its_memtable_intervals, tests_passed);
     RUN_TEST(test_flush_carries_a_prefix_delete_that_wrote_no_keys, tests_passed);
     RUN_TEST(test_flush_concurrent_same_cf, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

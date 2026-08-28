@@ -28,10 +28,6 @@
  * it -- compaction -- assemble their sstable iterators directly rather than coming through here */
 #define CF_ITER_USE_CACHE 1
 
-/* stack room for the prefixed form of a key while a range tombstone lookup asks the memtables about
- * it; a longer key falls back to the heap for that one lookup */
-#define CF_ITER_PKEY_STACK 256
-
 struct cf_iter
 {
     cf_t *cf;
@@ -172,83 +168,6 @@ static int cf_iter_collect_ssts(cf_iter_t *it, cf_t *cf)
     return TDB_ERR_BUSY;
 }
 
-/* open a cursor over each pinned source and fold them into one merge iterator; the write-set
- * overlay, when present, is the shallowest source so it wins ties and its buffered writes read back
- */
-/* whether any range tombstone visible at this scan's snapshot deletes this key at a sequence above
- * the version the merge resolved it to. the family's own set covers everything below L0; the pinned
- * memtables each answer for the deletes still sitting in them. a scan of a database that has never
- * deleted a range never gets past the counters
- * @param it the iterator, for its family, its pinned memtables and its snapshot
- * @param key the resolved key, without its family prefix
- * @param key_size length of key in bytes
- * @param seq the sequence of the version the merge resolved
- * @return non-zero when the key is deleted out from under that version
- */
-static int cf_iter_covered(cf_iter_t *it, const uint8_t *key, const size_t key_size,
-                           const uint64_t seq)
-{
-    uint64_t tomb = 0;
-    if (cf_range_tombstone_covering(it->cf, key, key_size, it->snapshot, &tomb) && tomb > seq)
-        return 1;
-
-    /* the memtable sets are keyed by the prefixed key the shared skip list sorts on, so the key has
-     * to be put back into that form once before any of them is asked */
-    int any = 0;
-    for (int i = 0; i < it->n_mts && !any; i++)
-        if (it->mts[i] &&
-            atomic_load_explicit(&it->mts[i]->range_tombstone_frags, memory_order_acquire) != 0)
-            any = 1;
-    if (!any) return 0;
-
-    const size_t pkey_size = TDB_CF_PREFIX_SIZE + key_size;
-    uint8_t stack_key[CF_ITER_PKEY_STACK];
-    uint8_t *pkey = pkey_size <= sizeof(stack_key) ? stack_key : malloc(pkey_size);
-    if (!pkey) return 0; /* a lookup that cannot be made reports nothing rather than hiding a key */
-    tdb_build_prefixed_key((uint32_t)it->cf->cf_id, key, key_size, pkey);
-
-    int covered = 0;
-    for (int i = 0; i < it->n_mts && !covered; i++)
-    {
-        if (!it->mts[i]) continue;
-        if (tidesdb_memtable_range_tombstone_covering(it->l0, it->mts[i], pkey, pkey_size,
-                                                      it->snapshot, &tomb) &&
-            tomb > seq)
-            covered = 1;
-    }
-    if (pkey != stack_key) free(pkey);
-    return covered;
-}
-
-/* step past every key a range tombstone covers, so a scan hides them exactly as the merge already
- * hides a key whose newest version is a point tombstone. bounded by the keys the merge has left
- * @param it the iterator, already positioned
- * @param forward non-zero to keep stepping forward, zero to step back
- * @return TDB_SUCCESS, or whatever the underlying step reported
- */
-static int cf_iter_skip_covered(cf_iter_t *it, const int forward)
-{
-    while (merge_iter_valid(it->merge))
-    {
-        const uint8_t *key = NULL;
-        size_t key_size = 0;
-        uint64_t seq = 0;
-        const uint8_t *value = NULL;
-        size_t value_size = 0;
-        uint64_t vlog_offset = 0;
-        int64_t ttl = 0;
-        uint8_t deleted = 0;
-        if (merge_iter_get(it->merge, &key, &key_size, &seq, &value, &value_size, &vlog_offset,
-                           &ttl, &deleted) != TDB_SUCCESS)
-            return TDB_SUCCESS;
-        if (!cf_iter_covered(it, key, key_size, seq)) return TDB_SUCCESS;
-
-        const int rc = forward ? merge_iter_next(it->merge) : merge_iter_prev(it->merge);
-        if (rc != TDB_SUCCESS) return rc;
-    }
-    return TDB_SUCCESS;
-}
-
 static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
 {
     const int ws_off = it->ws_src ? 1 : 0;
@@ -274,9 +193,11 @@ static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
         /* the cursor allocates and reads three atomics, so the only way it fails is allocation */
         if (skip_list_cursor_init(&it->cursors[i], it->mts[i]->skip_list) != 0)
             return TDB_ERR_MEMORY;
-        memtable_merge_source_init(&it->views[i], it->cursors[i], (uint32_t)cf->cf_id, snapshot);
+        memtable_merge_source_init(&it->views[i], it->cursors[i], it->l0, it->mts[i],
+                                   (uint32_t)cf->cf_id, snapshot);
         memtable_merge_source(&it->views[i], &it->sources[ws_off + i]);
     }
+    int n_src = ws_off + it->n_mts;
     for (int i = 0; i < it->n_ssts; i++)
     {
         /* carry the sstable's own result out rather than calling every failure an i/o error. it
@@ -285,9 +206,9 @@ static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
          */
         const int rc = sstable_iter_new(it->ssts[i], CF_ITER_USE_CACHE, &it->iters[i]);
         if (rc != TDB_SUCCESS) return rc;
-        sstable_merge_source(it->iters[i], &it->sources[ws_off + it->n_mts + i]);
+        sstable_merge_source(it->iters[i], &it->sources[n_src++]);
     }
-    return merge_iter_new(it->sources, n, snapshot, MERGE_ITER_RESOLVE, &it->merge);
+    return merge_iter_new(it->sources, n_src, snapshot, MERGE_ITER_RESOLVE, &it->merge);
 }
 
 int cf_iter_new(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot, writeset_merge_source_t *ws_src,
@@ -360,32 +281,32 @@ void cf_iter_free(cf_iter_t *it)
 int cf_iter_seek_first(cf_iter_t *it)
 {
     const int rc = merge_iter_seek_first(it->merge);
-    return rc == TDB_SUCCESS ? cf_iter_skip_covered(it, 1) : rc;
+    return rc;
 }
 int cf_iter_seek_last(cf_iter_t *it)
 {
     const int rc = merge_iter_seek_last(it->merge);
-    return rc == TDB_SUCCESS ? cf_iter_skip_covered(it, 0) : rc;
+    return rc;
 }
 int cf_iter_seek(cf_iter_t *it, const uint8_t *key, size_t key_size)
 {
     const int rc = merge_iter_seek(it->merge, key, key_size);
-    return rc == TDB_SUCCESS ? cf_iter_skip_covered(it, 1) : rc;
+    return rc;
 }
 int cf_iter_seek_for_prev(cf_iter_t *it, const uint8_t *key, size_t key_size)
 {
     const int rc = merge_iter_seek_for_prev(it->merge, key, key_size);
-    return rc == TDB_SUCCESS ? cf_iter_skip_covered(it, 0) : rc;
+    return rc;
 }
 int cf_iter_next(cf_iter_t *it)
 {
     const int rc = merge_iter_next(it->merge);
-    return rc == TDB_SUCCESS ? cf_iter_skip_covered(it, 1) : rc;
+    return rc;
 }
 int cf_iter_prev(cf_iter_t *it)
 {
     const int rc = merge_iter_prev(it->merge);
-    return rc == TDB_SUCCESS ? cf_iter_skip_covered(it, 0) : rc;
+    return rc;
 }
 int cf_iter_valid(const cf_iter_t *it)
 {

@@ -289,25 +289,47 @@ For each key it decides what survives:
   the base version included — nothing can resolve to it any more. See below.
 - **Tombstones** are the hard case.
 
-### Range tombstones, which are not in the sstables
+### Range tombstones, which the sstables carry
 
-A [range delete](/reference/transaction#tidesdb_txn_delete_range) is not written into the merge
-stream at all. It lives in the manifest, one blob per column family, so a compaction neither carries
-it nor can lose it — the merge simply asks the family whether an interval covers each key it is
-about to emit.
+A [range delete](/reference/transaction#tidesdb_txn_delete_range) lives in the table the memtable
+holding it flushed into, in a block of that table's own. A merge unions what its inputs carried into
+its outputs, so an interval travels down with the data it deletes and its lifetime is a table's
+lifetime. A family reached only by a delete still gets a table for it, holding the interval and no
+keys, which is what gives the delete somewhere to live.
 
-Retiring the interval itself is the mirror of the tombstone problem below, and `max_seq` cannot
-answer it: a table whose newest sequence is above the interval can still hold plenty of older
-versions inside it. So each build records the newest range tombstone it could see at the floor it
-ran at, and **the minimum of that across the family's tables** is the point below which nothing
-covered remains on disk. An interval at or below that minimum has nothing left to hide and is
-dropped from the manifest.
+There is no separate store to keep in step and nothing to prove spent. An interval is present
+exactly while some table carries it and goes when the last table holding it is merged away.
 
-The watermark has to be a sequence the build actually observed, never the floor it ran at. With no
-live transaction the floor is every sequence there is, so a table built *before* an interval existed
-would claim to have applied it and the interval would be retired with its data still present. A
-table built when the family held no intervals records zero and holds the minimum down until it is
-rewritten, which is the conservative direction.
+That property is what an earlier design failed to get right. Keeping intervals in a store of their
+own meant deciding when one had nothing left to hide, and the answer had to hold across every table,
+every unflushed memtable and every unreplayed log at once. A per-table watermark cannot carry that
+claim: intervals reach a family in flush order rather than in sequence order, so a table asserting
+it applied everything through a sequence can be handed one beneath that mark afterwards. Every key
+such an interval covered came back.
+
+### Where an interval stops travelling
+
+Carried forward unconditionally, intervals would only ever accumulate — every merge writing the
+union of what it read, for as long as the family lives. One merge can end that, and only under
+three conditions together:
+
+- It is writing the **largest level**, so there is no level below holding an older version.
+- The interval's sequence is at or **below the reclamation floor**, which is what says every reader
+  that can still exist already sees it applied — and is the same ceiling the per-entry drop above
+  ran under, so this merge really did delete what the interval covered rather than carry it past.
+- **No sstable outside the merge reaches into its range.** A key it covers that this merge never
+  read is a key that comes back the moment the interval stops being carried.
+
+Together those say the merge has just done the last of the interval's work, so its outputs are
+written without it. The test that pins the drop and the test that pins the carry are the same pair:
+`test_cf_source_compaction_drops_an_interval_it_has_finished` and
+`test_cf_source_compaction_carries_input_intervals`, the second of which leaves a table outside the
+merge holding a covered key precisely so the interval must survive.
+
+Everything here is one-sided in the safe direction. A level the scan could not read, a level with
+more overlapping tables than it will inspect, an unbounded upper bound, and a table beginning
+exactly at the interval's exclusive end all count as reaching in. Each keeps an interval that could
+have gone, which costs space; the other error loses data.
 
 ### Why tombstones are hard
 

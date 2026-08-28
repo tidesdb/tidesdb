@@ -121,7 +121,8 @@ static void sstable_adopt_footer(sstable_t *sst, sstable_footer_t *footer)
     sst->distinct_key_count = footer->distinct_key_count;
     sst->tombstone_count = footer->tombstone_count;
     sst->max_seq = footer->max_seq;
-    sst->range_del_applied_seq = footer->range_del_applied_seq;
+    sst->range_del_offset = footer->range_del_offset;
+    sst->range_del_size = footer->range_del_size;
     sst->total_key_bytes = footer->total_key_bytes;
     sst->total_value_bytes = footer->total_value_bytes;
     sst->klog_logical_bytes = footer->klog_logical_bytes;
@@ -141,6 +142,42 @@ static void sstable_adopt_footer(sstable_t *sst, sstable_footer_t *footer)
 
     sst->encoding_count = footer->encoding_count;
     memcpy(sst->encoding_pipeline, footer->encoding_pipeline, footer->encoding_count);
+}
+
+/* read back the range tombstone block a build wrote, so a table reopened from the manifest carries
+ * the intervals it was built with. read while the footer's descriptor is still open, since the
+ * open closes it straight afterwards and everything past that point goes through a lazy reopen
+ * @param bm the klog, still open from the footer read
+ * @param offset where the block was written
+ * @param size how large it is
+ * @param id the table's id, for the notice when the block will not parse
+ * @return the set, or NULL when the table carries none or the block would not read back. a block
+ *         that will not parse is not fatal, since the intervals it held are still in the logs
+ */
+static range_tombstone_set_t *sstable_read_range_dels(block_manager_t *bm, uint64_t offset,
+                                                      uint32_t size, uint64_t id)
+{
+    if (size == 0) return NULL;
+
+    /* through a cursor rather than a raw read at the offset, since what a write_raw left there is a
+     * framed block and the payload starts past its header */
+    block_manager_cursor_t cursor;
+    if (block_manager_cursor_init_stack(&cursor, bm) != 0) return NULL;
+    if (block_manager_cursor_goto(&cursor, offset) != 0) return NULL;
+
+    block_manager_block_t *block = block_manager_cursor_read(&cursor);
+    if (!block) return NULL;
+
+    range_tombstone_set_t *set = NULL;
+    if (block->size != size ||
+        range_tombstone_set_deserialize(block->data, block->size, &set) != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "sstable %llu range tombstone block would not read back",
+                      (unsigned long long)id);
+        set = NULL;
+    }
+    block_manager_block_free(block);
+    return set;
 }
 
 int sstable_open_from_manifest(sstable_t **out, const char *cf_dir, const char *cf_name,
@@ -184,6 +221,10 @@ int sstable_open_from_manifest(sstable_t **out, const char *cf_dir, const char *
 
     sstable_footer_t footer;
     rc = sstable_read_footer(bm, &footer);
+    range_tombstone_set_t *range_tombstones =
+        rc == TDB_SUCCESS
+            ? sstable_read_range_dels(bm, footer.range_del_offset, footer.range_del_size, entry->id)
+            : NULL;
     (void)block_manager_close(
         bm); /* the footer is cached from here on; the lazy reopen owns the resident fd */
     if (rc != TDB_SUCCESS)
@@ -196,6 +237,7 @@ int sstable_open_from_manifest(sstable_t **out, const char *cf_dir, const char *
         sstable_alloc_owning_path(entry->id, entry->partition, klog_path, cf_name, sync_mode);
     if (!sst)
     {
+        range_tombstone_set_free(range_tombstones);
         sstable_footer_free(&footer); /* the helper already freed klog_path */
         return TDB_ERR_MEMORY;
     }
@@ -206,6 +248,7 @@ int sstable_open_from_manifest(sstable_t **out, const char *cf_dir, const char *
     sst->encodings = encodings;
 
     sstable_adopt_footer(sst, &footer);
+    sst->range_tombstones = range_tombstones;
 
     /* resolve the footer's pipeline once, here. a node read cannot afford a registry walk, and a
      * file whose ids do not resolve is unreadable by this build -- reported as corruption, the same
@@ -301,6 +344,7 @@ void sstable_close(sstable_t *sst)
             TDB_DEBUG_LOG(TDB_LOG_WARN, "could not unlink superseded sstable %s", sst->klog_path);
     }
 
+    range_tombstone_set_free(sst->range_tombstones);
     free(sst->min_key);
     free(sst->max_key);
     free(sst->vlog_refs);

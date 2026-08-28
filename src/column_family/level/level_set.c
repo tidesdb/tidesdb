@@ -61,6 +61,8 @@ typedef struct
  * @write_lock serializes install and swap; reads are lock-free
  * @generation bumped on every published layout, so a caller can tell whether the shape it last
  * looked at is still the current one without walking it
+ * @interval_tables how many of the listed sstables carry range tombstones, republished with the
+ * layout, so a family that has never deleted a range answers a covering query from one load
  * @occupancy bit i set when level i+1 holds at least one sstable, republished with the layout. a
  * reader asking which levels are worth visiting reads this one word, where asking each level costs
  * an epoch enter and exit apiece -- and those are contended atomics on a counter every reader
@@ -74,6 +76,7 @@ struct level_set
     pthread_mutex_t write_lock;
     _Atomic(uint64_t) generation;
     _Atomic(uint32_t) occupancy;
+    _Atomic(uint32_t) interval_tables;
 };
 
 /* keys are ordered byte-wise; the shared prefix decides, otherwise the shorter key sorts first */
@@ -251,8 +254,14 @@ static int level_sst_in_set(const sstable_t *sst, sstable_t *const *set, const i
 static void level_publish(level_set_t *ls, level_layout_t *fresh)
 {
     uint32_t occ = 0;
+    uint32_t carrying = 0;
     for (int i = 0; i < LEVEL_SET_MAX_LEVELS; i++)
+    {
         if (fresh->counts[i] > 0) occ |= 1u << i;
+        for (int j = 0; j < fresh->counts[i]; j++)
+            if (range_tombstone_set_count(fresh->levels[i][j].sst->range_tombstones) > 0)
+                carrying++;
+    }
 
     level_layout_t *old = atomic_exchange_explicit(&ls->layout, fresh, memory_order_acq_rel);
     /* published after the layout, so a reader that sees a level occupied and then reads the layout
@@ -267,6 +276,13 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
      * L0 instead. shortening that window, or retiring the immutable before the install, would break
      * this */
     atomic_store_explicit(&ls->occupancy, occ, memory_order_release);
+    /* the interval count rests on that same argument. a reader can load it as zero just before a
+     * flush publishes the first table carrying an interval, and skip a walk that would have found
+     * it -- but the memtable that flush is installing for has not been retired yet and holds the
+     * same intervals, and it is asked ahead of any sstable. the count only ever drops to zero when
+     * the last interval is really gone, and a reader holding a stale non-zero simply walks and
+     * finds nothing */
+    atomic_store_explicit(&ls->interval_tables, carrying, memory_order_release);
     /* bumped after the swap so an observer that reads the generation and then the layout cannot see
      * a new generation against the old shape */
     atomic_fetch_add_explicit(&ls->generation, 1, memory_order_release);
@@ -276,6 +292,11 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
 uint32_t level_set_occupancy(const level_set_t *ls)
 {
     return ls ? atomic_load_explicit(&ls->occupancy, memory_order_acquire) : 0;
+}
+
+uint32_t level_set_interval_tables(const level_set_t *ls)
+{
+    return ls ? atomic_load_explicit(&ls->interval_tables, memory_order_acquire) : 0;
 }
 
 uint64_t level_set_generation(const level_set_t *ls)
@@ -306,6 +327,7 @@ int level_set_create(level_set_t **out)
     atomic_init(&ls->epoch, 0);
     atomic_init(&ls->generation, 0);
     atomic_init(&ls->occupancy, 0);
+    atomic_init(&ls->interval_tables, 0);
     ls->retire.head = NULL;
     *out = ls;
     return 0;

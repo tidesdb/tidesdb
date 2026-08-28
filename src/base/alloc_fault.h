@@ -43,13 +43,6 @@ void *__wrap_realloc(void *ptr, size_t size);
 void alloc_fault_arm(uint64_t nth);
 
 /**
- * alloc_fault_tripped
- * whether the armed allocation has been reached and refused
- * @return non-zero once it has, 0 while it has not
- */
-int alloc_fault_tripped(void);
-
-/**
  * alloc_fault_count
  * how many allocations have been counted since the last arm, which is what a sweep measures a
  * workload with before choosing its range

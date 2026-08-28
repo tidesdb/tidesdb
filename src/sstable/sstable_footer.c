@@ -16,12 +16,10 @@
 
 /* fixed portion of the footer -- magic(4) + version(4) + three btree offsets(24) + bloom dir off(8)
  * and size(4) + distinct(8) + tombstone(8) + max_seq(8) + total_key_bytes(8) + total_value_bytes(8)
- * + klog_logical_bytes(8) + btree_node_count(8) + range_del_applied_seq(8) + btree_height(4) +
- * btree_node_size(4), before the
- * variable min/max keys
- * and the encoding list
+ * + klog_logical_bytes(8) + btree_node_count(8) + range del block off(8) and size(4)
+ * + btree_height(4) + btree_node_size(4), before the variable min/max keys and the encoding list
  */
-#define TDB_SSTABLE_FOOTER_FIXED_BYTES 116
+#define TDB_SSTABLE_FOOTER_FIXED_BYTES 120
 
 /* one histogram entry on disk -- segment number, framed bytes, value count */
 #define TDB_SSTABLE_VLOG_REF_BYTES 24
@@ -70,8 +68,10 @@ int sstable_footer_serialize(const sstable_footer_t *footer, uint8_t **out, size
     p += sizeof(uint64_t);
     tdb_encode_be64(footer->btree_node_count, p);
     p += sizeof(uint64_t);
-    tdb_encode_be64(footer->range_del_applied_seq, p);
+    tdb_encode_be64(footer->range_del_offset, p);
     p += sizeof(uint64_t);
+    tdb_encode_be32(footer->range_del_size, p);
+    p += sizeof(uint32_t);
     tdb_encode_be32(footer->btree_height, p);
     p += sizeof(uint32_t);
     tdb_encode_be32(footer->btree_node_size, p);
@@ -168,8 +168,10 @@ static int sstable_footer_parse_fixed(const uint8_t **p, sstable_footer_t *out)
     *p += sizeof(uint64_t);
     out->btree_node_count = tdb_decode_be64(*p);
     *p += sizeof(uint64_t);
-    out->range_del_applied_seq = tdb_decode_be64(*p);
+    out->range_del_offset = tdb_decode_be64(*p);
     *p += sizeof(uint64_t);
+    out->range_del_size = tdb_decode_be32(*p);
+    *p += sizeof(uint32_t);
     out->btree_height = tdb_decode_be32(*p);
     *p += sizeof(uint32_t);
     out->btree_node_size = tdb_decode_be32(*p);

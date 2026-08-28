@@ -60,28 +60,6 @@ int manifest_pending_add_cf_add(tidesdb_manifest_t *manifest, const uint64_t cf_
     return 0;
 }
 
-/**
- * manifest_pending_add_range_del
- * append a column family's whole range tombstone set to the pending batch
- * @param manifest the manifest
- * @param cf_id the family the set belongs to
- * @param blob the serialized set, or NULL with blob_len 0 to clear it
- * @param blob_len length of blob
- * @return 0 on success, -1 on allocation failure
- */
-int manifest_pending_add_range_del(tidesdb_manifest_t *manifest, const uint64_t cf_id,
-                                   const uint8_t *blob, const uint32_t blob_len)
-{
-    const uint32_t len = (blob && blob_len) ? blob_len : 0;
-    uint8_t *p = manifest_pending_reserve(manifest, MANIFEST_REC_RANGE_DEL_HDR_SIZE + len);
-    if (!p) return -1;
-    *p = MANIFEST_OP_RANGE_DEL;
-    manifest_put_u64(p + 1, cf_id);
-    manifest_put_u32(p + 9, len);
-    if (len) memcpy(p + MANIFEST_REC_RANGE_DEL_HDR_SIZE, blob, len);
-    return 0;
-}
-
 int manifest_pending_add_cf_drop(tidesdb_manifest_t *manifest, const uint64_t cf_id)
 {
     uint8_t *p = manifest_pending_reserve(manifest, MANIFEST_REC_CF_DROP_SIZE);
@@ -227,19 +205,6 @@ static int manifest_apply_cf_record(tidesdb_manifest_t *manifest, const uint8_t 
             (void)manifest_cf_drop_unlocked(manifest, manifest_get_u64(data + off + 1));
             *out_next = off + MANIFEST_REC_CF_DROP_SIZE;
             return 0;
-        case MANIFEST_OP_RANGE_DEL:
-        {
-            if (off + MANIFEST_REC_RANGE_DEL_HDR_SIZE > size) return -1;
-            const uint64_t cf_id = manifest_get_u64(data + off + 1);
-            const uint32_t blob_len = manifest_get_u32(data + off + 9);
-            if (blob_len > MANIFEST_RANGE_DEL_BLOB_MAX) return -1;
-            if (off + MANIFEST_REC_RANGE_DEL_HDR_SIZE + blob_len > size) return -1;
-
-            const uint8_t *blob = blob_len ? data + off + MANIFEST_REC_RANGE_DEL_HDR_SIZE : NULL;
-            if (manifest_range_del_upsert_unlocked(manifest, cf_id, blob, blob_len) != 0) return -1;
-            *out_next = off + MANIFEST_REC_RANGE_DEL_HDR_SIZE + blob_len;
-            return 0;
-        }
         case MANIFEST_OP_CF_SEQ:
             if (off + MANIFEST_REC_CF_SEQ_SIZE > size) return -1;
             /* raised rather than stored, so replaying a snapshot that predates a later drop cannot
@@ -338,7 +303,6 @@ int manifest_apply_batch(tidesdb_manifest_t *manifest, const uint8_t *data, cons
             case MANIFEST_OP_CF_ADD:
             case MANIFEST_OP_CF_DROP:
             case MANIFEST_OP_CF_SEQ:
-            case MANIFEST_OP_RANGE_DEL:
                 rc = manifest_apply_cf_record(manifest, data, size, off, &off);
                 break;
             case MANIFEST_OP_ADD_P:

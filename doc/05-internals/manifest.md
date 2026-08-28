@@ -51,17 +51,16 @@ index:
 | `MANIFEST_OP_MOVE` | An sstable changes level without being rewritten |
 | `MANIFEST_OP_REMOVE` | An sstable leaves the set |
 | `MANIFEST_OP_SEQ` / `MANIFEST_OP_CF_SEQ` | Sequence and family-id high-water marks |
-| `MANIFEST_OP_RANGE_DEL` | One family's whole set of [range deletes](/reference/transaction#tidesdb_txn_delete_range), as an opaque blob |
 
 The config blob is stored **verbatim and never interpreted**. The manifest does not know what
 a column family configuration contains — that belongs to the configuration module — so the
 format can change without touching this one.
 
-`MANIFEST_OP_RANGE_DEL` is the one record that **replaces** rather than adds: it carries a family's
-entire interval set, so the newest one replay meets is the set and a rollover writes one per family
-that has any. Keeping them here rather than in the sstables is what lets a family that deleted a
-range but wrote no keys still record it — a flush that builds no sstable has nothing to hang it on,
-and an sstable with no keys cannot be placed in a level set at all.
+[Range deletes](/reference/transaction#tidesdb_txn_delete_range) are **not** recorded here. An
+interval lives in the sstable the memtable holding it flushed into, in a block of that table's own,
+and travels with that table through every merge — so its lifetime is the table's and the catalogue
+has nothing to say about it. A family that deleted a range but wrote no key still gets a table for
+it, holding the interval and no keys, which is what gives the delete somewhere to live.
 
 `MANIFEST_OP_MOVE` deserves note: promoting an sstable to a deeper level when nothing needs merging is a
 catalogue edit, not a rewrite. The file stays where it is and the manifest re-points it.
@@ -97,7 +96,7 @@ and a rollover would eventually write that out as the truth.
 
 An append-only log grows forever, and replay time grows with it. So the log is periodically
 rewritten as a single **snapshot block** holding the whole live set — the family registry,
-every live sstable, each family's range tombstone set, then the sequence records that close it.
+every live sstable, then the sequence records that close it.
 
 Rollover triggers when records since the last snapshot exceed
 `max(512, 2 × live entries)`. Tying it to the live set rather than a fixed count is what

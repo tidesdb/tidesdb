@@ -70,9 +70,27 @@ static int ss_read_failed(void *ctx)
     return sstable_iter_read_failed((sstable_iter_t *)ctx);
 }
 
+/* the newest interval this table carries that covers the key, at or below the snapshot. the block
+ * is keyed by the family's own keys, the same form the merge walks in, so the key needs no shaping
+ * @param ctx the sstable iterator, which names the table
+ * @param key the key being resolved
+ * @param key_size length of key
+ * @param snapshot the reader's ceiling
+ * @param out_seq receives the covering sequence on a hit
+ * @return 1 when an interval covers the key, 0 when none does
+ */
+static int sstable_source_covers(void *ctx, const uint8_t *key, size_t key_size, uint64_t snapshot,
+                                 uint64_t *out_seq)
+{
+    const range_tombstone_set_t *intervals = sstable_iter_intervals((sstable_iter_t *)ctx);
+    if (!intervals) return 0;
+    return range_tombstone_max_covering(intervals, key, key_size, snapshot, out_seq) == 1;
+}
+
 void sstable_merge_source(sstable_iter_t *it, merge_source_t *out)
 {
     if (!out) return;
+    memset(out, 0, sizeof(*out));
     out->read_failed = ss_read_failed;
     out->first = ss_first;
     out->last = ss_last;
@@ -83,6 +101,7 @@ void sstable_merge_source(sstable_iter_t *it, merge_source_t *out)
     out->seek_for_prev = ss_seek_for_prev;
     out->get = ss_get;
     out->ctx = it;
+    out->covers = sstable_source_covers;
 }
 
 /* ===== memtable source -- one column family's snapshot view of the shared skip_list ===== */
@@ -279,17 +298,48 @@ static void mt_get(void *ctx, const uint8_t **key, size_t *key_size, uint64_t *s
 }
 
 void memtable_merge_source_init(memtable_merge_source_t *s, skip_list_cursor_t *cursor,
-                                uint32_t cf_index, uint64_t snapshot)
+                                tidesdb_l0_t *l0, tidesdb_memtable_t *mt, uint32_t cf_index,
+                                uint64_t snapshot)
 {
     memset(s, 0, sizeof(*s));
+    s->l0 = l0;
+    s->mt = mt;
     s->cursor = cursor;
     s->cf_index = cf_index;
     s->snapshot = snapshot;
 }
 
+/* the newest interval this memtable holds that covers the key. the memtable's set is keyed by the
+ * shared prefixed keyspace, so the family prefix goes back on before it is asked
+ * @param ctx the memtable view, which names the memtable and the family
+ * @param key the key being resolved, without a prefix
+ * @param key_size length of key
+ * @param snapshot the reader's ceiling
+ * @param out_seq receives the covering sequence on a hit
+ * @return 1 when an interval covers the key, 0 when none does
+ */
+static int memtable_source_covers(void *ctx, const uint8_t *key, size_t key_size, uint64_t snapshot,
+                                  uint64_t *out_seq)
+{
+    memtable_merge_source_t *s = (memtable_merge_source_t *)ctx;
+    if (!s->l0 || !s->mt) return 0;
+
+    uint8_t stack[MERGE_SOURCE_PREFIXED_KEY_STACK];
+    const size_t pkey_size = TDB_CF_PREFIX_SIZE + key_size;
+    uint8_t *pkey = pkey_size <= sizeof(stack) ? stack : malloc(pkey_size);
+    if (!pkey) return 0;
+    tdb_build_prefixed_key(s->cf_index, key, key_size, pkey);
+
+    const int covered =
+        tidesdb_memtable_range_tombstone_covering(s->l0, s->mt, pkey, pkey_size, snapshot, out_seq);
+    if (pkey != stack) free(pkey);
+    return covered;
+}
+
 void memtable_merge_source(memtable_merge_source_t *s, merge_source_t *out)
 {
     if (!out) return;
+    memset(out, 0, sizeof(*out));
     out->read_failed = NULL; /* reads from memory, so it never stops short of exhaustion */
     out->first = mt_first;
     out->last = mt_last;
@@ -300,6 +350,7 @@ void memtable_merge_source(memtable_merge_source_t *s, merge_source_t *out)
     out->seek_for_prev = mt_seek_for_prev;
     out->get = mt_get;
     out->ctx = s;
+    out->covers = memtable_source_covers;
 }
 
 /* ===== writeset overlay source -- a transaction's own buffered puts and deletes ===== */
@@ -490,6 +541,7 @@ static void wss_get(void *ctx, const uint8_t **key, size_t *key_size, uint64_t *
 void writeset_merge_source(writeset_merge_source_t *s, merge_source_t *out)
 {
     if (!out) return;
+    memset(out, 0, sizeof(*out));
     out->read_failed = NULL; /* reads from the transaction's own buffer and cannot fail this way */
     out->first = wss_first;
     out->last = wss_last;

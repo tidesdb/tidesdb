@@ -14,6 +14,14 @@
 /* on-disk filename format for per-cf write-ahead logs, <id>.log */
 #define TDB_WAL_EXT ".log"
 
+/* the name a write-ahead log takes once its memtable has been flushed and the file is kept only
+ * because an undecided prepare still lives in it. the data records in such a log are already
+ * durable in L1, so a replay that applied them again would put versions a compaction may since
+ * have retired back above the sstables, where every reader takes them as newer. the name is what
+ * lets recovery tell that log apart from one a crash left behind, whose data is not durable
+ * anywhere else and has to be replayed in full */
+#define TDB_WAL_FLUSHED_EXT ".logf"
+
 #define TDB_SSTABLE_KLOG_EXT ".klog"
 
 /* the suffix a btree leaf build stages under beside its key log; a file carrying it is one a
@@ -132,10 +140,10 @@ static inline size_t tdb_build_prefixed_key(const uint32_t cf_index, const uint8
                                             const size_t key_size, uint8_t *out)
 {
     tdb_encode_be32(cf_index, out);
-    /* a bare family prefix is a legitimate key here -- it names where a family begins, which is what
-     * an interval left open inside the family before it uses as its upper bound. memcpy declares
-     * both pointers non-null whatever the length, so the copy is guarded rather than every such
-     * caller made to pass a pointer it does not have */
+    /* a bare family prefix is a legitimate key here -- it names where a family begins, which is
+     * what an interval left open inside the family before it uses as its upper bound. memcpy
+     * declares both pointers non-null whatever the length, so the copy is guarded rather than every
+     * such caller made to pass a pointer it does not have */
     if (key_size) memcpy(out + TDB_CF_PREFIX_SIZE, key, key_size);
     return TDB_CF_PREFIX_SIZE + key_size;
 }

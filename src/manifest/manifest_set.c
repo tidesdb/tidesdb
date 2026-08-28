@@ -87,74 +87,7 @@ int manifest_cf_drop_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id
         else
             i++;
     }
-
-    i = 0;
-    while (i < manifest->num_range_dels)
-    {
-        if (manifest->range_dels[i].cf_id == cf_id)
-        {
-            free(manifest->range_dels[i].blob);
-            manifest->range_dels[i] = manifest->range_dels[--manifest->num_range_dels];
-        }
-        else
-        {
-            i++;
-        }
-    }
     return found;
-}
-
-int manifest_range_del_upsert_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id,
-                                       const uint8_t *blob, const uint32_t blob_len)
-{
-    /* copied before anything is disturbed, so a failed allocation leaves the family's existing set
-     * exactly as it was */
-    uint8_t *copy = NULL;
-    if (blob && blob_len)
-    {
-        copy = malloc(blob_len);
-        if (!copy) return -1;
-        memcpy(copy, blob, blob_len);
-    }
-
-    for (int i = 0; i < manifest->num_range_dels; i++)
-    {
-        if (manifest->range_dels[i].cf_id != cf_id) continue;
-        free(manifest->range_dels[i].blob);
-        if (!copy)
-        {
-            /* an empty set is carried as no slot at all, so a family whose last fragment retired
-             * costs nothing in the next snapshot */
-            manifest->range_dels[i] = manifest->range_dels[--manifest->num_range_dels];
-            return 0;
-        }
-        manifest->range_dels[i].blob = copy;
-        manifest->range_dels[i].blob_len = blob_len;
-        return 0;
-    }
-
-    if (!copy) return 0;
-
-    if (manifest->num_range_dels == manifest->range_dels_capacity)
-    {
-        const int new_capacity = manifest->range_dels_capacity ? manifest->range_dels_capacity * 2
-                                                               : MANIFEST_INITIAL_CAPACITY;
-        tidesdb_manifest_range_del_t *grown = realloc(
-            manifest->range_dels, (size_t)new_capacity * sizeof(tidesdb_manifest_range_del_t));
-        if (!grown)
-        {
-            free(copy);
-            return -1;
-        }
-        manifest->range_dels = grown;
-        manifest->range_dels_capacity = new_capacity;
-    }
-
-    manifest->range_dels[manifest->num_range_dels].cf_id = cf_id;
-    manifest->range_dels[manifest->num_range_dels].blob = copy;
-    manifest->range_dels[manifest->num_range_dels].blob_len = blob_len;
-    manifest->num_range_dels++;
-    return 0;
 }
 
 int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id,

@@ -363,6 +363,56 @@ void test_l0_newest_version_wins(void)
     tidesdb_l0_destroy(l0);
 }
 
+/* the read walks the active memtable first and the immutables newest to oldest, taking the first
+ * hit rather than the highest sequence -- so a version in the active shadows a newer one behind it.
+ * the ordering that makes the walk right is a property of the write path, not of this read, and
+ * only a commit whose sequence was drawn before a rotation and applied after it can break it. this
+ * pins what such a break costs, since nothing here detects one */
+void test_l0_active_shadows_a_newer_immutable(void)
+{
+    tidesdb_l0_t *l0 = l0_in_memory(L0_BUFFER_SIZE);
+    ASSERT_TRUE(l0 != NULL);
+
+    ASSERT_EQ(mt_put(l0, "K", "newer", 10), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(1)), TDB_SUCCESS); /* imm holds K at seq 10 */
+    ASSERT_EQ(mt_put(l0, "K", "stale", 5), TDB_SUCCESS);        /* active holds K at seq 5 */
+
+    uint8_t *out = NULL;
+    size_t out_size = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(tidesdb_l0_get(l0, 0, (const uint8_t *)"K", 2, &out, &out_size, &ttl, &deleted),
+              TDB_SUCCESS);
+    ASSERT_TRUE(memcmp(out, "stale", out_size) == 0);
+    free(out);
+
+    tidesdb_l0_destroy(l0);
+}
+
+/* the same walk across two immutables -- the one rotated later is read first and wins, whatever
+ * sequence each holds */
+void test_l0_a_later_immutable_shadows_a_newer_earlier_one(void)
+{
+    tidesdb_l0_t *l0 = l0_in_memory(L0_BUFFER_SIZE);
+    ASSERT_TRUE(l0 != NULL);
+
+    ASSERT_EQ(mt_put(l0, "K", "newer", 10), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(1)), TDB_SUCCESS);
+    ASSERT_EQ(mt_put(l0, "K", "stale", 5), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(2)), TDB_SUCCESS);
+
+    uint8_t *out = NULL;
+    size_t out_size = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(tidesdb_l0_get(l0, 0, (const uint8_t *)"K", 2, &out, &out_size, &ttl, &deleted),
+              TDB_SUCCESS);
+    ASSERT_TRUE(memcmp(out, "stale", out_size) == 0);
+    free(out);
+
+    tidesdb_l0_destroy(l0);
+}
+
 /* immutables dequeue oldest first, and reclaiming a dequeued one frees it and shrinks the queue */
 void test_l0_dequeue_fifo_and_reclaim(void)
 {
@@ -1105,6 +1155,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_l0_tombstone, tests_passed);
     RUN_TEST(test_l0_rotate_and_read, tests_passed);
     RUN_TEST(test_l0_newest_version_wins, tests_passed);
+    RUN_TEST(test_l0_active_shadows_a_newer_immutable, tests_passed);
+    RUN_TEST(test_l0_a_later_immutable_shadows_a_newer_earlier_one, tests_passed);
     RUN_TEST(test_l0_dequeue_fifo_and_reclaim, tests_passed);
     RUN_TEST(test_l0_retire_is_observable_to_a_bracketed_read, tests_passed);
     RUN_TEST(test_l0_reclaim_defers_rather_than_blocking, tests_passed);

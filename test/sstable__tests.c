@@ -512,6 +512,86 @@ void test_builder_roundtrip(void)
     (void)remove_directory(TEST_SSTABLE_DIR);
 }
 
+/* a table carries the range tombstones it was built with in a block of its own, so an interval
+ * lives exactly as long as a table holding it rather than as long as a claim the family has to
+ * verify. the block has to survive the footer and come back on a reopen, since a table reopened
+ * from the manifest is the only copy of what it carried */
+void test_builder_carries_its_range_tombstones(void)
+{
+    (void)remove_directory(TEST_SSTABLE_DIR);
+    ASSERT_EQ(mkdir(TEST_SSTABLE_DIR, TEST_SSTABLE_DIR_PERMISSIONS), 0);
+
+    tidesdb_manifest_entry_t entry = {0};
+    entry.birth_level = 1;
+    entry.id = 140;
+    entry.partition = MANIFEST_NO_PARTITION;
+    char filename[128], path[256];
+    ASSERT_EQ(sstable_klog_filename(&entry, filename, sizeof(filename)), TDB_SUCCESS);
+    snprintf(path, sizeof(path), "%s%s%s", TEST_SSTABLE_DIR, PATH_SEPARATOR, filename);
+
+    block_manager_t *klog_bm = NULL;
+    ASSERT_EQ(block_manager_open(&klog_bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+    ASSERT_EQ(range_tombstone_set_add(set, (const uint8_t *)"b", 1, (const uint8_t *)"f", 1, 45),
+              TDB_SUCCESS);
+    ASSERT_EQ(range_tombstone_set_add(set, (const uint8_t *)"m", 1, NULL, RT_UNBOUNDED_ABOVE, 61),
+              TDB_SUCCESS);
+
+    sstable_builder_config_t config;
+    default_builder_config(&config, 140, path);
+    config.range_tombstones = set;
+
+    sstable_builder_t *builder = NULL;
+    ASSERT_EQ(sstable_builder_new(&builder, klog_bm, NULL, &config), TDB_SUCCESS);
+    ASSERT_EQ(
+        sstable_builder_add(builder, (const uint8_t *)"key", 3, (const uint8_t *)"v", 1, 70, 0, 0),
+        TDB_SUCCESS);
+
+    sstable_t *sst = NULL;
+    uint64_t vlog_bytes = 0;
+    ASSERT_EQ(sstable_builder_finish(builder, &sst, &vlog_bytes), TDB_SUCCESS);
+    sstable_builder_free(builder);
+
+    /* the build kept its own copy, and the set the caller passed is still the caller's to free */
+    ASSERT_TRUE(sst->range_del_offset != 0 && sst->range_del_size != 0);
+    const uint64_t sst_offset = sst->range_del_offset;
+    const uint32_t sst_size = sst->range_del_size;
+    ASSERT_TRUE(sst->range_tombstones != NULL);
+    ASSERT_EQ((int)range_tombstone_set_count(sst->range_tombstones), 2);
+    range_tombstone_set_free(set);
+    sstable_close(sst);
+
+    /* and it comes back off disk, covering the same keys at the same sequences */
+    sstable_t *reopened = NULL;
+    ASSERT_EQ(sstable_open_from_manifest(&reopened, TEST_SSTABLE_DIR, "cf", &entry,
+                                         BLOCK_MANAGER_SYNC_NONE, NULL, NULL, NULL, NULL, NULL),
+              TDB_SUCCESS);
+    /* the footer carried the block's whereabouts, before asking whether the block itself read */
+    ASSERT_EQ(reopened->range_del_offset, sst_offset);
+    ASSERT_EQ(reopened->range_del_size, sst_size);
+    ASSERT_TRUE(reopened->range_tombstones != NULL);
+    ASSERT_EQ((int)range_tombstone_set_count(reopened->range_tombstones), 2);
+
+    uint64_t seq = 0;
+    ASSERT_EQ(range_tombstone_max_covering(reopened->range_tombstones, (const uint8_t *)"cc", 2,
+                                           UINT64_MAX, &seq),
+              1);
+    ASSERT_EQ((int)seq, 45);
+    ASSERT_EQ(range_tombstone_max_covering(reopened->range_tombstones, (const uint8_t *)"zz", 2,
+                                           UINT64_MAX, &seq),
+              1);
+    ASSERT_EQ((int)seq, 61);
+    /* and a key outside every interval is covered by none */
+    ASSERT_EQ(range_tombstone_max_covering(reopened->range_tombstones, (const uint8_t *)"a", 1,
+                                           UINT64_MAX, &seq),
+              0);
+    sstable_close(reopened);
+
+    (void)remove_directory(TEST_SSTABLE_DIR);
+}
+
 /* a value at or above the threshold spills to the shared vlog; the btree stores its id and the
  * value round-trips through vlog_read, while a small value stays inline */
 void test_builder_vlog_spill(void)
@@ -1608,6 +1688,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_open_from_manifest, tests_passed);
     RUN_TEST(test_refcount_basics, tests_passed);
     RUN_TEST(test_builder_roundtrip, tests_passed);
+    RUN_TEST(test_builder_carries_its_range_tombstones, tests_passed);
     RUN_TEST(test_builder_vlog_spill, tests_passed);
     RUN_TEST(test_builder_records_vlog_segment_references, tests_passed);
     RUN_TEST(test_builder_respills_a_value_out_of_a_draining_segment, tests_passed);

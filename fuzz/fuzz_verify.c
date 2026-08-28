@@ -9,7 +9,13 @@
 #include <ctype.h>
 #include <string.h>
 
-#include "compat.h" /* usleep */
+#include "../src/column_family/column_family.h" /* cf_range_tombstone_covering, for the diagnosis below */
+#include "../src/column_family/level/level_set.h" /* level_set_collect_all, to enumerate the tables */
+#include "../src/engine/engine_internal.h"        /* db->l0, for the memtable interrogation */
+#include "../src/memtable/memtable.h"
+#include "../src/sstable/sstable.h"      /* sstable_get_at_seq, to ask each one directly */
+#include "base/encoding/serialization.h" /* tdb_build_prefixed_key */
+#include "compat.h"                      /* usleep */
 #include "fuzz_harness_internal.h"
 
 /* ===== iteration oracle =====
@@ -21,6 +27,10 @@
 
 /* how many leading bytes of a key or value a divergence report spells out */
 #define FX_DUMP_MAX_BYTES 32
+
+/* tables one divergence report enumerates before it stops, which is more than any family the
+ * harness builds ever holds */
+#define FX_DIAG_MAX_TABLES 64
 
 /* spell one key or value out as hex with a printable rendering beside it, so a divergence names the
  * bytes involved instead of only a position */
@@ -34,17 +44,129 @@ static void fx_dump_bytes(const char *label, const uint8_t *b, size_t n)
     fprintf(stderr, "%s\"\n", shown < n ? "..." : "");
 }
 
+/* the database currently being verified, so a divergence can interrogate it directly */
+static tidesdb_t *fx_diag_db;
+static const fuzz_model_t *fx_diag_model;
+
 /* report a diverging scan in full -- the model's whole visible set and the database entry that did
  * not match it -- so the offending key can be traced back through the engine log */
 static void fx_dump_divergence(const char *cf, const fuzz_model_kv_t *kv, size_t kn, size_t at,
                                const uint8_t *k, size_t kl, const uint8_t *v, size_t vl)
 {
+    fx_op_history_dump();
     fprintf(stderr, "\nscan divergence in cf %s at index %zu, model holds %zu keys\n", cf, at, kn);
     for (size_t i = 0; i < kn; i++)
     {
         fprintf(stderr, "  model[%zu]\n", i);
         fx_dump_bytes("key", kv[i].key, kv[i].klen);
         fx_dump_bytes("val", kv[i].val, kv[i].vlen);
+    }
+    if (k && fx_diag_db)
+    {
+        /* the model deleted this key and the database handed it back, so the question is whether
+         * an interval covering it is still in any table the read would have consulted. asked at the
+         * widest snapshot there is, so a yes means the read ignored an interval it had and a no
+         * means no table carries one any more */
+        cf_t *dcf = (cf_t *)tidesdb_get_column_family(fx_diag_db, cf);
+        uint64_t tomb = 0;
+        const int covered = dcf ? cf_range_tombstone_covering(dcf, k, kl, UINT64_MAX, &tomb) : -1;
+        fprintf(stderr, "  a table covers this key %d (seq %llu)\n", covered,
+                (unsigned long long)tomb);
+
+        /* which table is handing the key back, and how many intervals that table carries. an
+         * interval lives in the table it was written into, so a key that came back is either in a
+         * table no interval covers or in one whose intervals went with a merge */
+        if (dcf)
+        {
+            sstable_t *tabs[FX_DIAG_MAX_TABLES];
+            const int nt = level_set_collect_all(dcf->levels, tabs, FX_DIAG_MAX_TABLES);
+            fprintf(stderr, "  family holds %d tables\n", nt);
+            for (int t = 0; t < nt && t < FX_DIAG_MAX_TABLES; t++)
+            {
+                uint8_t *tv = NULL;
+                size_t tvl = 0;
+                uint64_t voff = 0, tseq = 0;
+                int64_t tttl = -1;
+                uint8_t tdel = 0;
+                const int hit = sstable_get_at_seq(tabs[t], k, kl, UINT64_MAX, &tv, &tvl, &voff,
+                                                   &tseq, &tttl, &tdel) == TDB_SUCCESS;
+                fprintf(stderr,
+                        "    table %llu carries %d intervals, holds this key %d (seq %llu, deleted "
+                        "%d)\n",
+                        (unsigned long long)tabs[t]->id,
+                        tabs[t]->range_tombstones
+                            ? (int)range_tombstone_set_count(tabs[t]->range_tombstones)
+                            : 0,
+                        hit, (unsigned long long)tseq, (int)tdel);
+                free(tv);
+                if (sstable_unref(tabs[t])) sstable_close(tabs[t]);
+            }
+        }
+
+        /* and what the model holds for it, which says whether the model deleted the key or never
+         * had it at all */
+        int mtomb = 0;
+        uint64_t mseq = 0;
+        const int held =
+            fx_diag_model ? fuzz_model_debug_entry(fx_diag_model, cf, k, kl, &mtomb, &mseq) : -1;
+        fprintf(stderr, "  model holds a version of this key %d (tombstone %d, seq %llu)\n", held,
+                mtomb, (unsigned long long)mseq);
+
+        /* and whether the engine agrees with itself. a point get that cannot find what the scan
+         * just handed back is the read path disagreeing internally, which is a different fault
+         * from the two of them agreeing on a key the model says is gone */
+        /* the tables are only half the picture -- an interval still sitting in a memtable, or one
+         * replayed into one, has not reached a table at all. ask each pinned memtable directly */
+        if (fx_diag_db)
+        {
+            tidesdb_memtable_t *mts[32];
+            int nm = 0;
+            if (tidesdb_l0_pin_memtables(fx_diag_db->l0, mts, 32, &nm) == TDB_SUCCESS)
+            {
+                uint8_t pk[TDB_CF_PREFIX_SIZE + 64];
+                const size_t pks = tdb_build_prefixed_key((uint32_t)((cf_t *)dcf)->cf_id, k,
+                                                          kl < 64 ? kl : 64, pk);
+                int hit = 0;
+                uint64_t mt_seq = 0;
+                for (int mi = 0; mi < nm; mi++)
+                    if (tidesdb_memtable_range_tombstone_covering(fx_diag_db->l0, mts[mi], pk, pks,
+                                                                  UINT64_MAX, &mt_seq))
+                        hit = 1;
+                fprintf(stderr, "  memtables pinned %d, any covers this key %d (seq %llu)\n", nm,
+                        hit, (unsigned long long)mt_seq);
+                tidesdb_l0_unpin_memtables(mts, nm);
+            }
+        }
+
+        /* and what L0 holds for the key as a version rather than as interval coverage. a tombstone
+         * sitting here that the read stack did not return is a read fault; nothing here at all
+         * means the delete never reached a memtable, or was replayed away, and the live version the
+         * tables hand back is simply the newest one that survives */
+        {
+            uint8_t *lv = NULL;
+            size_t lvl = 0;
+            uint64_t lvid = 0, lseq = 0;
+            int64_t lttl = -1;
+            uint8_t ldel = 0;
+            const int lrc =
+                tidesdb_l0_get_at_seq(fx_diag_db->l0, (uint32_t)((cf_t *)dcf)->cf_id, k, kl,
+                                      UINT64_MAX, &lv, &lvl, &lvid, &lttl, &ldel, &lseq);
+            fprintf(stderr, "  l0 holds this key rc %d (seq %llu, deleted %d, vlen %zu)\n", lrc,
+                    (unsigned long long)lseq, (int)ldel, lvl);
+            free(lv);
+        }
+
+        tidesdb_txn_t *gt = NULL;
+        if (tidesdb_txn_begin(fx_diag_db, &gt) == TDB_SUCCESS)
+        {
+            uint8_t *gv = NULL;
+            size_t gvl = 0;
+            const int grc = tidesdb_txn_get(gt, fx_cf_handle(fx_diag_db, cf), k, kl, &gv, &gvl);
+            fprintf(stderr, "  point get of the same key rc %d\n", grc);
+            free(gv);
+            (void)tidesdb_txn_rollback(gt);
+            tidesdb_txn_free(gt);
+        }
     }
     if (k)
     {
@@ -173,6 +295,8 @@ void fx_verify_cf(fx_state_t *s, tidesdb_t *db, const char *cf)
     fuzz_model_kv_t *kv = NULL;
     size_t kn = 0;
     FUZZ_CHECK(fuzz_model_scan(s->model, cf, &kv, &kn), "model scan %s", cf);
+    fx_diag_db = db;
+    fx_diag_model = s->model;
 
     tidesdb_txn_t *rt = NULL;
     FUZZ_CHECK(tidesdb_txn_begin(db, &rt) == TDB_SUCCESS, "verify txn begin");

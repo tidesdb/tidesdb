@@ -85,10 +85,6 @@ static void flush_builder_config(const flush_ctx_t *fx, cf_t *cf, uint64_t id,
     memset(config, 0, sizeof(*config));
     config->target_node_size = cc->btree_klog_block_size;
     config->value_threshold = cf_config_value_threshold(cc, fx->value_threshold);
-    /* the watermark is the newest tombstone this build could actually see, not the floor it ran at.
-     * a floor of every sequence there is would have this table claim it applied tombstones written
-     * long after it was built, and the family would retire them with covered data still here */
-    config->range_del_applied_seq = cf_range_tombstones_applied_through(cf, fx->gc_floor);
     config->enable_bloom = cc->enable_bloom_filter;
     config->bloom_fpr = cc->bloom_fpr;
     config->sync_mode = fx->sync_mode;
@@ -180,36 +176,10 @@ static int flush_emit(sstable_builder_t *builder, const uint8_t *key, size_t key
                                               entry_ttl, flush_kv_flags(flags));
 }
 
-/* whether a range tombstone at or below the reclamation floor deletes this version. both sets have
- * to be asked -- the family's, holding what earlier generations flushed, and this memtable's own,
- * which has not reached the family yet. a flush that skips either would still record the floor as
- * applied, and the family would go on to retire a tombstone with covered data left behind it
- * @param fx the flush context, for the floor
- * @param cf the family the run belongs to
- * @param immutable the memtable being flushed
- * @param pkey the key with its family prefix, the form the memtable's own set is keyed by
- * @param pkey_size length of pkey in bytes
- * @param seq the version's sequence
- * @return non-zero when the version is deleted out from under every reader there can still be
- */
-static int flush_covered(const flush_ctx_t *fx, cf_t *cf, tidesdb_memtable_t *immutable,
-                         const uint8_t *pkey, const size_t pkey_size, const uint64_t seq)
-{
-    uint64_t tomb = 0;
-    if (cf_range_tombstone_covering(cf, pkey + TDB_CF_PREFIX_SIZE, pkey_size - TDB_CF_PREFIX_SIZE,
-                                    fx->gc_floor, &tomb) &&
-        tomb > seq)
-        return 1;
-    return tidesdb_memtable_range_tombstone_covering(fx->l0, immutable, pkey, pkey_size,
-                                                     fx->gc_floor, &tomb) &&
-           tomb > seq;
-}
-
 /* add every surviving version of each key in one column family's contiguous run to the builder,
  * advancing the cursor to the first key of the next column family (or the end); the run is bounded
  * by the skip_list size and each key's chain by its own length */
-static int flush_add_run(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
-                         tidesdb_memtable_t *immutable, skip_list_cursor_t *cur,
+static int flush_add_run(const flush_ctx_t *fx, uint32_t cf_index, skip_list_cursor_t *cur,
                          sstable_builder_t *builder, uint64_t *out_entries)
 {
     uint64_t entries = 0;
@@ -244,8 +214,7 @@ static int flush_add_run(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
              * what a snapshot resolves to */
             /* a covered version does not consume the base either -- what no reader can resolve to
              * cannot be what a snapshot resolves to */
-            if (!flush_covered(fx, cf, immutable, key, key_size, seq) &&
-                !tidesdb_l0_seq_aborted(fx->l0, seq) && flush_retain(seq, fx->gc_floor, &kept_base))
+            if (!tidesdb_l0_seq_aborted(fx->l0, seq) && flush_retain(seq, fx->gc_floor, &kept_base))
             {
                 if (flush_emit(builder, key, key_size, value, value_size, vlog_id, seq, flags,
                                ttl) != TDB_SUCCESS)
@@ -262,6 +231,68 @@ static int flush_add_run(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
     return TDB_SUCCESS;
 }
 
+/**
+ * flush_cf_intervals
+ * the intervals this memtable holds for one family, with the family prefix taken off, so the
+ * table this flush is about to build can carry them itself
+ *
+ * read under the lock a reader takes, and filtered the way a version is -- an abandoned commit's
+ * sequence is skipped and the reclamation floor bounds what is kept. the table this flush builds is
+ * where the interval lives from here, so it lives exactly as long as that table does
+ * @param fx the flush context, for the abandoned set and the reclamation floor
+ * @param immutable the memtable being flushed
+ * @param cf_index the family whose intervals are wanted
+ * @return a set the caller frees, or NULL when this family has none or one could not be built
+ */
+static range_tombstone_set_t *flush_cf_intervals(const flush_ctx_t *fx,
+                                                 tidesdb_memtable_t *immutable,
+                                                 const uint32_t cf_index)
+{
+    if (atomic_load_explicit(&immutable->range_tombstone_frags, memory_order_acquire) == 0)
+        return NULL;
+
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    if (!set) return NULL;
+
+    int any = 0;
+    pthread_rwlock_rdlock(&immutable->range_tombstone_lock);
+    const size_t n = range_tombstone_set_count(immutable->range_tombstones);
+    for (size_t i = 0; i < n; i++)
+    {
+        const rt_fragment_t *frag = NULL;
+        if (range_tombstone_set_fragment_at(immutable->range_tombstones, i, &frag) != TDB_SUCCESS ||
+            frag->lo_size < TDB_CF_PREFIX_SIZE || tdb_decode_be32(frag->lo) != cf_index)
+            continue;
+
+        /* the upper bound is this family's own key only while it stays inside the family; one that
+         * reached the next family's prefix is unbounded once the prefix is gone */
+        const uint8_t *hi = NULL;
+        size_t hi_size = RT_UNBOUNDED_ABOVE;
+        if (frag->hi_size > TDB_CF_PREFIX_SIZE && tdb_decode_be32(frag->hi) == cf_index)
+        {
+            hi = frag->hi + TDB_CF_PREFIX_SIZE;
+            hi_size = frag->hi_size - TDB_CF_PREFIX_SIZE;
+        }
+
+        int kept_base = 0;
+        for (size_t k = 0; k < frag->seq_count; k++)
+        {
+            const uint64_t seq = frag->seqs[k];
+            if (tidesdb_l0_seq_aborted(fx->l0, seq)) continue;
+            if (!flush_retain(seq, fx->gc_floor, &kept_base)) break;
+            if (range_tombstone_set_add(set, frag->lo + TDB_CF_PREFIX_SIZE,
+                                        frag->lo_size - TDB_CF_PREFIX_SIZE, hi, hi_size,
+                                        seq) == TDB_SUCCESS)
+                any = 1;
+        }
+    }
+    pthread_rwlock_unlock(&immutable->range_tombstone_lock);
+
+    if (any) return set;
+    range_tombstone_set_free(set);
+    return NULL;
+}
+
 /* build one column family's L1 sstable from its run, leaving the cursor on the next family */
 static int flush_build_cf(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
                           tidesdb_memtable_t *immutable, uint64_t prealloc, skip_list_cursor_t *cur,
@@ -276,8 +307,14 @@ static int flush_build_cf(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
     sstable_builder_config_t config;
     tidesdb_column_family_config_t cc;
     flush_builder_config(fx, cf, id, klog_path, &cc, &config);
+    /* the builder clones what it is given, so this set is released as soon as it has been handed
+     * over rather than held for the length of the build */
+    range_tombstone_set_t *intervals = flush_cf_intervals(fx, immutable, cf_index);
+    config.range_tombstones = intervals;
     sstable_builder_t *builder = NULL;
-    if (sstable_builder_new(&builder, klog_bm, cf->vlog, &config) != TDB_SUCCESS)
+    const int new_rc = sstable_builder_new(&builder, klog_bm, cf->vlog, &config);
+    range_tombstone_set_free(intervals);
+    if (new_rc != TDB_SUCCESS)
     {
         /* the klog was opened but never adopted by a finished sstable, so it was not counted as a
          * resident descriptor; close it without a note_close, and unlink it. nothing references a
@@ -289,7 +326,7 @@ static int flush_build_cf(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
     }
 
     uint64_t num_entries = 0;
-    rc = flush_add_run(fx, cf, cf_index, immutable, cur, builder, &num_entries);
+    rc = flush_add_run(fx, cf_index, cur, builder, &num_entries);
     sstable_t *sst = NULL;
     uint64_t vlog_bytes = 0;
     if (rc == TDB_SUCCESS)
@@ -366,146 +403,9 @@ static void flush_retract_uninstalled(const flush_ctx_t *fx, flush_output_t *out
         if (outputs[i].sst) sstable_mark_for_deletion(outputs[i].sst);
 }
 
-/* record every output in one atomic manifest commit, then install them into the level sets */
-/**
- * flush_carry_one_fragment
- * lay one of the immutable's fragments onto the family it belongs to, stripping the family prefix
- * the memtable stores it under and keeping only the sequences a reader could still resolve to
- * @param fx the flush context, for the abort set and the reclamation floor
- * @param cf the family the fragment belongs to
- * @param cf_index that family's prefix index
- * @param frag the fragment, its bounds still prefixed
- * @return TDB_SUCCESS, or TDB_ERR_MEMORY
- */
-static int flush_carry_one_fragment(const flush_ctx_t *fx, cf_t *cf, const uint32_t cf_index,
-                                    const rt_fragment_t *frag)
+static int flush_commit_and_install(const flush_ctx_t *fx, flush_output_t *outputs, int n_out)
 {
-    /* the upper bound is the family's own key only while it stays inside the family. a bound that
-     * reached the next family's prefix, or ran off the end of the order, is unbounded once the
-     * family prefix is gone -- it covers this family's keys from the lower bound on */
-    const uint8_t *hi = NULL;
-    size_t hi_size = RT_UNBOUNDED_ABOVE;
-    if (frag->hi_size > TDB_CF_PREFIX_SIZE && tdb_decode_be32(frag->hi) == cf_index)
-    {
-        hi = frag->hi + TDB_CF_PREFIX_SIZE;
-        hi_size = frag->hi_size - TDB_CF_PREFIX_SIZE;
-    }
-
-    /* the same retention a version gets -- every sequence a live snapshot could still be reading at
-     * survives, plus the newest one at or below the floor as the base every older reader resolves
-     * to
-     */
-    int kept_base = 0;
-    for (size_t i = 0; i < frag->seq_count; i++)
-    {
-        const uint64_t seq = frag->seqs[i];
-        if (tidesdb_l0_seq_aborted(fx->l0, seq)) continue;
-        if (!flush_retain(seq, fx->gc_floor, &kept_base)) break;
-
-        const int rc = cf_range_tombstone_add(cf, frag->lo + TDB_CF_PREFIX_SIZE,
-                                              frag->lo_size - TDB_CF_PREFIX_SIZE, hi, hi_size, seq);
-        if (rc != TDB_SUCCESS) return rc;
-    }
-    return TDB_SUCCESS;
-}
-
-/**
- * flush_carry_range_tombstones
- * move the immutable's range tombstones into the families they belong to and record each touched
- * family's whole set in the manifest batch this flush is about to commit. a family reached only by
- * a tombstone is carried here whether or not it also had keys, which is what stops a delete of a
- * prefix that wrote nothing else from being lost when its memtable retires
- * @param fx the flush context
- * @param immutable the immutable being flushed
- * @param out_any set non-zero when any family's set was recorded, so a flush with no sstables still
- *                knows it has a batch to commit
- * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_IO when the manifest refused a set
- */
-static int flush_carry_range_tombstones(const flush_ctx_t *fx, tidesdb_memtable_t *immutable,
-                                        int *out_any)
-{
-    *out_any = 0;
-    if (atomic_load_explicit(&immutable->range_tombstone_frags, memory_order_acquire) == 0)
-        return TDB_SUCCESS;
-
-    /* the immutable takes no more writes, but a reader may still be resolving against its set, so
-     * the walk is under the same lock a read takes rather than over a set that could be replaced */
-    /* which families this flush actually reached. only those are rewritten below -- a family whose
-     * set nothing here changed already has the same bytes recorded, and rewriting them would grow
-     * the log and pull the next rollover forward for no change at all */
-    unsigned char *touched = calloc((size_t)(fx->n_cfs > 0 ? fx->n_cfs : 1), 1);
-    if (!touched) return TDB_ERR_MEMORY;
-
-    pthread_rwlock_rdlock(&immutable->range_tombstone_lock);
-    int rc = TDB_SUCCESS;
-    const size_t n = range_tombstone_set_count(immutable->range_tombstones);
-    for (size_t i = 0; i < n && rc == TDB_SUCCESS; i++)
-    {
-        const rt_fragment_t *frag = NULL;
-        if (range_tombstone_set_fragment_at(immutable->range_tombstones, i, &frag) != TDB_SUCCESS ||
-            frag->lo_size < TDB_CF_PREFIX_SIZE)
-        {
-            rc = TDB_ERR_CORRUPTION;
-            break;
-        }
-        const uint32_t cf_index = tdb_decode_be32(frag->lo);
-        cf_t *cf = (cf_index < (uint32_t)fx->n_cfs) ? fx->cfs[cf_index] : NULL;
-        if (!cf) continue; /* a dropped family's tombstones go with the rest of its data */
-
-        rc = flush_carry_one_fragment(fx, cf, cf_index, frag);
-        if (rc == TDB_SUCCESS)
-        {
-            touched[cf_index] = 1;
-            *out_any = 1;
-        }
-    }
-    pthread_rwlock_unlock(&immutable->range_tombstone_lock);
-    if (rc != TDB_SUCCESS || !*out_any)
-    {
-        free(touched);
-        return rc;
-    }
-
-    /* record each touched family's whole set once, after every fragment has landed in it, so a
-     * family reached by several fragments is written out once rather than once per fragment */
-    for (int i = 0; i < fx->n_cfs && rc == TDB_SUCCESS; i++)
-    {
-        if (!touched[i]) continue;
-        cf_t *cf = fx->cfs[i];
-
-        uint8_t *blob = NULL;
-        size_t blob_len = 0;
-        rc = cf_range_tombstones_serialize(cf, &blob, &blob_len);
-        if (rc != TDB_SUCCESS) break;
-
-        if (blob_len > MANIFEST_RANGE_DEL_BLOB_MAX)
-        {
-            /* named rather than folded into a bare io error, because the condition is a family
-             * whose range deletes have outrun the compaction that retires them, and nothing about
-             * an io failure would point at that */
-            TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                          "cf %s range tombstone set is %zu bytes, past the %u the manifest holds",
-                          cf->name, blob_len, (unsigned)MANIFEST_RANGE_DEL_BLOB_MAX);
-            rc = TDB_ERR_IO;
-        }
-        else if (tidesdb_manifest_set_range_dels(fx->manifest, cf->cf_id, blob,
-                                                 (uint32_t)blob_len) != 0)
-            rc = TDB_ERR_IO;
-        free(blob);
-    }
-    free(touched);
-    return rc;
-}
-
-static int flush_commit_and_install(const flush_ctx_t *fx, flush_output_t *outputs, int n_out,
-                                    tidesdb_memtable_t *immutable)
-{
-    /* the tombstones go into the batch first, so a flush that carries nothing but deletes still has
-     * a batch to commit and the early return below does not swallow them */
-    int carried = 0;
-    const int carry = flush_carry_range_tombstones(fx, immutable, &carried);
-    if (carry != TDB_SUCCESS) return carry;
-    if (n_out == 0 && !carried) return TDB_SUCCESS;
+    if (n_out == 0) return TDB_SUCCESS;
 
     for (int i = 0; i < n_out; i++)
     {
@@ -556,27 +456,6 @@ static int flush_commit_and_install(const flush_ctx_t *fx, flush_output_t *outpu
         return TDB_ERR_MEMORY;
     }
 
-    /* the installs have landed, so the family's tables now include this flush's outputs and their
-     * floor. a tombstone every one of them has applied has nothing left to hide, and this is the
-     * first moment that can be true of the tombstones this same flush just carried in */
-    for (int i = 0; i < n_out; i++)
-    {
-        size_t dropped = 0;
-        if (cf_range_tombstones_sweep(outputs[i].cf, &dropped) != TDB_SUCCESS || dropped == 0)
-            continue;
-
-        uint8_t *blob = NULL;
-        size_t blob_len = 0;
-        if (cf_range_tombstones_serialize(outputs[i].cf, &blob, &blob_len) != TDB_SUCCESS) continue;
-        /* a failure here costs nothing but the retirement -- the set in memory is already smaller,
-         * and the record it did not replace replays as the larger one it superseded */
-        (void)tidesdb_manifest_set_range_dels(fx->manifest, outputs[i].cf->cf_id, blob,
-                                              (uint32_t)blob_len);
-        free(blob);
-        (void)tidesdb_manifest_commit(fx->manifest, fx->manifest_path,
-                                      fx->sync_mode != BLOCK_MANAGER_SYNC_NONE);
-    }
-
     /* settled only once every install has landed. lowering each family's count as its own install
      * went would, on a failure part-way, leave the families already installed counted as drained
      * for keys the retried immutable flushes again, and the second pass lowers them a second time.
@@ -592,6 +471,68 @@ static int flush_commit_and_install(const flush_ctx_t *fx, flush_output_t *outpu
         atomic_fetch_sub_explicit(&outputs[i].cf->unflushed_key_count, drained,
                                   memory_order_relaxed);
     }
+    return TDB_SUCCESS;
+}
+
+/**
+ * flush_build_cf_intervals_only
+ * build a table that holds nothing but this family's intervals, for a family this memtable deleted
+ * a range of and wrote no key to
+ *
+ * an interval lives in a table, so a family reached only by a delete still needs one or the delete
+ * has nowhere to live and the keys it covered in older tables come back. the table carries no keys
+ * and answers every point read as a miss, which is what a table of pure deletes should do
+ * @param fx the flush context
+ * @param cf the family
+ * @param cf_index its prefix index
+ * @param immutable the memtable being flushed
+ * @param out receives the output on success
+ * @return TDB_SUCCESS, TDB_ERR_MEMORY, or an io code from the build
+ */
+static int flush_build_cf_intervals_only(const flush_ctx_t *fx, cf_t *cf, const uint32_t cf_index,
+                                         tidesdb_memtable_t *immutable, flush_output_t *out)
+{
+    range_tombstone_set_t *intervals = flush_cf_intervals(fx, immutable, cf_index);
+    if (!intervals) return TDB_ERR_NOT_FOUND; /* nothing of this family's to write */
+
+    const uint64_t id = atomic_fetch_add(fx->next_sstable_id, 1);
+    char klog_path[FLUSH_KLOG_PATH_LEN];
+    block_manager_t *klog_bm = NULL;
+    int rc = flush_open_klog(cf, id, 0, klog_path, sizeof(klog_path), &klog_bm);
+    if (rc != TDB_SUCCESS)
+    {
+        range_tombstone_set_free(intervals);
+        return rc;
+    }
+
+    sstable_builder_config_t config;
+    tidesdb_column_family_config_t cc;
+    flush_builder_config(fx, cf, id, klog_path, &cc, &config);
+    config.range_tombstones = intervals;
+    sstable_builder_t *builder = NULL;
+    const int new_rc = sstable_builder_new(&builder, klog_bm, cf->vlog, &config);
+    range_tombstone_set_free(intervals);
+    if (new_rc != TDB_SUCCESS)
+    {
+        (void)block_manager_close(klog_bm);
+        (void)remove(klog_path);
+        return TDB_ERR_MEMORY;
+    }
+
+    sstable_t *sst = NULL;
+    uint64_t vlog_bytes = 0;
+    rc = sstable_builder_finish(builder, &sst, &vlog_bytes);
+    sstable_builder_free(builder);
+    if (rc != TDB_SUCCESS)
+    {
+        (void)block_manager_close(klog_bm);
+        (void)remove(klog_path);
+        return rc;
+    }
+
+    uint64_t size_bytes = 0;
+    (void)block_manager_get_size(klog_bm, &size_bytes);
+    *out = (flush_output_t){cf, cf->cf_id, sst, id, 0, size_bytes};
     return TDB_SUCCESS;
 }
 
@@ -626,6 +567,16 @@ int flush_build(const flush_ctx_t *fx, tidesdb_memtable_t *immutable, flush_job_
         return TDB_ERR_MEMORY;
     }
 
+    /* which families the key runs already produced a table for, so the interval-only pass below
+     * does not give one of them a second */
+    unsigned char *wrote = calloc((size_t)cap, 1);
+    if (!wrote)
+    {
+        free(outputs);
+        skip_list_cursor_free(cur);
+        return TDB_ERR_MEMORY;
+    }
+
     int n_out = 0;
     int rc = TDB_SUCCESS;
     if (skip_list_cursor_goto_first(cur) == 0)
@@ -647,10 +598,32 @@ int flush_build(const flush_ctx_t *fx, tidesdb_memtable_t *immutable, flush_job_
                 continue;
             }
             rc = flush_build_cf(fx, cf, cf_index, immutable, prealloc, cur, &outputs[n_out]);
-            if (rc == TDB_SUCCESS) n_out++;
+            if (rc == TDB_SUCCESS)
+            {
+                wrote[cf_index] = 1;
+                n_out++;
+            }
+        }
+    }
+
+    /* a family this memtable only deleted a range of has no run, so the loop above never reached it
+     * and its intervals would have nowhere to live. give it a table carrying nothing else */
+    if (rc == TDB_SUCCESS &&
+        atomic_load_explicit(&immutable->range_tombstone_frags, memory_order_acquire) != 0)
+    {
+        for (int i = 0; i < fx->n_cfs && rc == TDB_SUCCESS && n_out < cap; i++)
+        {
+            if (wrote[i] || !fx->cfs[i]) continue;
+            const int one = flush_build_cf_intervals_only(fx, fx->cfs[i], (uint32_t)i, immutable,
+                                                          &outputs[n_out]);
+            if (one == TDB_SUCCESS)
+                n_out++;
+            else if (one != TDB_ERR_NOT_FOUND)
+                rc = one; /* not-found only means this family had none, which is the common case */
         }
     }
     skip_list_cursor_free(cur);
+    free(wrote);
 
     if (rc != TDB_SUCCESS)
     {
@@ -679,7 +652,7 @@ int flush_install(const flush_ctx_t *fx, flush_job_t *job)
 {
     if (!fx || !job) return TDB_ERR_INVALID_ARGS;
 
-    const int rc = flush_commit_and_install(fx, job->outputs, job->n_out, job->immutable);
+    const int rc = flush_commit_and_install(fx, job->outputs, job->n_out);
     if (rc == TDB_SUCCESS)
     {
         tidesdb_memtable_mark_flushed(job->immutable);
@@ -705,8 +678,47 @@ int flush_install(const flush_ctx_t *fx, flush_job_t *job)
                                fx->wal_generation_pinned(fx->on_wal_retained_ctx, generation);
             if (!pinned)
                 (void)remove(wal_path);
-            else if (fx->on_wal_retained)
-                fx->on_wal_retained(fx->on_wal_retained_ctx, wal_path, generation);
+            else
+            {
+                /* the file stays for the prepare, but its data records are durable in L1 now. it is
+                 * renamed so a later recovery can tell it from a log a crash left behind, and
+                 * replay only the two-phase records in it. replaying the data ones would put
+                 * versions back above the sstables, and a compaction that has since retired one
+                 * would see it come back */
+                char kept_path[MAX_FILE_PATH_LENGTH];
+                const char *retained = wal_path;
+                const size_t path_len = strlen(wal_path);
+                const size_t plain_ext = strlen(TDB_WAL_EXT);
+                const size_t marked_ext = strlen(TDB_WAL_FLUSHED_EXT);
+
+                /* a generation can be retained more than once -- it is installed and flushed again
+                 * on each open while its prepare stays undecided -- and the file already carries
+                 * the flushed name by then. renaming it a second time would build a name off the
+                 * marked one and leave a log nothing can parse, taking the prepare with it */
+                const int already_marked =
+                    path_len > marked_ext &&
+                    strcmp(wal_path + path_len - marked_ext, TDB_WAL_FLUSHED_EXT) == 0;
+                if (already_marked)
+                    retained = wal_path;
+                else
+                {
+                    const int n =
+                        path_len > plain_ext
+                            ? snprintf(kept_path, sizeof(kept_path), "%.*s%s",
+                                       (int)(path_len - plain_ext), wal_path, TDB_WAL_FLUSHED_EXT)
+                            : -1;
+                    if (n > 0 && (size_t)n < sizeof(kept_path) &&
+                        atomic_rename_file(wal_path, kept_path) == 0)
+                        retained = kept_path;
+                    else
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "could not mark generation %llu as flushed, its log keeps "
+                                      "the plain name and its data replays again",
+                                      (unsigned long long)generation);
+                }
+                if (fx->on_wal_retained)
+                    fx->on_wal_retained(fx->on_wal_retained_ctx, retained, generation);
+            }
         }
         /* the L1 segment is installed and visible, so drop the immutable from the reader-visible
          * queue and reclaim it -- a no-op on the queue for a dequeued immutable, a real removal for

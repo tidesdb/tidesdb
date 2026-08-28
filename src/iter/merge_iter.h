@@ -40,6 +40,11 @@
  * ran out. a source that cannot read reports itself invalid, which is indistinguishable from
  * exhaustion, and the merge would drop the rest of its entries without it. NULL for a source that
  * reads from memory and cannot fail this way
+ * @param covers the newest interval tombstone this source holds that covers a key, at or below the
+ * snapshot. asked of every source rather than only the one the key came from, since an interval in
+ * one source deletes keys held by another -- and asked here, inside the merge, so the sources the
+ * walk reads and the intervals it honours are the same set. a source holding no intervals leaves
+ * this NULL
  * @param ctx the source's own context, passed to every call
  */
 typedef struct
@@ -55,6 +60,8 @@ typedef struct
                 const uint8_t **value, size_t *value_size, uint64_t *vlog_offset, int64_t *ttl,
                 uint8_t *deleted);
     int (*read_failed)(void *ctx);
+    int (*covers)(void *ctx, const uint8_t *key, size_t key_size, uint64_t snapshot,
+                  uint64_t *out_seq);
     void *ctx;
 } merge_source_t;
 

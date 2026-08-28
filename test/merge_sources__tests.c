@@ -117,7 +117,7 @@ void test_memtable_source_bounds_cf(void)
     skip_list_cursor_t *cursor = NULL;
     ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
     memtable_merge_source_t mts;
-    memtable_merge_source_init(&mts, cursor, 0, UINT64_MAX);
+    memtable_merge_source_init(&mts, cursor, NULL, NULL, 0, UINT64_MAX);
     merge_source_t src[1];
     memtable_merge_source(&mts, &src[0]);
 
@@ -156,7 +156,7 @@ void test_merge_memtable_and_sstable(void)
     skip_list_cursor_t *cursor = NULL;
     ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
     memtable_merge_source_t mts;
-    memtable_merge_source_init(&mts, cursor, 0, UINT64_MAX);
+    memtable_merge_source_init(&mts, cursor, NULL, NULL, 0, UINT64_MAX);
     merge_source_t src[2];
     memtable_merge_source(&mts, &src[0]);
     sstable_merge_source(ssit, &src[1]);
@@ -172,7 +172,7 @@ void test_merge_memtable_and_sstable(void)
     merge_iter_free(it);
 
     merge_iter_t *snap = NULL;
-    memtable_merge_source_init(&mts, cursor, 0, 7); /* snapshot 7 */
+    memtable_merge_source_init(&mts, cursor, NULL, NULL, 0, 7); /* snapshot 7 */
     memtable_merge_source(&mts, &src[0]);
     ASSERT_EQ(merge_iter_new(src, 2, 7, MERGE_ITER_RESOLVE, &snap), TDB_SUCCESS);
     collect(snap, 1, got, sizeof(got));

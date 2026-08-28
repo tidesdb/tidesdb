@@ -152,6 +152,10 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
  * @param nth the crash point within that phase, as a decimal string
  * @return 0 once the child has exited, or -1 if it could not be started
  */
+/* the status a child reports when the exec itself failed, chosen as the shell's convention for a
+ * command that could not be run so it cannot collide with a phase's own exit */
+#define TEST_SPAWN_EXEC_FAILED 127
+
 static UNUSED int test_spawn_self(const char *exe, const char *flag, const char *phase,
                                   const char *nth)
 {
@@ -165,10 +169,20 @@ static UNUSED int test_spawn_self(const char *exe, const char *flag, const char 
     {
         char *const args[] = {(char *)exe, (char *)flag, (char *)phase, (char *)nth, NULL};
         execv(exe, args);
-        _exit(127); /* only reached when the exec itself failed */
+        _exit(TEST_SPAWN_EXEC_FAILED); /* only reached when the exec itself failed */
     }
     int status = 0;
     (void)waitpid(pid, &status, 0);
+
+    /* the child is meant to die abnormally, so its status says almost nothing -- except in the one
+     * case where it never became the child at all. an exec that failed is reported rather than
+     * swallowed, because a caller that cannot tell it apart from a crash goes on to read a database
+     * nothing ever wrote and fails somewhere far away from the reason */
+    if (WIFEXITED(status) && WEXITSTATUS(status) == TEST_SPAWN_EXEC_FAILED)
+    {
+        fprintf(stderr, "could not exec the child %s -- the crash phase never ran\n", exe);
+        return -1;
+    }
     return 0;
 #endif
 }

@@ -747,6 +747,21 @@ int fuzz_model_get_committed(const fuzz_model_t *m, const char *cf, const uint8_
     return 1;
 }
 
+int fuzz_model_debug_entry(const fuzz_model_t *m, const char *cf, const uint8_t *key,
+                           const size_t klen, int *out_tombstone, uint64_t *out_seq)
+{
+    if (out_tombstone) *out_tombstone = 0;
+    if (out_seq) *out_seq = 0;
+    if (!m || !cf || !key) return 0;
+    const fm_cf_t *c = fm_cf_find(m, cf);
+    if (!c) return 0;
+    const long found = fm_cf_search(c, key, klen);
+    if (found < 0) return 0;
+    if (out_tombstone) *out_tombstone = c->entries[found].tombstone;
+    if (out_seq) *out_seq = c->entries[found].seq;
+    return 1;
+}
+
 int fuzz_model_cf_count(const fuzz_model_t *m)
 {
     return m ? (int)m->cf_count : 0;

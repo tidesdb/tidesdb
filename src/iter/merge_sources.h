@@ -10,6 +10,7 @@
 #define __TIDESDB_MERGE_SOURCES_H__
 
 #include "datastructures/skip_list/skip_list.h"
+#include "memtable/memtable.h" /* the memtable a view reads, for the intervals it holds */
 #include "merge_iter.h"
 #include "sstable/sstable.h"
 
@@ -49,9 +50,16 @@ void sstable_merge_source(sstable_iter_t *it, merge_source_t *out);
  * @param ttl the resolved version's expiry
  * @param deleted non-zero when the resolved version is a tombstone
  */
+/* stack room for the prefixed form of a key while a memtable view is asked about its intervals */
+#define MERGE_SOURCE_PREFIXED_KEY_STACK 128
+
 typedef struct
 {
     skip_list_cursor_t *cursor;
+    /* the memtable this view reads and the subsystem that owns it, so the view can be asked about
+     * the intervals the memtable holds as well as the keys */
+    tidesdb_l0_t *l0;
+    tidesdb_memtable_t *mt;
     uint32_t cf_index;
     uint64_t snapshot;
     int positioned;
@@ -74,7 +82,8 @@ typedef struct
  * @param snapshot the snapshot sequence to resolve at
  */
 void memtable_merge_source_init(memtable_merge_source_t *s, skip_list_cursor_t *cursor,
-                                uint32_t cf_index, uint64_t snapshot);
+                                tidesdb_l0_t *l0, tidesdb_memtable_t *mt, uint32_t cf_index,
+                                uint64_t snapshot);
 
 /**
  * memtable_merge_source

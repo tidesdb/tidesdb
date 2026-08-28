@@ -24,7 +24,9 @@ struct sstable_builder
     pr_filter_builder_t *bloom_builder; /* NULL when the bloom is disabled */
 
     size_t value_threshold;
-    uint64_t range_del_applied_seq;
+    /* this build's own copy, since the caller's set may be rebuilt before finish writes the block
+     */
+    range_tombstone_set_t *range_tombstones;
     int sync_mode;
     /* the family's pipeline resolved once, here, rather than per node or per value. the btree reads
      * these on every node it writes, so a registry walk on that path would be paid per node */
@@ -212,7 +214,9 @@ int sstable_builder_new(sstable_builder_t **out, block_manager_t *klog_bm, vlog_
     b->klog_bm = klog_bm;
     b->vlog = cf_vlog;
     b->value_threshold = config->value_threshold;
-    b->range_del_applied_seq = config->range_del_applied_seq;
+    /* cloned rather than borrowed, since the family's set may be rebuilt while this build runs */
+    b->range_tombstones =
+        config->range_tombstones ? range_tombstone_set_clone(config->range_tombstones) : NULL;
     b->sync_mode = config->sync_mode;
     b->node_cache = config->node_cache;
     b->arena_pool = config->arena_pool;
@@ -363,6 +367,36 @@ int sstable_builder_add_reference(sstable_builder_t *builder, const uint8_t *key
  * @param out_size receives the filter directory size, 0 when the build has no filter
  * @return TDB_SUCCESS, or TDB_ERR_IO when the filter could not be written
  */
+/* write this table's own range tombstone block, so the intervals it carries travel with it. a
+ * table holding none writes nothing and records a zero offset, which is what every table produced
+ * before a family ever took an interval delete looks like
+ * @param builder the build being sealed
+ * @param out_offset receives where the block landed, 0 when none was written
+ * @param out_size receives how large it is, 0 when none was written
+ * @return TDB_SUCCESS, TDB_ERR_IO, or TDB_ERR_MEMORY
+ */
+static int sstable_finish_range_dels(sstable_builder_t *builder, uint64_t *out_offset,
+                                     uint32_t *out_size)
+{
+    *out_offset = 0;
+    *out_size = 0;
+    if (!builder->range_tombstones || range_tombstone_set_count(builder->range_tombstones) == 0)
+        return TDB_SUCCESS;
+
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+    const int rc = range_tombstone_set_serialize(builder->range_tombstones, &blob, &blob_len);
+    if (rc != TDB_SUCCESS) return rc;
+
+    const int64_t off = block_manager_write_raw(builder->klog_bm, blob, (uint32_t)blob_len);
+    free(blob);
+    if (off < 0) return TDB_ERR_IO;
+
+    *out_offset = (uint64_t)off;
+    *out_size = (uint32_t)blob_len;
+    return TDB_SUCCESS;
+}
+
 static int sstable_finish_bloom(sstable_builder_t *builder, uint64_t *out_offset,
                                 uint32_t *out_size)
 {
@@ -390,7 +424,8 @@ static int sstable_finish_bloom(sstable_builder_t *builder, uint64_t *out_offset
  * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_IO on a serialize or write failure
  */
 static int sstable_write_footer(sstable_builder_t *builder, const btree_t *tree,
-                                uint64_t bloom_dir_offset, uint32_t bloom_dir_size)
+                                uint64_t bloom_dir_offset, uint32_t bloom_dir_size,
+                                uint64_t range_del_offset, uint32_t range_del_size)
 {
     sstable_footer_t footer = {0};
     footer.version = TDB_SSTABLE_FORMAT_VERSION;
@@ -399,10 +434,11 @@ static int sstable_write_footer(sstable_builder_t *builder, const btree_t *tree,
     footer.last_leaf_offset = tree->last_leaf_offset;
     footer.bloom_dir_offset = bloom_dir_offset;
     footer.bloom_dir_size = bloom_dir_size;
+    footer.range_del_offset = range_del_offset;
+    footer.range_del_size = range_del_size;
     footer.distinct_key_count = builder->distinct_key_count;
     footer.tombstone_count = builder->tombstone_count;
     footer.max_seq = tree->max_seq;
-    footer.range_del_applied_seq = builder->range_del_applied_seq;
     footer.total_key_bytes = builder->total_key_bytes;
     footer.total_value_bytes = builder->total_value_bytes;
     footer.klog_logical_bytes = builder->klog_bytes;
@@ -473,7 +509,8 @@ static int sstable_copy_key_bounds(sstable_t *sst, const btree_t *tree)
  * @return TDB_SUCCESS, or TDB_ERR_MEMORY
  */
 static int sstable_build_handle(sstable_builder_t *builder, const btree_t *tree,
-                                uint64_t bloom_dir_offset, uint32_t bloom_dir_size, sstable_t **out)
+                                uint64_t bloom_dir_offset, uint32_t bloom_dir_size,
+                                uint64_t range_del_offset, uint32_t range_del_size, sstable_t **out)
 {
     const size_t path_len = strlen(builder->klog_path) + 1;
     char *path_copy = malloc(path_len);
@@ -490,10 +527,15 @@ static int sstable_build_handle(sstable_builder_t *builder, const btree_t *tree,
     sst->last_leaf_offset = tree->last_leaf_offset;
     sst->bloom_dir_offset = bloom_dir_offset;
     sst->bloom_dir_size = bloom_dir_size;
+    sst->range_del_offset = range_del_offset;
+    sst->range_del_size = range_del_size;
+    /* the handle takes the build's own set rather than reading the block back, since it is already
+     * in memory and identical to what was just written */
+    sst->range_tombstones = builder->range_tombstones;
+    builder->range_tombstones = NULL;
     sst->distinct_key_count = builder->distinct_key_count;
     sst->tombstone_count = builder->tombstone_count;
     sst->max_seq = tree->max_seq;
-    sst->range_del_applied_seq = builder->range_del_applied_seq;
     sst->total_key_bytes = builder->total_key_bytes;
     sst->total_value_bytes = builder->total_value_bytes;
     sst->btree_node_count = tree->node_count;
@@ -563,9 +605,14 @@ int sstable_builder_finish(sstable_builder_t *builder, sstable_t **out, uint64_t
 
     uint64_t bloom_dir_offset = 0;
     uint32_t bloom_dir_size = 0;
+    uint64_t range_del_offset = 0;
+    uint32_t range_del_size = 0;
     int rc = sstable_finish_bloom(builder, &bloom_dir_offset, &bloom_dir_size);
     if (rc == TDB_SUCCESS)
-        rc = sstable_write_footer(builder, tree, bloom_dir_offset, bloom_dir_size);
+        rc = sstable_finish_range_dels(builder, &range_del_offset, &range_del_size);
+    if (rc == TDB_SUCCESS)
+        rc = sstable_write_footer(builder, tree, bloom_dir_offset, bloom_dir_size, range_del_offset,
+                                  range_del_size);
 
     /* the file stops growing here, so give back the preallocated tail. preallocation advances the
      * logical end of the file, not just its block reservation -- that is deliberate, since
@@ -593,7 +640,8 @@ int sstable_builder_finish(sstable_builder_t *builder, sstable_t **out, uint64_t
 
     sstable_t *sst = NULL;
     if (rc == TDB_SUCCESS)
-        rc = sstable_build_handle(builder, tree, bloom_dir_offset, bloom_dir_size, &sst);
+        rc = sstable_build_handle(builder, tree, bloom_dir_offset, bloom_dir_size, range_del_offset,
+                                  range_del_size, &sst);
 
     btree_free(tree);
     if (rc != TDB_SUCCESS) return rc;
@@ -611,6 +659,8 @@ void sstable_builder_free(sstable_builder_t *builder)
      * one */
     if (builder->btree_builder) btree_builder_free(builder->btree_builder);
     if (builder->bloom_builder) pr_filter_builder_free(builder->bloom_builder);
+    /* NULL once a finish moved it onto the produced sstable */
+    range_tombstone_set_free(builder->range_tombstones);
     free(builder->klog_path);
     free(builder->prev_key);
     free(builder->vlog_refs);

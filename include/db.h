@@ -983,13 +983,11 @@ int tidesdb_txn_contains(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const 
  * @param lo inclusive lower bound; must not be empty. keys are never empty, so a single zero byte
  * is a lower bound below every key there can be
  * @param lo_size size of lo in bytes, greater than zero and at most TDB_MAX_RANGE_BOUND_SIZE
- * @param hi exclusive upper bound, which must be above lo, or NULL with hi_size 0 to run to the end
- * of the family. an interval ending at or before it starts covers no key and is refused here rather
- * than at the commit, so the rest of the batch is not lost with it
+ * @param hi exclusive upper bound, or NULL with hi_size 0 to run to the end of the family
  * @param hi_size size of hi in bytes, at most TDB_MAX_RANGE_BOUND_SIZE, 0 for the end of the family
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL txn, cf or lo, an empty lower bound, an upper
- * bound at or below the lower one, or a bound past TDB_MAX_RANGE_BOUND_SIZE, TDB_ERR_TXN_EXPIRED
- * once a timeout has passed, or TDB_ERR_MEMORY
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL txn, cf or lo, an empty lower bound or a
+ * bound past TDB_MAX_RANGE_BOUND_SIZE, TDB_ERR_TXN_EXPIRED once a timeout has passed, or
+ * TDB_ERR_MEMORY
  */
 int tidesdb_txn_delete_range(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *lo,
                              size_t lo_size, const uint8_t *hi, size_t hi_size);

@@ -44,8 +44,6 @@
 #define MANIFEST_OP_CF_DROP 0x0A /* a column family leaves, and its sstables die with it */
 #define MANIFEST_OP_CF_SEQ \
     0x0B /* the db-global cf-id high-water, so a dropped family's id is never handed out again */
-#define MANIFEST_OP_RANGE_DEL \
-    0x0C /* a column family's whole range tombstone set, replacing whatever it held before */
 /* on-disk manifest version, written as the byte leading every batch block. v10 is a hard break with
  * no legacy reader, so a block whose leading version is not this fails replay and the manifest
  * self-heals from the on-disk sstables rather than misreading an older format */
@@ -67,11 +65,6 @@
 #define MANIFEST_REC_CF_SEQ_SIZE  9  /* u8 op + u64 next_cf_id (db-global, no cf) */
 #define MANIFEST_REC_CF_ADD_HDR_SIZE \
     13 /* u8 op + u64 cf + u16 name_len + u16 blob_len, then name bytes then blob bytes */
-#define MANIFEST_REC_RANGE_DEL_HDR_SIZE 13 /* u8 op + u64 cf + u32 blob_len, then blob bytes */
-/* the largest serialized range tombstone set a family may carry. a set that outgrows this is one
- * whose deletes have outrun the compaction that retires them, which is a condition to report rather
- * than a blob to go on growing */
-#define MANIFEST_RANGE_DEL_BLOB_MAX (1u << 20)
 /* roll the log over into a fresh single snapshot block when records since the last snapshot exceed
  * max(MIN_RECORDS, LIVE_MULTIPLE * live entries) -- bounds recovery replay to a small multiple of
  * the live set and amortizes the O(N) snapshot to O(1) per commit */
@@ -123,22 +116,6 @@ typedef struct
 } tidesdb_manifest_cf_t;
 
 /**
- * tidesdb_manifest_range_del_t
- * one column family's serialized range tombstone set, stored verbatim and never interpreted here.
- * a record replaces the family's whole set rather than adding to it, so the newest record a replay
- * meets is the set, and a rollover writes one record per family that has any
- * @cf_id the family the set belongs to
- * @blob the serialized set, owned by the manifest
- * @blob_len length of blob in bytes
- */
-typedef struct
-{
-    uint64_t cf_id;
-    uint8_t *blob;
-    uint32_t blob_len;
-} tidesdb_manifest_range_del_t;
-
-/**
  * tidesdb_manifest_t
  * in-memory representation of the db-level manifest
  * @cfs registry of column families known to the manifest
@@ -147,9 +124,6 @@ typedef struct
  * @entries array of sstable entries across all column families
  * @num_entries number of entries
  * @capacity capacity of entries array
- * @range_dels each family's serialized range tombstone set, at most one entry per family
- * @num_range_dels how many families carry one
- * @range_dels_capacity capacity of the range_dels array
  * @sequence current db-global sequence number
  * @next_cf_id the db-global cf-id high-water, one past the largest id ever assigned. it outlives
  * the families themselves so a dropped family's id is never reissued, which would otherwise let its
@@ -176,9 +150,6 @@ typedef struct
     tidesdb_manifest_entry_t *entries;
     int num_entries;
     int capacity;
-    tidesdb_manifest_range_del_t *range_dels;
-    int num_range_dels;
-    int range_dels_capacity;
     _Atomic(uint64_t) sequence;
     _Atomic(uint64_t) next_cf_id;
     char path[MANIFEST_PATH_LEN];
@@ -330,33 +301,6 @@ int tidesdb_manifest_move_sstable(tidesdb_manifest_t *manifest, uint64_t cf_id, 
  */
 int tidesdb_manifest_copy_entries(tidesdb_manifest_t *manifest, uint64_t cf_id,
                                   tidesdb_manifest_entry_t *out, int max);
-
-/**
- * tidesdb_manifest_set_range_dels
- * record a column family's whole range tombstone set, replacing whatever it held. the set is
- * buffered like any other record and lands with the batch it is committed in, so a flush installs
- * its outputs and the tombstones that came with them in the one atomic block
- * @param manifest the manifest
- * @param cf_id the family the set belongs to
- * @param blob the serialized set, or NULL with blob_len 0 to clear the family's set
- * @param blob_len length of blob, at most MANIFEST_RANGE_DEL_BLOB_MAX
- * @return 0 on success, -1 on a NULL manifest, an oversized blob, or an allocation failure
- */
-int tidesdb_manifest_set_range_dels(tidesdb_manifest_t *manifest, uint64_t cf_id,
-                                    const uint8_t *blob, uint32_t blob_len);
-
-/**
- * tidesdb_manifest_get_range_dels
- * take a copy of a column family's serialized range tombstone set, for the engine to rebuild its
- * in-memory set from on open
- * @param manifest the manifest
- * @param cf_id the family to read
- * @param out_blob receives the owned copy the caller frees, or NULL when the family carries no set
- * @param out_len receives the copy's length, 0 when the family carries no set
- * @return 0 whether or not the family carries a set, -1 on a bad argument or an allocation failure
- */
-int tidesdb_manifest_get_range_dels(tidesdb_manifest_t *manifest, uint64_t cf_id,
-                                    uint8_t **out_blob, uint32_t *out_len);
 
 /**
  * tidesdb_manifest_update_sequence

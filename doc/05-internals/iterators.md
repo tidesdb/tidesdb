@@ -59,10 +59,11 @@ Then the outcome depends on what that newest version is:
 - An **expired** entry is treated as absent.
 - A **tombstone** hides the key — *unless* the iterator was built to emit tombstones.
 - A **covering range delete** hides the key too, when it is newer than the version the merge
-  resolved. That decision cannot be made inside one source: an interval sitting in a memtable has to
-  hide a key that arrived from an sstable, so it is applied to the merged stream rather than to any
-  source feeding it. Every positioning call steps past what it covers, so a caller that only asks
-  whether the iterator is valid never sees a deleted key.
+  resolved. An interval sitting in one source has to hide a key that arrived from another, so every
+  source is asked, not only the one the key came from. It is asked *inside* the merge rather than
+  after it, which is what keeps the sources a scan reads and the intervals it honours the same set —
+  applying the check outside meant two views of the store that could disagree, and a key the scan
+  showed while a point read correctly hid it.
 
 All of that describes a **read** scan, which is what snapshot resolution is for. A compaction does
 not want any of it, and does not merely flip the tombstone switch — it asks for a **raw** merge

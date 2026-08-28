@@ -11,7 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "base/errors.h" /* TDB_SUCCESS and the TDB_ERR_* result codes */
+#include "base/errors.h"    /* TDB_SUCCESS and the TDB_ERR_* result codes */
+#include "internal/types.h" /* TDB_TTL_NONE, what a deleted version carries */
 
 /* the scan direction; a flip between the two re-seeks the sources around the current key */
 typedef enum
@@ -173,6 +174,26 @@ static int merge_resolve(merge_iter_t *it, merge_dir_t dir)
                 (void)s->prev(s->ctx);
         }
     }
+
+    /* an interval any source holds deletes this key when it is newer than the version that won.
+     * every source is asked, not only the ones the key was found in, since the interval that
+     * deletes a key need not live beside it -- and asking here rather than after the merge is what
+     * keeps the sources this walk reads and the intervals it honours the same set */
+    if (have)
+        for (int i = 0; i < it->n_sources; i++)
+        {
+            const merge_source_t *s = &it->sources[i];
+            uint64_t tomb = 0;
+            if (s->covers && s->covers(s->ctx, it->key, it->key_size, it->snapshot, &tomb) &&
+                tomb > it->seq)
+            {
+                it->seq = tomb;
+                it->deleted = 1;
+                it->value_size = 0;
+                it->vlog_offset = 0;
+                it->ttl = TDB_TTL_NONE;
+            }
+        }
     return have;
 }
 

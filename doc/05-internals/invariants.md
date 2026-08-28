@@ -34,7 +34,8 @@ if the rule were broken. The enforcement column distinguishes three cases:
 | Invariant | From | Enforcement |
 | --- | --- | --- |
 | The write-ahead log must contain no gaps — only the contiguous completed run is written | [Block manager](/internals/block-manager) | `fuzz_crash` (exact-prefix oracle); `block_manager` tests cover the ring, not the gap property directly |
-| A range tombstone is retired only once every table in the family records having applied it | [Compaction](/internals/compaction) | `test_engine_range_tombstone_retires_only_when_every_table_applied_it` |
+| A range tombstone lives exactly as long as a table carrying it, and is honoured by every read that reads that table | [Compaction](/internals/compaction) | `test_engine_range_tombstone_lives_as_long_as_a_table_carries_it`; `test_flush_output_carries_its_memtable_intervals`; `test_cf_source_compaction_carries_input_intervals` |
+| A merge leaves an interval behind only when it has finished its work -- largest level, sequence below the reclamation floor, and no sstable outside the merge reaching into its range | [Compaction](/internals/compaction) | `test_cf_source_compaction_drops_an_interval_it_has_finished` -- the bound on what a table accumulates. Every uncertainty in the check counts as reaching in, so it keeps intervals it could have dropped rather than dropping one it could not |
 | A read that misses reports absence only if the level shape stood still while it looked | [Life of a read](/internals/life-of-a-read) | `test_engine_read_survives_a_compaction_moving_levels` |
 | Data is durable before the manifest names it | [Manifest](/internals/manifest) | `fuzz_crash`; `test_crash_recovery_torn_flush`, and `test_crash_recovery_torn_wal_append` for the writes a commit itself issues |
 | A write-ahead log is unlinked only after its data reaches L1 | [Memtable and WAL](/internals/memtable-and-wal) | `test_engine_write_recovery`, `test_engine_prepared_survives_flush` |

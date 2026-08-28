@@ -248,25 +248,8 @@ static int engine_clone_copy_sstables(tidesdb_t *db, const cf_t *src, cf_t *dst)
     }
     free(entries);
 
-    /* the clone takes on the source's range tombstones as well as its files. the sstables just
-     * copied still hold every key those tombstones covered, so a clone without them would hand back
-     * data the source had deleted. it joins the same batch as the sstable records, so the copy is
-     * either wholly there or wholly not */
-    if (rc == TDB_SUCCESS)
-    {
-        uint8_t *blob = NULL;
-        size_t blob_len = 0;
-        rc = cf_range_tombstones_serialize(src, &blob, &blob_len);
-        if (rc == TDB_SUCCESS && blob && blob_len > 0)
-        {
-            rc = cf_range_tombstones_adopt(dst, blob, blob_len);
-            if (rc == TDB_SUCCESS && tidesdb_manifest_set_range_dels(db->manifest, dst->cf_id, blob,
-                                                                     (uint32_t)blob_len) != 0)
-                rc = TDB_ERR_IO;
-        }
-        free(blob);
-    }
-
+    /* the clone takes on the source's files, and a table carries the intervals it was built with,
+     * so the copied records bring the deletes with them and there is nothing else to hand over */
     if (rc == TDB_SUCCESS && tidesdb_manifest_commit(db->manifest, db->manifest->path,
                                                      engine_cf_manifest_durable(db)) != 0)
         rc = TDB_ERR_IO;

@@ -72,7 +72,7 @@ static int manifest_replay_locked(tidesdb_manifest_t *manifest)
 /**
  * manifest_snapshot_size
  * bytes a full snapshot batch occupies -- the version byte, one CF_ADD per registered cf (variable
- * for its name), one ADD_P per entry, one RANGE_DEL per family carrying a tombstone set, and the
+ * for its name), one ADD_P per entry, and the
  * two sequence records
  * @return the byte count
  */
@@ -85,8 +85,6 @@ static size_t manifest_snapshot_size(const tidesdb_manifest_t *manifest)
         need += MANIFEST_REC_CF_ADD_HDR_SIZE +
                 strnlen(manifest->cfs[i].name, MANIFEST_CF_NAME_MAX - 1) +
                 manifest->cfs[i].config_blob_len;
-    for (int i = 0; i < manifest->num_range_dels; i++)
-        need += MANIFEST_REC_RANGE_DEL_HDR_SIZE + manifest->range_dels[i].blob_len;
     return need;
 }
 
@@ -128,17 +126,6 @@ static size_t manifest_encode_snapshot(const tidesdb_manifest_t *manifest, uint8
         manifest_put_u32(buf + off + 37, (uint32_t)manifest->entries[i].partition);
         manifest_put_u32(buf + off + 41, (uint32_t)manifest->entries[i].birth_level);
         off += MANIFEST_REC_ADD_P_SIZE;
-    }
-    for (int i = 0; i < manifest->num_range_dels; i++)
-    {
-        const uint32_t blob_len = manifest->range_dels[i].blob_len;
-        buf[off] = MANIFEST_OP_RANGE_DEL;
-        manifest_put_u64(buf + off + 1, manifest->range_dels[i].cf_id);
-        manifest_put_u32(buf + off + 9, blob_len);
-        if (blob_len)
-            memcpy(buf + off + MANIFEST_REC_RANGE_DEL_HDR_SIZE, manifest->range_dels[i].blob,
-                   blob_len);
-        off += MANIFEST_REC_RANGE_DEL_HDR_SIZE + blob_len;
     }
 
     buf[off] = MANIFEST_OP_SEQ;
@@ -260,19 +247,29 @@ static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int dura
                                      durable_sync) != 0)
         return -1;
 
-    if (atomic_rename_file(temp_path, manifest->path) != 0)
-    {
-        remove(temp_path);
-        return -1;
-    }
-    if (durable_sync) manifest_sync_parent_dir(manifest->path);
-
-    /* reopen the log on the (possibly new) path so subsequent commits append to the snapshot */
+    /* the log handle goes before the rename rather than after it. the rename replaces the very file
+     * that handle holds open, and windows refuses to replace an open file, so an order that closed
+     * afterwards could only ever have worked on posix. the caller holds the write lock and a reader
+     * waits on the read lock, so nothing reads the manifest across the gap */
     if (manifest->bm)
     {
         (void)block_manager_close(manifest->bm);
         manifest->bm = NULL;
     }
+
+    if (atomic_rename_file(temp_path, manifest->path) != 0)
+    {
+        remove(temp_path);
+        /* the snapshot never landed, so the log still standing at the path is the live one. it is
+         * reopened here because the close above already happened, and a manifest left with no
+         * handle would fail every commit after this rather than just this one */
+        if (block_manager_open_pre(&manifest->bm, manifest->path, BLOCK_MANAGER_SYNC_NONE, 0) != 0)
+            manifest->bm = NULL;
+        return -1;
+    }
+    if (durable_sync) manifest_sync_parent_dir(manifest->path);
+
+    /* reopen the log on the (possibly new) path so subsequent commits append to the snapshot */
     if (block_manager_open_pre(&manifest->bm, manifest->path, BLOCK_MANAGER_SYNC_NONE,
                                0 /* preallocation disabled */) != 0)
     {
@@ -370,9 +367,6 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
     manifest->cfs = NULL;
     manifest->num_cfs = 0;
     manifest->cfs_capacity = 0;
-    manifest->range_dels = NULL;
-    manifest->num_range_dels = 0;
-    manifest->range_dels_capacity = 0;
     atomic_init(&manifest->sequence, 0);
     atomic_init(&manifest->next_cf_id, 0);
     manifest->bm = NULL;
@@ -602,7 +596,7 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
             manifest->path[0] ? manifest->path : "(unknown)", atomic_load(&manifest->active_ops));
     }
 
-    pthread_rwlock_wrlock(&manifest->lock);
+    if (manifest->pending_len > 0) pthread_rwlock_wrlock(&manifest->lock);
     if (manifest->bm)
     {
         (void)block_manager_close(manifest->bm);
@@ -613,7 +607,5 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
     free(manifest->pending);
     free(manifest->cfs);
     free(manifest->entries);
-    for (int i = 0; i < manifest->num_range_dels; i++) free(manifest->range_dels[i].blob);
-    free(manifest->range_dels);
     free(manifest);
 }

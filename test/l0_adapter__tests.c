@@ -374,7 +374,7 @@ void test_failed_apply_does_not_recover_from_the_wal(void)
 
     uint64_t replayed_max_seq = 0;
     ASSERT_EQ(tidesdb_l0_replay_wal(l0b, wal2, L0_ADAPTER_TEST_GENERATION, &aborted,
-                                    &replayed_max_seq, NULL, NULL),
+                                    &replayed_max_seq, NULL, NULL, 0),
               TDB_SUCCESS);
 
     tidesdb_l0_txn_ctx_t ctxb;
@@ -453,7 +453,7 @@ void test_wal_replay_restores_a_value_log_reference(void)
 
     uint64_t max_seq = 0;
     ASSERT_EQ(
-        tidesdb_l0_replay_wal(l0, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &max_seq, NULL, NULL),
+        tidesdb_l0_replay_wal(l0, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &max_seq, NULL, NULL, 0),
         TDB_SUCCESS);
     ASSERT_EQ((int)max_seq, 2);
 
@@ -547,7 +547,7 @@ void test_wal_replay_recovers_a_prefix_delete(void)
 
     uint64_t replayed_max_seq = 0;
     ASSERT_EQ(tidesdb_l0_replay_wal(l0b, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &replayed_max_seq,
-                                    NULL, NULL),
+                                    NULL, NULL, 0),
               TDB_SUCCESS);
 
     tidesdb_l0_txn_ctx_t ctxb;
@@ -641,6 +641,84 @@ void test_prefix_delete_against_a_write_in_the_same_batch(void)
 }
 
 /* commits durably written to a WAL are recovered into a fresh L0 by replaying the reopened file */
+/* a generation whose memtable already reached L1 keeps its log only for a prepare still in doubt,
+ * and replay is told so. its write batches are skipped for that reason, and a two-phase COMMIT
+ * decided while it was the active generation applied into that very memtable -- so its batch is
+ * durable in L1 with everything else and must be skipped on the same grounds.
+ *
+ * re-applying it is not merely redundant. the log outlives the flush for as long as the prepare
+ * stays undecided, so every reopen replays it again, and once a later delete has removed the key
+ * and a compaction has retired the tombstone, the sstables hold nothing to compare against -- the
+ * superseded probe answers not-found, reads that as live, and the key comes back for good.
+ *
+ * the record is still staged either way, since deciding the prepare is the whole reason the log was
+ * kept, and its sequences still advance the clock so nothing later reuses them */
+void test_wal_replay_skips_a_commit_batch_already_in_l1(void)
+{
+    const char *wal_path = "./l0_adapter_durable_commit.log";
+    (void)remove(wal_path);
+
+    block_manager_t *wal1 = NULL;
+    ASSERT_EQ(block_manager_open(&wal1, wal_path, BLOCK_MANAGER_SYNC_NONE), 0);
+    tidesdb_l0_t *l0a = tidesdb_l0_create(ADP_BUFFER_SIZE, ADP_QUEUE_SIZE, ADP_MAX_LEVEL,
+                                          ADP_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0a != NULL);
+    tidesdb_l0_set_active(
+        l0a, tidesdb_memtable_create(wal1, 0, 0, ADP_MAX_LEVEL, ADP_PROBABILITY, NULL, NULL));
+    tidesdb_l0_txn_ctx_t ctxa;
+    ASSERT_EQ(tidesdb_l0_adapter_init(&ctxa, l0a, NULL), 0);
+    tdb_txn_backend_t bea;
+    tidesdb_l0_backend(&ctxa, &bea);
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+
+    /* one two-phase transaction, carried all the way through phase two, so the log holds a PREPARE
+     * and the COMMIT that decided it */
+    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_put(t, 0, (const uint8_t *)"dk", 2, (const uint8_t *)"dv", 2, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_prepare(t, &bea, NULL, 0, (const uint8_t *)"xid-durable", 11), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit_prepared(t, &bea), TDB_SUCCESS);
+    tdb_txn_free(t);
+
+    tidesdb_l0_destroy(l0a);
+    block_manager_close(wal1);
+
+    block_manager_t *wal2 = NULL;
+    ASSERT_EQ(block_manager_open(&wal2, wal_path, BLOCK_MANAGER_SYNC_NONE), 0);
+    tidesdb_l0_t *l0b = tidesdb_l0_create(ADP_BUFFER_SIZE, ADP_QUEUE_SIZE, ADP_MAX_LEVEL,
+                                          ADP_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0b != NULL);
+    tidesdb_l0_set_active(
+        l0b, tidesdb_memtable_create(wal2, 0, 0, ADP_MAX_LEVEL, ADP_PROBABILITY, NULL, NULL));
+
+    tdb_prepare_stage_t *stage = tdb_prepare_stage_create();
+    ASSERT_TRUE(stage != NULL);
+    uint64_t replayed_max_seq = 0;
+    /* replayed as a generation whose data already reached L1 */
+    ASSERT_EQ(tidesdb_l0_replay_wal(l0b, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &replayed_max_seq,
+                                    stage, NULL, 1),
+              TDB_SUCCESS);
+
+    /* the batch stayed out of the memtable */
+    tidesdb_l0_txn_ctx_t ctxb;
+    ASSERT_EQ(tidesdb_l0_adapter_init(&ctxb, l0b, NULL), 0);
+    tidesdb_source_t src;
+    tidesdb_l0_source(&ctxb, &src);
+    tidesdb_source_version_t out;
+    memset(&out, 0, sizeof(out));
+    ASSERT_EQ(src.get(src.ctx, 0, (const uint8_t *)"dk", 2, UINT64_MAX, &out),
+              TDB_SOURCE_NOT_FOUND);
+
+    /* but its sequences still advanced the clock, so nothing later reuses them */
+    ASSERT_TRUE(replayed_max_seq > 0);
+
+    tdb_prepare_stage_free(stage);
+    tidesdb_l0_destroy(l0b);
+    block_manager_close(wal2);
+    tidesdb_mvcc_destroy(clock);
+    (void)remove(wal_path);
+}
+
 void test_wal_replay_recovers_commits(void)
 {
     const char *wal_path = "./l0_adapter_recover.log";
@@ -687,7 +765,7 @@ void test_wal_replay_recovers_commits(void)
     uint64_t replayed_max_seq = 0;
     /* NULL stage -- this replay carries only single-phase batches, so nothing needs staging */
     ASSERT_EQ(tidesdb_l0_replay_wal(l0b, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &replayed_max_seq,
-                                    NULL, NULL),
+                                    NULL, NULL, 0),
               TDB_SUCCESS);
     ASSERT_TRUE(replayed_max_seq > 0); /* the three committed writes carried real sequences */
 
@@ -723,6 +801,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_partial_apply_entries_are_hidden, tests_passed);
     RUN_TEST(test_concurrent_commits, tests_passed);
     RUN_TEST(test_wal_replay_restores_a_value_log_reference, tests_passed);
+    RUN_TEST(test_wal_replay_skips_a_commit_batch_already_in_l1, tests_passed);
     RUN_TEST(test_wal_replay_recovers_commits, tests_passed);
     RUN_TEST(test_wal_replay_recovers_a_prefix_delete, tests_passed);
     RUN_TEST(test_prefix_delete_against_a_write_in_the_same_batch, tests_passed);

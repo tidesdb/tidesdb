@@ -335,21 +335,6 @@ int range_tombstone_set_add(range_tombstone_set_t *set, const uint8_t *lo, const
     return TDB_SUCCESS;
 }
 
-int range_tombstone_set_add_prefix(range_tombstone_set_t *set, const uint8_t *prefix,
-                                   const size_t prefix_size, const uint64_t seq)
-{
-    if (!set) return TDB_ERR_INVALID_ARGS;
-
-    uint8_t *hi = NULL;
-    size_t hi_size = RT_UNBOUNDED_ABOVE;
-    const int rc = range_tombstone_prefix_successor(prefix, prefix_size, &hi, &hi_size);
-    if (rc != TDB_SUCCESS) return rc;
-
-    const int added = range_tombstone_set_add(set, prefix, prefix_size, hi, hi_size, seq);
-    free(hi);
-    return added;
-}
-
 int range_tombstone_covering_fragment(const range_tombstone_set_t *set, const uint8_t *key,
                                       const size_t key_size, const rt_fragment_t **out)
 {
@@ -401,54 +386,6 @@ int range_tombstone_max_covering(const range_tombstone_set_t *set, const uint8_t
 size_t range_tombstone_set_count(const range_tombstone_set_t *set)
 {
     return set ? set->count : 0;
-}
-
-uint64_t range_tombstone_set_max_seq_through(const range_tombstone_set_t *set,
-                                             const uint64_t ceiling)
-{
-    if (!set) return 0;
-
-    uint64_t best = 0;
-    for (size_t i = 0; i < set->count; i++)
-    {
-        const rt_fragment_t *frag = &set->frags[i];
-        /* descending, so the first one at or below the ceiling is this fragment's best */
-        for (size_t j = 0; j < frag->seq_count; j++)
-        {
-            if (frag->seqs[j] > ceiling) continue;
-            if (frag->seqs[j] > best) best = frag->seqs[j];
-            break;
-        }
-    }
-    return best;
-}
-
-size_t range_tombstone_set_forget_through(range_tombstone_set_t *set, const uint64_t seq)
-{
-    if (!set) return 0;
-
-    size_t dropped = 0;
-    size_t out = 0;
-    for (size_t i = 0; i < set->count; i++)
-    {
-        rt_fragment_t *frag = &set->frags[i];
-
-        /* the sequences are descending, so everything from the first one at or below seq on goes */
-        size_t keep = 0;
-        while (keep < frag->seq_count && frag->seqs[keep] > seq) keep++;
-        dropped += frag->seq_count - keep;
-        frag->seq_count = keep;
-
-        if (keep == 0)
-        {
-            rt_frag_free(frag);
-            continue;
-        }
-        if (out != i) set->frags[out] = *frag;
-        out++;
-    }
-    set->count = out;
-    return dropped;
 }
 
 size_t range_tombstone_set_bytes(const range_tombstone_set_t *set)

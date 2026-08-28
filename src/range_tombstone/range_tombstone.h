@@ -104,18 +104,6 @@ int range_tombstone_set_add(range_tombstone_set_t *set, const uint8_t *lo, size_
                             const uint8_t *hi, size_t hi_size, uint64_t seq);
 
 /**
- * range_tombstone_set_add_prefix
- * add the tombstone covering every key starting with prefix, as [prefix, successor(prefix))
- * @param set the set to add to
- * @param prefix the prefix to delete under, which may be of zero length to cover every key
- * @param prefix_size length of prefix in bytes
- * @param seq the sequence the tombstone was written at
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS when the set is NULL, or TDB_ERR_MEMORY
- */
-int range_tombstone_set_add_prefix(range_tombstone_set_t *set, const uint8_t *prefix,
-                                   size_t prefix_size, uint64_t seq);
-
-/**
  * range_tombstone_max_covering
  * the newest sequence at or below snapshot_seq whose tombstone covers key -- what a read compares
  * against the key's own newest visible version to decide whether the key is deleted
@@ -166,29 +154,6 @@ size_t range_tombstone_set_count(const range_tombstone_set_t *set);
  */
 int range_tombstone_set_fragment_at(const range_tombstone_set_t *set, size_t i,
                                     const rt_fragment_t **out);
-
-/**
- * range_tombstone_set_max_seq_through
- * the largest sequence in the set at or below a ceiling -- what a build records as the point it
- * applied tombstones through. it has to be a sequence the build actually saw, not the floor it ran
- * at: a floor of every sequence there could be would have a table claim it applied tombstones
- * written long after it was built
- * @param set the set to measure, or NULL
- * @param ceiling the highest sequence to consider, inclusive
- * @return the largest sequence at or below ceiling, or 0 when the set holds none
- */
-uint64_t range_tombstone_set_max_seq_through(const range_tombstone_set_t *set, uint64_t ceiling);
-
-/**
- * range_tombstone_set_forget_through
- * drop every sequence at or below seq, and any fragment left covered by nothing. what retires a
- * tombstone once every table in the family has had it applied -- there is no longer anything for it
- * to hide, and no reader that could be looking below it
- * @param set the set to prune
- * @param seq the highest sequence to forget, inclusive
- * @return the number of sequences dropped, or 0 when nothing was
- */
-size_t range_tombstone_set_forget_through(range_tombstone_set_t *set, uint64_t seq);
 
 /**
  * range_tombstone_set_bytes

@@ -328,7 +328,15 @@ struct sstable_iter
     /* the sstable's clock rather than the sstable, so the cursor holds no second handle on a
      * refcounted object it does not own */
     _Atomic(int64_t) *now;
+    /* and the intervals it carries, borrowed on the same terms -- the caller holds the table open
+     * for as long as this cursor lives, so the set outlives it */
+    const range_tombstone_set_t *intervals;
 };
+
+const range_tombstone_set_t *sstable_iter_intervals(const sstable_iter_t *it)
+{
+    return it ? it->intervals : NULL;
+}
 static int64_t sstable_iter_now(const sstable_iter_t *it)
 {
     return sstable_clock_read(it->now);
@@ -358,6 +366,7 @@ int sstable_iter_new(sstable_t *sst, const int use_cache, sstable_iter_t **out)
         return TDB_ERR_IO;
     }
     it->now = sst->now;
+    it->intervals = sst->range_tombstones;
     atomic_store_explicit(&sst->last_access_time, sstable_now(sst), memory_order_relaxed);
 
     *out = it;

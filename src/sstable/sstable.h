@@ -17,8 +17,9 @@
 #include "db.h"                     /* TDB_MAX_CF_NAME_LEN */
 #include "fdmanager/fdmanager.h"    /* the descriptor budget guarding klog reopens */
 #include "io/block_manager.h"
-#include "manifest/manifest.h"   /* tidesdb_manifest_entry_t names the file to open */
-#include "sstable/btree/btree.h" /* btree_t, btree_builder for the sstable klog */
+#include "manifest/manifest.h"               /* tidesdb_manifest_entry_t names the file to open */
+#include "range_tombstone/range_tombstone.h" /* the tombstone block a table carries */
+#include "sstable/btree/btree.h"             /* btree_t, btree_builder for the sstable klog */
 #include "sstable/pr_filter.h"
 #include "sstable/vlog.h" /* the shared db-global value log, borrowed by the builder */
 
@@ -79,10 +80,10 @@ typedef struct
  * what the pipeline in this footer achieved, on this table's data. it has to be recorded here
  * rather than derived, because total_value_bytes counts spilled values too and those bytes are in
  * the value log, not this file
- * @param range_del_applied_seq the reclamation floor this table was built at -- every range
- * tombstone at or below it had already been applied to these contents, so nothing here is covered
- * by one. the minimum across a family's tables is what says a tombstone has nothing left to hide
- * and can be retired
+ * @param range_del_offset where this table's own range tombstone block landed, 0 when it carries
+ * none. a tombstone is written into the table its memtable flushed to and travels down with that
+ * table, so its lifetime is the table's rather than a claim the family has to verify
+ * @param range_del_size how large that block is, 0 when the table carries none
  * @param btree_node_count the klog btree's node count, recorded at build time for structure stats
  * @param btree_height the klog btree's height, recorded at build time for structure stats
  * @param btree_node_size the node size the klog btree was built to, recorded so a later read can
@@ -110,7 +111,8 @@ typedef struct
     uint64_t distinct_key_count;
     uint64_t tombstone_count;
     uint64_t max_seq;
-    uint64_t range_del_applied_seq;
+    uint64_t range_del_offset;
+    uint32_t range_del_size;
     uint64_t total_key_bytes;
     uint64_t total_value_bytes;
     uint64_t klog_logical_bytes;
@@ -214,7 +216,10 @@ typedef struct
     uint64_t distinct_key_count;
     uint64_t tombstone_count;
     uint64_t max_seq;
-    uint64_t range_del_applied_seq;
+    uint64_t range_del_offset;
+    uint32_t range_del_size;
+    /* the tombstones this table carries, taken from the build or read back at open, owned here */
+    range_tombstone_set_t *range_tombstones;
     uint64_t total_key_bytes;
     uint64_t total_value_bytes;
     uint64_t klog_logical_bytes;
@@ -383,6 +388,14 @@ int sstable_sync_klog(sstable_t *sst);
 typedef struct sstable_iter sstable_iter_t;
 
 /**
+ * sstable_iter_intervals
+ * the interval tombstones the table this cursor reads carries, borrowed for the cursor's life
+ * @param it the cursor
+ * @return the set, or NULL when the table carries none
+ */
+const range_tombstone_set_t *sstable_iter_intervals(const sstable_iter_t *it);
+
+/**
  * sstable_iter_new
  * open a bidirectional cursor over the sstable. the caller must already hold a reference so the
  * reaper cannot evict the klog for the cursor's lifetime. use_cache reads node blocks through the
@@ -520,9 +533,9 @@ void sstable_close(sstable_t *sst);
  * the inputs that shape a build, snapshotted at sstable_builder_new
  * @param target_node_size btree node target size in bytes, 0 selects the btree default
  * @param value_threshold values at or above this size spill to the shared vlog
- * @param range_del_applied_seq the reclamation floor this build ran at -- the caller sets it only
- * when it actually applied every range tombstone at or below that floor to what it emitted, since
- * the family retires a tombstone once every table claims to have applied it
+ * @param range_tombstones the tombstones this table is to carry, borrowed and written into a block
+ * of its own, or NULL to carry none. a flush passes what its memtable held and a merge passes what
+ * its inputs carried, so an interval lives exactly as long as a table holding it
  * @param enable_bloom build a partition-range filter (pr_filter) for point-get pruning
  * @param bloom_fpr target bloom false-positive rate when enable_bloom is set
  * @param sync_mode block-manager sync mode, drives the durability barrier at finish
@@ -548,7 +561,7 @@ typedef struct
 {
     size_t target_node_size;
     size_t value_threshold;
-    uint64_t range_del_applied_seq;
+    const range_tombstone_set_t *range_tombstones;
     int enable_bloom;
     double bloom_fpr;
     int sync_mode;

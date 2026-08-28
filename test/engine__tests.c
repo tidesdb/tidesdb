@@ -34,6 +34,8 @@ static int tests_failed = 0;
 
 /* the transaction id an undecided prepare is left under, to pin the log generation holding it */
 #define ENGINE_TEST_PIN_XID "pin-the-generation"
+/* the transaction that prepares and then decides, so its batch is durable as a COMMIT record */
+#define ENGINE_TEST_DECIDED_XID "decided-in-two-phases"
 
 /* a value log entry planted straight into a memtable, standing in for a commit that separated its
  * value, since nothing on the commit path produces one yet */
@@ -3373,12 +3375,20 @@ void test_engine_compaction_drops_versions_a_range_tombstone_covers(void)
     const uint64_t before = engine_sstable_key_count(icf);
     ASSERT_TRUE(before >= (uint64_t)n);
 
-    /* every key written so far falls under this prefix, and the tombstone sits at or below the
-     * floor because no transaction is holding a snapshot open */
-    const uint64_t tomb_seq = tidesdb_mvcc_current_seq(db->clock);
+    /* every key written so far falls under this interval, and it sits at or below the reclamation
+     * floor because no transaction is holding a snapshot open.
+     *
+     * written through a transaction rather than pushed into the family's set directly. the set is
+     * the union of what the family's tables carry, republished whenever the layout changes, so an
+     * interval that reached no table would be dropped by the next rebuild -- which is the point of
+     * deriving it, and means a delete has to arrive the way the engine delivers one */
+    tidesdb_txn_t *deleter = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &deleter), TDB_SUCCESS);
     ASSERT_EQ(
-        cf_range_tombstone_add(icf, (const uint8_t *)"key", 3, (const uint8_t *)"kez", 3, tomb_seq),
+        tidesdb_txn_delete_range(deleter, cf, (const uint8_t *)"key", 3, (const uint8_t *)"kez", 3),
         TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(deleter), TDB_SUCCESS);
+    tidesdb_txn_free(deleter);
 
     /* hidden, but still on disk */
     engine_assert_committed(db, cf, "key00000", NULL);
@@ -3415,10 +3425,16 @@ void test_engine_compaction_drops_versions_a_range_tombstone_covers(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
-/* a range tombstone is retired only once every table in the family has had it applied. while any
- * table predates it, the tombstone is the only thing hiding that table's covered keys, and retiring
- * it would hand them back */
-void test_engine_range_tombstone_retires_only_when_every_table_applied_it(void)
+/* an interval outlives everything that still needs it, and that is now a property of where it is
+ * kept rather than of a sweep proving it spent. the family's set is the union of what its tables
+ * carry, republished whenever the layout changes, so an interval is present exactly while a table
+ * carries it and goes when the last one holding it is merged away.
+ *
+ * the assertion that matters is the one at the end -- once the interval is no longer published, the
+ * keys it covered have to stay gone, because a merge rewrote them rather than the interval hiding
+ * them. that is what fails if the union is ever republished without an interval something still
+ * needed */
+void test_engine_range_tombstone_lives_as_long_as_a_table_carries_it(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
     char db_path[] = ENGINE_TEST_DB_DIR;
@@ -3427,41 +3443,48 @@ void test_engine_range_tombstone_retires_only_when_every_table_applied_it(void)
     engine_open_with_cf(db_path, &db, &cf);
     cf_t *icf = (cf_t *)cf;
 
-    /* a table built before any tombstone existed, so its watermark is nothing */
+    /* a table built before any interval existed, carrying keys the interval will cover */
     const int n = 30;
     for (int i = 0; i < n; i++) engine_put(db, cf, i);
     ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
 
-    const uint64_t tomb_seq = tidesdb_mvcc_current_seq(db->clock);
+    /* the interval and a key that outlives it go in together, so the flush builds a table for the
+     * family and that table is what carries the interval */
+    tidesdb_txn_t *deleter = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &deleter), TDB_SUCCESS);
     ASSERT_EQ(
-        cf_range_tombstone_add(icf, (const uint8_t *)"key", 3, (const uint8_t *)"kez", 3, tomb_seq),
+        tidesdb_txn_delete_range(deleter, cf, (const uint8_t *)"key", 3, (const uint8_t *)"kez", 3),
         TDB_SUCCESS);
-    ASSERT_TRUE(atomic_load(&icf->range_tombstone_frags) > 0);
+    ASSERT_EQ(tidesdb_txn_put(deleter, cf, (const uint8_t *)"zz", 2, (const uint8_t *)"v", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(deleter), TDB_SUCCESS);
+    tidesdb_txn_free(deleter);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
 
-    /* a sweep now must retire nothing -- the first table still holds every key it covers */
-    size_t dropped = 0;
-    ASSERT_EQ(cf_range_tombstones_sweep(icf, &dropped), TDB_SUCCESS);
-    ASSERT_EQ(dropped, 0);
-    ASSERT_TRUE(atomic_load(&icf->range_tombstone_frags) > 0);
+    /* the flush put it in a table, and the covered keys read as gone through it */
     engine_assert_committed(db, cf, "key00000", NULL);
 
-    /* another flush, then compactions until every table has been rewritten with the tombstone in
-     * sight, which is what lifts the family's lowest watermark past it */
-    for (int i = n; i < n * 2; i++) engine_put(db, cf, i);
-    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    /* and it is a table that carries it, since there is nowhere else for it to be */
+    sstable_t *tabs[64];
+    const int nt = level_set_collect_all(icf->levels, tabs, 64);
+    int carried_by_a_table = 0;
+    for (int i = 0; i < nt; i++)
+    {
+        if (tabs[i]->range_tombstones && range_tombstone_set_count(tabs[i]->range_tombstones) > 0)
+            carried_by_a_table = 1;
+        if (sstable_unref(tabs[i])) sstable_close(tabs[i]);
+    }
+    ASSERT_TRUE(carried_by_a_table);
+
+    /* merge until the covered run has been rewritten out of every table */
     for (int pass = 0; pass < 6; pass++)
     {
         const int rc = engine_test_compact(db, cf);
         ASSERT_TRUE(rc == TDB_SUCCESS || rc == TDB_ERR_LOCKED);
     }
 
-    ASSERT_EQ(cf_range_tombstones_sweep(icf, &dropped), TDB_SUCCESS);
-    ASSERT_EQ(dropped, 1);
-    ASSERT_EQ(atomic_load(&icf->range_tombstone_frags), 0);
-
-    /* and with the tombstone gone the covered keys stay gone, because compaction removed them
-     * rather than the tombstone hiding them. this is the assertion that fails if a sweep ever
-     * retires one early */
+    /* whether the interval is still published or not, the keys it covered stay gone -- a merge
+     * removed them rather than the interval hiding them */
     for (int i = 0; i < n; i++)
     {
         char key[16];
@@ -3469,12 +3492,19 @@ void test_engine_range_tombstone_retires_only_when_every_table_applied_it(void)
         engine_assert_committed(db, cf, key, NULL);
     }
 
-    /* the keys written above the tombstone were never its business */
-    char late[16], late_val[16];
-    snprintf(late, sizeof(late), "key%05d", n);
-    snprintf(late_val, sizeof(late_val), "val%05d", n);
-    engine_assert_committed(db, cf, late, late_val);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
+    /* and across a reopen, where the set is derived from the tables that came back */
+    tidesdb_config_t reopen = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&reopen, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    for (int i = 0; i < n; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "key%05d", i);
+        engine_assert_committed(db, cf, key, NULL);
+    }
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
@@ -4006,14 +4036,23 @@ void test_engine_clone_carries_range_tombstones(void)
     /* into sstables, so the clone's copy of them is what a read of it resolves against */
     ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
 
-    /* the next sequence the clock would hand out: above every key committed so far, and still at or
-     * below the snapshot a read draws, so the tombstone is both newer than the data and visible */
-    cf_t *src = (cf_t *)cf;
-    const uint64_t tomb_seq = tidesdb_mvcc_current_seq(db->clock);
-    ASSERT_TRUE(tomb_seq > 0);
+    /* delivered through a transaction and flushed into a table of its own, since the family's set
+     * is the union of what its tables carry -- an interval that reached no table is not the
+     * family's to hand to a clone */
+    tidesdb_txn_t *deleter = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &deleter), TDB_SUCCESS);
     ASSERT_EQ(
-        cf_range_tombstone_add(src, (const uint8_t *)"key", 3, (const uint8_t *)"kez", 3, tomb_seq),
+        tidesdb_txn_delete_range(deleter, cf, (const uint8_t *)"key", 3, (const uint8_t *)"kez", 3),
         TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(deleter), TDB_SUCCESS);
+    tidesdb_txn_free(deleter);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+    cf_t *src = (cf_t *)cf;
+    uint64_t tomb_seq = 0;
+    ASSERT_EQ(
+        cf_range_tombstone_covering(src, (const uint8_t *)"key00000", 8, UINT64_MAX, &tomb_seq), 1);
+    ASSERT_TRUE(tomb_seq > 0);
     engine_assert_committed(db, cf, "key00000", NULL); /* the source reads them deleted */
 
     ASSERT_EQ(tidesdb_clone_column_family(db, "kv", "copy"), TDB_SUCCESS);
@@ -4439,6 +4478,169 @@ void test_engine_replay_does_not_resurrect_over_its_sstables(void)
     ASSERT_TRUE(!engine_test_key_present(db, cf, "doomed"));
 
     /* the prepare the log was kept for is still in doubt, so the filter did not cost it */
+    int in_doubt = -1;
+    ASSERT_EQ(tidesdb_recover_prepared(db, NULL, 0, &in_doubt), TDB_SUCCESS);
+    ASSERT_EQ(in_doubt, 1);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* read a key back and compare it, so an overwrite that came undone shows up as the older value
+ * rather than as a mere presence */
+static int engine_test_value_is(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key,
+                                const char *expect)
+{
+    tidesdb_txn_t *rt = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &rt), TDB_SUCCESS);
+    uint8_t *got = NULL;
+    size_t got_size = 0;
+    const int rc = tidesdb_txn_get(rt, cf, (const uint8_t *)key, strlen(key), &got, &got_size);
+    const int match =
+        rc == TDB_SUCCESS && got_size == strlen(expect) && memcmp(got, expect, got_size) == 0;
+    free(got);
+    (void)tidesdb_txn_rollback(rt);
+    tidesdb_txn_free(rt);
+    return match;
+}
+
+/* the sibling of the test above, on the two axes it does not cover -- an overwrite rather than a
+ * delete, and more than one column family.
+ *
+ * one memtable serves every family, so one generation's log carries records for all of them and a
+ * flush of it installs an sstable into each. when that log is kept for an undecided prepare, every
+ * family's records in it are replayed together, and the filter has to answer per family: it
+ * resolves the record's own cf index and asks that family's sstables. a filter that answered from
+ * the wrong family, or from a db-wide view, would put one family's superseded writes back above its
+ * sstables while looking correct for the other */
+void test_engine_replay_does_not_undo_an_overwrite_in_any_family(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv2", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    tidesdb_column_family_t *cf2 = tidesdb_get_column_family(db, "kv2");
+    ASSERT_TRUE(cf != NULL && cf2 != NULL);
+
+    /* the older version, in both families, in the generation the prepare will pin */
+    engine_test_commit_one(db, cf, "b", "v1");
+    engine_test_commit_one(db, cf2, "b", "v1");
+
+    tidesdb_txn_t *pinned = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &pinned), TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_txn_put(pinned, cf, (const uint8_t *)"pinned", 6, (const uint8_t *)"v", 1, -1),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(pinned, (const uint8_t *)ENGINE_TEST_PIN_XID,
+                                  strlen(ENGINE_TEST_PIN_XID)),
+              TDB_SUCCESS);
+    tidesdb_txn_free(pinned); /* dropped undecided, so its generation's log is kept */
+
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+    /* the newer version, in a generation of its own whose log is unlinked once it flushes */
+    engine_test_commit_one(db, cf, "b", "v2");
+    engine_test_commit_one(db, cf2, "b", "v2");
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    ASSERT_TRUE(engine_test_value_is(db, cf, "b", "v2"));
+    ASSERT_TRUE(engine_test_value_is(db, cf2, "b", "v2"));
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    tidesdb_config_t reopen = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&reopen, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    cf2 = tidesdb_get_column_family(db, "kv2");
+    ASSERT_TRUE(cf != NULL && cf2 != NULL);
+
+    /* the retained log still holds v1 for both families; replaying it must not put either back */
+    ASSERT_TRUE(engine_test_value_is(db, cf, "b", "v2"));
+    ASSERT_TRUE(engine_test_value_is(db, cf2, "b", "v2"));
+
+    int in_doubt = -1;
+    ASSERT_EQ(tidesdb_recover_prepared(db, NULL, 0, &in_doubt), TDB_SUCCESS);
+    ASSERT_EQ(in_doubt, 1);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a two-phase batch replays from the COMMIT record that decided it, not from a write batch, and
+ * that record is filtered by nothing unless the replay applies the same superseded check the write
+ * batch path applies.
+ *
+ * the log holding a COMMIT is kept for as long as any prepare in its generation is undecided, which
+ * is unbounded, so every reopen replays that COMMIT again. once a later write has superseded one of
+ * its keys and been flushed, re-applying it puts the older version in a memtable above the sstable
+ * holding the newer one -- and a point get takes the first source holding the key, so it hands back
+ * the superseded value. a scan resolves by sequence and would still be right, which is why this
+ * reads the key rather than scanning for it */
+void test_engine_two_phase_replay_does_not_resurrect_a_superseded_key(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    /* the older version arrives through two-phase commit, so it is durable as a COMMIT record */
+    tidesdb_txn_t *decided = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &decided), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(decided, cf, (const uint8_t *)"k", 1, (const uint8_t *)"old", 3, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(decided, (const uint8_t *)ENGINE_TEST_DECIDED_XID,
+                                  strlen(ENGINE_TEST_DECIDED_XID)),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit_prepared(decided), TDB_SUCCESS);
+    tidesdb_txn_free(decided);
+    ASSERT_TRUE(engine_test_value_is(db, cf, "k", "old"));
+
+    /* and a second prepare left undecided in the same generation, which is what keeps that log --
+     * and the COMMIT record in it -- alive across every reopen below */
+    tidesdb_txn_t *pinned = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &pinned), TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_txn_put(pinned, cf, (const uint8_t *)"pinned", 6, (const uint8_t *)"v", 1, -1),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(pinned, (const uint8_t *)ENGINE_TEST_PIN_XID,
+                                  strlen(ENGINE_TEST_PIN_XID)),
+              TDB_SUCCESS);
+    tidesdb_txn_free(pinned); /* dropped undecided, on purpose */
+
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+    /* the newer version supersedes it and reaches an sstable of its own */
+    engine_test_commit_one(db, cf, "k", "new");
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    ASSERT_TRUE(engine_test_value_is(db, cf, "k", "new"));
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    tidesdb_config_t reopen = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&reopen, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    ASSERT_TRUE(engine_test_value_is(db, cf, "k", "new"));
+
+    /* and again, since the generation is kept for as long as the prepare stays in doubt and each
+     * reopen replays that COMMIT record afresh */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    tidesdb_config_t again = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&again, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_TRUE(engine_test_value_is(db, cf, "k", "new"));
+
     int in_doubt = -1;
     ASSERT_EQ(tidesdb_recover_prepared(db, NULL, 0, &in_doubt), TDB_SUCCESS);
     ASSERT_EQ(in_doubt, 1);
@@ -6284,7 +6486,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_open_keeps_sstables_when_manifest_self_healed, tests_passed);
     RUN_TEST(test_engine_runtime_config_rejects_an_unbacked_encoding, tests_passed);
     RUN_TEST(test_engine_compaction_drops_versions_a_range_tombstone_covers, tests_passed);
-    RUN_TEST(test_engine_range_tombstone_retires_only_when_every_table_applied_it, tests_passed);
+    RUN_TEST(test_engine_range_tombstone_lives_as_long_as_a_table_carries_it, tests_passed);
     RUN_TEST(test_engine_read_survives_a_compaction_moving_levels, tests_passed);
     RUN_TEST(test_engine_prepared_prefix_delete_blocks_a_write_under_it, tests_passed);
     RUN_TEST(test_engine_delete_range_covers_bounds_no_prefix_could, tests_passed);
@@ -6301,6 +6503,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_separated_value_survives_reopen_and_reclaim, tests_passed);
     RUN_TEST(test_engine_prepared_batch_keeps_its_separated_values, tests_passed);
     RUN_TEST(test_engine_replay_does_not_resurrect_over_its_sstables, tests_passed);
+    RUN_TEST(test_engine_replay_does_not_undo_an_overwrite_in_any_family, tests_passed);
+    RUN_TEST(test_engine_two_phase_replay_does_not_resurrect_a_superseded_key, tests_passed);
     RUN_TEST(test_engine_replay_probe_says_yes_only_to_a_newer_durable_version, tests_passed);
     RUN_TEST(test_engine_replay_keeps_entries_disk_never_superseded, tests_passed);
     RUN_TEST(test_engine_compression_reaches_separated_values, tests_passed);

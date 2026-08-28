@@ -115,9 +115,6 @@ typedef struct cf
     _Atomic(tidesdb_commit_hook_fn) commit_hook_fn;
     _Atomic(void *) commit_hook_ctx;
     _Atomic(int64_t) unflushed_key_count;
-    range_tombstone_set_t *range_tombstones;
-    _Atomic(size_t) range_tombstone_frags;
-    pthread_rwlock_t range_tombstone_lock;
 } cf_t;
 
 /**
@@ -186,22 +183,6 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, uint64_t cf_id, co
 int cf_reload_levels(cf_t *cf, tidesdb_manifest_t *manifest, int sync_mode);
 
 /**
- * cf_range_tombstone_add
- * lay one range tombstone over the family's set, covering every key in [lo, hi) from seq on. the
- * bounds are the family's own keys, unprefixed, since that is the keyspace its sstables are written
- * in
- * @param cf the column family
- * @param lo inclusive lower bound
- * @param lo_size length of lo in bytes
- * @param hi exclusive upper bound, or NULL with hi_size RT_UNBOUNDED_ABOVE for unbounded above
- * @param hi_size length of hi in bytes, or RT_UNBOUNDED_ABOVE for unbounded above
- * @param seq the sequence the tombstone was committed at
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_MEMORY
- */
-int cf_range_tombstone_add(cf_t *cf, const uint8_t *lo, size_t lo_size, const uint8_t *hi,
-                           size_t hi_size, uint64_t seq);
-
-/**
  * cf_range_tombstone_covering
  * the newest sequence at or below the snapshot whose tombstone covers the key -- what a read of the
  * family's sstables compares against the newest version it found there. a family that has never
@@ -215,52 +196,6 @@ int cf_range_tombstone_add(cf_t *cf, const uint8_t *lo, size_t lo_size, const ui
  */
 int cf_range_tombstone_covering(cf_t *cf, const uint8_t *key, size_t key_size, uint64_t snapshot,
                                 uint64_t *out_seq);
-
-/**
- * cf_range_tombstones_serialize
- * take the family's set as a block, for the manifest to record it
- * @param cf the column family
- * @param out receives the owned buffer the caller frees, NULL when the family holds no tombstones
- * @param out_size receives the buffer length, 0 when the family holds none
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_MEMORY
- */
-int cf_range_tombstones_serialize(const cf_t *cf, uint8_t **out, size_t *out_size);
-
-/**
- * cf_range_tombstones_adopt
- * install a serialized set as the family's own, replacing whatever it held. what a clone uses to
- * take on the tombstones of the family it was copied from -- without them the copied sstables would
- * hand back every key those tombstones had covered
- * @param cf the column family
- * @param blob the serialized set
- * @param blob_len length of blob
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_MEMORY, or TDB_ERR_CORRUPTION on a bad block
- */
-int cf_range_tombstones_adopt(cf_t *cf, const uint8_t *blob, size_t blob_len);
-
-/**
- * cf_range_tombstones_applied_through
- * the largest range tombstone sequence at or below a ceiling the family currently holds -- what a
- * build that applied them all records as its watermark
- * @param cf the column family
- * @param ceiling the highest sequence the build was willing to apply, inclusive
- * @return the sequence, or 0 when the family holds no tombstone at or below the ceiling
- */
-uint64_t cf_range_tombstones_applied_through(const cf_t *cf, uint64_t ceiling);
-
-/**
- * cf_range_tombstones_sweep
- * retire every range tombstone the family's tables have all had applied to them. the lowest floor
- * any table was built at is the point below which nothing covered can still be on disk, so a
- * tombstone at or below it has nothing left to hide. a family holding no tables at all has nothing
- * to hide anywhere, which is why that case retires all of them
- * @param cf the column family
- * @param out_dropped receives how many sequences were retired, 0 when none were
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_MEMORY. a sweep that cannot see every table
- *         retires nothing and still reports success, since keeping a spent tombstone costs space
- *         and dropping a live one costs data
- */
-int cf_range_tombstones_sweep(cf_t *cf, size_t *out_dropped);
 
 /**
  * cf_free

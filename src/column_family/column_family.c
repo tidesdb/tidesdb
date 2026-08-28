@@ -84,25 +84,6 @@ static int cf_load_entries(cf_t *cf, tidesdb_manifest_t *manifest, const int syn
     return result;
 }
 
-/* rebuild the family's range tombstone set from the block the manifest holds for it. a family that
- * never had one loads nothing and keeps the empty set every read short-circuits on
- * @param cf the column family
- * @param manifest the db-level manifest to read the block from
- * @return 0 on success or when the family carries no block, -1 on a corrupt block or an allocation
- *         failure
- */
-static int cf_load_range_tombstones(cf_t *cf, tidesdb_manifest_t *manifest)
-{
-    uint8_t *blob = NULL;
-    uint32_t len = 0;
-    if (tidesdb_manifest_get_range_dels(manifest, cf->cf_id, &blob, &len) != 0) return -1;
-    if (!blob || len == 0) return 0;
-
-    const int rc = cf_range_tombstones_adopt(cf, blob, len);
-    free(blob);
-    return rc == TDB_SUCCESS ? 0 : -1;
-}
-
 /* zero-initialize the cf's atomic stat counters and the compacting flag */
 static void cf_init_counters(cf_t *cf)
 {
@@ -142,11 +123,6 @@ int cf_create(const char *db_dir, const uint64_t cf_id,
     cf->fdm = fdm;
     cf->encodings = reg;
     cf_init_counters(cf);
-    if (pthread_rwlock_init(&cf->range_tombstone_lock, NULL) != 0)
-    {
-        free(cf);
-        return -1;
-    }
     snprintf(cf->name, sizeof(cf->name), "%s", config->name);
     if (cf_dir_path(cf->dir, sizeof(cf->dir), db_dir) != 0)
     {
@@ -182,11 +158,6 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
     cf->fdm = fdm;
     cf->encodings = reg;
     cf_init_counters(cf);
-    if (pthread_rwlock_init(&cf->range_tombstone_lock, NULL) != 0)
-    {
-        free(cf);
-        return -1;
-    }
     snprintf(cf->name, sizeof(cf->name), "%s", name);
     /* zeroed first because the decoder leaves any field the blob does not carry untouched, and this
      * is the copy that becomes the family's configuration */
@@ -210,9 +181,10 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
         return -1;
     }
 
+    /* the tables bring their own intervals with them, so opening them is the whole of restoring
+     * this family's deletes */
     if (level_set_create(&cf->levels) != 0 ||
-        cf_load_entries(cf, manifest, sync_mode, CF_LOAD_SELF_HEAL) != 0 ||
-        cf_load_range_tombstones(cf, manifest) != 0)
+        cf_load_entries(cf, manifest, sync_mode, CF_LOAD_SELF_HEAL) != 0)
     {
         cf_free(cf);
         return -1;
@@ -246,135 +218,55 @@ void cf_free(cf_t *cf)
      * ones drain unconditionally and the live one is freed outright */
     tdb_retire_drain(&cf->config_retire, NULL, NULL);
     free(atomic_load_explicit(&cf->config, memory_order_acquire));
-    range_tombstone_set_free(cf->range_tombstones);
-    (void)pthread_rwlock_destroy(&cf->range_tombstone_lock);
     free(cf);
 }
 
-int cf_range_tombstones_adopt(cf_t *cf, const uint8_t *blob, const size_t blob_len)
-{
-    if (!cf || !blob || blob_len == 0) return TDB_ERR_INVALID_ARGS;
-
-    range_tombstone_set_t *set = NULL;
-    const int rc = range_tombstone_set_deserialize(blob, blob_len, &set);
-    if (rc != TDB_SUCCESS) return rc;
-
-    pthread_rwlock_wrlock(&cf->range_tombstone_lock);
-    range_tombstone_set_free(cf->range_tombstones);
-    cf->range_tombstones = set;
-    atomic_store_explicit(&cf->range_tombstone_frags, range_tombstone_set_count(set),
-                          memory_order_release);
-    pthread_rwlock_unlock(&cf->range_tombstone_lock);
-    return TDB_SUCCESS;
-}
-
-int cf_range_tombstone_add(cf_t *cf, const uint8_t *lo, const size_t lo_size, const uint8_t *hi,
-                           const size_t hi_size, const uint64_t seq)
-{
-    if (!cf) return TDB_ERR_INVALID_ARGS;
-
-    pthread_rwlock_wrlock(&cf->range_tombstone_lock);
-    int rc = TDB_SUCCESS;
-    if (!cf->range_tombstones)
-    {
-        cf->range_tombstones = range_tombstone_set_new();
-        if (!cf->range_tombstones) rc = TDB_ERR_MEMORY;
-    }
-    if (rc == TDB_SUCCESS)
-        rc = range_tombstone_set_add(cf->range_tombstones, lo, lo_size, hi, hi_size, seq);
-    if (rc == TDB_SUCCESS)
-        atomic_store_explicit(&cf->range_tombstone_frags,
-                              range_tombstone_set_count(cf->range_tombstones),
-                              memory_order_release);
-    pthread_rwlock_unlock(&cf->range_tombstone_lock);
-    return rc;
-}
+/* tables one interval lookup reads before it gives up rather than answer from a partial view */
+#define CF_INTERVAL_SCAN_MAX 512
 
 int cf_range_tombstone_covering(cf_t *cf, const uint8_t *key, const size_t key_size,
                                 const uint64_t snapshot, uint64_t *out_seq)
 {
     if (!cf || !key || !out_seq) return 0;
-    if (atomic_load_explicit(&cf->range_tombstone_frags, memory_order_acquire) == 0) return 0;
 
-    pthread_rwlock_rdlock(&cf->range_tombstone_lock);
-    const int covered =
-        range_tombstone_max_covering(cf->range_tombstones, key, key_size, snapshot, out_seq) == 1;
-    pthread_rwlock_unlock(&cf->range_tombstone_lock);
-    return covered;
-}
+    /* every point read and every conflict probe comes through here, so a family that has never
+     * deleted a range must not pay for the walk below. the set republishes the count with each
+     * layout, which makes that one load */
+    if (level_set_interval_tables(cf->levels) == 0) return 0;
 
-/* tables one sweep reads before it gives up rather than risk a partial view; a family with more
- * than this simply keeps its tombstones until a later sweep finds it smaller */
-#define CF_SWEEP_MAX_TABLES 512
-
-uint64_t cf_range_tombstones_applied_through(const cf_t *cf, const uint64_t ceiling)
-{
-    if (!cf) return 0;
-    if (atomic_load_explicit(&cf->range_tombstone_frags, memory_order_acquire) == 0) return 0;
-
-    pthread_rwlock_t *lock = (pthread_rwlock_t *)&cf->range_tombstone_lock;
-    pthread_rwlock_rdlock(lock);
-    const uint64_t seq = range_tombstone_set_max_seq_through(cf->range_tombstones, ceiling);
-    pthread_rwlock_unlock(lock);
-    return seq;
-}
-
-int cf_range_tombstones_sweep(cf_t *cf, size_t *out_dropped)
-{
-    if (!cf || !out_dropped) return TDB_ERR_INVALID_ARGS;
-    *out_dropped = 0;
-    if (atomic_load_explicit(&cf->range_tombstone_frags, memory_order_acquire) == 0)
-        return TDB_SUCCESS;
-
-    sstable_t **tables = malloc(CF_SWEEP_MAX_TABLES * sizeof(*tables));
-    if (!tables) return TDB_ERR_MEMORY;
-
-    const int n = level_set_collect_all(cf->levels, tables, CF_SWEEP_MAX_TABLES);
-    if (n > CF_SWEEP_MAX_TABLES)
+    /* asked of the tables, since a table carries the intervals it was built with and there is no
+     * store of the family's own to ask instead. every table is consulted rather than only those
+     * whose key range holds the key, because an interval covers a range the table it rode in on
+     * need not have a single key of */
+    sstable_t *tables[CF_INTERVAL_SCAN_MAX];
+    const int n = level_set_collect_all(cf->levels, tables, CF_INTERVAL_SCAN_MAX);
+    if (n <= 0) return 0;
+    if (n > CF_INTERVAL_SCAN_MAX)
     {
-        /* a partial view would take the minimum over a subset, which reads higher than the true one
-         * and would retire a tombstone some unseen table still needs. the references the collect
-         * did take are still this call's to drop */
-        for (int i = 0; i < CF_SWEEP_MAX_TABLES; i++)
+        /* a partial view could miss the interval that covers this key and report it live, so the
+         * read is answered as covered by nothing only when the whole family was seen */
+        for (int i = 0; i < CF_INTERVAL_SCAN_MAX; i++)
             if (sstable_unref(tables[i])) sstable_close(tables[i]);
-        free(tables);
-        return TDB_SUCCESS;
+        return 0;
     }
 
-    uint64_t applied = UINT64_MAX;
+    int covered = 0;
+    uint64_t newest = 0;
     for (int i = 0; i < n; i++)
     {
-        if (tables[i]->range_del_applied_seq < applied) applied = tables[i]->range_del_applied_seq;
+        uint64_t seq = 0;
+        if (tables[i]->range_tombstones &&
+            range_tombstone_max_covering(tables[i]->range_tombstones, key, key_size, snapshot,
+                                         &seq) == 1 &&
+            (!covered || seq > newest))
+        {
+            covered = 1;
+            newest = seq;
+        }
         if (sstable_unref(tables[i])) sstable_close(tables[i]);
     }
-    free(tables);
-    if (applied == 0) return TDB_SUCCESS;
-
-    pthread_rwlock_wrlock(&cf->range_tombstone_lock);
-    *out_dropped = range_tombstone_set_forget_through(cf->range_tombstones, applied);
-    if (*out_dropped)
-        atomic_store_explicit(&cf->range_tombstone_frags,
-                              range_tombstone_set_count(cf->range_tombstones),
-                              memory_order_release);
-    pthread_rwlock_unlock(&cf->range_tombstone_lock);
-    return TDB_SUCCESS;
-}
-
-int cf_range_tombstones_serialize(const cf_t *cf, uint8_t **out, size_t *out_size)
-{
-    if (!cf || !out || !out_size) return TDB_ERR_INVALID_ARGS;
-    *out = NULL;
-    *out_size = 0;
-
-    /* the lock is bookkeeping for the read, not part of the family's state, so taking it does not
-     * make the family any less const to the caller -- the same reasoning cf_config_get runs on */
-    pthread_rwlock_t *lock = (pthread_rwlock_t *)&cf->range_tombstone_lock;
-    pthread_rwlock_rdlock(lock);
-    const int rc = cf->range_tombstones
-                       ? range_tombstone_set_serialize(cf->range_tombstones, out, out_size)
-                       : TDB_SUCCESS;
-    pthread_rwlock_unlock(lock);
-    return rc;
+    if (covered) *out_seq = newest;
+    return covered;
 }
 
 /* free a configuration displaced by a reconfigure, once the epoch says no reader holds it */

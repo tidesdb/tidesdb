@@ -21,19 +21,11 @@ typedef int alloc_fault_translation_unit;
 static _Atomic(uint64_t) g_alloc_nth = 0;
 /* allocations counted since the last arm, whether or not anything is armed */
 static _Atomic(uint64_t) g_alloc_count = 0;
-/* set once the armed allocation was refused */
-static _Atomic(int) g_alloc_tripped = 0;
 
 void alloc_fault_arm(const uint64_t nth)
 {
     atomic_store_explicit(&g_alloc_count, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_alloc_tripped, 0, memory_order_relaxed);
     atomic_store_explicit(&g_alloc_nth, nth, memory_order_release);
-}
-
-int alloc_fault_tripped(void)
-{
-    return atomic_load_explicit(&g_alloc_tripped, memory_order_acquire);
 }
 
 uint64_t alloc_fault_count(void)
@@ -47,9 +39,7 @@ uint64_t alloc_fault_count(void)
 static int alloc_fault_should_fail(void)
 {
     const uint64_t seen = atomic_fetch_add_explicit(&g_alloc_count, 1, memory_order_relaxed) + 1;
-    if (seen != atomic_load_explicit(&g_alloc_nth, memory_order_acquire)) return 0;
-    atomic_store_explicit(&g_alloc_tripped, 1, memory_order_release);
-    return 1;
+    return seen == atomic_load_explicit(&g_alloc_nth, memory_order_acquire);
 }
 
 /* the linker redirects the library's allocation calls here and leaves the real ones reachable under

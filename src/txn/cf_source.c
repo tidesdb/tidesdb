@@ -158,9 +158,11 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
     const uint64_t layout_at_entry = level_set_generation(cf->levels);
     const uint32_t occupied = level_set_occupancy(cf->levels);
 
-    /* the family's range tombstones sit below every level, so one lookup answers for all of them.
-     * whichever is newer wins -- a tombstone laid after a version deletes it, and a version written
-     * after a tombstone survives it */
+    /* an interval covers a range the table carrying it need not hold a single key of, so it cannot
+     * be looked for alongside the key -- it is asked of the whole family once, before the walk, and
+     * whichever is newer wins. a tombstone laid after a version deletes it, and a version written
+     * after a tombstone survives it. a family that has never deleted a range answers from one load
+     */
     uint64_t tomb_seq = 0;
     const int covered = cf_range_tombstone_covering(cf, key, key_size, snapshot, &tomb_seq);
 

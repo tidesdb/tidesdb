@@ -266,6 +266,120 @@ void test_cf_source_top_down_levels(void)
     cs_db_close(&db);
 }
 
+/* the level walk stops at the first level holding the key rather than comparing what each holds, so
+ * an older version in L1 shadows a newer one in L2. compaction only ever moves keys downward, which
+ * is what makes the walk right; this pins what it costs if anything ever moves one the other way */
+void test_cf_source_l1_shadows_a_newer_l2(void)
+{
+    cs_db_t db;
+    cs_db_open(&db);
+
+    const cs_entry_t newer[] = {{"k", "newer", 0, 10, 0}};
+    const uint64_t id0 = cs_flush(&db, newer, 1, 1);
+    const uint64_t l1[1] = {id0};
+    cs_grow_to_l2(&db, l1, 1); /* k@10 now lives at L2 */
+    ASSERT_EQ(level_set_count(db.cf->levels, 2), 1);
+
+    const cs_entry_t stale[] = {{"k", "stale", 0, 5, 0}};
+    (void)cs_flush(&db, stale, 1, 2); /* k@5 at L1, above the newer L2 version */
+    ASSERT_EQ(level_set_count(db.cf->levels, 1), 1);
+
+    cs_assert_live(db.cf, "k", UINT64_MAX, "stale", 5);
+
+    cs_db_close(&db);
+}
+
+/* a merge retires its inputs, so whatever intervals they carried have to reach the output or every
+ * delete they held goes with their files. this is the other half of a tombstone living as long as a
+ * table holds it, and the half a merge is responsible for. the table left outside the merge is what
+ * makes the carry necessary here -- it holds a key the interval covers and the merge never reads
+ * it, so an output that let the interval go would bring that key back */
+void test_cf_source_compaction_carries_input_intervals(void)
+{
+    cs_db_t db;
+    cs_db_open(&db);
+
+    /* a flush that lays down a key and an interval covering a different one */
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db.l0, 0, (const uint8_t *)"m", 1,
+                                               (const uint8_t *)"q", 1, 7),
+              TDB_SUCCESS);
+    const cs_entry_t rows[] = {{"k", "v", 0, 3, 0}};
+    const uint64_t id0 = cs_flush(&db, rows, 1, 1);
+
+    sstable_t *l1[4];
+    int n = level_set_overlapping(db.cf->levels, 1, (const uint8_t *)"k", 1, (const uint8_t *)"k",
+                                  1, l1, 4);
+    ASSERT_EQ(n, 1);
+    ASSERT_TRUE(l1[0]->range_tombstones != NULL);
+    if (sstable_unref(l1[0])) sstable_close(l1[0]);
+
+    /* a second table, inside the interval's range and older than it, that the merge below will not
+     * take as an input. flush order is not sequence order, which is how a table younger than an
+     * interval still holds a key beneath it */
+    const cs_entry_t covered[] = {{"n", "older", 0, 3, 0}};
+    (void)cs_flush(&db, covered, 1, 2);
+
+    /* merged down, the output carries what the input did */
+    const uint64_t ids[1] = {id0};
+    cs_grow_to_l2(&db, ids, 1);
+    ASSERT_EQ(level_set_count(db.cf->levels, 2), 1);
+
+    sstable_t *l2[4];
+    n = level_set_overlapping(db.cf->levels, 2, (const uint8_t *)"k", 1, (const uint8_t *)"k", 1,
+                              l2, 4);
+    ASSERT_EQ(n, 1);
+    ASSERT_TRUE(l2[0]->range_tombstones != NULL);
+    uint64_t seq = 0;
+    ASSERT_EQ(range_tombstone_max_covering(l2[0]->range_tombstones, (const uint8_t *)"n", 1,
+                                           UINT64_MAX, &seq),
+              1);
+    ASSERT_EQ((int)seq, 7);
+    if (sstable_unref(l2[0])) sstable_close(l2[0]);
+
+    /* and the key it covers is still deleted, which is what the carry was for */
+    tidesdb_source_version_t out;
+    ASSERT_EQ(cs_get(db.cf, "n", UINT64_MAX, &out), TDB_SOURCE_FOUND);
+    ASSERT_EQ((int)out.deleted, 1);
+    free(out.value);
+
+    cs_db_close(&db);
+}
+
+/* the other side of that rule. a merge writing the largest level, whose inputs are the only tables
+ * the interval's range reaches and whose sequence is below the reclamation floor, has just deleted
+ * everything the interval had left to delete. carrying it on would grow what every table after this
+ * one writes for no reader that could tell */
+void test_cf_source_compaction_drops_an_interval_it_has_finished(void)
+{
+    cs_db_t db;
+    cs_db_open(&db);
+
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db.l0, 0, (const uint8_t *)"m", 1,
+                                               (const uint8_t *)"q", 1, 7),
+              TDB_SUCCESS);
+    /* one key outside the interval so the merge still has an output, one inside for it to delete */
+    const cs_entry_t rows[] = {{"k", "v", 0, 3, 0}, {"n", "gone", 0, 3, 0}};
+    const uint64_t id0 = cs_flush(&db, rows, 2, 1);
+
+    const uint64_t ids[1] = {id0};
+    cs_grow_to_l2(&db, ids, 1);
+    ASSERT_EQ(level_set_count(db.cf->levels, 2), 1);
+
+    sstable_t *l2[4];
+    const int n = level_set_overlapping(db.cf->levels, 2, (const uint8_t *)"k", 1,
+                                        (const uint8_t *)"k", 1, l2, 4);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ((int)range_tombstone_set_count(l2[0]->range_tombstones), 0);
+    if (sstable_unref(l2[0])) sstable_close(l2[0]);
+
+    /* the covered key went with the merge, so letting the interval go resurrects nothing */
+    cs_assert_live(db.cf, "k", UINT64_MAX, "v", 3);
+    tidesdb_source_version_t out;
+    ASSERT_EQ(cs_get(db.cf, "n", UINT64_MAX, &out), TDB_SOURCE_NOT_FOUND);
+
+    cs_db_close(&db);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -274,6 +388,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_cf_source_tombstone, tests_passed);
     RUN_TEST(test_cf_source_spilled_value, tests_passed);
     RUN_TEST(test_cf_source_top_down_levels, tests_passed);
+    RUN_TEST(test_cf_source_l1_shadows_a_newer_l2, tests_passed);
+    RUN_TEST(test_cf_source_compaction_carries_input_intervals, tests_passed);
+    RUN_TEST(test_cf_source_compaction_drops_an_interval_it_has_finished, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

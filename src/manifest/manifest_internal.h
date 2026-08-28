@@ -56,10 +56,6 @@ int manifest_cf_upsert_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_
                                 const char *name, const uint8_t *config_blob,
                                 size_t config_blob_len);
 int manifest_cf_drop_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id);
-int manifest_range_del_upsert_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id,
-                                       const uint8_t *blob, const uint32_t blob_len);
-int manifest_pending_add_range_del(tidesdb_manifest_t *manifest, const uint64_t cf_id,
-                                   const uint8_t *blob, const uint32_t blob_len);
 int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id,
                                           const int level, const uint64_t id,
                                           const uint64_t num_entries, const uint64_t size_bytes,

@@ -210,4 +210,15 @@ uint64_t level_set_generation(const level_set_t *ls);
  */
 uint32_t level_set_occupancy(const level_set_t *ls);
 
+/**
+ * level_set_interval_tables
+ * how many of the set's sstables carry range tombstones, republished with the layout. an interval
+ * covers a range the table carrying it need not hold a single key of, so the only way to ask the
+ * family what covers a key is to ask every table -- and every point read and every conflict probe
+ * asks. this is the one load that lets a family which has never deleted a range skip that walk
+ * @param ls the level set
+ * @return the number of sstables carrying at least one interval, or 0 for a null set
+ */
+uint32_t level_set_interval_tables(const level_set_t *ls);
+
 #endif /* __TIDESDB_LEVEL_SET_H__ */

@@ -703,8 +703,17 @@ jobs:
         run: |
           TIDESDB_PORTABLE_DIR=./testdb ./build/portable_db_verify.exe
 
+      # msvc is a multi-config generator, so it puts the binary under the configuration directory
+      # rather than beside the build tree the single-config generators use, and names it with the
+      # executable suffix. the generic step below is right for the platforms that build with one
+      - name: Verify database (Windows MSVC)
+        if: matrix.compiler == 'msvc'
+        shell: bash
+        run: |
+          TIDESDB_PORTABLE_DIR=./testdb ./build/Release/portable_db_verify.exe
+
       - name: Verify database
-        if: matrix.compiler != 'mingw'
+        if: matrix.compiler != 'mingw' && matrix.compiler != 'msvc'
         shell: bash
         run: |
           TIDESDB_PORTABLE_DIR=./testdb ./build/portable_db_verify

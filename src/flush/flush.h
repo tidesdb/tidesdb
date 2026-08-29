@@ -26,8 +26,9 @@
  * the shared, read-only context a flush runs against; the engine builds one and the flush pool
  * reuses it across immutables
  * @param l0 the L0 subsystem, for reclaiming an immutable once its data is durable in L1
- * @param cfs the column family registry indexed by cf-index; a NULL slot is a dropped family whose
- *            entries are discarded
+ * @param cfs the live families by id, which is also the index a memtable key carries as its prefix
+ *            -- the write path takes the prefix from the family's own id, so the two are one value
+ *            under two names. a NULL slot is a dropped family whose entries are discarded
  * @param n_cfs the length of cfs
  * @param manifest the db-level manifest every output sstable is recorded in
  * @param manifest_path the path the manifest commits to
@@ -35,6 +36,9 @@
  * @param fdm the db-global descriptor budget, for releasing a flushed immutable's WAL descriptor,
  * or NULL when the immutables carry no WAL
  * @param sync_mode the block-manager sync mode driving the klog and manifest durability barriers
+ * @param value_threshold the database's value separation size, which a family that keeps its values
+ *                        inline raises out of reach rather than switching off -- see
+ *                        cf_config_value_threshold, which resolves the two
  * @param gc_floor the oldest sequence any live snapshot can still read. a memtable holds a version
  *                 chain per key and this is what decides how much of it reaches L1 -- every version
  *                 above the floor survives, plus the newest at or below it. with no reader

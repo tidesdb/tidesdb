@@ -59,7 +59,9 @@
  * @param range_tombstone_frags how many fragments that set holds, published so a read can decide to
  * skip the lock entirely -- which is every read of every database that never deletes a range
  * @param range_tombstone_lock guards the set; a commit takes it exclusive and a read takes it
- * shared, and neither reaches it at all while the fragment count reads zero
+ * shared, and neither reaches it at all while the fragment count reads zero. writer-preferring,
+ * because on a family that deletes ranges every read takes it and a commit waiting behind an
+ * unbroken run of them would never get in
  */
 typedef struct tidesdb_memtable_t
 {
@@ -74,7 +76,7 @@ typedef struct tidesdb_memtable_t
     _Atomic(int) vlog_token;
     range_tombstone_set_t *range_tombstones;
     _Atomic(size_t) range_tombstone_frags;
-    pthread_rwlock_t range_tombstone_lock;
+    tdb_wprwlock_t range_tombstone_lock;
 } tidesdb_memtable_t;
 
 #endif /* __TIDESDB_INTERNAL_TYPES_H__ */

@@ -33,6 +33,11 @@ static int l0_version_visible(void *ctx, uint64_t seq)
  * the snapshot and reads the latest. the visibility predicate is passed even for that case, because
  * a commit whose apply failed can leave entries here at a sequence that never committed, and those
  * have to be stepped over at any snapshot rather than returned as the key's newest version */
+int tidesdb_memtable_has_range_tombstones(const tidesdb_memtable_t *mt)
+{
+    return mt && atomic_load_explicit(&mt->range_tombstone_frags, memory_order_acquire) != 0;
+}
+
 /* the newest range tombstone covering a prefixed key at or below the snapshot, stepping over one an
  * abandoned commit left behind exactly as the per-version predicate does for a point write. a
  * memtable that has never taken a range delete answers from one load and never reaches the lock */
@@ -44,7 +49,7 @@ int tidesdb_memtable_range_tombstone_covering(const tidesdb_l0_t *l0, tidesdb_me
 
     int found = 0;
     const rt_fragment_t *frag = NULL;
-    pthread_rwlock_rdlock(&mt->range_tombstone_lock);
+    tdb_wprwlock_rdlock(&mt->range_tombstone_lock);
     if (range_tombstone_covering_fragment(mt->range_tombstones, pkey, pkey_size, &frag) == 1)
     {
         for (size_t i = 0; i < frag->seq_count && !found; i++)
@@ -54,7 +59,7 @@ int tidesdb_memtable_range_tombstone_covering(const tidesdb_l0_t *l0, tidesdb_me
             found = 1;
         }
     }
-    pthread_rwlock_unlock(&mt->range_tombstone_lock);
+    tdb_wprwlock_unlock(&mt->range_tombstone_lock);
     return found;
 }
 

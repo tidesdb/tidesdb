@@ -27,16 +27,40 @@ process that touches the database. Supply a different one — a fixed bug, a cha
 second application — and the sstables are no longer mergeable and the data is silently
 misordered. The failure is catastrophic, delayed, and unattributable.
 
-Byte ordering removes that class of failure entirely, and costs only that **you encode keys to
-sort correctly**:
+That is the operational argument. The structural one is that features here are defined in terms of
+byte order and would not survive without it.
+
+**A prefix delete is one interval, not a scan.** Deleting every key under a prefix is stored as the
+half-open interval from the prefix to its successor — the prefix with its trailing `0xff` bytes
+stripped and the last byte incremented — which is one entry however many keys it covers. That
+rewrite is only valid because byte ordering makes the keys sharing a prefix contiguous. Under an
+arbitrary comparator they need not be, so there is no interval to record and the operation would
+have to walk and delete every key it covers, one at a time.
+[Range deletes](/reference/transaction#tidesdb_txn_delete_prefix) rest on this, and so does the
+notion of an interval that is unbounded above, which means nothing until an order says what comes
+last.
+
+**One memtable holds every family.** Families are separated inside it by a fixed-width prefix on
+each key rather than by having a structure each. A per-family comparator would make every
+comparison in that structure decode the prefix, find the family and call through a pointer, on the
+hottest path the engine has, where the comparison is otherwise a `memcmp` the compiler inlines.
+
+Byte ordering costs only that **you encode keys to sort correctly**:
 
 | To sort by | Encode as |
 | --- | --- |
 | Unsigned integer | Big-endian, fixed width |
 | Signed integer | Big-endian with the sign bit flipped |
+| IEEE 754 float | Big-endian, then set the sign bit on a positive and invert every bit of a negative |
 | Descending anything | Invert the bytes |
 | Timestamp then id | Big-endian timestamp, then the id, concatenated |
 | Text, case-insensitive | Normalise before storing |
+
+The float row is the one worth reading twice. Encoding the raw bits big-endian is not enough —
+negatives would sort backwards among themselves and every negative would sort above every positive.
+Flipping as described puts the whole range in order, at the cost that `-0.0` and `+0.0` encode to
+different keys and so are different keys, and that a NaN sorts at one end rather than comparing
+unordered as it does in arithmetic.
 
 A composite key is just concatenation, and because ordering is lexicographic, a prefix scan over
 the leading component works with no extra machinery — which is what makes

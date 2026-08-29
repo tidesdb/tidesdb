@@ -49,6 +49,13 @@
 /* size in bytes of the big-endian column-family index prepended to every memtable key */
 #define TDB_CF_PREFIX_SIZE 4
 
+/* the largest family id that prefix can carry. one shared memtable holds every family's keys and
+ * the prefix is what separates them, so an id past this would be written truncated and land under
+ * the prefix of whichever family it wrapped onto -- two families interleaved in one order, which no
+ * later read could tell apart. family ids are drawn from a counter that never reuses one, so the
+ * ceiling is on how many a database may ever create rather than on how many it holds */
+#define TDB_CF_INDEX_MAX 0xFFFFFFFFull
+
 /**
  * encode_varint
  * encode a uint64_t as a base-128 varint

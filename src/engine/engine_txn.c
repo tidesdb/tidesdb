@@ -45,6 +45,8 @@ int engine_txn_put(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
                    const uint8_t *value, size_t value_size, int64_t ttl)
 {
     if (!txn || !cf) return TDB_ERR_INVALID_ARGS;
+    /* the family id is the key prefix, narrowed to the width the prefix is. engine_create_cf will
+     * not hand out an id past TDB_CF_INDEX_MAX, which is what makes this lossless */
     return tdb_txn_put(txn->inner, (uint32_t)cf->cf_id, key, key_size, value, value_size, ttl);
 }
 

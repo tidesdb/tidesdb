@@ -32,11 +32,17 @@
  */
 void sstable_merge_source(sstable_iter_t *it, merge_source_t *out);
 
+/* stack room for the prefixed form of a key while a memtable view is asked about its intervals */
+#define MERGE_SOURCE_PREFIXED_KEY_STACK 128
+
 /**
  * memtable_merge_source_t
  * the state a memtable view keeps between calls -- the borrowed skip_list cursor, the column family
  * it filters to, the snapshot it resolves at, and the currently resolved entry
  * @param cursor the borrowed skip_list cursor over the shared memtable
+ * @param l0 the subsystem owning the memtable, for the sequences an abandoned commit left behind
+ * @param mt the memtable this view reads, so it can be asked about the intervals it holds as well
+ *           as the keys
  * @param cf_index the column family whose prefix range this view iterates
  * @param snapshot the snapshot sequence versions are resolved at
  * @param positioned 1 when resolved on a visible in-range entry
@@ -50,14 +56,9 @@ void sstable_merge_source(sstable_iter_t *it, merge_source_t *out);
  * @param ttl the resolved version's expiry
  * @param deleted non-zero when the resolved version is a tombstone
  */
-/* stack room for the prefixed form of a key while a memtable view is asked about its intervals */
-#define MERGE_SOURCE_PREFIXED_KEY_STACK 128
-
 typedef struct
 {
     skip_list_cursor_t *cursor;
-    /* the memtable this view reads and the subsystem that owns it, so the view can be asked about
-     * the intervals the memtable holds as well as the keys */
     tidesdb_l0_t *l0;
     tidesdb_memtable_t *mt;
     uint32_t cf_index;
@@ -78,6 +79,8 @@ typedef struct
  * initialize a memtable view over a borrowed cursor for one column family at a snapshot
  * @param s the view state to initialize
  * @param cursor the borrowed skip_list cursor
+ * @param l0 the subsystem owning the memtable
+ * @param mt the memtable the view reads, for the intervals it holds beside its keys
  * @param cf_index the column family to filter to
  * @param snapshot the snapshot sequence to resolve at
  */

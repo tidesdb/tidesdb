@@ -17,6 +17,10 @@
  * successor can be formed by incrementing */
 #define RT_KEY_BYTE_MAX 0xff
 
+/* fragments the first append reserves room for, doubled from there. a set built by appending is
+ * one being rebuilt from a source that already knows its own shape, so it grows once or twice */
+#define RT_APPEND_INITIAL_CAPACITY 8
+
 /**
  * rt_key_cmp
  * total byte-wise order over keys -- the shared prefix decides, otherwise the shorter key sorts
@@ -284,6 +288,26 @@ static int rt_merge(const range_tombstone_set_t *set, const uint8_t *lo, const s
     return TDB_SUCCESS;
 }
 
+/**
+ * rt_starts_after_last
+ * whether a lower bound begins at or after the end of the set's last fragment, which is what keeps
+ * the fragments sorted and non-overlapping as they are read back
+ * @param set the set built so far
+ * @param lo the lower bound to place
+ * @param lo_size length of lo in bytes
+ * @return 1 when the bound may start a fragment after the last one, 0 otherwise
+ */
+static int rt_starts_after_last(const range_tombstone_set_t *set, const uint8_t *lo,
+                                const size_t lo_size)
+{
+    if (set->count == 0) return 1;
+
+    /* nothing can follow a fragment that reaches the end of the order */
+    const rt_fragment_t *prev = &set->frags[set->count - 1];
+    if (prev->hi_size == RT_UNBOUNDED_ABOVE) return 0;
+    return rt_hi_cmp_key(prev->hi, prev->hi_size, lo, lo_size) <= 0;
+}
+
 range_tombstone_set_t *range_tombstone_set_new(void)
 {
     return calloc(1, sizeof(range_tombstone_set_t));
@@ -333,6 +357,31 @@ int range_tombstone_set_add(range_tombstone_set_t *set, const uint8_t *lo, const
     set->count = out.count;
     set->capacity = out.capacity;
     return TDB_SUCCESS;
+}
+
+int range_tombstone_set_append_fragment(range_tombstone_set_t *set, const uint8_t *lo,
+                                        const size_t lo_size, const uint8_t *hi,
+                                        const size_t hi_size, const uint64_t *seqs,
+                                        const size_t seq_count)
+{
+    if (!set || !seqs || seq_count == 0) return TDB_ERR_INVALID_ARGS;
+    if (!range_tombstone_interval_valid(lo, lo_size, hi, hi_size)) return TDB_ERR_INVALID_ARGS;
+    if (!rt_starts_after_last(set, lo, lo_size)) return TDB_ERR_INVALID_ARGS;
+
+    /* strictly descending is what lets a snapshot read take the first sequence at or below its
+     * ceiling and stop */
+    for (size_t i = 1; i < seq_count; i++)
+        if (seqs[i] >= seqs[i - 1]) return TDB_ERR_INVALID_ARGS;
+
+    if (set->count == set->capacity)
+    {
+        const size_t grown = set->capacity ? set->capacity * 2 : RT_APPEND_INITIAL_CAPACITY;
+        rt_fragment_t *frags = realloc(set->frags, grown * sizeof(rt_fragment_t));
+        if (!frags) return TDB_ERR_MEMORY;
+        set->frags = frags;
+        set->capacity = grown;
+    }
+    return rt_emit(set, lo, lo_size, hi, hi_size, seqs, seq_count, NULL);
 }
 
 int range_tombstone_covering_fragment(const range_tombstone_set_t *set, const uint8_t *key,
@@ -514,14 +563,22 @@ static int rt_take_bytes(const uint8_t **p, size_t *rem, uint8_t **out_bytes, si
 
 /**
  * rt_read_fragment
- * read one fragment out of a serialized block straight into the set being built
+ * read one fragment out of a serialized block straight into the next slot of the set
+ *
+ * the block already holds the fragmented form, so it is rebuilt as it is read rather than replayed
+ * through the merge one sequence at a time -- replaying it refragments the whole set per sequence
+ * and costs the square of the fragment count, which on a large block is seconds spent opening an
+ * sstable. what the merge enforced as a side effect of rebuilding is checked here instead, so a
+ * block not in that form is refused rather than quietly turned into a different set
  * @param p the read cursor, advanced past the fragment
  * @param rem bytes left in the block, decremented by what this read
- * @param set the set being filled, pre-sized to hold the append
+ * @param set the set being filled, sized to the fragment count the block declared
  * @return TDB_SUCCESS, TDB_ERR_CORRUPTION, or TDB_ERR_MEMORY
  */
 static int rt_read_fragment(const uint8_t **p, size_t *rem, range_tombstone_set_t *set)
 {
+    if (set->count >= set->capacity) return TDB_ERR_CORRUPTION;
+
     uint8_t *lo = NULL;
     uint8_t *hi = NULL;
     size_t lo_size = 0;
@@ -550,15 +607,26 @@ static int rt_read_fragment(const uint8_t **p, size_t *rem, range_tombstone_set_
         return TDB_ERR_CORRUPTION;
     }
 
-    rc = TDB_SUCCESS;
-    for (uint32_t s = 0; s < seq_count && rc == TDB_SUCCESS; s++)
+    uint64_t *seqs = malloc(seq_count * sizeof(uint64_t));
+    if (!seqs)
     {
-        const uint64_t seq = tdb_decode_be64(*p);
+        free(lo);
+        free(hi);
+        return TDB_ERR_MEMORY;
+    }
+    for (uint32_t s = 0; s < seq_count; s++)
+    {
+        seqs[s] = tdb_decode_be64(*p);
         *p += sizeof(uint64_t);
         *rem -= sizeof(uint64_t);
-        rc = range_tombstone_set_add(set, lo, lo_size, hi, hi_size, seq);
     }
 
+    /* the append is what decides whether these fragments are a fragmentation at all. a block whose
+     * bytes are well formed but whose contents are not one is corrupt rather than a bad argument */
+    rc = range_tombstone_set_append_fragment(set, lo, lo_size, hi, hi_size, seqs, seq_count);
+    if (rc == TDB_ERR_INVALID_ARGS) rc = TDB_ERR_CORRUPTION;
+
+    free(seqs);
     free(lo);
     free(hi);
     return rc;
@@ -585,6 +653,19 @@ int range_tombstone_set_deserialize(const uint8_t *data, const size_t size,
 
     range_tombstone_set_t *set = range_tombstone_set_new();
     if (!set) return TDB_ERR_MEMORY;
+
+    /* sized once to the count the block declared, which the bound above has already weighed against
+     * the bytes actually left */
+    if (count > 0)
+    {
+        set->frags = calloc(count, sizeof(rt_fragment_t));
+        if (!set->frags)
+        {
+            range_tombstone_set_free(set);
+            return TDB_ERR_MEMORY;
+        }
+        set->capacity = count;
+    }
 
     int rc = TDB_SUCCESS;
     for (uint32_t i = 0; i < count && rc == TDB_SUCCESS; i++) rc = rt_read_fragment(&p, &rem, set);

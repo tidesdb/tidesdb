@@ -202,7 +202,7 @@ static inline int btree_key_cmp(const uint8_t *key1, const size_t key1_size, con
                                 const size_t key2_size)
 {
     const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    const int c = memcmp(key1, key2, min_size);
+    const int c = min_size > 0 ? memcmp(key1, key2, min_size) : 0;
     if (c != 0) return c < 0 ? -1 : 1;
     if (key1_size < key2_size) return -1;
     if (key1_size > key2_size) return 1;

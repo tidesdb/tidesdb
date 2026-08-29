@@ -7,13 +7,15 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+#include "../src/base/encoding/serialization.h" /* TDB_CF_INDEX_MAX */
 #include "../src/base/waitstat.h" /* tdb_monotonic_us, for a duration the wall clock cannot give */
 #include "../src/column_family/column_family.h" /* cf_t, for level inspection */
 #include "../src/column_family/level/level_set.h"
 #include "../src/engine/engine.h"          /* engine_vlog_gc, for a direct value-log reclaim */
 #include "../src/engine/engine_internal.h" /* ENGINE_FIRST_WAL_GENERATION */
-#include "../src/engine/engine_types.h"    /* the inner txn a prefix delete is buffered on */
-#include "../src/txn/txn.h"                /* tdb_txn_delete_prefix, not yet a public call */
+#include "../src/engine/engine_types.h"
+#include "../src/manifest/manifest.h" /* the inner txn a prefix delete is buffered on */
+#include "../src/txn/txn.h"           /* tdb_txn_delete_prefix, not yet a public call */
 #include "db.h"
 #include "test_utils.h"
 
@@ -6481,6 +6483,45 @@ void test_engine_txn_two_phase_commit(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* one shared memtable holds every family's keys and a fixed-width prefix is what separates them, so
+ * a family id past what that prefix can carry would be written truncated and interleave with
+ * whichever family it wrapped onto. the counter never reuses an id, so the ceiling is on how many a
+ * database may ever create -- unreachable in practice, and silent corruption if it were not refused
+ */
+void test_engine_create_cf_refuses_an_id_past_the_key_prefix(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    /* wind the high-water to the last id the prefix can carry and let a reopen seed the registry
+     * from it, which is the same path a recovered database takes */
+    tidesdb_manifest_update_next_cf_id(db->manifest, TDB_CF_INDEX_MAX);
+    ASSERT_EQ(tidesdb_manifest_commit(db->manifest, db->manifest->path, 1), 0);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+
+    /* the last id the prefix holds is still a usable one */
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "last", &cc), TDB_SUCCESS);
+
+    /* the one past it is refused rather than silently aliased onto another family */
+    ASSERT_EQ(tidesdb_create_column_family(db, "past_the_end", &cc), TDB_ERR_TOO_LARGE);
+    ASSERT_TRUE(tidesdb_get_column_family(db, "past_the_end") == NULL);
+
+    /* and the database still works, since nothing was half-created */
+    tidesdb_column_family_t *last = tidesdb_get_column_family(db, "last");
+    ASSERT_TRUE(last != NULL);
+    engine_put(db, last, 1);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -6546,6 +6587,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_finished_sstable_is_trimmed_to_its_data, tests_passed);
     RUN_TEST(test_engine_compaction_unlinks_merged_inputs, tests_passed);
     RUN_TEST(test_engine_compaction_leaves_no_orphans_under_load, tests_passed);
+    RUN_TEST(test_engine_create_cf_refuses_an_id_past_the_key_prefix, tests_passed);
     RUN_TEST(test_engine_open_sweeps_orphaned_sstables, tests_passed);
     RUN_TEST(test_engine_open_keeps_sstables_when_manifest_self_healed, tests_passed);
     RUN_TEST(test_engine_runtime_config_rejects_an_unbacked_encoding, tests_passed);

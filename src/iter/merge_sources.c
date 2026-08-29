@@ -13,6 +13,7 @@
 
 #include "base/encoding/serialization.h" /* be32 codec, TDB_CF_PREFIX_SIZE */
 #include "base/errors.h"                 /* TDB_SUCCESS */
+#include "memtable/memtable.h"           /* the interval predicate a memtable view asks first */
 #include "txn/writeset.h"                /* writeset op access and TDB_WAL_ENTRY_TOMBSTONE */
 
 /* stack buffer for the prefixed lookup key a memtable seek builds, covering the common small case
@@ -324,6 +325,12 @@ static int memtable_source_covers(void *ctx, const uint8_t *key, size_t key_size
     memtable_merge_source_t *s = (memtable_merge_source_t *)ctx;
     if (!s->l0 || !s->mt) return 0;
 
+    /* asked before the key is built rather than after. the answer needs the family prefix put back
+     * on, which for a long key is an allocation, and a memtable that has never taken a range delete
+     * answers no whatever key it is handed -- which is every memtable of every database that does
+     * not delete ranges, on every key a scan resolves */
+    if (!tidesdb_memtable_has_range_tombstones(s->mt)) return 0;
+
     uint8_t stack[MERGE_SOURCE_PREFIXED_KEY_STACK];
     const size_t pkey_size = TDB_CF_PREFIX_SIZE + key_size;
     uint8_t *pkey = pkey_size <= sizeof(stack) ? stack : malloc(pkey_size);
@@ -378,7 +385,7 @@ struct writeset_merge_source
 static int ws_key_cmp(const uint8_t *a, size_t a_size, const uint8_t *b, size_t b_size)
 {
     const size_t n = a_size < b_size ? a_size : b_size;
-    const int c = memcmp(a, b, n);
+    const int c = n > 0 ? memcmp(a, b, n) : 0;
     if (c != 0) return c;
     return a_size < b_size ? -1 : (a_size > b_size ? 1 : 0);
 }

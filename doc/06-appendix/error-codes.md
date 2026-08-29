@@ -22,7 +22,7 @@ Every public function returns `TDB_SUCCESS` (0) or one of these. They are negati
 | `TDB_ERR_CORRUPTION` | -5 | On-disk data did not decode |
 | `TDB_ERR_EXISTS` | -6 | A column family with that name already exists |
 | `TDB_ERR_CONFLICT` | -7 | Another transaction committed a conflicting write first |
-| `TDB_ERR_TOO_LARGE` | -8 | A supplied buffer is too small |
+| `TDB_ERR_TOO_LARGE` | -8 | A value does not fit the space that holds it — a buffer too small, or a database that has used every column family id |
 | `TDB_ERR_MEMORY_LIMIT` | -9 | A configured memory limit was reached |
 | `TDB_ERR_INVALID_DB` | -10 | The database is closing or otherwise unusable |
 | `TDB_ERR_UNKNOWN` | -11 | An error with no more specific code |
@@ -90,7 +90,7 @@ Retry with a short backoff.
 | `TDB_ERR_TXN_ABORTED` | Every operation on a transaction after another thread called `tidesdb_txn_request_abort` on it, the commit included. Distinct from `TDB_ERR_CONFLICT` on purpose: a conflict is the engine's own verdict between two writers, where this says an outside authority ruled and the engine never weighed in |
 | `TDB_ERR_TOO_OLD` | `tidesdb_txn_begin_at_seq` for a sequence a collection has already run below. It is not a transient condition and retrying never clears it -- the versions that point named are gone, and the boundary only moves further away. Hold a snapshot in advance for a point in time you know you will want |
 | `TDB_ERR_INVALID_DB` | Operations against a closing database |
-| `TDB_ERR_TOO_LARGE` | `tidesdb_recover_prepared` when the buffer is too small |
+| `TDB_ERR_TOO_LARGE` | `tidesdb_recover_prepared` when the buffer is too small, and `tidesdb_create_column_family` when the family id space is spent |
 | `TDB_ERR_CORRUPTION` | Open and read paths, on undecodable on-disk data |
 | `TDB_ERR_NO_SPACE` | `tidesdb_flush_memtable`, `tidesdb_checkpoint`, and any path that writes an sstable |
 

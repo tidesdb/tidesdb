@@ -128,6 +128,9 @@ typedef enum
 #define TDB_ERR_CORRUPTION   -5
 #define TDB_ERR_EXISTS       -6
 #define TDB_ERR_CONFLICT     -7
+/* a value does not fit the space that has to hold it -- a caller's buffer too small for what was
+ * asked of it, or a database that has drawn every column family id its memtable key prefix can
+ * carry */
 #define TDB_ERR_TOO_LARGE    -8
 #define TDB_ERR_MEMORY_LIMIT -9
 #define TDB_ERR_INVALID_DB   -10

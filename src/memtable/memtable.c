@@ -80,7 +80,7 @@ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, u
      * nothing but the empty count and the lock */
     mt->range_tombstones = NULL;
     atomic_init(&mt->range_tombstone_frags, 0);
-    if (pthread_rwlock_init(&mt->range_tombstone_lock, NULL) != 0)
+    if (tdb_wprwlock_init(&mt->range_tombstone_lock) != 0)
     {
         skip_list_free(mt->skip_list);
         free(mt);
@@ -94,7 +94,7 @@ void tidesdb_memtable_free(tidesdb_memtable_t *mt)
     if (!mt) return;
     if (mt->skip_list) skip_list_free(mt->skip_list);
     range_tombstone_set_free(mt->range_tombstones);
-    (void)pthread_rwlock_destroy(&mt->range_tombstone_lock);
+    tdb_wprwlock_destroy(&mt->range_tombstone_lock);
     free(mt);
 }
 
@@ -451,9 +451,9 @@ static size_t l0_range_tombstone_bytes(tidesdb_memtable_t *mt)
 {
     if (atomic_load_explicit(&mt->range_tombstone_frags, memory_order_acquire) == 0) return 0;
 
-    pthread_rwlock_rdlock(&mt->range_tombstone_lock);
+    tdb_wprwlock_rdlock(&mt->range_tombstone_lock);
     const size_t bytes = range_tombstone_set_bytes(mt->range_tombstones);
-    pthread_rwlock_unlock(&mt->range_tombstone_lock);
+    tdb_wprwlock_unlock(&mt->range_tombstone_lock);
     return bytes;
 }
 
@@ -496,7 +496,7 @@ int tidesdb_l0_apply_range_tombstone(tidesdb_l0_t *l0, const uint32_t cf_index, 
     else
         tdb_build_prefixed_key(cf_index + 1, NULL, 0, phi);
 
-    pthread_rwlock_wrlock(&mt->range_tombstone_lock);
+    tdb_wprwlock_wrlock(&mt->range_tombstone_lock);
     int rc = TDB_SUCCESS;
     if (!mt->range_tombstones)
     {
@@ -510,7 +510,7 @@ int tidesdb_l0_apply_range_tombstone(tidesdb_l0_t *l0, const uint32_t cf_index, 
         atomic_store_explicit(&mt->range_tombstone_frags,
                               range_tombstone_set_count(mt->range_tombstones),
                               memory_order_release);
-    pthread_rwlock_unlock(&mt->range_tombstone_lock);
+    tdb_wprwlock_unlock(&mt->range_tombstone_lock);
 
     if (plo != stack_lo) free(plo);
     if (phi != stack_hi) free(phi);

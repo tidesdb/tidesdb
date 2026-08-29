@@ -104,6 +104,30 @@ int range_tombstone_set_add(range_tombstone_set_t *set, const uint8_t *lo, size_
                             const uint8_t *hi, size_t hi_size, uint64_t seq);
 
 /**
+ * range_tombstone_set_append_fragment
+ * append one fragment past the end of a set, for a caller building one out of data already in
+ * fragmented form rather than laying tombstones over each other
+ *
+ * range_tombstone_set_add refragments the whole set per tombstone, which a fragmented source does
+ * not need and cannot afford -- rebuilding n fragments through it costs the square of n. this
+ * appends in one step and checks what that rebuild would otherwise have guaranteed, so a caller
+ * handing over fragments that do not ascend, that overlap, or whose sequences do not descend is
+ * refused rather than left holding a set that answers wrongly
+ * @param set the set to append to
+ * @param lo inclusive lower bound, at or after the last fragment's upper bound
+ * @param lo_size length of lo in bytes
+ * @param hi exclusive upper bound, or NULL with hi_size RT_UNBOUNDED_ABOVE for unbounded above
+ * @param hi_size length of hi in bytes, or RT_UNBOUNDED_ABOVE for unbounded above
+ * @param seqs the sequences covering the fragment, strictly descending
+ * @param seq_count how many of them, which may not be zero
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS when the fragment does not follow the set or its
+ *         sequences do not descend, or TDB_ERR_MEMORY
+ */
+int range_tombstone_set_append_fragment(range_tombstone_set_t *set, const uint8_t *lo,
+                                        size_t lo_size, const uint8_t *hi, size_t hi_size,
+                                        const uint64_t *seqs, size_t seq_count);
+
+/**
  * range_tombstone_max_covering
  * the newest sequence at or below snapshot_seq whose tombstone covers key -- what a read compares
  * against the key's own newest visible version to decide whether the key is deleted

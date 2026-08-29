@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "../src/base/encoding/serialization.h"
 #include "../src/compat.h"
 #include "../src/range_tombstone/range_tombstone.h"
 #include "test_utils.h"
@@ -662,6 +663,239 @@ void test_range_tombstone_matches_a_linear_scan_over_every_tombstone(void)
     }
 }
 
+/* compare two sets fragment for fragment, so a round trip is checked as an identity rather than as
+ * a set that merely answers the same questions */
+static void assert_sets_identical(const range_tombstone_set_t *a, const range_tombstone_set_t *b)
+{
+    ASSERT_EQ(range_tombstone_set_count(a), range_tombstone_set_count(b));
+    for (size_t i = 0; i < range_tombstone_set_count(a); i++)
+    {
+        const rt_fragment_t *fa = NULL;
+        const rt_fragment_t *fb = NULL;
+        ASSERT_EQ(range_tombstone_set_fragment_at(a, i, &fa), TDB_SUCCESS);
+        ASSERT_EQ(range_tombstone_set_fragment_at(b, i, &fb), TDB_SUCCESS);
+        ASSERT_EQ(fa->lo_size, fb->lo_size);
+        ASSERT_EQ(fa->hi_size, fb->hi_size);
+        if (fa->lo_size) ASSERT_EQ(memcmp(fa->lo, fb->lo, fa->lo_size), 0);
+        if (fa->hi_size) ASSERT_EQ(memcmp(fa->hi, fb->hi, fa->hi_size), 0);
+        ASSERT_EQ(fa->seq_count, fb->seq_count);
+        for (size_t k = 0; k < fa->seq_count; k++) ASSERT_EQ(fa->seqs[k], fb->seqs[k]);
+    }
+}
+
+/* the block an sstable carries has to read back as the set that was written, fragment boundaries
+ * and every sequence on each of them included -- overlapping tombstones are the case that makes a
+ * fragment carry more than one sequence, and an unbounded tail the case with no upper bound to
+ * write */
+void test_range_tombstone_serialize_round_trips(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+    add_interval(set, "a", "z", 10);
+    add_interval(set, "c", "e", 20);
+    add_interval(set, "c", "e", 30);
+    add_interval(set, "m", NULL, 40);
+    ASSERT_TRUE(range_tombstone_set_count(set) > 1);
+
+    uint8_t *blob = NULL;
+    size_t blob_size = 0;
+    ASSERT_EQ(range_tombstone_set_serialize(set, &blob, &blob_size), TDB_SUCCESS);
+
+    range_tombstone_set_t *back = NULL;
+    ASSERT_EQ(range_tombstone_set_deserialize(blob, blob_size, &back), TDB_SUCCESS);
+    assert_sets_identical(set, back);
+
+    /* and it answers the same question the original does, at a snapshot between the sequences */
+    uint64_t seq_a = 0, seq_b = 0;
+    ASSERT_EQ(range_tombstone_max_covering(set, (const uint8_t *)"d", 1, 25, &seq_a), 1);
+    ASSERT_EQ(range_tombstone_max_covering(back, (const uint8_t *)"d", 1, 25, &seq_b), 1);
+    ASSERT_EQ(seq_a, seq_b);
+
+    free(blob);
+    range_tombstone_set_free(back);
+    range_tombstone_set_free(set);
+}
+
+/* an empty set is a block an sstable with no range deletes still writes, and it has to come back
+ * empty rather than as a failure */
+void test_range_tombstone_serialize_empty_set(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+
+    uint8_t *blob = NULL;
+    size_t blob_size = 0;
+    ASSERT_EQ(range_tombstone_set_serialize(set, &blob, &blob_size), TDB_SUCCESS);
+
+    range_tombstone_set_t *back = NULL;
+    ASSERT_EQ(range_tombstone_set_deserialize(blob, blob_size, &back), TDB_SUCCESS);
+    ASSERT_EQ(range_tombstone_set_count(back), 0);
+
+    free(blob);
+    range_tombstone_set_free(back);
+    range_tombstone_set_free(set);
+}
+
+/* a block is read straight into fragments rather than replayed through the merge, so everything the
+ * merge used to guarantee by construction is a property the reader has to check for itself. each of
+ * these is a block whose bytes are well formed but whose contents are not a fragmentation */
+void test_range_tombstone_deserialize_refuses_a_malformed_block(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+    add_interval(set, "a", "c", 10);
+    add_interval(set, "e", "g", 20);
+
+    uint8_t *blob = NULL;
+    size_t blob_size = 0;
+    ASSERT_EQ(range_tombstone_set_serialize(set, &blob, &blob_size), TDB_SUCCESS);
+    range_tombstone_set_t *back = NULL;
+
+    /* a version this build does not speak */
+    uint8_t *bad = malloc(blob_size);
+    ASSERT_TRUE(bad != NULL);
+    memcpy(bad, blob, blob_size);
+    bad[0] = RT_BLOCK_VERSION + 1;
+    ASSERT_EQ(range_tombstone_set_deserialize(bad, blob_size, &back), TDB_ERR_CORRUPTION);
+
+    /* a fragment count the remaining bytes could never fill */
+    memcpy(bad, blob, blob_size);
+    tdb_encode_be32(0xFFFFFFFFu, bad + 1);
+    ASSERT_EQ(range_tombstone_set_deserialize(bad, blob_size, &back), TDB_ERR_CORRUPTION);
+
+    /* truncated part way through */
+    ASSERT_EQ(range_tombstone_set_deserialize(blob, blob_size - 1, &back), TDB_ERR_CORRUPTION);
+
+    /* a header with nothing behind it */
+    ASSERT_EQ(range_tombstone_set_deserialize(blob, 1, &back), TDB_ERR_CORRUPTION);
+
+    free(bad);
+    free(blob);
+    range_tombstone_set_free(set);
+}
+
+/* two sequences on one fragment written ascending. a read takes the first sequence at or below its
+ * ceiling and stops, so an ascending list would hand back the oldest covering sequence instead of
+ * the newest and a deleted key could read as live */
+void test_range_tombstone_deserialize_refuses_ascending_sequences(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+    add_interval(set, "a", "c", 10);
+    add_interval(set, "a", "c", 20);
+
+    const rt_fragment_t *frag = NULL;
+    ASSERT_EQ(range_tombstone_set_fragment_at(set, 0, &frag), TDB_SUCCESS);
+    ASSERT_EQ(frag->seq_count, 2);
+
+    uint8_t *blob = NULL;
+    size_t blob_size = 0;
+    ASSERT_EQ(range_tombstone_set_serialize(set, &blob, &blob_size), TDB_SUCCESS);
+
+    /* the two sequences are the last sixteen bytes of the block, so swapping them puts the pair in
+     * the order the reader must refuse */
+    uint8_t swap[sizeof(uint64_t)];
+    uint8_t *first = blob + blob_size - 2 * sizeof(uint64_t);
+    uint8_t *second = blob + blob_size - sizeof(uint64_t);
+    memcpy(swap, first, sizeof(swap));
+    memcpy(first, second, sizeof(swap));
+    memcpy(second, swap, sizeof(swap));
+
+    range_tombstone_set_t *back = NULL;
+    ASSERT_EQ(range_tombstone_set_deserialize(blob, blob_size, &back), TDB_ERR_CORRUPTION);
+
+    free(blob);
+    range_tombstone_set_free(set);
+}
+
+/* appending is how a set is rebuilt from a source already in fragmented form -- a serialized block,
+ * or a memtable's fragments filtered down to one family. it does no merging, so everything the
+ * merge would have imposed is a precondition it has to enforce instead */
+void test_range_tombstone_append_fragment_builds_a_set(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+
+    const uint64_t two[2] = {30, 10};
+    const uint64_t one[1] = {20};
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"a", 1,
+                                                  (const uint8_t *)"c", 1, two, 2),
+              TDB_SUCCESS);
+    /* the next fragment may begin exactly where the last one ended, since the bound is exclusive */
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"c", 1,
+                                                  (const uint8_t *)"e", 1, one, 1),
+              TDB_SUCCESS);
+    ASSERT_EQ(range_tombstone_set_count(set), 2);
+
+    /* and the set answers as though it had been merged into existence */
+    uint64_t seq = 0;
+    ASSERT_EQ(range_tombstone_max_covering(set, (const uint8_t *)"b", 1, 20, &seq), 1);
+    ASSERT_EQ(seq, 10);
+    ASSERT_EQ(range_tombstone_max_covering(set, (const uint8_t *)"d", 1, 25, &seq), 1);
+    ASSERT_EQ(seq, 20);
+
+    range_tombstone_set_free(set);
+}
+
+/* each of these would leave a set that answers wrongly rather than one that is merely odd, so the
+ * append refuses them instead of accepting a shape it cannot search */
+void test_range_tombstone_append_fragment_refuses_a_bad_shape(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+
+    const uint64_t two[2] = {30, 10};
+    const uint64_t ascending[2] = {10, 30};
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"m", 1,
+                                                  (const uint8_t *)"q", 1, two, 2),
+              TDB_SUCCESS);
+
+    /* starting back inside what is already there, which no binary search would find */
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"n", 1,
+                                                  (const uint8_t *)"z", 1, two, 2),
+              TDB_ERR_INVALID_ARGS);
+
+    /* starting before it entirely */
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"a", 1,
+                                                  (const uint8_t *)"b", 1, two, 2),
+              TDB_ERR_INVALID_ARGS);
+
+    /* sequences that ascend, which a read would resolve to the oldest rather than the newest */
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"q", 1,
+                                                  (const uint8_t *)"z", 1, ascending, 2),
+              TDB_ERR_INVALID_ARGS);
+
+    /* an interval covering no key, and a fragment covered by nothing */
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"q", 1,
+                                                  (const uint8_t *)"q", 1, two, 2),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"q", 1,
+                                                  (const uint8_t *)"z", 1, two, 0),
+              TDB_ERR_INVALID_ARGS);
+
+    /* nothing above was accepted */
+    ASSERT_EQ(range_tombstone_set_count(set), 1);
+    range_tombstone_set_free(set);
+}
+
+/* an unbounded fragment reaches the end of the order, so nothing can follow it */
+void test_range_tombstone_append_fragment_refuses_following_an_unbounded_tail(void)
+{
+    range_tombstone_set_t *set = range_tombstone_set_new();
+    ASSERT_TRUE(set != NULL);
+
+    const uint64_t one[1] = {10};
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"m", 1, NULL,
+                                                  RT_UNBOUNDED_ABOVE, one, 1),
+              TDB_SUCCESS);
+    ASSERT_EQ(range_tombstone_set_append_fragment(set, (const uint8_t *)"z", 1, NULL,
+                                                  RT_UNBOUNDED_ABOVE, one, 1),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(range_tombstone_set_count(set), 1);
+
+    range_tombstone_set_free(set);
+}
+
 int main(void)
 {
     RUN_TEST(test_range_tombstone_empty_set_covers_nothing, tests_passed);
@@ -686,6 +920,14 @@ int main(void)
     RUN_TEST(test_range_tombstone_clone_is_independent, tests_passed);
     RUN_TEST(test_range_tombstone_clone_of_an_empty_set_is_empty, tests_passed);
     RUN_TEST(test_range_tombstone_covering_fragment_carries_every_sequence, tests_passed);
+    RUN_TEST(test_range_tombstone_append_fragment_builds_a_set, tests_passed);
+    RUN_TEST(test_range_tombstone_append_fragment_refuses_a_bad_shape, tests_passed);
+    RUN_TEST(test_range_tombstone_append_fragment_refuses_following_an_unbounded_tail,
+             tests_passed);
+    RUN_TEST(test_range_tombstone_serialize_round_trips, tests_passed);
+    RUN_TEST(test_range_tombstone_serialize_empty_set, tests_passed);
+    RUN_TEST(test_range_tombstone_deserialize_refuses_a_malformed_block, tests_passed);
+    RUN_TEST(test_range_tombstone_deserialize_refuses_ascending_sequences, tests_passed);
     RUN_TEST(test_range_tombstone_matches_a_linear_scan_over_every_tombstone, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

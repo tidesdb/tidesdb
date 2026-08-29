@@ -12,7 +12,7 @@
 #include <string.h>
 
 #include "base/bg_pool.h"
-#include "base/encoding/serialization.h" /* TDB_WAL_EXT */
+#include "base/encoding/serialization.h" /* TDB_WAL_EXT, TDB_CF_INDEX_MAX */
 #include "base/errors.h"
 #include "base/log.h"
 #include "column_family/cf_config.h"
@@ -745,6 +745,18 @@ int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_famil
     cf_config_warn_layout(&cfg, db->config.value_separation_threshold);
 
     const uint64_t cf_id = cf_registry_next_cf_id(db->cfs);
+    if (cf_id > TDB_CF_INDEX_MAX)
+    {
+        /* said at error because nothing an operator does clears it -- the counter never goes back,
+         * so this database can hold the families it has and create no more */
+        TDB_DEBUG_LOG(
+            TDB_LOG_ERROR,
+            "cannot create %s, this database has used every column family id the memtable "
+            "key prefix can carry",
+            name);
+        return TDB_ERR_TOO_LARGE;
+    }
+
     cf_t *cf = NULL;
     if (cf_create(db->db_path, cf_id, &cfg, &db->encodings, db->vlog, db->cache, &db->fdm,
                   db->node_arena, &db->now_seconds, &cf) != 0)

@@ -236,25 +236,30 @@ static int flush_add_run(const flush_ctx_t *fx, uint32_t cf_index, skip_list_cur
  * read under the lock a reader takes, and filtered the way a version is -- an abandoned commit's
  * sequence is skipped and the reclamation floor bounds what is kept. the table this flush builds is
  * where the interval lives from here, so it lives exactly as long as that table does
+ *
+ * having none and failing to gather them are reported apart, because a table built without the
+ * intervals this family did delete is a table that says those keys are back
  * @param fx the flush context, for the abandoned set and the reclamation floor
  * @param immutable the memtable being flushed
  * @param cf_index the family whose intervals are wanted
- * @return a set the caller frees, or NULL when this family has none or one could not be built
+ * @param out receives a set the caller frees, or NULL when this family has none
+ * @return TDB_SUCCESS, or TDB_ERR_MEMORY when the intervals could not be gathered
  */
-static range_tombstone_set_t *flush_cf_intervals(const flush_ctx_t *fx,
-                                                 tidesdb_memtable_t *immutable,
-                                                 const uint32_t cf_index)
+static int flush_cf_intervals(const flush_ctx_t *fx, tidesdb_memtable_t *immutable,
+                              const uint32_t cf_index, range_tombstone_set_t **out)
 {
+    *out = NULL;
     if (atomic_load_explicit(&immutable->range_tombstone_frags, memory_order_acquire) == 0)
-        return NULL;
+        return TDB_SUCCESS;
 
     range_tombstone_set_t *set = range_tombstone_set_new();
-    if (!set) return NULL;
+    if (!set) return TDB_ERR_MEMORY;
 
     int any = 0;
-    pthread_rwlock_rdlock(&immutable->range_tombstone_lock);
+    int rc = TDB_SUCCESS;
+    tdb_wprwlock_rdlock(&immutable->range_tombstone_lock);
     const size_t n = range_tombstone_set_count(immutable->range_tombstones);
-    for (size_t i = 0; i < n; i++)
+    for (size_t i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
         const rt_fragment_t *frag = NULL;
         if (range_tombstone_set_fragment_at(immutable->range_tombstones, i, &frag) != TDB_SUCCESS ||
@@ -271,23 +276,46 @@ static range_tombstone_set_t *flush_cf_intervals(const flush_ctx_t *fx,
             hi_size = frag->hi_size - TDB_CF_PREFIX_SIZE;
         }
 
+        /* the sequences this family keeps, gathered before any of them is appended. they stay
+         * descending because the fragment's are, and the filter only drops from that order */
+        uint64_t *kept = malloc(frag->seq_count * sizeof(uint64_t));
+        if (!kept)
+        {
+            rc = TDB_ERR_MEMORY;
+            break;
+        }
+
+        size_t n_kept = 0;
         int kept_base = 0;
         for (size_t k = 0; k < frag->seq_count; k++)
         {
             const uint64_t seq = frag->seqs[k];
             if (tidesdb_l0_seq_aborted(fx->l0, seq)) continue;
             if (!flush_retain(seq, fx->gc_floor, &kept_base)) break;
-            if (range_tombstone_set_add(set, frag->lo + TDB_CF_PREFIX_SIZE,
-                                        frag->lo_size - TDB_CF_PREFIX_SIZE, hi, hi_size,
-                                        seq) == TDB_SUCCESS)
-                any = 1;
+            kept[n_kept++] = seq;
         }
-    }
-    pthread_rwlock_unlock(&immutable->range_tombstone_lock);
 
-    if (any) return set;
-    range_tombstone_set_free(set);
-    return NULL;
+        /* appended whole rather than laid over the set one sequence at a time. the source is
+         * already fragmented and this walk preserves its order, so there is nothing to merge and
+         * merging would cost the square of the fragment count */
+        if (n_kept > 0)
+        {
+            rc = range_tombstone_set_append_fragment(set, frag->lo + TDB_CF_PREFIX_SIZE,
+                                                     frag->lo_size - TDB_CF_PREFIX_SIZE, hi,
+                                                     hi_size, kept, n_kept);
+            if (rc == TDB_SUCCESS) any = 1;
+        }
+        free(kept);
+    }
+    tdb_wprwlock_unlock(&immutable->range_tombstone_lock);
+
+    if (rc != TDB_SUCCESS || !any)
+    {
+        range_tombstone_set_free(set);
+        return rc;
+    }
+    *out = set;
+    return TDB_SUCCESS;
 }
 
 /* build one column family's L1 sstable from its run, leaving the cursor on the next family */
@@ -305,8 +333,16 @@ static int flush_build_cf(const flush_ctx_t *fx, cf_t *cf, uint32_t cf_index,
     tidesdb_column_family_config_t cc;
     flush_builder_config(fx, cf, id, klog_path, &cc, &config);
     /* the builder clones what it is given, so this set is released as soon as it has been handed
-     * over rather than held for the length of the build */
-    range_tombstone_set_t *intervals = flush_cf_intervals(fx, immutable, cf_index);
+     * over rather than held for the length of the build. a failure to gather them fails the build,
+     * since the alternative is a table that silently un-deletes what this family deleted */
+    range_tombstone_set_t *intervals = NULL;
+    rc = flush_cf_intervals(fx, immutable, cf_index, &intervals);
+    if (rc != TDB_SUCCESS)
+    {
+        (void)block_manager_close(klog_bm);
+        (void)remove(klog_path);
+        return rc;
+    }
     config.range_tombstones = intervals;
     sstable_builder_t *builder = NULL;
     const int new_rc = sstable_builder_new(&builder, klog_bm, cf->vlog, &config);
@@ -489,7 +525,9 @@ static int flush_commit_and_install(const flush_ctx_t *fx, flush_output_t *outpu
 static int flush_build_cf_intervals_only(const flush_ctx_t *fx, cf_t *cf, const uint32_t cf_index,
                                          tidesdb_memtable_t *immutable, flush_output_t *out)
 {
-    range_tombstone_set_t *intervals = flush_cf_intervals(fx, immutable, cf_index);
+    range_tombstone_set_t *intervals = NULL;
+    const int gather = flush_cf_intervals(fx, immutable, cf_index, &intervals);
+    if (gather != TDB_SUCCESS) return gather;
     if (!intervals) return TDB_ERR_NOT_FOUND; /* nothing of this family's to write */
 
     const uint64_t id = atomic_fetch_add(fx->next_sstable_id, 1);

@@ -56,7 +56,9 @@ struct merge_iter
 static int merge_key_cmp(const uint8_t *a, size_t a_size, const uint8_t *b, size_t b_size)
 {
     const size_t n = a_size < b_size ? a_size : b_size;
-    const int c = memcmp(a, b, n);
+    /* a zero length is a real key here -- a table carrying nothing but an interval tombstone has no
+     * key to name itself with -- and memcmp wants valid pointers whatever the length */
+    const int c = n > 0 ? memcmp(a, b, n) : 0;
     if (c != 0) return c;
     if (a_size < b_size) return -1;
     return a_size > b_size ? 1 : 0;

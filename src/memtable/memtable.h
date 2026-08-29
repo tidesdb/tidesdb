@@ -354,6 +354,18 @@ int tidesdb_l0_apply_range_tombstone(tidesdb_l0_t *l0, uint32_t cf_index, const 
                                      uint64_t seq);
 
 /**
+ * tidesdb_memtable_has_range_tombstones
+ * whether this memtable holds any interval at all, from one load and without the lock
+ *
+ * a caller that has to build a key before it can ask about one -- the merge's memtable view, which
+ * puts the family prefix back on first -- asks this before doing that work, since a memtable that
+ * has never taken a range delete answers no whatever key it would have been given
+ * @param mt the memtable
+ * @return 1 when it holds at least one interval, 0 otherwise
+ */
+int tidesdb_memtable_has_range_tombstones(const tidesdb_memtable_t *mt);
+
+/**
  * tidesdb_memtable_range_tombstone_covering
  * the newest range tombstone in one memtable covering a prefixed key at or below the snapshot,
  * stepping over one an abandoned commit left behind. a scan consults this per memtable so a delete

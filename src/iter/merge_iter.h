@@ -18,7 +18,9 @@
  * that and asks for MERGE_ITER_RAW instead, taking every version and applying its own retention.
  * it is generic over the source interface, so it composes real cursors or stub streams and is
  * unit-testable with neither a memtable nor an sstable. it is bidirectional; a direction change
- * re-seeks the sources around the current key so the flip never drops or repeats an entry. */
+ * re-seeks the sources around the current key so the flip never drops or repeats an entry. a raw
+ * scan may run either way but not both -- the re-seek a flip needs steps over the very versions raw
+ * exists to emit, so a flip is refused rather than answered wrongly. */
 
 /**
  * merge_source_t
@@ -74,9 +76,10 @@ typedef struct merge_iter merge_iter_t;
  * zero */
 #define MERGE_ITER_RESOLVE 0x0
 
-/* yield every version of every key (key ascending, then sequence descending) with no snapshot
- * resolution and no tombstone hiding; a compaction merge consumes this and applies its own MVCC
- * retention and tombstone GC. raw mode is forward-only. */
+/* yield every version of every key with no snapshot resolution and no tombstone hiding; a
+ * compaction merge consumes this and applies its own MVCC retention and tombstone GC. run forward
+ * the order is key ascending then sequence descending, and backward the reverse of both. whichever
+ * direction a raw scan starts in is the one it keeps, since it may not turn round. */
 #define MERGE_ITER_RAW 0x2
 
 /**

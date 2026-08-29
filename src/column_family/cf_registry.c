@@ -38,6 +38,20 @@ struct cf_registry
     int count;
     int capacity;
     _Atomic(uint64_t) next_cf_id;
+    /* writer-preferring, and it has to be. the readers are the engine's own background work --
+     * every flush install, every compaction claim, every reaper sweep -- and they arrive
+     * continuously under load, while the writers are the caller's create, drop, rename and clone.
+     * a plain rwlock admits an arriving reader while a writer waits, so a database that never stops
+     * flushing never lets the writer in and a create appears to hang while the process stays busy.
+     *
+     * the attribute that says otherwise is a glibc extension, which left the guarantee holding on
+     * one platform and the hang reachable on every other, so the preference is announced in the
+     * primitive instead.
+     *
+     * either way it is safe only because no reader takes it again while holding it. a reader that
+     * did would wait on its own writer announcement and never reach the acquire that would have
+     * completed, which is the same deadlock the nonrecursive attribute gave and for the same
+     * reason */
     tdb_wprwlock_t lock;
     /* the published view, its reader guard, and the retire list superseded views wait on */
     _Atomic(cf_registry_view_t *) view;
@@ -76,27 +90,6 @@ static int cf_registry_publish_locked(cf_registry_t *reg)
     return TDB_SUCCESS;
 }
 
-/* initialize the registry lock. a waiting writer is preferred over arriving readers, but by the
- * announcement in cf_registry_wrlock rather than by the lock's own kind.
- *
- * the readers are the engine's own background work -- every flush install, every compaction claim,
- * every reaper sweep -- and they arrive continuously under load. the writers are the caller's
- * create, drop, rename and clone. every rwlock admits an arriving reader while a writer waits
- * unless told otherwise, so a database that never stops flushing never lets the writer in at all,
- * and a create appears to hang while the process stays busy.
- *
- * the kind that says otherwise is a glibc extension, which left the guarantee holding on one
- * platform and the hang reachable on every other. announcing the writer instead is portable, so
- * this is a plain rwlock now and the preference lives in the two accessors.
- *
- * either way it is safe only because no reader takes the lock again while holding it. a reader that
- * did would wait on its own writer announcement and never reach the acquire that would have
- * completed, which is the same deadlock the nonrecursive attribute gave and for the same reason */
-static int cf_registry_lock_init(tdb_wprwlock_t *lock)
-{
-    return tdb_wprwlock_init(lock);
-}
-
 cf_registry_t *cf_registry_create(uint64_t next_cf_id)
 {
     cf_registry_t *reg = calloc(1, sizeof(*reg));
@@ -112,7 +105,7 @@ cf_registry_t *cf_registry_create(uint64_t next_cf_id)
     atomic_init(&reg->next_cf_id, next_cf_id);
     atomic_init(&reg->view, NULL);
     atomic_init(&reg->view_epoch, 0);
-    if (cf_registry_lock_init(&reg->lock) != 0)
+    if (tdb_wprwlock_init(&reg->lock) != 0)
     {
         free(reg->cfs);
         free(reg);

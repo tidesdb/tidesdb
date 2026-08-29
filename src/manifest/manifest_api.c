@@ -160,16 +160,19 @@ int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, const uint64_t cf
 
     atomic_fetch_add(&manifest->active_ops, 1);
     tdb_wprwlock_rdlock(&manifest->lock);
-    int found = 0;
-    for (int i = 0; i < manifest->num_entries; i++)
+    int at = manifest_index_find(manifest, cf_id, level, id);
+    if (at == MANIFEST_INDEX_NO_INDEX)
     {
-        if (manifest->entries[i].column_family_id == cf_id && manifest->entries[i].level == level &&
-            manifest->entries[i].id == id)
-        {
-            found = 1;
-            break;
-        }
+        at = -1;
+        for (int i = 0; i < manifest->num_entries; i++)
+            if (manifest->entries[i].column_family_id == cf_id &&
+                manifest->entries[i].level == level && manifest->entries[i].id == id)
+            {
+                at = i;
+                break;
+            }
     }
+    const int found = at >= 0;
     tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return found;
@@ -182,15 +185,20 @@ int tidesdb_manifest_find_level_by_id(tidesdb_manifest_t *manifest, const uint64
 
     atomic_fetch_add(&manifest->active_ops, 1);
     tdb_wprwlock_rdlock(&manifest->lock);
-    int level = -1;
-    for (int i = 0; i < manifest->num_entries; i++)
+    /* asked once per key log on disk by the orphan sweep, so walking the entries here is the open
+     * path paying the whole catalogue for every file it finds */
+    int at = manifest_index_find(manifest, cf_id, -1, id);
+    if (at == MANIFEST_INDEX_NO_INDEX)
     {
-        if (manifest->entries[i].column_family_id == cf_id && manifest->entries[i].id == id)
-        {
-            level = manifest->entries[i].level;
-            break;
-        }
+        at = -1;
+        for (int i = 0; i < manifest->num_entries; i++)
+            if (manifest->entries[i].column_family_id == cf_id && manifest->entries[i].id == id)
+            {
+                at = i;
+                break;
+            }
     }
+    const int level = at >= 0 ? manifest->entries[at].level : -1;
     tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return level;
@@ -203,15 +211,23 @@ int tidesdb_manifest_move_sstable(tidesdb_manifest_t *manifest, const uint64_t c
 
     atomic_fetch_add(&manifest->active_ops, 1);
     tdb_wprwlock_wrlock(&manifest->lock);
-    int result = -1;
-    for (int i = 0; i < manifest->num_entries; i++)
+    int at = manifest_index_find(manifest, cf_id, -1, id);
+    if (at == MANIFEST_INDEX_NO_INDEX)
     {
-        if (manifest->entries[i].column_family_id == cf_id && manifest->entries[i].id == id)
-        {
-            manifest->entries[i].level = new_level; /* birth_level, which names the file, is kept */
-            result = 0;
-            break;
-        }
+        at = -1;
+        for (int i = 0; i < manifest->num_entries; i++)
+            if (manifest->entries[i].column_family_id == cf_id && manifest->entries[i].id == id)
+            {
+                at = i;
+                break;
+            }
+    }
+    int result = -1;
+    if (at >= 0)
+    {
+        /* the level moves but the key does not, so the index still names it */
+        manifest->entries[at].level = new_level; /* birth_level, which names the file, is kept */
+        result = 0;
     }
     if (result == 0)
     {

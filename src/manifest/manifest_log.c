@@ -72,8 +72,8 @@ static int manifest_replay_locked(tidesdb_manifest_t *manifest)
 /**
  * manifest_snapshot_size
  * bytes a full snapshot batch occupies -- the version byte, one CF_ADD per registered cf (variable
- * for its name), one ADD_P per entry, and the
- * two sequence records
+ * for its name), one ADD_P per entry, and the two sequence records
+ * @param manifest the manifest to measure
  * @return the byte count
  */
 static size_t manifest_snapshot_size(const tidesdb_manifest_t *manifest)
@@ -362,6 +362,10 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
 
     manifest->num_entries = 0;
     manifest->capacity = MANIFEST_INITIAL_CAPACITY;
+    /* built on the first insert, since a manifest with no entries has nothing to index */
+    manifest->index = NULL;
+    manifest->index_cap = 0;
+    manifest->index_tombs = 0;
     /* the cf registry and the range tombstone sets are allocated lazily on first insert so a
      * database that uses neither carries no extra bookkeeping */
     manifest->cfs = NULL;
@@ -382,6 +386,7 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
     if (tdb_wprwlock_init(&manifest->lock) != 0)
     {
         free(manifest->entries);
+        free(manifest->index);
         free(manifest);
         return NULL;
     }
@@ -397,6 +402,8 @@ static void manifest_free_unopened(tidesdb_manifest_t *manifest)
 {
     tdb_wprwlock_destroy(&manifest->lock);
     free(manifest->entries);
+    free(manifest->index);
+    manifest->index = NULL;
     free(manifest);
 }
 
@@ -607,5 +614,7 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
     free(manifest->pending);
     free(manifest->cfs);
     free(manifest->entries);
+    free(manifest->index);
+    manifest->index = NULL;
     free(manifest);
 }

@@ -125,6 +125,11 @@ typedef struct
  * @entries array of sstable entries across all column families
  * @num_entries number of entries
  * @capacity capacity of entries array
+ * @index open-addressed map from a table's family and id to where it sits in entries, so an add, a
+ *        remove or a lookup does not walk them all. NULL when it could not be allocated, which
+ *        costs the walk back rather than correctness
+ * @index_cap slots the index holds, a power of two
+ * @index_tombs erased slots still occupying the table, which the remove path rebuilds past
  * @sequence current db-global sequence number
  * @next_cf_id the db-global cf-id high-water, one past the largest id ever assigned. it outlives
  * the families themselves so a dropped family's id is never reissued, which would otherwise let its
@@ -155,6 +160,9 @@ typedef struct
     tidesdb_manifest_entry_t *entries;
     int num_entries;
     int capacity;
+    int *index;
+    int index_cap;
+    int index_tombs;
     _Atomic(uint64_t) sequence;
     _Atomic(uint64_t) next_cf_id;
     char path[MANIFEST_PATH_LEN];

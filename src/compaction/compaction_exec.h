@@ -33,6 +33,9 @@
  *                 collapse to their newest, and a tombstone at the largest level below it is
  * dropped
  * @param sync_mode the block-manager sync mode driving the klog and manifest durability barriers
+ * @param value_threshold the database's value separation size, which a family that keeps its values
+ *                        inline raises out of reach rather than switching off -- see
+ *                        cf_config_value_threshold, which resolves the two
  * @param max_subdivisions the most threads one job may split its key range across, or 0 or 1 to run
  * every merge on the calling thread alone
  */

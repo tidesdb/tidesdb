@@ -126,7 +126,9 @@ int cf_create(const char *db_dir, const uint64_t cf_id,
     snprintf(cf->name, sizeof(cf->name), "%s", config->name);
     if (cf_dir_path(cf->dir, sizeof(cf->dir), db_dir) != 0)
     {
-        free(cf);
+        /* the configuration is published by this point and is an allocation of its own, so the
+         * family goes back through the teardown that knows about it */
+        cf_free(cf);
         return -1;
     }
 
@@ -177,7 +179,7 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
 
     if (cf_dir_path(cf->dir, sizeof(cf->dir), db_dir) != 0)
     {
-        free(cf);
+        cf_free(cf);
         return -1;
     }
 

@@ -374,10 +374,40 @@ void test_cf_open_fails_on_torn_deep_level(void)
     db_services_close(&dv);
 }
 
+/* a database directory too long to hold fails the create, and it fails after the configuration has
+ * been published -- which is an allocation of its own. the family has to go back through the
+ * teardown that knows about that allocation rather than be freed as a flat struct, or every failed
+ * create leaves the configuration behind */
+void test_cf_create_over_long_dir_leaks_nothing(void)
+{
+    db_services_t dv;
+    db_services_open(&dv);
+
+    tidesdb_encoding_registry_t reg;
+    ASSERT_EQ(tidesdb_encoding_registry_init(&reg), 0);
+    tidesdb_column_family_config_t config = make_config();
+
+    /* one byte past what the family's directory buffer can hold */
+    char *too_long = malloc(CF_DIR_PATH_LEN + 1);
+    ASSERT_TRUE(too_long != NULL);
+    memset(too_long, 'd', CF_DIR_PATH_LEN);
+    too_long[CF_DIR_PATH_LEN] = '\0';
+
+    cf_t *cf = NULL;
+    ASSERT_EQ(
+        cf_create(too_long, TEST_CF_ID, &config, &reg, dv.vlog, dv.cache, &dv.fdm, NULL, NULL, &cf),
+        -1);
+    ASSERT_TRUE(cf == NULL);
+
+    free(too_long);
+    db_services_close(&dv);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_cf_create, tests_passed);
+    RUN_TEST(test_cf_create_over_long_dir_leaks_nothing, tests_passed);
     RUN_TEST(test_cf_create_invalid, tests_passed);
     RUN_TEST(test_cf_open_empty, tests_passed);
     RUN_TEST(test_cf_open_rebuilds_levels, tests_passed);

@@ -86,10 +86,15 @@ int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out
  * cf_config_deserialize
  * decode a blob into a config's persisted fields; the caller sets name and the commit hook
  * separately
+ *
+ * only the fields the blob carries are written, so out must be zeroed first. what is left untouched
+ * is not merely stale but read -- the validation below measures the name, and the commit hook would
+ * be installed from whatever the caller's memory held
  * @param data the blob bytes
  * @param len length of data in bytes
- * @param out the config to fill (persisted fields only)
- * @return 0 on success, -1 on a bad argument, a wrong version, or a truncated blob
+ * @param out the config to fill, zeroed by the caller; persisted fields only
+ * @return 0 on success, -1 on a bad argument, a wrong version, a truncated blob, or a blob whose
+ *         decoded values are ones the create path would itself have refused
  */
 int cf_config_deserialize(const uint8_t *data, size_t len, tidesdb_column_family_config_t *out);
 

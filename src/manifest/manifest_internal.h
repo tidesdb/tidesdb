@@ -56,6 +56,28 @@ int manifest_cf_upsert_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_
                                 const char *name, const uint8_t *config_blob,
                                 size_t config_blob_len);
 int manifest_cf_drop_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id);
+/* what manifest_index_find returns when there is no index to consult, so a caller falls back to the
+ * walk rather than reading the absence as a miss */
+#define MANIFEST_INDEX_NO_INDEX (-3)
+
+/**
+ * manifest_index_find
+ * the entries slot holding one table, or -1 when the set does not hold it
+ * @param manifest the manifest to search
+ * @param cf_id the owning family
+ * @param level the level it must sit at, or negative to accept it wherever it sits
+ * @param id the table id
+ * @return the slot, -1 when absent, or MANIFEST_INDEX_NO_INDEX when there is no index
+ */
+int manifest_index_find(const tidesdb_manifest_t *manifest, uint64_t cf_id, int level, uint64_t id);
+
+/**
+ * manifest_index_invalidate
+ * drop the index, so the next mutation rebuilds it. used where entries are rewritten wholesale
+ * @param manifest the manifest whose index to drop
+ */
+void manifest_index_invalidate(tidesdb_manifest_t *manifest);
+
 int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, const uint64_t cf_id,
                                           const int level, const uint64_t id,
                                           const uint64_t num_entries, const uint64_t size_bytes,

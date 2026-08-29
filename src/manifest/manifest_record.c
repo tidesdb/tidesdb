@@ -12,6 +12,8 @@
  * manifest_pending_reserve
  * ensure the pending batch has room for need more bytes and return a write pointer to them,
  * advancing pending_len. grows the buffer by doubling
+ * @param manifest the manifest whose pending batch is being built
+ * @param need how many bytes to make room for
  * @return a write pointer to the reserved bytes, or NULL on allocation failure
  */
 static uint8_t *manifest_pending_reserve(tidesdb_manifest_t *manifest, const size_t need)
@@ -73,6 +75,7 @@ int manifest_pending_add_cf_drop(tidesdb_manifest_t *manifest, const uint64_t cf
  * manifest_pending_reset
  * reset the pending buffer to a fresh batch containing only the format byte. allocates the buffer
  * on first use
+ * @param manifest the manifest whose pending batch is reset
  * @return 0 on success, -1 on allocation failure
  */
 int manifest_pending_reset(tidesdb_manifest_t *manifest)
@@ -93,6 +96,14 @@ int manifest_pending_reset(tidesdb_manifest_t *manifest)
  * append one fixed-size record to the pending batch. carries the owning cf id after the opcode for
  * ADD_P/MOVE/REMOVE; for MANIFEST_OP_SEQ the sequence is passed in id and cf_id is unused. grows
  * the buffer by doubling
+ * @param manifest the manifest whose pending batch the record joins
+ * @param op the record's opcode
+ * @param cf_id the owning family, unused for MANIFEST_OP_SEQ
+ * @param level the level the entry sits at
+ * @param id the sstable id, or the sequence for MANIFEST_OP_SEQ
+ * @param num_entries how many entries the sstable holds
+ * @param size_bytes how large it is on disk
+ * @param partition the partition it belongs to, or MANIFEST_NO_PARTITION
  * @return 0 on success, -1 on allocation failure
  */
 int manifest_pending_add_record(tidesdb_manifest_t *manifest, const uint8_t op,
@@ -286,6 +297,9 @@ static int manifest_apply_sstable_record(tidesdb_manifest_t *manifest, const uin
  * decode one committed block payload (format byte then self-delimiting records) and apply each
  * record to the in-memory set. a record whose fields would overrun the payload marks the batch
  * truncated
+ * @param manifest the manifest the records are applied to
+ * @param data the committed block payload
+ * @param size length of data in bytes
  * @return 0 on a clean batch, -1 if the batch was truncated (a torn final commit)
  */
 int manifest_apply_batch(tidesdb_manifest_t *manifest, const uint8_t *data, const size_t size)

@@ -864,14 +864,18 @@ static int ce_interval_contained(cf_t *cf, const rt_fragment_t *frag, const uint
  * bounds what a table accumulates
  * @param cx the compaction context, for the family and the reclamation floor
  * @param job the job being run, for its input ids and whether it writes the largest level
+ * carrying none and failing to carry them are reported apart. this merge deletes the files its
+ * inputs live in, so an interval that does not reach the output is not delayed but gone, and the
+ * keys it covered come back
  * @param inputs the tables being merged
  * @param n_inputs how many
- * @return a set the caller frees, or NULL when no input carries any
+ * @param out receives a set the caller frees, or NULL when no input carries any
+ * @return TDB_SUCCESS, or TDB_ERR_MEMORY when the union could not be built
  */
-static range_tombstone_set_t *ce_union_intervals(const compaction_ctx_t *cx,
-                                                 const compaction_job_t *job,
-                                                 sstable_t *const *inputs, int n_inputs)
+static int ce_union_intervals(const compaction_ctx_t *cx, const compaction_job_t *job,
+                              sstable_t *const *inputs, int n_inputs, range_tombstone_set_t **out)
 {
+    *out = NULL;
     range_tombstone_set_t *set = NULL;
     for (int i = 0; i < n_inputs; i++)
     {
@@ -897,14 +901,20 @@ static range_tombstone_set_t *ce_union_intervals(const compaction_ctx_t *cx,
             for (size_t k = 0; k < frag->seq_count; k++)
             {
                 if (finished && frag->seqs[k] <= cx->gc_floor) continue;
-                if (!set && !(set = range_tombstone_set_new())) return NULL;
-                (void)range_tombstone_set_add(set, frag->lo, frag->lo_size,
-                                              frag->hi_size ? frag->hi : NULL, frag->hi_size,
-                                              frag->seqs[k]);
+                if (!set && !(set = range_tombstone_set_new())) return TDB_ERR_MEMORY;
+                const int added = range_tombstone_set_add(set, frag->lo, frag->lo_size,
+                                                          frag->hi_size ? frag->hi : NULL,
+                                                          frag->hi_size, frag->seqs[k]);
+                if (added != TDB_SUCCESS)
+                {
+                    range_tombstone_set_free(set);
+                    return added;
+                }
             }
         }
     }
-    return set;
+    *out = set;
+    return TDB_SUCCESS;
 }
 
 int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
@@ -936,10 +946,14 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     memset(&sink, 0, sizeof(sink));
     sink.cx = cx;
     /* borrowed by the sink for the length of the merge; every output clones what it is given */
-    range_tombstone_set_t *carried = ce_union_intervals(cx, job, inputs, n_inputs);
+    range_tombstone_set_t *carried = NULL;
+    /* built before anything is written, so a failure to gather what the inputs carry stops the
+     * merge while its inputs are still installed and the whole job can be run again */
+    int rc = ce_union_intervals(cx, job, inputs, n_inputs, &carried);
     sink.carried = carried;
     const int k = ce_subdivisions(cx, job);
-    int rc = k > 1 ? ce_merge_subdivided(cx, job, inputs, n_inputs, k, &sink)
+    if (rc == TDB_SUCCESS)
+        rc = k > 1 ? ce_merge_subdivided(cx, job, inputs, n_inputs, k, &sink)
                    : ce_merge_inputs(cx, job, inputs, n_inputs, &sink, NULL, 0, NULL, 0);
     if (rc == TDB_SUCCESS) rc = ce_commit(cx, job, inputs, in_sizes, n_inputs, &sink);
 

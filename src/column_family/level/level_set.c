@@ -96,6 +96,8 @@ static int level_key_cmp(const uint8_t *key1, const size_t key1_size, const uint
 /**
  * level_min_key_cmp
  * order two sstables by their min_key, keeping L2+ runs sorted
+ * @param a the first sstable
+ * @param b the second sstable
  * @return negative, zero, or positive as a's min_key orders before, equal to, or after b's
  */
 static int level_min_key_cmp(const sstable_t *a, const sstable_t *b)
@@ -144,6 +146,12 @@ static int level_min_key_upper_bound(const level_entry_t *arr, const int n, cons
  * level_ranges_overlap
  * whether an sstable's [min,max] intersects the query range [min_key,max_key]; disjoint iff
  * the sstable ends before the range starts or starts after the range ends
+ * @param sst the sstable whose recorded bounds are tested
+ * @param min_key inclusive lower bound of the query range
+ * @param min_key_size length of min_key in bytes
+ * @param max_key inclusive upper bound of the query range
+ * @param max_key_size length of max_key in bytes
+ * @return 1 when the two ranges intersect, 0 when they are disjoint
  */
 static int level_ranges_overlap(const sstable_t *sst, const uint8_t *min_key,
                                 const size_t min_key_size, const uint8_t *max_key,
@@ -165,6 +173,8 @@ static int level_ranges_overlap(const sstable_t *sst, const uint8_t *min_key,
  * level_layout_reclaim
  * free a superseded layout, dropping its reference on every sstable it listed; the last reference
  * to a superseded sstable closes the handle
+ * @param item the retired layout, typed void for the epoch reclaimer that calls this
+ * @param ctx unused, present for the reclaimer's signature
  */
 static void level_layout_reclaim(void *item, void *ctx)
 {
@@ -239,6 +249,10 @@ static void level_insert_entry(level_layout_t *lay, const int level_index, sstab
 /**
  * level_sst_in_set
  * whether an sstable pointer is one of the swap inputs, matched by identity
+ * @param sst the sstable to look for
+ * @param set the swap inputs
+ * @param n how many inputs set holds
+ * @return 1 when sst is one of them, 0 otherwise
  */
 static int level_sst_in_set(const sstable_t *sst, sstable_t *const *set, const int n)
 {
@@ -250,6 +264,8 @@ static int level_sst_in_set(const sstable_t *sst, sstable_t *const *set, const i
 /**
  * level_publish
  * install a freshly built layout as current and retire the old one for epoch-guarded reclamation
+ * @param ls the level set to publish into
+ * @param fresh the layout to make current, whose ownership passes to the set
  */
 static void level_publish(level_set_t *ls, level_layout_t *fresh)
 {

@@ -103,6 +103,15 @@ Rollover triggers when records since the last snapshot exceed
 bounds replay to a small multiple of what is actually there, while amortizing the O(N)
 snapshot to O(1) per commit.
 
+That bound only means something if replaying a record is cheap. The live set is held with an
+index from a table's family and id to where it sits, so applying a record — and every later add,
+removal and lookup — finds its entry rather than walking the set. Without one each record pays the
+length of everything before it, which makes replay quadratic in the very number the rollover was
+sized to bound, and makes each flush and compaction output pay it again for as long as the
+database runs. The index is rebuilt rather than repaired where the set is rewritten wholesale, and
+a database whose index could not be allocated falls back to the walk, which costs speed and not
+correctness.
+
 The rewrite is done safely: the snapshot is written to a temp file beside the manifest, made
 durable, then **atomically renamed** over it. A crash before the rename leaves the old
 manifest intact; after it, the new one. There is no window where the file is partially

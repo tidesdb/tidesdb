@@ -122,14 +122,16 @@ it, and only one of them is soon enough:
   which are closed once flushed.
 - **When a build finishes.** An sstable is closed only when it is evicted or the database shuts
   down, so a live one holds its handle for as long as it is installed. Waiting for close would leave
-  every installed sstable occupying a full chunk.
+  every installed sstable occupying its whole reserved extent.
 
 A finished sstable is therefore trimmed by its builder, before the durability barrier so the one
 fsync covers the truncation as well. Skipping it is not a correctness bug and nothing fails — the
 data is intact, reads are unaffected, and closing the database reclaims it all — which is exactly
-what makes it easy to miss. What it does is make the store mostly padding: at a 64 MiB chunk, a
-database of a few hundred sstables reports several gigabytes of live data while occupying tens of
-gigabytes on disk, and the gap looks convincingly like a compaction that is failing to reclaim.
+what makes it easy to miss. What it does is make the store mostly padding, and the gap looks
+convincingly like a compaction that is failing to reclaim. A flush sizes each output's reservation
+to the data it is about to write and a quarter again, so the padding on an ordinary sstable is a
+fraction of it rather than a whole chunk; the chunk is the ceiling that estimate is capped at, and
+what a run reserves when it outgrows its estimate and the block manager extends it.
 
 A platform where no variant is available is not broken, only slower: the first failure disables
 further attempts for that file and writes take the extending path. Because that cost is large and

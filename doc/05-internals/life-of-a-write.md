@@ -93,7 +93,7 @@ that does not feed the write should not narrow the window the write is validated
 
 An interval has no key to hash, so a range delete claims the interval itself in a second, small
 table, and every point write checks that table before taking its own slot. The table is almost
-always empty, so the check is a single relaxed load. The claim is released when the transaction
+always empty, so the check is a single atomic load of its count. The claim is released when the transaction
 resolves, which is what carries a two-phase range delete through its in-doubt window.
 
 A lost reservation is `TDB_ERR_CONFLICT`, and still nothing durable has happened.
@@ -205,9 +205,10 @@ committing thread. Work done in a hook is latency every writer pays.
 
 ## Stage 10 — Rotation
 
-The committing thread then checks whether its write filled the memtable. If so, **that
-thread** performs the rotation: it seals the active memtable, enqueues it, and installs a
-fresh one.
+The committing thread then checks whether its write filled the memtable. If so it tries to take the
+rotation lock, and having it, seals the active memtable, enqueues it, and installs a fresh one. A
+thread that finds the lock held does not queue behind it. The rotation is already being done by the
+holder, and this thread's write has landed either way, so it returns to its commit.
 
 The order within the rotation is exact: the sealed memtable is **enqueued before** the
 active slot is swapped. For a moment it is reachable both ways. The alternative — swap then
@@ -310,7 +311,7 @@ annihilate immediately.
           |
      mark committed       now visible; hooks fire
           |
-     maybe rotate         on this thread; enqueue before swap
+     maybe rotate         on this thread if it takes the lock; enqueue before swap
           |
      flush                demux to per-family sstables, one atomic manifest commit,
           |               installs ordered by ticket

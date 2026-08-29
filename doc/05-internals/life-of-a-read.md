@@ -136,6 +136,24 @@ keys left L0 long ago and nothing backs them up. So the read records the layout 
 the walk and checks it again on a miss; a shape that moved underneath reports a retryable busy
 rather than an absence that was never true.
 
+## A range delete is not found where the key is
+
+Every source above answers by looking where the key would be. A range delete cannot be found that
+way. It covers an interval, so it deletes keys that may not exist yet and keys it was never stored
+beside, and no search for the key itself would meet it.
+
+So each source is asked separately whether an interval it holds covers the key. A memtable keeps its
+intervals beside its skip list and is asked for both. A family's tables each carry the intervals
+they were built with, and the covering question is put to all of them rather than only to the ones
+whose key range holds the key, since the table an interval rode in on need not have a single key of
+its own. A family that has never deleted a range answers from one load of a count the level set
+republishes with each layout.
+
+Whichever is newer wins. An interval laid after a version deletes it, and a version written after an
+interval survives it. The comparison is against the sequence, exactly as it is between two versions
+of the same key, and a covering interval resolves to an absent answer rather than a fall-through to
+an older source, for the same reason a tombstone does.
+
 ## Stage 5 — Inside one sstable
 
 Three steps, arranged so the expensive ones are usually skipped.

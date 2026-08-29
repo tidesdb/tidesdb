@@ -235,9 +235,14 @@ close, silently, which no crash test would catch.
 
 ## The rotation lock is on the commit path
 
-Rotation runs on whichever committing thread finds the memtable full, and every other committer
-that agrees waits on the same lock. That makes `rotate_lock` unlike any other lock in the engine:
-**time spent holding it is time every writer in the database is stopped.**
+Rotation runs on whichever committing thread finds the memtable full. The others do not queue behind
+it. A rotation has to happen, but it is not work any particular caller must do, and the write that
+prompted it has already landed, so a committer that finds the lock held goes back to its commit and
+leaves the rotation to the thread already doing it. Declining rather than waiting is what keeps a
+mutex that hands off by barging from starving one committer for as long as the rest keep arriving.
+
+The lock is still unlike any other in the engine. Time spent holding it is time no other committer
+can rotate, so a memtable that is already full stays full for the length of the hold.
 
 The rotation itself is short — a few hundred microseconds to open the next log and swap the slot.
 What is not safe is anything else borrowing the lock for convenience.
@@ -359,11 +364,10 @@ taken literally.
 A flush retires the memtable it just installed while holding the column-family registry read lock,
 and it holds that lock across the whole install because the level sets it mutates belong to
 families the lock keeps alive. Creating or dropping a family takes the same lock for writing. So a
-retire that waited for a reader to leave would hold a read lock for as long as that reader stayed —
-and under glibc's default reader-preference, a waiting writer does not stop new readers arriving,
-so the write lock is not merely delayed but can be starved outright while the flush spins. The
-visible symptom is a `tidesdb_create_column_family` that never returns while the process burns a
-core.
+retire that waited for a reader to leave would hold a read lock for as long as that reader stayed.
+The announcement holds off readers that have not arrived yet. It does nothing about a reader already
+inside, and the writer waits for every one of those. A `tidesdb_create_column_family` then takes as
+long as the reader the flush is waiting on.
 
 The reclaim is therefore bounded. It rechecks whether the readers have gone a fixed number of
 times, and if they have not, it puts the memtable on a **pending list** and returns. The
@@ -440,7 +444,7 @@ rather than applied, and surfaces through
 | A memtable takes its value log floor when it becomes active, not at its first reference | A value reaches the value log before the commit that produced it reaches any memtable, so a floor taken later leaves a window where a reclaim drops the segment it just landed in |
 | A memtable lowers that floor onto a reference's own segment | Its floor covers what was written after it became active; a value separated a moment before a rotation is applied here while living below that point |
 | The floor is released only when the flush installs | Until an sstable names those values, this memtable is the only thing that does |
-| A flush never waits out a reader to free a memtable | It holds the registry read lock, so an unbounded wait there starves family create and drop; it defers to the reaper instead |
+| A flush never waits out a reader to free a memtable | It holds the registry read lock, so an unbounded wait there blocks family create and drop for exactly that long; it defers to the reaper instead |
 | Blocking on backpressure has a ceiling | A stuck flush must degrade to slow, not to deadlocked |
 | Ingestion is paced against merging, not only against flush | They fail independently: an empty queue with a deep tier means flush kept up and merging did not, and every later read pays for it |
 | A synchronous flush waits for the immutable queue to drain, not for its own generation | Backup and clone copy files, and a rotation seals nothing when the active memtable is empty — so waiting on the sealed generation returns while earlier generations are still only in memory, and the copy misses them |

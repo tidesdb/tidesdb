@@ -281,7 +281,7 @@ one that a tail is made of, since a total cannot tell many short waits from one 
 | Reason | Constant | The caller was |
 | --- | --- | --- |
 | `wal_append` | `TDB_STALL_WAL_APPEND` | waiting on the write-ahead log — for staging-ring space, or under a syncing mode for its record to reach the file |
-| `rotate_lock` | `TDB_STALL_ROTATE_LOCK` | waiting to take the rotation lock, so another committer was rotating |
+| `rotate_lock` | `TDB_STALL_ROTATE_LOCK` | taking the rotation lock, which a committer declines rather than waits for when another thread holds it |
 | `rotate_work` | `TDB_STALL_ROTATE_WORK` | performing the rotation itself, which one committer pays on every other's behalf |
 | `admission` | `TDB_STALL_ADMISSION` | held by write admission because the unflushed backlog was too deep |
 

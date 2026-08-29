@@ -103,10 +103,11 @@ this point is reading the very memtables being rebuilt. Any answer short of a de
 entry: applying one that was already superseded costs a redundant version, dropping one that was not
 is data loss.
 
-A sequence gate keeps this free in the ordinary case. An entry above the highest sequence any
-sstable holds cannot be on disk, so it never reaches the probe -- and after a clean shutdown the
-only surviving log is the one the active memtable was never flushed from, whose sequences are all
-above it.
+The probe is cheap in the ordinary case. Every entry is asked about, since a watermark covering the
+whole database cannot stand in for the question, but each table records the highest sequence it
+holds and one above that is skipped without a descent. After a clean shutdown the only surviving log
+is the one the active memtable was never flushed from, whose sequences are all above every table's,
+so every skip applies.
 :::
 
 **Not every durable batch is applied.** A batch that reached the log but failed to enter the

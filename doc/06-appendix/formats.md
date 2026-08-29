@@ -145,7 +145,7 @@ as it always did.
 The last block of a `.klog`. **Big-endian**, unlike everything else — it is read by a path that
 predates the little-endian convention elsewhere.
 
-Fixed head, 116 bytes:
+Fixed head, 120 bytes (`TDB_SSTABLE_FOOTER_FIXED_BYTES`):
 
 ```
   size  field
@@ -164,18 +164,17 @@ Fixed head, 116 bytes:
      8  total value bytes
      8  klog logical bytes
      8  btree node count
-     8  range tombstone applied sequence
+     8  range tombstone block offset
+     4  range tombstone block size
      4  btree height
      4  btree node size
 ```
 
-The *range tombstone applied sequence* is the newest range tombstone this table's build could see
-at the reclamation floor it ran at, and every one at or below it had already been applied to these
-contents. The **minimum across a column family's tables** is what says a range tombstone has
-nothing left to hide and can be retired. A table built before any range tombstone existed records
-zero and holds that minimum down until it is rewritten, which is the conservative direction: the
-value has to be a sequence the build actually observed, never the floor, or a table built before a
-tombstone would claim to have applied it.
+The *range tombstone block* holds the intervals this table carries, written at seal and read back at
+open. A flush hands over what its memtable held and a merge hands on what its inputs carried, so an
+interval lives exactly as long as a table holding it. An offset and size of zero mean the table
+carries none, which is the common case. A table may carry intervals and no keys at all, which is how
+a family reached only by a range delete has somewhere to keep it.
 
 Then a variable tail:
 
@@ -308,9 +307,9 @@ One framed block per commit, holding a batch:
 Records are self-delimiting, so a batch is walked without an index. The column family
 configuration blob is stored **verbatim and never interpreted** by the manifest.
 
-A rollover writes a single snapshot batch — the family registry, every live sstable, each family's
-range tombstone set, then `MANIFEST_OP_SEQ` and `MANIFEST_OP_CF_SEQ` — to a temp file that is then
-atomically renamed over the manifest.
+A rollover writes a single snapshot batch — the family registry, every live sstable, then
+`MANIFEST_OP_SEQ` and `MANIFEST_OP_CF_SEQ` — to a temp file that is then atomically renamed over the
+manifest. Range deletes are not among them; a table carries its own.
 
 ## Compatibility
 

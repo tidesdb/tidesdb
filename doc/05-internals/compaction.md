@@ -300,12 +300,13 @@ keys, which is what gives the delete somewhere to live.
 There is no separate store to keep in step and nothing to prove spent. An interval is present
 exactly while some table carries it and goes when the last table holding it is merged away.
 
-That property is what an earlier design failed to get right. Keeping intervals in a store of their
-own meant deciding when one had nothing left to hide, and the answer had to hold across every table,
-every unflushed memtable and every unreplayed log at once. A per-table watermark cannot carry that
-claim: intervals reach a family in flush order rather than in sequence order, so a table asserting
-it applied everything through a sequence can be handed one beneath that mark afterwards. Every key
-such an interval covered came back.
+That property is the reason the interval travels with the table rather than living in a store of the
+family's own. A store has to be told when an interval is spent, and that answer has to hold across
+every table, every unflushed memtable and every unreplayed log at once. A per-table watermark cannot
+carry it. Intervals reach a family in flush order rather than in sequence order, so a table that has
+applied everything through a sequence can be handed one beneath that mark afterwards, and every key
+the interval covered comes back. Carrying it makes the question unnecessary instead of answering
+it.
 
 ### Where an interval stops travelling
 

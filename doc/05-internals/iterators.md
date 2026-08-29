@@ -84,9 +84,10 @@ sit one step past the version just emitted, so the first step back re-emits it. 
 right, so `merge_iter_prev` on a forward raw scan returns `TDB_ERR_INVALID_ARGS` rather than a
 silently repeated version. A raw scan that runs backward from the start never turns and is fine.
 
-Range deletes are the exception to that division of labour: they never enter the merge stream at
-all, in either mode. They live in the manifest, so a compaction asks the family whether an interval
-covers each key it is about to emit rather than carrying tombstones through its output.
+Range deletes are the exception to that division of labour. They never enter the merge stream at
+all, in either mode, because an interval is not an entry in a key order. A table carries the
+intervals it was built with beside its keys, so a compaction asks the family whether one covers each
+key it is about to emit rather than carrying tombstones through its output.
 
 ## Which sources the merge is built from
 

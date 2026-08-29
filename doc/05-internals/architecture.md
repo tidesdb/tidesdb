@@ -112,16 +112,21 @@ reaper sweep, every statistics fold. Under load these arrive continuously, and n
 the caller's work. Only `create`, `drop`, `rename` and `clone` take it for **writing**, and those
 are exactly the operations a user issues and waits on.
 
-That asymmetry makes the default lock policy the wrong one. glibc's rwlock prefers readers, so a
-new reader is admitted even while a writer is queued -- and a database whose background work never
-stops never produces the gap the writer needs. The writer is not slow; it never runs. A
-`CREATE TABLE` hangs for minutes while the process sits at a full core, which reads as a deadlock
-and is really starvation.
+That asymmetry makes the default lock policy the wrong one. A reader-writer lock admits an arriving
+reader while a writer waits, so a database whose background work never stops never produces the gap
+the writer needs. The writer is not slow; it never runs. A `CREATE TABLE` hangs for minutes while
+the process sits at a full core, which reads as a deadlock and is really starvation.
 
-So the registry lock is initialised to prefer a waiting writer, and the read side is kept short
-enough that the writer's wait is bounded by one operation rather than by the load. The one rule
-that buys is that **no reader may take the lock again while holding it**, and none does; the
-attribute deadlocks a reader that tries.
+The lock therefore announces a waiting writer. A writer raises a count before it acquires and lowers
+it after, and a reader arriving while that count is non-zero waits for it to fall. The writer's wait
+is bounded by the readers already inside rather than by the load. A reader that slips through
+between reading the count and acquiring costs the writer one more hold, which is why the count is
+enough and a handoff is not needed. `tdb_wprwlock_t` carries this, and the commit gate and the
+manifest take it for the same reason.
+
+The one rule it depends on is that no reader may take the lock again while holding it, and none
+does. Such a reader would wait on its own writer's announcement and never reach the acquire that
+would release it.
 
 Two things follow from the same reasoning. A flush waits for its install ticket *before* taking
 the read lock, never while holding it -- waiting under it would both lengthen the hold to include

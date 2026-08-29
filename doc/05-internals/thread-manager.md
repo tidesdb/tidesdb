@@ -106,6 +106,14 @@ a detail.
 
 The tickers are cheap by construction. Each parks on a condition variable with a deadline rather
 than polling, and the ones that are conditional are not started at all when nothing asks for them.
+
+A deadline is an absolute time, so the clock it is read from decides what the wait means. Where a
+condition variable can select its clock the engine gives it the monotonic one and builds the
+deadline from the same, so the two agree. A wall clock that steps forward or back would otherwise
+leave every parked thread waiting for a time that has moved away from it, and since the background
+workers all park in the same place, they stop together and for the length of the step. macOS has no
+way to select the clock, so there both the variable and its deadlines stay on the wall clock, which
+at least keeps them consistent with each other.
 Four run once a second — the transaction clock, the descriptor reaper, deferred frees and the
 compaction scheduler — so that is four wakeups a second in the usual configuration and five under
 `TDB_SYNC_INTERVAL`, plus idle rotation on its own far longer period, thirty seconds by default.

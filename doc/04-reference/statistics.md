@@ -346,6 +346,7 @@ putting beside it.
 | --- | --- | --- |
 | `sstable` | `TDB_IO_SSTABLE` | flush and compaction, writing key logs |
 | `wal` | `TDB_IO_WAL` | the write-ahead log's own single flush thread |
+| `vlog` | `TDB_IO_VLOG` | value log segments, written by a commit that separates a value and by the reclaim that copies live values forward |
 
 As with the stall reasons, the short name is what `tidesdb_io_class_name` returns and the constant
 is how you index `classes[]`; `TDB_IO_COUNT` is the number of classes, not itself a class.

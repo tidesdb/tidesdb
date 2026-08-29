@@ -173,9 +173,9 @@ static int ce_sink_open(ce_sink_t *s)
      * until it installs, and the builder's closing fsync covers the whole file, so a barrier per
      * block would only slow the merge down. the builder config below still carries the real sync
      * mode, which is what drives that closing barrier */
-    if (s->cx->cf->fdm
-            ? fd_manager_bm_open(s->cx->cf->fdm, &s->cur_bm, klog_path, BLOCK_MANAGER_SYNC_NONE)
-            : block_manager_open(&s->cur_bm, klog_path, BLOCK_MANAGER_SYNC_NONE))
+    if (s->cx->cf->fdm ? fd_manager_bm_open(s->cx->cf->fdm, &s->cur_bm, klog_path,
+                                            BLOCK_MANAGER_SYNC_NONE, FD_LABEL_SSTABLE_KLOG)
+                       : block_manager_open(&s->cur_bm, klog_path, BLOCK_MANAGER_SYNC_NONE))
         return TDB_ERR_IO;
 
     sstable_builder_config_t config;

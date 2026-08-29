@@ -194,8 +194,9 @@ int sstable_open_from_manifest(sstable_t **out, const char *cf_dir, const char *
      * descriptor; it still routes through the fd manager for EMFILE backpressure when one is given
      */
     block_manager_t *bm = NULL;
-    const int open_rc = fdm ? fd_manager_bm_open(fdm, &bm, klog_path, sync_mode)
-                            : block_manager_open(&bm, klog_path, sync_mode);
+    const int open_rc =
+        fdm ? fd_manager_bm_open(fdm, &bm, klog_path, sync_mode, FD_LABEL_SSTABLE_KLOG)
+            : block_manager_open(&bm, klog_path, sync_mode);
     if (open_rc != 0)
     {
         free(klog_path);
@@ -271,9 +272,9 @@ block_manager_t *sstable_ensure_open(sstable_t *sst)
     if (bm) return bm;
 
     block_manager_t *opened = NULL;
-    const int open_rc = sst->fdm
-                            ? fd_manager_bm_open(sst->fdm, &opened, sst->klog_path, sst->sync_mode)
-                            : block_manager_open(&opened, sst->klog_path, sst->sync_mode);
+    const int open_rc = sst->fdm ? fd_manager_bm_open(sst->fdm, &opened, sst->klog_path,
+                                                      sst->sync_mode, FD_LABEL_SSTABLE_KLOG)
+                                 : block_manager_open(&opened, sst->klog_path, sst->sync_mode);
     if (open_rc != 0) return NULL;
 
     block_manager_t *expected = NULL;

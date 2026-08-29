@@ -166,7 +166,9 @@ void test_fd_manager_bm_open(void)
     ASSERT_EQ(fd_manager_init(&fdm, 128), 0);
 
     block_manager_t *bm = NULL;
-    ASSERT_EQ(fd_manager_bm_open(&fdm, &bm, TEST_FDM_FILE, BLOCK_MANAGER_SYNC_NONE), 0);
+    ASSERT_EQ(fd_manager_bm_open(&fdm, &bm, TEST_FDM_FILE, BLOCK_MANAGER_SYNC_NONE,
+                                 FD_LABEL_SSTABLE_KLOG),
+              0);
     ASSERT_TRUE(bm != NULL);
     ASSERT_EQ(block_manager_close(bm), 0);
 
@@ -209,6 +211,84 @@ void test_fd_manager_budget_for_process(void)
     ASSERT_EQ(fd_manager_budget_for_process(4, 64), 4);
 }
 
+/* a handle's writes are accounted against the label it was opened with. the manager keeps one
+ * counter per file kind so a caller can see what each kind is costing the device, and that only
+ * means anything if the kind is the one the file actually is -- an open that pinned every handle to
+ * one label would report a value log's writes as a key log's, and the value log's own counter would
+ * never move */
+void test_fd_manager_io_accounted_by_label(void)
+{
+    remove(TEST_FDM_FILE);
+    remove(TEST_FDM_FILE ".2");
+
+    fd_manager_t fdm;
+    ASSERT_EQ(fd_manager_init(&fdm, 128), 0);
+
+    const char payload[64] = {0};
+    block_manager_t *klog = NULL, *vlog = NULL;
+    ASSERT_EQ(fd_manager_bm_open(&fdm, &klog, TEST_FDM_FILE, BLOCK_MANAGER_SYNC_NONE,
+                                 FD_LABEL_SSTABLE_KLOG),
+              0);
+    ASSERT_EQ(fd_manager_bm_open(&fdm, &vlog, TEST_FDM_FILE ".2", BLOCK_MANAGER_SYNC_NONE,
+                                 FD_LABEL_VLOG_SEGMENT),
+              0);
+    ASSERT_TRUE(block_manager_write_raw(klog, payload, (uint32_t)sizeof(payload)) >= 0);
+    ASSERT_TRUE(block_manager_write_raw(vlog, payload, (uint32_t)sizeof(payload)) >= 0);
+    ASSERT_EQ(block_manager_close(klog), 0);
+    ASSERT_EQ(block_manager_close(vlog), 0);
+
+    uint64_t ops = 0, bytes = 0, total_us = 0, max_us = 0;
+    fd_manager_io_stats(&fdm, FD_LABEL_SSTABLE_KLOG, &ops, &bytes, &total_us, &max_us);
+    ASSERT_EQ((int)ops, 1);
+    ASSERT_TRUE(bytes >= sizeof(payload));
+
+    fd_manager_io_stats(&fdm, FD_LABEL_VLOG_SEGMENT, &ops, &bytes, &total_us, &max_us);
+    ASSERT_EQ((int)ops, 1);
+    ASSERT_TRUE(bytes >= sizeof(payload));
+
+    /* nothing was opened as a log, so its counter stayed where it started */
+    fd_manager_io_stats(&fdm, FD_LABEL_WAL_LOG, &ops, &bytes, &total_us, &max_us);
+    ASSERT_EQ((int)ops, 0);
+    ASSERT_EQ((int)bytes, 0);
+
+    fd_manager_destroy(&fdm);
+    remove(TEST_FDM_FILE);
+    remove(TEST_FDM_FILE ".2");
+}
+
+static int fdm_test_wake_calls = 0;
+
+static void fdm_test_wake(void *ctx)
+{
+    (*(int *)ctx)++;
+}
+
+/* waking the reaper has to actually reach it. the callers that wake it wait far less than the
+ * reaper's own tick before giving up, so a wake that went nowhere would leave every one of them
+ * reporting a shortage the reaper was about to clear. the manager holds no engine, so what to call
+ * is installed from outside and is absent in a test that drives it with no reaper behind it */
+void test_fd_manager_reaper_wake_reaches_the_reaper(void)
+{
+    fd_manager_t fdm;
+    ASSERT_EQ(fd_manager_init(&fdm, 128), 0);
+
+    /* nothing installed yet, so a wake is a no-op rather than a crash */
+    fd_manager_wake_reaper(&fdm);
+
+    fdm_test_wake_calls = 0;
+    fd_manager_set_reaper_wake(&fdm, fdm_test_wake, &fdm_test_wake_calls);
+    fd_manager_wake_reaper(&fdm);
+    fd_manager_wake_reaper(&fdm);
+    ASSERT_EQ(fdm_test_wake_calls, 2);
+
+    /* cleared before the reaper it names goes away, after which a wake reaches nothing */
+    fd_manager_set_reaper_wake(&fdm, NULL, NULL);
+    fd_manager_wake_reaper(&fdm);
+    ASSERT_EQ(fdm_test_wake_calls, 2);
+
+    fd_manager_destroy(&fdm);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -220,6 +300,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_fd_manager_reader_budget, tests_passed);
     RUN_TEST(test_fd_manager_reader_gate_wait_is_bounded, tests_passed);
     RUN_TEST(test_fd_manager_bm_open, tests_passed);
+    RUN_TEST(test_fd_manager_io_accounted_by_label, tests_passed);
+    RUN_TEST(test_fd_manager_reaper_wake_reaches_the_reaper, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

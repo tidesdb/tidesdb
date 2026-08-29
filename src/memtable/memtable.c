@@ -12,6 +12,7 @@
 #include "base/encoding/serialization.h" /* encode_varint, TDB_CF_PREFIX_SIZE */
 #include "base/errors.h"                 /* TDB_ERR_BUSY */
 #include "base/log.h"                    /* TDB_DEBUG_LOG for the admission trace */
+#include "base/waitstat.h"               /* tdb_wait_deadline and the condvar clock it pairs with */
 #include "l0_internal.h"
 
 /* a writer the policy blocks re-reads L0 pressure on this cadence, for at most this many reads. the
@@ -151,19 +152,9 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
     atomic_init(&l0->aborted_count, 0);
     pthread_mutex_init(&l0->aborted_lock, NULL);
     pthread_mutex_init(&l0->admit_mtx, NULL);
-#if TDB_COND_CLOCK_SELECTABLE
-    {
-        /* pinned to the same clock the park's deadline is built on, so a wall clock step cannot
-         * hold a blocked writer past the backstop it asked for */
-        pthread_condattr_t cattr;
-        pthread_condattr_init(&cattr);
-        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
-        pthread_cond_init(&l0->admit_cv, &cattr);
-        pthread_condattr_destroy(&cattr);
-    }
-#else
-    pthread_cond_init(&l0->admit_cv, NULL);
-#endif
+    /* on the clock the park's deadline is built from, so a wall clock step cannot hold a blocked
+     * writer past the backstop it asked for */
+    tdb_cond_init_monotonic(&l0->admit_cv);
     return l0;
 }
 

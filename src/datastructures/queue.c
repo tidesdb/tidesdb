@@ -8,12 +8,13 @@
  */
 #include "datastructures/queue.h"
 
+#include "base/waitstat.h" /* tdb_wait_deadline and the condvar clock it pairs with */
 #include "compat.h"
 
 #define QUEUE_LIKELY(x)   TDB_LIKELY(x)
 #define QUEUE_UNLIKELY(x) TDB_UNLIKELY(x)
 
-#define QUEUE_WAIT_TIMEOUT_NS 100000000  /* 100ms in nanoseconds */
+#define QUEUE_WAIT_TIMEOUT_US 100000     /* 100ms, the backstop for a wake that raced the wait */
 #define QUEUE_NS_PER_SEC      1000000000 /* nanoseconds per second */
 
 /* the node pool recycles a bounded set of nodes so enqueue and dequeue rarely hit the allocator,
@@ -52,27 +53,6 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
 
     /* pool empty, allocate from heap */
     return (queue_node_t *)malloc(sizeof(queue_node_t));
-}
-
-/* fill ts with an absolute deadline offset_ns from now, on the same clock the not_empty condvar was
- * initialized with. where the clock can be selected that is CLOCK_MONOTONIC, so a wall clock step
- * cannot stretch the wait. a worker parked against a realtime deadline when the clock steps back
- * sleeps until that absolute time comes round again, and since every background worker parks here,
- * they all stop together for the length of the step -- the burst of work that lands when they wake
- * is the tell. offset_ns is under one second, so a single carry normalizes tv_nsec. */
-static inline void queue_cond_deadline(struct timespec *ts, long offset_ns)
-{
-#if TDB_COND_CLOCK_SELECTABLE
-    clock_gettime(CLOCK_MONOTONIC, ts);
-#else
-    clock_gettime(CLOCK_REALTIME, ts);
-#endif
-    ts->tv_nsec += offset_ns;
-    if (ts->tv_nsec >= QUEUE_NS_PER_SEC)
-    {
-        ts->tv_sec += 1;
-        ts->tv_nsec -= QUEUE_NS_PER_SEC;
-    }
 }
 
 /**
@@ -171,22 +151,8 @@ queue_t *queue_new(void)
         return NULL;
     }
 
-    /* initialize not_empty on CLOCK_MONOTONIC where supported so its timed waits are immune to a
-     * wall-clock step (see queue_cond_deadline). the clock chosen here must match the one the
-     * deadlines use. */
-#if TDB_COND_CLOCK_SELECTABLE
-    int cond_rc;
-    {
-        pthread_condattr_t cattr;
-        pthread_condattr_init(&cattr);
-        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
-        cond_rc = pthread_cond_init(&queue->not_empty, &cattr);
-        pthread_condattr_destroy(&cattr);
-    }
-    if (cond_rc != 0)
-#else
-    if (pthread_cond_init(&queue->not_empty, NULL) != 0)
-#endif
+    /* on the clock its deadlines are built from (see tdb_wait_deadline) */
+    if (tdb_cond_init_monotonic(&queue->not_empty) != 0)
     {
         pthread_rwlock_destroy(&queue->read_lock);
         pthread_mutex_destroy(&queue->pool_lock);
@@ -310,7 +276,7 @@ static void queue_block_until_ready(queue_t *queue)
            !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
     {
         struct timespec ts;
-        queue_cond_deadline(&ts, QUEUE_WAIT_TIMEOUT_NS);
+        tdb_wait_deadline(&ts, QUEUE_WAIT_TIMEOUT_US);
         pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
     }
 
@@ -588,7 +554,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     while (atomic_load_explicit(&queue->waiter_count, memory_order_acquire) > 0)
     {
         struct timespec ts;
-        queue_cond_deadline(&ts, QUEUE_WAIT_TIMEOUT_NS);
+        tdb_wait_deadline(&ts, QUEUE_WAIT_TIMEOUT_US);
         pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
     }
 

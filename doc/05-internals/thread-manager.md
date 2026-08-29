@@ -126,6 +126,12 @@ process's CPU. The timeout is only insurance against a missed wake, never the me
 delivers work, so it now grows while parks come up empty and resets the moment a run drains — see
 [Block Manager](/internals/block-manager).
 
+Being insurance is also why its park reads the clock the tickers do. The timeout decides anything
+only when a wake was missed, which is exactly the moment a deadline built on a clock that has since
+stepped has nothing behind it — and this is the single thread that drains the ring, so a flush
+worker retiring a memtable and every committer waiting on durability wait for however long the step
+was.
+
 The lesson generalizes. A periodic *fallback* alongside an event-driven path should be sized for
 the rare case it exists to catch, not for the latency of the common case, because the common case
 is already covered by the signal.

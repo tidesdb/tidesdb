@@ -112,8 +112,8 @@ static uint64_t engine_wal_ring_size(const tidesdb_t *db)
 int engine_open_wal(tidesdb_t *db, const char *wal_path, block_manager_t **out_bm)
 {
     const int bm_sync = engine_wal_sync_mode(db->config.memtable_sync_mode);
-    const int rc =
-        fd_manager_bm_open_buffered(&db->fdm, out_bm, wal_path, bm_sync, engine_wal_ring_size(db));
+    const int rc = fd_manager_bm_open_buffered(&db->fdm, out_bm, wal_path, bm_sync,
+                                               engine_wal_ring_size(db), FD_LABEL_WAL_LOG);
     /* the labelled count is what the reaper and the open budget read, and it only balances if every
      * close pairs with this -- engine_close_wal and the flush path are the only two that may */
     if (rc == 0) fd_manager_note_open(&db->fdm, FD_LABEL_WAL_LOG);
@@ -129,7 +129,7 @@ int engine_open_wal_sealed(tidesdb_t *db, const char *wal_path, block_manager_t 
      * unused until the generation was flushed. so a sealed log is opened plainly and the buffering
      * is spent only on the active log that actually needs it */
     const int bm_sync = engine_wal_sync_mode(db->config.memtable_sync_mode);
-    const int rc = fd_manager_bm_open(&db->fdm, out_bm, wal_path, bm_sync);
+    const int rc = fd_manager_bm_open(&db->fdm, out_bm, wal_path, bm_sync, FD_LABEL_WAL_LOG);
     if (rc == 0) fd_manager_note_open(&db->fdm, FD_LABEL_WAL_LOG);
     return rc;
 }
@@ -642,6 +642,10 @@ void engine_close(tidesdb_t *db)
 
     /* dependency order: stop the workers, tear down the txn/l0 write path, then the cfs (which
      * borrow the vlog), then the shared singletons, then the leaf resources */
+    /* dropped before the reaper it names is stopped, so a descriptor wait raced against the close
+     * finds nothing to call rather than a ticker that is going away */
+    fd_manager_set_reaper_wake(&db->fdm, NULL, NULL);
+    db->fd_reaper = NULL;
     if (db->threads)
         threadmanager_stop_all(db->threads); /* stops every process and frees the registry */
 

@@ -123,9 +123,9 @@ static int flush_open_klog(cf_t *cf, uint64_t id, uint64_t prealloc, char *klog_
      * barrier at the end covers exactly the same bytes. the builder still gets the real sync mode
      * in its config, which is what decides that closing barrier */
     const int rc =
-        cf->fdm
-            ? fd_manager_bm_open_pre(cf->fdm, out_bm, klog_path, BLOCK_MANAGER_SYNC_NONE, prealloc)
-            : block_manager_open_pre(out_bm, klog_path, BLOCK_MANAGER_SYNC_NONE, prealloc);
+        cf->fdm ? fd_manager_bm_open_pre(cf->fdm, out_bm, klog_path, BLOCK_MANAGER_SYNC_NONE,
+                                         prealloc, FD_LABEL_SSTABLE_KLOG)
+                : block_manager_open_pre(out_bm, klog_path, BLOCK_MANAGER_SYNC_NONE, prealloc);
     /* the open preserved the failing syscall's errno, so a create that could not find space on the
      * device reports that rather than a generic io failure */
     if (rc != 0) return tdb_errno_to_result(errno);

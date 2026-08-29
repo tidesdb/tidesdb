@@ -42,9 +42,11 @@ static inline uint64_t tdb_monotonic_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
 
-/* nanoseconds in a microsecond and in a second, for building a deadline out of a duration */
+/* nanoseconds in a microsecond and in a second, and microseconds in a second, for building a
+ * deadline out of a duration */
 #define TDB_NS_PER_US  1000L
 #define TDB_NS_PER_SEC 1000000000L
+#define TDB_US_PER_SEC 1000000ull
 
 /**
  * tdb_wait_deadline
@@ -55,19 +57,48 @@ static inline uint64_t tdb_monotonic_us(void)
  * @param ts filled with the deadline
  * @param us how far ahead to place it
  */
-static inline void tdb_wait_deadline(struct timespec *ts, long us)
+static inline void tdb_wait_deadline(struct timespec *ts, uint64_t us)
 {
 #if TDB_COND_CLOCK_SELECTABLE
     clock_gettime(CLOCK_MONOTONIC, ts);
 #else
     clock_gettime(CLOCK_REALTIME, ts);
 #endif
-    ts->tv_nsec += us * TDB_NS_PER_US;
+    /* whole seconds are added as seconds rather than folded through the nanosecond field, which a
+     * multi-second interval would overflow where long is 32 bits */
+    ts->tv_sec += (time_t)(us / TDB_US_PER_SEC);
+    ts->tv_nsec += (long)((us % TDB_US_PER_SEC) * TDB_NS_PER_US);
     if (ts->tv_nsec >= TDB_NS_PER_SEC)
     {
-        ts->tv_sec += ts->tv_nsec / TDB_NS_PER_SEC;
-        ts->tv_nsec %= TDB_NS_PER_SEC;
+        ts->tv_sec += 1;
+        ts->tv_nsec -= TDB_NS_PER_SEC;
     }
+}
+
+/**
+ * tdb_cond_init_monotonic
+ * initialize a condition variable on the clock tdb_wait_deadline builds its deadlines from
+ *
+ * the two have to agree or a timed wait means nothing, so they are settled in one place. where the
+ * clock can be selected that is the monotonic one, which a wall clock step cannot move -- an ntp
+ * correction or a hypervisor resuming a guest it had suspended otherwise parks every waiter until
+ * an absolute time that has walked away from them, and they all wake together in a burst when it
+ * finally comes round
+ * @param cv the condition variable to initialize
+ * @return 0 on success, non-zero on failure
+ */
+static inline int tdb_cond_init_monotonic(pthread_cond_t *cv)
+{
+#if TDB_COND_CLOCK_SELECTABLE
+    pthread_condattr_t cattr;
+    if (pthread_condattr_init(&cattr) != 0) return -1;
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    const int rc = pthread_cond_init(cv, &cattr);
+    pthread_condattr_destroy(&cattr);
+    return rc;
+#else
+    return pthread_cond_init(cv, NULL);
+#endif
 }
 
 /**
@@ -120,6 +151,21 @@ typedef struct
     _Atomic(uint64_t) total_us;
     _Atomic(uint64_t) max_us;
 } tdb_io_stat_t;
+
+/**
+ * tdb_io_init
+ * put a class's totals at zero, so an accounting context is fully initialized by its own init
+ * rather than by however its owner happened to allocate it
+ * @param io the class to zero
+ */
+static inline void tdb_io_init(tdb_io_stat_t *io)
+{
+    if (!io) return;
+    atomic_init(&io->ops, 0);
+    atomic_init(&io->bytes, 0);
+    atomic_init(&io->total_us, 0);
+    atomic_init(&io->max_us, 0);
+}
 
 /**
  * tdb_io_note

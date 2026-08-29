@@ -58,21 +58,20 @@ int fd_manager_init(fd_manager_t *fdm, int max_open)
 {
     if (!fdm) return -1;
     fdm->max_open = max_open;
-    for (int i = 0; i < FD_LABEL_COUNT; i++) atomic_init(&fdm->num_open[i], 0);
-    if (pthread_mutex_init(&fdm->reaper_lock, NULL) != 0) return -1;
-    if (pthread_cond_init(&fdm->reaper_cond, NULL) != 0)
+    for (int i = 0; i < FD_LABEL_COUNT; i++)
     {
-        pthread_mutex_destroy(&fdm->reaper_lock);
-        return -1;
+        atomic_init(&fdm->num_open[i], 0);
+        tdb_io_init(&fdm->io[i]);
     }
+    atomic_init(&fdm->wake_fn, NULL);
+    fdm->wake_ctx = NULL;
     return 0;
 }
 
 void fd_manager_destroy(fd_manager_t *fdm)
 {
     if (!fdm) return;
-    pthread_cond_destroy(&fdm->reaper_cond);
-    pthread_mutex_destroy(&fdm->reaper_lock);
+    atomic_store_explicit(&fdm->wake_fn, NULL, memory_order_release);
 }
 
 void fd_manager_note_open(fd_manager_t *fdm, fd_manager_label_t label)
@@ -87,22 +86,36 @@ void fd_manager_note_close(fd_manager_t *fdm, fd_manager_label_t label)
     atomic_fetch_sub_explicit(&fdm->num_open[label], 1, memory_order_relaxed);
 }
 
-void fd_manager_wake_reaper(fd_manager_t *fdm)
+void fd_manager_set_reaper_wake(fd_manager_t *fdm, const fd_manager_wake_fn fn, void *ctx)
 {
-    if (pthread_mutex_trylock(&fdm->reaper_lock) == 0)
+    if (!fdm) return;
+    /* the context is published before the function that reads it, and the function is cleared
+     * before the context is dropped, so a concurrent wake sees either both or neither */
+    if (fn)
     {
-        pthread_cond_signal(&fdm->reaper_cond);
-        pthread_mutex_unlock(&fdm->reaper_lock);
+        fdm->wake_ctx = ctx;
+        atomic_store_explicit(&fdm->wake_fn, fn, memory_order_release);
+        return;
     }
+    atomic_store_explicit(&fdm->wake_fn, NULL, memory_order_release);
+    fdm->wake_ctx = NULL;
 }
 
-int fd_manager_bm_open(fd_manager_t *fdm, block_manager_t **bm, const char *path, int sync_mode)
+void fd_manager_wake_reaper(fd_manager_t *fdm)
+{
+    if (!fdm) return;
+    const fd_manager_wake_fn fn = atomic_load_explicit(&fdm->wake_fn, memory_order_acquire);
+    if (fn) fn(fdm->wake_ctx);
+}
+
+int fd_manager_bm_open(fd_manager_t *fdm, block_manager_t **bm, const char *path, int sync_mode,
+                       const fd_manager_label_t label)
 {
     for (int attempt = 0;; attempt++)
     {
         if (block_manager_open(bm, path, sync_mode) == 0)
         {
-            block_manager_set_io_stat(*bm, &fdm->io[FD_LABEL_SSTABLE_KLOG]);
+            block_manager_set_io_stat(*bm, &fdm->io[label]);
             return 0;
         }
         if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)
@@ -122,13 +135,13 @@ int fd_manager_bm_open(fd_manager_t *fdm, block_manager_t **bm, const char *path
 }
 
 int fd_manager_bm_open_pre(fd_manager_t *fdm, block_manager_t **bm, const char *path, int sync_mode,
-                           uint64_t prealloc_chunk)
+                           uint64_t prealloc_chunk, const fd_manager_label_t label)
 {
     for (int attempt = 0;; attempt++)
     {
         if (block_manager_open_pre(bm, path, sync_mode, prealloc_chunk) == 0)
         {
-            block_manager_set_io_stat(*bm, &fdm->io[FD_LABEL_SSTABLE_KLOG]);
+            block_manager_set_io_stat(*bm, &fdm->io[label]);
             return 0;
         }
         if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)
@@ -139,14 +152,13 @@ int fd_manager_bm_open_pre(fd_manager_t *fdm, block_manager_t **bm, const char *
 }
 
 int fd_manager_bm_open_buffered(fd_manager_t *fdm, block_manager_t **bm, const char *path,
-                                int sync_mode, uint64_t ring_size)
+                                int sync_mode, uint64_t ring_size, const fd_manager_label_t label)
 {
     for (int attempt = 0;; attempt++)
     {
         if (block_manager_open_buffered(bm, path, sync_mode, ring_size) == 0)
         {
-            /* buffered mode is the write-ahead log's alone, so this is the log's accounting */
-            block_manager_set_io_stat(*bm, &fdm->io[FD_LABEL_WAL_LOG]);
+            block_manager_set_io_stat(*bm, &fdm->io[label]);
             return 0;
         }
         if ((errno != EMFILE && errno != ENFILE) || attempt >= TDB_BM_OPEN_EMFILE_MAX_RETRIES)

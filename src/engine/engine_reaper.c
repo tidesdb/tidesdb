@@ -171,9 +171,10 @@ static void engine_idle_flush_tick(void *ctx)
     }
 }
 
-/* start one ticker and register it, stopping it if registration fails */
+/* start one ticker and register it, stopping it if registration fails. out_ticker receives the
+ * started ticker for a caller that has to reach it again, borrowed -- the threadmanager owns it */
 static int engine_start_ticker(tidesdb_t *db, uint64_t interval_us, bg_ticker_fn fn,
-                               const char *label)
+                               const char *label, bg_ticker_t **out_ticker)
 {
     bg_ticker_t *ticker = bg_ticker_start(interval_us, fn, db);
     if (!ticker) return TDB_ERR_MEMORY;
@@ -182,7 +183,16 @@ static int engine_start_ticker(tidesdb_t *db, uint64_t interval_us, bg_ticker_fn
         bg_ticker_stop(ticker);
         return TDB_ERR_MEMORY;
     }
+    if (out_ticker) *out_ticker = ticker;
     return TDB_SUCCESS;
+}
+
+/* run the fd reaper's sweep now. the descriptor manager calls this when a caller is waiting on a
+ * descriptor it cannot have, and without it that caller would sit out the rest of the tick -- which
+ * is an order of magnitude longer than it is willing to wait, so it would give up every time */
+static void engine_wake_fd_reaper(void *ctx)
+{
+    bg_ticker_wake((bg_ticker_t *)ctx);
 }
 
 int engine_reaper_init(tidesdb_t *db)
@@ -191,13 +201,16 @@ int engine_reaper_init(tidesdb_t *db)
      * real clock rather than against zero */
     atomic_store_explicit(&db->now_seconds, (int64_t)time(NULL), memory_order_relaxed);
     int rc = engine_start_ticker(db, ENGINE_TXN_CLOCK_INTERVAL_US, engine_txn_clock_tick,
-                                 ENGINE_TXN_CLOCK_LABEL);
+                                 ENGINE_TXN_CLOCK_LABEL, NULL);
     if (rc != TDB_SUCCESS) return rc;
     rc = engine_start_ticker(db, ENGINE_FD_REAPER_INTERVAL_US, engine_fd_reaper_tick,
-                             ENGINE_FD_REAPER_LABEL);
+                             ENGINE_FD_REAPER_LABEL, &db->fd_reaper);
     if (rc != TDB_SUCCESS) return rc;
+    /* now that there is a reaper to reach, a caller held at the descriptor budget can make it sweep
+     * instead of waiting out its tick */
+    fd_manager_set_reaper_wake(&db->fdm, engine_wake_fd_reaper, db->fd_reaper);
     rc = engine_start_ticker(db, ENGINE_DEFERRED_FREE_INTERVAL_US, engine_deferred_free_tick,
-                             ENGINE_DEFERRED_FREE_LABEL);
+                             ENGINE_DEFERRED_FREE_LABEL, NULL);
     if (rc != TDB_SUCCESS) return rc;
 
     /* the idle-flush ticker is opt-out rather than opt-in, since a database that never drains is
@@ -206,7 +219,7 @@ int engine_reaper_init(tidesdb_t *db)
     {
         rc = engine_start_ticker(
             db, (uint64_t)db->config.memtable_idle_flush_seconds * ENGINE_IDLE_FLUSH_US_PER_SECOND,
-            engine_idle_flush_tick, ENGINE_IDLE_FLUSH_LABEL);
+            engine_idle_flush_tick, ENGINE_IDLE_FLUSH_LABEL, NULL);
         if (rc != TDB_SUCCESS) return rc;
     }
 
@@ -217,7 +230,7 @@ int engine_reaper_init(tidesdb_t *db)
         const uint64_t interval = db->config.memtable_sync_interval_us
                                       ? db->config.memtable_sync_interval_us
                                       : ENGINE_WAL_SYNC_DEFAULT_US;
-        rc = engine_start_ticker(db, interval, engine_wal_sync_tick, ENGINE_WAL_SYNC_LABEL);
+        rc = engine_start_ticker(db, interval, engine_wal_sync_tick, ENGINE_WAL_SYNC_LABEL, NULL);
         if (rc != TDB_SUCCESS) return rc;
     }
     return TDB_SUCCESS;

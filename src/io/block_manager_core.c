@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "base/log.h"
+#include "base/waitstat.h" /* tdb_wait_deadline and the condvar clock it pairs with */
 #include "block_manager_internal.h"
 
 /* set once the first preallocation failure has been reported, so a platform that lacks the call
@@ -588,8 +589,10 @@ int block_manager_open_buffered(block_manager_t **bm, const char *file_path, con
     atomic_store(&b->buf_flushed, fsz);
 
     pthread_mutex_init(&b->buf_mtx, NULL);
-    pthread_cond_init(&b->buf_work_cv, NULL);
-    pthread_cond_init(&b->buf_durable_cv, NULL);
+    /* both on the clock their deadlines are built from, so a wall clock step cannot hold the
+     * flush thread or a durability waiter past the backstop it asked for */
+    tdb_cond_init_monotonic(&b->buf_work_cv);
+    tdb_cond_init_monotonic(&b->buf_durable_cv);
     b->buffered = 1;
 
     if (pthread_create(&b->flush_tid, NULL, bm_flush_thread, b) != 0)

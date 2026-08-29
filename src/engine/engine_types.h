@@ -125,6 +125,8 @@ typedef struct
  * @flush_install_seq the next ticket allowed to install, advanced under install_lock
  * @compaction_queue the compaction pool's work queue, carrying planned {cf, plan} jobs
  * @compaction_scheduler the backstop ticker that snapshots and plans each cf, woken on every flush
+ * @fd_reaper the descriptor-eviction ticker, borrowed from the threadmanager that owns it, so a
+ *            caller held at the descriptor budget can make it sweep rather than wait out its tick
  * @next_sstable_id the db-level monotonic sstable id sequence flush and compaction draw from
  * @gc_floor_high_water the highest reclamation floor any collection has ever taken. everything at
  *                      or above it has never been eligible for collection, so a read there resolves
@@ -202,6 +204,7 @@ struct tidesdb_t
 
     queue_t *compaction_queue;
     bg_ticker_t *compaction_scheduler;
+    bg_ticker_t *fd_reaper;
 
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) gc_floor_high_water;

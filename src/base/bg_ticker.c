@@ -12,11 +12,7 @@
 #include <time.h>
 
 #include "log.h"
-
-/* time conversion factors for building the cond_timedwait deadline */
-#define BG_TICKER_US_PER_SEC 1000000ULL
-#define BG_TICKER_NS_PER_US  1000ULL
-#define BG_TICKER_NS_PER_SEC 1000000000L
+#include "waitstat.h" /* tdb_wait_deadline and the condvar clock it pairs with */
 
 /**
  * bg_ticker
@@ -40,20 +36,6 @@ struct bg_ticker
     void *ctx;
 };
 
-/* fill ts with the absolute realtime deadline interval_us from now, normalizing the nanosecond
- * carry */
-static void bg_ticker_deadline(struct timespec *ts, const uint64_t interval_us)
-{
-    clock_gettime(CLOCK_REALTIME, ts);
-    ts->tv_sec += (time_t)(interval_us / BG_TICKER_US_PER_SEC);
-    ts->tv_nsec += (long)((interval_us % BG_TICKER_US_PER_SEC) * BG_TICKER_NS_PER_US);
-    if (ts->tv_nsec >= BG_TICKER_NS_PER_SEC)
-    {
-        ts->tv_sec += 1;
-        ts->tv_nsec -= BG_TICKER_NS_PER_SEC;
-    }
-}
-
 static void *bg_ticker_thread(void *arg)
 {
     bg_ticker_t *ticker = (bg_ticker_t *)arg;
@@ -66,7 +48,7 @@ static void *bg_ticker_thread(void *arg)
         if (atomic_load_explicit(&ticker->active, memory_order_acquire))
         {
             struct timespec ts;
-            bg_ticker_deadline(&ts, ticker->interval_us);
+            tdb_wait_deadline(&ts, ticker->interval_us);
             pthread_cond_timedwait(&ticker->cond, &ticker->mtx, &ts);
         }
         pthread_mutex_unlock(&ticker->mtx);
@@ -85,7 +67,7 @@ bg_ticker_t *bg_ticker_start(const uint64_t interval_us, bg_ticker_fn tick, void
     ticker->ctx = ctx;
     atomic_init(&ticker->active, 1);
     pthread_mutex_init(&ticker->mtx, NULL);
-    pthread_cond_init(&ticker->cond, NULL);
+    tdb_cond_init_monotonic(&ticker->cond);
 
     if (pthread_create(&ticker->thread, NULL, bg_ticker_thread, ticker) != 0)
     {

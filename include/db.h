@@ -344,7 +344,9 @@ typedef struct tidesdb_column_family_config_t
  * change how much space the store settles at -- it changes what reclaiming costs. smaller segments
  * mean more of them and more live data copied forward per reclaim, measurably slower below 256 MiB;
  * larger ones are close to flat
- * @memtable_l0_queue_stall_threshold immutable-queue depth at which writes stall for backpressure
+ * @memtable_l0_queue_stall_threshold immutable-queue depth at which writes stall for
+ * backpressure, or 0 to never stall. left at 0 the queue is unbounded and a writer outrunning
+ * the flush threads is never paced, so it is a value to set deliberately rather than leave
  * @memtable_idle_flush_seconds how long the active memtable may sit unwritten before the engine
  * rotates it on its own, or 0 to never do so. a database that stops taking writes otherwise holds
  * that data in memory indefinitely -- its log cannot be unlinked until it reaches L1, so recovery
@@ -1664,12 +1666,16 @@ int tidesdb_get_stall_stats(tidesdb_t *db, tidesdb_stall_stats_t *stats);
  * the kinds of file the engine writes, so device time can be attributed rather than pooled
  * @TDB_IO_SSTABLE key logs, written by flush and compaction
  * @TDB_IO_WAL the write-ahead log, written by its own single flush thread
+ * @TDB_IO_VLOG value log segments, written by a commit that separates a value and by the reclaim
+ *              that copies live values forward. this is the write cost of key/value separation, so
+ *              it is counted apart from the key logs whose size that separation is what keeps down
  * @TDB_IO_COUNT the number of classes, not itself a class
  */
 typedef enum
 {
     TDB_IO_SSTABLE = 0,
     TDB_IO_WAL,
+    TDB_IO_VLOG,
     TDB_IO_COUNT
 } tidesdb_io_class_t;
 

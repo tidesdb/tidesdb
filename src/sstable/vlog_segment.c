@@ -143,8 +143,9 @@ int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot)
     /* opened through the budget when there is one, so descriptor exhaustion wakes the reaper and
      * retries rather than failing the store outright */
     block_manager_t *bm = NULL;
-    const int opened = v->fdm ? fd_manager_bm_open(v->fdm, &bm, path, v->sync_mode)
-                              : block_manager_open(&bm, path, v->sync_mode);
+    const int opened =
+        v->fdm ? fd_manager_bm_open(v->fdm, &bm, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
+               : block_manager_open(&bm, path, v->sync_mode);
     if (opened != 0) return VLOG_ERR_IO;
     if (v->fdm) fd_manager_note_open(v->fdm, FD_LABEL_VLOG_SEGMENT);
 
@@ -334,8 +335,9 @@ block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot)
     if (vlog_segment_path(v, v->segments[slot].number, path, sizeof(path)) != VLOG_OK) return NULL;
 
     block_manager_t *opened = NULL;
-    const int rc = v->fdm ? fd_manager_bm_open(v->fdm, &opened, path, v->sync_mode)
-                          : block_manager_open(&opened, path, v->sync_mode);
+    const int rc =
+        v->fdm ? fd_manager_bm_open(v->fdm, &opened, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
+               : block_manager_open(&opened, path, v->sync_mode);
     if (rc != 0) return NULL;
 
     block_manager_t *expected = NULL;

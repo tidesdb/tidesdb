@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "base/log.h"
+#include "base/waitstat.h" /* tdb_wait_deadline and the condvar clock it pairs with */
 #include "block_manager_internal.h"
 
 /* record the errno of a failed write or sync on the handle, and say so once per handle. a full
@@ -325,7 +326,7 @@ static void bm_flush_park(block_manager_t *bm, long *park_us)
         !(atomic_load_explicit(&bm->flush_stop, memory_order_acquire) && fl == res2))
     {
         struct timespec ts;
-        bm_deadline(&ts, *park_us);
+        tdb_wait_deadline(&ts, *park_us);
         pthread_cond_timedwait(&bm->buf_work_cv, &bm->buf_mtx, &ts);
         if (*park_us < BM_BUF_FLUSH_PARK_MAX_US) *park_us *= BM_BUF_FLUSH_PARK_GROWTH;
     }
@@ -399,7 +400,7 @@ int bm_wait_flushed(block_manager_t *bm, uint64_t need)
            !atomic_load_explicit(&bm->flush_error, memory_order_acquire))
     {
         struct timespec ts;
-        bm_deadline(&ts, BM_BUF_WAIT_PARK_US);
+        tdb_wait_deadline(&ts, BM_BUF_WAIT_PARK_US);
         pthread_cond_timedwait(&bm->buf_durable_cv, &bm->buf_mtx, &ts);
     }
     atomic_fetch_sub_explicit(&bm->durable_waiters, 1, memory_order_acq_rel);

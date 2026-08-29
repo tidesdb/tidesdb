@@ -38,8 +38,8 @@ typedef enum
  * one labeled background process managed by the registry
  * @param label human-readable name, e.g. "flush" or "reaper.deferred_free"
  * @param kind whether the handle is a pool or a ticker
- * @param pool the worker pool when kind is THREADMANAGER_POOL
- * @param ticker the ticker when kind is THREADMANAGER_TICKER
+ * @param handle the process itself, read as handle.pool when kind is THREADMANAGER_POOL and as
+ *               handle.ticker when it is THREADMANAGER_TICKER
  */
 typedef struct
 {

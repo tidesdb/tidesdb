@@ -182,21 +182,6 @@ static inline void bm_cpu_relax(void)
 #endif
 }
 
-/**
- * bm_deadline
- * fill ts with an absolute CLOCK_REALTIME deadline us microseconds from now, for cond_timedwait
- */
-static inline void bm_deadline(struct timespec *ts, long us)
-{
-    clock_gettime(CLOCK_REALTIME, ts);
-    ts->tv_nsec += us * BM_NS_PER_US;
-    if (ts->tv_nsec >= BM_NS_PER_SEC)
-    {
-        ts->tv_sec += ts->tv_nsec / BM_NS_PER_SEC;
-        ts->tv_nsec %= BM_NS_PER_SEC;
-    }
-}
-
 /* ===== helpers one translation unit defines and another calls ===== */
 
 /* util -- the calling thread's reusable read buffer, grown to at least needed bytes (see the

@@ -40,9 +40,11 @@
  * nonsense, so the cut stops here and lets the EMFILE retry carry what is left */
 #define TDB_FD_BUDGET_MIN 16
 
-/* the reader fd reserve held for the priority paths (flush / compaction / conflict-check). the
- * reader budget is max_open minus reserve = max_open / DIVISOR, clamped to at least MIN and to at
- * most max_open / MAX_DIVISOR so reads always keep at least half the descriptors. */
+/* the reserve held back from the reapers, so that descriptors stay free for a reader to open into
+ * rather than being held by whatever was resident when the sweep ran. the reserve is max_open /
+ * DIVISOR, raised to MIN and then capped at max_open / MAX_DIVISOR, and the budget the reapers
+ * evict down to is max_open minus it. the cap is what keeps the reserve from taking more than half,
+ * so the reapers are always left at least half the descriptors to work with. */
 #define TDB_FD_READER_RESERVE_DIVISOR     8
 #define TDB_FD_READER_RESERVE_MIN         16
 #define TDB_FD_READER_RESERVE_MAX_DIVISOR 2
@@ -81,13 +83,23 @@ typedef enum
 const char *fd_manager_label_name(fd_manager_label_t label);
 
 /**
+ * fd_manager_wake_fn
+ * makes the reaper run its sweep now rather than at its next tick. the manager holds no engine and
+ * knows nothing of how the reaper is scheduled, so what to call is installed from outside
+ * @param ctx the context given alongside the function
+ */
+typedef void (*fd_manager_wake_fn)(void *ctx);
+
+/**
  * fd_manager_t
  * a descriptor-budget context -- the shared resident-file cap, a live open count per label, and the
- * condition a reader signals to wake the reaper. zero-initialize then fd_manager_init.
+ * condition a reader signals to wake the reaper. fd_manager_init puts every field at its starting
+ * value, so one on the stack needs nothing done to it first.
  * @max_open shared soft cap on total resident labeled files, 0 for unlimited
  * @num_open live open count per label, indexed by fd_manager_label_t
- * @reaper_lock guards the reaper wakeup condition
- * @reaper_cond signaled to nudge the reaper to reclaim idle descriptors
+ * @wake_fn what to run to make the reaper sweep now, or NULL while none is installed. cleared
+ *          before the reaper is stopped, so a wake raced against shutdown finds nothing to call
+ * @wake_ctx passed to wake_fn, set once alongside it
  * @io per-label write accounting, so bytes and time are attributed to the kind of file rather
  *     than pooled. a handle opened outside this manager is not accounted
  */
@@ -95,8 +107,8 @@ typedef struct
 {
     int max_open;
     _Atomic(int) num_open[FD_LABEL_COUNT];
-    pthread_mutex_t reaper_lock;
-    pthread_cond_t reaper_cond;
+    _Atomic(fd_manager_wake_fn) wake_fn;
+    void *wake_ctx;
     tdb_io_stat_t io[FD_LABEL_COUNT];
 } fd_manager_t;
 
@@ -146,12 +158,23 @@ void fd_manager_note_close(fd_manager_t *fdm, fd_manager_label_t label);
 
 /**
  * fd_manager_wake_reaper
- * nudge the reaper to run its eviction pass now, closing idle unreferenced sstable block managers.
- * uses trylock, so a held reaper lock skips the signal (safe -- the reaper runs on its own timer).
- * never blocks.
+ * nudge the reaper to run its eviction pass now, closing idle unreferenced block managers, rather
+ * than leaving the waiting caller to sit out the rest of its tick. a no-op when no wake was
+ * installed, which is every unit test that drives a manager without a reaper behind it
  * @param fdm the fd manager
  */
 void fd_manager_wake_reaper(fd_manager_t *fdm);
+
+/**
+ * fd_manager_set_reaper_wake
+ * install what fd_manager_wake_reaper calls, or clear it by passing NULL. the caller clears it
+ * before the reaper it names is torn down, since a wake arriving after that would reach a stopped
+ * one
+ * @param fdm the fd manager
+ * @param fn what to run to make the reaper sweep now, or NULL to install nothing
+ * @param ctx passed back to fn
+ */
+void fd_manager_set_reaper_wake(fd_manager_t *fdm, fd_manager_wake_fn fn, void *ctx);
 
 /**
  * fd_manager_bm_open
@@ -161,9 +184,11 @@ void fd_manager_wake_reaper(fd_manager_t *fdm);
  * @param bm receives the opened block manager
  * @param path file path
  * @param sync_mode block-manager sync mode
+ * @param label the file kind this handle's writes are accounted against
  * @return 0 on success, -1 on failure with errno set
  */
-int fd_manager_bm_open(fd_manager_t *fdm, block_manager_t **bm, const char *path, int sync_mode);
+int fd_manager_bm_open(fd_manager_t *fdm, block_manager_t **bm, const char *path, int sync_mode,
+                       fd_manager_label_t label);
 
 /**
  * fd_manager_bm_open_pre
@@ -174,10 +199,11 @@ int fd_manager_bm_open(fd_manager_t *fdm, block_manager_t **bm, const char *path
  * @param path file path
  * @param sync_mode block-manager sync mode
  * @param prealloc_chunk the on-disk extent to grow by at a time, in bytes, or 0 to disable
+ * @param label the file kind this handle's writes are accounted against
  * @return 0 on success, -1 on failure with errno set
  */
 int fd_manager_bm_open_pre(fd_manager_t *fdm, block_manager_t **bm, const char *path, int sync_mode,
-                           uint64_t prealloc_chunk);
+                           uint64_t prealloc_chunk, fd_manager_label_t label);
 
 /**
  * fd_manager_bm_open_buffered
@@ -188,10 +214,11 @@ int fd_manager_bm_open_pre(fd_manager_t *fdm, block_manager_t **bm, const char *
  * @param path file path
  * @param sync_mode block-manager sync mode
  * @param ring_size staging ring size in bytes, 0 for the block manager's default
+ * @param label the file kind this handle's writes are accounted against
  * @return 0 on success, -1 on failure with errno set
  */
 int fd_manager_bm_open_buffered(fd_manager_t *fdm, block_manager_t **bm, const char *path,
-                                int sync_mode, uint64_t ring_size);
+                                int sync_mode, uint64_t ring_size, fd_manager_label_t label);
 
 /**
  * fd_manager_io_stats
@@ -226,8 +253,9 @@ int fd_manager_open_total(const fd_manager_t *fdm);
 
 /**
  * fd_manager_open_budget
- * the shared descriptor budget, max_open minus the reader reserve; both reader admission and every
- * reaper's eviction trigger compare the resident total against it
+ * the shared descriptor budget, max_open minus the reader reserve. it is what every reaper evicts
+ * down to; a reader is admitted against max_open itself, and the gap between the two is the reserve
+ * that leaves it something to open into
  * @param fdm the fd manager
  * @return the open budget, or INT_MAX when max_open is 0 (unlimited)
  */

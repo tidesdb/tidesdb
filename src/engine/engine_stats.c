@@ -475,6 +475,8 @@ const char *tidesdb_io_class_name(const tidesdb_io_class_t cls)
             return "sstable";
         case TDB_IO_WAL:
             return "wal";
+        case TDB_IO_VLOG:
+            return "vlog";
         case TDB_IO_COUNT:
         default:
             return "unknown";
@@ -485,7 +487,17 @@ const char *tidesdb_io_class_name(const tidesdb_io_class_t cls)
  * is written out rather than assumed */
 static fd_manager_label_t engine_io_label(const tidesdb_io_class_t cls)
 {
-    return cls == TDB_IO_WAL ? FD_LABEL_WAL_LOG : FD_LABEL_SSTABLE_KLOG;
+    switch (cls)
+    {
+        case TDB_IO_WAL:
+            return FD_LABEL_WAL_LOG;
+        case TDB_IO_VLOG:
+            return FD_LABEL_VLOG_SEGMENT;
+        case TDB_IO_SSTABLE:
+        case TDB_IO_COUNT:
+        default:
+            return FD_LABEL_SSTABLE_KLOG;
+    }
 }
 
 int engine_get_io_stats(tidesdb_t *db, tidesdb_io_stats_t *out)

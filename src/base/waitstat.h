@@ -50,14 +50,18 @@ static inline uint64_t tdb_monotonic_us(void)
  * tdb_wait_deadline
  * an absolute deadline this many microseconds from now, for a timed condition wait
  *
- * built on the realtime clock rather than the monotonic one because that is the clock a condition
- * variable measures against unless its attribute says otherwise, and none here does
+ * built on whichever clock the condition variable was pinned to, which is the monotonic one
+ * wherever that can be selected. the two have to agree or the deadline means nothing
  * @param ts filled with the deadline
  * @param us how far ahead to place it
  */
 static inline void tdb_wait_deadline(struct timespec *ts, long us)
 {
+#if TDB_COND_CLOCK_SELECTABLE
+    clock_gettime(CLOCK_MONOTONIC, ts);
+#else
     clock_gettime(CLOCK_REALTIME, ts);
+#endif
     ts->tv_nsec += us * TDB_NS_PER_US;
     if (ts->tv_nsec >= TDB_NS_PER_SEC)
     {

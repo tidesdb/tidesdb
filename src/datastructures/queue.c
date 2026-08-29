@@ -55,14 +55,14 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
 }
 
 /* fill ts with an absolute deadline offset_ns from now, on the same clock the not_empty condvar was
- * initialized with. on linux that is CLOCK_MONOTONIC, so a wall-clock step (an ntp correction or a
- * manual clock change) cannot stretch or shorten a timed wait; elsewhere pthread_condattr_setclock
- * is not portably available -- notably on macOS -- so the condvar and this deadline both use
- * CLOCK_REALTIME to stay consistent, mirroring the pattern the engine uses for its own condvars.
- * offset_ns is under one second, so a single carry normalizes tv_nsec. */
+ * initialized with. where the clock can be selected that is CLOCK_MONOTONIC, so a wall clock step
+ * cannot stretch the wait. a worker parked against a realtime deadline when the clock steps back
+ * sleeps until that absolute time comes round again, and since every background worker parks here,
+ * they all stop together for the length of the step -- the burst of work that lands when they wake
+ * is the tell. offset_ns is under one second, so a single carry normalizes tv_nsec. */
 static inline void queue_cond_deadline(struct timespec *ts, long offset_ns)
 {
-#if defined(__linux__)
+#if TDB_COND_CLOCK_SELECTABLE
     clock_gettime(CLOCK_MONOTONIC, ts);
 #else
     clock_gettime(CLOCK_REALTIME, ts);
@@ -174,7 +174,7 @@ queue_t *queue_new(void)
     /* initialize not_empty on CLOCK_MONOTONIC where supported so its timed waits are immune to a
      * wall-clock step (see queue_cond_deadline). the clock chosen here must match the one the
      * deadlines use. */
-#if defined(__linux__)
+#if TDB_COND_CLOCK_SELECTABLE
     int cond_rc;
     {
         pthread_condattr_t cattr;

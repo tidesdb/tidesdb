@@ -117,6 +117,19 @@ static inline int tdb_ctz64_portable(uint64_t x)
 #define TDB_CTZ64(x) tdb_ctz64_portable(x)
 #endif
 
+/* whether a condition variable can be pinned to the monotonic clock with
+ * pthread_condattr_setclock, the posix clock selection option. where it can, a timed wait cannot be
+ * stretched by a wall clock step -- an ntp correction, or a hypervisor resuming a guest it had
+ * suspended -- which otherwise parks every waiter until an absolute time that has moved away from
+ * them. macos does not carry the option, so there a condvar and its deadlines stay on the realtime
+ * clock and at least agree with each other */
+#if defined(__linux__) || defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+    defined(__DragonFly__) || defined(__sun)
+#define TDB_COND_CLOCK_SELECTABLE 1
+#else
+#define TDB_COND_CLOCK_SELECTABLE 0
+#endif
+
 /* cross-platform thread ID for unique file naming */
 #if defined(_WIN32)
 #include <windows.h>

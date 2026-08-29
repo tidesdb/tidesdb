@@ -151,7 +151,19 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
     atomic_init(&l0->aborted_count, 0);
     pthread_mutex_init(&l0->aborted_lock, NULL);
     pthread_mutex_init(&l0->admit_mtx, NULL);
+#if TDB_COND_CLOCK_SELECTABLE
+    {
+        /* pinned to the same clock the park's deadline is built on, so a wall clock step cannot
+         * hold a blocked writer past the backstop it asked for */
+        pthread_condattr_t cattr;
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+        pthread_cond_init(&l0->admit_cv, &cattr);
+        pthread_condattr_destroy(&cattr);
+    }
+#else
     pthread_cond_init(&l0->admit_cv, NULL);
+#endif
     return l0;
 }
 

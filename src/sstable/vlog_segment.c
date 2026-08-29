@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "base/encoding/serialization.h" /* TDB_ID_MAX_DIGITS */
 #include "base/log.h"
 #include "sstable/vlog_internal.h"
 
@@ -46,6 +47,10 @@ static int vlog_segment_parse_name(const char *name, uint64_t *out_number)
     /* the extension identifies the kind and the leading digits the order, so anything else in the
      * directory -- a key log, the manifest, a partly written file -- is passed over */
     if (strcmp(name + (len - ext_len), VLOG_SEGMENT_EXT) != 0) return 0;
+
+    /* a run longer than a uint64_t can hold would wrap into some other segment's number rather
+     * than be rejected, so the width is bounded before it is accumulated */
+    if (len - ext_len > TDB_ID_MAX_DIGITS) return 0;
 
     uint64_t number = 0;
     for (size_t i = 0; i < len - ext_len; i++)

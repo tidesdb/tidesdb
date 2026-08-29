@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "base/encoding/serialization.h" /* TDB_WAL_EXT */
+#include "base/encoding/serialization.h" /* TDB_WAL_EXT, the key log name format */
 #include "base/errors.h"
 #include "base/log.h"
 #include "column_family/cf_config.h"
@@ -62,13 +62,6 @@ uint64_t engine_recovered_max_sstable_seq(tidesdb_t *db)
     return max_seq;
 }
 
-/* the zero-padded width of an sstable id in a .klog file name, matching what the sstable module
- * writes */
-#define ENGINE_SSTABLE_ID_DIGITS 7
-
-/* the family-id field leading a key log's name, matching what sstable_klog_filename writes */
-#define ENGINE_CF_ID_DIGITS 10
-
 /* families a rebuild will adopt from a directory of orphaned key logs. a rebuild is a last resort
  * over whatever survived, so the bound is a guard against a corrupt directory rather than a limit
  * any real database approaches */
@@ -82,24 +75,38 @@ uint64_t engine_recovered_max_sstable_seq(tidesdb_t *db)
 /* adopted sstables are reopened without per-write durability -- they are read, never appended */
 #define ENGINE_REBUILD_SYNC BLOCK_MANAGER_SYNC_NONE
 
-/* whether name is exactly a CCCCCCCCCC.NNNNNNN.klog sstable file, decoding the family id into
- * out_cf_id and the sstable id into out_id. the family is part of the name because it is no longer
- * part of the path */
+/* whether name is a family id, a dot, a table id and the key log extension, decoding the two ids
+ * into out_cf_id and out_id. the family is part of the name because it is no longer part of the
+ * path. the two runs of digits are measured rather than assumed to be the width they are padded
+ * to, so an id that has outgrown its padding is still read back as the id it is -- matching on the
+ * padded length would make a table invisible to the sweep below and to a rebuild, which is a file
+ * left behind and a table dropped rather than an error anyone would see */
 static int engine_parse_klog_name(const char *name, uint64_t *out_cf_id, uint64_t *out_id)
 {
+    const size_t len = strlen(name);
     const size_t ext_len = strlen(TDB_SSTABLE_KLOG_EXT);
-    const size_t stem = (size_t)ENGINE_CF_ID_DIGITS + 1 + (size_t)ENGINE_SSTABLE_ID_DIGITS;
-    if (strlen(name) != stem + ext_len) return 0;
-    if (name[ENGINE_CF_ID_DIGITS] != '.') return 0;
-    for (size_t i = 0; i < stem; i++)
-    {
-        if (i == (size_t)ENGINE_CF_ID_DIGITS) continue;
-        if (name[i] < '0' || name[i] > '9') return 0;
-    }
+    if (len <= ext_len) return 0;
+
+    const size_t stem = len - ext_len;
     if (strcmp(name + stem, TDB_SSTABLE_KLOG_EXT) != 0) return 0;
 
+    /* the extension carries a dot of its own, so the separator is looked for in the stem alone */
+    const char *dot = memchr(name, '.', stem);
+    if (!dot) return 0;
+
+    const size_t cf_len = (size_t)(dot - name);
+    const size_t id_len = stem - cf_len - 1;
+    if (cf_len == 0 || id_len == 0) return 0;
+    if (cf_len > TDB_ID_MAX_DIGITS || id_len > TDB_ID_MAX_DIGITS) return 0;
+
+    for (size_t i = 0; i < stem; i++)
+    {
+        if (name + i == dot) continue;
+        if (name[i] < '0' || name[i] > '9') return 0;
+    }
+
     *out_cf_id = strtoull(name, NULL, 10);
-    *out_id = strtoull(name + ENGINE_CF_ID_DIGITS + 1, NULL, 10);
+    *out_id = strtoull(dot + 1, NULL, 10);
     return 1;
 }
 
@@ -427,17 +434,16 @@ typedef struct
 
 static int engine_parse_wal_name(const char *name, uint64_t *out_gen, int *out_flushed)
 {
-    /* checked before the digits are read, since a shorter name would be walked past its end */
-    const size_t len = strlen(name);
-    if (len != (size_t)TDB_WAL_ID_DIGITS + strlen(TDB_WAL_EXT) &&
-        len != (size_t)TDB_WAL_ID_DIGITS + strlen(TDB_WAL_FLUSHED_EXT))
-        return 0;
-    for (int i = 0; i < TDB_WAL_ID_DIGITS; i++)
-        if (name[i] < '0' || name[i] > '9') return 0;
+    /* the run of digits is measured rather than assumed to be the width a generation is padded to,
+     * so a generation that has outgrown its padding is still recognised. a log this failed to name
+     * would be a log recovery never replayed */
+    size_t digits = 0;
+    while (name[digits] >= '0' && name[digits] <= '9') digits++;
+    if (digits == 0 || digits > TDB_ID_MAX_DIGITS) return 0;
 
     /* a log carries one of two names -- the plain one, whose data is durable nowhere else, and the
      * flushed one, kept only for an undecided prepare after its memtable reached L1 */
-    const char *ext = name + TDB_WAL_ID_DIGITS;
+    const char *ext = name + digits;
     int flushed;
     if (strcmp(ext, TDB_WAL_EXT) == 0)
         flushed = 0;
@@ -446,10 +452,7 @@ static int engine_parse_wal_name(const char *name, uint64_t *out_gen, int *out_f
     else
         return 0;
 
-    char digits[TDB_WAL_ID_DIGITS + 1];
-    memcpy(digits, name, TDB_WAL_ID_DIGITS);
-    digits[TDB_WAL_ID_DIGITS] = '\0';
-    *out_gen = strtoull(digits, NULL, 10);
+    *out_gen = strtoull(name, NULL, 10);
     if (out_flushed) *out_flushed = flushed;
     return 1;
 }

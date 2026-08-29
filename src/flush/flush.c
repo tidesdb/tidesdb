@@ -17,11 +17,8 @@
 #include "internal/types.h"  /* TDB_KV_FLAG_* the builder consumes, and TDB_TTL_NONE */
 #include "sstable/sstable.h" /* the sstable builder and level_set install */
 
-/* buffer for a klog file name, room for the family and sstable ids, the extension and the nul */
-#define FLUSH_KLOG_NAME_MAX 64
-
 /* longest klog path a flush opens, the database directory plus a klog file name */
-#define FLUSH_KLOG_PATH_LEN (CF_DIR_PATH_LEN + FLUSH_KLOG_NAME_MAX)
+#define FLUSH_KLOG_PATH_LEN (CF_DIR_PATH_LEN + TDB_SSTABLE_KLOG_NAME_MAX)
 
 /* fraction of the flushed data added as klog preallocation slack for internal nodes and the footer,
  * as a right shift; 2 adds a quarter, so a klog rarely has to extend mid-build */
@@ -107,7 +104,7 @@ static void flush_builder_config(const flush_ctx_t *fx, cf_t *cf, uint64_t id,
 static int flush_open_klog(cf_t *cf, uint64_t id, uint64_t prealloc, char *klog_path,
                            size_t path_cap, block_manager_t **out_bm)
 {
-    char filename[FLUSH_KLOG_NAME_MAX];
+    char filename[TDB_SSTABLE_KLOG_NAME_MAX];
     tidesdb_manifest_entry_t naming = {0};
     naming.id = id;
     /* the family is part of the file's name, so a table written without it would be looked for

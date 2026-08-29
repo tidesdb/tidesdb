@@ -22,7 +22,7 @@ be deleted.
 
 ## What one sstable is
 
-A single `CCCCCCCCCC.SSSSSSS.klog` file — the owning family's id and then the table's, each
+A single `CCCCCC.SSSSSSSSSSSS.klog` file — the owning family's id and then the table's, each
 zero-padded — containing, in order:
 
 ```

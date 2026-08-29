@@ -160,7 +160,7 @@ Three files carry everything, and the order they are written in is the whole rec
 
 1. **The write-ahead log** (`NNNNNNN.log`) takes a committed batch before the memtable does.
    A crash between the two recovers the batch.
-2. **The sstables** (`CCCCCCCCCC.SSSSSSS.klog`, named for the owning family's id and the table's)
+2. **The sstables** (`CCCCCC.SSSSSSSSSSSS.klog`, named for the owning family's id and the table's)
    and the **value log** (`NNNNNNN.vlog` segments) hold what has been flushed. They are durable
    before the manifest names them.
 3. **The manifest** (`MANIFEST`) is the catalogue. A file it does not name does not exist as

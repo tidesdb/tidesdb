@@ -46,10 +46,17 @@ typedef enum
  */
 typedef enum
 {
+    /* every version is visible, including sequences still in progress */
     TDB_ISOLATION_READ_UNCOMMITTED = 0,
+    /* the newest committed version, with the ceiling re-read on every operation */
     TDB_ISOLATION_READ_COMMITTED = 1,
+    /* the ceiling is frozen when the transaction begins, and a commit validates that every key it
+       read still holds the version it read */
     TDB_ISOLATION_REPEATABLE_READ = 2,
+    /* frozen ceiling, and a commit reserves each key it writes on a first-committer-wins basis
+       rather than validating what it read */
     TDB_ISOLATION_SNAPSHOT = 3,
+    /* both of the checks above, plus the one that catches write skew */
     TDB_ISOLATION_SERIALIZABLE = 4
 } tidesdb_isolation_level_t;
 
@@ -1157,11 +1164,11 @@ int tidesdb_txn_rollback_prepared(tidesdb_txn_t *txn);
 /**
  * tidesdb_prepared_txn_t
  * one transaction that was durably prepared before a restart and has no decision recorded after it
- * @param txn a handle in the prepared state, resolved with tidesdb_txn_commit_prepared or
+ * @field txn a handle in the prepared state, resolved with tidesdb_txn_commit_prepared or
  *            tidesdb_txn_rollback_prepared and freed like any other transaction
- * @param xid the transaction id the coordinator prepared it under, borrowed from the database and
+ * @field xid the transaction id the coordinator prepared it under, borrowed from the database and
  *            valid until it is closed
- * @param xid_size length of xid in bytes
+ * @field xid_size length of xid in bytes
  */
 typedef struct
 {

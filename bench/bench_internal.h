@@ -55,6 +55,29 @@ typedef enum
  * @param scan_length the number of entries a scan op iterates
  * @param seed the base RNG seed
  * @param sample_interval_ms the sampler tick period, 0 disables sampling
+ * @param seconds run each workload for this many seconds instead of to its op count
+ * @param rate hold total throughput to this many ops a second, 0 leaves a run unpaced
+ * @param compression the klog encoding pipeline
+ * @param index_fanout rows sharing one indexed value, for fillindex and indexscan
+ * @param bloom_fpr the bloom filter false positive rate, negative leaves the family default
+ * @param level_size_ratio the level size ratio, 0 leaves the family default
+ * @param min_levels the minimum level count, 0 leaves the family default
+ * @param dividing_level_offset how far above the largest level partitioned merges begin, negative
+ * leaves the family default since zero is itself a setting
+ * @param l1_file_count_trigger the L1 file count a merge is due at, 0 leaves the family default
+ * @param tombstone_density_trigger the tombstone fraction a merge is due at, negative leaves the
+ * family default since zero is itself a setting
+ * @param tombstone_density_min_entries the entry count that trigger applies above, 0 leaves the
+ * family default
+ * @param btree_block_size the target btree node size, 0 leaves the family default
+ * @param value_separation_threshold the size at or above which a value is separated, 0 leaves the
+ * database default
+ * @param large_value_size the value size the large-value workloads write
+ * @param large_ratio the percent of mixed-large ops that write a large value
+ * @param idle_flush_seconds the idle rotation period, negative leaves the database default
+ * @param skip_list_max_level the memtable skip list height, 0 leaves the database default
+ * @param skip_list_probability the memtable skip list probability, negative leaves the database
+ * default
  * @param sync_mode the engine sync mode
  * @param memtable_size the memtable write-buffer size in bytes
  * @param cache_size the block-cache size in bytes
@@ -184,17 +207,8 @@ typedef struct bench_thread
 } bench_thread_t;
 
 /**
- * bench_more
- * the loop bound every workload shares. under --seconds the run is governed by a deadline and the
- * per-thread op budget is ignored, so a workload sustains pressure for as long as it is given
- * rather than finishing early at high thread counts -- which is what lets a store reach the depth
- * and the compaction backlog a short counted run never builds
- * @param t the worker
- * @param done how many of this thread's iterations have completed
- * @param budget this thread's share of --num, used only when no deadline was set
- * @return 1 while the workload should keep going
- */
-/* hold the worker to its share of --rate by sleeping until this op's slot comes due.
+ * bench_pace
+ * hold the worker to its share of --rate by sleeping until this op's slot comes due.
  *
  * a rate is what makes two configurations comparable on anything the store's *shape* decides. read
  * amplification is an equilibrium between how fast data enters the flush tier and how fast
@@ -212,6 +226,17 @@ static inline void bench_pace(const bench_thread_t *t)
     if (due > now) usleep((unsigned int)((due - now) * 1e6));
 }
 
+/**
+ * bench_more
+ * the loop bound every workload shares. under --seconds the run is governed by a deadline and the
+ * per-thread op budget is ignored, so a workload sustains pressure for as long as it is given
+ * rather than finishing early at high thread counts -- which is what lets a store reach the depth
+ * and the compaction backlog a short counted run never builds
+ * @param t the worker
+ * @param done how many of this thread's iterations have completed
+ * @param budget this thread's share of --num, used only when no deadline was set
+ * @return 1 while the workload should keep going
+ */
 static inline int bench_more(const bench_thread_t *t, uint64_t done, uint64_t budget)
 {
     bench_pace(t);

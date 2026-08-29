@@ -850,6 +850,8 @@ int main(int argc, char **argv)
             "             matched ingest rather than at whatever each can reach\n"
             "  [--compression=none|snappy|lz4|lz4fast|zstd] klog encoding pipeline\n"
             "  [--index_fanout=N] rows sharing one indexed value, for fillindex and indexscan\n"
+            "  [--large_value_size=B] [--large_ratio=PCT] the size of a large value and the\n"
+            "    share of ops that write one, for the mixedlarge and deletewhilereadlarge runs\n"
             "  [--sample_interval_ms=N] [--sync=0|1|2] [--memtable_size=B] [--cache_size=B]\n"
             "  [--l0_stall=N] [--max_open_sstables=N] [--vlog_segment_mb=N] [--stall_trace_ms=N]\n"
             "  [--flush_threads=N] [--compaction_threads=N]\n"

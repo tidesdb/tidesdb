@@ -36,8 +36,8 @@ is the exception and is noted where it occurs.
 | `MANIFEST` | The catalogue: which families and sstables exist |
 | `NNNNNNN.vlog` | One append-only segment of the shared value log holding separated values; exactly one is open for appends and the rest are immutable. Each value's block records the whole chain of encodings it was written through, so one store serves families with different pipelines and a value survives being carried into an sstable configured differently |
 | `NNNNNNN.log` | A write-ahead log generation, zero-padded to 7 digits |
-| `CCCCCCCCCC.SSSSSSS.klog` | An sstable's key log: its family's id zero-padded to ten digits, a dot, then the sstable id zero-padded to seven |
-| `CCCCCCCCCC.SSSSSSS.klog.lstmp` | Transient. Where a build stages uncompressed leaves before encoding them, so it exists only while an sstable is being written and only when the family has an encoding pipeline. It is removed when the build ends, whether it succeeded or failed; only a crash leaves one behind, and the next open sweeps it alongside the orphaned key logs |
+| `CCCCCC.SSSSSSSSSSSS.klog` | An sstable's key log: its family's id zero-padded to six digits, a dot, then the sstable id zero-padded to twelve |
+| `CCCCCC.SSSSSSSSSSSS.klog.lstmp` | Transient. Where a build stages uncompressed leaves before encoding them, so it exists only while an sstable is being written and only when the family has an encoding pipeline. It is removed when the build ends, whether it succeeded or failed; only a crash leaves one behind, and the next open sweeps it alongside the orphaned key logs |
 
 Every one is a block-manager file and shares the framing below.
 
@@ -51,6 +51,15 @@ move would invalidate need rebuilding. Mapping an id back to a family name means
 
 Carrying the family id in the filename is also what lets a database whose `MANIFEST` is unreadable be
 rebuilt from the key logs alone: the files still say which family each belongs to.
+
+**The zero padding is presentation, not format.** It exists so that an ordinary directory listing
+sorts in id order, and the two fields of a key log name are padded to different widths because their
+two counts differ by orders of magnitude. A database holds families in the hundreds or thousands,
+while it draws a fresh table id for every flush and every compaction output and never reuses one, so
+tables accumulate for as long as it is written to. An id too large for its field is written out in
+full rather than truncated, and every reader measures the digits it finds instead of assuming the
+padded width, so such a name is read back as the id it is. All it loses is its place in that
+listing. The same holds for the write-ahead log and value log names.
 
 ## The block frame
 

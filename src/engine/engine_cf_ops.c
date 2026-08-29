@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "base/encoding/serialization.h" /* the key log name format */
 #include "base/errors.h"
 #include "base/log.h"
 #include "column_family/cf_config.h"
@@ -24,9 +25,6 @@
  * it can claim the family; the product caps the wait so a stuck compaction surfaces as busy */
 #define ENGINE_CF_QUIESCE_STALL_US 1000
 #define ENGINE_CF_QUIESCE_TICKS    60000
-
-/* upper bound on a klog file name (a zero-padded id and the extension), for a clone's copy paths */
-#define ENGINE_CF_KLOG_NAME_MAX 64
 
 int engine_list_column_families(tidesdb_t *db, char ***out_names, int *out_count)
 {
@@ -205,7 +203,7 @@ static int engine_klog_path(char *dst, size_t cap, const char *cf_dir, uint64_t 
     /* the family belongs in the name. source and destination share a directory, so without it a
      * clone would build the same path for both and copy a file onto itself */
     name_entry.column_family_id = cf_id;
-    char name[ENGINE_CF_KLOG_NAME_MAX];
+    char name[TDB_SSTABLE_KLOG_NAME_MAX];
     if (sstable_klog_filename(&name_entry, name, sizeof(name)) != TDB_SUCCESS) return -1;
     const int n = snprintf(dst, cap, "%s%s%s", cf_dir, PATH_SEPARATOR, name);
     return (n < 0 || (size_t)n >= cap) ? -1 : 0;

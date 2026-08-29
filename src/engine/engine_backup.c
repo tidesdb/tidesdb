@@ -37,9 +37,6 @@
  */
 #define ENGINE_BACKUP_PATH_MAX 4096
 
-/* upper bound on a klog file name (a zero-padded id and the extension) */
-#define ENGINE_BACKUP_KLOG_NAME_MAX 64
-
 /* join a directory and a leaf into dst with the platform separator; returns -1 if it would not fit
  */
 static int engine_join(char *dst, size_t cap, const char *dir, const char *leaf)
@@ -211,7 +208,7 @@ static int engine_backup_copy_cf(tidesdb_t *db, cf_t *cf, const char *dir)
     int rc = TDB_SUCCESS;
     for (int i = 0; i < got && rc == TDB_SUCCESS; i++)
     {
-        char name[ENGINE_BACKUP_KLOG_NAME_MAX];
+        char name[TDB_SSTABLE_KLOG_NAME_MAX];
         char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
         if (sstable_klog_filename(&entries[i], name, sizeof(name)) != TDB_SUCCESS ||
             engine_join(src, sizeof(src), cf->dir, name) != 0 ||

@@ -380,16 +380,6 @@ static void fc_run(uint64_t seed, const char *dir)
     (void)remove_directory(dir);
 }
 
-static uint64_t fc_seed_rng(uint64_t *state)
-{
-    uint64_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    return x;
-}
-
 int main(void)
 {
     const char *base = getenv("TIDESDB_FUZZ_DIR");
@@ -402,7 +392,7 @@ int main(void)
     uint64_t state = seed_env ? (uint64_t)strtoull(seed_env, NULL, 10) : 0x243f6a8885a308d3ULL;
     if (state == 0) state = 0x243f6a8885a308d3ULL;
 
-    for (long it = 0; it < iters; it++) fc_run(fc_seed_rng(&state), dir);
+    for (long it = 0; it < iters; it++) fc_run(fc_rng(&state), dir);
     fprintf(stderr, "conc fuzz: %ld iterations passed\n", iters);
     return 0;
 }

@@ -59,6 +59,9 @@ static inline double bench_now_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* the most samplers the built-in set can fill */
+#define BENCH_SAMPLER_MAX 8
+
 /**
  * bench_samplers_open
  * populate samplers with the built-in set, opening a <dir>/<name>.tsv stream for each when dir is
@@ -68,7 +71,6 @@ static inline double bench_now_seconds(void)
  * @param c the shared sampler context
  * @return the number of samplers populated
  */
-#define BENCH_SAMPLER_MAX 8
 int bench_samplers_open(bench_sampler_t *samplers, const char *dir, const bench_sample_ctx_t *c);
 
 /**

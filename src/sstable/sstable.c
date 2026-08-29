@@ -22,17 +22,11 @@
  * holds */
 #define TDB_SSTABLE_REF_OWNER 1
 
-/* upper bound on a .klog file name, generous against the zero-padded id and the extension */
-#define TDB_SSTABLE_KLOG_NAME_MAX 96
-
-/* sstable klog files are named by id alone (globally unique), zero-padded to this width; the
- * manifest still records level and partition for placement, they are not in the file name */
-#define TDB_SSTABLE_ID_DIGITS 7
-
-/* the owning family's id leads the name. every family's files share the one database directory, so
- * the name is the only thing that says which family a file belongs to */
-#define TDB_SSTABLE_CF_DIGITS 10
-
+/* the owning family's id leads the name and the table's own id follows it. every family's files
+ * share the one database directory, so the name is the only thing that says which family a file
+ * belongs to, and the table id is globally unique. the manifest still records level and partition
+ * for placement, they are not in the name. both widths live in serialization.h beside the
+ * extension, because recovery reads these names back and has to agree about their shape */
 int sstable_klog_filename(const tidesdb_manifest_entry_t *entry, char *out, size_t out_size)
 {
     if (!entry || !out || out_size == 0) return TDB_ERR_INVALID_ARGS;

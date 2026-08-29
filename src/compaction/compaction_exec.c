@@ -13,7 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "base/errors.h" /* TDB_SUCCESS and the TDB_ERR_* result codes */
+#include "base/encoding/serialization.h" /* the key log name format */
+#include "base/errors.h"                 /* TDB_SUCCESS and the TDB_ERR_* result codes */
 #include "base/log.h"
 #include "column_family/level/level_set.h" /* level_set_collect_all, level_set_swap */
 #include "compat.h"                        /* PATH_SEPARATOR */
@@ -21,9 +22,8 @@
 #include "iter/merge_iter.h"
 #include "iter/merge_sources.h"
 
-/* buffer for a NNNNNNN.klog file name and the full path a compaction output opens */
-#define CE_KLOG_NAME_MAX 64
-#define CE_KLOG_PATH_LEN (CF_DIR_PATH_LEN + CE_KLOG_NAME_MAX)
+/* the full path a compaction output opens, a family directory and a key log name within it */
+#define CE_KLOG_PATH_LEN (CF_DIR_PATH_LEN + TDB_SSTABLE_KLOG_NAME_MAX)
 
 /* how many output slots to grow the sink's array by at a time */
 #define CE_OUTPUTS_GROW 8
@@ -162,7 +162,7 @@ static int ce_sink_open(ce_sink_t *s)
     naming.column_family_id = s->cx->cf->cf_id;
     naming.id = id;
     naming.partition = MANIFEST_NO_PARTITION;
-    char filename[CE_KLOG_NAME_MAX], klog_path[CE_KLOG_PATH_LEN];
+    char filename[TDB_SSTABLE_KLOG_NAME_MAX], klog_path[CE_KLOG_PATH_LEN];
     if (sstable_klog_filename(&naming, filename, sizeof(filename)) != TDB_SUCCESS)
         return TDB_ERR_INVALID_ARGS;
     const int len =

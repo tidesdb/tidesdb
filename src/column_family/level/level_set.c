@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "base/lockfree.h"
 
 /* a layout that is neither published nor on the retire list holds sstable references nothing will
@@ -79,20 +80,6 @@ struct level_set
     _Atomic(uint32_t) interval_tables;
 };
 
-/* keys are ordered byte-wise; the shared prefix decides, otherwise the shorter key sorts first */
-static int level_key_cmp(const uint8_t *key1, const size_t key1_size, const uint8_t *key2,
-                         const size_t key2_size)
-{
-    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    /* the bounds of an sstable carrying nothing but an interval tombstone are a null pointer of no
-     * length, and memcmp declares both pointers non-null whatever the count */
-    const int c = min_size > 0 ? memcmp(key1, key2, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (key1_size < key2_size) return -1;
-    if (key1_size > key2_size) return 1;
-    return 0;
-}
-
 /**
  * level_min_key_cmp
  * order two sstables by their min_key, keeping L2+ runs sorted
@@ -102,7 +89,7 @@ static int level_key_cmp(const uint8_t *key1, const size_t key1_size, const uint
  */
 static int level_min_key_cmp(const sstable_t *a, const sstable_t *b)
 {
-    return level_key_cmp(a->min_key, a->min_key_size, b->min_key, b->min_key_size);
+    return tdb_key_cmp(a->min_key, a->min_key_size, b->min_key, b->min_key_size);
 }
 
 /**
@@ -134,7 +121,7 @@ static int level_min_key_upper_bound(const level_entry_t *arr, const int n, cons
     {
         const int mid = lo + (hi - lo) / 2;
         const sstable_t *s = arr[mid].sst;
-        if (level_key_cmp(s->min_key, s->min_key_size, key, key_size) <= 0)
+        if (tdb_key_cmp(s->min_key, s->min_key_size, key, key_size) <= 0)
             lo = mid + 1;
         else
             hi = mid;
@@ -164,8 +151,8 @@ static int level_ranges_overlap(const sstable_t *sst, const uint8_t *min_key,
     if (!sst->min_key || !sst->max_key || sst->min_key_size == 0 || sst->max_key_size == 0)
         return 1;
 
-    if (level_key_cmp(sst->max_key, sst->max_key_size, min_key, min_key_size) < 0) return 0;
-    if (level_key_cmp(sst->min_key, sst->min_key_size, max_key, max_key_size) > 0) return 0;
+    if (tdb_key_cmp(sst->max_key, sst->max_key_size, min_key, min_key_size) < 0) return 0;
+    if (tdb_key_cmp(sst->min_key, sst->min_key_size, max_key, max_key_size) > 0) return 0;
     return 1;
 }
 

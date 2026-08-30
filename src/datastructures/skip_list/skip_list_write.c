@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "datastructures/skip_list/skip_list_internal.h"
 
 /* the version-add outcome codes shared by the write paths, kept distinct so a caller can tell a
@@ -138,7 +139,7 @@ static void skip_list_link_node_upper_levels(skip_list_node_t *new_node, skip_li
         {
             next = atomic_load_explicit(&pred->forward[i], memory_order_acquire);
             if (next != NULL && !NODE_IS_SENTINEL(next) &&
-                skip_list_key_cmp(next->key, next->key_size, new_node->key, new_node->key_size) < 0)
+                tdb_key_cmp(next->key, next->key_size, new_node->key, new_node->key_size) < 0)
             {
                 pred = next;
                 continue;
@@ -193,7 +194,7 @@ static skip_list_node_t *skip_list_find_update(skip_list_node_t *start, const in
 
         while (next != NULL && !NODE_IS_SENTINEL(next))
         {
-            int cmp = skip_list_key_cmp(next->key, next->key_size, key, key_size);
+            int cmp = tdb_key_cmp(next->key, next->key_size, key, key_size);
             if (cmp >= 0) break;
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
@@ -242,7 +243,7 @@ static int skip_list_link_base(skip_list_t *list, skip_list_node_t *header,
      * already too far right is discarded for the header and the walk starts over */
     skip_list_node_t *pred = update[0];
     if (pred != header && pred->key != NULL &&
-        skip_list_key_cmp(pred->key, pred->key_size, e->key, e->key_size) >= 0)
+        tdb_key_cmp(pred->key, pred->key_size, e->key, e->key_size) >= 0)
         pred = header;
 
     int cas_attempts = 0;
@@ -254,8 +255,7 @@ static int skip_list_link_base(skip_list_t *list, skip_list_node_t *header,
 
         if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
         {
-            const int cmp =
-                skip_list_key_cmp(next_at_0->key, next_at_0->key_size, e->key, e->key_size);
+            const int cmp = tdb_key_cmp(next_at_0->key, next_at_0->key_size, e->key, e->key_size);
             if (cmp == 0)
             {
                 const int r = skip_list_add_version_to_node(list, next_at_0, e);
@@ -282,8 +282,7 @@ static int skip_list_link_base(skip_list_t *list, skip_list_node_t *header,
          */
         if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
         {
-            const int cmp =
-                skip_list_key_cmp(next_at_0->key, next_at_0->key_size, e->key, e->key_size);
+            const int cmp = tdb_key_cmp(next_at_0->key, next_at_0->key_size, e->key, e->key_size);
             if (cmp == 0)
             {
                 const int r = skip_list_add_version_to_node(list, next_at_0, e);
@@ -325,7 +324,7 @@ static int skip_list_try_fold(skip_list_t *list, const skip_list_batch_entry_t *
                               skip_list_node_t *node, int *out_rc)
 {
     if (node == NULL || NODE_IS_SENTINEL(node)) return 0;
-    if (skip_list_key_cmp(node->key, node->key_size, e->key, e->key_size) != 0) return 0;
+    if (tdb_key_cmp(node->key, node->key_size, e->key, e->key_size) != 0) return 0;
 
     const int r = skip_list_add_version_to_node(list, node, e);
     *out_rc = r == SKIP_LIST_ADD_OK ? 0 : -1;
@@ -504,8 +503,8 @@ static skip_list_node_t *skip_list_batch_seek(skip_list_t *list, skip_list_node_
 
     /* each update[i] has level >= i, set during traversal at that level, so reusing it and reading
      * update[i]->forward[i] is always safe */
-    const int use_hint = hint->key != NULL && skip_list_key_cmp(entry->key, entry->key_size,
-                                                                hint->key, hint->key_size) >= 0;
+    const int use_hint = hint->key != NULL &&
+                         tdb_key_cmp(entry->key, entry->key_size, hint->key, hint->key_size) >= 0;
 
     skip_list_node_t *current;
     if (!use_hint)
@@ -552,7 +551,7 @@ static int skip_list_batch_link_base(skip_list_t *list, const skip_list_batch_en
         if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
         {
             const int cmp =
-                skip_list_key_cmp(next_at_0->key, next_at_0->key_size, entry->key, entry->key_size);
+                tdb_key_cmp(next_at_0->key, next_at_0->key_size, entry->key, entry->key_size);
             if (cmp == 0)
             {
                 if (skip_list_add_version_to_node(list, next_at_0, entry) == SKIP_LIST_ADD_OK)
@@ -636,7 +635,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         skip_list_node_t *existing =
             atomic_load_explicit(&current->forward[0], memory_order_acquire);
         if (existing != NULL && !NODE_IS_SENTINEL(existing) &&
-            skip_list_key_cmp(existing->key, existing->key_size, entry->key, entry->key_size) == 0)
+            tdb_key_cmp(existing->key, existing->key_size, entry->key, entry->key_size) == 0)
         {
             if (skip_list_add_version_to_node(list, existing, entry) == SKIP_LIST_ADD_OK)
                 success_count++;

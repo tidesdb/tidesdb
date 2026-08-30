@@ -13,6 +13,7 @@
 
 #include "base/encoding/serialization.h" /* be32 codec, TDB_CF_PREFIX_SIZE */
 #include "base/errors.h"                 /* TDB_SUCCESS */
+#include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 #include "memtable/memtable.h"           /* the interval predicate a memtable view asks first */
 #include "txn/writeset.h"                /* writeset op access and TDB_WAL_ENTRY_TOMBSTONE */
 
@@ -381,15 +382,6 @@ struct writeset_merge_source
     uint64_t seq;
 };
 
-/* byte-wise key order with a length tiebreak, matching the merge's ordering everywhere */
-static int ws_key_cmp(const uint8_t *a, size_t a_size, const uint8_t *b, size_t b_size)
-{
-    const size_t n = a_size < b_size ? a_size : b_size;
-    const int c = n > 0 ? memcmp(a, b, n) : 0;
-    if (c != 0) return c;
-    return a_size < b_size ? -1 : (a_size > b_size ? 1 : 0);
-}
-
 /* one collected op paired with its insertion index, so a sort by key then index leaves the latest
  * write of each key last in its run */
 typedef struct
@@ -401,7 +393,7 @@ typedef struct
 static int ws_collect_cmp(const void *a, const void *b)
 {
     const ws_collect_t *x = a, *y = b;
-    const int c = ws_key_cmp(x->op.key, x->op.key_size, y->op.key, y->op.key_size);
+    const int c = tdb_key_cmp(x->op.key, x->op.key_size, y->op.key, y->op.key_size);
     if (c != 0) return c;
     return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
 }
@@ -445,8 +437,8 @@ writeset_merge_source_t *writeset_merge_source_new(const tidesdb_writeset_t *ws,
     int out = 0;
     for (int i = 0; i < m; i++)
     {
-        if (i + 1 < m && ws_key_cmp(collected[i].op.key, collected[i].op.key_size,
-                                    collected[i + 1].op.key, collected[i + 1].op.key_size) == 0)
+        if (i + 1 < m && tdb_key_cmp(collected[i].op.key, collected[i].op.key_size,
+                                     collected[i + 1].op.key, collected[i + 1].op.key_size) == 0)
             continue;
         const int deleted = (collected[i].op.flags & TDB_WAL_ENTRY_TOMBSTONE) != 0;
         ents[out].key = collected[i].op.key;
@@ -503,7 +495,7 @@ static int wss_seek(void *ctx, const uint8_t *key, size_t key_size)
     while (lo < hi)
     {
         const int mid = lo + (hi - lo) / 2;
-        if (ws_key_cmp(s->ents[mid].key, s->ents[mid].key_size, key, key_size) < 0)
+        if (tdb_key_cmp(s->ents[mid].key, s->ents[mid].key_size, key, key_size) < 0)
             lo = mid + 1;
         else
             hi = mid;
@@ -520,7 +512,7 @@ static int wss_seek_for_prev(void *ctx, const uint8_t *key, size_t key_size)
     while (lo < hi)
     {
         const int mid = lo + (hi - lo) / 2;
-        if (ws_key_cmp(s->ents[mid].key, s->ents[mid].key_size, key, key_size) <= 0)
+        if (tdb_key_cmp(s->ents[mid].key, s->ents[mid].key_size, key, key_size) <= 0)
             lo = mid + 1;
         else
             hi = mid;

@@ -9,7 +9,8 @@
 #ifndef __SKIP_LIST_INTERNAL_H__
 #define __SKIP_LIST_INTERNAL_H__
 
-#include "base/arena.h" /* the shared region allocator backing node and version storage */
+#include "base/arena.h"  /* the shared region allocator backing node and version storage */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "datastructures/skip_list/skip_list.h"
 
 /* internal helpers shared across the skip_list translation units; not part of the public api */
@@ -55,27 +56,6 @@ static inline void skip_list_dealloc(const skip_list_t *list, void *ptr)
     free(ptr);
 }
 
-/**
- * skip_list_key_cmp
- * total byte-wise order over keys -- the shared prefix decides, otherwise the shorter key sorts
- * first
- * @param key1 first key
- * @param key1_size size of the first key in bytes
- * @param key2 second key
- * @param key2_size size of the second key in bytes
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
- */
-static inline int skip_list_key_cmp(const uint8_t *key1, const size_t key1_size,
-                                    const uint8_t *key2, const size_t key2_size)
-{
-    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    const int c = memcmp(key1, key2, min_size);
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (key1_size < key2_size) return -1;
-    if (key1_size > key2_size) return 1;
-    return 0;
-}
-
 /* where a descent stops relative to a node whose key equals the target. a lookup and a forward seek
  * want the node before it; a backward seek wants the node itself */
 #define SKIP_LIST_DESCEND_BELOW       0
@@ -119,7 +99,7 @@ static inline skip_list_node_t *skip_list_descend(const skip_list_t *list, skip_
 
         while (next != NULL && !NODE_IS_SENTINEL(next))
         {
-            const int cmp = skip_list_key_cmp(next->key, next->key_size, key, key_size);
+            const int cmp = tdb_key_cmp(next->key, next->key_size, key, key_size);
             if (cmp > 0 || (cmp == 0 && stop == SKIP_LIST_DESCEND_BELOW)) break;
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);

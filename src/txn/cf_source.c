@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "base/errors.h" /* TDB_SUCCESS, TDB_ERR_NOT_FOUND, TDB_ERR_BUSY */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "column_family/level/level_set.h"
 #include "internal/types.h" /* TDB_TTL_NONE, the deadline a delete carries */
 #include "sstable/sstable.h"
@@ -287,18 +288,6 @@ static tidesdb_source_result_t cf_source_newer_in_level(cf_t *cf, int level, con
  * which a commit retries rather than reading as a clear run */
 #define CF_SOURCE_RANGE_MAX_TABLES 512
 
-/* byte-wise order over keys, the same one the tables are sorted in */
-static int cf_source_key_cmp(const uint8_t *a, const size_t a_size, const uint8_t *b,
-                             const size_t b_size)
-{
-    const size_t min_size = a_size < b_size ? a_size : b_size;
-    const int c = min_size > 0 ? memcmp(a, b, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (a_size < b_size) return -1;
-    if (a_size > b_size) return 1;
-    return 0;
-}
-
 /**
  * cf_source_table_in_range
  * whether a table's recorded key range meets [lo, hi) at all. a table entirely outside it holds
@@ -314,9 +303,8 @@ static int cf_source_table_in_range(const sstable_t *sst, const uint8_t *lo, con
                                     const uint8_t *hi, const size_t hi_size)
 {
     if (!sst->min_key || !sst->max_key) return 1; /* no recorded range, so it cannot be ruled out */
-    if (cf_source_key_cmp(sst->max_key, sst->max_key_size, lo, lo_size) < 0) return 0;
-    if (hi_size > 0 && cf_source_key_cmp(sst->min_key, sst->min_key_size, hi, hi_size) >= 0)
-        return 0;
+    if (tdb_key_cmp(sst->max_key, sst->max_key_size, lo, lo_size) < 0) return 0;
+    if (hi_size > 0 && tdb_key_cmp(sst->min_key, sst->min_key_size, hi, hi_size) >= 0) return 0;
     return 1;
 }
 
@@ -356,7 +344,7 @@ static int cf_source_table_range_has_newer(sstable_t *sst, const uint8_t *lo, co
         if (sstable_iter_get(it, &key, &key_size, &value, &value_size, &vlog_offset, &seq, &ttl,
                              &deleted) != TDB_SUCCESS)
             break;
-        if (hi_size > 0 && cf_source_key_cmp(key, key_size, hi, hi_size) >= 0) break;
+        if (hi_size > 0 && tdb_key_cmp(key, key_size, hi, hi_size) >= 0) break;
         if (seq > seq_floor)
         {
             *newer = 1;

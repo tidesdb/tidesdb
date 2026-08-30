@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "base/encoding/serialization.h" /* the big-endian fixed-width codec the block is written in */
+#include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 
 /* the largest value a key byte can hold, which is what a prefix has to be stripped of before its
  * successor can be formed by incrementing */
@@ -20,27 +21,6 @@
 /* fragments the first append reserves room for, doubled from there. a set built by appending is
  * one being rebuilt from a source that already knows its own shape, so it grows once or twice */
 #define RT_APPEND_INITIAL_CAPACITY 8
-
-/**
- * rt_key_cmp
- * total byte-wise order over keys -- the shared prefix decides, otherwise the shorter key sorts
- * first, matching the order the memtable and the sstables are already sorted in
- * @param key1 first key
- * @param key1_size size of the first key in bytes
- * @param key2 second key
- * @param key2_size size of the second key in bytes
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
- */
-static int rt_key_cmp(const uint8_t *key1, const size_t key1_size, const uint8_t *key2,
-                      const size_t key2_size)
-{
-    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    const int c = min_size > 0 ? memcmp(key1, key2, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (key1_size < key2_size) return -1;
-    if (key1_size > key2_size) return 1;
-    return 0;
-}
 
 /**
  * rt_hi_cmp_key
@@ -55,7 +35,7 @@ static int rt_hi_cmp_key(const uint8_t *hi, const size_t hi_size, const uint8_t 
                          const size_t key_size)
 {
     if (hi_size == RT_UNBOUNDED_ABOVE) return 1;
-    return rt_key_cmp(hi, hi_size, key, key_size);
+    return tdb_key_cmp(hi, hi_size, key, key_size);
 }
 
 /**
@@ -73,7 +53,7 @@ static int rt_hi_cmp_hi(const uint8_t *a, const size_t a_size, const uint8_t *b,
     if (a_size == RT_UNBOUNDED_ABOVE && b_size == RT_UNBOUNDED_ABOVE) return 0;
     if (a_size == RT_UNBOUNDED_ABOVE) return 1;
     if (b_size == RT_UNBOUNDED_ABOVE) return -1;
-    return rt_key_cmp(a, a_size, b, b_size);
+    return tdb_key_cmp(a, a_size, b, b_size);
 }
 
 /**
@@ -229,7 +209,7 @@ static int rt_merge(const range_tombstone_set_t *set, const uint8_t *lo, const s
         size_t ov_hi_size = hi_size;
 
         /* the run of the new interval reaching this fragment carries only its own sequence */
-        if (rt_key_cmp(pos, pos_size, frag->lo, frag->lo_size) < 0)
+        if (tdb_key_cmp(pos, pos_size, frag->lo, frag->lo_size) < 0)
         {
             rc = rt_emit(out, pos, pos_size, frag->lo, frag->lo_size, NULL, 0, &seq);
             if (rc != TDB_SUCCESS) return rc;
@@ -239,7 +219,7 @@ static int rt_merge(const range_tombstone_set_t *set, const uint8_t *lo, const s
 
         /* the head of a fragment the new interval starts inside keeps only what already covered it
          */
-        if (rt_key_cmp(frag->lo, frag->lo_size, pos, pos_size) < 0)
+        if (tdb_key_cmp(frag->lo, frag->lo_size, pos, pos_size) < 0)
         {
             rc = rt_emit(out, frag->lo, frag->lo_size, pos, pos_size, frag->seqs, frag->seq_count,
                          NULL);
@@ -397,7 +377,7 @@ int range_tombstone_covering_fragment(const range_tombstone_set_t *set, const ui
     while (lo_i < hi_i)
     {
         const size_t mid = lo_i + (hi_i - lo_i) / 2;
-        if (rt_key_cmp(set->frags[mid].lo, set->frags[mid].lo_size, key, key_size) <= 0)
+        if (tdb_key_cmp(set->frags[mid].lo, set->frags[mid].lo_size, key, key_size) <= 0)
             lo_i = mid + 1;
         else
             hi_i = mid;

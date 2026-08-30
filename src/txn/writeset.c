@@ -12,7 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "db.h" /* TDB_SUCCESS / TDB_ERR_* result codes */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
+#include "db.h"          /* TDB_SUCCESS / TDB_ERR_* result codes */
 
 /* initial op-array capacity, grown by doubling */
 #define TDB_WRITESET_INITIAL_CAP 16
@@ -142,18 +143,6 @@ int tidesdb_writeset_op_at(const tidesdb_writeset_t *ws, int index, tidesdb_writ
     return 1;
 }
 
-/* byte-wise order over keys, matching every source */
-static int writeset_key_cmp(const uint8_t *a, const size_t a_size, const uint8_t *b,
-                            const size_t b_size)
-{
-    const size_t min_size = a_size < b_size ? a_size : b_size;
-    const int c = min_size > 0 ? memcmp(a, b, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (a_size < b_size) return -1;
-    if (a_size > b_size) return 1;
-    return 0;
-}
-
 /* whether a buffered interval delete covers a key. its lower bound is the op's key and its upper
  * bound the value stored beside it, open when that value is empty
  * @param op the buffered op, which the caller has already checked is an interval delete
@@ -163,9 +152,9 @@ static int writeset_key_cmp(const uint8_t *a, const size_t a_size, const uint8_t
  */
 static int writeset_range_covers(const writeset_op *op, const uint8_t *key, const size_t key_size)
 {
-    if (writeset_key_cmp(op->buf, op->key_size, key, key_size) > 0) return 0;
+    if (tdb_key_cmp(op->buf, op->key_size, key, key_size) > 0) return 0;
     if (op->value_size == 0) return 1; /* open above */
-    return writeset_key_cmp(key, key_size, op->buf + op->key_size, op->value_size) < 0;
+    return tdb_key_cmp(key, key_size, op->buf + op->key_size, op->value_size) < 0;
 }
 
 int tidesdb_writeset_lookup(const tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,

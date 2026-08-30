@@ -15,6 +15,7 @@
 
 #include "base/encoding/serialization.h" /* the key log name format */
 #include "base/errors.h"                 /* TDB_SUCCESS and the TDB_ERR_* result codes */
+#include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
 #include "column_family/level/level_set.h" /* level_set_collect_all, level_set_swap */
 #include "compat.h"                        /* PATH_SEPARATOR */
@@ -31,18 +32,6 @@
 /* how many sstables one level of the base-tombstone sibling scan inspects; a level that fills this
  * many leaves the rest of the level unread, so absence is unproven and the tombstone is kept */
 #define CE_TOMB_SIBLING_MAX 64
-
-/* byte-wise key order with a length tiebreak, matching the engine's memcmp ordering */
-static int ce_key_cmp(const uint8_t *a, size_t a_size, const uint8_t *b, size_t b_size)
-{
-    const size_t n = a_size < b_size ? a_size : b_size;
-    /* a partition boundary is the min-key of an sstable, and one carrying nothing but an interval
-     * tombstone has no key to name it with */
-    const int c = n > 0 ? memcmp(a, b, n) : 0;
-    if (c != 0) return c;
-    if (a_size < b_size) return -1;
-    return a_size > b_size ? 1 : 0;
-}
 
 /* reference the job's input sstables from the live level set, summing their on-disk sizes into
  * read_bytes and recording each one's size in out_sizes so a rollback can put its catalogue entry
@@ -246,7 +235,7 @@ static int ce_partition_of(const compaction_job_t *job, const uint8_t *key, size
 {
     int p = 0;
     while (p < job->n_boundaries &&
-           ce_key_cmp(key, key_size, job->boundaries[p], job->boundary_sizes[p]) >= 0)
+           tdb_key_cmp(key, key_size, job->boundaries[p], job->boundary_sizes[p]) >= 0)
         p++;
     return p;
 }
@@ -393,9 +382,9 @@ static int ce_write_merged(const compaction_ctx_t *cx, const compaction_job_t *j
         /* the bound is exclusive and lands on a boundary key, which is a real key from the level
          * above -- so every version of every key below it has already been seen, and the range that
          * starts here begins with that key's own versions rather than the tail of this one's */
-        if (end && ce_key_cmp(key, key_size, end, end_size) >= 0) break;
+        if (end && tdb_key_cmp(key, key_size, end, end_size) >= 0) break;
 
-        if (!prev_key || ce_key_cmp(key, key_size, prev_key, prev_key_size) != 0)
+        if (!prev_key || tdb_key_cmp(key, key_size, prev_key, prev_key_size) != 0)
         {
             kept_base = 0;
             if (ce_sink_maybe_roll(sink, job, key, key_size) != TDB_SUCCESS)

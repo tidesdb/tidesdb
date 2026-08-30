@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "base/keycmp.h"   /* tdb_key_cmp, the one byte-wise key order */
 #include "base/lockfree.h" /* the writer-preferring rwlock the commit gate is */
 
 /* commit-ring slot states */
@@ -116,25 +117,13 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     return m;
 }
 
-/* byte-wise order over keys, the order every source is sorted in */
-static int mvcc_key_cmp(const uint8_t *a, const size_t a_size, const uint8_t *b,
-                        const size_t b_size)
-{
-    const size_t min_size = a_size < b_size ? a_size : b_size;
-    const int c = min_size > 0 ? memcmp(a, b, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (a_size < b_size) return -1;
-    if (a_size > b_size) return 1;
-    return 0;
-}
-
 /* whether a held interval covers a key */
 static int mvcc_range_covers(const mvcc_range_reservation_t *r, const uint8_t *key,
                              const size_t key_size)
 {
-    if (mvcc_key_cmp(r->lo, r->lo_size, key, key_size) > 0) return 0;
+    if (tdb_key_cmp(r->lo, r->lo_size, key, key_size) > 0) return 0;
     if (r->hi_size == 0) return 1; /* open above */
-    return mvcc_key_cmp(key, key_size, r->hi, r->hi_size) < 0;
+    return tdb_key_cmp(key, key_size, r->hi, r->hi_size) < 0;
 }
 
 /* whether two half-open intervals intersect. an open upper bound is above every bound that can be
@@ -142,8 +131,8 @@ static int mvcc_range_covers(const mvcc_range_reservation_t *r, const uint8_t *k
 static int mvcc_ranges_overlap(const mvcc_range_reservation_t *r, const uint8_t *lo,
                                const size_t lo_size, const uint8_t *hi, const size_t hi_size)
 {
-    if (hi_size > 0 && mvcc_key_cmp(hi, hi_size, r->lo, r->lo_size) <= 0) return 0;
-    if (r->hi_size > 0 && mvcc_key_cmp(r->hi, r->hi_size, lo, lo_size) <= 0) return 0;
+    if (hi_size > 0 && tdb_key_cmp(hi, hi_size, r->lo, r->lo_size) <= 0) return 0;
+    if (r->hi_size > 0 && tdb_key_cmp(r->hi, r->hi_size, lo, lo_size) <= 0) return 0;
     return 1;
 }
 

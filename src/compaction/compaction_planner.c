@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "base/errors.h" /* TDB_SUCCESS and the TDB_ERR_* result codes */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 
 /* the shallowest tree Spooky's structure can exist in: the flush tier plus one level for merges to
  * land in. below this the dividing level would be the tier itself */
@@ -282,24 +283,12 @@ static int ce_emit_simple(compaction_plan_t *p, const compaction_snapshot_t *sna
     return ce_plan_add(p, &job);
 }
 
-/* byte-wise key order with a length tiebreak, matching the engine's memcmp ordering */
-static int ce_key_cmp(const uint8_t *a, size_t a_size, const uint8_t *b, size_t b_size)
-{
-    const size_t n = a_size < b_size ? a_size : b_size;
-    /* a partition boundary is the min-key of an sstable, and one carrying nothing but an interval
-     * tombstone has no key to name it with */
-    const int c = n > 0 ? memcmp(a, b, n) : 0;
-    if (c != 0) return c;
-    if (a_size < b_size) return -1;
-    return a_size > b_size ? 1 : 0;
-}
-
 /* the boundary partition a key falls in -- the count of boundaries at or below it */
 static int ce_partition_of_key(const compaction_plan_t *p, const uint8_t *key, size_t key_size)
 {
     int part = 0;
     while (part < p->n_boundaries &&
-           ce_key_cmp(key, key_size, p->boundary_keys[part], p->boundary_sizes[part]) >= 0)
+           tdb_key_cmp(key, key_size, p->boundary_keys[part], p->boundary_sizes[part]) >= 0)
         part++;
     return part;
 }

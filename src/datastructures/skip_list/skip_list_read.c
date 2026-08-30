@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "datastructures/skip_list/skip_list_internal.h"
 
 /* the "not answered yet" result of one descent, distinct from both a hit and a definitive miss.
@@ -70,7 +71,7 @@ static skip_list_node_t *skip_list_find_node_once(skip_list_t *list, const uint8
     for (int hop = 0; hop < budget; hop++)
     {
         if (target == NULL || NODE_IS_SENTINEL(target) || target->key == NULL) return NULL;
-        const int cmp = skip_list_key_cmp(target->key, target->key_size, key, key_size);
+        const int cmp = tdb_key_cmp(target->key, target->key_size, key, key_size);
         if (cmp == 0) return target;
 
         /* only a key above the search key proves absence. stopping on one below it is the false

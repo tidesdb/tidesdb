@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "base/encoding/serialization.h" /* tdb_encode_be64 for the abort record */
+#include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
 #include "txn_internal.h"
 
@@ -36,17 +37,6 @@ uint64_t txn_key_hash(uint32_t cf_index, const uint8_t *key, size_t key_size)
     return h;
 }
 
-/* byte-wise order over keys, the order every source is sorted in */
-static int txn_key_cmp(const uint8_t *a, const size_t a_size, const uint8_t *b, const size_t b_size)
-{
-    const size_t min_size = a_size < b_size ? a_size : b_size;
-    const int c = min_size > 0 ? memcmp(a, b, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (a_size < b_size) return -1;
-    if (a_size > b_size) return 1;
-    return 0;
-}
-
 /* order two exclusive upper bounds, either of which may be open. an open bound is above every
  * spellable one, which is what a zero length means for an interval delete */
 static int txn_hi_cmp_hi(const uint8_t *a, const size_t a_size, const uint8_t *b,
@@ -55,7 +45,7 @@ static int txn_hi_cmp_hi(const uint8_t *a, const size_t a_size, const uint8_t *b
     if (a_size == 0 && b_size == 0) return 0;
     if (a_size == 0) return 1;
     if (b_size == 0) return -1;
-    return txn_key_cmp(a, a_size, b, b_size);
+    return tdb_key_cmp(a, a_size, b, b_size);
 }
 
 /* whether an interval delete covers a key -- its lower bound is the op's key and its upper bound
@@ -63,9 +53,9 @@ static int txn_hi_cmp_hi(const uint8_t *a, const size_t a_size, const uint8_t *b
 static int txn_range_covers(const tidesdb_writeset_op_t *op, const uint8_t *key,
                             const size_t key_size)
 {
-    if (txn_key_cmp(op->key, op->key_size, key, key_size) > 0) return 0;
+    if (tdb_key_cmp(op->key, op->key_size, key, key_size) > 0) return 0;
     if (op->value_size == 0) return 1; /* open above */
-    return txn_key_cmp(key, key_size, op->value, op->value_size) < 0;
+    return tdb_key_cmp(key, key_size, op->value, op->value_size) < 0;
 }
 
 /* whether a later op in the same batch already writes everything this one does, so only the later
@@ -86,7 +76,7 @@ static int txn_op_superseded_by(const tidesdb_writeset_op_t *op, const tidesdb_w
         /* an interval retires a point write it contains, and another interval it contains whole */
         if (!(op->flags & TDB_WAL_ENTRY_RANGE_DELETE))
             return txn_range_covers(later, op->key, op->key_size);
-        return txn_key_cmp(later->key, later->key_size, op->key, op->key_size) <= 0 &&
+        return tdb_key_cmp(later->key, later->key_size, op->key, op->key_size) <= 0 &&
                txn_hi_cmp_hi(op->value, op->value_size, later->value, later->value_size) <= 0;
     }
 

@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "datastructures/skip_list/skip_list_internal.h"
 
 /**
@@ -157,7 +158,7 @@ int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t 
                            const uint8_t *key2, size_t key2_size)
 {
     if (list == NULL || key1 == NULL || key2 == NULL) return 0;
-    return skip_list_key_cmp(key1, key1_size, key2, key2_size);
+    return tdb_key_cmp(key1, key1_size, key2, key2_size);
 }
 
 /**

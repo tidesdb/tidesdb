@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "base/errors.h" /* TDB_SUCCESS from the encoding stage runners */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
 #include "sstable/btree/btree_internal.h"
 
@@ -746,7 +747,7 @@ int btree_descend_to_leaf(btree_t *tree, const uint8_t *key, const size_t key_si
             while (lo <= hi)
             {
                 const int32_t mid = lo + (hi - lo) / 2;
-                const int cmp = btree_key_cmp(key, key_size, node->keys[mid], node->key_sizes[mid]);
+                const int cmp = tdb_key_cmp(key, key_size, node->keys[mid], node->key_sizes[mid]);
                 if (cmp < 0)
                 {
                     hi = mid - 1;

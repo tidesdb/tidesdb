@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
+
 /* directory blob layout, all little-endian
  *   magic (4) | version (4) | partition_count (4)
  *   then partition_count records of
@@ -392,26 +394,13 @@ int pr_filter_reader_open(pr_filter_reader_t **out, uint64_t dir_offset, uint32_
 
 /* index of the partition whose range covers key, or -1 if key sorts before the first partition.
  * partitions are ascending, so this is the rightmost first_key <= key. */
-/* keys are ordered byte-wise; the shared prefix decides, otherwise the shorter key sorts first */
-static int pr_filter_key_cmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
-                             size_t key2_size)
-{
-    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    const int c = min_size > 0 ? memcmp(key1, key2, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (key1_size < key2_size) return -1;
-    if (key1_size > key2_size) return 1;
-    return 0;
-}
-
 static int64_t bbf_route(const pr_filter_reader_t *r, const uint8_t *key, size_t key_size)
 {
     int64_t lo = 0, hi = (int64_t)r->num_parts - 1, res = -1;
     while (lo <= hi)
     {
         int64_t mid = lo + (hi - lo) / 2;
-        int c =
-            pr_filter_key_cmp(r->parts[mid].first_key, r->parts[mid].first_key_len, key, key_size);
+        int c = tdb_key_cmp(r->parts[mid].first_key, r->parts[mid].first_key_len, key, key_size);
         if (c <= 0)
         {
             res = mid;

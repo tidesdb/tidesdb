@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "sstable/btree/btree_internal.h"
 
 int btree_cursor_init(btree_cursor_t **cursor, btree_t *tree)
@@ -242,7 +243,7 @@ int btree_cursor_seek(btree_cursor_t *cursor, const uint8_t *key, const size_t k
     while (lo < hi)
     {
         const int32_t mid = lo + (hi - lo) / 2;
-        const int cmp = btree_key_cmp(key, key_size, node->keys[mid], node->key_sizes[mid]);
+        const int cmp = tdb_key_cmp(key, key_size, node->keys[mid], node->key_sizes[mid]);
         if (cmp <= 0)
         {
             hi = mid;
@@ -295,8 +296,8 @@ int btree_cursor_seek_for_prev(btree_cursor_t *cursor, const uint8_t *key, const
         return btree_cursor_goto_last(cursor);
     }
 
-    const int cmp = btree_key_cmp(key, key_size, cursor->current_node->keys[cursor->current_index],
-                                  cursor->current_node->key_sizes[cursor->current_index]);
+    const int cmp = tdb_key_cmp(key, key_size, cursor->current_node->keys[cursor->current_index],
+                                cursor->current_node->key_sizes[cursor->current_index]);
 
     if (cmp < 0)
     {

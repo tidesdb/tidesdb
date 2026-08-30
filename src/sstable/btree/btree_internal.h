@@ -13,6 +13,7 @@
 
 #include "base/encoding/compress.h"
 #include "base/encoding/serialization.h" /* TDB_SSTABLE_KLOG_STAGE_EXT */
+#include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 #include "sstable/btree/btree.h"
 #include "xxhash.h"
 
@@ -186,27 +187,6 @@ static inline size_t btree_compute_prefix_len(const uint8_t *key1, const size_t 
         prefix_len++;
     }
     return prefix_len;
-}
-
-/**
- * btree_key_cmp
- * total byte-wise order over keys -- the shared prefix decides, otherwise the shorter key sorts
- * first
- * @param key1 first key
- * @param key1_size size of the first key in bytes
- * @param key2 second key
- * @param key2_size size of the second key in bytes
- * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
- */
-static inline int btree_key_cmp(const uint8_t *key1, const size_t key1_size, const uint8_t *key2,
-                                const size_t key2_size)
-{
-    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    const int c = min_size > 0 ? memcmp(key1, key2, min_size) : 0;
-    if (c != 0) return c < 0 ? -1 : 1;
-    if (key1_size < key2_size) return -1;
-    if (key1_size > key2_size) return 1;
-    return 0;
 }
 
 /**

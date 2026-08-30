@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "base/errors.h"    /* TDB_SUCCESS and the TDB_ERR_* result codes */
+#include "base/keycmp.h"    /* tdb_key_cmp, the one byte-wise key order */
 #include "internal/types.h" /* TDB_TTL_NONE, what a deleted version carries */
 
 /* the scan direction; a flip between the two re-seeks the sources around the current key */
@@ -51,18 +52,6 @@ struct merge_iter
     int *match;
     int n_match;
 };
-
-/* byte-wise key order with a length tiebreak, matching the engine's memcmp ordering everywhere */
-static int merge_key_cmp(const uint8_t *a, size_t a_size, const uint8_t *b, size_t b_size)
-{
-    const size_t n = a_size < b_size ? a_size : b_size;
-    /* a zero length is a real key here -- a table carrying nothing but an interval tombstone has no
-     * key to name itself with -- and memcmp wants valid pointers whatever the length */
-    const int c = n > 0 ? memcmp(a, b, n) : 0;
-    if (c != 0) return c;
-    if (a_size < b_size) return -1;
-    return a_size > b_size ? 1 : 0;
-}
 
 /* grow an owned buffer to at least need bytes; a zero need leaves it untouched */
 static int merge_ensure_cap(uint8_t **buf, size_t *cap, size_t need)
@@ -109,7 +98,7 @@ static int merge_pick_extreme(merge_iter_t *it, merge_dir_t dir)
             it->n_match = 1;
             continue;
         }
-        const int c = merge_key_cmp(key, key_size, extreme, extreme_size);
+        const int c = tdb_key_cmp(key, key_size, extreme, extreme_size);
         if ((dir == MERGE_FORWARD && c < 0) || (dir == MERGE_BACKWARD && c > 0))
         {
             /* a new winner replaces the tie set rather than joining it */
@@ -151,7 +140,7 @@ static int merge_resolve(merge_iter_t *it, merge_dir_t dir)
             uint8_t deleted = 0;
             s->get(s->ctx, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl,
                    &deleted);
-            if (merge_key_cmp(key, key_size, it->key, it->key_size) != 0) break;
+            if (tdb_key_cmp(key, key_size, it->key, it->key_size) != 0) break;
 
             if (seq <= it->snapshot && (!have || seq > best_seq))
             {
@@ -218,7 +207,7 @@ static int merge_advance_raw(merge_iter_t *it, merge_dir_t dir)
         int64_t ttl = 0;
         uint8_t deleted = 0;
         s->get(s->ctx, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl, &deleted);
-        const int c = best < 0 ? 0 : merge_key_cmp(key, key_size, best_key, best_key_size);
+        const int c = best < 0 ? 0 : tdb_key_cmp(key, key_size, best_key, best_key_size);
         const int better =
             best < 0 || (dir == MERGE_FORWARD ? (c < 0 || (c == 0 && seq > best_seq))
                                               : (c > 0 || (c == 0 && seq < best_seq)));
@@ -339,7 +328,7 @@ static void merge_reseek(merge_iter_t *it, merge_dir_t dir)
             const uint8_t *key = NULL;
             size_t key_size = 0;
             merge_source_key(s, &key, &key_size);
-            if (merge_key_cmp(key, key_size, it->key, it->key_size) != 0) break;
+            if (tdb_key_cmp(key, key_size, it->key, it->key_size) != 0) break;
             if (dir == MERGE_FORWARD)
                 (void)s->next(s->ctx);
             else

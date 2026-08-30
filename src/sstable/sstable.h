@@ -166,6 +166,11 @@ typedef struct
  * @param vlog_refs cached footer field, which value-log segments this table's separated values live
  * in and how much of each they hold, owned by the sstable
  * @param vlog_ref_count how many entries vlog_refs holds
+ * @param range_del_offset cached footer field, where this table's interval-delete block sits in the
+ *                         klog, 0 when it carries none
+ * @param range_del_size cached footer field, the size of that block, 0 when it carries none
+ * @param range_tombstones the intervals decoded from that block, read once at open and owned by the
+ *                         sstable, or NULL when the table carries none
  * @param sync_mode block-manager sync mode used when reopening the klog
  * @param encodings borrowed encoding registry the footer's pipeline ids resolve against, or NULL
  * when the family stores nodes verbatim

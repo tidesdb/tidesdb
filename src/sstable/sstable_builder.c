@@ -358,15 +358,6 @@ int sstable_builder_add_reference(sstable_builder_t *builder, const uint8_t *key
     return sstable_builder_emit(builder, key, key_size, NULL, value_size, vlog_id, seq, ttl, flags);
 }
 
-/**
- * sstable_finish_bloom
- * close out the partition range filter, when the build has one, and report where its directory
- * landed in the klog
- * @param builder the builder, whose filter builder is consumed
- * @param out_offset receives the filter directory offset, 0 when the build has no filter
- * @param out_size receives the filter directory size, 0 when the build has no filter
- * @return TDB_SUCCESS, or TDB_ERR_IO when the filter could not be written
- */
 /* write this table's own range tombstone block, so the intervals it carries travel with it. a
  * table holding none writes nothing and records a zero offset, which is what every table produced
  * before a family ever took an interval delete looks like
@@ -397,6 +388,15 @@ static int sstable_finish_range_dels(sstable_builder_t *builder, uint64_t *out_o
     return TDB_SUCCESS;
 }
 
+/**
+ * sstable_finish_bloom
+ * close out the partition range filter, when the build has one, and report where its directory
+ * landed in the klog
+ * @param builder the builder, whose filter builder is consumed
+ * @param out_offset receives the filter directory offset, 0 when the build has no filter
+ * @param out_size receives the filter directory size, 0 when the build has no filter
+ * @return TDB_SUCCESS, or TDB_ERR_IO when the filter could not be written
+ */
 static int sstable_finish_bloom(sstable_builder_t *builder, uint64_t *out_offset,
                                 uint32_t *out_size)
 {
@@ -421,6 +421,8 @@ static int sstable_finish_bloom(sstable_builder_t *builder, uint64_t *out_offset
  * @param tree the finished btree, for its shape and key bounds
  * @param bloom_dir_offset where the partition range filter directory landed
  * @param bloom_dir_size how large that directory is
+ * @param range_del_offset where this table's interval-delete block landed, 0 when it carries none
+ * @param range_del_size how large that block is, 0 when it carries none
  * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_IO on a serialize or write failure
  */
 static int sstable_write_footer(sstable_builder_t *builder, const btree_t *tree,
@@ -505,6 +507,8 @@ static int sstable_copy_key_bounds(sstable_t *sst, const btree_t *tree)
  * @param tree the finished btree
  * @param bloom_dir_offset where the partition range filter directory landed
  * @param bloom_dir_size how large that directory is
+ * @param range_del_offset where this table's interval-delete block landed, 0 when it carries none
+ * @param range_del_size how large that block is, 0 when it carries none
  * @param out receives the sstable
  * @return TDB_SUCCESS, or TDB_ERR_MEMORY
  */

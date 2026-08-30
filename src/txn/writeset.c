@@ -8,6 +8,7 @@
  */
 #include "writeset.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -43,7 +44,10 @@ typedef struct
  * @param count number of live ops
  * @param capacity allocated length of ops
  * @param lock guards ops-array mutation against a cross-txn peer scan
- * @param mem_bytes approximate heap held by the ops and their buffers
+ * @param mem_bytes approximate heap held by the ops and their buffers. atomic because the stats
+ *                  sweep sums it across live transactions owned by other threads, while only the
+ *                  owner mutates it -- relaxed throughout, since the figure is a gauge and the
+ *                  mutations are already ordered by the lock
  */
 struct tidesdb_writeset
 {
@@ -51,7 +55,7 @@ struct tidesdb_writeset
     int count;
     int capacity;
     pthread_rwlock_t lock;
-    int64_t mem_bytes;
+    _Atomic(int64_t) mem_bytes;
 };
 
 tidesdb_writeset_t *tidesdb_writeset_create(void)
@@ -107,7 +111,9 @@ int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_
     }
     ws->ops[ws->count] = (writeset_op){cf_index, buf, key_size, value_size, ttl, flags};
     ws->count++;
-    ws->mem_bytes += (int64_t)(sizeof(writeset_op) + key_size + value_size);
+    atomic_fetch_add_explicit(&ws->mem_bytes,
+                              (int64_t)(sizeof(writeset_op) + key_size + value_size),
+                              memory_order_relaxed);
     pthread_rwlock_unlock(&ws->lock);
     return TDB_SUCCESS;
 }
@@ -196,8 +202,10 @@ void tidesdb_writeset_truncate(tidesdb_writeset_t *ws, int count)
     {
         for (int i = count; i < ws->count; i++)
         {
-            ws->mem_bytes -=
-                (int64_t)(sizeof(writeset_op) + ws->ops[i].key_size + ws->ops[i].value_size);
+            atomic_fetch_sub_explicit(
+                &ws->mem_bytes,
+                (int64_t)(sizeof(writeset_op) + ws->ops[i].key_size + ws->ops[i].value_size),
+                memory_order_relaxed);
             free(ws->ops[i].buf);
         }
         ws->count = count;
@@ -227,5 +235,5 @@ int tidesdb_writeset_contains(tidesdb_writeset_t *ws, uint32_t cf_index, const u
 
 int64_t tidesdb_writeset_mem_bytes(const tidesdb_writeset_t *ws)
 {
-    return ws ? ws->mem_bytes : 0;
+    return ws ? atomic_load_explicit(&ws->mem_bytes, memory_order_relaxed) : 0;
 }

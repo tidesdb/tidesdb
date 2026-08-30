@@ -520,6 +520,112 @@ void test_txn_commit_wal_failure(void)
     tidesdb_mvcc_destroy(clock);
 }
 
+/* the dedup keeps only the last op covering each key, and it does so through a hash-backed backward
+ * walk rather than by asking every pair. this checks that walk against an independent brute-force
+ * oracle over randomized batches that mix repeated keys with interval deletes, since a disagreement
+ * would silently drop or resurrect a write */
+#define DEDUP_ORACLE_MAX_OPS 400
+
+typedef struct
+{
+    uint32_t cf;
+    char key[16];
+    char hi[16]; /* upper bound for an interval delete, empty when open or when a point write */
+    int is_range;
+} oracle_op;
+
+static int oracle_kcmp(const char *a, const char *b)
+{
+    const int c = strcmp(a, b);
+    return c < 0 ? -1 : (c > 0 ? 1 : 0);
+}
+
+/* the documented rule, written out independently of the implementation under test */
+static int oracle_superseded_by(const oracle_op *op, const oracle_op *later)
+{
+    if (later->cf != op->cf) return 0;
+    if (later->is_range)
+    {
+        if (!op->is_range)
+        {
+            if (oracle_kcmp(later->key, op->key) > 0) return 0;
+            if (later->hi[0] == '\0') return 1;
+            return oracle_kcmp(op->key, later->hi) < 0;
+        }
+        if (oracle_kcmp(later->key, op->key) > 0) return 0;
+        if (later->hi[0] == '\0') return 1;
+        if (op->hi[0] == '\0') return 0;
+        return oracle_kcmp(op->hi, later->hi) <= 0;
+    }
+    if (op->is_range) return 0;
+    return oracle_kcmp(later->key, op->key) == 0;
+}
+
+static uint32_t dedup_rng_state = 0x9E3779B9u;
+static uint32_t dedup_rand(void)
+{
+    dedup_rng_state ^= dedup_rng_state << 13;
+    dedup_rng_state ^= dedup_rng_state >> 17;
+    dedup_rng_state ^= dedup_rng_state << 5;
+    return dedup_rng_state;
+}
+
+void test_txn_commit_dedup_matches_brute_force(void)
+{
+    for (int round = 0; round < 40; round++)
+    {
+        tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+        mockbe m = {0};
+        tdb_txn_backend_t be = mkbackend(&m);
+        tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+
+        const int attempts = 1 + (int)(dedup_rand() % DEDUP_ORACLE_MAX_OPS);
+        oracle_op *ops = calloc((size_t)attempts, sizeof(*ops));
+        ASSERT_TRUE(ops != NULL);
+
+        /* only an op the api actually buffered belongs in the oracle -- an interval whose upper
+         * bound is not above its lower is refused, and counting one would compare the dedup against
+         * a write set that never held it */
+        int n = 0;
+        for (int i = 0; i < attempts; i++)
+        {
+            oracle_op cand = {0};
+            /* a small key space so repeats and interval overlaps actually happen */
+            cand.cf = dedup_rand() % 2;
+            snprintf(cand.key, sizeof cand.key, "k%03u", dedup_rand() % 40);
+            cand.is_range = (dedup_rand() % 8) == 0;
+
+            int rc;
+            if (cand.is_range)
+            {
+                if (dedup_rand() % 4) snprintf(cand.hi, sizeof cand.hi, "k%03u", dedup_rand() % 40);
+                rc = tdb_txn_delete_range(t, cand.cf, (const uint8_t *)cand.key, strlen(cand.key),
+                                          cand.hi[0] ? (const uint8_t *)cand.hi : NULL,
+                                          strlen(cand.hi));
+            }
+            else
+                rc = tdb_txn_put(t, cand.cf, (const uint8_t *)cand.key, strlen(cand.key),
+                                 (const uint8_t *)"v", 1, -1);
+            if (rc == TDB_SUCCESS) ops[n++] = cand;
+        }
+
+        int expected = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int sup = 0;
+            for (int j = i + 1; j < n && !sup; j++) sup = oracle_superseded_by(&ops[i], &ops[j]);
+            if (!sup) expected++;
+        }
+
+        ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
+        ASSERT_EQ(m.last_apply_count, expected);
+
+        free(ops);
+        tdb_txn_free(t);
+        tidesdb_mvcc_destroy(clock);
+    }
+}
+
 /* two snapshot transactions racing the same key -- the second to commit loses first-committer-wins
  */
 void test_txn_commit_write_conflict(void)
@@ -794,6 +900,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_commit_readonly, tests_passed);
     RUN_TEST(test_txn_commit_dedup, tests_passed);
     RUN_TEST(test_txn_commit_wal_failure, tests_passed);
+    RUN_TEST(test_txn_commit_dedup_matches_brute_force, tests_passed);
     RUN_TEST(test_txn_commit_write_conflict, tests_passed);
     RUN_TEST(test_txn_read_ryow, tests_passed);
     RUN_TEST(test_txn_read_external, tests_passed);

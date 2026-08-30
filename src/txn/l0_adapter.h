@@ -162,6 +162,9 @@ typedef struct
  *              caller replays, or NULL to discard two-phase records
  * @param filter leaves out an entry the sstables have already superseded, or NULL to apply every
  *               entry the log holds
+ * @param data_already_durable non-zero when a flush already carried this log's entries to the
+ *                             sstables, so the replay only advances the clock past the sequences it
+ *                             holds rather than applying them into L0 a second time
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_IO on a read failure, TDB_ERR_CORRUPTION on a
  *         malformed record, or TDB_ERR_BUSY/TDB_ERR_MEMORY from the apply
  */

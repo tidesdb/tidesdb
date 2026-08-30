@@ -8,6 +8,7 @@
  */
 #include "readset.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,7 +40,8 @@ typedef struct
  * @param count number of entries
  * @param capacity allocated length of entries
  * @param lock guards entry-array mutation against a cross-txn peer scan
- * @param mem_bytes approximate heap held by the entries and their keys
+ * @param mem_bytes approximate heap held by the entries and their keys. atomic for the same reason
+ *                  the write set's is -- the stats sweep reads it from another thread
  */
 struct tidesdb_readset
 {
@@ -47,7 +49,7 @@ struct tidesdb_readset
     int count;
     int capacity;
     pthread_rwlock_t lock;
-    int64_t mem_bytes;
+    _Atomic(int64_t) mem_bytes;
 };
 
 tidesdb_readset_t *tidesdb_readset_create(void)
@@ -67,7 +69,7 @@ static void readset_drop_all(tidesdb_readset_t *rs)
 {
     for (int i = 0; i < rs->count; i++) free(rs->entries[i].key);
     rs->count = 0;
-    rs->mem_bytes = 0;
+    atomic_store_explicit(&rs->mem_bytes, 0, memory_order_relaxed);
 }
 
 void tidesdb_readset_free(tidesdb_readset_t *rs)
@@ -132,7 +134,8 @@ int tidesdb_readset_record(tidesdb_readset_t *rs, uint32_t cf_index, const uint8
     }
     rs->entries[rs->count] = (readset_entry){cf_index, key_copy, key_size, seq};
     rs->count++;
-    rs->mem_bytes += (int64_t)(sizeof(readset_entry) + key_size);
+    atomic_fetch_add_explicit(&rs->mem_bytes, (int64_t)(sizeof(readset_entry) + key_size),
+                              memory_order_relaxed);
     pthread_rwlock_unlock(&rs->lock);
     return TDB_SUCCESS;
 }
@@ -183,5 +186,5 @@ void tidesdb_readset_clear(tidesdb_readset_t *rs)
 
 int64_t tidesdb_readset_mem_bytes(const tidesdb_readset_t *rs)
 {
-    return rs ? rs->mem_bytes : 0;
+    return rs ? atomic_load_explicit(&rs->mem_bytes, memory_order_relaxed) : 0;
 }

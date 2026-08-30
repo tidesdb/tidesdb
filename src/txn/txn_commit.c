@@ -95,6 +95,114 @@ static int txn_op_superseded_by(const tidesdb_writeset_op_t *op, const tidesdb_w
     return later->key_size == op->key_size && memcmp(later->key, op->key, op->key_size) == 0;
 }
 
+/* the dedup set's floor, so a small batch does not pay a resize walk to reach a useful width */
+#define TDB_DEDUP_MIN_SLOTS 64
+
+/* the dedup asks, for every op, whether a later one already writes everything it does. asked
+ * pairwise that is quadratic, and a bulk-loading transaction is exactly the case with the most ops
+ * -- so the walk runs backward instead, testing each op against a summary of what follows it. point
+ * writes are retired by the newest write of the same key, which an open-addressed set answers in
+ * constant time; interval deletes cannot be summarized that way, but a batch holds few of them, so
+ * they stay a list every op is checked against.
+ * @param slot op index plus one, 0 for an empty slot; the index is kept so a collision can compare
+ *             the key rather than trust the hash
+ * @param mask one less than the power-of-two slot count
+ */
+typedef struct
+{
+    int *slot;
+    uint64_t mask;
+} txn_dedup_set_t;
+
+/* whether the set already holds a point write of this op's key, meaning a later one supersedes it
+ */
+static int txn_dedup_seen(const txn_dedup_set_t *set, tidesdb_writeset_t *ws,
+                          const tidesdb_writeset_op_t *op)
+{
+    uint64_t at = txn_key_hash(op->cf_index, op->key, op->key_size) & set->mask;
+    while (set->slot[at] != 0)
+    {
+        tidesdb_writeset_op_t other;
+        if (tidesdb_writeset_op_at(ws, set->slot[at] - 1, &other) &&
+            other.cf_index == op->cf_index && other.key_size == op->key_size &&
+            memcmp(other.key, op->key, op->key_size) == 0)
+            return 1;
+        at = (at + 1) & set->mask;
+    }
+    return 0;
+}
+
+/* record this op as the newest point write of its key seen so far */
+static void txn_dedup_insert(const txn_dedup_set_t *set, tidesdb_writeset_t *ws, const int index,
+                             const tidesdb_writeset_op_t *op)
+{
+    uint64_t at = txn_key_hash(op->cf_index, op->key, op->key_size) & set->mask;
+    while (set->slot[at] != 0)
+    {
+        tidesdb_writeset_op_t other;
+        if (tidesdb_writeset_op_at(ws, set->slot[at] - 1, &other) &&
+            other.cf_index == op->cf_index && other.key_size == op->key_size &&
+            memcmp(other.key, op->key, op->key_size) == 0)
+            return; /* a newer write of this key is already the one that speaks for it */
+        at = (at + 1) & set->mask;
+    }
+    set->slot[at] = index + 1;
+}
+
+/* mark every op a later one supersedes, walking backward so each is tested against what follows
+ * @param ws the write set
+ * @param n the op count
+ * @param superseded out, one byte per op, set non-zero for an op a later one covers
+ * @return 0 on success, -1 when the scratch could not be allocated and the caller must fall back
+ */
+static int txn_mark_superseded(tidesdb_writeset_t *ws, const int n, unsigned char *superseded)
+{
+    /* held at least twice the op count so a probe walks a short run */
+    uint64_t cap = TDB_DEDUP_MIN_SLOTS;
+    while (cap < (uint64_t)n * 2) cap <<= 1;
+
+    txn_dedup_set_t set = {.slot = calloc((size_t)cap, sizeof(*set.slot)), .mask = cap - 1};
+    int *ranges = malloc((size_t)n * sizeof(*ranges));
+    if (!set.slot || !ranges)
+    {
+        free(set.slot);
+        free(ranges);
+        return -1;
+    }
+
+    int nranges = 0;
+    for (int i = n - 1; i >= 0; i--)
+    {
+        tidesdb_writeset_op_t op;
+        if (!tidesdb_writeset_op_at(ws, i, &op)) continue;
+
+        /* the interval deletes are asked pairwise, which is the same answer the quadratic walk gave
+         * and cheap while a batch holds few of them */
+        int sup = 0;
+        for (int r = 0; r < nranges && !sup; r++)
+        {
+            tidesdb_writeset_op_t later;
+            if (!tidesdb_writeset_op_at(ws, ranges[r], &later)) continue;
+            sup = txn_op_superseded_by(&op, &later);
+        }
+
+        if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE)
+            ranges[nranges++] = i;
+        else
+        {
+            if (!sup) sup = txn_dedup_seen(&set, ws, &op);
+            /* recorded whether or not it survives -- an op it lost to speaks for the key from here
+             * back, exactly as the pairwise walk had every later op to compare against */
+            txn_dedup_insert(&set, ws, i, &op);
+        }
+        superseded[i] = (unsigned char)sup;
+    }
+
+    free(set.slot);
+    free(ranges);
+    return 0;
+}
+
 /* materialize the write set as deduplicated WAL entries at commit_seq. only the last write covering
  * each cf-namespaced key survives, so last-write-wins holds on apply and replay. entries of one
  * batch share a sequence, and a point write beats a range delete at the same one -- which is what
@@ -110,6 +218,12 @@ static tidesdb_wal_entry_t *txn_build_entries(tidesdb_writeset_t *ws, uint64_t c
     tidesdb_wal_entry_t *entries = malloc((size_t)n * sizeof(*entries));
     if (!entries) return NULL;
 
+    /* one byte per op saying whether a later one covers it. the scan that fills this is linear in
+     * the point writes; a failed allocation drops back to asking every pair, which is slow on a
+     * large batch but still correct */
+    unsigned char *superseded_of = calloc((size_t)n, 1);
+    const int marked = superseded_of && txn_mark_superseded(ws, n, superseded_of) == 0;
+
     int k = 0;
     for (int i = 0; i < n; i++)
     {
@@ -121,12 +235,15 @@ static tidesdb_wal_entry_t *txn_build_entries(tidesdb_writeset_t *ws, uint64_t c
         /* skip if a later op already writes everything this one does -- that later op is the
          * surviving version */
         int superseded = 0;
-        for (int j = i + 1; j < n && !superseded; j++)
-        {
-            tidesdb_writeset_op_t later;
-            if (!tidesdb_writeset_op_at(ws, j, &later)) continue;
-            superseded = txn_op_superseded_by(&op, &later);
-        }
+        if (marked)
+            superseded = superseded_of[i];
+        else
+            for (int j = i + 1; j < n && !superseded; j++)
+            {
+                tidesdb_writeset_op_t later;
+                if (!tidesdb_writeset_op_at(ws, j, &later)) continue;
+                superseded = txn_op_superseded_by(&op, &later);
+            }
         if (superseded) continue;
 
         tidesdb_wal_entry_t *e = &entries[k++];
@@ -141,6 +258,7 @@ static tidesdb_wal_entry_t *txn_build_entries(tidesdb_writeset_t *ws, uint64_t c
         e->value_size = op.value_size;
         e->vlog_id = 0; /* the commit path holds its own bytes; nothing separates them yet */
     }
+    free(superseded_of);
     *out_count = k;
     return entries;
 }
@@ -243,12 +361,6 @@ static int txn_probe_range_newer(const tidesdb_source_t *sources, int num_source
     return TDB_ERR_IO;
 }
 
-/* serializable-snapshot-isolation dangerous-structure check. this txn is the pivot of a dangerous
- * read-write dependency structure when it has both an outgoing rw-edge (it read a key an active
- * serializable peer writes) and an incoming rw-edge (an active serializable peer read a key it
- * writes). a pivot is aborted -- the conservative Cahill rule, always safe. the edges are computed
- * locally against currently-active peers without mutating them, so exactly one of a write-skew pair
- * aborts and the other makes progress. returns TDB_ERR_CONFLICT if a pivot, else TDB_SUCCESS */
 /* what the peer walk accumulates; the pivot test needs both edges, so the walk stops as soon as it
  * has them */
 typedef struct
@@ -287,6 +399,12 @@ static int txn_ssi_visit(tdb_txn_t *peer, void *ctx)
     return scan->rw_in && scan->rw_out;
 }
 
+/* serializable-snapshot-isolation dangerous-structure check. this txn is the pivot of a dangerous
+ * read-write dependency structure when it has both an outgoing rw-edge (it read a key an active
+ * serializable peer writes) and an incoming rw-edge (an active serializable peer read a key it
+ * writes). a pivot is aborted -- the conservative Cahill rule, always safe. the edges are computed
+ * locally against currently-active peers without mutating them, so exactly one of a write-skew pair
+ * aborts and the other makes progress. returns TDB_ERR_CONFLICT if a pivot, else TDB_SUCCESS */
 static int txn_check_ssi(tdb_txn_t *txn)
 {
     if (txn->isolation != TDB_ISOLATION_SERIALIZABLE || !txn->registry) return TDB_SUCCESS;

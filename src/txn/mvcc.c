@@ -26,19 +26,6 @@
     (((uint64_t)(fp) << TDB_MVCC_RES_SEQ_BITS) | ((seq)&TDB_MVCC_RES_SEQ_MASK))
 
 /**
- * tidesdb_mvcc
- * the MVCC clock state
- * @param global_seq monotonic sequence counter; the next seq to assign
- * @param ring commit-status ring indexed by seq modulo capacity
- * @param ring_max_seq highest sequence recorded in the ring, the eviction high-water mark
- * @param ring_capacity length of ring, the eviction window width
- * @param reservation write-reservation table indexed by a key hash
- * @param stat_seqs count of commit sequences drawn
- * @param stat_marks count of sequences marked committed
- * @param stat_res_won count of write reservations that claimed their slot
- * @param stat_res_lost count of write reservations that lost to a concurrent writer
- */
-/**
  * mvcc_range_reservation_t
  * one interval held against concurrent point writes while its transaction is unresolved
  * @param lo the inclusive lower bound
@@ -61,6 +48,19 @@ typedef struct
     int in_use;
 } mvcc_range_reservation_t;
 
+/**
+ * tidesdb_mvcc
+ * the MVCC clock state
+ * @param global_seq monotonic sequence counter; the next seq to assign
+ * @param ring commit-status ring indexed by seq modulo capacity
+ * @param ring_max_seq highest sequence recorded in the ring, the eviction high-water mark
+ * @param ring_capacity length of ring, the eviction window width
+ * @param reservation write-reservation table indexed by a key hash
+ * @param stat_seqs count of commit sequences drawn
+ * @param stat_marks count of sequences marked committed
+ * @param stat_res_won count of write reservations that claimed their slot
+ * @param stat_res_lost count of write reservations that lost to a concurrent writer
+ */
 struct tidesdb_mvcc
 {
     _Atomic(uint64_t) global_seq;

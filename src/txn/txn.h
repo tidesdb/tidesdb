@@ -198,6 +198,23 @@ int tdb_txn_contains(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size
                      const tidesdb_source_t *sources, int num_sources);
 
 /**
+ * tdb_value_separator_t
+ * moves a large value out of the record and into the shared value log, so the bytes reach the
+ * device once instead of once in the log and again in the flush. it carries its own context, since
+ * the policy is the database's while the durable side is the log's
+ * @param separate separate one value, returning 1 with out_id set when the bytes went to the value
+ *                 log, 0 when the policy keeps them in the record, and negative when the append
+ *                 failed
+ * @param ctx opaque context passed to separate
+ */
+typedef struct
+{
+    int (*separate)(void *ctx, uint32_t cf_index, const uint8_t *value, size_t value_size,
+                    uint64_t *out_id);
+    void *ctx;
+} tdb_value_separator_t;
+
+/**
  * tdb_txn_backend_t
  * the durable side of commit, injected so the txn core stays decoupled from the L0 subsystem and
  * WAL. the engine supplies the concrete backend; tests supply a mock
@@ -205,22 +222,11 @@ int tdb_txn_contains(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size
  * @param wal_append append the framed WAL batch and make it durable per the sync mode
  * @param apply apply the committed entries to L0 at their commit sequence
  * @param abandon record that a sequence's batch was applied in part and then given up on, so the
- * entries it left behind are hidden from reads and dropped by the flush rather than reaching L1;
- * may be NULL for a backend with no such state
- * @param separator moves a large value out of the record and into the shared value log, so the
- * bytes reach the device once instead of once in the log and again in the flush; its own context,
- * since the policy is the database's and the durable side is the log's
+ *                entries it left behind are hidden from reads and dropped by the flush rather than
+ *                reaching L1; may be NULL for a backend with no such state
+ * @param separator the value-log separation policy this backend commits through
  * @param ctx opaque context passed to every backend call
  */
-typedef struct
-{
-    /* separate one value, returning 1 with out_id set when the bytes went to the value log, 0 when
-     * the policy keeps them in the record, and negative when the append failed */
-    int (*separate)(void *ctx, uint32_t cf_index, const uint8_t *value, size_t value_size,
-                    uint64_t *out_id);
-    void *ctx;
-} tdb_value_separator_t;
-
 typedef struct
 {
     int (*backpressure)(void *ctx, uint32_t cf_index);

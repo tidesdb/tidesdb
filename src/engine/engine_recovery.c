@@ -230,13 +230,6 @@ static int engine_readopt_cf_dir(tidesdb_t *db, const char *cf_dir, uint64_t cf_
     return adopted;
 }
 
-/* whether a rebuild's catalogue writes should be made durable, which every mode but sync none
- * asks for */
-static int engine_rebuild_durable(const tidesdb_t *db)
-{
-    return db->config.memtable_sync_mode != TDB_SYNC_NONE ? 1 : 0;
-}
-
 /**
  * engine_rebuild_from_sstables
  * rebuild what the catalogue lost from the files still on disk. a manifest whose header would not
@@ -323,7 +316,7 @@ static int engine_rebuild_from_sstables(tidesdb_t *db)
      * adopted id plus one is safe whatever the manifest already held */
     tidesdb_manifest_update_next_cf_id(db->manifest, max_cf_id + 1);
 
-    if (tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_rebuild_durable(db)) != 0)
+    if (tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) != 0)
         return TDB_ERR_IO;
 
     TDB_DEBUG_LOG(

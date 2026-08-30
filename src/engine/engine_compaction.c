@@ -80,14 +80,6 @@ static void engine_job_group_release(engine_job_group_t *group)
     free(group);
 }
 
-/* compaction writes the durable base, so it fsyncs for both full and interval durability (interval
- * only batches the WAL, never the sstables); only none skips the fsync */
-static int engine_compaction_bm_sync(const tidesdb_t *db)
-{
-    return db->config.memtable_sync_mode == TDB_SYNC_NONE ? BLOCK_MANAGER_SYNC_NONE
-                                                          : BLOCK_MANAGER_SYNC_FULL;
-}
-
 /* fold the cf config into the planner config; the L1 base capacity is one flush's worth of data.
  * force plans a merge even when no trigger is due, for a manual compaction */
 static compaction_planner_config_t engine_planner_config(const tidesdb_t *db, const cf_t *cf,
@@ -251,14 +243,14 @@ static void engine_schedule_claimed_cf(tidesdb_t *db, cf_t *cf)
             if (queued == n) return;
 
             /* some units never made it onto the queue, so their share of the count would never be
-             * paid and the teardown would never run. drop it to what was actually queued; if that
-             * is none, tear down here */
-            if (queued > 0)
-            {
-                atomic_store_explicit(&group->remaining, queued, memory_order_release);
-                return;
-            }
-            free(group);
+             * paid and the teardown would never run. pay each missing one off here rather than
+             * storing the total: a worker can already have finished a queued unit, and a store
+             * would discard that decrement, leaving a count nothing can drive to zero -- the plan
+             * leaked and the family claimed for the life of the process. releasing instead lands
+             * on exactly n payments however the two sides interleave, and whichever pays last
+             * tears the group down */
+            for (int i = queued; i < n; i++) engine_job_group_release(group);
+            return;
         }
     }
     compaction_plan_free(plan);
@@ -320,7 +312,7 @@ static int engine_exec_job(tidesdb_t *db, cf_t *cf, const compaction_job_t *job)
                                  .manifest_path = db->manifest->path,
                                  .next_sstable_id = &db->next_sstable_id,
                                  .gc_floor = engine_take_gc_floor(db),
-                                 .sync_mode = engine_compaction_bm_sync(db),
+                                 .sync_mode = engine_sstable_bm_sync(db),
                                  .value_threshold = db->config.value_separation_threshold,
                                  /* a lone job may spread its ranges over as many threads as the
                                   * pool has workers. it is the only job of its plan and its family

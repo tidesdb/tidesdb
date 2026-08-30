@@ -182,11 +182,6 @@ int engine_build_path(const char *dir, const char *name, char *out, size_t out_s
 
 /* a manifest commit fdatasyncs for both full and interval durability -- the catalog is part of the
  * durable base -- and only skips the fsync under none */
-static int engine_manifest_durable(const tidesdb_t *db)
-{
-    return db->config.memtable_sync_mode != TDB_SYNC_NONE ? 1 : 0;
-}
-
 /* the db-level sstable read source: resolve the cf-index to its column family and read that cf's
  * sstable levels, so one source in the stack serves every cf a transaction touches */
 static tidesdb_source_result_t engine_sstable_source_get(void *ctx, uint32_t cf_index,
@@ -669,8 +664,8 @@ void engine_close(tidesdb_t *db)
         /* a failure here is not fatal to the close, but it is not free either -- the next open
          * reseeds the clock from the WAL, the manifest and the sstables, so it recovers a sequence
          * rather than resuming this one, and an operator should know the cheap path was missed */
-        if (tidesdb_manifest_commit(db->manifest, db->manifest->path,
-                                    engine_manifest_durable(db)) != 0)
+        if (tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) !=
+            0)
             TDB_DEBUG_LOG(TDB_LOG_WARN,
                           "could not persist the clock at %llu on close, the next open reseeds it",
                           (unsigned long long)seq);
@@ -785,7 +780,7 @@ int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_famil
      * does not know about */
     int rc = TDB_SUCCESS;
     if (tidesdb_manifest_add_cf(db->manifest, cf_id, name, blob, blob_len) != 0 ||
-        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_manifest_durable(db)) != 0)
+        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) != 0)
         rc = TDB_ERR_IO;
     free(blob);
     if (rc != TDB_SUCCESS)
@@ -853,7 +848,7 @@ int engine_drop_cf(tidesdb_t *db, const char *name)
 
     int result = TDB_SUCCESS;
     if (tidesdb_manifest_drop_cf(db->manifest, cf_id) != 0 ||
-        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_manifest_durable(db)) != 0)
+        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) != 0)
         result = TDB_ERR_IO;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "cf %s dropped, id %llu retired", name, (unsigned long long)cf_id);

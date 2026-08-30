@@ -20,6 +20,7 @@
 #include "db.h"
 #include "fdmanager/fdmanager.h"
 #include "flush/flush.h"
+#include "io/block_manager.h" /* the sync-mode enum the sstable helper returns */
 #include "manifest/manifest.h"
 #include "memtable/memtable.h"
 #include "sstable/vlog.h"
@@ -279,5 +280,31 @@ struct tidesdb_iter_t
     cf_t *cf;
     tidesdb_t *db;
 };
+
+/**
+ * engine_durable_writes
+ * whether the engine's own durable writes -- the manifest commits behind a ddl, a config publish
+ * and a rebuild's catalogue -- should be fsynced. every sync mode but none asks for it, since
+ * interval mode batches only the WAL and never the structures naming the data
+ * @param db the database whose configuration decides
+ * @return 1 when the write must be made durable, 0 under sync none
+ */
+static inline int engine_durable_writes(const tidesdb_t *db)
+{
+    return db->config.memtable_sync_mode != TDB_SYNC_NONE ? 1 : 0;
+}
+
+/**
+ * engine_sstable_bm_sync
+ * the block-manager sync mode the engine opens and writes sstables with, so a reload, a compaction
+ * and the recovery path all reach the device on the same terms
+ * @param db the database whose configuration decides
+ * @return BLOCK_MANAGER_SYNC_NONE under sync none, BLOCK_MANAGER_SYNC_FULL otherwise
+ */
+static inline int engine_sstable_bm_sync(const tidesdb_t *db)
+{
+    return db->config.memtable_sync_mode == TDB_SYNC_NONE ? BLOCK_MANAGER_SYNC_NONE
+                                                          : BLOCK_MANAGER_SYNC_FULL;
+}
 
 #endif /* __TIDESDB_ENGINE_TYPES_H__ */

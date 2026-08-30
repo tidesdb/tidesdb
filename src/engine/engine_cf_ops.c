@@ -64,14 +64,6 @@ int engine_list_column_families(tidesdb_t *db, char ***out_names, int *out_count
     return TDB_SUCCESS;
 }
 
-/* the durable flag for a config-persisting manifest commit; sync none never fsyncs, every other
- * mode does. mirrors engine.c's engine_manifest_durable so this module needs no engine handle to
- * decide */
-static int engine_cf_manifest_durable(const tidesdb_t *db)
-{
-    return db->config.memtable_sync_mode != TDB_SYNC_NONE ? 1 : 0;
-}
-
 /* register a family's name and config in the manifest and commit; the caller has set config already
  */
 static int engine_cf_persist_config(tidesdb_t *db, uint64_t cf_id, const char *name,
@@ -80,9 +72,9 @@ static int engine_cf_persist_config(tidesdb_t *db, uint64_t cf_id, const char *n
     uint8_t *blob = NULL;
     size_t blob_len = 0;
     if (cf_config_serialize(config, &blob, &blob_len) != 0) return TDB_ERR_MEMORY;
-    const int ok = tidesdb_manifest_add_cf(db->manifest, cf_id, name, blob, blob_len) == 0 &&
-                   tidesdb_manifest_commit(db->manifest, db->manifest->path,
-                                           engine_cf_manifest_durable(db)) == 0;
+    const int ok =
+        tidesdb_manifest_add_cf(db->manifest, cf_id, name, blob, blob_len) == 0 &&
+        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) == 0;
     free(blob);
     return ok ? TDB_SUCCESS : TDB_ERR_IO;
 }
@@ -126,14 +118,6 @@ int engine_cf_update_runtime_config(tidesdb_t *db, cf_t *cf,
 
     atomic_store_explicit(&cf->compacting, 0, memory_order_release);
     return rc;
-}
-
-/* the block-manager sync mode the engine opens klogs with, mirrored from engine.c so a reload uses
- * the same durability the recovery path did */
-static int engine_cf_bm_sync(const tidesdb_t *db)
-{
-    return db->config.memtable_sync_mode == TDB_SYNC_NONE ? BLOCK_MANAGER_SYNC_NONE
-                                                          : BLOCK_MANAGER_SYNC_FULL;
 }
 
 /* claim a family for a DDL operation, waiting out an in-flight compaction; a family that stays
@@ -248,8 +232,8 @@ static int engine_clone_copy_sstables(tidesdb_t *db, const cf_t *src, cf_t *dst)
 
     /* the clone takes on the source's files, and a table carries the intervals it was built with,
      * so the copied records bring the deletes with them and there is nothing else to hand over */
-    if (rc == TDB_SUCCESS && tidesdb_manifest_commit(db->manifest, db->manifest->path,
-                                                     engine_cf_manifest_durable(db)) != 0)
+    if (rc == TDB_SUCCESS &&
+        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) != 0)
         rc = TDB_ERR_IO;
     return rc;
 }
@@ -306,7 +290,7 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
                 /* same reason as rename -- exclude the fd reaper from the destination's level-set
                  * swap */
                 cf_registry_wrlock(db->cfs);
-                if (cf_reload_levels(dst, db->manifest, engine_cf_bm_sync(db)) != 0)
+                if (cf_reload_levels(dst, db->manifest, engine_sstable_bm_sync(db)) != 0)
                     rc = TDB_ERR_IO;
                 cf_registry_wrunlock(db->cfs);
             }

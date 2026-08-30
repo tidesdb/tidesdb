@@ -163,16 +163,16 @@ static inline size_t btree_compute_prefix_len(const uint8_t *key1, const size_t 
 /**
  * btree_pending_leaf_t
  * a leaf node being built during tree construction
- * @entries array of entry metadata
- * @keys array of key pointers
- * @values array of value pointers
- * @num_entries current number of entries
- * @capacity maximum capacity of arrays
- * @current_size current serialized size estimate
- * @first_key first key in this leaf (for separator)
- * @first_key_size size of first key
- * @last_key last key in this leaf
- * @last_key_size size of last key
+ * @param entries array of entry metadata
+ * @param keys array of key pointers
+ * @param values array of value pointers
+ * @param num_entries current number of entries
+ * @param capacity maximum capacity of arrays
+ * @param current_size current serialized size estimate
+ * @param first_key first key in this leaf (for separator)
+ * @param first_key_size size of first key
+ * @param last_key last key in this leaf
+ * @param last_key_size size of last key
  */
 typedef struct btree_pending_leaf_t
 {
@@ -191,9 +191,9 @@ typedef struct btree_pending_leaf_t
 /**
  * btree_level_entry_t
  * entry for building internal nodes (separator key + child offset)
- * @key separator key data
- * @key_size size of separator key
- * @child_offset offset of child node in storage
+ * @param key separator key data
+ * @param key_size size of separator key
+ * @param child_offset offset of child node in storage
  */
 typedef struct btree_level_entry_t
 {
@@ -205,28 +205,28 @@ typedef struct btree_level_entry_t
 /**
  * btree_builder_t
  * builder state for constructing B+tree from sorted data
- * @bm block manager for storage
- * @leaf_bm where uncompressed leaves stage -- a temp file when compression is on, so the real klog
- * never keeps the discarded pre-compression copies
- * @config btree configuration
- * @current_leaf leaf node currently being built
- * @first_leaf_offset offset of first leaf in tree
- * @last_leaf_offset offset of last leaf in tree
- * @prev_leaf_offset offset of previously written leaf
- * @leaf_offsets array of all leaf offsets for backpatching
- * @num_leaf_offsets number of leaf offsets
- * @leaf_offsets_capacity capacity of leaf_offsets array
- * @level_entries entries for building internal nodes
- * @num_level_entries number of level entries
- * @level_entries_capacity capacity of level_entries array
- * @entry_count total number of entries added
- * @node_count total number of nodes written
- * @max_seq maximum sequence number seen
- * @height levels the finished tree has, counted as the internal levels are built
- * @min_key minimum key in tree
- * @min_key_size size of minimum key
- * @max_key maximum key in tree
- * @max_key_size size of maximum key
+ * @param bm block manager for storage
+ * @param leaf_bm where uncompressed leaves stage -- a temp file when compression is on, so the real
+ * klog never keeps the discarded pre-compression copies
+ * @param config btree configuration
+ * @param current_leaf leaf node currently being built
+ * @param first_leaf_offset offset of first leaf in tree
+ * @param last_leaf_offset offset of last leaf in tree
+ * @param prev_leaf_offset offset of previously written leaf
+ * @param leaf_offsets array of all leaf offsets for backpatching
+ * @param num_leaf_offsets number of leaf offsets
+ * @param leaf_offsets_capacity capacity of leaf_offsets array
+ * @param level_entries entries for building internal nodes
+ * @param num_level_entries number of level entries
+ * @param level_entries_capacity capacity of level_entries array
+ * @param entry_count total number of entries added
+ * @param node_count total number of nodes written
+ * @param max_seq maximum sequence number seen
+ * @param height levels the finished tree has, counted as the internal levels are built
+ * @param min_key minimum key in tree
+ * @param min_key_size size of minimum key
+ * @param max_key maximum key in tree
+ * @param max_key_size size of maximum key
  */
 struct btree_builder_t
 {

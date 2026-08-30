@@ -61,10 +61,10 @@
  * fd_manager_label_t
  * the kind of file a tracked descriptor belongs to; the manager keeps one open count per label and
  * a kind-specific reaper reclaims that label's descriptors
- * @FD_LABEL_SSTABLE_KLOG an immutable sstable klog file
- * @FD_LABEL_WAL_LOG an L0 write-ahead log file
- * @FD_LABEL_VLOG_SEGMENT a value-log segment file
- * @FD_LABEL_COUNT the number of labels, not itself a label
+ * @param FD_LABEL_SSTABLE_KLOG an immutable sstable klog file
+ * @param FD_LABEL_WAL_LOG an L0 write-ahead log file
+ * @param FD_LABEL_VLOG_SEGMENT a value-log segment file
+ * @param FD_LABEL_COUNT the number of labels, not itself a label
  */
 typedef enum
 {
@@ -95,12 +95,12 @@ typedef void (*fd_manager_wake_fn)(void *ctx);
  * a descriptor-budget context -- the shared resident-file cap, a live open count per label, and the
  * condition a reader signals to wake the reaper. fd_manager_init puts every field at its starting
  * value, so one on the stack needs nothing done to it first.
- * @max_open shared soft cap on total resident labeled files, 0 for unlimited
- * @num_open live open count per label, indexed by fd_manager_label_t
- * @wake_fn what to run to make the reaper sweep now, or NULL while none is installed. cleared
+ * @param max_open shared soft cap on total resident labeled files, 0 for unlimited
+ * @param num_open live open count per label, indexed by fd_manager_label_t
+ * @param wake_fn what to run to make the reaper sweep now, or NULL while none is installed. cleared
  *          before the reaper is stopped, so a wake raced against shutdown finds nothing to call
- * @wake_ctx passed to wake_fn, set once alongside it
- * @io per-label write accounting, so bytes and time are attributed to the kind of file rather
+ * @param wake_ctx passed to wake_fn, set once alongside it
+ * @param io per-label write accounting, so bytes and time are attributed to the kind of file rather
  *     than pooled. a handle opened outside this manager is not accounted
  */
 typedef struct

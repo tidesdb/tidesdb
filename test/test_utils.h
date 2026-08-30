@@ -103,7 +103,7 @@ int64_t level_live_layouts(void);
 
 /*
  * cleanup_test_dir
- * @brief cleanup test directory with retry logic
+ * @param brief cleanup test directory with retry logic
  */
 static inline void cleanup_test_dir(void)
 {
@@ -112,7 +112,7 @@ static inline void cleanup_test_dir(void)
 
 /*
  * generate_random_key_value
- * @brief generate random key-value pairs for testing
+ * @param brief generate random key-value pairs for testing
  */
 static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint8_t *value,
                                              size_t value_size)

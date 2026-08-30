@@ -19,8 +19,8 @@
 /**
  * queue_node_t
  * one node in the singly linked list backing the queue
- * @data pointer to user data
- * @next pointer to next node, published with release and consumed with acquire -- the only
+ * @param data pointer to user data
+ * @param next pointer to next node, published with release and consumed with acquire -- the only
  *       happens-before edge across the separate head_lock / tail_lock, so a node's payload stays
  *       visible to consumers
  */
@@ -34,22 +34,22 @@ typedef struct queue_node_t
  * queue_t
  * thread-safe FIFO queue with a dummy sentinel and separate head and tail locks so enqueue and
  * dequeue contend only through the payload publish, not each other
- * @head first node, protected by head_lock
- * @tail last node, protected by tail_lock
- * @dummy sentinel separating head and tail so the two locks stay independent
- * @size current element count, atomic so readers never take a lock
- * @shutdown non-zero once the queue is shut down, so blocked waiters release
- * @waiter_count threads currently blocked in queue_dequeue_wait
- * @head_lock guards dequeue and the head pointer
- * @tail_lock guards enqueue and the tail pointer
- * @read_lock rwlock coordinating read-only iterators against destructive ops -- peek, peek_at,
- *            foreach and snapshot take it shared, dequeue, dequeue_wait, clear and remove_if take
- *            it exclusive so iteration never races a removal
- * @not_empty condition signaled when the queue becomes non-empty or shuts down
- * @node_pool free list of reusable nodes that spares the allocator on churn
- * @pool_size current node-pool depth
- * @pool_lock guards the node pool
- * @max_pool_size the most nodes the pool retains before freeing to the heap
+ * @param head first node, protected by head_lock
+ * @param tail last node, protected by tail_lock
+ * @param dummy sentinel separating head and tail so the two locks stay independent
+ * @param size current element count, atomic so readers never take a lock
+ * @param shutdown non-zero once the queue is shut down, so blocked waiters release
+ * @param waiter_count threads currently blocked in queue_dequeue_wait
+ * @param head_lock guards dequeue and the head pointer
+ * @param tail_lock guards enqueue and the tail pointer
+ * @param read_lock rwlock coordinating read-only iterators against destructive ops -- peek,
+ * peek_at, foreach and snapshot take it shared, dequeue, dequeue_wait, clear and remove_if take it
+ * exclusive so iteration never races a removal
+ * @param not_empty condition signaled when the queue becomes non-empty or shuts down
+ * @param node_pool free list of reusable nodes that spares the allocator on churn
+ * @param pool_size current node-pool depth
+ * @param pool_lock guards the node pool
+ * @param max_pool_size the most nodes the pool retains before freeing to the heap
  */
 typedef struct
 {

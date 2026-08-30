@@ -75,12 +75,12 @@ typedef struct skip_list_version_t skip_list_version_t;
 /**
  * skip_list_version_t
  * a single version of a key's value
- * @seq sequence number for MVCC (monotonically increasing)
- * @value value data
- * @value_size size of value
- * @ttl time-to-live
- * @next next older version
- * @flags version flags (deleted, etc)
+ * @param seq sequence number for MVCC (monotonically increasing)
+ * @param value value data
+ * @param value_size size of value
+ * @param ttl time-to-live
+ * @param next next older version
+ * @param flags version flags (deleted, etc)
  */
 struct skip_list_version_t
 {
@@ -159,12 +159,12 @@ static inline uint64_t skip_list_version_vlog_id(const skip_list_version_t *vers
 /**
  * skip_list_node_t
  * a key in the skip list with multiple versions
- * @level node level in skip list
- * @node_flags node flags (sentinel, etc)
- * @key key data (NULL for sentinel nodes)
- * @key_size size of key (0 for sentinel nodes)
- * @versions lock-free list of versions (newest first)
- * @forward forward[0..level] forward pointers, forward[level+1..2*level+1] backward pointers
+ * @param level node level in skip list
+ * @param node_flags node flags (sentinel, etc)
+ * @param key key data (NULL for sentinel nodes)
+ * @param key_size size of key (0 for sentinel nodes)
+ * @param versions lock-free list of versions (newest first)
+ * @param forward forward[0..level] forward pointers, forward[level+1..2*level+1] backward pointers
  */
 struct skip_list_node_t
 {
@@ -187,22 +187,23 @@ struct skip_list_node_t
 /**
  * skip_list_t
  * main skip list structure
- * @level current maximum level
- * @max_level maximum allowed level
- * @probability probability for level generation
- * @header sentinel header node (compares less than all keys)
- * @tail sentinel tail node (compares greater than all keys)
- * @data_bytes logical key and value bytes held, which is roughly what flushing the list writes
- * @memory_bytes bytes the list actually occupies -- nodes, both pointer arrays, keys, version
+ * @param level current maximum level
+ * @param max_level maximum allowed level
+ * @param probability probability for level generation
+ * @param header sentinel header node (compares less than all keys)
+ * @param tail sentinel tail node (compares greater than all keys)
+ * @param data_bytes logical key and value bytes held, which is roughly what flushing the list
+ * writes
+ * @param memory_bytes bytes the list actually occupies -- nodes, both pointer arrays, keys, version
  * structs and values. this is what the rotation threshold reads, since a memtable is a memory
  * budget rather than a promise about output size
- * @entry_count track entry count atomically to avoid O(n) traversals
- * @cached_time borrowed clock published by a ticker, read instead of calling time(NULL) on every
- * expiry test (NULL = call time(NULL) directly)
- * @arena bump allocator for cache-friendly node allocation (NULL = use malloc/free)
- * @min_seq smallest sequence number ever inserted (UINT64_MAX when empty). lets a compaction learn
- * the oldest unflushed write held in a memtable so it never reaps a tombstone newer than data that
- * has not yet reached disk
+ * @param entry_count track entry count atomically to avoid O(n) traversals
+ * @param cached_time borrowed clock published by a ticker, read instead of calling time(NULL) on
+ * every expiry test (NULL = call time(NULL) directly)
+ * @param arena bump allocator for cache-friendly node allocation (NULL = use malloc/free)
+ * @param min_seq smallest sequence number ever inserted (UINT64_MAX when empty). lets a compaction
+ * learn the oldest unflushed write held in a memtable so it never reaps a tombstone newer than data
+ * that has not yet reached disk
  */
 typedef struct skip_list_t
 {
@@ -222,11 +223,11 @@ typedef struct skip_list_t
 /**
  * skip_list_cursor_t
  * cursor structure for iterating through the skip list
- * @list pointer to the skip list
- * @current current node position
- * @cached_header cached header sentinel for fast boundary checks
- * @cached_tail cached tail sentinel for fast boundary checks
- * @current_version current version on the current node; NULL means use head.
+ * @param list pointer to the skip list
+ * @param current current node position
+ * @param cached_header cached header sentinel for fast boundary checks
+ * @param cached_tail cached tail sentinel for fast boundary checks
+ * @param current_version current version on the current node; NULL means use head.
  *                        advanced by skip_list_cursor_advance_in_node and reset on
  *                        every cursor seek/next/prev
  */

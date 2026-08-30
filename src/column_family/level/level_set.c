@@ -28,8 +28,8 @@ int64_t level_live_layouts(void)
  * level_entry_t
  * one sstable's slot within a level -- the open handle plus the on-disk size that feeds size
  * triggers
- * @sst the referenced open sstable
- * @size_bytes on-disk size of the sstable
+ * @param sst the referenced open sstable
+ * @param size_bytes on-disk size of the sstable
  */
 typedef struct
 {
@@ -42,8 +42,8 @@ typedef struct
  * an immutable snapshot of every level's sstables, published behind one atomic pointer and
  * reclaimed once the reader epoch that could still see it has drained. holds one reference per
  * listed sstable.
- * @levels per-level arrays of entries, index level-1; L1 unordered, L2+ sorted by min_key
- * @counts number of entries at each level
+ * @param levels per-level arrays of entries, index level-1; L1 unordered, L2+ sorted by min_key
+ * @param counts number of entries at each level
  */
 typedef struct
 {
@@ -56,18 +56,18 @@ typedef struct
  * the per-cf tier structure -- an atomically published immutable layout, a reader epoch guarding
  * it, a retire list reclaiming superseded layouts, and a write lock serializing the infrequent
  * mutations
- * @layout current immutable layout
- * @epoch in-flight-reader counter guarding the layout
- * @retire deferred reclamation of superseded layouts
- * @write_lock serializes install and swap; reads are lock-free
- * @generation bumped on every published layout, so a caller can tell whether the shape it last
- * looked at is still the current one without walking it
- * @interval_tables how many of the listed sstables carry range tombstones, republished with the
- * layout, so a family that has never deleted a range answers a covering query from one load
- * @occupancy bit i set when level i+1 holds at least one sstable, republished with the layout. a
- * reader asking which levels are worth visiting reads this one word, where asking each level costs
- * an epoch enter and exit apiece -- and those are contended atomics on a counter every reader
- * shares, so the empty levels were the expensive ones
+ * @param layout current immutable layout
+ * @param epoch in-flight-reader counter guarding the layout
+ * @param retire deferred reclamation of superseded layouts
+ * @param write_lock serializes install and swap; reads are lock-free
+ * @param generation bumped on every published layout, so a caller can tell whether the shape it
+ * last looked at is still the current one without walking it
+ * @param interval_tables how many of the listed sstables carry range tombstones, republished with
+ * the layout, so a family that has never deleted a range answers a covering query from one load
+ * @param occupancy bit i set when level i+1 holds at least one sstable, republished with the
+ * layout. a reader asking which levels are worth visiting reads this one word, where asking each
+ * level costs an epoch enter and exit apiece -- and those are contended atomics on a counter every
+ * reader shares, so the empty levels were the expensive ones
  */
 struct level_set
 {

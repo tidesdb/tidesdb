@@ -78,15 +78,15 @@
 /**
  * tidesdb_manifest_entry_t
  * a single sstable entry in the db-level manifest
- * @column_family_id the column family the sstable belongs to
- * @level current logical level (1-based), mutable by a trivial move
- * @id sstable id
- * @num_entries number of entries in the sstable
- * @size_bytes total size in bytes
- * @partition partition shard index for a partitioned merge output, or MANIFEST_NO_PARTITION for a
- *            non-partitioned flush output. it is part of the sstable's on-disk name, so anything
+ * @param column_family_id the column family the sstable belongs to
+ * @param level current logical level (1-based), mutable by a trivial move
+ * @param id sstable id
+ * @param num_entries number of entries in the sstable
+ * @param size_bytes total size in bytes
+ * @param partition partition shard index for a partitioned merge output, or MANIFEST_NO_PARTITION
+ * for a non-partitioned flush output. it is part of the sstable's on-disk name, so anything
  *            reconstructing that name from the manifest alone needs it
- * @birth_level the level the file was created at; names the on-disk file, never changes
+ * @param birth_level the level the file was created at; names the on-disk file, never changes
  */
 typedef struct
 {
@@ -103,10 +103,11 @@ typedef struct
  * tidesdb_manifest_cf_t
  * a column family in the manifest registry, mapping a stable id to its name and its opaque config
  * blob
- * @id stable column family id, the key every entry references
- * @name column family name, NUL-terminated
- * @config_blob the cf's serialized config, stored verbatim and never interpreted by the manifest
- * @config_blob_len length of config_blob in bytes, 0 when no config was registered
+ * @param id stable column family id, the key every entry references
+ * @param name column family name, NUL-terminated
+ * @param config_blob the cf's serialized config, stored verbatim and never interpreted by the
+ * manifest
+ * @param config_blob_len length of config_blob in bytes, 0 when no config was registered
  */
 typedef struct
 {
@@ -119,38 +120,38 @@ typedef struct
 /**
  * tidesdb_manifest_t
  * in-memory representation of the db-level manifest
- * @cfs registry of column families known to the manifest
- * @num_cfs number of column families
- * @cfs_capacity capacity of the cfs array
- * @entries array of sstable entries across all column families
- * @num_entries number of entries
- * @capacity capacity of entries array
- * @index open-addressed map from a table's family and id to where it sits in entries, so an add, a
- *        remove or a lookup does not walk them all. NULL when it could not be allocated, which
+ * @param cfs registry of column families known to the manifest
+ * @param num_cfs number of column families
+ * @param cfs_capacity capacity of the cfs array
+ * @param entries array of sstable entries across all column families
+ * @param num_entries number of entries
+ * @param capacity capacity of entries array
+ * @param index open-addressed map from a table's family and id to where it sits in entries, so an
+ * add, a remove or a lookup does not walk them all. NULL when it could not be allocated, which
  *        costs the walk back rather than correctness
- * @index_cap slots the index holds, a power of two
- * @index_tombs erased slots still occupying the table, which the remove path rebuilds past
- * @sequence current db-global sequence number
- * @next_cf_id the db-global cf-id high-water, one past the largest id ever assigned. it outlives
- * the families themselves so a dropped family's id is never reissued, which would otherwise let its
- * unreaped wal records replay into whichever family later took the id
- * @path path to manifest file
- * @bm append-only block-manager log handle. a commit appends one framed block of pending records
- * and (durably) fdatasyncs it -- no full rewrite, no rename, no reopen. only a rollover writes a
- *     fresh file and renames it into place
- * @pending records buffered by add/remove/update_sequence since the last commit
- * @pending_len bytes used in the pending buffer
- * @pending_cap allocated capacity of the pending buffer
- * @records_since_snapshot records appended since the last snapshot; drives rollover
- * @self_healed set when open discarded a corrupt or unreadable log. the set it carries is then
- *              incomplete or empty, which is why recovery readopts the sstables on disk rather
- *              than trusting it
- * @lock reader-writer lock for thread safety. writer-preferring, because the readers are the
+ * @param index_cap slots the index holds, a power of two
+ * @param index_tombs erased slots still occupying the table, which the remove path rebuilds past
+ * @param sequence current db-global sequence number
+ * @param next_cf_id the db-global cf-id high-water, one past the largest id ever assigned. it
+ * outlives the families themselves so a dropped family's id is never reissued, which would
+ * otherwise let its unreaped wal records replay into whichever family later took the id
+ * @param path path to manifest file
+ * @param bm append-only block-manager log handle. a commit appends one framed block of pending
+ * records and (durably) fdatasyncs it -- no full rewrite, no rename, no reopen. only a rollover
+ * writes a fresh file and renames it into place
+ * @param pending records buffered by add/remove/update_sequence since the last commit
+ * @param pending_len bytes used in the pending buffer
+ * @param pending_cap allocated capacity of the pending buffer
+ * @param records_since_snapshot records appended since the last snapshot; drives rollover
+ * @param self_healed set when open discarded a corrupt or unreadable log. the set it carries is
+ * then incomplete or empty, which is why recovery readopts the sstables on disk rather than
+ * trusting it
+ * @param lock reader-writer lock for thread safety. writer-preferring, because the readers are the
  * engine's own background work -- a compaction asks it the level of every input file of every
  * merge -- and under sustained flush a plain rwlock never lets a writer in at all. a column family
  * create takes it exclusively twice, to name the family and to commit, so it is the writer that
  * starves
- * @active_ops count of active operations (for safe shutdown)
+ * @param active_ops count of active operations (for safe shutdown)
  */
 typedef struct
 {

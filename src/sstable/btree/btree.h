@@ -57,12 +57,12 @@ typedef struct btree_entry_t btree_entry_t;
 /**
  * btree_entry_t
  * a single key-value entry in a leaf node
- * @key_size size of key
- * @value_size size of value (inline or in vlog)
- * @vlog_offset offset in vlog if value is external (0 = inline)
- * @seq sequence number
- * @ttl time-to-live (0 = no expiry)
- * @flags entry flags (tombstone, has_ttl, vlog_ref)
+ * @param key_size size of key
+ * @param value_size size of value (inline or in vlog)
+ * @param vlog_offset offset in vlog if value is external (0 = inline)
+ * @param seq sequence number
+ * @param ttl time-to-live (0 = no expiry)
+ * @param flags entry flags (tombstone, has_ttl, vlog_ref)
  */
 struct btree_entry_t
 {
@@ -77,17 +77,17 @@ struct btree_entry_t
 /**
  * btree_node_t
  * in-memory representation of a B+tree node
- * @type node type (leaf or internal)
- * @num_entries number of entries/children
- * @entries array of entries (leaf nodes only)
- * @keys array of key pointers
- * @key_sizes array of key sizes
- * @values array of inline value pointers (leaf nodes only)
- * @child_offsets array of child block offsets (internal nodes only)
- * @prev_offset offset of previous sibling (leaf nodes, for backward scan)
- * @next_offset offset of next sibling (leaf nodes, for forward scan)
- * @block_offset this node's offset in the file
- * @arena arena the node's storage was deserialized into, freed as a unit and returning its
+ * @param type node type (leaf or internal)
+ * @param num_entries number of entries/children
+ * @param entries array of entries (leaf nodes only)
+ * @param keys array of key pointers
+ * @param key_sizes array of key sizes
+ * @param values array of inline value pointers (leaf nodes only)
+ * @param child_offsets array of child block offsets (internal nodes only)
+ * @param prev_offset offset of previous sibling (leaf nodes, for backward scan)
+ * @param next_offset offset of next sibling (leaf nodes, for forward scan)
+ * @param block_offset this node's offset in the file
+ * @param arena arena the node's storage was deserialized into, freed as a unit and returning its
  * chunks to the shared pool rather than to the OS
  */
 struct btree_node_t
@@ -108,13 +108,13 @@ struct btree_node_t
 /**
  * btree_config_t
  * configuration for B+tree construction
- * @target_node_size target size for nodes in bytes
- * @codec the family's encoding pipeline, already resolved to transforms and applied to every node
- * in order on write and in reverse on read; the btree knows nothing about which algorithms these
- * are. NULL, or a count of zero, stores nodes verbatim
- * @codec_count how many stages codec holds
- * @arena_pool the db-global chunk pool a decoded node's arena draws from, borrowed, or NULL to
- * allocate directly
+ * @param target_node_size target size for nodes in bytes
+ * @param codec the family's encoding pipeline, already resolved to transforms and applied to every
+ * node in order on write and in reverse on read; the btree knows nothing about which algorithms
+ * these are. NULL, or a count of zero, stores nodes verbatim
+ * @param codec_count how many stages codec holds
+ * @param arena_pool the db-global chunk pool a decoded node's arena draws from, borrowed, or NULL
+ * to allocate directly
  */
 typedef struct
 {
@@ -127,23 +127,23 @@ typedef struct
 /**
  * btree_t
  * immutable B+tree structure (read-only after construction)
- * @bm block manager for storage
- * @root_offset offset of root node
- * @first_leaf_offset offset of first leaf (for forward iteration)
- * @last_leaf_offset offset of last leaf (for backward iteration)
- * @entry_count total number of entries
- * @node_count total number of nodes
- * @height tree height
- * @config configuration
- * @min_key minimum key in tree
- * @min_key_size size of minimum key
- * @max_key maximum key in tree
- * @max_key_size size of maximum key
- * @max_seq maximum sequence number
- * @node_cache node cache for fast lookups (optional, can be NULL)
- * @cache_key_prefix precomputed cache key prefix for this btree's node cache entries
- * @borrowed_root a root node held open elsewhere for longer than this tree lives, used without a
- * pin of its own, or NULL to read the root like any other node
+ * @param bm block manager for storage
+ * @param root_offset offset of root node
+ * @param first_leaf_offset offset of first leaf (for forward iteration)
+ * @param last_leaf_offset offset of last leaf (for backward iteration)
+ * @param entry_count total number of entries
+ * @param node_count total number of nodes
+ * @param height tree height
+ * @param config configuration
+ * @param min_key minimum key in tree
+ * @param min_key_size size of minimum key
+ * @param max_key maximum key in tree
+ * @param max_key_size size of maximum key
+ * @param max_seq maximum sequence number
+ * @param node_cache node cache for fast lookups (optional, can be NULL)
+ * @param cache_key_prefix precomputed cache key prefix for this btree's node cache entries
+ * @param borrowed_root a root node held open elsewhere for longer than this tree lives, used
+ * without a pin of its own, or NULL to read the root like any other node
  */
 struct btree_t
 {
@@ -168,10 +168,10 @@ struct btree_t
 /**
  * btree_stats_t
  * statistics for a single B+tree (per-sstable)
- * @entry_count total number of entries
- * @node_count total number of nodes
- * @height tree height (1 = single leaf, 2+ = has internal nodes)
- * @serialized_size total bytes on disk
+ * @param entry_count total number of entries
+ * @param node_count total number of nodes
+ * @param height tree height (1 = single leaf, 2+ = has internal nodes)
+ * @param serialized_size total bytes on disk
  */
 typedef struct
 {
@@ -185,14 +185,14 @@ typedef struct
  * btree_cursor_t
  * cursor for iterating through the B+tree
  * uses tree traversal for leaf-to-leaf navigation (memory efficient)
- * @tree pointer to the B+tree
- * @current_node current leaf node
- * @current_index index within current node
- * @current_leaf_offset offset of current leaf node
- * @at_end flag indicating cursor is past end
- * @at_begin flag indicating cursor is before begin
- * @current_pin cache pin for current_node when it came from the node cache, else NULL
- * @read_error set when a node load failed (vs a genuine end of tree) so callers can tell a
+ * @param tree pointer to the B+tree
+ * @param current_node current leaf node
+ * @param current_index index within current node
+ * @param current_leaf_offset offset of current leaf node
+ * @param at_end flag indicating cursor is past end
+ * @param at_begin flag indicating cursor is before begin
+ * @param current_pin cache pin for current_node when it came from the node cache, else NULL
+ * @param read_error set when a node load failed (vs a genuine end of tree) so callers can tell a
  *                   truncated traversal apart from a complete one and not treat lost entries as
  * gone
  */

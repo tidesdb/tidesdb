@@ -24,8 +24,8 @@
  * and a reader lock there would put an atomic read-modify-write on the shared lock word into every
  * read, and stall all of them whenever a rename or clone took the write lock. membership changes
  * are rare by comparison, so they pay a copy and the readers pay nothing
- * @cfs the family pointers, borrowed; the registry's locked array owns them
- * @count how many are live in this view */
+ * @param cfs the family pointers, borrowed; the registry's locked array owns them
+ * @param count how many are live in this view */
 typedef struct
 {
     cf_t **cfs;

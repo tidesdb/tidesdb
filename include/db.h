@@ -197,14 +197,14 @@ const char *tidesdb_strerror(int code);
 /**
  * tidesdb_commit_op_t
  * one operation in a committed transaction batch, passed to the commit hook
- * @key key data, valid only during the callback invocation
- * @key_size size of key in bytes
- * @value value data, NULL for deletes, valid only during the callback invocation
- * @value_size size of value in bytes, 0 for deletes
- * @ttl the pair's absolute expiry as a unix timestamp -- the deadline the engine stored, not the
- * lifetime in seconds that tidesdb_txn_put was given, so a hook forwarding the write elsewhere
+ * @param key key data, valid only during the callback invocation
+ * @param key_size size of key in bytes
+ * @param value value data, NULL for deletes, valid only during the callback invocation
+ * @param value_size size of value in bytes, 0 for deletes
+ * @param ttl the pair's absolute expiry as a unix timestamp -- the deadline the engine stored, not
+ * the lifetime in seconds that tidesdb_txn_put was given, so a hook forwarding the write elsewhere
  * reproduces the same expiry instant rather than restarting the clock. -1 when it never expires
- * @is_delete 1 for a delete operation, 0 for a put
+ * @param is_delete 1 for a delete operation, 0 for a put
  */
 typedef struct tidesdb_commit_op_t
 {
@@ -240,46 +240,47 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * always mergeable. all fields except the commit hook are persisted with the cf in the manifest;
  * the commit hook is a runtime-only callback. the memtable, wal, and their sync/skip-list settings
  * are db-level (tidesdb_config_t), not per-cf.
- * @name column family name, the cf's persisted identity
- * @level_size_ratio target size ratio between successive levels
- * @min_levels floor on the level count. the tree deepens as it fills and sheds levels again as
- * data is deleted, and this is the depth it will not shed below -- the engine keeps its own floor
- * of a flush tier plus one level for merges to land in, so a smaller value has no further effect
- * @dividing_level_offset how far above the largest level the dividing level sits, so 1 means
+ * @param name column family name, the cf's persisted identity
+ * @param level_size_ratio target size ratio between successive levels
+ * @param min_levels floor on the level count. the tree deepens as it fills and sheds levels again
+ * as data is deleted, and this is the depth it will not shed below -- the engine keeps its own
+ * floor of a flush tier plus one level for merges to land in, so a smaller value has no further
+ * effect
+ * @param dividing_level_offset how far above the largest level the dividing level sits, so 1 means
  * X = L - 2. the dividing level is where a merge writes output partitioned to the largest level's
  * file boundaries, which is what lets later merges take one group of overlapping files at a time.
  * 0 puts it directly above the largest level, where a single dividing merge rewrites a tenth of the
  * data at once; larger offsets cut that at the cost of more files open at once
- * @keep_values_inline 1 to hold every value in the klog whatever its size, ignoring the database's
- * value_separation_threshold, 0 to separate by that threshold like every other family. a separated
- * value costs a scan one value-log read per row, so a family that is scanned far more than it is
- * merged can be worth keeping whole even though its values are large. the cost is the one the
- * threshold exists to avoid, that compaction rewrites those bytes on every merge
- * @btree_klog_block_size target size in bytes of a btree klog node. raise it alongside the
+ * @param keep_values_inline 1 to hold every value in the klog whatever its size, ignoring the
+ * database's value_separation_threshold, 0 to separate by that threshold like every other family. a
+ * separated value costs a scan one value-log read per row, so a family that is scanned far more
+ * than it is merged can be worth keeping whole even though its values are large. the cost is the
+ * one the threshold exists to avoid, that compaction rewrites those bytes on every merge
+ * @param btree_klog_block_size target size in bytes of a btree klog node. raise it alongside the
  * database's value_separation_threshold rather than on its own. 0 leaves the choice to the btree,
  * whose own default
  * is far larger than the one this config starts at, so a caller who wants the small node size that
  * fits the block manager's first-read window must ask for it rather than pass 0
- * @encoding_pipeline encoding ids applied in order to btree klog nodes and undone in reverse on
- *                    read; the ids are recorded in the sstable footer so a reader rebuilds the same
- *                    chain from the file. a value separated into the shared value log carries the
- *                    same chain, recorded in the value's own block, since compaction moves a value
- *                    forward by id and the sstable referencing it may by then record a different
- *                    pipeline. an id naming no encoding is rejected; one naming
- *                    an algorithm this build lacks is accepted so a database written elsewhere
- * still opens, and fails when such a node is read
- * @encoding_count number of entries in the pipeline, at most TDB_ENCODING_PIPELINE_MAX
- * @enable_bloom_filter build a partition-range filter for point-get pruning
- * @bloom_fpr target bloom false-positive rate when the filter is enabled
- * @default_isolation_level isolation applied to a transaction opened without an explicit level
- * @l1_file_count_trigger L1 sstable count that triggers compaction
- * @tombstone_density_trigger ratio in [0,1] above which an sstable's tombstone density
+ * @param encoding_pipeline encoding ids applied in order to btree klog nodes and undone in reverse
+ * on read; the ids are recorded in the sstable footer so a reader rebuilds the same chain from the
+ * file. a value separated into the shared value log carries the same chain, recorded in the value's
+ * own block, since compaction moves a value forward by id and the sstable referencing it may by
+ * then record a different pipeline. an id naming no encoding is rejected; one naming an algorithm
+ * this build lacks is accepted so a database written elsewhere still opens, and fails when such a
+ * node is read
+ * @param encoding_count number of entries in the pipeline, at most TDB_ENCODING_PIPELINE_MAX
+ * @param enable_bloom_filter build a partition-range filter for point-get pruning
+ * @param bloom_fpr target bloom false-positive rate when the filter is enabled
+ * @param default_isolation_level isolation applied to a transaction opened without an explicit
+ * level
+ * @param l1_file_count_trigger L1 sstable count that triggers compaction
+ * @param tombstone_density_trigger ratio in [0,1] above which an sstable's tombstone density
  *                            (tombstone_count / num_entries) escalates compaction; 0 disables it
- * @tombstone_density_min_entries minimum entry count for an sstable to be judged by the density
- *                                trigger, filtering tiny-sstable noise; 0 imposes no minimum, so
- *                                every sstable is judged by density however small it is
- * @commit_hook_fn optional post-commit callback, runtime-only, NULL to disable
- * @commit_hook_ctx user context passed to the commit hook, runtime-only
+ * @param tombstone_density_min_entries minimum entry count for an sstable to be judged by the
+ * density trigger, filtering tiny-sstable noise; 0 imposes no minimum, so every sstable is judged
+ * by density however small it is
+ * @param commit_hook_fn optional post-commit callback, runtime-only, NULL to disable
+ * @param commit_hook_ctx user context passed to the commit hook, runtime-only
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -305,34 +306,34 @@ typedef struct tidesdb_column_family_config_t
  * tidesdb_config_t
  * database-level configuration. the memtable, write-ahead log, block cache, and worker pool are
  * db-level and shared by every column family, so their settings live here rather than per-cf.
- * @db_path path to the database directory
- * @num_flush_threads number of flush worker threads
- * @num_compaction_threads number of compaction worker threads
- * @log_level minimum severity to emit
- * @block_cache_size size in bytes of the db-level block cache for hot sstable blocks
- * @max_open_sstables maximum number of concurrently open sstable file handles. lowered at open to
- * what this process's open-file ceiling leaves once the manifest, stdio and temporaries are
+ * @param db_path path to the database directory
+ * @param num_flush_threads number of flush worker threads
+ * @param num_compaction_threads number of compaction worker threads
+ * @param log_level minimum severity to emit
+ * @param block_cache_size size in bytes of the db-level block cache for hot sstable blocks
+ * @param max_open_sstables maximum number of concurrently open sstable file handles. lowered at
+ * open to what this process's open-file ceiling leaves once the manifest, stdio and temporaries are
  * allowed for, and a lowering says so in the log at warn -- raise the ceiling with
  * tidesdb_raise_open_file_limit first if the larger figure is the one you want
- * @log_to_file 1 to write the log to tidesdb.log inside db_path, 0 for stderr. the sink is
+ * @param log_to_file 1 to write the log to tidesdb.log inside db_path, 0 for stderr. the sink is
  * process-wide rather than per-database, so the last database opened with this set owns it and
  * every other handle in the process logs there too, until that one closes
- * @log_truncation_at size in bytes past which the log file is truncated and reopened, 0 for
+ * @param log_truncation_at size in bytes past which the log file is truncated and reopened, 0 for
  * never; ignored unless log_to_file is set
- * @memtable_write_buffer_size memory the active memtable may occupy before it is rotated, 0 for
- * auto. this is a memory budget rather than a promise about the size of what a rotation flushes --
- * an entry costs its key and value plus about a hundred bytes of skip list node, pointer arrays
+ * @param memtable_write_buffer_size memory the active memtable may occupy before it is rotated, 0
+ * for auto. this is a memory budget rather than a promise about the size of what a rotation flushes
+ * -- an entry costs its key and value plus about a hundred bytes of skip list node, pointer arrays
  * and version struct, so a memtable of small entries reaches this limit holding far fewer bytes of
  * data than the limit names. the overhead is fixed per entry, so it is most of an entry that holds
  * a short value and almost none of one that holds a large one
- * @memtable_skip_list_max_level skip list max level for the memtable, 0 for the default
+ * @param memtable_skip_list_max_level skip list max level for the memtable, 0 for the default
  * (12)
- * @memtable_skip_list_probability skip list level probability, 0 for the default (0.25)
- * @memtable_sync_mode durability mode for the write-ahead log
- * @memtable_sync_interval_us fsync interval for TDB_SYNC_INTERVAL, in microseconds; 0 uses a one
- * second default, and the field is ignored under the other sync modes
- * @value_separation_threshold values at or above this size are stored in the shared value log and
- * referenced from the key log, so a value stays inline only while it is strictly under it; 0
+ * @param memtable_skip_list_probability skip list level probability, 0 for the default (0.25)
+ * @param memtable_sync_mode durability mode for the write-ahead log
+ * @param memtable_sync_interval_us fsync interval for TDB_SYNC_INTERVAL, in microseconds; 0 uses a
+ * one second default, and the field is ignored under the other sync modes
+ * @param value_separation_threshold values at or above this size are stored in the shared value log
+ * and referenced from the key log, so a value stays inline only while it is strictly under it; 0
  * selects the default. it is database level because the value log is one shared structure, and
  * because the decision keys on the size of a value rather than on which family holds it, so one
  * cut-off serves a family of small metadata and a family of large blobs alike. raising it keeps
@@ -342,21 +343,21 @@ typedef struct tidesdb_column_family_config_t
  * holding one entry and spends the btree fan-out that makes a lookup cheap. the pairing is
  * advisory, and a config that breaks it only logs a warning. a single family can opt out entirely
  * with keep_values_inline
- * @vlog_segment_size size at which the value log seals its active segment and opens a fresh one,
- * in bytes; 0 selects the default. a reclaim drains every segment worth draining, so this does not
- * change how much space the store settles at -- it changes what reclaiming costs. smaller segments
- * mean more of them and more live data copied forward per reclaim, measurably slower below 256 MiB;
- * larger ones are close to flat
- * @memtable_l0_queue_stall_threshold immutable-queue depth at which writes stall for
+ * @param vlog_segment_size size at which the value log seals its active segment and opens a fresh
+ * one, in bytes; 0 selects the default. a reclaim drains every segment worth draining, so this does
+ * not change how much space the store settles at -- it changes what reclaiming costs. smaller
+ * segments mean more of them and more live data copied forward per reclaim, measurably slower below
+ * 256 MiB; larger ones are close to flat
+ * @param memtable_l0_queue_stall_threshold immutable-queue depth at which writes stall for
  * backpressure, or 0 to never stall. left at 0 the queue is unbounded and a writer outrunning
  * the flush threads is never paced, so it is a value to set deliberately rather than leave
- * @memtable_idle_flush_seconds how long the active memtable may sit unwritten before the engine
- * rotates it on its own, or 0 to never do so. a database that stops taking writes otherwise holds
- * that data in memory indefinitely -- its log cannot be unlinked until it reaches L1, so recovery
- * stays long, reads keep paying for it, and compaction never sees the shape it would act on.
- * rotating on idle is a write a quiet process would not otherwise make, which is why it can be
+ * @param memtable_idle_flush_seconds how long the active memtable may sit unwritten before the
+ * engine rotates it on its own, or 0 to never do so. a database that stops taking writes otherwise
+ * holds that data in memory indefinitely -- its log cannot be unlinked until it reaches L1, so
+ * recovery stays long, reads keep paying for it, and compaction never sees the shape it would act
+ * on. rotating on idle is a write a quiet process would not otherwise make, which is why it can be
  * turned off
- * @txn_timeout_seconds how long a transaction may stay active before the next operation on it
+ * @param txn_timeout_seconds how long a transaction may stay active before the next operation on it
  * expires it, or 0 for no timeout, which is the default. an abandoned transaction holds its
  * snapshot and its write reservations, which keeps the reclamation floor down and stops compaction
  * dropping old versions, so a caller that may leak transactions should bound them. a single
@@ -396,38 +397,39 @@ typedef struct tidesdb_config_t
  * per-column-family statistics returned by tidesdb_get_cf_stats; a flat value the caller owns, with
  * no heap members and nothing to free. shared-memtable figures are db-level and live in
  * tidesdb_db_stats_t
- * @num_levels number of levels in the cf
- * @config a copy of the cf configuration
- * @level_sizes on-disk size of each level, indexed by level-1, valid for the first num_levels
+ * @param num_levels number of levels in the cf
+ * @param config a copy of the cf configuration
+ * @param level_sizes on-disk size of each level, indexed by level-1, valid for the first num_levels
  * entries
- * @level_num_sstables sstable count of each level, indexed by level-1
- * @level_key_counts key count of each level, indexed by level-1
- * @level_tombstone_counts tombstone count of each level, indexed by level-1
- * @total_keys total distinct keys across every sstable in the cf
- * @total_data_size the family's own on-disk size, the sum of its key logs, which is also the sum
- * of level_sizes. values below the spill threshold are inside those bytes already; what spilled
+ * @param level_num_sstables sstable count of each level, indexed by level-1
+ * @param level_key_counts key count of each level, indexed by level-1
+ * @param level_tombstone_counts tombstone count of each level, indexed by level-1
+ * @param total_keys total distinct keys across every sstable in the cf
+ * @param total_data_size the family's own on-disk size, the sum of its key logs, which is also the
+ * sum of level_sizes. values below the spill threshold are inside those bytes already; what spilled
  * lives in the shared value log, whose size is database-level and reported as vlog_file_size
- * @avg_key_size average key length in bytes, over distinct keys
- * @avg_value_size average value length in bytes, over distinct keys (tombstones contribute zero)
- * @read_amp point-lookup read amplification, the sstables a worst-case get may probe
- * @btree_total_nodes total btree nodes across the cf
- * @btree_max_height maximum btree height
- * @btree_avg_height average btree height
- * @total_tombstones sum of tombstone_count across every sstable
- * @tombstone_ratio total_tombstones / total_keys, 0 when total_keys is 0
- * @max_sst_density worst per-sstable tombstone density observed
- * @max_sst_density_level 1-based level where max_sst_density was observed, 0 if none
- * @wal_bytes_written this family's share of the shared write-ahead log, as the encoded size of
- * its own entries. an attribution rather than a measurement -- the batch header and the block
+ * @param avg_key_size average key length in bytes, over distinct keys
+ * @param avg_value_size average value length in bytes, over distinct keys (tombstones contribute
+ * zero)
+ * @param read_amp point-lookup read amplification, the sstables a worst-case get may probe
+ * @param btree_total_nodes total btree nodes across the cf
+ * @param btree_max_height maximum btree height
+ * @param btree_avg_height average btree height
+ * @param total_tombstones sum of tombstone_count across every sstable
+ * @param tombstone_ratio total_tombstones / total_keys, 0 when total_keys is 0
+ * @param max_sst_density worst per-sstable tombstone density observed
+ * @param max_sst_density_level 1-based level where max_sst_density was observed, 0 if none
+ * @param wal_bytes_written this family's share of the shared write-ahead log, as the encoded size
+ * of its own entries. an attribution rather than a measurement -- the batch header and the block
  * framing belong to no single family, so these do not sum to what the log wrote; the database
  * level figure of the same name is the measured one
- * @flush_bytes_written on-disk bytes this cf's flushes wrote to L1
- * @compaction_bytes_written on-disk bytes this cf's compactions wrote
- * @compaction_bytes_read on-disk bytes this cf's compactions read as input
- * @user_bytes_written logical key+value bytes committed to this cf
- * @compaction_count compactions this cf has run
- * @unflushed_key_count distinct keys resident in the shared memtables for this cf and not yet in
- * any sstable, so total_keys plus this is the live logical key count including what is still in
+ * @param flush_bytes_written on-disk bytes this cf's flushes wrote to L1
+ * @param compaction_bytes_written on-disk bytes this cf's compactions wrote
+ * @param compaction_bytes_read on-disk bytes this cf's compactions read as input
+ * @param user_bytes_written logical key+value bytes committed to this cf
+ * @param compaction_count compactions this cf has run
+ * @param unflushed_key_count distinct keys resident in the shared memtables for this cf and not yet
+ * in any sstable, so total_keys plus this is the live logical key count including what is still in
  * memory
  */
 typedef struct tidesdb_cf_stats_t
@@ -462,13 +464,13 @@ typedef struct tidesdb_cf_stats_t
 /**
  * tidesdb_cache_stats_t
  * db-level block cache statistics returned by tidesdb_get_cache_stats
- * @enabled 1 if the block cache is enabled
- * @total_entries number of cached entries
- * @total_bytes bytes used by the cache
- * @hits cache hits
- * @misses cache misses
- * @hit_rate hits / (hits + misses)
- * @num_partitions number of cache shards
+ * @param enabled 1 if the block cache is enabled
+ * @param total_entries number of cached entries
+ * @param total_bytes bytes used by the cache
+ * @param hits cache hits
+ * @param misses cache misses
+ * @param hit_rate hits / (hits + misses)
+ * @param num_partitions number of cache shards
  */
 typedef struct tidesdb_cache_stats_t
 {
@@ -490,11 +492,11 @@ typedef struct tidesdb_cache_stats_t
  * family because a family can change its codec, and compaction rewrites data under whichever
  * pipeline is merging it, so a single figure for a family would average across settings that no
  * longer apply and describe none of them
- * @ids the codec ids in the order applied, empty when the data was stored verbatim
- * @id_count how many ids
- * @logical_bytes what the data amounts to before encoding
- * @stored_bytes what it occupies on disk, so logical over stored is the realised ratio
- * @item_count values for the value log, sstables for the key logs
+ * @param ids the codec ids in the order applied, empty when the data was stored verbatim
+ * @param id_count how many ids
+ * @param logical_bytes what the data amounts to before encoding
+ * @param stored_bytes what it occupies on disk, so logical over stored is the realised ratio
+ * @param item_count values for the value log, sstables for the key logs
  */
 typedef struct
 {
@@ -509,67 +511,70 @@ typedef struct
  * tidesdb_db_stats_t
  * database-level statistics returned by tidesdb_get_db_stats. the memtable, the value log, and the
  * mvcc clock are db-level and shared, so their figures live here.
- * @num_column_families number of column families
- * @immutable_memtable_count immutable memtables awaiting flush (the L0 queue depth)
- * @compaction_pending_count compaction jobs queued for the worker pool
- * @total_sstable_count total sstables across every cf and level
- * @total_data_size_bytes on-disk key-log bytes summed across every cf and level, the database-wide
- * counterpart of the per-family total_data_size. the value log is reported separately as
- * vlog_file_size, since it is shared rather than owned by any one family
- * @num_open_sstables currently open sstable file handles
- * @global_seq current db-global sequence number (the mvcc clock)
- * @min_snapshot_seq the oldest live-transaction snapshot, the compaction gc floor
- * @active_txn_count live transactions joined to the registry, which is repeatable-read and
+ * @param num_column_families number of column families
+ * @param immutable_memtable_count immutable memtables awaiting flush (the L0 queue depth)
+ * @param compaction_pending_count compaction jobs queued for the worker pool
+ * @param total_sstable_count total sstables across every cf and level
+ * @param total_data_size_bytes on-disk key-log bytes summed across every cf and level, the
+ * database-wide counterpart of the per-family total_data_size. the value log is reported separately
+ * as vlog_file_size, since it is shared rather than owned by any one family
+ * @param num_open_sstables currently open sstable file handles
+ * @param global_seq current db-global sequence number (the mvcc clock)
+ * @param min_snapshot_seq the oldest live-transaction snapshot, the compaction gc floor
+ * @param active_txn_count live transactions joined to the registry, which is repeatable-read and
  * stronger only -- read-uncommitted and read-committed transactions need no snapshot reservation
  * and so are not counted, and read-committed is the default
- * @txn_memory_bytes bytes held by in-flight transactions, over the same registered set
- * @memtable_bytes memory the active memtable occupies, the figure memtable_write_buffer_size is
- * compared against, so it counts skip list nodes and version structs as well as key and value
+ * @param txn_memory_bytes bytes held by in-flight transactions, over the same registered set
+ * @param memtable_bytes memory the active memtable occupies, the figure memtable_write_buffer_size
+ * is compared against, so it counts skip list nodes and version structs as well as key and value
  * bytes
- * @is_flushing 1 while an immutable is queued or flushing
- * @next_cf_index next column family id to be assigned
- * @wal_generation current write-ahead-log generation counter
- * @flush_count sstables flushed across every cf
- * @compaction_count compactions run across every cf
- * @flush_bytes_written flush output bytes summed across every cf
- * @compaction_bytes_written compaction output bytes summed across every cf
- * @compaction_bytes_read compaction input bytes summed across every cf
- * @wal_bytes_written framed write-ahead-log bytes, counted at the append. the log is one shared
- * structure for the whole database rather than one per family, so this is measured there rather
- * than summed from the families, whose own figure is an attribution and excludes the batch header
- * and the block framing. the log is reclaimed with its memtable and never appears in the on-disk
- * totals, but the device was still asked to write it, and a write-amplification figure that omits
- * it understates by a whole copy of the data
- * @user_bytes_written logical committed bytes summed across every cf
- * @vlog_file_size total value-log file size in bytes
- * @vlog_value_count values currently indexed in the value log
- * @vlog_used_bytes uncompressed length the indexed values represent. this counts everything the
- * index still names, reachable or not, so it is not a measure of live data
- * @vlog_stored_bytes the on-disk length those same indexed values occupy. read against
+ * @param is_flushing 1 while an immutable is queued or flushing
+ * @param next_cf_index next column family id to be assigned
+ * @param wal_generation current write-ahead-log generation counter
+ * @param flush_count sstables flushed across every cf
+ * @param compaction_count compactions run across every cf
+ * @param flush_bytes_written flush output bytes summed across every cf
+ * @param compaction_bytes_written compaction output bytes summed across every cf
+ * @param compaction_bytes_read compaction input bytes summed across every cf
+ * @param wal_bytes_written framed write-ahead-log bytes, counted at the append. the log is one
+ * shared structure for the whole database rather than one per family, so this is measured there
+ * rather than summed from the families, whose own figure is an attribution and excludes the batch
+ * header and the block framing. the log is reclaimed with its memtable and never appears in the
+ * on-disk totals, but the device was still asked to write it, and a write-amplification figure that
+ * omits it understates by a whole copy of the data
+ * @param user_bytes_written logical committed bytes summed across every cf
+ * @param vlog_file_size total value-log file size in bytes
+ * @param vlog_value_count values currently indexed in the value log
+ * @param vlog_used_bytes uncompressed length the indexed values represent. this counts everything
+ * the index still names, reachable or not, so it is not a measure of live data
+ * @param vlog_stored_bytes the on-disk length those same indexed values occupy. read against
  * vlog_used_bytes it is the encoding pipeline's realised ratio, measured on the data the store is
  * actually holding rather than on a sample: used over stored is how much the values shrank
- * @vlog_live_bytes value-log bytes the live sstables still reference, summed from what each records
- * about the segments its separated values landed in. this is the figure space amplification is
- * against: a store can hold many gigabytes of values no tree can reach, and only this tells them
+ * @param vlog_live_bytes value-log bytes the live sstables still reference, summed from what each
+ * records about the segments its separated values landed in. this is the figure space amplification
+ * is against: a store can hold many gigabytes of values no tree can reach, and only this tells them
  * apart from the ones still worth keeping
- * @vlog_segment_count value-log segment files currently open, the one taking appends included
- * @vlog_bytes_written value-log bytes ever appended, reclamation's own rewrites included. this is
- * the term a write-amplification figure needs from the log -- the live and stored totals describe
- * what is held now, and on a store that separates its values most of the writing happens here
- * @vlog_dead_bytes value-log bytes beyond what the live values account for, the space a reclaim
- * could recover
- * @vlog_reclaim_calls value-log reclaims attempted, lifetime. read beside vlog_reclaim_passes this
- * separates a reclaim that never runs from one that runs and finds nothing worth draining
- * @vlog_reclaim_passes value-log reclaim passes that drained a segment, since this handle opened
- * @vlog_segments_retired value-log segment files a reclaim has unlinked
- * @vlog_segments_drainable sealed segments holding so little live data that rewriting the tables
- * referencing them would free most of a file. read against vlog_dead_bytes this says how much of
- * the garbage is currently actionable, and a figure that stays high is reclamation falling behind
- * @writes_throttled commits the L0 admission policy made dwell before admitting
- * @writes_blocked commits the L0 admission policy made wait for the flush queue to drain
- * @write_stall_us total microseconds commits were held in L0 admission, dwell plus wait
- * @write_stall_ceiling_hits commits admitted only because the admission wait ceiling expired; any
- * of these means flush did not keep up with ingestion
+ * @param vlog_segment_count value-log segment files currently open, the one taking appends included
+ * @param vlog_bytes_written value-log bytes ever appended, reclamation's own rewrites included.
+ * this is the term a write-amplification figure needs from the log -- the live and stored totals
+ * describe what is held now, and on a store that separates its values most of the writing happens
+ * here
+ * @param vlog_dead_bytes value-log bytes beyond what the live values account for, the space a
+ * reclaim could recover
+ * @param vlog_reclaim_calls value-log reclaims attempted, lifetime. read beside vlog_reclaim_passes
+ * this separates a reclaim that never runs from one that runs and finds nothing worth draining
+ * @param vlog_reclaim_passes value-log reclaim passes that drained a segment, since this handle
+ * opened
+ * @param vlog_segments_retired value-log segment files a reclaim has unlinked
+ * @param vlog_segments_drainable sealed segments holding so little live data that rewriting the
+ * tables referencing them would free most of a file. read against vlog_dead_bytes this says how
+ * much of the garbage is currently actionable, and a figure that stays high is reclamation falling
+ * behind
+ * @param writes_throttled commits the L0 admission policy made dwell before admitting
+ * @param writes_blocked commits the L0 admission policy made wait for the flush queue to drain
+ * @param write_stall_us total microseconds commits were held in L0 admission, dwell plus wait
+ * @param write_stall_ceiling_hits commits admitted only because the admission wait ceiling expired;
+ * any of these means flush did not keep up with ingestion
  */
 typedef struct tidesdb_db_stats_t
 {
@@ -1604,13 +1609,13 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
  * the places a caller's own thread can be made to wait inside a write. a commit that took far
  * longer than its peers was held at exactly one of these, and knowing which is the difference
  * between a device that cannot keep up and an engine that is not letting it
- * @TDB_STALL_WAL_APPEND waiting on the write-ahead log -- either for staging-ring space or, under a
- * syncing mode, for the record to reach the file. the two are one figure because both are the same
- * wait on the same single writer, and separating them tells a caller nothing it can act on
- * @TDB_STALL_ROTATE_LOCK waiting to take the rotation lock, so another committer was rotating
- * @TDB_STALL_ROTATE_WORK performing the rotation, which this thread pays on everyone's behalf
- * @TDB_STALL_ADMISSION held by write admission because the unflushed backlog was too deep
- * @TDB_STALL_COUNT the number of reasons, not itself a reason
+ * @param TDB_STALL_WAL_APPEND waiting on the write-ahead log -- either for staging-ring space or,
+ * under a syncing mode, for the record to reach the file. the two are one figure because both are
+ * the same wait on the same single writer, and separating them tells a caller nothing it can act on
+ * @param TDB_STALL_ROTATE_LOCK waiting to take the rotation lock, so another committer was rotating
+ * @param TDB_STALL_ROTATE_WORK performing the rotation, which this thread pays on everyone's behalf
+ * @param TDB_STALL_ADMISSION held by write admission because the unflushed backlog was too deep
+ * @param TDB_STALL_COUNT the number of reasons, not itself a reason
  */
 typedef enum
 {
@@ -1624,9 +1629,9 @@ typedef enum
 /**
  * tidesdb_stall_stat_t
  * how much waiting one reason accounted for since the database opened
- * @count how many times a thread waited here
- * @total_us the summed wait, so a reason's share of all waiting is comparable
- * @max_us the longest single wait, which is what a latency tail is made of
+ * @param count how many times a thread waited here
+ * @param total_us the summed wait, so a reason's share of all waiting is comparable
+ * @param max_us the longest single wait, which is what a latency tail is made of
  */
 typedef struct
 {
@@ -1638,7 +1643,7 @@ typedef struct
 /**
  * tidesdb_stall_stats_t
  * every wait reason, indexed by tidesdb_stall_reason_t
- * @reasons the per-reason totals
+ * @param reasons the per-reason totals
  */
 typedef struct
 {
@@ -1667,12 +1672,12 @@ int tidesdb_get_stall_stats(tidesdb_t *db, tidesdb_stall_stats_t *stats);
 /**
  * tidesdb_io_class_t
  * the kinds of file the engine writes, so device time can be attributed rather than pooled
- * @TDB_IO_SSTABLE key logs, written by flush and compaction
- * @TDB_IO_WAL the write-ahead log, written by its own single flush thread
- * @TDB_IO_VLOG value log segments, written by a commit that separates a value and by the reclaim
- *              that copies live values forward. this is the write cost of key/value separation, so
- *              it is counted apart from the key logs whose size that separation is what keeps down
- * @TDB_IO_COUNT the number of classes, not itself a class
+ * @param TDB_IO_SSTABLE key logs, written by flush and compaction
+ * @param TDB_IO_WAL the write-ahead log, written by its own single flush thread
+ * @param TDB_IO_VLOG value log segments, written by a commit that separates a value and by the
+ * reclaim that copies live values forward. this is the write cost of key/value separation, so it is
+ * counted apart from the key logs whose size that separation is what keeps down
+ * @param TDB_IO_COUNT the number of classes, not itself a class
  */
 typedef enum
 {
@@ -1685,10 +1690,10 @@ typedef enum
 /**
  * tidesdb_io_stat_t
  * what one class asked of the device
- * @ops writes issued
- * @bytes bytes written
- * @total_us the summed time inside those writes
- * @max_us the slowest single write
+ * @param ops writes issued
+ * @param bytes bytes written
+ * @param total_us the summed time inside those writes
+ * @param max_us the slowest single write
  */
 typedef struct
 {
@@ -1701,7 +1706,7 @@ typedef struct
 /**
  * tidesdb_io_stats_t
  * every class, indexed by tidesdb_io_class_t
- * @classes the per-class totals
+ * @param classes the per-class totals
  */
 typedef struct
 {

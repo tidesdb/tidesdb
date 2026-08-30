@@ -247,8 +247,8 @@ static inline int bench_more(const bench_thread_t *t, uint64_t done, uint64_t bu
 /**
  * bench_workload_t
  * one named workload the driver can run
- * @field name the name a caller selects the workload by
- * @field run the per-thread body, run once on each worker
+ * @param name the name a caller selects the workload by
+ * @param run the per-thread body, run once on each worker
  */
 typedef struct
 {

@@ -15,7 +15,7 @@
  * from whichever operation happened to be running -- which is how a filled disk gets mistaken for a
  * bug in the engine. the free-space figure comes from the same statvfs the caller would have to run
  * by hand to tell the two apart */
-static void bm_note_write_failure(block_manager_t *bm)
+void bm_note_write_failure(block_manager_t *bm)
 {
     const int err = errno ? errno : EIO;
     /* the first failure is the one that explains the rest, so only it is reported */
@@ -227,11 +227,11 @@ static void bm_note_io(const block_manager_t *bm, const uint64_t bytes, const ui
 
 /**
  * bm_flush_write_run
- * pwrite the contiguous completed run at the flush frontier, handling a ring wrap as two writes;
- * returns 0 on success and -1 with errno set on an io error
+ * pwrite the contiguous completed run at the flush frontier, handling a ring wrap as two writes
  * @param bm the buffered block manager
  * @param fl the flushed frontier the run starts at
  * @param sz the run length in bytes
+ * @return 0 on success, -1 with errno set on an io error
  */
 static int bm_flush_write_run(block_manager_t *bm, uint64_t fl, uint64_t sz)
 {
@@ -256,9 +256,10 @@ static int bm_flush_write_run(block_manager_t *bm, uint64_t fl, uint64_t sz)
 /**
  * bm_flush_drain
  * drain the contiguous completed run at the flush frontier to the fd and advance the durability
- * watermarks, waking backpressured appenders; returns 1 when a run was written, 0 when nothing was
- * ready at the frontier, and -1 on an io error with flush_error set
+ * watermarks, waking backpressured appenders
  * @param bm the buffered block manager
+ * @return 1 when a run was written, 0 when nothing was ready at the frontier, -1 on an io error
+ *         with flush_error set
  */
 static int bm_flush_drain(block_manager_t *bm)
 {
@@ -553,10 +554,18 @@ static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint
     const ssize_t wrote =
         tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)offset);
     bm_note_io(bm, total_size, started_us);
-    if (BM_UNLIKELY(wrote != (ssize_t)total_size)) return -1;
+    if (BM_UNLIKELY(wrote != (ssize_t)total_size))
+    {
+        bm_note_write_failure(bm);
+        return -1;
+    }
 
     /* with O_DSYNC the pwrite already synced; otherwise fall back to fdatasync */
-    if (bm_sync_after_write(bm) != 0) return -1;
+    if (bm_sync_after_write(bm) != 0)
+    {
+        bm_note_write_failure(bm);
+        return -1;
+    }
 
     return offset;
 }
@@ -686,12 +695,12 @@ static size_t bm_batch_build_frames(block_manager_block_t **blocks, size_t count
 
 /**
  * bm_batch_writev
- * pwritev the built iovecs to the fd in BM_IOV_MAX-sized chunks, starting at base_offset; returns 0
- * on success and -1 on a short write
+ * pwritev the built iovecs to the fd in BM_IOV_MAX-sized chunks, starting at base_offset
  * @param bm the block manager
  * @param iov the iovec array
  * @param iov_count the number of iovecs
  * @param base_offset the file offset the batch starts at
+ * @return 0 on success, -1 on a short write
  */
 static int bm_batch_writev(block_manager_t *bm, struct iovec *iov, size_t iov_count,
                            int64_t base_offset)

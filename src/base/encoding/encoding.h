@@ -144,9 +144,9 @@ const tidesdb_encoding_t *tidesdb_encoding_find_by_id(const tidesdb_encoding_reg
  * one resolved stage of a pipeline -- the transform pair and context an id resolves to
  * resolving ids to these once, at setup, keeps the registry lookup off the path that runs per
  * block; the registry is a linear scan, and a btree node read cannot afford one
- * @field encode the forward transform
- * @field decode its inverse
- * @field ctx the opaque context both were registered with
+ * @param encode the forward transform
+ * @param decode its inverse
+ * @param ctx the opaque context both were registered with
  */
 typedef struct
 {

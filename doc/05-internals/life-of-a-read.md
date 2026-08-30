@@ -84,8 +84,11 @@ committer still waiting on that log holds the memtable to hold the log.
 **The set of memtables must not appear to shrink.** Rotation enqueues the sealed memtable
 before swapping the active slot, so at worst a reader sees it twice, never zero times. A
 reader that walks the active slot and the queue non-atomically can still observe the set move
-under it — there is a visible-change counter for exactly this, and the read re-snapshots and
-retries rather than reporting a false absence.
+under it — there is a visible-change counter for exactly this, read before the walk and again on a
+miss. A miss whose boundary moved underneath it is re-snapshotted and read again rather than handed
+back: the race is the engine's own doing and clears in the time an enqueue and an exchange take, so
+a caller told to ask again has no lever the read does not already have. Only a miss that keeps
+racing across several rounds reports busy, and never an absence that was never true.
 
 Within one memtable the skip list holds a version chain per key. The read takes the newest
 version at or below the snapshot ceiling. **A memtable version may hold a reference rather than

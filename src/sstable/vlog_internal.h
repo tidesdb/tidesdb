@@ -72,21 +72,21 @@
 /**
  * vlog_segment_t
  * one append-only segment file and the state deciding when it may be drained and freed
- * @field bm the block manager over the segment file, owned by the store and closed on retire, or
+ * @param bm the block manager over the segment file, owned by the store and closed on retire, or
  *        NULL while the reaper has taken its descriptor back. reopened on demand, published by a
  *        compare-exchange, so a reader that finds it absent is delayed rather than failed
- * @field number the ascending file number, which is also what recovery orders segments by
- * @field rc references held by readers currently inside the segment, above the table's own; a
+ * @param number the ascending file number, which is also what recovery orders segments by
+ * @param rc references held by readers currently inside the segment, above the table's own; a
  *        retire waits for it to fall back to VLOG_SEG_BASELINE
- * @field state VLOG_SEG_OPEN while the file is usable, VLOG_SEG_ABSENT before first use and after
+ * @param state VLOG_SEG_OPEN while the file is usable, VLOG_SEG_ABSENT before first use and after
  *        the file is unlinked
- * @field live_bytes framed bytes the live sstables referencing this segment still hold in it,
+ * @param live_bytes framed bytes the live sstables referencing this segment still hold in it,
  * summed from their footers. the store cannot derive this itself -- which values are still
  * reachable is known only to the trees -- so they report it as they are installed and dropped, and
  * a segment falling to zero is one nothing can reach any more
- * @field live_count how many values those bytes are, kept beside them because a segment holding a
+ * @param live_count how many values those bytes are, kept beside them because a segment holding a
  *        few large values and one holding many small ones want different reclamation decisions
- * @field draining set when the segment holds little enough live data to be worth emptying, which
+ * @param draining set when the segment holds little enough live data to be worth emptying, which
  *        makes the next compaction carrying one of its values rewrite the value instead
  */
 typedef struct
@@ -103,18 +103,18 @@ typedef struct
 /**
  * vlog_index_entry_t
  * one live value's location, as a segment slot and an offset within that segment's file
- * @field id the logical value id, non-zero when the bucket is occupied
- * @field offset block offset within the segment
- * @field value_len uncompressed value length
- * @field disk_len framed bytes the value's block occupies in its segment, which is what per-segment
+ * @param id the logical value id, non-zero when the bucket is occupied
+ * @param offset block offset within the segment
+ * @param value_len uncompressed value length
+ * @param disk_len framed bytes the value's block occupies in its segment, which is what per-segment
  *        space accounting has to be stated in -- a logical length would not say how much of a file
  *        a table actually holds once framing and compression are counted
- * @field chain the encoding chain the value was written through, packed one codec id per byte.
+ * @param chain the encoding chain the value was written through, packed one codec id per byte.
  *        carried per value rather than taken from the store or the family, because a family can
  *        change its codec and compaction rewrites values under whichever pipeline is merging them,
  *        so the only thing that knows what encoded a value is the value
- * @field segment slot index into the store's segment table
- * @field state bucket occupancy, one of the VLOG_BUCKET_* values
+ * @param segment slot index into the store's segment table
+ * @param state bucket occupancy, one of the VLOG_BUCKET_* values
  */
 typedef struct
 {
@@ -131,51 +131,51 @@ typedef struct
  * vlog
  * the value store: a fixed table of segment files, one of them taking appends, over an id index
  * mapping every live value to the segment and offset holding it
- * @field dir the store directory, copied at open so segment paths can be rebuilt without the caller
- * @field fdm borrowed descriptor budget segment files are opened against, or NULL
- * @field sync_mode block manager sync mode every segment is opened with
- * @field encodings the db-global encoding registry a value's recorded chain resolves against,
+ * @param dir the store directory, copied at open so segment paths can be rebuilt without the caller
+ * @param fdm borrowed descriptor budget segment files are opened against, or NULL
+ * @param sync_mode block manager sync mode every segment is opened with
+ * @param encodings the db-global encoding registry a value's recorded chain resolves against,
  *        borrowed. db-global rather than per-family because compaction moves a value forward by id
  *        and the family merging it may by then run a different pipeline
- * @field segment_target_bytes size at which the active segment seals and a fresh one opens
- * @field next_id the id the next write assigns
- * @field next_number the file number the next segment created will carry
- * @field active_slot table index of the segment currently taking appends
- * @field seg_high one past the highest slot ever used, so a scan stops early rather than walking
+ * @param segment_target_bytes size at which the active segment seals and a fresh one opens
+ * @param next_id the id the next write assigns
+ * @param next_number the file number the next segment created will carry
+ * @param active_slot table index of the segment currently taking appends
+ * @param seg_high one past the highest slot ever used, so a scan stops early rather than walking
  *        the whole table
- * @field roll_mu serializes sealing the active segment and opening its successor, so exactly one
+ * @param roll_mu serializes sealing the active segment and opening its successor, so exactly one
  *        thread creates each segment file
- * @field segments the fixed segment table; a slot's address never moves, which is what lets a
+ * @param segments the fixed segment table; a slot's address never moves, which is what lets a
  *        reader hold one across an unlocked read
- * @field index_rw guards the id map, the space counters and every index repoint. a reader-writer
+ * @param index_rw guards the id map, the space counters and every index repoint. a reader-writer
  *        lock rather than a mutex because resolving an id is a read and nothing else: every value a
  *        scan dereferences goes through here, so a mutex made the store's own index the thing
  *        concurrent readers waited on rather than the device
- * @field buckets the open-addressed id map
- * @field bucket_cap capacity of buckets, a power of two
- * @field bucket_count occupied buckets
- * @field bucket_tomb deleted buckets awaiting a resize
- * @field used_bytes uncompressed length the indexed values represent
- * @field stored_bytes framed length those same values occupy on disk. read against used_bytes it is
+ * @param buckets the open-addressed id map
+ * @param bucket_cap capacity of buckets, a power of two
+ * @param bucket_count occupied buckets
+ * @param bucket_tomb deleted buckets awaiting a resize
+ * @param used_bytes uncompressed length the indexed values represent
+ * @param stored_bytes framed length those same values occupy on disk. read against used_bytes it is
  *        what the encoding pipeline actually bought, measured on the values the store still holds
  *        rather than on a sample
- * @field chain_keys the packed chains seen, chain_n of them
- * @field chain_used uncompressed bytes attributed to each chain
- * @field chain_stored on-disk bytes attributed to each chain
- * @field chain_values how many values each chain accounts for
- * @field chain_n how many chains are in use
- * @field reclaim_calls reclaim calls made, lifetime, whether or not any segment was worth
+ * @param chain_keys the packed chains seen, chain_n of them
+ * @param chain_used uncompressed bytes attributed to each chain
+ * @param chain_stored on-disk bytes attributed to each chain
+ * @param chain_values how many values each chain accounts for
+ * @param chain_n how many chains are in use
+ * @param reclaim_calls reclaim calls made, lifetime, whether or not any segment was worth
  *        draining. read beside reclaim_passes it separates a reclaim that never runs from one that
  *        runs and finds nothing, which are different faults with different fixes
- * @field reclaim_passes reclaim calls that drained at least one segment, lifetime; a call
+ * @param reclaim_passes reclaim calls that drained at least one segment, lifetime; a call
  *        drains every segment worth draining, so this counts calls and segments_retired
  *        counts what they freed
- * @field segments_retired segment files unlinked by a reclaim, lifetime
- * @field build_floors one slot per builder in flight, holding the lowest segment number that
+ * @param segments_retired segment files unlinked by a reclaim, lifetime
+ * @param build_floors one slot per builder in flight, holding the lowest segment number that
  * builder may have written a value into, or VLOG_BUILD_FLOOR_NONE when the slot is free. a segment
  * at or above the lowest floor held cannot be reclaimed, since a builder may have put a value in it
  * that no installed sstable references yet
- * @field builds_unslotted builders that found no free slot in build_floors and so cannot be
+ * @param builds_unslotted builders that found no free slot in build_floors and so cannot be
  *        described individually. any of them stops reclamation entirely, there being no way to say
  *        which segments they might have reached
  */

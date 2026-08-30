@@ -144,14 +144,13 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     if (block_size == 0) return -1; /* zero-filled hole extent unknown, cannot advance */
 
     /* read footer magic to distinguish partial write from genuine corruption.
-     * footer layout [footer_size(4)][footer_magic(4)]; footer_magic sits at
-     * (current_pos + BLOCK_HEADER_SIZE + block_size + SIZE_FIELD_SIZE) */
+     * the magic sits one size field into the footer, which starts after the payload */
     const off_t footer_magic_offset = (off_t)cursor->current_pos + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
-                                      (off_t)block_size + BLOCK_MANAGER_SIZE_FIELD_SIZE;
-    unsigned char magic_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
+                                      (off_t)block_size + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET;
+    unsigned char magic_buf[BLOCK_MANAGER_FOOTER_MAGIC_SIZE];
     const ssize_t nread =
-        pread(cursor->bm->fd, magic_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, footer_magic_offset);
-    if (nread != BLOCK_MANAGER_CHECKSUM_LENGTH)
+        pread(cursor->bm->fd, magic_buf, BLOCK_MANAGER_FOOTER_MAGIC_SIZE, footer_magic_offset);
+    if (nread != BLOCK_MANAGER_FOOTER_MAGIC_SIZE)
     {
         /* footer not present so file truncated mid-block; treat as partial write */
         cursor->current_pos +=
@@ -184,14 +183,13 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
  * @param offset the file offset of the block (start of header)
  * @param extent_limit if non-zero, reject a block whose frame extends past this
  *                     byte offset (guards against garbage sizes); 0 skips the check
- * @param check_budget if non-zero, refuse a payload larger than the memory budget
  * @param payload_hint bytes of payload to fetch alongside the header, for a caller that already
  * knows the size; 0 or anything under the default asks for BM_READ_HINT_BYTES
  * @param out_size set to the payload size on success
  * @return pointer to the verified payload inside the TLS buffer, or NULL on failure
  */
 uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t extent_limit,
-                           const int check_budget, const uint32_t payload_hint, uint32_t *out_size)
+                           const uint32_t payload_hint, uint32_t *out_size)
 {
     /* first pread -- header + a hint of payload in one syscall */
     const uint32_t hint = payload_hint > BM_READ_HINT_BYTES ? payload_hint : BM_READ_HINT_BYTES;
@@ -212,15 +210,6 @@ uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t e
         const uint64_t frame_end =
             offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)size + BLOCK_MANAGER_FOOTER_SIZE;
         if (BM_UNLIKELY(frame_end > extent_limit)) return NULL;
-    }
-
-    /* only large blocks consult the budget (relaxed atomic load, no syscall); a
-     * block over budget is skipped so the caller degrades instead of OOMing */
-    if (check_budget && BM_UNLIKELY(size > BM_LARGE_BLOCK_BUDGET_CHECK_THRESHOLD))
-    {
-        const uint64_t budget =
-            atomic_load_explicit(&bm_max_safe_block_bytes, memory_order_relaxed);
-        if (budget > 0 && (uint64_t)size > budget) return NULL;
     }
 
     /* payload bytes already in buf (the first read may also have pulled the footer
@@ -265,7 +254,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     const uint64_t file_size = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
 
     uint32_t block_size = 0;
-    uint8_t *payload = bm_read_block_tls(bm->fd, offset, file_size, 1, 0, &block_size);
+    uint8_t *payload = bm_read_block_tls(bm->fd, offset, file_size, 0, &block_size);
     if (BM_UNLIKELY(!payload)) return NULL;
 
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t) + block_size);
@@ -295,7 +284,7 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
     const uint64_t extent =
         atomic_load_explicit(&cursor->bm->current_file_size, memory_order_acquire);
 
-    unsigned char magic[BLOCK_MANAGER_CHECKSUM_LENGTH];
+    unsigned char magic[BLOCK_MANAGER_FOOTER_MAGIC_SIZE];
     encode_uint32_le_compat(magic, BLOCK_MANAGER_FOOTER_MAGIC);
 
     /* small on-stack scan window -- a big buffer is risky on platforms with small thread stacks and
@@ -319,11 +308,11 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
         if ((uint64_t)want > extent - pos) want = (size_t)(extent - pos);
 
         const ssize_t got = pread(cursor->bm->fd, buf, want, (off_t)pos);
-        if (got < (ssize_t)BLOCK_MANAGER_CHECKSUM_LENGTH) break;
+        if (got < (ssize_t)BLOCK_MANAGER_FOOTER_MAGIC_SIZE) break;
 
-        for (ssize_t i = 0; i + (ssize_t)BLOCK_MANAGER_CHECKSUM_LENGTH <= got; i++)
+        for (ssize_t i = 0; i + (ssize_t)BLOCK_MANAGER_FOOTER_MAGIC_SIZE <= got; i++)
         {
-            if (buf[i] != magic[0] || memcmp(buf + i, magic, BLOCK_MANAGER_CHECKSUM_LENGTH) != 0)
+            if (buf[i] != magic[0] || memcmp(buf + i, magic, BLOCK_MANAGER_FOOTER_MAGIC_SIZE) != 0)
                 continue;
 
             const uint64_t abs_magic = pos + (uint64_t)i;
@@ -337,7 +326,7 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
 
             const uint64_t frame =
                 BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)fsize + BLOCK_MANAGER_FOOTER_SIZE;
-            const uint64_t magic_end = abs_magic + BLOCK_MANAGER_CHECKSUM_LENGTH;
+            const uint64_t magic_end = abs_magic + BLOCK_MANAGER_FOOTER_MAGIC_SIZE;
             if (magic_end < frame) continue;
             const uint64_t block_start = magic_end - frame;
             if (block_start < cursor->current_pos) continue;
@@ -345,7 +334,7 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
             /* validate the whole frame by re-reading it -- the checksum inside bm_read_block_tls is
              * the gate that rejects a false-positive magic */
             uint32_t validated_size = 0;
-            if (bm_read_block_tls(cursor->bm->fd, block_start, extent, 0, 0, &validated_size) &&
+            if (bm_read_block_tls(cursor->bm->fd, block_start, extent, 0, &validated_size) &&
                 validated_size == fsize)
             {
                 cursor->current_pos = block_start;
@@ -356,7 +345,7 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
         }
 
         if ((uint64_t)got < want) break; /* short read means end of file reached */
-        pos += (uint64_t)got - (BLOCK_MANAGER_CHECKSUM_LENGTH - 1);
+        pos += (uint64_t)got - (BLOCK_MANAGER_FOOTER_MAGIC_SIZE - 1);
     }
 
     return -1;
@@ -426,7 +415,7 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
 
     const uint32_t prev_block_size = decode_uint32_le_compat(footer_buf);
     const uint32_t footer_magic =
-        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
+        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET);
 
     /* validate footer magic */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || prev_block_size == 0)
@@ -487,7 +476,7 @@ int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, const 
 
     const uint32_t block_size = decode_uint32_le_compat(footer_buf);
     const uint32_t footer_magic =
-        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
+        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET);
 
     /* verify footer magic */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || block_size == 0)
@@ -620,10 +609,11 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
      * as trustworthy as the file it was read from. the checksum inside the helper rejects a corrupt
      * block, but it can only do so after the declared size has been believed once -- four garbage
      * bytes would otherwise buy a four gigabyte buffer before anything checks them. bounding the
-     * frame by the file and consulting the budget puts the guard ahead of the allocation */
+     * frame by the file puts the guard ahead of the allocation, and the checksum then rejects what
+     * survives it */
     const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
     uint32_t block_size = 0;
-    uint8_t *payload = bm_read_block_tls(bm->fd, offset, extent, 1, 0, &block_size);
+    uint8_t *payload = bm_read_block_tls(bm->fd, offset, extent, 0, &block_size);
     if (BM_UNLIKELY(!payload)) return -1;
 
     uint8_t *block_data = malloc(block_size);
@@ -642,7 +632,7 @@ const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, co
     if (!bm || !data_size) return NULL;
 
     /* the same untrusted-offset reasoning as the owning read above applies -- the frame is bounded
-     * by the file and checked against the budget before anything sizes a buffer from it */
+     * by the file before anything sizes a buffer from it */
     const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
-    return bm_read_block_tls(bm->fd, offset, extent, 1, payload_hint, data_size);
+    return bm_read_block_tls(bm->fd, offset, extent, payload_hint, data_size);
 }

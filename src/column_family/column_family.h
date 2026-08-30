@@ -41,49 +41,49 @@
 /**
  * cf_t
  * a runtime column family, composing its config and tiered sstables over a borrowed db-global vlog
- * @field cf_id stable id from the manifest registry, the key every manifest entry references
- * @field name column family name, NUL-terminated
- * @field config the validated, persisted configuration, published as an immutable snapshot. a
+ * @param cf_id stable id from the manifest registry, the key every manifest entry references
+ * @param name column family name, NUL-terminated
+ * @param config the validated, persisted configuration, published as an immutable snapshot. a
  *               runtime reconfigure swaps a whole new one in rather than writing through this one,
  *               so a reader that took it sees one coherent configuration for as long as it holds it
  *               -- read it with cf_config_get rather than reaching through this pointer
- * @field config_epoch guards a published config against reclaim while a reader is copying it
- * @field config_retire configs displaced by a reconfigure, freed once no reader can hold them
- * @field dir the directory this family's klogs are resolved against, which is the database
+ * @param config_epoch guards a published config against reclaim while a reader is copying it
+ * @param config_retire configs displaced by a reconfigure, freed once no reader can hold them
+ * @param dir the directory this family's klogs are resolved against, which is the database
  * directory itself -- families have no directory of their own, and a klog carries its family's id
  * in its file name instead
- * @field vlog the db-global value log, borrowed by this family's sstable builders and reads, not
+ * @param vlog the db-global value log, borrowed by this family's sstable builders and reads, not
  * owned
- * @field cache the db-global block cache this family's sstables read through, borrowed, not owned
- * @field now the db-wide clock the family's sstables read the current second from, borrowed
- * @field arena_pool the db-global chunk pool a decoded btree node's arena draws from, borrowed, not
+ * @param cache the db-global block cache this family's sstables read through, borrowed, not owned
+ * @param now the db-wide clock the family's sstables read the current second from, borrowed
+ * @param arena_pool the db-global chunk pool a decoded btree node's arena draws from, borrowed, not
  *                   owned, or NULL to allocate directly
- * @field fdm the db-global descriptor budget guarding this family's klog reopens, borrowed, not
+ * @param fdm the db-global descriptor budget guarding this family's klog reopens, borrowed, not
  * owned
- * @field encodings the db-global encoding registry, borrowed; the family's pipeline ids mean
+ * @param encodings the db-global encoding registry, borrowed; the family's pipeline ids mean
  *                  nothing without it, so every builder and reader it creates carries it through
- * @field levels the tiered set of sstables (L1 overlapping, L2+ sorted)
- * @field compacting set while a compaction for this family is planned or running, so the scheduler
+ * @param levels the tiered set of sstables (L1 overlapping, L2+ sorted)
+ * @param compacting set while a compaction for this family is planned or running, so the scheduler
  *                   runs at most one compaction per family at a time and a drop waits it out
- * @field planned_generation the level-set generation the backstop scheduler last planned this
+ * @param planned_generation the level-set generation the backstop scheduler last planned this
  *                           family at, so a tick can skip a family whose shape has not moved. only
  *                           the holder of the compaction claim reads or writes it, which is what
  *                           makes a plain field safe here
- * @field planned_gc_floor the reclamation floor that plan was made against. a merge's value depends
+ * @param planned_gc_floor the reclamation floor that plan was made against. a merge's value depends
  * on it as much as on the shape -- when transactions drain, the floor rises and versions the same
  * layout could not drop become droppable -- so a floor that has moved is reason to plan again even
  * though nothing was written
- * @field user_bytes_written logical key+value bytes committed to this family, for stats
- * @field wal_bytes_written write-ahead-log bytes this family's commits contributed, for stats
- * @field flush_bytes_written on-disk bytes this family's flushes wrote, for stats
- * @field flush_count sstables this family's flushes produced, for stats
- * @field compaction_bytes_written on-disk bytes this family's compactions wrote, for stats
- * @field compaction_bytes_read on-disk bytes this family's compactions read as input, for stats
- * @field compaction_count compactions this family has run, for stats
- * @field commit_hook_fn the live post-commit callback, set at runtime, NULL when none; read on the
+ * @param user_bytes_written logical key+value bytes committed to this family, for stats
+ * @param wal_bytes_written write-ahead-log bytes this family's commits contributed, for stats
+ * @param flush_bytes_written on-disk bytes this family's flushes wrote, for stats
+ * @param flush_count sstables this family's flushes produced, for stats
+ * @param compaction_bytes_written on-disk bytes this family's compactions wrote, for stats
+ * @param compaction_bytes_read on-disk bytes this family's compactions read as input, for stats
+ * @param compaction_count compactions this family has run, for stats
+ * @param commit_hook_fn the live post-commit callback, set at runtime, NULL when none; read on the
  *                       commit path and swapped by the setter, so it is atomic
- * @field commit_hook_ctx the user context passed to commit_hook_fn, atomic for the same reason
- * @field unflushed_key_count distinct keys resident in the shared memtables for this family and not
+ * @param commit_hook_ctx the user context passed to commit_hook_fn, atomic for the same reason
+ * @param unflushed_key_count distinct keys resident in the shared memtables for this family and not
  *                            yet in any sstable, raised by the l0 as new keys land and lowered by
  *                            flush as they drain to L1, for stats
  */

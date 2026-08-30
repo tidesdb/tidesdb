@@ -50,9 +50,9 @@
 /**
  * sstable_vlog_ref_t
  * how much of one value-log segment an sstable's separated values hold
- * @field segment the segment number, stable across the segment table's slot reuse
- * @field bytes framed bytes this sstable's values occupy in that segment
- * @field count how many values those bytes are
+ * @param segment the segment number, stable across the segment table's slot reuse
+ * @param bytes framed bytes this sstable's values occupy in that segment
+ * @param count how many values those bytes are
  */
 typedef struct
 {

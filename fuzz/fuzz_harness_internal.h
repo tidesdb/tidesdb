@@ -53,30 +53,30 @@
 /**
  * fx_state_t
  * the harness state threaded through every operation
- * @field db the database under test
- * @field model the reference model the database is compared against
- * @field txn the single open transaction, mirroring the model, or NULL
- * @field prepared the single prepared transaction awaiting phase two, or NULL
- * @field prepared_xid the two-phase transaction id the prepared handle carries
- * @field prepared_xid_size length of prepared_xid, 0 when none is outstanding
- * @field txn_iso the level the open transaction was begun at
- * @field prepared_iso the level the prepared transaction was begun at
- * @field prepared_recovered the prepared handle came back from a reopen rather than a prepare
- * @field cf_names the live column family names, refreshed from the database after every lifecycle
+ * @param db the database under test
+ * @param model the reference model the database is compared against
+ * @param txn the single open transaction, mirroring the model, or NULL
+ * @param prepared the single prepared transaction awaiting phase two, or NULL
+ * @param prepared_xid the two-phase transaction id the prepared handle carries
+ * @param prepared_xid_size length of prepared_xid, 0 when none is outstanding
+ * @param txn_iso the level the open transaction was begun at
+ * @param prepared_iso the level the prepared transaction was begun at
+ * @param prepared_recovered the prepared handle came back from a reopen rather than a prepare
+ * @param cf_names the live column family names, refreshed from the database after every lifecycle
  *        operation
- * @field cf_count how many of cf_names are live
- * @field db_dir the scratch directory the run's database lives in
- * @field sync_mode FUZZ_SYNC_NONE or FUZZ_SYNC_FULL
- * @field value_tag makes each generated value distinct so a stale read is detectable
- * @field verbose whether the run traces each operation to stderr
- * @field handles_at_open the live sstable handle count when this run's database opened; a closed
+ * @param cf_count how many of cf_names are live
+ * @param db_dir the scratch directory the run's database lives in
+ * @param sync_mode FUZZ_SYNC_NONE or FUZZ_SYNC_FULL
+ * @param value_tag makes each generated value distinct so a stale read is detectable
+ * @param verbose whether the run traces each operation to stderr
+ * @param handles_at_open the live sstable handle count when this run's database opened; a closed
  *        database owns none of its own, so every close has to bring the count back here
- * @field layouts_at_open the live level-layout count when this run's database opened, checked the
+ * @param layouts_at_open the live level-layout count when this run's database opened, checked the
  *        same way -- a layout that outlives its level set holds sstable references forever
- * @field log_level the engine log severity a run opens its databases with
- * @field data the fuzzer input the operation stream decodes from
- * @field size length of data
- * @field pos how far the decoder has consumed data
+ * @param log_level the engine log severity a run opens its databases with
+ * @param data the fuzzer input the operation stream decodes from
+ * @param size length of data
+ * @param pos how far the decoder has consumed data
  */
 typedef struct
 {

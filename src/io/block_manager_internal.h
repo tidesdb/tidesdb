@@ -37,11 +37,6 @@
  * block and the common small footer block so the hot read path is just integer compares. blocks
  * larger than this (a multi-hundred-MB bloom filter on a huge bottom-level sstable) are rare and
  * only there is the budget tested, itself a relaxed atomic load rather than a syscall. */
-#define BM_LARGE_BLOCK_BUDGET_CHECK_THRESHOLD (256u * 1024u * 1024u)
-
-/* nanosecond conversion factors for the cond-var deadline math */
-#define BM_NS_PER_US  1000L
-#define BM_NS_PER_SEC 1000000000L
 
 /* buffered-append staging ring sizing, shared because core sizes the ring at open and write fills
  * it. the default is the ring a buffered open reserves; the floor is the smallest ring allowed,
@@ -49,11 +44,14 @@
 #define BM_BUF_DEFAULT_RING (8ull * 1024 * 1024)
 #define BM_BUF_MIN_RING     (1ull * 1024 * 1024)
 
-/* memory-safety budget for a single block read in bytes, pushed down from the tidesdb layer via
- * block_manager_set_max_safe_block_bytes and refreshed by the reaper. 0 means no budget configured,
- * so the size-vs-EOF check still applies but no memory-based refusal happens. defined in
- * block_manager_util.c. */
-extern _Atomic(uint64_t) bm_max_safe_block_bytes;
+/**
+ * bm_note_write_failure
+ * record the errno of a failed write or sync on the handle so block_manager_last_errno can tell a
+ * caller which failure it was, and log a full device once per handle. both the buffered flush
+ * thread and the direct append path call this, so the two report a filled disk the same way
+ * @param bm the block manager whose write or sync failed, with errno still set from it
+ */
+void bm_note_write_failure(block_manager_t *bm);
 
 /**
  * compute_checksum
@@ -62,6 +60,9 @@ extern _Atomic(uint64_t) bm_max_safe_block_bytes;
  * over every byte read back, not just every byte written, so a scan streaming separated values pays
  * it per value. truncating a 64-bit hash keeps the collision behaviour of the wider function over
  * the bits that are kept
+ * @param data the bytes to checksum
+ * @param size how many
+ * @return the low 32 bits of their XXH3
  */
 static inline uint32_t compute_checksum(const void *data, const size_t size)
 {
@@ -70,7 +71,11 @@ static inline uint32_t compute_checksum(const void *data, const size_t size)
 
 /**
  * verify_checksum
- * verify size bytes of data against expected_checksum, returning 0 on a match and -1 otherwise
+ * verify size bytes of data against expected_checksum
+ * @param data the bytes to check
+ * @param size how many
+ * @param expected_checksum the checksum the frame carries
+ * @return 0 on a match, -1 otherwise
  */
 static inline int verify_checksum(const void *data, const size_t size,
                                   const uint32_t expected_checksum)
@@ -82,6 +87,10 @@ static inline int verify_checksum(const void *data, const size_t size,
  * bm_encode_frame
  * encode a block's framing, the header as [size][checksum] and the footer as [size][magic], so the
  * on-disk block layout is defined in exactly one place across every write path
+ * @param header receives the header bytes
+ * @param footer receives the footer bytes
+ * @param size the block's payload length
+ * @param checksum the payload's checksum
  */
 static inline void bm_encode_frame(unsigned char *header, unsigned char *footer, uint32_t size,
                                    uint32_t checksum)
@@ -89,12 +98,13 @@ static inline void bm_encode_frame(unsigned char *header, unsigned char *footer,
     encode_uint32_le_compat(header, size);
     encode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE, checksum);
     encode_uint32_le_compat(footer, size);
-    encode_uint32_le_compat(footer + BLOCK_MANAGER_CHECKSUM_LENGTH, BLOCK_MANAGER_FOOTER_MAGIC);
+    encode_uint32_le_compat(footer + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET, BLOCK_MANAGER_FOOTER_MAGIC);
 }
 
 /**
  * odsync_available
  * whether O_DSYNC is available on this platform, so an opened-with-O_DSYNC write is already durable
+ * @return non-zero when the platform has it
  */
 static inline int odsync_available(void)
 {
@@ -105,6 +115,8 @@ static inline int odsync_available(void)
  * is_sync_full
  * whether this block manager fsyncs every write; the flag is cached atomically so a runtime
  * sync-mode change cannot race the read on the write path
+ * @param bm the block manager
+ * @return non-zero when every write is fsynced
  */
 static inline int is_sync_full(const block_manager_t *bm)
 {
@@ -113,9 +125,13 @@ static inline int is_sync_full(const block_manager_t *bm)
 
 /**
  * pwrite_all
- * write exactly nbyte bytes at offset, retrying short writes and EINTR, returning 0 on success and
- * -1 on error with errno set; a bare pwrite treats a short write as a hard error, but a large
- * write_raw can legitimately come up short under a signal
+ * write exactly nbyte bytes at offset, retrying short writes and EINTR. a bare pwrite treats a
+ * short write as a hard error, but a large write_raw can legitimately come up short under a signal
+ * @param fd the file to write to
+ * @param buf the bytes to write
+ * @param nbyte how many
+ * @param offset where in the file they go
+ * @return 0 on success, -1 on error with errno set
  */
 static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset)
 {
@@ -149,7 +165,9 @@ static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset
 /**
  * bm_sync_after_write
  * make a just-written range durable when the block manager fsyncs every write, skipping the
- * fdatasync when O_DSYNC already made the write durable; returns 0 on success and -1 on error
+ * fdatasync when O_DSYNC already made the write durable
+ * @param bm the block manager
+ * @return 0 on success, -1 on error
  */
 static inline int bm_sync_after_write(block_manager_t *bm)
 {
@@ -160,7 +178,9 @@ static inline int bm_sync_after_write(block_manager_t *bm)
 /**
  * bm_sync_after_truncate
  * make a truncation durable when the block manager fsyncs every write; unlike a write this always
- * fdatasyncs under sync-full because O_DSYNC does not cover ftruncate. returns 0 or -1 on error
+ * fdatasyncs under sync-full because O_DSYNC does not cover ftruncate
+ * @param bm the block manager
+ * @return 0 on success, -1 on error
  */
 static inline int bm_sync_after_truncate(block_manager_t *bm)
 {
@@ -216,9 +236,8 @@ void *bm_flush_thread(void *arg);
  * first make sure the bytes it means to sync have left the staging ring */
 int bm_wait_flushed(block_manager_t *bm, uint64_t need);
 
-/* cursor -- read one block at offset into the thread-local buffer, verifying its checksum;
- * check_budget consults the per-read memory budget for outsized blocks */
-uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, int check_budget,
-                           uint32_t payload_hint, uint32_t *out_size);
+/* cursor -- read one block at offset into the thread-local buffer, verifying its checksum */
+uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, uint32_t payload_hint,
+                           uint32_t *out_size);
 
 #endif /* __BLOCK_MANAGER_INTERNAL_H__ */

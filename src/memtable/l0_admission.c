@@ -6,6 +6,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include <string.h>
+
 #include "base/log.h"
 #include "base/waitstat.h" /* tdb_monotonic_us, for a wait bounded by real time */
 #include "memtable/memtable.h"
@@ -41,6 +43,10 @@
  */
 static void l0_admission_snapshot(const tidesdb_l0_t *l0, tidesdb_l0_pressure_t *out)
 {
+    /* zeroed first so a field added to the snapshot later reads as unweighed rather than as
+     * whatever the caller's stack held. every field this producer does weigh is assigned below, and
+     * the ones it deliberately does not are left with a note saying so */
+    memset(out, 0, sizeof(*out));
     out->queue_depth = (int)queue_size(l0->queue);
     out->queue_limit = l0->l0_queue_size;
     /* weighing the active memtable would cost a pinned read of the shared active slot -- three

@@ -1169,11 +1169,11 @@ int tidesdb_txn_rollback_prepared(tidesdb_txn_t *txn);
 /**
  * tidesdb_prepared_txn_t
  * one transaction that was durably prepared before a restart and has no decision recorded after it
- * @field txn a handle in the prepared state, resolved with tidesdb_txn_commit_prepared or
+ * @param txn a handle in the prepared state, resolved with tidesdb_txn_commit_prepared or
  *            tidesdb_txn_rollback_prepared and freed like any other transaction
- * @field xid the transaction id the coordinator prepared it under, borrowed from the database and
+ * @param xid the transaction id the coordinator prepared it under, borrowed from the database and
  *            valid until it is closed
- * @field xid_size length of xid in bytes
+ * @param xid_size length of xid in bytes
  */
 typedef struct
 {
@@ -1737,9 +1737,9 @@ int tidesdb_get_io_stats(tidesdb_t *db, tidesdb_io_stats_t *stats);
  * tidesdb_range_stats_t
  * what a query planner needs to know about a key range, both figures taken from one layout snapshot
  * so they describe the same instant
- * @field sstables_overlapping sorted runs a scan of the range would merge, the shape of its cost
- * @field estimated_keys live keys the range holds, tombstoned and superseded versions excluded
- * @field keys_exact non-zero when estimated_keys was counted rather than estimated from metadata,
+ * @param sstables_overlapping sorted runs a scan of the range would merge, the shape of its cost
+ * @param estimated_keys live keys the range holds, tombstoned and superseded versions excluded
+ * @param keys_exact non-zero when estimated_keys was counted rather than estimated from metadata,
  * so a planner can trust it outright instead of hedging
  */
 typedef struct

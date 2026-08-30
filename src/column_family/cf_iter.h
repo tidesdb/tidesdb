@@ -29,11 +29,11 @@ typedef struct writeset_merge_source writeset_merge_source_t;
  * cf_iter_bounds_t
  * the key range a scan will stay inside, so the merge is built from the sstables whose own range
  * meets it rather than from every sstable the family holds
- * @field lower range start, inclusive
- * @field lower_size size of lower in bytes
- * @field upper range end, inclusive for the purpose of selecting sources, so a caller with an
+ * @param lower range start, inclusive
+ * @param lower_size size of lower in bytes
+ * @param upper range end, inclusive for the purpose of selecting sources, so a caller with an
  * exclusive end may pass it unchanged and at worst keep one source it does not read from
- * @field upper_size size of upper in bytes
+ * @param upper_size size of upper in bytes
  */
 typedef struct
 {

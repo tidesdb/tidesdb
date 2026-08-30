@@ -100,13 +100,13 @@ uint64_t bench_zipf_next(const bench_zipf_t *z, double u)
 /**
  * bench_stall_slot_t
  * one worker's stall-tracer state, published to the watchdog
- * @field start_ns when the worker entered its current commit, 0 when it is not in one
- * @field signalled set once the watchdog has asked this thread for a stack, so it asks once
- * @field captured set by the handler when frames hold a stack the watchdog may print
- * @field thread the worker, for pthread_kill
- * @field frames the captured return addresses
- * @field n_frames how many of frames are valid
- * @field observed_us how long the commit had been running when the watchdog noticed
+ * @param start_ns when the worker entered its current commit, 0 when it is not in one
+ * @param signalled set once the watchdog has asked this thread for a stack, so it asks once
+ * @param captured set by the handler when frames hold a stack the watchdog may print
+ * @param thread the worker, for pthread_kill
+ * @param frames the captured return addresses
+ * @param n_frames how many of frames are valid
+ * @param observed_us how long the commit had been running when the watchdog noticed
  */
 typedef struct
 {
@@ -142,9 +142,9 @@ static void bench_stall_handler(int sig)
 /**
  * bench_stall_watchdog_ctx_t
  * what the watchdog needs to police the workers
- * @field threads how many slots are live
- * @field threshold_ns a commit still running after this is reported
- * @field stop set to end the watchdog
+ * @param threads how many slots are live
+ * @param threshold_ns a commit still running after this is reported
+ * @param stop set to end the watchdog
  */
 typedef struct
 {

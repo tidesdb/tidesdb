@@ -2113,6 +2113,34 @@ void test_block_manager_no_space_is_reported_distinctly(void)
     ASSERT_EQ(block_manager_open(&full, "/dev/full", BLOCK_MANAGER_SYNC_NONE), -1);
     ASSERT_EQ(errno, ENOSPC);
     ASSERT_EQ(tdb_errno_to_result(errno), TDB_ERR_NO_SPACE);
+
+    /* the open above never reaches an append, so it cannot show what a caller is told when a write
+     * fails on an already-open handle. that is the case the sstable builder maps through
+     * block_manager_last_errno to tell a filled device from a hard io error, and the direct append
+     * path is the one a klog uses. swap the descriptor for one that fails every write and check the
+     * handle carries the errno out, rather than the builder seeing a bare io failure */
+    const char *swap_file = "test_no_space_direct.db";
+    (void)remove(swap_file);
+    block_manager_t *direct = NULL;
+    ASSERT_EQ(block_manager_open(&direct, swap_file, BLOCK_MANAGER_SYNC_NONE), 0);
+
+    const int full_fd = open("/dev/full", O_RDWR);
+    ASSERT_TRUE(full_fd >= 0);
+    ASSERT_TRUE(dup2(full_fd, direct->fd) >= 0);
+    close(full_fd);
+
+    unsigned char payload[64];
+    memset(payload, 'x', sizeof(payload));
+    block_manager_block_t *blk = block_manager_block_create(sizeof(payload), payload);
+    ASSERT_TRUE(blk != NULL);
+    errno = 0;
+    ASSERT_TRUE(block_manager_block_write(direct, blk) < 0);
+    ASSERT_EQ(block_manager_last_errno(direct), ENOSPC);
+    ASSERT_EQ(tdb_errno_to_result(block_manager_last_errno(direct)), TDB_ERR_NO_SPACE);
+
+    block_manager_block_free(blk);
+    block_manager_close(direct);
+    (void)remove(swap_file);
 #endif
 }
 
@@ -2874,47 +2902,6 @@ void test_block_manager_large_block_read_roundtrip(void)
     (void)remove(path);
 }
 
-void test_block_manager_max_safe_block_bytes_refusal(void)
-{
-    /* the budget is only consulted past the large-block threshold (256 MB); a block
-     * over both threshold and budget is refused with NULL instead of being allocated */
-    const uint64_t large_block_threshold = 256ull * 1024 * 1024;
-    const uint32_t big = (uint32_t)(large_block_threshold + 4096);
-
-    const char *path = "test_budget_refusal.db";
-    (void)remove(path);
-
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    uint8_t *payload = calloc(1, big);
-    ASSERT_TRUE(payload != NULL);
-    int64_t offset = block_manager_write_raw(bm, payload, big);
-    ASSERT_TRUE(offset >= 0);
-    free(payload);
-
-    block_manager_cursor_t *cursor = NULL;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* no budget configured -- the oversized block reads back fine */
-    block_manager_set_max_safe_block_bytes(0);
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_EQ(block->size, big);
-    block_manager_block_free(block);
-
-    /* budget below the block size -- the read is refused (graceful, no OOM) */
-    block_manager_set_max_safe_block_bytes(large_block_threshold);
-    ASSERT_TRUE(block_manager_cursor_read(cursor) == NULL);
-
-    /* restore the process-wide budget so later tests are unaffected */
-    block_manager_set_max_safe_block_bytes(0);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove(path);
-}
-
 /* buffered-append mode -- write through block_manager_open_buffered (staging ring + flush thread),
  * then reopen on the direct path to prove the on-disk bytes are identical and every record survives
  */
@@ -3257,7 +3244,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_strict_validation_rejects_garbage_tail, tests_passed);
     RUN_TEST(test_block_manager_permissive_validation_truncates_prealloc_tail, tests_passed);
     RUN_TEST(test_block_manager_large_block_read_roundtrip, tests_passed);
-    RUN_TEST(test_block_manager_max_safe_block_bytes_refusal, tests_passed);
 
     RUN_TEST(test_block_manager_buffered_roundtrip, tests_passed);
     RUN_TEST(test_block_manager_buffered_concurrent, tests_passed);

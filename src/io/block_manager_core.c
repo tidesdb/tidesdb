@@ -502,7 +502,12 @@ int block_manager_escalate_fsync(block_manager_t *bm)
                                                                  memory_order_acquire)) != 0)
         return -1;
 
-    return fdatasync(bm->fd);
+    if (fdatasync(bm->fd) != 0)
+    {
+        bm_note_write_failure(bm);
+        return -1;
+    }
+    return 0;
 }
 
 time_t block_manager_last_modified(block_manager_t *bm)

@@ -181,9 +181,9 @@ void test_crash_recovery_torn_flush(void)
 
 /* what the child's commit loop needs, so the loop can run on its own thread and leave the main
  * thread free to crash the process the moment the tear lands
- * @field db the database being committed to
- * @field cf the family the keys go to
- * @field progress the record of commits that returned, already durable when the crash comes */
+ * @param db the database being committed to
+ * @param cf the family the keys go to
+ * @param progress the record of commits that returned, already durable when the crash comes */
 typedef struct
 {
     tidesdb_t *db;
@@ -315,8 +315,8 @@ void test_crash_recovery_torn_wal_append(void)
 
 /* the handles a forced merge needs, since it runs on its own thread while the main one waits to
  * crash the process
- * @field db the database being merged
- * @field cf the family to merge */
+ * @param db the database being merged
+ * @param cf the family to merge */
 typedef struct
 {
     tidesdb_t *db;

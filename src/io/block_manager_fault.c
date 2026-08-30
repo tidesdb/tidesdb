@@ -76,7 +76,7 @@ void block_manager_fault_freeze(void)
 {
     /* stand in for a dead process -- park here so the caller does nothing after the tear; the
      * test's main thread observes the trip and exits the whole process */
-    for (;;) usleep(1000);
+    for (;;) usleep(BM_FAULT_FREEZE_SLEEP_US);
 }
 
 #endif /* TDB_FAULT_INJECTION */

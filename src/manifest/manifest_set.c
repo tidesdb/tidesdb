@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "manifest/manifest_internal.h"
+#include "xxhash.h" /* XXH3 for the (cf_id, id) key hash, as the block cache does for its own */
 
 /* ===== the entry index =====
  *
@@ -32,10 +33,8 @@
  * pair leaves the high bits of every key identical and every probe in one run */
 static uint64_t manifest_index_hash(const uint64_t cf_id, const uint64_t id)
 {
-    uint64_t h = (cf_id + 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull;
-    h ^= id + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-    h *= 0x94D049BB133111EBull;
-    return h ^ (h >> 31);
+    const uint64_t key[2] = {cf_id, id};
+    return XXH3_64bits(key, sizeof(key));
 }
 
 /* place the entry at slot into the index, which the caller has already sized to hold it */

@@ -215,8 +215,8 @@ void tdb_retire_drain(tdb_retire_list_t *list, tdb_retire_match_fn match, void *
 /**
  * tdb_wprwlock_t
  * a reader-writer lock that prefers a waiting writer on every platform
- * @field lock the underlying lock, taken with default attributes
- * @field writer_waiting how many writers are waiting on it, which is what holds new readers off
+ * @param lock the underlying lock, taken with default attributes
+ * @param writer_waiting how many writers are waiting on it, which is what holds new readers off
  */
 typedef struct
 {

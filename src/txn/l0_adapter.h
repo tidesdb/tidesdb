@@ -85,9 +85,9 @@ int tidesdb_l0_apply_entries(tidesdb_l0_t *l0, const tidesdb_wal_entry_t *entrie
  * an abort can land in a later generation than the batch it cancels, since the failing commit
  * appends it to whatever log is active by then, so the set has to be complete before replay starts
  * applying anything
- * @field seqs the aborted sequences, unordered
- * @field count how many are held
- * @field capacity allocated length of seqs
+ * @param seqs the aborted sequences, unordered
+ * @param count how many are held
+ * @param capacity allocated length of seqs
  */
 typedef struct
 {

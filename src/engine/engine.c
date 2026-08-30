@@ -23,6 +23,17 @@
 #include "txn/cf_source.h"
 #include "txn/wal_record.h"
 
+/* the low-level modules mirror a few public constants rather than include db.h, which keeps them
+ * independent but leaves nothing tying the copy to the original. the engine sees both sides, so it
+ * is where the copies are held to their source -- a change to either half fails the build here
+ * instead of quietly mapping a sync mode wrong or truncating a family name */
+_Static_assert((int)TDB_SYNC_NONE == (int)BLOCK_MANAGER_SYNC_NONE,
+               "block manager sync-none must match the public TDB_SYNC_NONE it is converted from");
+_Static_assert((int)TDB_SYNC_FULL == (int)BLOCK_MANAGER_SYNC_FULL,
+               "block manager sync-full must match the public TDB_SYNC_FULL it is converted from");
+_Static_assert(MANIFEST_CF_NAME_MAX == TDB_MAX_CF_NAME_LEN,
+               "manifest column family name bound must match the public one it mirrors");
+
 /* the db-level arena pool sizing the unified memtable draws from */
 #define ENGINE_ARENA_CHUNK_SIZE (1u << 20)  /* 1 MiB chunks */
 #define ENGINE_ARENA_MAX_CACHED (16u << 20) /* retain up to 16 MiB of freed chunks */

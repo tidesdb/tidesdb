@@ -25,6 +25,10 @@
 #define BM_FAULT_TORN_NUM 1
 #define BM_FAULT_TORN_DEN 2
 
+/* how long the frozen thread sleeps between checks -- it never wakes to do anything, so this only
+ * decides how little cpu a parked thread burns while the test's main thread exits the process */
+#define BM_FAULT_FREEZE_SLEEP_US 1000
+
 /**
  * block_manager_fault_arm_torn
  * arm a torn-write fault so the nth block-manager write after this call writes only a fraction of

@@ -93,12 +93,6 @@ static int l0_read_mt(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt, const uint
     return rc;
 }
 
-/* search the immutable queue for a prefixed key visible at the snapshot, newest to oldest,
- * returning the first hit. the snapshot and the pinning of each memtable happen inside a brief
- * reader epoch so a pointer cannot be freed by a concurrent reclaim before it is pinned; the epoch
- * is dropped before the skip_list reads so a reclaimer's drain is never held off by a slow read,
- * only by the pinning window. the pins (not the epoch) keep the memtables alive across the reads.
- */
 /* pin every memtable in a queue snapshot, all or nothing -- a memtable already retiring cannot be
  * pinned, and rather than read a partial set the pins already taken are rolled back so the caller
  * retries against a fresh snapshot */
@@ -119,6 +113,9 @@ static int l0_pin_all(void **snap, size_t got)
     return 0;
 }
 
+/* search the immutable queue for a prefixed key visible at the snapshot, newest to oldest,
+ * returning the first hit. the epoch is dropped before the skip_list reads, so a reclaimer's drain
+ * is held off only for the pinning window and not for a slow read */
 static int l0_get_from_immutables(tidesdb_l0_t *l0, const uint8_t *pkey, size_t pkey_size,
                                   uint64_t snapshot, uint8_t **value, size_t *value_size,
                                   uint64_t *vlog_id, int64_t *ttl, uint8_t *deleted,
@@ -209,37 +206,51 @@ static int l0_get_impl(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, 
 
     /* the active and the immutable queue are read in two steps with no lock between them, so a
      * rotation that moves a memtable from the active slot into the queue mid-read can leave a
-     * just-committed version in neither snapshot. bracket the two-step read with the rotation
-     * counter and, on a miss that raced a rotation, report a retryable busy rather than a
-     * definitive absence the caller would trust and fall through to a stale older version for. */
-    const uint64_t seen_before = atomic_load_explicit(&l0->visible_changes, memory_order_acquire);
-
-    tidesdb_memtable_t *mt = NULL;
-    for (int attempt = 0; attempt < TDB_L0_ACTIVE_ACQUIRE_MAX_ATTEMPTS; attempt++)
+     * just-committed version in neither snapshot. the two-step read is bracketed with the rotation
+     * counter, and a miss that raced a rotation is read again rather than handed back -- the race
+     * is the engine's own doing and clears in the time an enqueue and an exchange take, so a caller
+     * told to ask again has no lever this does not already have. only a miss that keeps racing is
+     * reported busy, and never as the absence a caller would trust and fall through on. */
+    int rc = TDB_ERR_NOT_FOUND;
+    for (int round = 0; round < TDB_L0_ROTATION_RETRY_MAX; round++)
     {
-        mt = l0_pin_active_read(l0);
-        if (mt) break;
-    }
-    if (!mt)
-    {
-        if (pkey != stack_key) free(pkey);
-        return TDB_ERR_BUSY;
-    }
+        const uint64_t seen_before =
+            atomic_load_explicit(&l0->visible_changes, memory_order_acquire);
 
-    /* the active memtable holds the newest writes; only when it misses does the search fall through
-     * the sealed immutables, newest first */
-    const int found = l0_read_mt(l0, mt, pkey, pkey_size, snapshot, value, value_size, vlog_id, ttl,
-                                 deleted, out_seq);
-    l0_unpin_read(mt);
+        tidesdb_memtable_t *mt = NULL;
+        for (int attempt = 0; attempt < TDB_L0_ACTIVE_ACQUIRE_MAX_ATTEMPTS; attempt++)
+        {
+            mt = l0_pin_active_read(l0);
+            if (mt) break;
+        }
+        if (!mt)
+        {
+            if (pkey != stack_key) free(pkey);
+            return TDB_ERR_BUSY;
+        }
 
-    int rc = found == 0 ? TDB_SUCCESS
+        /* the active memtable holds the newest writes; only when it misses does the search fall
+         * through the sealed immutables, newest first */
+        const int found = l0_read_mt(l0, mt, pkey, pkey_size, snapshot, value, value_size, vlog_id,
+                                     ttl, deleted, out_seq);
+        l0_unpin_read(mt);
+
+        rc = found == 0 ? TDB_SUCCESS
                         : l0_get_from_immutables(l0, pkey, pkey_size, snapshot, value, value_size,
                                                  vlog_id, ttl, deleted, out_seq);
-    if (rc == TDB_ERR_NOT_FOUND &&
-        atomic_load_explicit(&l0->visible_changes, memory_order_acquire) != seen_before)
-        rc = TDB_ERR_BUSY;
+
+        /* an answer either way stands. only a miss whose boundary moved underneath it is worth
+         * asking again, since that is the one outcome the two-step read can get wrong */
+        if (rc != TDB_ERR_NOT_FOUND ||
+            atomic_load_explicit(&l0->visible_changes, memory_order_acquire) == seen_before)
+        {
+            if (pkey != stack_key) free(pkey);
+            return rc;
+        }
+    }
+
     if (pkey != stack_key) free(pkey);
-    return rc;
+    return TDB_ERR_BUSY;
 }
 
 int tidesdb_l0_get(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size_t key_size,

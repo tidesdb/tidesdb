@@ -25,7 +25,11 @@
 #define BLOCK_MANAGER_MAGIC_SIZE 3
 /* version field size in bytes */
 #define BLOCK_MANAGER_VERSION_SIZE 1
-#define BLOCK_MANAGER_HEADER_SIZE  8
+/* reserved bytes rounding the header to eight, written as zeros and not read back */
+#define BLOCK_MANAGER_HEADER_PADDING_SIZE 4
+/* file header is magic + version + padding */
+#define BLOCK_MANAGER_HEADER_SIZE \
+    (BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE + BLOCK_MANAGER_HEADER_PADDING_SIZE)
 
 /* block field sizes */
 /* block size field (uint32_t) -- supports blocks up to 4GB, though try to keep it under! */
@@ -37,9 +41,12 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
 
-/* block footer for fast validation -- size + magic */
-#define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
-#define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
+/* block footer for fast validation -- a repeat of the size field then the magic. the magic sits one
+ * size field into the footer, which is what a reader offsets by to reach it */
+#define BLOCK_MANAGER_FOOTER_MAGIC        0x42445442 /* "BTDB" reversed */
+#define BLOCK_MANAGER_FOOTER_MAGIC_SIZE   4
+#define BLOCK_MANAGER_FOOTER_MAGIC_OFFSET BLOCK_MANAGER_SIZE_FIELD_SIZE
+#define BLOCK_MANAGER_FOOTER_SIZE         (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_FOOTER_MAGIC_SIZE)
 
 /* number of iovecs emitted per block in pwritev ( header, payload, footer ) */
 #define BLOCK_MANAGER_IOVECS_PER_BLOCK 3
@@ -188,7 +195,10 @@ void block_manager_set_io_stat(block_manager_t *bm, tdb_io_stat_t *io);
  * opens a block manager
  * @param bm the block manager to open
  * @param file_path the path of the file
- * @param sync_mode the sync mode (BLOCK_MANAGER_SYNC_NONE, BLOCK_MANAGER_SYNC_FULL)
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
  * @return 0 if successful, -1 if not
  */
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode);
@@ -201,7 +211,10 @@ int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mod
  * zeros) rather than reserve a full BLOCK_MANAGER_PREALLOC_CHUNK extent.
  * @param bm the block manager to open
  * @param file_path the path of the file
- * @param sync_mode the sync mode (BLOCK_MANAGER_SYNC_NONE, BLOCK_MANAGER_SYNC_FULL)
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
  * @param prealloc_chunk bytes to extend the on-disk extent by at a time; 0 disables preallocation
  * @return 0 if successful, -1 if not
  */
@@ -216,7 +229,10 @@ int block_manager_open_pre(block_manager_t **bm, const char *file_path, int sync
  * concurrently. reads, recovery, and the on-disk format are identical to the direct path.
  * @param bm output block manager
  * @param file_path path of the file
- * @param sync_mode TDB_SYNC_NONE or TDB_SYNC_FULL
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
  * @param ring_size staging ring capacity in bytes (0 = a sensible default); rounded up internally
  * @return 0 on success, -1 on failure
  */
@@ -627,17 +643,6 @@ int block_manager_validate_last_block(block_manager_t *bm,
                                       tidesdb_block_validation_mode_t validation);
 
 /**
- * block_manager_set_max_safe_block_bytes
- * sets a process-wide upper bound (bytes) on the size of a single block the
- * reader will allocate. a block whose claimed size exceeds this budget is
- * refused with a warning instead of allocating (graceful degradation, not OOM).
- * pushed down from the tidesdb layer (derived from resolved_memory_limit) so the
- * read path never makes a memory syscall. 0 disables the memory-based refusal.
- * @param bytes the budget in bytes, or 0 to disable
- */
-void block_manager_set_max_safe_block_bytes(uint64_t bytes);
-
-/**
  * convert_sync_mode
  * converts TidesDB sync mode enum values to block manager sync mode enum values
  * this method provides compatibility between the public TidesDB API (which uses
@@ -652,7 +657,10 @@ block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
  * block_manager_set_sync_mode
  * updates the sync mode of an existing block manager
  * @param bm the block manager to update
- * @param sync_mode the new sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
  */
 void block_manager_set_sync_mode(block_manager_t *bm, int sync_mode);
 

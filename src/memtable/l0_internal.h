@@ -19,6 +19,12 @@
  */
 #define TDB_L0_ACTIVE_ACQUIRE_MAX_ATTEMPTS 1000
 
+/* how many times a read re-snapshots the active slot and the queue when a rotation moved the
+ * boundary between the two halves of its walk. a rotation is an enqueue and an exchange, so one
+ * more look is almost always enough and a handful bounds the pathological case where rotations
+ * arrive faster than a read completes -- past that the caller is told busy rather than spun on */
+#define TDB_L0_ROTATION_RETRY_MAX 4
+
 /* stack buffer for the prefixed key a put or a get builds, so the common small case avoids a
  * malloc; a larger key falls back to a heap allocation */
 #define TDB_L0_KEY_STACK_BUF 256

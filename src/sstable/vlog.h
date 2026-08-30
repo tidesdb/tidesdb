@@ -99,12 +99,12 @@ typedef struct vlog vlog_t;
 /**
  * vlog_config_t
  * what a vlog is opened with, sourced from the owning database config
- * @field sync_mode block manager sync mode every segment file is opened with
- * @field segment_target_bytes size at which the active segment seals and a fresh one opens
- * @field encodings the db-global registry a stored value's recorded ids resolve against. the
+ * @param sync_mode block manager sync mode every segment file is opened with
+ * @param segment_target_bytes size at which the active segment seals and a fresh one opens
+ * @param encodings the db-global registry a stored value's recorded ids resolve against. the
  *        registry is db-global even though a pipeline is per-family, so the store can decode any
  *        value it holds
- * @field fdm the descriptor budget segment files open against, borrowed, or NULL to open them
+ * @param fdm the descriptor budget segment files open against, borrowed, or NULL to open them
  *        directly. a store can hold thousands of segments, so leaving them outside the budget that
  *        klogs and write ahead logs respect would let the value log exhaust the process on its own
  */
@@ -121,26 +121,26 @@ typedef struct
  * a point-in-time physical accounting. the vlog cannot report reclaimable space on its own because
  * it does not know which values are dead; the engine tracks that with its own dropped-bytes hint
  * and decides when to trigger a reclaim
- * @field file_size total bytes across every segment
- * @field value_count values currently indexed
- * @field used_bytes uncompressed length the indexed values represent
- * @field stored_bytes framed length those same values occupy on disk, so used over stored is what
+ * @param file_size total bytes across every segment
+ * @param value_count values currently indexed
+ * @param used_bytes uncompressed length the indexed values represent
+ * @param stored_bytes framed length those same values occupy on disk, so used over stored is what
  *        the encoding pipeline is actually buying on the data the store holds
- * @field segment_count segments currently open, the active one included
- * @field dead_bytes bytes held by segments beyond what their live values account for,
+ * @param segment_count segments currently open, the active one included
+ * @param dead_bytes bytes held by segments beyond what their live values account for,
  *        derived from the index rather than tracked, so it needs no caller to report a drop
- * @field live_bytes framed bytes the store's live sstables still reference, summed from what they
+ * @param live_bytes framed bytes the store's live sstables still reference, summed from what they
  *        reported. this is the figure space amplification is against: used_bytes counts everything
  *        the index still names, which includes values no tree can reach any more, so it converges
  *        on the file size and says nothing about how much of the store is worth keeping
- * @field bytes_written every byte ever appended, reclamation's rewrites included. this is the
+ * @param bytes_written every byte ever appended, reclamation's rewrites included. this is the
  *        write-amplification term for a separated value; the live and stored totals say what is
  *        held, not what the device was asked to write
- * @field reclaim_calls reclaim calls made, lifetime, whether or not anything was drained
- * @field reclaim_passes reclaim calls that drained at least one segment, lifetime; one call
+ * @param reclaim_calls reclaim calls made, lifetime, whether or not anything was drained
+ * @param reclaim_passes reclaim calls that drained at least one segment, lifetime; one call
  *        drains every segment worth draining, so segments_retired may exceed this
- * @field segments_retired segment files unlinked by a reclaim, lifetime
- * @field segments_drainable sealed segments holding so little live data that rewriting the tables
+ * @param segments_retired segment files unlinked by a reclaim, lifetime
+ * @param segments_drainable sealed segments holding so little live data that rewriting the tables
  *        referencing them would free most of a file, as of the last reclaim. dead_bytes says how
  *        much there is to reclaim and this says how much of it is currently actionable
  */
@@ -173,11 +173,11 @@ typedef struct
  * codec's effect: a family can change its codec, and compaction rewrites values under whichever
  * pipeline is merging them, so a single figure for the store would average across chains and
  * describe none of them
- * @field ids the codec ids in the order applied, empty when the values were stored verbatim
- * @field id_count how many ids
- * @field used_bytes uncompressed length of the values written through this chain
- * @field stored_bytes the on-disk length those values occupy, so used over stored is the ratio
- * @field value_count how many values it accounts for
+ * @param ids the codec ids in the order applied, empty when the values were stored verbatim
+ * @param id_count how many ids
+ * @param used_bytes uncompressed length of the values written through this chain
+ * @param stored_bytes the on-disk length those values occupy, so used over stored is the ratio
+ * @param value_count how many values it accounts for
  */
 typedef struct
 {
@@ -191,8 +191,8 @@ typedef struct
 /**
  * vlog_segment_info_t
  * one segment's identity and logical length, for a caller copying the store elsewhere
- * @field name the segment's file name within the store directory, no path
- * @field logical_size bytes to copy for a faithful duplicate; a preallocated tail beyond this is
+ * @param name the segment's file name within the store directory, no path
+ * @param logical_size bytes to copy for a faithful duplicate; a preallocated tail beyond this is
  *        not part of the segment's contents
  */
 typedef struct

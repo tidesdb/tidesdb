@@ -123,7 +123,12 @@ int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size
  * @param admit_ceiling_hits writers admitted only because the wait ceiling expired, each one a
  * flush that is not keeping up
  * @param admit_max_us the longest single admission wait, which is what a latency tail is made of
+ * @param wal_bytes_written framed bytes handed to the log, counted where the append happens. the
+ * log is one shared structure for every family, so this belongs here rather than beside a family's
+ * counters, and it is what the device was asked to write rather than what an entry encoded to
  * @param wal_wait how long appends have been made to wait on the log
+ * @param vlog the shared value log, borrowed, for the floor a memtable holds over values only it
+ * names
  * @param cf_unflushed per-cf-index pointers to each column family's unflushed distinct-key counter,
  * bound by the owner so an apply can attribute a newly resident key to its family without the l0
  * knowing about column families; a cf index past the table is simply not tracked
@@ -136,6 +141,13 @@ int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size
  * without it, which is safe because entries are only ever appended
  * @param pending_reclaim immutables whose readers had not left when the flush finished with them,
  * held here for a later sweep rather than waited on inline
+ * @param admit_mtx guards the admission wait, so a writer cannot be between its check and its wait
+ * and miss the wake
+ * @param admit_cv where a writer held by backpressure waits rather than waking on a timer. the
+ * backlog it waits on is drained by another thread, so that thread can say when to look again --
+ * polling instead costs a wakeup every couple of hundred microseconds per blocked writer, which on
+ * a machine with fewer cores than it has blocked writers is the scheduler's whole budget spent on
+ * threads discovering nothing has changed
  */
 typedef struct
 {
@@ -151,31 +163,20 @@ typedef struct
     int wal_ack_on_stage;
     tidesdb_backpressure_t *backpressure;
     _Atomic(int) flushes_in_flight;
-    /* the deepest flush tier across the families, published by the compaction scheduler. the queue
-     * beside it says whether flush keeps up; this says whether merging does */
     _Atomic(int) tier_depth;
     _Atomic(uint64_t) admits_throttled;
     _Atomic(uint64_t) admits_blocked;
     _Atomic(uint64_t) admit_stall_us;
     _Atomic(uint64_t) admit_ceiling_hits;
     _Atomic(uint64_t) admit_max_us;
-    /* framed bytes handed to the log, counted where the append happens. the log is one shared
-     * structure for every family, so this belongs here rather than beside a family's counters,
-     * and it is what the device was asked to write rather than what an entry encoded to */
     _Atomic(uint64_t) wal_bytes_written;
     tdb_wait_stat_t wal_wait;
-    /* the shared value log, borrowed, for the floor a memtable holds over values only it names */
     vlog_t *vlog;
     _Atomic(_Atomic(int64_t) *) cf_unflushed[TDB_L0_MAX_TRACKED_CFS];
     uint64_t aborted_seqs[TDB_L0_MAX_ABORTED_SEQS];
     _Atomic(int) aborted_count;
     pthread_mutex_t aborted_lock;
     _Atomic(void *) pending_reclaim;
-    /* a writer held by backpressure waits here rather than waking on a timer. the backlog it waits
-     * on is drained by another thread, so that thread can say when to look again -- and polling it
-     * instead costs a wakeup every couple of hundred microseconds per blocked writer, which on a
-     * machine with fewer cores than it has blocked writers is the scheduler's whole budget spent
-     * on threads discovering nothing has changed */
     pthread_mutex_t admit_mtx;
     pthread_cond_t admit_cv;
 } tidesdb_l0_t;
@@ -638,9 +639,9 @@ typedef struct
 /**
  * tidesdb_l0_wal_wait_t
  * how long appends have been made to wait on the write-ahead log
- * @field count appends that waited
- * @field total_us the summed wait
- * @field max_us the longest single wait
+ * @param count appends that waited
+ * @param total_us the summed wait
+ * @param max_us the longest single wait
  */
 typedef struct
 {

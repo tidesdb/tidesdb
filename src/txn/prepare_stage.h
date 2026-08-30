@@ -33,14 +33,14 @@ typedef struct tdb_prepare_stage tdb_prepare_stage_t;
 /**
  * tdb_prepared_record_t
  * one staged prepared transaction, owning every byte it points at
- * @field xid the transaction id the coordinator knows it by
- * @field xid_size length of xid in bytes
- * @field entries the prepared write set, already carrying the sequence phase two would apply it at
- * @field count number of entries
- * @field generation the write-ahead log generation the PREPARE record was replayed from, so the
+ * @param xid the transaction id the coordinator knows it by
+ * @param xid_size length of xid in bytes
+ * @param entries the prepared write set, already carrying the sequence phase two would apply it at
+ * @param count number of entries
+ * @param generation the write-ahead log generation the PREPARE record was replayed from, so the
  *        engine can keep exactly that log while the batch stays in doubt
- * @field commit_seq the sequence the whole batch commits at, taken when it prepared
- * @field resolution one of the TDB_PREPARE_* outcomes
+ * @param commit_seq the sequence the whole batch commits at, taken when it prepared
+ * @param resolution one of the TDB_PREPARE_* outcomes
  */
 typedef struct
 {

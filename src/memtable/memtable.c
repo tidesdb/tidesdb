@@ -694,20 +694,12 @@ int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt)
 
 int tidesdb_l0_active_full(tidesdb_l0_t *l0)
 {
+    /* a buffer size of zero is a memtable that never fills on size, so the measurement below is not
+     * worth the pin. an active slot that cannot be pinned measures as zero, which is under any real
+     * threshold and so reads as not full, which is what a caller should do with a rotation it could
+     * not see past anyway */
     if (!l0 || l0->write_buffer_size == 0) return 0;
-
-    tidesdb_memtable_t *mt = NULL;
-    for (int attempt = 0; attempt < TDB_L0_ACTIVE_ACQUIRE_MAX_ATTEMPTS; attempt++)
-    {
-        mt = l0_pin_active_read(l0);
-        if (mt) break;
-    }
-    if (!mt) return 0;
-
-    const int full = skip_list_get_memory_bytes(mt->skip_list) + l0_range_tombstone_bytes(mt) >=
-                     l0->write_buffer_size;
-    l0_unpin_read(mt);
-    return full;
+    return tidesdb_l0_active_bytes(l0) >= l0->write_buffer_size;
 }
 
 size_t tidesdb_l0_active_bytes(tidesdb_l0_t *l0)

@@ -19,9 +19,9 @@
 /**
  * tdb_wait_stat_t
  * one wait point's totals
- * @field count how many times a thread waited here
- * @field total_us the summed wait
- * @field max_us the longest single wait
+ * @param count how many times a thread waited here
+ * @param total_us the summed wait
+ * @param max_us the longest single wait
  */
 typedef struct
 {
@@ -139,10 +139,10 @@ static inline void tdb_wait_read(const tdb_wait_stat_t *w, uint64_t *out_count,
  * what one class of file was asked to write. bytes over total_us gives the throughput that class
  * actually achieved, which is what says whether a device is saturated or merely idle behind a
  * bottleneck somewhere else
- * @field ops writes issued
- * @field bytes bytes written
- * @field total_us the summed time inside those writes
- * @field max_us the slowest single write
+ * @param ops writes issued
+ * @param bytes bytes written
+ * @param total_us the summed time inside those writes
+ * @param max_us the slowest single write
  */
 typedef struct
 {

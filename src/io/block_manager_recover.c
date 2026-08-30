@@ -185,7 +185,7 @@ static uint64_t validate_scan_extent(block_manager_t *bm, uint64_t file_size, in
 
         const uint32_t block_footer_size = decode_uint32_le_compat(footer_buf);
         const uint32_t block_footer_magic =
-            decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
+            decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET);
         if (block_footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || block_footer_size != block_size)
         {
             *corrupt = 1;
@@ -319,7 +319,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
 
     const uint32_t footer_size = decode_uint32_le_compat(footer_buf);
     const uint32_t footer_magic =
-        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_CHECKSUM_LENGTH);
+        decode_uint32_le_compat(footer_buf + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET);
 
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC)
         return validate_recover_no_magic(bm, file_size, validation);

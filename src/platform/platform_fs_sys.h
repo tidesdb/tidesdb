@@ -183,42 +183,6 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #include <sched.h>
 #define cpu_yield() sched_yield()
 #endif
-
-/*
- * tdb_hardlink
- * portable hard link creation
- * @param src existing file path
- * @param dst new hard link path
- * @return 0 on success, -1 on failure
- */
-static inline int tdb_hardlink(const char *src, const char *dst)
-{
-    if (!src || !dst) return -1;
-#ifdef _WIN32
-    return CreateHardLinkA(dst, src, NULL) ? 0 : -1;
-#else
-    return link(src, dst);
-#endif
-}
-
-/*
- * tdb_unlink
- * portable file deletion
- * @param path the file path to delete
- * @return 0 on success, -1 on failure
- */
-static inline int tdb_unlink(const char *path)
-{
-    if (!path) return -1;
-#ifdef _WIN32
-    /* clear read-only attribute that might prevent deletion */
-    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-    return _unlink(path);
-#else
-    return unlink(path);
-#endif
-}
-
 /**
  * is_directory_empty
  * checks if a directory is empty (contains only . and ..)
@@ -420,34 +384,6 @@ static inline int remove_directory(const char *path)
     return -1; /* failed after all retries */
 }
 
-/**
- * tdb_sync_directory
- * syncs a directory to ensure directory entries (new files/subdirs) are persisted
- * on POSIX systems, directory entries must be explicitly synced after mkdir/file creation
- * on Windows, directory entries are immediately durable, so this is a no-op
- * @param dir_path path to the directory to sync
- * @return 0 on success, -1 on error (errors are non-fatal, just logged)
- */
-static inline int tdb_sync_directory(const char *dir_path)
-{
-#ifdef _WIN32
-    /* Windows -- directory entries are immediately durable, no sync needed */
-    (void)dir_path;
-    return 0;
-#else
-    /* POSIX -- must fsync directory to persist directory entries */
-    const int fd = open(dir_path, O_RDONLY);
-    if (fd < 0)
-    {
-        /* non-fatal -- directory might not support fsync (e.g., some network filesystems) */
-        return -1;
-    }
-    const int result = fsync(fd);
-    close(fd);
-    return result;
-#endif
-}
-
 /*
  * tdb_fsync_parent_dir
  * fsync the parent directory of path so a rename's directory entry is durable on a crash. the
@@ -542,46 +478,6 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     return 0;
 #endif
 }
-
-/**
- * atomic_rename_dir
- * renames a directory from old_path to new_path
- * on POSIX systems, rename() works for directories
- * on windows rename() fails if the target exists, so this uses MoveFileEx
- * this does not replace an existing directory, so the caller must ensure the target is absent
- * @param old_path the current path of the directory
- * @param new_path the new path for the directory
- * @return 0 on success, -1 on failure
- */
-static inline int atomic_rename_dir(const char *old_path, const char *new_path)
-{
-    if (!old_path || !new_path) return -1;
-
-#ifdef _WIN32
-    /* MoveFileEx works for directories on Windows. MOVEFILE_REPLACE_EXISTING does not work for
-     * non-empty directories, so it is not used here and the caller must ensure the target does not
-     * exist */
-    if (!MoveFileEx(old_path, new_path, MOVEFILE_WRITE_THROUGH))
-    {
-        errno = GetLastError();
-        return -1;
-    }
-
-    return 0;
-#else
-    /* POSIX rename() works for directories */
-    if (rename(old_path, new_path) != 0)
-    {
-        return -1;
-    }
-
-    /* sync parent directory for durability */
-    tdb_fsync_parent_dir(new_path);
-
-    return 0;
-#endif
-}
-
 /**
  * tdb_get_cpu_count
  * gets the number of available CPU cores
@@ -611,27 +507,6 @@ static inline int tdb_get_cpu_count(void)
     return 4; /* fallback */
 #endif
 }
-
-/**
- * tdb_get_cpu_id
- * gets the current CPU core ID the calling thread is running on
- * used for NUMA-aware partition routing
- * @return current CPU ID, or 0 as fallback
- */
-static inline int tdb_get_cpu_id(void)
-{
-#if defined(__linux__) && (defined(__GLIBC__) || defined(__GNU_LIBRARY__))
-    /* sched_getcpu() is a fast vDSO call (~5ns) on modern Linux, declared by <sched.h> under
-     * _GNU_SOURCE which the build defines; re-declaring it here would shadow that one */
-    const int cpu = sched_getcpu();
-    return cpu >= 0 ? cpu : 0;
-#elif defined(_WIN32)
-    return (int)GetCurrentProcessorNumber();
-#else
-    return 0; /* fallback -- no CPU detection */
-#endif
-}
-
 /*
  * tdb_get_current_time
  * cross-platform function to get current Unix timestamp in seconds
@@ -668,48 +543,6 @@ static inline struct tm *tdb_gmtime_r(const time_t *timep, struct tm *result)
     return gmtime_r(timep, result);
 #endif
 }
-
-/**
- * tdb_fmemopen
- * cross-platform fmemopen
- * opens a memory buffer as a FILE stream for reading
- * @param buf pointer to memory buffer
- * @param size size of buffer in bytes
- * @param mode fopen mode string (e.g. "rb")
- * @return FILE pointer or NULL on failure
- */
-static inline FILE *tdb_fmemopen(void *buf, size_t size, const char *mode)
-{
-#if defined(_WIN32)
-    /* windows has no fmemopen, so this writes to a temp file and reopens */
-    (void)mode;
-    char temp_path[MAX_PATH];
-    char temp_file[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, temp_path) == 0) return NULL;
-    if (GetTempFileNameA(temp_path, "tdb", 0, temp_file) == 0) return NULL;
-
-    FILE *fp = fopen(temp_file, "wb");
-    if (!fp) return NULL;
-
-    if (size > 0 && buf)
-    {
-        if (fwrite(buf, 1, size, fp) != size)
-        {
-            fclose(fp);
-            DeleteFileA(temp_file);
-            return NULL;
-        }
-    }
-    fclose(fp);
-
-    fp = fopen(temp_file, "rb");
-    DeleteFileA(temp_file); /* the file stays open until fclose */
-    return fp;
-#else
-    return fmemopen(buf, size, mode);
-#endif
-}
-
 #ifndef _WIN32
 #include <sys/resource.h> /* getrlimit / RLIMIT_NOFILE, getrusage for the resource shims below */
 #endif
@@ -863,37 +696,4 @@ static inline long tdb_raise_max_open_files(long desired)
 #endif
     return tdb_max_open_files();
 }
-
-/**
- * tdb_addressable_memory_limit
- * report the largest span of memory this process could address, so callers can keep a budget
- * derived from physical RAM from exceeding the virtual address space. on a 64-bit process the
- * space dwarfs physical RAM and this never constrains anything; on an ILP32 process the whole
- * space is at most 4 GiB, and less after the kernel split, code, thread stacks and any sanitizer
- * shadow, so an unclamped budget can arm a memory-pressure valve above the ceiling that never
- * fires before allocation fails. returns the smaller of the pointer-width ceiling and, when it is
- * finite, the process address-space rlimit (on Windows, the top of the user-mode address range).
- * @return the address-space ceiling in bytes
- */
-static inline size_t tdb_addressable_memory_limit(void)
-{
-    size_t ceiling = SIZE_MAX; /* pointer-width max, which is 4 GiB on an ILP32 process */
-#if defined(_WIN32)
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    /* lpMaximumApplicationAddress is the highest user-mode address; its magnitude is the size of
-     * the usable range (2 GiB on Win32, 3 GiB with /LARGEADDRESSAWARE, ~128 TiB on Win64) */
-    const uintptr_t hi = (uintptr_t)si.lpMaximumApplicationAddress;
-    if (hi > 0 && (size_t)hi < ceiling) ceiling = (size_t)hi;
-#elif defined(RLIMIT_AS)
-    /* RLIMIT_AS caps the process virtual size on most unices; openbsd and a few others omit it,
-     * where the pointer-width ceiling above already bounds what the process can map */
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0 &&
-        (size_t)rl.rlim_cur < ceiling)
-        ceiling = (size_t)rl.rlim_cur;
-#endif
-    return ceiling;
-}
-
 #endif /* __PLATFORM_FS_SYS_H__ */

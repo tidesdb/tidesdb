@@ -557,6 +557,9 @@ static inline int pthread_key_create(pthread_key_t *key, void (*dtor)(void *))
     key->dtor = dtor;
     return 0;
 }
+/* the engine's one thread-local key lives for the process, so nothing here deletes one. present for
+ * the same reason the thread attributes above are -- the shim stands in for the posix header whole,
+ * rather than only for the calls this tree happens to make */
 static inline int pthread_key_delete(pthread_key_t key)
 {
     return FlsFree(key.fls) ? 0 : EINVAL;

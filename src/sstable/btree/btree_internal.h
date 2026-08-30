@@ -106,35 +106,6 @@ static inline size_t btree_varint_encode(uint8_t *buf, uint64_t val)
     buf[i++] = (uint8_t)val;
     return i;
 }
-
-/**
- * btree_varint_decode
- * decodes a varint value from a buffer
- * @param buf the buffer to decode from
- * @param val the value to decode
- * @return the number of bytes decoded
- */
-static inline size_t btree_varint_decode(const uint8_t *buf, uint64_t *val)
-{
-    uint64_t result = 0;
-    size_t shift = 0;
-    /* a 64-bit varint is at most 10 bytes -- stop after the terminating byte or 10 bytes, never
-     * reading an 11th (the old form broke at i==10 then still read buf[10]) */
-    for (size_t i = 0; i < 10; i++)
-    {
-        const uint8_t b = buf[i];
-        result |= (uint64_t)(b & 0x7F) << shift;
-        if (!(b & 0x80))
-        {
-            *val = result;
-            return i + 1;
-        }
-        shift += 7;
-    }
-    *val = result;
-    return 10;
-}
-
 /**
  * btree_signed_varint_encode
  * encodes a signed integer using zigzag encoding then varint

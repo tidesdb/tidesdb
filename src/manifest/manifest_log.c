@@ -208,25 +208,6 @@ static int manifest_write_snapshot_temp(tidesdb_manifest_t *manifest, uint8_t *b
 }
 
 /**
- * manifest_sync_parent_dir
- * fsync the directory holding the manifest, so the rename that put the snapshot there survives a
- * crash rather than the entry going missing with the file itself intact
- * @param path the manifest path whose parent directory is synced
- */
-static void manifest_sync_parent_dir(const char *path)
-{
-    char dir_buf[MANIFEST_PATH_LEN];
-    snprintf(dir_buf, sizeof(dir_buf), "%s", path);
-    char *last_sep = strrchr(dir_buf, '/');
-#ifdef _WIN32
-    if (!last_sep) last_sep = strrchr(dir_buf, '\\');
-#endif
-    if (!last_sep) return;
-    *last_sep = '\0';
-    tdb_sync_directory(dir_buf);
-}
-
-/**
  * manifest_rollover_locked
  * write the current set as one snapshot block to a temp log, fsync it when durable, atomically
  * rename it over the manifest path, and reopen the log handle. this bounds recovery replay and, on
@@ -267,7 +248,10 @@ static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int dura
             manifest->bm = NULL;
         return -1;
     }
-    if (durable_sync) manifest_sync_parent_dir(manifest->path);
+    /* the platform helper rather than a local copy -- it flushes the directory on windows too,
+     * takes the last separator of either kind, and heap-allocates for a path longer than its stack
+     * buffer instead of truncating and flushing whatever that left */
+    if (durable_sync) tdb_fsync_parent_dir(manifest->path);
 
     /* reopen the log on the (possibly new) path so subsequent commits append to the snapshot */
     if (block_manager_open_pre(&manifest->bm, manifest->path, BLOCK_MANAGER_SYNC_NONE,

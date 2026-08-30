@@ -219,7 +219,10 @@ static uint8_t *decompress_alloc_from_prefix(const uint8_t *data, const size_t d
         return NULL;
 
     *out_size = (size_t)original_size;
-    return malloc(*out_size);
+    /* a zero-length original still allocates a byte, so the returned pointer is always non-NULL and
+     * always freeable -- malloc(0) may hand back either, and a NULL would read here as a failed
+     * decode. the same reason encoding_passthrough does it */
+    return malloc(*out_size ? *out_size : 1);
 }
 
 #ifdef TIDESDB_HAVE_SNAPPY

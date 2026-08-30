@@ -63,7 +63,12 @@ int tdb_try_ref(tdb_refcount_t *rc)
             else if (evict_spins < TDB_EVICT_WAIT_MAX)
                 usleep(TDB_REFCOUNT_DRAIN_SLEEP_US);
             else
-                return 0; /* stuck far past any real close, caller backs off and retries */
+                /* only reachable if a window were held far past any real close. it is a wrong
+                 * answer rather than a slow one -- the one caller that reads through this reports
+                 * a value it could not acquire as absent -- so the windows are kept to a couple of
+                 * atomics, with the expensive part of a close outside them. widening one turns
+                 * this into a live value read as missing */
+                return 0;
             old = atomic_load_explicit(rc, memory_order_acquire);
         }
     }

@@ -28,8 +28,9 @@ typedef void (*bg_pool_worker_fn)(void *item, void *ctx);
  * @param queue the caller-owned work queue to drain
  * @param worker callback invoked per dequeued item
  * @param ctx opaque context passed to every worker call
- * @return the pool, or NULL on allocation or thread-creation failure (any started threads are
- * joined)
+ * @return the pool, or NULL on allocation or thread-creation failure. any started threads are
+ *         joined, which shuts the caller's queue down to reach them -- so a queue handed to a start
+ *         that failed is spent, and a retry on it would have its workers exit at once
  */
 bg_pool_t *bg_pool_start(int num_threads, queue_t *queue, bg_pool_worker_fn worker, void *ctx);
 
@@ -44,8 +45,9 @@ bg_pool_t *bg_pool_start(int num_threads, queue_t *queue, bg_pool_worker_fn work
  * limit
  * @param worker callback invoked per dequeued item
  * @param ctx opaque context passed to every worker call
- * @return the pool, or NULL on allocation or thread-creation failure (any started threads are
- * joined)
+ * @return the pool, or NULL on allocation or thread-creation failure. any started threads are
+ *         joined, which shuts the caller's queue down to reach them -- so a queue handed to a start
+ *         that failed is spent, and a retry on it would have its workers exit at once
  */
 bg_pool_t *bg_pool_start_named(int num_threads, queue_t *queue, const char *name_prefix,
                                bg_pool_worker_fn worker, void *ctx);

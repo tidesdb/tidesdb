@@ -306,6 +306,20 @@ jobs:
           fi
           echo "no -Wmaybe-uninitialized warnings in src/"
 
+      - name: Allocation-failure sweep (Linux x64 GCC)
+        if: runner.os == 'Linux' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          # refuse the nth allocation and walk n across a workload, which is the only way an
+          # out-of-memory unwind gets exercised at all -- every one of these paths is unreachable
+          # from an ordinary run. isolated in build-af rather than folded into the sanitizer build
+          # above, because the injector wraps malloc at link time and asan interposes on it at
+          # runtime, and because the sweeps are slow enough to be worth their own step.
+          cmake -S . -B build-af -DCMAKE_BUILD_TYPE=Debug \
+            -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_ALLOC_FAULT=ON
+          cmake --build build-af -j"$(nproc)" --target alloc_fault_tests
+          ./build-af/alloc_fault_tests
+
       - name: Configure CMake (Linux x86)
         if: runner.os == 'Linux' && matrix.arch == 'x86'
         shell: bash

@@ -480,6 +480,7 @@ typedef int (*skip_list_visibility_check_fn)(void *opaque_ctx, uint64_t seq);
  * @param key_size size of key
  * @param value pointer to value pointer (caller must free)
  * @param value_size pointer to value size
+ * @param vlog_id out -- the value log entry holding the value, or 0 when it is inline; may be NULL
  * @param ttl pointer to ttl
  * @param deleted pointer to deleted flag
  * @param seq pointer to sequence number (output)
@@ -569,6 +570,8 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor);
 /**
  * skip_list_cursor_get
  * gets key-value at current cursor position
+ * key, key_size, value and value_size are written on every path and may not be NULL. ttl and
+ * deleted are optional and are skipped when NULL
  * @param cursor cursor
  * @param key pointer to key pointer
  * @param key_size pointer to key size
@@ -585,6 +588,8 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
  * skip_list_cursor_next_get
  * fused next + get in a single call, avoiding redundant sentinel checks
  * and enabling better prefetching. returns zero-copy pointers.
+ * key, key_size, value and value_size are written on every path and may not be NULL. ttl and
+ * deleted are optional and are skipped when NULL
  * @param cursor cursor
  * @param key pointer to key pointer (do not free)
  * @param key_size pointer to key size
@@ -600,6 +605,8 @@ int skip_list_cursor_next_get(skip_list_cursor_t *cursor, uint8_t **key, size_t 
 /**
  * skip_list_cursor_get_with_seq
  * get key-value pair at cursor position with sequence number
+ * key, key_size, value and value_size are written on every path and may not be NULL. vlog_id,
+ * ttl, deleted and seq are optional and are skipped when NULL
  * @param cursor cursor
  * @param key pointer to key
  * @param key_size pointer to key size

@@ -87,8 +87,8 @@ tidesdb_config_t tidesdb_default_config(void)
 /* the public spelling of internal contention. TDB_ERR_BUSY is an engine-internal code that db.h
  * does not define, and to a caller it means exactly what TDB_ERR_LOCKED means -- something else
  * held what the call needed, nothing was written, and asking again is the remedy. mapping it here
- * at the boundary is what keeps a code no header declares out of a caller's switch and out of
- * tidesdb_strerror, which would describe it as unknown */
+ * at the boundary keeps a code the public header does not declare out of a caller's switch, where
+ * it would fall through every case they could have written */
 static int tdb_public_rc(const int rc)
 {
     return rc == TDB_ERR_BUSY ? TDB_ERR_LOCKED : rc;

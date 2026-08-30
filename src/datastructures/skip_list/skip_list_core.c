@@ -167,6 +167,10 @@ int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t 
  * the per-node backward pointers (which are maintained best-effort and can be left
  * stale by concurrent inserts, so a backward walk may skip nodes), forward[0] is the
  * linearizable structure, so this is always complete.
+ * @param list the skip list being walked
+ * @param header the list's header sentinel, which is also what an empty search returns
+ * @param key the key to find the predecessor of, or NULL for the last node in the list
+ * @param key_size length of key in bytes
  * @return the predecessor node, or the header sentinel when none exists
  */
 skip_list_node_t *skip_list_predecessor(const skip_list_t *list, skip_list_node_t *header,

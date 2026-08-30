@@ -14,13 +14,14 @@
  * handles out-of-order arrivals from concurrent transaction commits by inserting
  * at the correct position in the chain rather than only at the head
  * @param versions_ptr pointer to atomic version list head
- * @param new_version version to insert
+ * @param new_version version to insert, whose ownership passes here either way -- a rejected
+ *                    duplicate is freed before returning, so a caller must not free it itself
  * @param seq sequence number (for validation)
  * @param list skip list (for the size counters)
  * @param data_size the value's logical length, which is what the data counter charges
  * @param tail_size the bytes trailing the version struct, which is the value for an inline version
  *                  and the value log id for a referenced one
- * @return 0 on success, -1 on failure (duplicate seq)
+ * @return 0 on success, -1 when the sequence is already in the chain
  */
 int skip_list_insert_version_cas(_Atomic(skip_list_version_t *) *versions_ptr,
                                  skip_list_version_t *new_version, const uint64_t seq,

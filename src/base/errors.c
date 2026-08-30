@@ -29,7 +29,7 @@ const char *tidesdb_strerror(const int code)
         case TDB_ERR_CONFLICT:
             return "transaction conflict";
         case TDB_ERR_TOO_LARGE:
-            return "value too large";
+            return "too large for the space that holds it";
         case TDB_ERR_MEMORY_LIMIT:
             return "memory limit exceeded";
         case TDB_ERR_INVALID_DB:

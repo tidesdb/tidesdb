@@ -259,7 +259,8 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, const size_t key_siz
     skip_list_node_t *target = skip_list_find_node(list, key, key_size);
     if (target == NULL) return 0; /* nothing to delete */
 
-    skip_list_version_t *tombstone = skip_list_create_version(list, NULL, 0, 0, -1, 1, seq);
+    skip_list_version_t *tombstone =
+        skip_list_create_version(list, NULL, 0, 0, -1, SKIP_LIST_FLAG_DELETED, seq);
     if (tombstone == NULL) return -1;
 
     if (skip_list_insert_version_cas(&target->versions, tombstone, seq, list, 0, 0) != 0) return -1;

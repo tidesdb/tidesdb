@@ -125,7 +125,11 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
 {
     if (cursor == NULL || cursor->current == NULL) return -1;
 
-    if (cursor->current == cursor->cached_tail) return -1;
+    /* both sentinels, as skip_list_cursor_valid rejects both. a seek that found nothing at or below
+     * its target parks on the header, which has no key to hand back -- it also has no version,
+     * which is what stopped this short before the sentinel was named here */
+    if (cursor->current == cursor->cached_tail || cursor->current == cursor->cached_header)
+        return -1;
 
     *key = cursor->current->key;
     *key_size = cursor->current->key_size;
@@ -160,7 +164,11 @@ int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, siz
     if (vlog_id != NULL) *vlog_id = 0;
     if (cursor == NULL || cursor->current == NULL) return -1;
 
-    if (cursor->current == cursor->cached_tail) return -1;
+    /* both sentinels, as skip_list_cursor_valid rejects both. a seek that found nothing at or below
+     * its target parks on the header, which has no key to hand back -- it also has no version,
+     * which is what stopped this short before the sentinel was named here */
+    if (cursor->current == cursor->cached_tail || cursor->current == cursor->cached_header)
+        return -1;
 
     *key = cursor->current->key;
     *key_size = cursor->current->key_size;

@@ -14,8 +14,7 @@
 #define QUEUE_LIKELY(x)   TDB_LIKELY(x)
 #define QUEUE_UNLIKELY(x) TDB_UNLIKELY(x)
 
-#define QUEUE_WAIT_TIMEOUT_US 100000     /* 100ms, the backstop for a wake that raced the wait */
-#define QUEUE_NS_PER_SEC      1000000000 /* nanoseconds per second */
+#define QUEUE_WAIT_TIMEOUT_US 100000 /* 100ms, the backstop for a wake that raced the wait */
 
 /* the node pool recycles a bounded set of nodes so enqueue and dequeue rarely hit the allocator,
  * but a burst past QUEUE_MAX_POOL_SIZE still mallocs and frees in steady state -- an accepted

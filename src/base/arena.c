@@ -126,19 +126,11 @@ static int arena_thread_slot(void)
     return t_arena_slot;
 }
 
-/* round v up to a power-of-two alignment a */
-static size_t arena_align_up(void)
-{
-    const size_t v = sizeof(arena_chunk_t);
-    const size_t a = ARENA_MAX_ALIGN;
-
-    return (v + a - 1) & ~(a - 1);
-}
-
-/* aligned byte offset from the chunk start to its usable region */
+/* aligned byte offset from a chunk's start to its usable region -- the header rounded up to the
+ * largest fundamental alignment, so the region it precedes starts aligned for anything */
 static size_t arena_header_size(void)
 {
-    return arena_align_up();
+    return (sizeof(arena_chunk_t) + ARENA_MAX_ALIGN - 1) & ~(ARENA_MAX_ALIGN - 1);
 }
 
 /* allocate a chunk with the given usable capacity, freshly reset */
@@ -375,6 +367,7 @@ arena_t *arena_create_concurrent(arena_pool_t *pool)
     }
     atomic_init(&mt->all_chunks, NULL);
     atomic_init(&mt->total_used, 0);
+    atomic_init(&mt->total_reserved, 0);
     arena->mt = mt;
     return arena;
 }

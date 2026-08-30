@@ -672,9 +672,8 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
     {
         atomic_fetch_add_explicit(&list->data_bytes, batch_data_bytes, memory_order_relaxed);
         atomic_fetch_add_explicit(&list->memory_bytes, batch_memory_bytes, memory_order_relaxed);
-    }
-    if (batch_entry_count > 0)
         atomic_fetch_add_explicit(&list->entry_count, batch_entry_count, memory_order_relaxed);
+    }
 
     if (!use_stack) free(update);
     return success_count;

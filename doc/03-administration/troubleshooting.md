@@ -235,5 +235,8 @@ backpressure events.
 The sink is process-wide, not per-database. If your process opens several, the last one opened with
 `log_to_file` owns the file and the others log into it too, until that handle closes.
 
-A slow rotation — over 20 ms — is logged specifically, because it runs on a committing thread and
-lands directly in write latency where it is otherwise invisible.
+A rotation the engine considers slow is logged specifically, because it runs on a committing thread
+and lands directly in write latency where it is otherwise invisible. The line carries the duration
+it measured and a breakdown of where it went — opening the next log, allocating the memtable,
+publishing it, handing the sealed one to a flush worker — so the figure to act on is the one in the
+log rather than any threshold quoted here.

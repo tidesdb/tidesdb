@@ -261,7 +261,6 @@ static void *bench_worker_entry(void *arg)
     return NULL;
 }
 
-/* run one named benchmark across cfg->threads workers, sampling throughout, and print its result */
 /**
  * bench_report_run
  * merge every worker's counters and histograms and print the workload's result lines

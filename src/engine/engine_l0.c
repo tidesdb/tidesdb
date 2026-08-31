@@ -324,9 +324,6 @@ static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
             new_wal = NULL;
     }
 
-    /* the log open above is timed on its own, and a ci run showed it accounting for 105 ms of a
-     * 37 s rotation -- so the memtable the rotation allocates and the publish that installs it are
-     * timed apart from it too, rather than leaving the remainder as one unattributed number */
     cost->gen = gen;
     const uint64_t mt_from = engine_monotonic_us();
     tidesdb_memtable_t *new_mt =
@@ -344,10 +341,7 @@ static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
     if (published)
     {
         db->wal_bm = new_wal; /* the old active's WAL now belongs to the sealed immutable */
-        /* the last call this function makes under the rotation lock, and the only one left that a
-         * slow rotation could hide in once the open, the create and the publish are each accounted
-         * for -- a ci run showed a 376 s rotation whose three timed phases summed to under a fifth
-         * of a second */
+
         const uint64_t enq_from = engine_monotonic_us();
         (void)queue_enqueue(db->flush_queue, db); /* wake a worker to flush the sealed immutable */
         cost->enqueue_us = engine_monotonic_us() - enq_from;
@@ -420,10 +414,6 @@ void engine_maybe_rotate(tidesdb_t *db)
      * thread the next rotation would otherwise do while every committer waits behind it. it is
      * still this caller's latency, so it is worth its own line -- but it is one thread's cost now
      * rather than every committer's */
-    /* timed from here rather than from the unlock, because the line above sits between the two and
-     * writing it takes a process-wide mutex and a stream that can block. measured across that log
-     * call, this figure reported the logging as though it were the prepare -- a 238 s "prepare" in
-     * a ci run that the prepare had no part in */
     const uint64_t prepare_from = engine_monotonic_us();
     engine_prepare_spare_wal(db);
     const uint64_t prepared_us = engine_monotonic_us();

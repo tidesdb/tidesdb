@@ -164,12 +164,16 @@ only repeated writes to the same keys would show it.
 
 That choice is visible in latency: a rotation is real work on the write path, and every other
 committer that agrees the memtable is full waits behind the same lock. A slow one lands
-directly in the write latency tail, which is why the engine logs any rotation over 20 ms.
+directly in the write latency tail, which is why the engine logs any rotation that exceeds
+`ENGINE_SLOW_ROTATE_WARN_US`.
 
 **The log the rotation installs is opened before the rotation needs it.** Opening one costs a file
-creation, a staging ring and a flush thread, and paid inline that measured 49 ms — with every
-committer in the database stopped for the whole of it, since the rotation holds the lock while it
-works. A log is therefore prepared after each rotation, outside the lock, and the next rotation
+creation, a staging ring and a flush thread. Paid inline, that is orders of magnitude more than the
+slot swap it accompanies — and every committer in the database is stopped for the whole of it, since
+the rotation holds the lock while it works. How much more depends entirely on the filesystem and the
+device: it has been measured from tens of milliseconds on a local SSD to well over a hundred on a
+virtualised runner with no working preallocation. A log is therefore prepared after each rotation,
+outside the lock, and the next rotation
 takes the prepared one and becomes a memtable allocation and two pointer swaps. The preparing thread
 still pays the cost; the other fifteen no longer do.
 
@@ -244,11 +248,11 @@ mutex that hands off by barging from starving one committer for as long as the r
 The lock is still unlike any other in the engine. Time spent holding it is time no other committer
 can rotate, so a memtable that is already full stays full for the length of the hold.
 
-The rotation itself is meant to be short — a few hundred microseconds to swap the slot, with the
-next log opened ahead of time so no file creation happens under the lock. It is not always: on a
-virtualised runner with no working preallocation the log open has been measured at 122 ms when the
-prepared log was not ready and the rotation had to open its own. What is not safe is anything else
-borrowing the lock for convenience, or the rotation itself blocking while it holds it.
+The rotation itself is meant to be short — a slot swap and little else, with the next log opened
+ahead of time so no file creation happens under the lock. It is not always: when the prepared log is
+not ready the rotation opens its own, and on a slow or virtualised filesystem that open dominates
+everything else the rotation does. What is not safe is anything else borrowing the lock for
+convenience, or the rotation itself blocking while it holds it.
 
 :::caution[Never hold the rotation lock across a wait or a device barrier]
 Anything that sleeps, polls, or issues an `fsync` while holding it stops every committer in the

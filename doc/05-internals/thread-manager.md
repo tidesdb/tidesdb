@@ -141,7 +141,7 @@ is already covered by the signal.
 A commit does its own work rather than handing it to a worker, so commit latency is the work
 itself plus contention — not a queue depth. Rotation is the exception that proves the rule: it
 runs on a committing thread, which is exactly why a slow one lands in the write latency tail
-and is logged when it exceeds 20 ms.
+and is logged when it exceeds `ENGINE_SLOW_ROTATE_WARN_US`.
 
 ## Invariants
 

@@ -152,7 +152,8 @@ it hands the memtable to the reaper instead. See
 Rotation is the interesting case: it runs on **whichever committing thread finds the
 memtable full**, not on a worker. That thread pays the latency, and every other committer
 that agrees waits behind the same lock — which is why a slow rotation shows up directly in
-the write latency tail, and why the engine logs one when it exceeds 20 ms.
+the write latency tail, and why the engine logs one when it exceeds
+`ENGINE_SLOW_ROTATE_WARN_US`.
 
 ## Where the durability guarantees come from
 

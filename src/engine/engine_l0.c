@@ -219,7 +219,29 @@ static uint64_t engine_monotonic_us(void)
     return (uint64_t)ts.tv_sec * ENGINE_US_PER_SEC + (uint64_t)ts.tv_nsec / ENGINE_NS_PER_US;
 }
 
-static int engine_open_wal_for_gen(tidesdb_t *db, uint64_t gen, block_manager_t **out)
+/**
+ * engine_rotate_cost_t
+ * what each phase of a rotation cost, filled while the rotation lock is held and reported after it
+ * is dropped. logging takes a process-wide mutex and writes to a stream that can block, so a
+ * rotation that logged its own timings would hold the lock across exactly the wait these figures
+ * exist to find
+ * @param open_us microseconds spent opening the next log, 0 when a prepared one was taken
+ * @param create_us microseconds spent allocating the incoming memtable
+ * @param publish_us microseconds spent installing it
+ * @param enqueue_us microseconds spent handing the sealed memtable to a flush worker
+ * @param gen the generation the rotation installed
+ */
+typedef struct
+{
+    uint64_t open_us;
+    uint64_t create_us;
+    uint64_t publish_us;
+    uint64_t enqueue_us;
+    uint64_t gen;
+} engine_rotate_cost_t;
+
+static int engine_open_wal_for_gen(tidesdb_t *db, uint64_t gen, block_manager_t **out,
+                                   uint64_t *out_us)
 {
     char wal_name[ENGINE_WAL_NAME_MAX], wal_path[ENGINE_PATH_BUF_SIZE];
     if (tidesdb_wal_filename(gen, wal_name, sizeof(wal_name)) != TDB_SUCCESS) return TDB_ERR_IO;
@@ -232,10 +254,7 @@ static int engine_open_wal_for_gen(tidesdb_t *db, uint64_t gen, block_manager_t 
      * left a slow open looking like a lock this path does not take */
     const uint64_t opened_from = engine_monotonic_us();
     const int rc = engine_open_wal(db, wal_path, out);
-    const uint64_t opened_us = engine_monotonic_us() - opened_from;
-    if (opened_us >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow wal open %llu us for generation %llu",
-                      (unsigned long long)opened_us, (unsigned long long)gen);
+    if (out_us) *out_us = engine_monotonic_us() - opened_from;
     return rc == 0 ? TDB_SUCCESS : TDB_ERR_IO;
 }
 
@@ -252,7 +271,7 @@ void engine_prepare_spare_wal(tidesdb_t *db)
     const uint64_t gen =
         atomic_fetch_add_explicit(&db->wal_generation, 1, memory_order_relaxed) + 1;
     block_manager_t *wal = NULL;
-    if (engine_open_wal_for_gen(db, gen, &wal) != TDB_SUCCESS)
+    if (engine_open_wal_for_gen(db, gen, &wal, NULL) != TDB_SUCCESS)
     {
         atomic_store_explicit(&db->spare_wal_preparing, 0, memory_order_release);
         return;
@@ -276,7 +295,7 @@ void engine_prepare_spare_wal(tidesdb_t *db)
 /* seal the active memtable into the immutable queue and install a fresh active on the next WAL
  * generation, then wake a flush worker; the caller holds rotate_lock. returns TDB_SUCCESS, or an
  * error with the active left in place */
-static int engine_rotate_locked(tidesdb_t *db)
+static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
 {
     /* take the prepared log when one is waiting, which is the whole point of preparing it -- the
      * rotation then costs a memtable allocation and two pointer swaps rather than a file creation.
@@ -301,12 +320,14 @@ static int engine_rotate_locked(tidesdb_t *db)
     if (!new_wal)
     {
         gen = atomic_fetch_add_explicit(&db->wal_generation, 1, memory_order_relaxed) + 1;
-        if (engine_open_wal_for_gen(db, gen, &new_wal) != TDB_SUCCESS) new_wal = NULL;
+        if (engine_open_wal_for_gen(db, gen, &new_wal, &cost->open_us) != TDB_SUCCESS)
+            new_wal = NULL;
     }
 
     /* the log open above is timed on its own, and a ci run showed it accounting for 105 ms of a
      * 37 s rotation -- so the memtable the rotation allocates and the publish that installs it are
      * timed apart from it too, rather than leaving the remainder as one unattributed number */
+    cost->gen = gen;
     const uint64_t mt_from = engine_monotonic_us();
     tidesdb_memtable_t *new_mt =
         new_wal == NULL
@@ -314,17 +335,11 @@ static int engine_rotate_locked(tidesdb_t *db)
             : tidesdb_memtable_create(new_wal, gen, gen, db->config.memtable_skip_list_max_level,
                                       db->config.memtable_skip_list_probability, &db->now_seconds,
                                       db->arena);
-    const uint64_t mt_us = engine_monotonic_us() - mt_from;
-    if (mt_us >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow memtable create %llu us for generation %llu",
-                      (unsigned long long)mt_us, (unsigned long long)gen);
+    cost->create_us = engine_monotonic_us() - mt_from;
 
     const uint64_t pub_from = engine_monotonic_us();
     const int published = new_mt != NULL && tidesdb_l0_rotate(db->l0, new_mt) == TDB_SUCCESS;
-    const uint64_t pub_us = engine_monotonic_us() - pub_from;
-    if (pub_us >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow rotation publish %llu us for generation %llu",
-                      (unsigned long long)pub_us, (unsigned long long)gen);
+    cost->publish_us = engine_monotonic_us() - pub_from;
 
     if (published)
     {
@@ -335,10 +350,7 @@ static int engine_rotate_locked(tidesdb_t *db)
          * of a second */
         const uint64_t enq_from = engine_monotonic_us();
         (void)queue_enqueue(db->flush_queue, db); /* wake a worker to flush the sealed immutable */
-        const uint64_t enq_us = engine_monotonic_us() - enq_from;
-        if (enq_us >= ENGINE_SLOW_ROTATE_WARN_US)
-            TDB_DEBUG_LOG(TDB_LOG_WARN, "slow flush enqueue %llu us for generation %llu",
-                          (unsigned long long)enq_us, (unsigned long long)gen);
+        cost->enqueue_us = engine_monotonic_us() - enq_from;
         return TDB_SUCCESS;
     }
 
@@ -374,7 +386,9 @@ void engine_maybe_rotate(tidesdb_t *db)
     const uint64_t acquired_us = engine_monotonic_us();
     /* nobody rotated while this thread waited for the lock, so the fullness established above still
      * holds and this rotation is the one to do it */
-    if (tidesdb_l0_rotation_mark(db->l0) == mark_before) (void)engine_rotate_locked(db);
+    engine_rotate_cost_t cost;
+    memset(&cost, 0, sizeof(cost));
+    if (tidesdb_l0_rotation_mark(db->l0) == mark_before) (void)engine_rotate_locked(db, &cost);
     pthread_mutex_unlock(&db->rotate_lock);
 
     /* measured before the prepare below, so the figure stays what it claims to be: the time this
@@ -389,10 +403,17 @@ void engine_maybe_rotate(tidesdb_t *db)
     tdb_wait_note(&db->rotate_lock_wait, acquired_us - started_us);
     tdb_wait_note(&db->rotate_work_wait, done_us - acquired_us);
 
+    /* reported here rather than inside the rotation, because writing a line takes a process-wide
+     * mutex and a stream that can block -- logging under the rotation lock would hold it across
+     * exactly the wait these figures are meant to find */
     if (done_us - started_us >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow memtable rotation %llu us, %llu of it taking the lock",
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "slow memtable rotation %llu us, %llu of it taking the lock, generation %llu "
+                      "-- open %llu us, create %llu us, publish %llu us, enqueue %llu us",
                       (unsigned long long)(done_us - started_us),
-                      (unsigned long long)(acquired_us - started_us));
+                      (unsigned long long)(acquired_us - started_us), (unsigned long long)cost.gen,
+                      (unsigned long long)cost.open_us, (unsigned long long)cost.create_us,
+                      (unsigned long long)cost.publish_us, (unsigned long long)cost.enqueue_us);
 
     /* prepared outside the lock on purpose: this is the file creation, ring allocation and flush
      * thread the next rotation would otherwise do while every committer waits behind it. it is
@@ -414,7 +435,10 @@ int engine_force_rotate(tidesdb_t *db)
     if (tidesdb_l0_active_bytes(db->l0) == 0) return TDB_SUCCESS;
 
     pthread_mutex_lock(&db->rotate_lock);
-    const int rc = tidesdb_l0_active_bytes(db->l0) > 0 ? engine_rotate_locked(db) : TDB_SUCCESS;
+    engine_rotate_cost_t forced_cost;
+    memset(&forced_cost, 0, sizeof(forced_cost));
+    const int rc =
+        tidesdb_l0_active_bytes(db->l0) > 0 ? engine_rotate_locked(db, &forced_cost) : TDB_SUCCESS;
     pthread_mutex_unlock(&db->rotate_lock);
     return rc;
 }

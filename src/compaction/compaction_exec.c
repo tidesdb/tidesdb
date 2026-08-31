@@ -970,12 +970,12 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
         /* the file counts and the two byte totals are what a write-amplification question is asked
          * in, and a merge that keeps writing as much as it reads is the shape of a level that is
          * not converging */
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "compacted cf %s to level %d, %d files in %d out over %d range%s, %llu bytes "
-                      "read %llu written",
-                      cx->cf->name, job->target_level, n_inputs, sink.n_outputs, k,
-                      k == 1 ? "" : "s", (unsigned long long)read_bytes,
-                      (unsigned long long)written);
+        TDB_DEBUG_LOG_THROTTLED(
+            TDB_LOG_INFO,
+            "compacted cf %s to level %d, %d files in %d out over %d range%s, %llu bytes "
+            "read %llu written",
+            cx->cf->name, job->target_level, n_inputs, sink.n_outputs, k, k == 1 ? "" : "s",
+            (unsigned long long)read_bytes, (unsigned long long)written);
 
         /* the level set took its own references and dropped the inputs' structural references */
         for (int i = 0; i < sink.n_outputs; i++)

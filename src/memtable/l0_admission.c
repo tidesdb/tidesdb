@@ -167,10 +167,11 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
         if (stalled_us >= TDB_L0_BACKPRESSURE_CEILING_US)
         {
             atomic_fetch_add_explicit(&l0->admit_ceiling_hits, 1, memory_order_relaxed);
-            TDB_DEBUG_LOG(TDB_LOG_WARN,
-                          "l0 admission ceiling reached after %llu us at depth %d, flush is not "
-                          "keeping up",
-                          (unsigned long long)stalled_us, pressure.queue_depth);
+            TDB_DEBUG_LOG_THROTTLED(
+                TDB_LOG_WARN,
+                "l0 admission ceiling reached after %llu us at depth %d, flush is not "
+                "keeping up",
+                (unsigned long long)stalled_us, pressure.queue_depth);
             break;
         }
     }

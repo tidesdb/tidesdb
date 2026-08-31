@@ -513,6 +513,7 @@ sup {{ line-height: 0; }}
 /* --- title page --- */
 .title-page {{ break-after: page; text-align: center; padding-top: 30mm; height: 100vh;
                display: flex; flex-direction: column; }}
+.title-page.plain {{ padding-top: 58mm; }}
 .title-page .edition {{ margin-top: auto; padding-bottom: 22mm; }}
 .title-page .imprint {{ font-variant: small-caps; letter-spacing: .14em; font-size: .8rem; margin-bottom: 26mm; }}
 .title-page h1 {{
@@ -609,11 +610,12 @@ def build_html(manual: dict, chapters: list[dict], args, version: str | None) ->
                 f"<p>Generated from the manual sources at "
                 f"{'version ' + version if version else 'the checked-out revision'} "
                 f"on {date.today().isoformat()}.</p>")
+    imprint = f'<p class="imprint">{args.imprint}</p>' if args.imprint else ""
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{title}</title>
 <style>{stylesheet(args, code_css)}</style></head><body>
-<section class="title-page">
-  <p class="imprint">{args.imprint}</p>
+<section class="title-page{'' if args.imprint else ' plain'}">
+  {imprint}
   <h1>{title}</h1>
   <p class="subtitle">{subtitle}</p>
   <p class="edition">{"<br>".join(e for e in edition if e)}</p>
@@ -1128,7 +1130,7 @@ def main() -> int:
     ap.add_argument("--toc-depth", type=int, choices=(2, 3), default=2,
                     help="2 = chapters only (default), 3 = also list sections")
     ap.add_argument("--code-style", default="bw", help="pygments style for code (default: bw, black and white)")
-    ap.add_argument("--imprint", default="TidesDB", help="small-caps line above the title (default: TidesDB)")
+    ap.add_argument("--imprint", default="", help="optional small-caps line above the title (default: none)")
     ap.add_argument("--manual-version", help="version on the title page (default: from CMakeLists.txt)")
     ap.add_argument("--recto-chapters", action="store_true",
                     help="open every part and chapter on a right-hand page, as a printed book does")

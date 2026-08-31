@@ -207,21 +207,26 @@ void tdb_retire_drain(tdb_retire_list_t *list, tdb_retire_match_fn match, void *
  * own writer announcement and never reach the acquire that would have completed, which is the same
  * deadlock the nonrecursive attribute gives and for the same reason. */
 
-/* how long a reader waits before looking again at whether the writer it is holding off for has got
- * in. short enough that a writer is not left waiting on a sleeping reader, long enough that the
- * hold-off is not a spin */
-#define TDB_WPRW_YIELD_US 100
-
 /**
  * tdb_wprwlock_t
- * a reader-writer lock that prefers a waiting writer on every platform
+ * a reader-writer lock that prefers a waiting writer on every platform.
+ *
+ * the underlying pthread_rwlock_t is reader-preferring by default on most platforms, so a writer
+ * competing with steady read traffic can wait indefinitely. the turnstile is what makes the
+ * preference real -- every arrival passes through it, and a writer holds it for as long as it is
+ * blocked, so no reader can arrive while a writer waits. the readers already inside drain, the
+ * writer goes in, and the turnstile is released.
+ *
+ * an advisory flag cannot do this: a reader that has read the flag and not yet taken the lock is
+ * past the check, and on a reader-preferring lock it still wins. that left a writer starving behind
+ * continuous readers, which is a stall of unbounded length rather than a slow path
+ * @param turnstile serialises arrivals; a waiting writer holds it, which is the hold-off
  * @param lock the underlying lock, taken with default attributes
- * @param writer_waiting how many writers are waiting on it, which is what holds new readers off
  */
 typedef struct
 {
+    pthread_mutex_t turnstile;
     pthread_rwlock_t lock;
-    _Atomic(int) writer_waiting;
 } tdb_wprwlock_t;
 
 /**
@@ -232,8 +237,10 @@ typedef struct
  */
 static inline int tdb_wprwlock_init(tdb_wprwlock_t *l)
 {
-    atomic_init(&l->writer_waiting, 0);
-    return pthread_rwlock_init(&l->lock, NULL);
+    if (pthread_mutex_init(&l->turnstile, NULL) != 0) return -1;
+    const int rc = pthread_rwlock_init(&l->lock, NULL);
+    if (rc != 0) (void)pthread_mutex_destroy(&l->turnstile);
+    return rc;
 }
 
 /**
@@ -244,6 +251,7 @@ static inline int tdb_wprwlock_init(tdb_wprwlock_t *l)
 static inline void tdb_wprwlock_destroy(tdb_wprwlock_t *l)
 {
     (void)pthread_rwlock_destroy(&l->lock);
+    (void)pthread_mutex_destroy(&l->turnstile);
 }
 
 /**
@@ -253,9 +261,11 @@ static inline void tdb_wprwlock_destroy(tdb_wprwlock_t *l)
  */
 static inline void tdb_wprwlock_rdlock(tdb_wprwlock_t *l)
 {
-    while (atomic_load_explicit(&l->writer_waiting, memory_order_acquire) > 0)
-        usleep(TDB_WPRW_YIELD_US);
+    /* held only across the acquire, never across the read itself, so readers still run concurrently
+     * -- the turnstile orders arrivals, it does not serialise the work */
+    (void)pthread_mutex_lock(&l->turnstile);
     (void)pthread_rwlock_rdlock(&l->lock);
+    (void)pthread_mutex_unlock(&l->turnstile);
 }
 
 /**
@@ -265,9 +275,11 @@ static inline void tdb_wprwlock_rdlock(tdb_wprwlock_t *l)
  */
 static inline void tdb_wprwlock_wrlock(tdb_wprwlock_t *l)
 {
-    atomic_fetch_add_explicit(&l->writer_waiting, 1, memory_order_release);
+    /* the turnstile is held for the whole of the wait, which is what keeps arriving readers out
+     * until this writer has been in and gone */
+    (void)pthread_mutex_lock(&l->turnstile);
     (void)pthread_rwlock_wrlock(&l->lock);
-    atomic_fetch_sub_explicit(&l->writer_waiting, 1, memory_order_release);
+    (void)pthread_mutex_unlock(&l->turnstile);
 }
 
 /**

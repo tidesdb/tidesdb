@@ -329,7 +329,16 @@ static int engine_rotate_locked(tidesdb_t *db)
     if (published)
     {
         db->wal_bm = new_wal; /* the old active's WAL now belongs to the sealed immutable */
+        /* the last call this function makes under the rotation lock, and the only one left that a
+         * slow rotation could hide in once the open, the create and the publish are each accounted
+         * for -- a ci run showed a 376 s rotation whose three timed phases summed to under a fifth
+         * of a second */
+        const uint64_t enq_from = engine_monotonic_us();
         (void)queue_enqueue(db->flush_queue, db); /* wake a worker to flush the sealed immutable */
+        const uint64_t enq_us = engine_monotonic_us() - enq_from;
+        if (enq_us >= ENGINE_SLOW_ROTATE_WARN_US)
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "slow flush enqueue %llu us for generation %llu",
+                          (unsigned long long)enq_us, (unsigned long long)gen);
         return TDB_SUCCESS;
     }
 
@@ -352,10 +361,20 @@ void engine_maybe_rotate(tidesdb_t *db)
      *
      * the caller's write has already landed by this point, so declining costs it nothing. the
      * memtable stays full until the holder seals it, which is what admission paces against */
+    /* taken before the lock, and compared after it, so the re-check below costs one relaxed load.
+     * measuring the memtable again would take its range tombstone lock, whose read side holds off
+     * while any writer waits -- an unbounded wait, performed while holding the lock every other
+     * committer needs. that is how a rotation came to hold this lock for minutes: not doing slow
+     * work, but blocking on another lock in the middle of it, with every other committer declining
+     * and writing on into a memtable that could no longer seal */
+    const uint64_t mark_before = tidesdb_l0_rotation_mark(db->l0);
+
     const uint64_t started_us = engine_monotonic_us();
     if (pthread_mutex_trylock(&db->rotate_lock) != 0) return;
     const uint64_t acquired_us = engine_monotonic_us();
-    if (tidesdb_l0_active_full(db->l0)) (void)engine_rotate_locked(db);
+    /* nobody rotated while this thread waited for the lock, so the fullness established above still
+     * holds and this rotation is the one to do it */
+    if (tidesdb_l0_rotation_mark(db->l0) == mark_before) (void)engine_rotate_locked(db);
     pthread_mutex_unlock(&db->rotate_lock);
 
     /* measured before the prepare below, so the figure stays what it claims to be: the time this

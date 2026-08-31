@@ -1078,15 +1078,17 @@ void test_engine_cf_stats(void)
         tidesdb_txn_free(t);
     }
 
-    /* wait for the first L1 sstables to land so the fold sees on-disk runs */
+    /* wait for on-disk runs to exist so the fold has something to read. every level is asked, not
+     * just the first two -- how deep compaction has carried the data by the time this looks is a
+     * function of volume and timing, and a run that drained l1 and l2 into l3 left the old
+     * two-level check reporting nothing on disk while the whole set was there */
     cf_t *icf = (cf_t *)cf;
     int flushed = 0;
     for (int t = 0; t < 500 && !flushed; t++)
     {
-        if (level_set_count(icf->levels, 1) > 0 || level_set_count(icf->levels, 2) > 0)
-            flushed = 1;
-        else
-            usleep(10000);
+        for (int lvl = 1; lvl <= TDB_MAX_LEVELS && !flushed; lvl++)
+            if (level_set_count(icf->levels, lvl) > 0) flushed = 1;
+        if (!flushed) usleep(10000);
     }
     ASSERT_TRUE(flushed);
 

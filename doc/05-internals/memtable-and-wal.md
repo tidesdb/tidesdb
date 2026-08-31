@@ -244,8 +244,11 @@ mutex that hands off by barging from starving one committer for as long as the r
 The lock is still unlike any other in the engine. Time spent holding it is time no other committer
 can rotate, so a memtable that is already full stays full for the length of the hold.
 
-The rotation itself is short — a few hundred microseconds to open the next log and swap the slot.
-What is not safe is anything else borrowing the lock for convenience.
+The rotation itself is meant to be short — a few hundred microseconds to swap the slot, with the
+next log opened ahead of time so no file creation happens under the lock. It is not always: on a
+virtualised runner with no working preallocation the log open has been measured at 122 ms when the
+prepared log was not ready and the rotation had to open its own. What is not safe is anything else
+borrowing the lock for convenience, or the rotation itself blocking while it holds it.
 
 :::caution[Never hold the rotation lock across a wait or a device barrier]
 Anything that sleeps, polls, or issues an `fsync` while holding it stops every committer in the
@@ -255,7 +258,15 @@ being done.
 
 The rule is kept in the simplest way available: **nothing outside the rotation itself takes the
 lock.** The only two acquisitions in the engine are `engine_maybe_rotate` and
-`engine_force_rotate`. The paths that would otherwise be tempted avoid it by construction — the
+`engine_force_rotate`.
+
+That half of the rule only covers other callers. The rotation's own work has to obey it too, and the
+one place that failed was the fullness re-check: having taken the lock, it asked whether the memtable
+was still full, and measuring a memtable takes its pin and its range tombstone lock, both of which
+wait. So a rotation could sit on the lock indefinitely without doing anything slow itself. It now
+compares a rotation marker taken before the lock instead — the marker moves whenever the
+reader-visible set does, which answers "did someone else rotate while I waited?" without touching
+either lock. The paths that would otherwise be tempted avoid it by construction — the
 value-log reclaim runs under the column-family registry read lock alone, and the interval sync
 ticker reaches the log through the same pin an append takes rather than through the lock, so its
 `fsync` blocks nobody's commit but its own.

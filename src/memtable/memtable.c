@@ -701,6 +701,11 @@ int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt)
     return TDB_SUCCESS;
 }
 
+uint64_t tidesdb_l0_rotation_mark(const tidesdb_l0_t *l0)
+{
+    return l0 ? atomic_load_explicit(&l0->visible_changes, memory_order_acquire) : 0;
+}
+
 int tidesdb_l0_active_full(tidesdb_l0_t *l0)
 {
     /* a buffer size of zero is a memtable that never fills on size, so the measurement below is not

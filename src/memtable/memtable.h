@@ -495,6 +495,17 @@ int tidesdb_l0_wal_append_one(tidesdb_l0_t *l0, const uint8_t *batch, size_t siz
 int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt);
 
 /**
+ * tidesdb_l0_rotation_mark
+ * a marker that changes whenever the reader-visible set does, so a caller can ask whether a
+ * rotation happened between two points without measuring the memtable again. sizing the active
+ * memtable takes the range tombstone lock, and a caller holding the rotation lock must not block on
+ * anything -- this answers the same question with one relaxed load
+ * @param l0 the L0 subsystem
+ * @return the current marker, or 0 for a NULL subsystem
+ */
+uint64_t tidesdb_l0_rotation_mark(const tidesdb_l0_t *l0);
+
+/**
  * tidesdb_l0_active_full
  * report whether the active memtable has reached the db-level rotation threshold; the caller mints
  * a replacement and calls tidesdb_l0_rotate when it has. a zero write_buffer_size never fills.

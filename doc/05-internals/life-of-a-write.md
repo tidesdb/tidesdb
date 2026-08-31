@@ -210,6 +210,14 @@ rotation lock, and having it, seals the active memtable, enqueues it, and instal
 thread that finds the lock held does not queue behind it. The rotation is already being done by the
 holder, and this thread's write has landed either way, so it returns to its commit.
 
+Because every other committer declines rather than waits, the holder must never block while it has
+the lock — a holder that stops makes no progress *and* stops everyone else from rotating, so the
+memtable can no longer seal, flushes stop, and the log's staging ring fills behind it. That is why
+the holder does not re-measure the memtable to confirm it is still full: sizing it takes the
+memtable's pin and its range tombstone lock, and both wait. It compares a rotation marker instead,
+which changes whenever the reader-visible set does, so the question "did someone else rotate while I
+waited for this lock?" costs one atomic load.
+
 The order within the rotation is exact: the sealed memtable is **enqueued before** the
 active slot is swapped. For a moment it is reachable both ways. The alternative — swap then
 enqueue — leaves a window where a reader sees the new active memtable and cannot see the

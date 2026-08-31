@@ -29,6 +29,10 @@
 /* how many output slots to grow the sink's array by at a time */
 #define CE_OUTPUTS_GROW 8
 
+/* how many times a layout snapshot is retried when the level set grew past the array it was given
+ */
+#define CE_SNAPSHOT_RETRIES 8
+
 /* how many sstables one level of the base-tombstone sibling scan inspects; a level that fills this
  * many leaves the rest of the level unread, so absence is unproven and the tombstone is kept */
 #define CE_TOMB_SIBLING_MAX 64
@@ -43,14 +47,23 @@ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t 
     *read_bytes = 0;
     int total = level_set_snapshot(cx->cf->levels, NULL, 0);
     level_set_snapshot_entry_t *all = NULL;
+    /* how many entries the collect actually wrote, which is not the capacity it was given -- the
+     * count and the collect are two loads of a live layout, and a compaction retiring inputs
+     * between them leaves the tail of the array holding whatever the allocator did. reading it as
+     * an sstable pointer is a garbage dereference, and unreferencing it below is worse */
+    int filled = 0;
     if (total > 0)
     {
-        for (int tries = 0; tries < 8; tries++)
+        for (int tries = 0; tries < CE_SNAPSHOT_RETRIES; tries++)
         {
             all = malloc((size_t)total * sizeof(*all));
             if (!all) return TDB_ERR_MEMORY;
             const int got = level_set_snapshot(cx->cf->levels, all, total);
-            if (got <= total) break;
+            if (got <= total)
+            {
+                filled = got;
+                break;
+            }
             free(all);
             all = NULL;
             total = got;
@@ -64,7 +77,7 @@ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t 
     {
         sstable_t *found = NULL;
         uint64_t found_size = 0;
-        for (int i = 0; i < total; i++)
+        for (int i = 0; i < filled; i++)
             if (all[i].sst && all[i].sst->id == job->input_ids[j])
             {
                 found = all[i].sst;
@@ -82,7 +95,7 @@ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t 
             stale = 1;
     }
 
-    for (int i = 0; i < total; i++)
+    for (int i = 0; i < filled; i++)
         if (all[i].sst && sstable_unref(all[i].sst)) sstable_close(all[i].sst);
     free(all);
 

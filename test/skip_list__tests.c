@@ -297,6 +297,14 @@ void test_skip_list_memory_bytes_counts_structural_overhead(void)
  * exactly rather than raced for */
 void test_skip_list_expiry_agrees_between_get_and_cursor(void)
 {
+#if defined(__MINGW32__) && !defined(__MINGW64__)
+    /* skip_list_get_current_time deliberately ignores the injected clock on mingw x86, where the
+     * cached time has cross-thread visibility problems, and reads the wall clock instead. driving
+     * the boundary needs the injected clock to be the one consulted, so there is nothing to land on
+     * here -- the agreement this checks is not platform-specific, and every other target proves it
+     */
+    printf("  injected clock is bypassed on mingw x86, skipping the boundary walk\n");
+#else
     _Atomic(int64_t) clock;
     atomic_init(&clock, 1000);
 
@@ -351,6 +359,7 @@ void test_skip_list_expiry_agrees_between_get_and_cursor(void)
     }
 
     skip_list_free(list);
+#endif
 }
 
 void test_skip_list_cursor_init()

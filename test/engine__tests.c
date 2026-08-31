@@ -301,6 +301,23 @@ static int engine_test_compact(tidesdb_t *db, tidesdb_column_family_t *cf)
     return rc;
 }
 
+/* the same for an interval compaction, which honours the same contract for two reasons rather than
+ * one -- the family's claim may be held, and the call refuses when the layout moves between the
+ * count it sizes its snapshot from and the collect that fills it, which a background flush
+ * installing underneath it does routinely */
+static int engine_test_compact_range(tidesdb_t *db, tidesdb_column_family_t *cf,
+                                     const uint8_t *start, size_t start_size, const uint8_t *end,
+                                     size_t end_size)
+{
+    int rc = TDB_ERR_LOCKED;
+    for (int attempt = 0; attempt < ENGINE_TEST_LOCKED_RETRIES && rc == TDB_ERR_LOCKED; attempt++)
+    {
+        rc = tidesdb_compact_range(db, cf, start, start_size, end, end_size);
+        if (rc == TDB_ERR_LOCKED) usleep(ENGINE_TEST_LOCKED_BACKOFF_US);
+    }
+    return rc;
+}
+
 /* reconfigure a family, retrying while it is claimed. the update takes the family's claim so that
  * no two reconfigures or ddl operations run on it at once, and reports locked rather than waiting
  * when it cannot have it -- and the compaction scheduler's backstop tick claims every idle family
@@ -2052,8 +2069,8 @@ void test_engine_compact_range(void)
     ASSERT_TRUE(rs.keys_exact);
 
     /* compacting the whole span consolidates the three overlapping runs into fewer */
-    ASSERT_EQ(tidesdb_compact_range(db, cf, (const uint8_t *)"key00000", 8,
-                                    (const uint8_t *)"key00299", 8),
+    ASSERT_EQ(engine_test_compact_range(db, cf, (const uint8_t *)"key00000", 8,
+                                        (const uint8_t *)"key00299", 8),
               TDB_SUCCESS);
     ASSERT_TRUE(level_set_count(icf->levels, 1) < 3);
 

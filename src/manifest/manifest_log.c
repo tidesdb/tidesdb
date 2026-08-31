@@ -364,6 +364,8 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
     manifest->records_since_snapshot = 0;
     manifest->self_healed = 0;
     atomic_init(&manifest->active_ops, 0);
+    /* the struct is malloc'd, so every field is set here or holds what the allocator left */
+    tdb_wait_init(&manifest->commit_wait);
     strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
     manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
 

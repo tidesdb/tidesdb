@@ -3025,6 +3025,15 @@ void test_engine_stall_stats_attribute_writer_waits(void)
      * folded into the maximum as well as the sum */
     for (int i = 0; i < TDB_STALL_COUNT; i++)
     {
+        /* named and printed before the assert -- the bare comparison says a reason is inconsistent
+         * without saying which, and reproducing this one cost a whole investigation */
+        if (after.reasons[i].total_us < after.reasons[i].max_us ||
+            (after.reasons[i].total_us > 0 && after.reasons[i].max_us == 0))
+            fprintf(stderr, "  stall reason %s inconsistent, count %llu total %llu longest %llu\n",
+                    tidesdb_stall_reason_name((tidesdb_stall_reason_t)i),
+                    (unsigned long long)after.reasons[i].count,
+                    (unsigned long long)after.reasons[i].total_us,
+                    (unsigned long long)after.reasons[i].max_us);
         ASSERT_TRUE(after.reasons[i].total_us >= after.reasons[i].max_us);
         if (after.reasons[i].total_us > 0) ASSERT_TRUE(after.reasons[i].max_us > 0);
     }

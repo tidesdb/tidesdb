@@ -183,7 +183,7 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
         uint64_t seen = atomic_load_explicit(&l0->admit_max_us, memory_order_relaxed);
         while (stalled_us > seen &&
                !atomic_compare_exchange_weak_explicit(&l0->admit_max_us, &seen, stalled_us,
-                                                      memory_order_relaxed, memory_order_relaxed))
+                                                      memory_order_release, memory_order_relaxed))
             ;
     }
     return TDB_SUCCESS;
@@ -194,7 +194,9 @@ void tidesdb_l0_admission_stats(const tidesdb_l0_t *l0, tidesdb_l0_admission_t *
     if (!l0 || !out) return;
     out->throttled = atomic_load_explicit(&l0->admits_throttled, memory_order_relaxed);
     out->blocked = atomic_load_explicit(&l0->admits_blocked, memory_order_relaxed);
+    /* longest before total, for the reason tdb_wait_read gives -- both only rise, and an admission
+     * raises the total before the longest */
+    out->max_us = atomic_load_explicit(&l0->admit_max_us, memory_order_acquire);
     out->stall_us = atomic_load_explicit(&l0->admit_stall_us, memory_order_relaxed);
     out->ceiling_hits = atomic_load_explicit(&l0->admit_ceiling_hits, memory_order_relaxed);
-    out->max_us = atomic_load_explicit(&l0->admit_max_us, memory_order_relaxed);
 }

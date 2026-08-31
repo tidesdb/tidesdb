@@ -149,6 +149,7 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
     atomic_init(&l0->admits_blocked, 0);
     atomic_init(&l0->admit_stall_us, 0);
     atomic_init(&l0->admit_ceiling_hits, 0);
+    atomic_init(&l0->admit_max_us, 0);
     atomic_init(&l0->aborted_count, 0);
     pthread_mutex_init(&l0->aborted_lock, NULL);
     pthread_mutex_init(&l0->admit_mtx, NULL);
@@ -571,7 +572,7 @@ static void l0_pace_against_ring(tidesdb_l0_t *l0, block_manager_t *wal)
     uint64_t seen = atomic_load_explicit(&l0->admit_max_us, memory_order_relaxed);
     while (paced_us > seen &&
            !atomic_compare_exchange_weak_explicit(&l0->admit_max_us, &seen, paced_us,
-                                                  memory_order_relaxed, memory_order_relaxed))
+                                                  memory_order_release, memory_order_relaxed))
         ;
 }
 

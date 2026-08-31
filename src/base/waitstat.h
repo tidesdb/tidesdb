@@ -31,6 +31,21 @@ typedef struct
 } tdb_wait_stat_t;
 
 /**
+ * tdb_wait_init
+ * bring a wait point up at zero. worth a function rather than three stores at each site: a wait
+ * point living in a malloc'd struct starts as whatever the allocator returned, and a missed field
+ * does not fail a build or a read -- it surfaces as a longest wait larger than the total containing
+ * it, on whichever platform's allocator happened to leave a large value there
+ * @param w the wait point
+ */
+static inline void tdb_wait_init(tdb_wait_stat_t *w)
+{
+    atomic_init(&w->count, 0);
+    atomic_init(&w->total_us, 0);
+    atomic_init(&w->max_us, 0);
+}
+
+/**
  * tdb_monotonic_us
  * microseconds on a monotonic clock, for measuring an interval a caller waited
  * @return the reading
@@ -111,10 +126,13 @@ static inline void tdb_wait_note(tdb_wait_stat_t *w, const uint64_t waited_us)
 {
     atomic_fetch_add_explicit(&w->count, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&w->total_us, waited_us, memory_order_relaxed);
+    /* released, so a reader that sees this sample in the longest also sees it in the total it was
+     * added to. relaxed here would let a weakly ordered machine publish the two in either order and
+     * hand a reader a longest wait larger than the sum containing it */
     uint64_t seen = atomic_load_explicit(&w->max_us, memory_order_relaxed);
     while (waited_us > seen &&
            !atomic_compare_exchange_weak_explicit(&w->max_us, &seen, waited_us,
-                                                  memory_order_relaxed, memory_order_relaxed))
+                                                  memory_order_release, memory_order_relaxed))
         ;
 }
 
@@ -129,9 +147,15 @@ static inline void tdb_wait_note(tdb_wait_stat_t *w, const uint64_t waited_us)
 static inline void tdb_wait_read(const tdb_wait_stat_t *w, uint64_t *out_count,
                                  uint64_t *out_total_us, uint64_t *out_max_us)
 {
-    *out_count = atomic_load_explicit(&w->count, memory_order_relaxed);
+    /* the longest is read before the total, and the note above raises the total before the longest,
+     * so the two can only be seen in an order that keeps total >= max. read the other way round a
+     * sample landing between the two loads is counted in the longest but not yet in the total, and
+     * a caller comparing them sees a longest wait larger than the sum containing it -- most easily
+     * on a counter whose total is still small, where one large sample outweighs everything before
+     * it */
+    *out_max_us = atomic_load_explicit(&w->max_us, memory_order_acquire);
     *out_total_us = atomic_load_explicit(&w->total_us, memory_order_relaxed);
-    *out_max_us = atomic_load_explicit(&w->max_us, memory_order_relaxed);
+    *out_count = atomic_load_explicit(&w->count, memory_order_relaxed);
 }
 
 /**

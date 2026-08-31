@@ -304,12 +304,29 @@ static int engine_rotate_locked(tidesdb_t *db)
         if (engine_open_wal_for_gen(db, gen, &new_wal) != TDB_SUCCESS) new_wal = NULL;
     }
 
-    tidesdb_memtable_t *new_mt = NULL;
-    if (new_wal != NULL &&
-        (new_mt = tidesdb_memtable_create(
-             new_wal, gen, gen, db->config.memtable_skip_list_max_level,
-             db->config.memtable_skip_list_probability, &db->now_seconds, db->arena)) != NULL &&
-        tidesdb_l0_rotate(db->l0, new_mt) == TDB_SUCCESS)
+    /* the log open above is timed on its own, and a ci run showed it accounting for 105 ms of a
+     * 37 s rotation -- so the memtable the rotation allocates and the publish that installs it are
+     * timed apart from it too, rather than leaving the remainder as one unattributed number */
+    const uint64_t mt_from = engine_monotonic_us();
+    tidesdb_memtable_t *new_mt =
+        new_wal == NULL
+            ? NULL
+            : tidesdb_memtable_create(new_wal, gen, gen, db->config.memtable_skip_list_max_level,
+                                      db->config.memtable_skip_list_probability, &db->now_seconds,
+                                      db->arena);
+    const uint64_t mt_us = engine_monotonic_us() - mt_from;
+    if (mt_us >= ENGINE_SLOW_ROTATE_WARN_US)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow memtable create %llu us for generation %llu",
+                      (unsigned long long)mt_us, (unsigned long long)gen);
+
+    const uint64_t pub_from = engine_monotonic_us();
+    const int published = new_mt != NULL && tidesdb_l0_rotate(db->l0, new_mt) == TDB_SUCCESS;
+    const uint64_t pub_us = engine_monotonic_us() - pub_from;
+    if (pub_us >= ENGINE_SLOW_ROTATE_WARN_US)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow rotation publish %llu us for generation %llu",
+                      (unsigned long long)pub_us, (unsigned long long)gen);
+
+    if (published)
     {
         db->wal_bm = new_wal; /* the old active's WAL now belongs to the sealed immutable */
         (void)queue_enqueue(db->flush_queue, db); /* wake a worker to flush the sealed immutable */

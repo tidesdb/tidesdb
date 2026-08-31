@@ -290,6 +290,69 @@ void test_skip_list_memory_bytes_counts_structural_overhead(void)
     skip_list_free(list);
 }
 
+/* a lapsing entry has to read the same way through both doors. the point get and the cursor each
+ * decide expiry for themselves, and a strict comparison on one side against an inclusive one on the
+ * other left them disagreeing for the whole of the deadline's second -- a get reporting the key
+ * gone while a scan still handed it back. driven off an injected clock so the boundary is landed on
+ * exactly rather than raced for */
+void test_skip_list_expiry_agrees_between_get_and_cursor(void)
+{
+    _Atomic(int64_t) clock;
+    atomic_init(&clock, 1000);
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, &clock, NULL), 0);
+
+    const uint8_t key[] = "lapses";
+    const uint8_t value[] = "v";
+    const int64_t deadline = 1010;
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), deadline, 1, 0),
+              0);
+
+    /* at each of the three interesting instants both doors must give the same answer: before the
+     * deadline the key is there, at it and after it the key is gone */
+    const int64_t instants[] = {deadline - 1, deadline, deadline + 1};
+    const int expect_live[] = {1, 0, 0};
+    for (int i = 0; i < 3; i++)
+    {
+        atomic_store(&clock, instants[i]);
+
+        uint8_t *gvalue = NULL;
+        size_t gvalue_size = 0;
+        int64_t gttl = 0;
+        uint8_t gdeleted = 0;
+        uint64_t gseq = 0, gid = 0;
+        const int grc = skip_list_get_with_seq(list, key, sizeof(key), &gvalue, &gvalue_size, &gid,
+                                               &gttl, &gdeleted, &gseq, UINT64_MAX, NULL, NULL);
+        const int get_live = grc == 0 && !gdeleted;
+        free(gvalue);
+
+        /* the cursor's get is where it decides expiry -- positioning alone does not filter */
+        skip_list_cursor_t *cursor = NULL;
+        ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+        int cursor_live = 0;
+        if (skip_list_cursor_goto_first(cursor) == 0)
+        {
+            uint8_t *ckey = NULL, *cvalue = NULL;
+            size_t ckey_size = 0, cvalue_size = 0;
+            uint64_t cid = 0, cseq = 0;
+            int64_t cttl = 0;
+            uint8_t cflags = 0;
+            /* a lapsed entry still returns 0 here and reports itself through the flags, the same
+             * way a tombstone does, so the flag is what says whether it is live */
+            const int crc = skip_list_cursor_get_with_seq(
+                cursor, &ckey, &ckey_size, &cvalue, &cvalue_size, &cid, &cttl, &cflags, &cseq);
+            cursor_live = crc == 0 && !(cflags & SKIP_LIST_FLAG_DELETED);
+        }
+        skip_list_cursor_free(cursor);
+
+        ASSERT_EQ(get_live, expect_live[i]);
+        ASSERT_EQ(cursor_live, get_live);
+    }
+
+    skip_list_free(list);
+}
+
 void test_skip_list_cursor_init()
 {
     skip_list_t *list = NULL;
@@ -3788,6 +3851,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_skip_list_reference_is_reported_by_every_getter, tests_passed);
     RUN_TEST(test_skip_list_reference_costs_an_id_not_a_value, tests_passed);
     RUN_TEST(test_skip_list_reference_rejects_a_tombstone_and_a_zero_id, tests_passed);
+    RUN_TEST(test_skip_list_expiry_agrees_between_get_and_cursor, tests_passed);
     RUN_TEST(test_skip_list_cursor_init, tests_passed);
     RUN_TEST(test_skip_list_cursor_next, tests_passed);
     RUN_TEST(test_skip_list_cursor_prev, tests_passed);

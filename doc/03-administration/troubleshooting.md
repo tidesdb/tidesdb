@@ -18,6 +18,19 @@ something is wrong.
 where writers waited, so a tail is attributable without a debugger. Compare each reason's longest
 single wait against the tail you measured — whichever matches is where the time went.
 
+If `manifest_commit` dominates, installers are queueing behind the catalogue rather than the data.
+Under a syncing mode each commit carries an fsync and periodically a rollover that rewrites the
+whole catalogue, both under a lock every flush install, compaction install and DDL needs, so this
+grows with the install rate. Under `TDB_SYNC_NONE` a commit is bookkeeping only and should be
+microseconds, so a large total there means something is holding that lock rather than the commit
+being expensive.
+
+If no reason accounts for the tail you measured, the wait was somewhere the taxonomy does not
+cover — the counters name the waits the engine knows how to attribute, not every place a thread can
+stop. Allocation, the filesystem, and thread creation are all outside them. That is the point to
+capture stacks from the stalled threads rather than to keep reading counters, which is how the two
+rotation-lock violations in [invariants](/internals/invariants) were found.
+
 If `wal_append` dominates, compare the two classes in
 [`tidesdb_get_io_stats`](/reference/statistics#tidesdb_get_io_stats). When `sstable` is moving
 several times the bytes the `wal` is, the log's writes are queued behind flush and compaction, and

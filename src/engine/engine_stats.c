@@ -435,6 +435,8 @@ const char *tidesdb_stall_reason_name(const tidesdb_stall_reason_t reason)
             return "rotate_work";
         case TDB_STALL_ADMISSION:
             return "admission";
+        case TDB_STALL_MANIFEST_COMMIT:
+            return "manifest_commit";
         case TDB_STALL_COUNT:
         default:
             return "unknown";
@@ -464,6 +466,10 @@ int engine_get_stall_stats(tidesdb_t *db, tidesdb_stall_stats_t *out)
     out->reasons[TDB_STALL_ADMISSION].count = adm.throttled + adm.blocked;
     out->reasons[TDB_STALL_ADMISSION].total_us = adm.stall_us;
     out->reasons[TDB_STALL_ADMISSION].max_us = adm.max_us;
+
+    tdb_wait_read(&db->manifest->commit_wait, &out->reasons[TDB_STALL_MANIFEST_COMMIT].count,
+                  &out->reasons[TDB_STALL_MANIFEST_COMMIT].total_us,
+                  &out->reasons[TDB_STALL_MANIFEST_COMMIT].max_us);
     return TDB_SUCCESS;
 }
 

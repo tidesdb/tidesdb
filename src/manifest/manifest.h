@@ -72,6 +72,7 @@
 #define MANIFEST_ROLLOVER_LIVE_MULTIPLE 2
 
 #include "base/lockfree.h" /* the writer-preferring rwlock the manifest is guarded by */
+#include "base/waitstat.h" /* tdb_wait_stat_t for the commit wait point */
 #include "compat.h"
 #include "io/block_manager.h"
 
@@ -151,6 +152,8 @@ typedef struct
  * merge -- and under sustained flush a plain rwlock never lets a writer in at all. a column family
  * create takes it exclusively twice, to name the family and to commit, so it is the writer that
  * starves
+ * @param commit_wait how long callers spent inside a commit, which every flush install, every
+ *                     compaction install and every ddl serialises through
  * @param active_ops count of active operations (for safe shutdown)
  */
 typedef struct
@@ -175,6 +178,7 @@ typedef struct
     int self_healed;
     tdb_wprwlock_t lock;
     _Atomic(int) active_ops;
+    tdb_wait_stat_t commit_wait;
 } tidesdb_manifest_t;
 
 /**

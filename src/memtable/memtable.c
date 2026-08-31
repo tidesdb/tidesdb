@@ -565,6 +565,14 @@ static void l0_pace_against_ring(tidesdb_l0_t *l0, block_manager_t *wal)
     const uint64_t paced_us = tdb_monotonic_us() - paced_from;
     atomic_fetch_add_explicit(&l0->admits_throttled, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&l0->admit_stall_us, paced_us, memory_order_relaxed);
+    /* the max takes both contributors, as the total does. folding only the blocking path into it
+     * reported a longest of zero against a non-zero total whenever the pacing was the whole of it,
+     * which reads as an accounting fault in the very figure a stalled write is diagnosed from */
+    uint64_t seen = atomic_load_explicit(&l0->admit_max_us, memory_order_relaxed);
+    while (paced_us > seen &&
+           !atomic_compare_exchange_weak_explicit(&l0->admit_max_us, &seen, paced_us,
+                                                  memory_order_relaxed, memory_order_relaxed))
+        ;
 }
 
 int tidesdb_l0_sync_active_wal(tidesdb_l0_t *l0)

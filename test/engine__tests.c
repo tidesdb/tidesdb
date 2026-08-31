@@ -2996,12 +2996,19 @@ void test_engine_stall_stats_attribute_writer_waits(void)
     ASSERT_EQ(tidesdb_get_stall_stats(db, &before), TDB_SUCCESS);
     for (int i = 0; i < TDB_STALL_COUNT; i++)
     {
-        ASSERT_EQ((int)before.reasons[i].count, 0);
-        ASSERT_EQ((int)before.reasons[i].total_us, 0);
-        ASSERT_EQ((int)before.reasons[i].max_us, 0);
+        /* the manifest commit is the one reason that has already done real work by here -- opening
+         * the database and creating the family each commit -- so it is the setup that is checked
+         * for it rather than a zero it was never going to hold */
+        if (i != TDB_STALL_MANIFEST_COMMIT)
+        {
+            ASSERT_EQ((int)before.reasons[i].count, 0);
+            ASSERT_EQ((int)before.reasons[i].total_us, 0);
+            ASSERT_EQ((int)before.reasons[i].max_us, 0);
+        }
         /* every reason names itself, so a stats table needs no parallel list of labels */
         ASSERT_TRUE(strcmp(tidesdb_stall_reason_name((tidesdb_stall_reason_t)i), "unknown") != 0);
     }
+    ASSERT_TRUE(before.reasons[TDB_STALL_MANIFEST_COMMIT].count > 0);
     ASSERT_TRUE(strcmp(tidesdb_stall_reason_name(TDB_STALL_COUNT), "unknown") == 0);
 
     for (int i = 0; i < ENGINE_TEST_COMPACT_KEYS; i++) engine_put(db, cf, i);
@@ -3012,9 +3019,15 @@ void test_engine_stall_stats_attribute_writer_waits(void)
     ASSERT_EQ(tidesdb_get_stall_stats(db, &after), TDB_SUCCESS);
     ASSERT_TRUE(after.reasons[TDB_STALL_WAL_APPEND].count > 0);
 
-    /* a total can never be less than the longest single wait inside it */
+    /* a total can never be less than the longest single wait inside it, and a reason that counted
+     * time must report some longest -- a non-zero total against a zero longest is an accounting
+     * fault, which is exactly what a ci log reported for admission before the pacing path was
+     * folded into the maximum as well as the sum */
     for (int i = 0; i < TDB_STALL_COUNT; i++)
+    {
         ASSERT_TRUE(after.reasons[i].total_us >= after.reasons[i].max_us);
+        if (after.reasons[i].total_us > 0) ASSERT_TRUE(after.reasons[i].max_us > 0);
+    }
 
     ASSERT_EQ(tidesdb_get_stall_stats(NULL, &after), TDB_ERR_INVALID_ARGS);
     ASSERT_EQ(tidesdb_get_stall_stats(db, NULL), TDB_ERR_INVALID_ARGS);

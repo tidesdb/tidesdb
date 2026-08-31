@@ -480,10 +480,10 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     return manifest;
 }
 
-int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, const int durable_sync)
+/* the commit itself; wrapped below so its several exits are timed in one place rather than each */
+static int manifest_commit_inner(tidesdb_manifest_t *manifest, const char *path,
+                                 const int durable_sync)
 {
-    if (!manifest || !path) return -1;
-
     atomic_fetch_add(&manifest->active_ops, 1);
     tdb_wprwlock_wrlock(&manifest->lock);
 
@@ -565,6 +565,19 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, cons
     tdb_wprwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
+}
+
+int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path, const int durable_sync)
+{
+    if (!manifest || !path) return -1;
+
+    /* every flush install, every compaction install and every ddl serialises through this call, so
+     * a database that stops making progress is often waiting here. counted because the stall
+     * breakdown had no bucket for it, which left a stalled create with nothing to name */
+    const uint64_t commit_from = tdb_monotonic_us();
+    const int rc = manifest_commit_inner(manifest, path, durable_sync);
+    tdb_wait_note(&manifest->commit_wait, tdb_monotonic_us() - commit_from);
+    return rc;
 }
 
 void tidesdb_manifest_close(tidesdb_manifest_t *manifest)

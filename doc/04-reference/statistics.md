@@ -284,6 +284,7 @@ one that a tail is made of, since a total cannot tell many short waits from one 
 | `rotate_lock` | `TDB_STALL_ROTATE_LOCK` | taking the rotation lock, which a committer declines rather than waits for when another thread holds it |
 | `rotate_work` | `TDB_STALL_ROTATE_WORK` | performing the rotation itself, which one committer pays on every other's behalf |
 | `admission` | `TDB_STALL_ADMISSION` | held by write admission because the unflushed backlog was too deep |
+| `manifest_commit` | `TDB_STALL_MANIFEST_COMMIT` | inside a manifest commit, which every flush install, every compaction install and every DDL serialises through |
 
 The short name is what `tidesdb_stall_reason_name` returns; the constant is how you index
 `reasons[]` for one particular reason. `TDB_STALL_COUNT` is the number of reasons, not itself a
@@ -293,6 +294,15 @@ Read it by comparing each reason's `max_us` against the tail you measured. If on
 the tail, that is where the time went. If `wal_append` dominates, the log is the constraint and the
 next question is whether the device can keep up — compare the bytes written against what the device
 can sustain, because a saturated disk and a stalled engine look identical from the application.
+
+`manifest_commit` is the one to read against the durability mode. Under `TDB_SYNC_NONE` a commit is
+bookkeeping only and costs a couple of microseconds, so a non-trivial total there means something
+else. Under a syncing mode it carries an fsync, and periodically a rollover that rewrites the whole
+catalogue — both under an exclusive lock every installer needs — so a total that grows with the
+flush rate is that serialisation rather than a fault.
+
+A reason reporting a non-zero total against a zero longest is an accounting fault, not a reading:
+every path that adds to a total must also offer its wait to the maximum.
 
 The totals are cumulative since the database opened and never reset, so sample twice and subtract to
 attribute a particular window.

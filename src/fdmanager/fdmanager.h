@@ -136,13 +136,13 @@ int fd_manager_budget_for_process(int configured, long process_limit);
  * process ceiling in the question
  * @param fdm the fd manager
  * @param max_open shared soft cap on total resident labeled files, 0 for unlimited
- * @return 0 on success, -1 on a lock/condition init failure
+ * @return 0 on success, -1 when the counters could not be brought up
  */
 int fd_manager_init(fd_manager_t *fdm, int max_open);
 
 /**
  * fd_manager_destroy
- * destroy an fd manager's lock and condition; the caller has already quiesced its users
+ * tear an fd manager down; the caller has already quiesced its users
  * @param fdm the fd manager, may be NULL
  */
 void fd_manager_destroy(fd_manager_t *fdm);

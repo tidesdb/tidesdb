@@ -1615,6 +1615,9 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
  * @param TDB_STALL_ROTATE_LOCK waiting to take the rotation lock, so another committer was rotating
  * @param TDB_STALL_ROTATE_WORK performing the rotation, which this thread pays on everyone's behalf
  * @param TDB_STALL_ADMISSION held by write admission because the unflushed backlog was too deep
+ * @param TDB_STALL_MANIFEST_COMMIT inside a manifest commit, which every flush install, every
+ *                                  compaction install and every ddl serialises through, so a
+ *                                  database making no progress is often waiting here
  * @param TDB_STALL_COUNT the number of reasons, not itself a reason
  */
 typedef enum
@@ -1623,6 +1626,7 @@ typedef enum
     TDB_STALL_ROTATE_LOCK,
     TDB_STALL_ROTATE_WORK,
     TDB_STALL_ADMISSION,
+    TDB_STALL_MANIFEST_COMMIT,
     TDB_STALL_COUNT
 } tidesdb_stall_reason_t;
 

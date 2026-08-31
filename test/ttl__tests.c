@@ -34,6 +34,9 @@ static int tests_failed = 0;
 #define TTL_ON_DISK_SECS 3
 /* how long a wait for a deadline sleeps between checks */
 #define TTL_POLL_US 50000
+/* how long to let the engine's once-a-second clock catch up to a deadline the test's own
+ * clock has passed; generous because it only bounds a failure, never a success */
+#define TTL_ABSENT_MAX_POLLS 200
 /* keys written alongside the expiring one, enough that a merge has real work and the family does
  * not consist of a single entry */
 #define TTL_FILLER_KEYS 64
@@ -89,6 +92,28 @@ static int ttl_get(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
     return rc;
 }
 
+/* the engine decides expiry against a clock a background ticker republishes once a second, so a
+ * deadline the test's own time(NULL) has already passed can still be in the future from the
+ * engine's point of view. the wall-clock wait above is what says the entry must not lapse early;
+ * this is what waits for the engine to agree that it has, rather than demanding it the instant the
+ * test's clock says so and failing on the ticker's phase
+ * @param db the database
+ * @param cf the column family
+ * @param key the key expected to lapse
+ * @return the engine's result once the key reads as absent, or its last result at the timeout
+ */
+static int ttl_wait_until_absent(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
+{
+    int rc = TDB_SUCCESS;
+    for (int i = 0; i < TTL_ABSENT_MAX_POLLS && rc == TDB_SUCCESS; i++)
+    {
+        rc = ttl_get(db, cf, key);
+        if (rc != TDB_SUCCESS) break;
+        usleep(TTL_POLL_US);
+    }
+    return rc;
+}
+
 /* assert the three keys read as expected, so each stage checks the same thing */
 static void ttl_expect(tidesdb_t *db, tidesdb_column_family_t *cf, int soon_rc)
 {
@@ -125,6 +150,7 @@ void test_ttl_expires_across_memtable_flush_and_reopen(void)
 
     /* once it passes, the lapsed key reads as absent straight from the memtable */
     while (time(NULL) <= written_at + TTL_SHORT_SECS) usleep(TTL_POLL_US);
+    ASSERT_EQ(ttl_wait_until_absent(db, cf, "soon"), TDB_ERR_NOT_FOUND);
     ttl_expect(db, cf, TDB_ERR_NOT_FOUND);
 
     /* the deadline has to reach the sstable, not be lost in the flush */
@@ -173,7 +199,7 @@ void test_ttl_expires_after_reaching_an_sstable(void)
     while (time(NULL) <= written_at + TTL_ON_DISK_SECS) usleep(TTL_POLL_US);
 
     /* the deadline has passed and the only copy is the one on disk */
-    ASSERT_EQ(ttl_get(db, cf, "lapses_on_disk"), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(ttl_wait_until_absent(db, cf, "lapses_on_disk"), TDB_ERR_NOT_FOUND);
     ASSERT_EQ(ttl_get(db, cf, "forever"), TDB_SUCCESS);
 
     /* a reopen reads that same sstable, so it must not bring the key back either */
@@ -227,7 +253,7 @@ void test_ttl_expired_entry_is_collected_by_compaction(void)
     ASSERT_TRUE(keys_before >= TTL_FILLER_KEYS + 1);
 
     while (time(NULL) <= written_at + TTL_ON_DISK_SECS) usleep(TTL_POLL_US);
-    ASSERT_EQ(ttl_get(db, cf, "lapses_on_disk"), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(ttl_wait_until_absent(db, cf, "lapses_on_disk"), TDB_ERR_NOT_FOUND);
 
     /* every level merges into one run here, so the lapsed entry meets the largest level where a
      * tombstone with nothing beneath it is dropped for good */

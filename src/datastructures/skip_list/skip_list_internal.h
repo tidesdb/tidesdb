@@ -216,7 +216,10 @@ static inline int skip_list_version_is_invalid_with_time(skip_list_version_t *ve
 {
     if (version == NULL) return 1;
     if (VERSION_IS_DELETED(version)) return 1;
-    if (version->ttl > 0 && version->ttl < current_time) return 1;
+    /* at or past the deadline, matching the point get in skip_list_read.c and the sstable read.
+     * with a strict less-than an iterator kept an entry the whole of the second a get already
+     * reported gone, so the two disagreed for one second on every lapsing key */
+    if (version->ttl > 0 && version->ttl <= current_time) return 1;
     return 0;
 }
 

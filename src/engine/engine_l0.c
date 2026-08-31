@@ -206,13 +206,37 @@ void engine_flush_worker(void *item, void *ctx)
 }
 
 /* open a log for the given generation; the naming and path work a rotation would otherwise do */
+/**
+ * engine_monotonic_us
+ * read the monotonic clock in microseconds, for measuring how long a committing thread spent in
+ * work it does on behalf of the engine rather than the transaction
+ * @return microseconds since an unspecified epoch
+ */
+static uint64_t engine_monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * ENGINE_US_PER_SEC + (uint64_t)ts.tv_nsec / ENGINE_NS_PER_US;
+}
+
 static int engine_open_wal_for_gen(tidesdb_t *db, uint64_t gen, block_manager_t **out)
 {
     char wal_name[ENGINE_WAL_NAME_MAX], wal_path[ENGINE_PATH_BUF_SIZE];
     if (tidesdb_wal_filename(gen, wal_name, sizeof(wal_name)) != TDB_SUCCESS) return TDB_ERR_IO;
     if (engine_build_path(db->db_path, wal_name, wal_path, sizeof(wal_path)) != TDB_SUCCESS)
         return TDB_ERR_IO;
-    return engine_open_wal(db, wal_path, out) == 0 ? TDB_SUCCESS : TDB_ERR_IO;
+
+    /* timed on its own because it is the one piece of work a rotation and a spare-log prepare both
+     * do, and the rotation's own figure covers the memtable allocation and the publish as well. a
+     * stall reported against the rotation alone cannot say which of the three held it, which has
+     * left a slow open looking like a lock this path does not take */
+    const uint64_t opened_from = engine_monotonic_us();
+    const int rc = engine_open_wal(db, wal_path, out);
+    const uint64_t opened_us = engine_monotonic_us() - opened_from;
+    if (opened_us >= ENGINE_SLOW_ROTATE_WARN_US)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow wal open %llu us for generation %llu",
+                      (unsigned long long)opened_us, (unsigned long long)gen);
+    return rc == 0 ? TDB_SUCCESS : TDB_ERR_IO;
 }
 
 void engine_prepare_spare_wal(tidesdb_t *db)
@@ -296,19 +320,6 @@ static int engine_rotate_locked(tidesdb_t *db)
     engine_close_wal(db, new_wal);
     TDB_DEBUG_LOG(TDB_LOG_ERROR, "wal rotation failed at generation %llu", (unsigned long long)gen);
     return TDB_ERR_IO;
-}
-
-/**
- * engine_monotonic_us
- * read the monotonic clock in microseconds, for measuring how long a committing thread spent in
- * work it does on behalf of the engine rather than the transaction
- * @return microseconds since an unspecified epoch
- */
-static uint64_t engine_monotonic_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * ENGINE_US_PER_SEC + (uint64_t)ts.tv_nsec / ENGINE_NS_PER_US;
 }
 
 void engine_maybe_rotate(tidesdb_t *db)

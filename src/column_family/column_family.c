@@ -29,6 +29,31 @@
  * @param cap capacity of dst
  * @param db_dir the database directory
  * @return 0, or -1 if the path would not fit */
+/**
+ * cf_name_publish
+ * publish name as this family's, handing back the one it displaced
+ *
+ * a rename cannot write the field in place -- a flush stamping the name onto an sstable would copy
+ * it mid-write, and that name is the first component of a block cache key. the replacement is
+ * published instead, and the displaced one belongs to the caller, which is the only place that
+ * knows when the readers still able to copy it have gone
+ * @param cf the family
+ * @param name the name to carry
+ * @param out_old receives the displaced name to free, or NULL when there was none
+ * @return TDB_SUCCESS, or TDB_ERR_MEMORY
+ */
+int cf_name_publish(cf_t *cf, const char *name, char **out_old)
+{
+    *out_old = NULL;
+    const size_t len = strlen(name) + 1;
+    char *fresh = malloc(len);
+    if (!fresh) return TDB_ERR_MEMORY;
+    memcpy(fresh, name, len);
+
+    *out_old = atomic_exchange_explicit(&cf->name, fresh, memory_order_acq_rel);
+    return TDB_SUCCESS;
+}
+
 static int cf_dir_path(char *dst, const size_t cap, const char *db_dir)
 {
     const int n = snprintf(dst, cap, "%s", db_dir);
@@ -123,7 +148,12 @@ int cf_create(const char *db_dir, const uint64_t cf_id,
     cf->fdm = fdm;
     cf->encodings = reg;
     cf_init_counters(cf);
-    snprintf(cf->name, sizeof(cf->name), "%s", config->name);
+    char *displaced_name = NULL;
+    if (cf_name_publish(cf, config->name, &displaced_name) != TDB_SUCCESS)
+    {
+        free(cf);
+        return -1;
+    }
     if (cf_dir_path(cf->dir, sizeof(cf->dir), db_dir) != 0)
     {
         /* the configuration is published by this point and is an allocation of its own, so the
@@ -160,7 +190,8 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
     cf->fdm = fdm;
     cf->encodings = reg;
     cf_init_counters(cf);
-    snprintf(cf->name, sizeof(cf->name), "%s", name);
+    char *displaced_name = NULL;
+    if (cf_name_publish(cf, name, &displaced_name) != TDB_SUCCESS) return -1;
     /* zeroed first because the decoder leaves any field the blob does not carry untouched, and this
      * is the copy that becomes the family's configuration */
     tidesdb_column_family_config_t loaded;
@@ -216,6 +247,7 @@ void cf_free(cf_t *cf)
 {
     if (!cf) return;
     level_set_free(cf->levels);
+    free(atomic_load_explicit(&cf->name, memory_order_acquire));
     /* nothing can be mid-copy of a configuration by the time the family is freed, so the retired
      * ones drain unconditionally and the live one is freed outright */
     tdb_retire_drain(&cf->config_retire, NULL, NULL);

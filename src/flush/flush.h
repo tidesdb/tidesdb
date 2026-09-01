@@ -86,9 +86,9 @@ typedef struct
  * closed and the immutable is left for a retry, its data still durable in its WAL.
  *
  * the engine does not use this. it runs flush_build and flush_install separately so many immutables
- * build at once while only the install is ordered by ticket, and so the registry lock is held
- * across neither the wait nor the build alone. this is the equivalent single-threaded path, kept
- * because it is what the flush tests drive and what makes the two halves' contract legible
+ * build at once while only the install is ordered by ticket. this is the equivalent single-threaded
+ * path, kept because it is what the flush tests drive and what makes the two halves' contract
+ * legible
  * @param fx the flush context
  * @param immutable the dequeued immutable memtable, owned by this call on success
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_IO on a klog or manifest failure,

@@ -317,17 +317,18 @@ int engine_backup(tidesdb_t *db, const char *dir)
      * klog, so the snapshot the manifest references cannot lose a file mid-copy. the claimed
      * handles are captured here rather than re-indexed later, because a drop removes a family from
      * the registry before it waits the flag out, so an index taken now would name a different
-     * family afterwards. this waits under the registry read lock alone and never rotate_lock, so a
-     * claim that has to wait out a running compaction does not stall rotations and flushes for the
-     * whole wait */
-    cf_registry_rdlock(db->cfs);
-    const int n = cf_registry_count_locked(db->cfs);
+     * family afterwards. this waits holding the view borrow alone and never rotate_lock, so a claim
+     * that has to wait out a running compaction does not stall rotations and flushes for the whole
+     * wait */
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
     cf_t **cfs = n ? malloc((size_t)n * sizeof(*cfs)) : NULL;
     int claimed = 0;
     if (n && !cfs) rc = TDB_ERR_MEMORY;
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         int got = 0;
         for (int tick = 0; tick < ENGINE_BACKUP_FREEZE_TICKS; tick++)
         {
@@ -351,7 +352,7 @@ int engine_backup(tidesdb_t *db, const char *dir)
             rc = TDB_ERR_LOCKED;
         }
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
 
     /* the claims keep these families alive across the copy, since a drop waits the flag out before
      * it frees one, so the copy needs no registry lock at all.

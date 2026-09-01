@@ -37,31 +37,45 @@ static void engine_on_flush(void *ctx, uint64_t cf_id)
     engine_compaction_wake((tidesdb_t *)ctx);
 }
 
-/* build the cf-by-index array the flush demux addresses families through; the caller holds the
- * registry read lock, and the array is valid only while it does. returns the array length, or -1 on
- * an allocation failure */
-static int engine_cf_index_array(tidesdb_t *db, cf_t ***out)
+/* build the cf-by-index array the flush demux addresses families through. the borrow on the
+ * published view is held until engine_cf_index_array_release, and the families are valid only until
+ * then. returns the array length, or -1 on an allocation failure */
+static int engine_cf_index_array(tidesdb_t *db, cf_t ***out, cf_registry_view_t **out_view)
 {
     *out = NULL;
-    const int n_live = cf_registry_count_locked(db->cfs);
+    *out_view = NULL;
+
+    /* borrowed from the published view rather than read under the registry lock. this runs on every
+     * flush build and every install, which is continuously under load, and holding the read lock
+     * for it is what left a create waiting behind a stream of readers that never broke. the borrow
+     * is left by engine_cf_index_array_release once the caller has finished with the families */
+    cf_t **live = NULL;
+    int n_live = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n_live);
+    *out_view = view;
+
     uint64_t max_id = 0;
     for (int i = 0; i < n_live; i++)
-    {
-        const cf_t *c = cf_registry_at_locked(db->cfs, i);
-        if (c->cf_id > max_id) max_id = c->cf_id;
-    }
+        if (live[i]->cf_id > max_id) max_id = live[i]->cf_id;
+
+    /* the borrow is handed back through out_view on every path, including these two, so the caller
+     * releases it exactly once. leaving it here as well would drop one borrow twice and free the
+     * view while another reader still held it */
     const int size = n_live ? (int)max_id + 1 : 0;
     if (size == 0) return 0;
 
     cf_t **cfs = calloc((size_t)size, sizeof(*cfs));
     if (!cfs) return -1;
-    for (int i = 0; i < n_live; i++)
-    {
-        cf_t *c = cf_registry_at_locked(db->cfs, i);
-        cfs[c->cf_id] = c;
-    }
+    for (int i = 0; i < n_live; i++) cfs[live[i]->cf_id] = live[i];
     *out = cfs;
     return size;
+}
+
+/* give back the borrow engine_cf_index_array took, once the families it handed out are done with */
+static void engine_cf_index_array_release(tidesdb_t *db, cf_t **cfs, cf_registry_view_t *view)
+{
+    cf_registry_view_leave(db->cfs, view);
+    free(cfs);
 }
 
 /* the flush context over a cf-by-index array; the array and the families it names must outlive the
@@ -93,12 +107,10 @@ static flush_ctx_t engine_flush_ctx(tidesdb_t *db, cf_t *const *cfs, int n_cfs)
  * oldest-first; the sequence advances and the next ticket is woken whether or not this one
  * installed, so a build failure never stalls the order.
  *
- * the registry read lock is taken only once the ticket has come up, and released before returning.
- * waiting for the ticket under it would hold a read lock for as long as the flushes ahead take,
- * which is what a column-family create or drop then waits behind; it would also close a cycle,
- * since the worker holding the earlier ticket needs that same read lock to install. the families
- * the build resolved may have been dropped in the meantime, so the job is rebound to what the
- * registry holds now. returns TDB_SUCCESS only when the job installed, which is also the only case
+ * the view is borrowed only once the ticket has come up, and given back before returning. the
+ * families the build resolved may have been dropped in the meantime, so the job is rebound to what
+ * the registry holds now. returns TDB_SUCCESS only when the job installed, which is also the only
+ * case
  * where the immutable was retired */
 static int engine_flush_install_ordered(tidesdb_t *db, flush_job_t *job, int build_rc,
                                         uint64_t ticket)
@@ -108,9 +120,9 @@ static int engine_flush_install_ordered(tidesdb_t *db, flush_job_t *job, int bui
     while (db->flush_install_seq != ticket) pthread_cond_wait(&db->install_cv, &db->install_lock);
     if (build_rc == TDB_SUCCESS)
     {
-        cf_registry_rdlock(db->cfs);
         cf_t **cfs = NULL;
-        const int n_cfs = engine_cf_index_array(db, &cfs);
+        cf_registry_view_t *view = NULL;
+        const int n_cfs = engine_cf_index_array(db, &cfs, &view);
         if (n_cfs < 0)
         {
             /* the install never ran, so the built sstables are still this call's to close */
@@ -123,8 +135,7 @@ static int engine_flush_install_ordered(tidesdb_t *db, flush_job_t *job, int bui
             (void)flush_job_rebind(job, cfs, n_cfs);
             rc = flush_install(&fx, job); /* consumes the job either way */
         }
-        cf_registry_rdunlock(db->cfs);
-        free(cfs);
+        engine_cf_index_array_release(db, cfs, view);
         if (rc != TDB_SUCCESS)
             TDB_DEBUG_LOG(TDB_LOG_ERROR,
                           "flush install failed rc=%d, data stays durable in the WAL", rc);
@@ -142,17 +153,16 @@ static int engine_flush_install_ordered(tidesdb_t *db, flush_job_t *job, int bui
     return rc;
 }
 
-/* build the immutable's sstables under the cf registry read lock, then install them in the claim
- * ticket's order. the build holds the read lock so a concurrent drop cannot free a family whose run
- * is being written; the wait for the ticket does not, so a create or drop is never queued behind
- * more than the one build in progress */
+/* build the immutable's sstables against a borrowed view of the families, then install them in the
+ * claim ticket's order. the borrow is what stops a concurrent drop freeing a family whose run is
+ * being written -- a drop publishes a view without it and then waits for the borrows to drain */
 static void engine_flush_one(tidesdb_t *db, tidesdb_memtable_t *imm, uint64_t ticket)
 {
     flush_job_t *job = NULL;
     const int build_token = vlog_build_enter(db->vlog);
-    cf_registry_rdlock(db->cfs);
     cf_t **cfs = NULL;
-    const int n_cfs = engine_cf_index_array(db, &cfs);
+    cf_registry_view_t *view = NULL;
+    const int n_cfs = engine_cf_index_array(db, &cfs, &view);
     int build_rc = TDB_SUCCESS;
     if (n_cfs < 0)
     {
@@ -167,8 +177,7 @@ static void engine_flush_one(tidesdb_t *db, tidesdb_memtable_t *imm, uint64_t ti
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "flush build failed rc=%d, data stays durable in the WAL",
                           build_rc);
     }
-    cf_registry_rdunlock(db->cfs);
-    free(cfs);
+    engine_cf_index_array_release(db, cfs, view);
 
     /* read before the install, which retires the immutable and frees it on the way through. the
      * value is settled by then -- a reference is only ever added to the active memtable, and this

@@ -116,10 +116,10 @@ void engine_drain_immutables(tidesdb_t *db, int do_flush);
 
 /**
  * engine_collect_sstables
- * reference every sstable across every column family into a freshly allocated array. the caller
- * holds the registry read lock across this call, and may release it once this returns -- an
- * sstable's file is closed and truncated only when its last reference drops, so a held reference
- * keeps it readable through a concurrent level-set reload
+ * reference every sstable across every column family into a freshly allocated array. the families
+ * are borrowed from the published view for the length of the call only -- an sstable's file is
+ * closed and truncated only when its last reference drops, so the references this returns keep them
+ * readable through a concurrent level-set reload
  * @param db the database
  * @param out receives the allocated array, NULL when the count is zero
  * @return the number of referenced sstables, 0 when there are none, or -1 on allocation failure

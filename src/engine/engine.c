@@ -292,28 +292,42 @@ static int engine_create_l0(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
-/* reference every sstable across all cfs into a freshly allocated array; the caller holds the
- * registry read lock, unrefs each, and frees the array. returns the count, or -1 on allocation
- * failure */
+/* reference every sstable across all cfs into a freshly allocated array; the caller unrefs each and
+ * frees the array. returns the count, or -1 on allocation failure */
 int engine_collect_sstables(tidesdb_t *db, sstable_t ***out)
 {
     *out = NULL;
-    const int ncf = cf_registry_count_locked(db->cfs);
+
+    /* the borrow covers the family pointers only. every sstable this hands back was referenced by
+     * level_set_collect_all, so it outlives the borrow on its own reference and the caller gives it
+     * back with sstable_unref as it always did */
+    cf_t **live = NULL;
+    int ncf = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &ncf);
+
     int total = 0;
-    for (int i = 0; i < ncf; i++)
-        total += level_set_collect_all(cf_registry_at_locked(db->cfs, i)->levels, NULL, 0);
-    if (total == 0) return 0;
+    for (int i = 0; i < ncf; i++) total += level_set_collect_all(live[i]->levels, NULL, 0);
+    if (total == 0)
+    {
+        cf_registry_view_leave(db->cfs, view);
+        return 0;
+    }
     sstable_t **arr = malloc((size_t)total * sizeof(*arr));
-    if (!arr) return -1;
+    if (!arr)
+    {
+        cf_registry_view_leave(db->cfs, view);
+        return -1;
+    }
     int k = 0;
     for (int i = 0; i < ncf; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         const int got = level_set_collect_all(cf->levels, arr + k, total - k);
         /* collect_all references only when the level's count fits the remaining room; a level that
          * grew since the first pass references nothing and is picked up on the next tick */
         if (got > 0 && got <= total - k) k += got;
     }
+    cf_registry_view_leave(db->cfs, view);
     *out = arr;
     return k;
 }

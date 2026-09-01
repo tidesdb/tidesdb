@@ -73,10 +73,8 @@ static int engine_sync_all_klogs(tidesdb_t *db)
      * the whole sweep stalls those for as long as a full-database fsync takes. a held reference is
      * what keeps each file open and untruncated meanwhile, since an sstable closes only when its
      * last reference drops */
-    cf_registry_rdlock(db->cfs);
     sstable_t **all = NULL;
     const int n = engine_collect_sstables(db, &all);
-    cf_registry_rdunlock(db->cfs);
 
     if (n < 0) return TDB_ERR_MEMORY;
 

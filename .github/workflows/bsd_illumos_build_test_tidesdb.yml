@@ -175,47 +175,11 @@ jobs:
             echo "*=====================================*"
             cd build
 
-            # this platform intermittently stalls one test for minutes, and the failure prints a
-            # duration rather than what it waited on. a watchdog samples any test binary that
-            # outlives anything the suite normally takes, so the next occurrence arrives with the
-            # thread that holds the lock named instead of inferred. it costs nothing on a green run.
-            #
-            # the age is tracked here rather than read from ps, which has no etimes keyword on this
-            # platform -- asking for one selects nothing and the watchdog is silently inert, which
-            # reads exactly like a run that never stalled
-            (
-              while [ ! -f /tmp/ctest.done ]; do
-                for p in $(ps -axo pid,comm 2>/dev/null | awk '$2 ~ /_tests$/ {print $1}'); do
-                  seen=/tmp/wd.$p
-                  [ -f "$seen" ] || date +%s > "$seen"
-                  now=$(date +%s)
-                  age=$((now - $(cat "$seen")))
-                  [ "$age" -gt 60 ] || continue
-                  last=0
-                  [ -f "$seen.last" ] && last=$(cat "$seen.last")
-                  [ $((now - last)) -gt 45 ] || continue
-                  echo "$now" > "$seen.last"
-                  echo "*===== watchdog: pid $p alive ${age}s, sampling ====="
-                  ps -p $p -o pid,lid,pcpu,state,wchan,comm 2>/dev/null
-                  # gdb writes to a file rather than a pipe. piping it through head closes the pipe
-                  # once the cap is reached, and a gdb killed by the resulting SIGPIPE never detaches
-                  # -- which kills the very process being sampled, and truncates the dump to the
-                  # first few threads at that
-                  gdb -p $p -batch -ex 'set pagination off' -ex 'thread apply all bt' \
-                    > /tmp/bt.$p.$now 2>&1
-                  cat /tmp/bt.$p.$now
-                  rm -f /tmp/bt.$p.$now
-                done
-                sleep 5
-              done
-            ) &
-            WATCHDOG=$!
-
-            ctest -V --output-on-failure --timeout 5400 --build-config Release
-            CTEST_RC=$?
-            touch /tmp/ctest.done
-            wait $WATCHDOG 2>/dev/null
-            exit $CTEST_RC
+            # 300s per test, not the 5400 the other jobs use. nothing here legitimately runs
+            # beyond ninety seconds, and this platform has intermittently parked one test for
+            # minutes -- at the default a single stall holds the runner for the whole ninety-minute
+            # ceiling, so the timeout is what turns that into a prompt failure
+            ctest -V --output-on-failure --timeout 300 --build-config Release
 
   omnios-build:
     runs-on: ubuntu-latest

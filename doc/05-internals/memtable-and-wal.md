@@ -271,9 +271,9 @@ wait. So a rotation could sit on the lock indefinitely without doing anything sl
 compares a rotation marker taken before the lock instead — the marker moves whenever the
 reader-visible set does, which answers "did someone else rotate while I waited?" without touching
 either lock. The paths that would otherwise be tempted avoid it by construction — the
-value-log reclaim runs under the column-family registry read lock alone, and the interval sync
-ticker reaches the log through the same pin an append takes rather than through the lock, so its
-`fsync` blocks nobody's commit but its own.
+value-log reclaim runs against a borrowed view of the families and no lock at all, and the interval
+sync ticker reaches the log through the same pin an append takes rather than through the lock, so
+its `fsync` blocks nobody's commit but its own.
 :::
 
 The rule this leaves has two halves.
@@ -376,19 +376,17 @@ the only durable copy.
 "Waits for the readers to drain" is where a flush would hurt the rest of the database if it were
 taken literally.
 
-A flush retires the memtable it just installed while holding the column-family registry read lock,
-and it holds that lock across the whole install because the level sets it mutates belong to
-families the lock keeps alive. Creating or dropping a family takes the same lock for writing. So a
-retire that waited for a reader to leave would hold a read lock for as long as that reader stayed.
-The announcement holds off readers that have not arrived yet. It does nothing about a reader already
-inside, and the writer waits for every one of those. A `tidesdb_create_column_family` then takes as
-long as the reader the flush is waiting on.
+A flush retires the memtable it just installed while holding a borrow of the family view, and it
+holds that borrow across the whole install because the level sets it mutates belong to families the
+borrow keeps alive. So a retire that waited for a reader to leave would hold that borrow for as long
+as that reader stayed -- and a `drop` waits out the borrows naming the family it is freeing, so it
+would then wait just as long.
 
 The reclaim is therefore bounded. It rechecks whether the readers have gone a fixed number of
 times, and if they have not, it puts the memtable on a **pending list** and returns. The
 deferred-free reaper sweeps that list each second, freeing whatever has since drained. Nothing is
 leaked — a memtable still pinned at close is freed when the L0 is destroyed — and the flush gives
-the registry lock back on a bound that does not depend on how long some reader chooses to stay.
+its borrow back on a bound that does not depend on how long some reader chooses to stay.
 
 The overwhelmingly common case still frees inline: a reader that entered just before the retire is
 normally gone within a recheck or two, and the deferral is what happens when it is not.
@@ -459,7 +457,7 @@ rather than applied, and surfaces through
 | A memtable takes its value log floor when it becomes active, not at its first reference | A value reaches the value log before the commit that produced it reaches any memtable, so a floor taken later leaves a window where a reclaim drops the segment it just landed in |
 | A memtable lowers that floor onto a reference's own segment | Its floor covers what was written after it became active; a value separated a moment before a rotation is applied here while living below that point |
 | The floor is released only when the flush installs | Until an sstable names those values, this memtable is the only thing that does |
-| A flush never waits out a reader to free a memtable | It holds the registry read lock, so an unbounded wait there blocks family create and drop for exactly that long; it defers to the reaper instead |
+| A flush never waits out a reader to free a memtable | It holds a borrow of the family view, so an unbounded wait there blocks a family drop for exactly that long; it defers to the reaper instead |
 | Blocking on backpressure has a ceiling | A stuck flush must degrade to slow, not to deadlocked |
 | Ingestion is paced against merging, not only against flush | They fail independently: an empty queue with a deep tier means flush kept up and merging did not, and every later read pays for it |
 | A synchronous flush waits for the immutable queue to drain, not for its own generation | Backup and clone copy files, and a rotation seals nothing when the active memtable is empty — so waiting on the sealed generation returns while earlier generations are still only in memory, and the copy misses them |

@@ -32,14 +32,15 @@ int engine_list_column_families(tidesdb_t *db, char ***out_names, int *out_count
     *out_names = NULL;
     *out_count = 0;
 
-    cf_registry_rdlock(db->cfs);
-    const int n = cf_registry_count_locked(db->cfs);
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
     char **names = n > 0 ? calloc((size_t)n, sizeof(*names)) : NULL;
     int rc = (n == 0 || names) ? TDB_SUCCESS : TDB_ERR_MEMORY;
     int filled = 0;
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
-        const cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        const cf_t *cf = live[i];
         if (!cf) continue;
         const size_t len = strlen(cf->name) + 1;
         names[filled] = malloc(len);
@@ -51,7 +52,7 @@ int engine_list_column_families(tidesdb_t *db, char ***out_names, int *out_count
         memcpy(names[filled], cf->name, len);
         filled++;
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
 
     if (rc != TDB_SUCCESS)
     {
@@ -155,8 +156,7 @@ int engine_rename_cf(tidesdb_t *db, const char *old_name, const char *new_name)
     int rc = engine_cf_claim(cf);
     if (rc != TDB_SUCCESS) return rc;
 
-    cf_registry_wrlock(db->cfs);
-    rc = cf_registry_rename_locked(db->cfs, cf, new_name);
+    rc = cf_registry_rename(db->cfs, cf, new_name);
     tidesdb_column_family_config_t renamed;
     cf_config_get(cf, &renamed);
     if (rc == TDB_SUCCESS)
@@ -164,7 +164,6 @@ int engine_rename_cf(tidesdb_t *db, const char *old_name, const char *new_name)
         snprintf(renamed.name, sizeof(renamed.name), "%s", new_name);
         rc = cf_config_publish(cf, &renamed);
     }
-    cf_registry_wrunlock(db->cfs);
 
     /* the manifest commit fsyncs and needs no lock; the claim keeps another DDL off the family */
     if (rc == TDB_SUCCESS) rc = engine_cf_persist_config(db, cf->cf_id, new_name, &renamed);
@@ -271,9 +270,9 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
         cf_t *dst = cf_registry_get_by_name(db->cfs, dst_name);
 
         /* the destination is already published in the registry, and the scheduler plans a claimed
-         * family after it drops the registry read lock, so the registry write lock alone does not
-         * keep a planner off dst while its level set is rebuilt. claiming dst waits that planner
-         * out, which is the quiesce cf_reload_levels requires */
+         * family after it gives its borrow back, so holding the registry alone does not keep a
+         * planner off dst while its level set is rebuilt. claiming dst waits that planner out,
+         * which is the quiesce cf_reload_levels requires */
         rc = engine_cf_claim(dst);
         if (rc == TDB_SUCCESS)
         {
@@ -287,12 +286,23 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
             rc = engine_clone_copy_sstables(db, src, dst);
             if (rc == TDB_SUCCESS)
             {
-                /* same reason as rename -- exclude the fd reaper from the destination's level-set
-                 * swap */
-                cf_registry_wrlock(db->cfs);
-                if (cf_reload_levels(dst, db->manifest, engine_sstable_bm_sync(db)) != 0)
+                /* the reload frees the destination's level set and builds a new one, and the
+                 * compaction scheduler reads every published family's overlap depth whether or not
+                 * it is claimed -- so the claim above does not keep it off this set. the family is
+                 * taken out of the published view for the swap instead, which waits out the borrows
+                 * that could still name it and leaves nothing able to reach the set being freed.
+                 *
+                 * the destination is invisible for that window. it is a half-built clone that no
+                 * caller has been given yet, and the only cost is that a create racing for the same
+                 * name could take it, which fails this clone rather than corrupting either */
+                cf_t *detached = NULL;
+                if (cf_registry_remove(db->cfs, dst_name, &detached) != TDB_SUCCESS)
+                    rc = TDB_ERR_NOT_FOUND;
+                if (rc == TDB_SUCCESS &&
+                    cf_reload_levels(dst, db->manifest, engine_sstable_bm_sync(db)) != 0)
                     rc = TDB_ERR_IO;
-                cf_registry_wrunlock(db->cfs);
+                if (detached && cf_registry_add(db->cfs, detached) != TDB_SUCCESS)
+                    rc = TDB_ERR_EXISTS;
             }
 
             /* released before the undo below, which waits the same flag out */

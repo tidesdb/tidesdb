@@ -147,7 +147,8 @@ void test_cf_registry_next_id(void)
     cf_registry_destroy(reg);
 }
 
-/* locked iteration walks every registered cf and rejects an out-of-range index */
+/* a borrowed view walks every registered family, and a family added after the borrow is not in it
+ */
 void test_cf_registry_iteration(void)
 {
     cr_env_t env;
@@ -158,19 +159,28 @@ void test_cf_registry_iteration(void)
     ASSERT_EQ(cf_registry_add(reg, cr_make_cf(&env, 2, "b")), TDB_SUCCESS);
     ASSERT_EQ(cf_registry_add(reg, cr_make_cf(&env, 3, "c")), TDB_SUCCESS);
 
-    cf_registry_rdlock(reg);
-    ASSERT_EQ(cf_registry_count_locked(reg), 3);
-    int seen = 0;
-    for (int i = 0; i < cf_registry_count_locked(reg); i++)
-    {
-        cf_t *cf = cf_registry_at_locked(reg, i);
-        ASSERT_TRUE(cf != NULL);
-        seen++;
-    }
-    ASSERT_EQ(seen, 3);
-    ASSERT_TRUE(cf_registry_at_locked(reg, 3) == NULL);
-    ASSERT_TRUE(cf_registry_at_locked(reg, -1) == NULL);
-    cf_registry_rdunlock(reg);
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(reg, &live, &n);
+    ASSERT_EQ(n, 3);
+    for (int i = 0; i < n; i++) ASSERT_TRUE(live[i] != NULL);
+
+    /* the borrow is a snapshot, so a family published while it is held belongs to the next one */
+    ASSERT_EQ(cf_registry_add(reg, cr_make_cf(&env, 4, "d")), TDB_SUCCESS);
+    ASSERT_EQ(n, 3);
+    cf_registry_view_leave(reg, view);
+
+    view = cf_registry_view_enter(reg, &live, &n);
+    ASSERT_EQ(n, 4);
+    cf_registry_view_leave(reg, view);
+
+    /* and with nothing to borrow from, the count is zero rather than an error */
+    cf_t **none = NULL;
+    int zero = -1;
+    cf_registry_view_t *empty = cf_registry_view_enter(NULL, &none, &zero);
+    ASSERT_TRUE(none == NULL);
+    ASSERT_EQ(zero, 0);
+    cf_registry_view_leave(NULL, empty);
 
     cf_registry_destroy(reg);
     cr_env_close(&env);

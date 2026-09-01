@@ -26,11 +26,15 @@
  * are rare by comparison, so they pay a copy and the readers pay nothing
  * @param cfs the family pointers, borrowed; the registry's locked array owns them
  * @param count how many are live in this view */
-typedef struct
+struct cf_registry_view
 {
     cf_t **cfs;
     int count;
-} cf_registry_view_t;
+    /* borrows outstanding on this view. the epoch covers only the window between reading the
+     * published pointer and counting it, which is a few instructions; this covers the long hold,
+     * and it is per view so an unpublished one's count can only fall */
+    _Atomic(int) refs;
+};
 
 struct cf_registry
 {
@@ -38,44 +42,49 @@ struct cf_registry
     int count;
     int capacity;
     _Atomic(uint64_t) next_cf_id;
-    /* writer-preferring, and it has to be. the readers are the engine's own background work --
-     * every flush install, every compaction claim, every reaper sweep -- and they arrive
-     * continuously under load, while the writers are the caller's create, drop, rename and clone.
-     * a plain rwlock admits an arriving reader while a writer waits, so a database that never stops
-     * flushing never lets the writer in and a create appears to hang while the process stays busy.
+    /* the membership changes -- create, drop, rename, clone -- and nothing else. the engine's
+     * background work reads the published view instead, so this excludes the other writers and no
+     * reader waits behind it.
      *
-     * the attribute that says otherwise is a glibc extension, which left the guarantee holding on
-     * one platform and the hang reachable on every other, so the preference is announced in the
-     * primitive instead.
+     * it was a reader-writer lock while that background work took it for read. those readers arrive
+     * continuously under load, which left a create waiting for a break in a stream that had none,
+     * and on a platform that does not hand a waiting writer its turn promptly the wait ran to
+     * minutes. no amount of preference in the lock fixed that; taking the readers off it did */
+    pthread_mutex_t lock;
+    /* the published view and the guard covering the window in which a borrow is taken. a superseded
+     * view needs no retire list -- it is freed by whichever reference to it is dropped last.
      *
-     * either way it is safe only because no reader takes it again while holding it. a reader that
-     * did would wait on its own writer announcement and never reach the acquire that would have
-     * completed, which is the same deadlock the nonrecursive attribute gave and for the same
-     * reason */
-    tdb_wprwlock_t lock;
-    /* the published view, its reader guard, and the retire list superseded views wait on */
+     * live_views counts every view still allocated, published or not. a removal has to wait out the
+     * borrows of every view that still names the family, which is every view published before it --
+     * waiting only on the one it displaced leaves a borrow of an older view holding a handle the
+     * caller is about to free */
     _Atomic(cf_registry_view_t *) view;
+    _Atomic(int) live_views;
     tdb_epoch_t view_epoch;
-    tdb_retire_list_t view_retire;
 };
 
 /* free a superseded view; the family pointers it held are owned by the locked array, not by it */
 static void cf_registry_view_reclaim(void *item, void *ctx)
 {
-    (void)ctx;
+    cf_registry_t *reg = (cf_registry_t *)ctx;
     cf_registry_view_t *v = (cf_registry_view_t *)item;
     free(v->cfs);
     free(v);
+    if (reg) atomic_fetch_sub_explicit(&reg->live_views, 1, memory_order_acq_rel);
 }
 
 /* publish the locked array as a fresh immutable view and retire the previous one once the readers
  * that could still be inside it have drained. the caller holds the write lock, so the array is
  * stable while it is copied. on allocation failure the previous view stays published -- it would
  * then be missing this change, so every mutation treats that as a failure rather than continuing */
-static int cf_registry_publish_locked(cf_registry_t *reg)
+static int cf_registry_publish_locked(cf_registry_t *reg, cf_registry_view_t **old_out)
 {
     cf_registry_view_t *fresh = malloc(sizeof(*fresh));
     if (!fresh) return TDB_ERR_MEMORY;
+    /* one reference for being published. borrows add their own, and whoever drops the last one
+     * frees it -- so a view outlives its publication for exactly as long as someone holds it */
+    atomic_init(&fresh->refs, 1);
+    atomic_fetch_add_explicit(&reg->live_views, 1, memory_order_acq_rel);
     fresh->cfs = reg->count ? malloc((size_t)reg->count * sizeof(*fresh->cfs)) : NULL;
     if (reg->count && !fresh->cfs)
     {
@@ -86,7 +95,19 @@ static int cf_registry_publish_locked(cf_registry_t *reg)
     fresh->count = reg->count;
 
     cf_registry_view_t *old = atomic_exchange_explicit(&reg->view, fresh, memory_order_acq_rel);
-    if (old) tdb_retire(&reg->view_retire, old, &reg->view_epoch, cf_registry_view_reclaim, NULL);
+    if (!old) return TDB_SUCCESS;
+
+    /* wait out the acquire windows before anything is decided about the old view, so no borrow can
+     * still be between reading the published pointer and counting it. the window is a few
+     * instructions, so this comes back at once however busy the readers are */
+    tdb_epoch_wait_drained(&reg->view_epoch);
+
+    /* a caller that must know when the old view is unused takes the publish reference from here and
+     * drops it itself; otherwise it goes now, and the view is freed by whichever borrow is last */
+    if (old_out)
+        *old_out = old;
+    else if (atomic_fetch_sub_explicit(&old->refs, 1, memory_order_acq_rel) == 1)
+        cf_registry_view_reclaim(old, reg);
     return TDB_SUCCESS;
 }
 
@@ -105,16 +126,16 @@ cf_registry_t *cf_registry_create(uint64_t next_cf_id)
     atomic_init(&reg->next_cf_id, next_cf_id);
     atomic_init(&reg->view, NULL);
     atomic_init(&reg->view_epoch, 0);
-    if (tdb_wprwlock_init(&reg->lock) != 0)
+    if (pthread_mutex_init(&reg->lock, NULL) != 0)
     {
         free(reg->cfs);
         free(reg);
         return NULL;
     }
     /* publish an empty view up front so a lookup before the first family never sees a null one */
-    if (cf_registry_publish_locked(reg) != TDB_SUCCESS)
+    if (cf_registry_publish_locked(reg, NULL) != TDB_SUCCESS)
     {
-        tdb_wprwlock_destroy(&reg->lock);
+        (void)pthread_mutex_destroy(&reg->lock);
         free(reg->cfs);
         free(reg);
         return NULL;
@@ -128,10 +149,9 @@ void cf_registry_destroy(cf_registry_t *reg)
     for (int i = 0; i < reg->count; i++) cf_free(reg->cfs[i]);
     free(reg->cfs);
     /* reclaim every superseded view, then the published one; no reader can be left by this point */
-    tdb_retire_drain(&reg->view_retire, NULL, NULL);
     cf_registry_view_t *v = atomic_load_explicit(&reg->view, memory_order_acquire);
-    if (v) cf_registry_view_reclaim(v, NULL);
-    tdb_wprwlock_destroy(&reg->lock);
+    if (v) cf_registry_view_reclaim(v, reg);
+    (void)pthread_mutex_destroy(&reg->lock);
     free(reg);
 }
 
@@ -147,17 +167,17 @@ int cf_registry_add(cf_registry_t *reg, cf_t *cf)
 {
     if (!reg || !cf) return TDB_ERR_INVALID_ARGS;
 
-    cf_registry_wrlock(reg);
+    cf_registry_lock(reg);
 
     if (cf_registry_index_of_name(reg, cf->name) >= 0)
     {
-        cf_registry_wrunlock(reg);
+        cf_registry_unlock(reg);
         return TDB_ERR_EXISTS;
     }
     for (int i = 0; i < reg->count; i++)
         if (reg->cfs[i]->cf_id == cf->cf_id)
         {
-            cf_registry_wrunlock(reg);
+            cf_registry_unlock(reg);
             return TDB_ERR_EXISTS;
         }
 
@@ -167,7 +187,7 @@ int cf_registry_add(cf_registry_t *reg, cf_t *cf)
         cf_t **grown = realloc(reg->cfs, (size_t)cap * sizeof(*grown));
         if (!grown)
         {
-            cf_registry_wrunlock(reg);
+            cf_registry_unlock(reg);
             return TDB_ERR_MEMORY;
         }
         reg->cfs = grown;
@@ -178,9 +198,9 @@ int cf_registry_add(cf_registry_t *reg, cf_t *cf)
     /* the view is what every lookup reads, so a family that is not in it does not exist as far as
      * the read path is concerned. an append that cannot be published is undone rather than left
      * half-applied */
-    const int published = cf_registry_publish_locked(reg);
+    const int published = cf_registry_publish_locked(reg, NULL);
     if (published != TDB_SUCCESS) reg->count--;
-    cf_registry_wrunlock(reg);
+    cf_registry_unlock(reg);
     return published;
 }
 
@@ -229,11 +249,11 @@ int cf_registry_remove(cf_registry_t *reg, const char *name, cf_t **out)
 {
     if (!reg || !name) return TDB_ERR_INVALID_ARGS;
 
-    cf_registry_wrlock(reg);
+    cf_registry_lock(reg);
     const int idx = cf_registry_index_of_name(reg, name);
     if (idx < 0)
     {
-        cf_registry_wrunlock(reg);
+        cf_registry_unlock(reg);
         return TDB_ERR_NOT_FOUND;
     }
     cf_t *detached = reg->cfs[idx];
@@ -241,16 +261,23 @@ int cf_registry_remove(cf_registry_t *reg, const char *name, cf_t **out)
     reg->count--;
     /* a removal that cannot be published would leave the dropped family still reachable through the
      * view while the caller went on to free it, so it is put back instead */
-    const int published = cf_registry_publish_locked(reg);
+    cf_registry_view_t *displaced = NULL;
+    const int published = cf_registry_publish_locked(reg, &displaced);
     if (published != TDB_SUCCESS)
     {
         memmove(&reg->cfs[idx + 1], &reg->cfs[idx], (size_t)(reg->count - idx) * sizeof(*reg->cfs));
         reg->cfs[idx] = detached;
         reg->count++;
-        cf_registry_wrunlock(reg);
+        cf_registry_unlock(reg);
         return published;
     }
-    cf_registry_wrunlock(reg);
+    /* the family is out of the published view, so nothing new can reach it. what can still be
+     * holding it is a borrow of a view that named it, and the caller frees the handle the moment
+     * this returns -- so those are waited out here rather than left to the caller. the registry
+     * stays held across the wait so no other change can publish a view meanwhile; the readers being
+     * waited for do not take it, so holding it costs them nothing */
+    if (displaced) cf_registry_wait_readers_drained(reg, displaced);
+    cf_registry_unlock(reg);
 
     if (out)
         *out = detached;
@@ -259,17 +286,29 @@ int cf_registry_remove(cf_registry_t *reg, const char *name, cf_t **out)
     return TDB_SUCCESS;
 }
 
-int cf_registry_rename_locked(cf_registry_t *reg, cf_t *cf, const char *new_name)
+int cf_registry_rename(cf_registry_t *reg, cf_t *cf, const char *new_name)
 {
     if (!reg || !cf || !new_name) return TDB_ERR_INVALID_ARGS;
 
-    if (cf_registry_index_of_name(reg, new_name) >= 0) return TDB_ERR_EXISTS;
-    /* the name field is also the lookup key, so writing it under the write lock re-indexes the cf.
-     * the view holds the same pointers, so it sees the new name immediately -- but it is
-     * republished anyway so a lookup racing the write cannot observe a torn name through a stale
-     * view */
-    snprintf(cf->name, sizeof(cf->name), "%s", new_name);
-    return cf_registry_publish_locked(reg);
+    cf_registry_lock(reg);
+    if (cf_registry_index_of_name(reg, new_name) >= 0)
+    {
+        cf_registry_unlock(reg);
+        return TDB_ERR_EXISTS;
+    }
+    char *displaced_name = NULL;
+    int rc = cf_name_publish(cf, new_name, &displaced_name);
+    cf_registry_view_t *displaced_view = NULL;
+    if (rc == TDB_SUCCESS) rc = cf_registry_publish_locked(reg, &displaced_view);
+
+    /* every reader that could still be copying the displaced name is either inside a borrow of a
+     * view that named this family, waited out here, or holding the family's compaction claim, which
+     * the caller took before asking for the rename. once both are past, nothing can reach it */
+    if (displaced_view) cf_registry_wait_readers_drained(reg, displaced_view);
+    cf_registry_unlock(reg);
+
+    if (displaced_view) free(displaced_name);
+    return rc;
 }
 
 uint64_t cf_registry_next_cf_id(cf_registry_t *reg)
@@ -278,33 +317,57 @@ uint64_t cf_registry_next_cf_id(cf_registry_t *reg)
     return atomic_fetch_add_explicit(&reg->next_cf_id, 1, memory_order_relaxed);
 }
 
-void cf_registry_rdlock(cf_registry_t *reg)
+void cf_registry_lock(cf_registry_t *reg)
 {
-    if (reg) tdb_wprwlock_rdlock(&reg->lock);
+    if (reg) (void)pthread_mutex_lock(&reg->lock);
 }
 
-void cf_registry_rdunlock(cf_registry_t *reg)
+void cf_registry_unlock(cf_registry_t *reg)
 {
-    if (reg) tdb_wprwlock_unlock(&reg->lock);
+    if (reg) (void)pthread_mutex_unlock(&reg->lock);
 }
 
-void cf_registry_wrlock(cf_registry_t *reg)
+cf_registry_view_t *cf_registry_view_enter(cf_registry_t *reg, cf_t ***out_cfs, int *out_count)
 {
-    if (reg) tdb_wprwlock_wrlock(&reg->lock);
+    *out_cfs = NULL;
+    *out_count = 0;
+    if (!reg) return NULL;
+
+    /* the epoch is held across the load and the count and nothing else, so waiting on it is a wait
+     * on a few instructions rather than on however long a caller holds what it borrowed */
+    tdb_epoch_enter(&reg->view_epoch);
+    cf_registry_view_t *v = atomic_load_explicit(&reg->view, memory_order_acquire);
+    if (v) atomic_fetch_add_explicit(&v->refs, 1, memory_order_acq_rel);
+    tdb_epoch_exit(&reg->view_epoch);
+    if (!v) return NULL;
+
+    *out_cfs = v->cfs;
+    *out_count = v->count;
+    return v;
 }
 
-void cf_registry_wrunlock(cf_registry_t *reg)
+void cf_registry_view_leave(cf_registry_t *reg, cf_registry_view_t *view)
 {
-    if (reg) tdb_wprwlock_unlock(&reg->lock);
+    if (view && atomic_fetch_sub_explicit(&view->refs, 1, memory_order_acq_rel) == 1)
+        cf_registry_view_reclaim(view, reg);
 }
 
-int cf_registry_count_locked(const cf_registry_t *reg)
+void cf_registry_wait_readers_drained(cf_registry_t *reg, cf_registry_view_t *view)
 {
-    return reg ? reg->count : 0;
-}
+    if (!reg || !view) return;
 
-cf_t *cf_registry_at_locked(const cf_registry_t *reg, int index)
-{
-    if (!reg || index < 0 || index >= reg->count) return NULL;
-    return reg->cfs[index];
+    /* the publish reference is still held here, so one is what remains when every borrow has gone.
+     * the view is no longer published, so arriving borrows take the newer one and this count only
+     * falls -- which is what makes the wait terminate under readers that never stop, where waiting
+     * for no reader at all could not */
+    while (atomic_load_explicit(&view->refs, memory_order_acquire) > 1) cpu_yield();
+
+    if (atomic_fetch_sub_explicit(&view->refs, 1, memory_order_acq_rel) == 1)
+        cf_registry_view_reclaim(view, reg);
+
+    /* and every older view still borrowed, since each of those names the family too. they were
+     * displaced by earlier changes and nobody waited on them, so a borrow of one outlives the wait
+     * above -- and the caller frees the handle the moment this returns. no publish can add to the
+     * count meanwhile because the caller holds the registry */
+    while (atomic_load_explicit(&reg->live_views, memory_order_acquire) > 1) cpu_yield();
 }

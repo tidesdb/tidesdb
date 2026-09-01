@@ -47,6 +47,7 @@
  *               runtime reconfigure swaps a whole new one in rather than writing through this one,
  *               so a reader that took it sees one coherent configuration for as long as it holds it
  *               -- read it with cf_config_get rather than reaching through this pointer
+ * @param name the family's name, published so a rename cannot tear one a reader is copying
  * @param config_epoch guards a published config against reclaim while a reader is copying it
  * @param config_retire configs displaced by a reconfigure, freed once no reader can hold them
  * @param dir the directory this family's klogs are resolved against, which is the database
@@ -90,7 +91,11 @@
 typedef struct cf
 {
     uint64_t cf_id;
-    char name[TDB_MAX_CF_NAME_LEN];
+    /* published rather than written in place. a rename rewrites it while a flush may be reading it
+     * to stamp onto an sstable, where it is the first component of a block cache key, so the name a
+     * reader holds has to stay whole -- it is replaced by publishing another and freeing the old
+     * once no reader can still be on it */
+    _Atomic(char *) name;
     _Atomic(tidesdb_column_family_config_t *) config;
     tdb_epoch_t config_epoch;
     tdb_retire_list_t config_retire;
@@ -136,6 +141,20 @@ typedef struct cf
  * @param out out -- the new column family on success, owned by the caller (freed by cf_free)
  * @return 0 on success, -1 on a bad argument, an invalid config, an io or allocation failure
  */
+/**
+ * cf_name_publish
+ * publish name as this family's, retiring whatever it carried before
+ *
+ * a rename cannot write the field in place -- a flush stamping the name onto an sstable would copy
+ * it mid-write, and that name is the first component of a block cache key. the replacement is
+ * published instead, and the old one retired behind the guard a config change already uses
+ * @param cf the family
+ * @param name the name to carry
+ * @param out_old receives the displaced name to free, or NULL when there was none
+ * @return TDB_SUCCESS, or TDB_ERR_MEMORY
+ */
+int cf_name_publish(cf_t *cf, const char *name, char **out_old);
+
 int cf_create(const char *db_dir, uint64_t cf_id, const tidesdb_column_family_config_t *config,
               const tidesdb_encoding_registry_t *reg, vlog_t *vlog, cache_t *cache,
               fd_manager_t *fdm, arena_pool_t *arena_pool, _Atomic(int64_t) *now, cf_t **out);

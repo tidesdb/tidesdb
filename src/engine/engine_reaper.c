@@ -55,9 +55,9 @@ static int engine_sstable_lru_cmp(const void *a, const void *b)
 }
 
 /* the fd-eviction tick: gather every sstable, order it least-recently-accessed first, and hand it
- * to the fd reaper, which closes idle klog descriptors down to the budget. the whole tick holds the
- * registry read lock so a concurrent cf-levels reload cannot free a level set or truncate a klog
- * underneath the collected, still-referenced sstables */
+ * to the fd reaper, which closes idle klog descriptors down to the budget. the collect references
+ * every sstable it returns, so a concurrent cf-levels reload cannot free a level set or truncate a
+ * klog underneath them once the borrow that named the families has been given back */
 static void engine_fd_reaper_tick(void *ctx)
 {
     tidesdb_t *db = (tidesdb_t *)ctx;
@@ -71,12 +71,10 @@ static void engine_fd_reaper_tick(void *ctx)
     const int budget = fd_manager_open_budget(&db->fdm);
     if (budget >= INT_MAX || fd_manager_open_total(&db->fdm) <= budget) return;
 
-    cf_registry_rdlock(db->cfs);
     sstable_t **cands = NULL;
     const int n = engine_collect_sstables(db, &cands);
     if (n <= 0)
     {
-        cf_registry_rdunlock(db->cfs);
         free(cands);
         return;
     }
@@ -98,7 +96,6 @@ static void engine_fd_reaper_tick(void *ctx)
     (void)fd_reaper_run(&db->fdm, cands, resident, db->vlog);
     for (int i = 0; i < resident; i++)
         if (sstable_unref(cands[i])) sstable_close(cands[i]);
-    cf_registry_rdunlock(db->cfs);
     free(cands);
 }
 
@@ -110,15 +107,14 @@ static void engine_deferred_free_tick(void *ctx)
     tidesdb_t *db = (tidesdb_t *)ctx;
     if (atomic_load_explicit(&db->closing, memory_order_acquire)) return;
 
-    cf_registry_rdlock(db->cfs);
-    const int n = cf_registry_count_locked(db->cfs);
-    for (int i = 0; i < n; i++)
-        level_set_reclaim_deferred(cf_registry_at_locked(db->cfs, i)->levels);
-    cf_registry_rdunlock(db->cfs);
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
+    for (int i = 0; i < n; i++) level_set_reclaim_deferred(live[i]->levels);
+    cf_registry_view_leave(db->cfs, view);
 
     /* immutables a flush could not free inline, because readers still held them when it finished.
-     * swept here rather than waited on there, so a flush never holds the registry lock waiting for
-     * a reader to leave */
+     * swept here rather than waited on there, so a flush never waits on a reader to leave */
     tidesdb_l0_reclaim_pending(db->l0);
 }
 

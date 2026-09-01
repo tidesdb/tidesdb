@@ -39,11 +39,12 @@ static uint64_t engine_recovered_max_sstable_id(const tidesdb_manifest_t *manife
 uint64_t engine_recovered_max_sstable_seq(tidesdb_t *db)
 {
     uint64_t max_seq = 0;
-    cf_registry_rdlock(db->cfs);
-    const int n = cf_registry_count_locked(db->cfs);
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
     for (int i = 0; i < n; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         if (!cf) continue;
         const int total = level_set_collect_all(cf->levels, NULL, 0);
         if (total <= 0) continue;
@@ -58,7 +59,7 @@ uint64_t engine_recovered_max_sstable_seq(tidesdb_t *db)
             }
         free(arr);
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
     return max_seq;
 }
 

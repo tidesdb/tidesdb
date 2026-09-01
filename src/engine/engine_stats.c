@@ -206,12 +206,13 @@ int engine_cf_estimate_cardinality(cf_t *cf, uint64_t *out_estimate)
  * read lock, so no family is added or dropped mid-walk */
 static void engine_db_fold_cfs(tidesdb_t *db, tidesdb_db_stats_t *out)
 {
-    cf_registry_rdlock(db->cfs);
-    const int n = cf_registry_count_locked(db->cfs);
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
     out->num_column_families = n;
     for (int i = 0; i < n; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         if (!cf) continue;
         out->flush_count += atomic_load_explicit(&cf->flush_count, memory_order_relaxed);
         out->flush_bytes_written +=
@@ -230,7 +231,7 @@ static void engine_db_fold_cfs(tidesdb_t *db, tidesdb_db_stats_t *out)
             out->total_data_size_bytes += level_set_level_bytes(cf->levels, lvl);
         }
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
 }
 
 /* accumulate one live transaction into the db stats */
@@ -307,11 +308,12 @@ int engine_get_klog_encoding_stats(tidesdb_t *db, tidesdb_encoding_stats_t *out,
     if (!db || !out || !out_count || max == 0) return TDB_ERR_INVALID_ARGS;
     *out_count = 0;
 
-    cf_registry_rdlock(db->cfs);
-    const int ncf = cf_registry_count_locked(db->cfs);
+    cf_t **live = NULL;
+    int ncf = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &ncf);
     for (int i = 0; i < ncf; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         if (!cf) continue;
 
         const int total = level_set_snapshot(cf->levels, NULL, 0);
@@ -341,7 +343,7 @@ int engine_get_klog_encoding_stats(tidesdb_t *db, tidesdb_encoding_stats_t *out,
             if (all[j].sst && sstable_unref(all[j].sst)) sstable_close(all[j].sst);
         free(all);
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
     return TDB_SUCCESS;
 }
 

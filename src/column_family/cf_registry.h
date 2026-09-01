@@ -20,6 +20,10 @@
 
 typedef struct cf_registry cf_registry_t;
 
+/* one published, immutable snapshot of the registry's membership; borrowed by readers and handed
+ * back by name so the borrow can be counted on the snapshot itself */
+typedef struct cf_registry_view cf_registry_view_t;
+
 /**
  * cf_registry_create
  * create an empty registry whose next allocated cf id is next_cf_id
@@ -78,16 +82,17 @@ cf_t *cf_registry_get_by_id(cf_registry_t *reg, uint64_t cf_id);
 int cf_registry_remove(cf_registry_t *reg, const char *name, cf_t **out);
 
 /**
- * cf_registry_rename_locked
- * change a registered column family's name, re-indexing it since the name is the lookup key, with
- * the registry write lock already held by the caller -- a rename has more to do under that lock
- * than change the name, so it takes it once around the whole operation
+ * cf_registry_rename
+ * give a family a new name, published so no reader can copy a torn one
+ *
+ * the caller must hold the family's compaction claim, which is what covers the readers that copy
+ * the name outside a view borrow
  * @param reg the registry
- * @param cf the column family to rename, already in the registry
- * @param new_name the new name, shorter than TDB_MAX_CF_NAME_LEN
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_EXISTS when new_name is taken
+ * @param cf the family
+ * @param new_name the name to carry
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_MEMORY
  */
-int cf_registry_rename_locked(cf_registry_t *reg, cf_t *cf, const char *new_name);
+int cf_registry_rename(cf_registry_t *reg, cf_t *cf, const char *new_name);
 
 /**
  * cf_registry_next_cf_id
@@ -98,51 +103,61 @@ int cf_registry_rename_locked(cf_registry_t *reg, cf_t *cf, const char *new_name
 uint64_t cf_registry_next_cf_id(cf_registry_t *reg);
 
 /**
- * cf_registry_rdlock
- * take the read lock so a caller can scan the registry consistently; no cf can be added or removed
- * while it is held
+ * cf_registry_lock
+ * take the registry exclusively so a caller can change what it holds, or change a registered
+ * family's structure
+ *
+ * only the membership changes take this -- create, drop, rename, clone. the readers are all on the
+ * published view, so a caller holding this excludes the other writers and nothing else
  * @param reg the registry
  */
-void cf_registry_rdlock(cf_registry_t *reg);
+void cf_registry_lock(cf_registry_t *reg);
 
 /**
- * cf_registry_rdunlock
- * release the read lock
+ * cf_registry_unlock
+ * release the registry
  * @param reg the registry
  */
-void cf_registry_rdunlock(cf_registry_t *reg);
+void cf_registry_unlock(cf_registry_t *reg);
 
 /**
- * cf_registry_wrlock
- * take the write lock so a caller can mutate a registered cf's structure -- the same lock the
- * reaper and query paths hold for read, so a structural change like reloading a cf's level set
- * excludes them
+ * cf_registry_view_enter
+ * borrow the published family list without taking the read lock, guarded by the view epoch
+ *
+ * the background work that reads this list -- every flush build and install, every compaction
+ * claim -- arrives continuously under load, and taking the read lock for it is what leaves a create
+ * or a drop waiting on a stream that never breaks. a scheduler that does not hand the writer its
+ * turn promptly turns that wait into a stall of minutes, so the readers stay off the lock entirely
+ * and the writers contend only with each other.
+ *
+ * the returned array belongs to the view and stays valid until cf_registry_view_leave, which every
+ * caller must reach on every path
  * @param reg the registry
+ * @param out_cfs receives the borrowed family array, valid until the matching leave
+ * @param out_count receives how many families it holds, zero when there are none
+ * @return the borrowed view, to be handed back to cf_registry_view_leave; NULL when there is none
  */
-void cf_registry_wrlock(cf_registry_t *reg);
+cf_registry_view_t *cf_registry_view_enter(cf_registry_t *reg, cf_t ***out_cfs, int *out_count);
 
 /**
- * cf_registry_wrunlock
- * release the write lock
+ * cf_registry_view_leave
+ * give back the borrow taken by cf_registry_view_enter
  * @param reg the registry
+ * @param view the view that enter returned, may be NULL
  */
-void cf_registry_wrunlock(cf_registry_t *reg);
+void cf_registry_view_leave(cf_registry_t *reg, cf_registry_view_t *view);
 
 /**
- * cf_registry_count_locked
- * the number of registered column families; the caller must hold the read lock
+ * cf_registry_wait_readers_drained
+ * wait until no borrow of the published view is outstanding
+ *
+ * a family removed from the registry is still named by a view a reader borrowed before the removal
+ * was published, so the handle cannot be freed until those readers have gone. the wait is on that
+ * displaced view alone, whose borrows can only fall once a newer one is published -- waiting for no
+ * reader at all would never come back under work that reads continuously
  * @param reg the registry
- * @return the count, or 0 when reg is NULL
+ * @param view the displaced view to wait out
  */
-int cf_registry_count_locked(const cf_registry_t *reg);
-
-/**
- * cf_registry_at_locked
- * the column family at an index; the caller must hold the read lock
- * @param reg the registry
- * @param index 0-based index
- * @return the column family, or NULL when the index is out of range
- */
-cf_t *cf_registry_at_locked(const cf_registry_t *reg, int index);
+void cf_registry_wait_readers_drained(cf_registry_t *reg, cf_registry_view_t *view);
 
 #endif /* __TIDESDB_CF_REGISTRY_H__ */

@@ -254,10 +254,10 @@ Installs are ordered by a ticket. Workers may build in parallel — building is 
 part — but each waits its turn to install, so the level sets are mutated in the same order
 the memtables were sealed. Out-of-order installs would put an older sstable above a newer one.
 
-That wait happens **before** the worker takes the family registry read lock, not while holding it.
-Both the build and the install need that lock, so the families they address cannot be dropped
-underneath them — but holding it across the wait as well would stretch one worker's hold to cover
-every flush queued ahead of it, and a `create` or `drop` waits behind exactly that. It would also
+That wait happens **before** the worker borrows the family view, not while holding one. Both the
+build and the install need that borrow, so the families they address cannot be dropped underneath
+them — but holding it across the wait as well would stretch one worker's hold to cover every flush
+queued ahead of it, and a `drop` waits behind exactly that. It would also
 deadlock outright once writers are preferred, since the worker holding the earlier ticket needs the
 same read lock to make progress. The families are therefore re-resolved by id after the wait, and
 an output whose family was dropped in the gap is discarded rather than installed.

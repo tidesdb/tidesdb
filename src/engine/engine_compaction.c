@@ -257,9 +257,9 @@ static void engine_schedule_claimed_cf(tidesdb_t *db, cf_t *cf)
     atomic_store_explicit(&cf->compacting, 0, memory_order_release);
 }
 
-/* the backstop scheduler tick: claim each idle cf (compacting 0->1) under the registry read lock,
- * then plan each outside the lock. the claim also protects the cf from being freed by a concurrent
- * drop, which waits the flag out */
+/* the backstop scheduler tick: claim each idle cf (compacting 0->1) against a borrowed view, then
+ * plan each once the borrow is given back. the claim is what protects the cf from being freed by a
+ * concurrent drop, which waits the flag out */
 static void engine_compaction_scheduler_tick(void *ctx)
 {
     tidesdb_t *db = (tidesdb_t *)ctx;
@@ -270,14 +270,15 @@ static void engine_compaction_scheduler_tick(void *ctx)
      * cannot run the scan itself -- it would be every registry shard, once per written key */
     tidesdb_txn_registry_publish_min_snapshot(db->txn_registry);
 
-    cf_registry_rdlock(db->cfs);
-    const int n = cf_registry_count_locked(db->cfs);
+    cf_t **live = NULL;
+    int n = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
     cf_t **claimed = n ? malloc((size_t)n * sizeof(*claimed)) : NULL;
     int nc = 0;
     int deepest_tier = 0;
     for (int i = 0; i < n; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         /* the deepest tier across the families, whether or not this tick claims them. it is the
          * signal ingestion paces against, so it has to reflect every family and not just the ones
          * that happened to be idle */
@@ -287,7 +288,7 @@ static void engine_compaction_scheduler_tick(void *ctx)
         int expected = 0;
         if (atomic_compare_exchange_strong(&cf->compacting, &expected, 1)) claimed[nc++] = cf;
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
 
     /* published every tick, so a tier that drains releases the writers it was slowing */
     tidesdb_l0_set_tier_depth(db->l0, deepest_tier);
@@ -415,14 +416,15 @@ void engine_vlog_gc(tidesdb_t *db)
     vlog_live_reset(db->vlog);
 
     int rc = TDB_SUCCESS;
-    cf_registry_rdlock(db->cfs);
-    const int ncf = cf_registry_count_locked(db->cfs);
+    cf_t **live = NULL;
+    int ncf = 0;
+    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &ncf);
     for (int i = 0; i < ncf && rc == TDB_SUCCESS; i++)
     {
-        cf_t *cf = cf_registry_at_locked(db->cfs, i);
+        cf_t *cf = live[i];
         if (cf) rc = engine_vlog_note_cf(cf, db->vlog);
     }
-    cf_registry_rdunlock(db->cfs);
+    cf_registry_view_leave(db->cfs, view);
 
     /* a staged prepare's values are held by no table and no memtable -- its entries enter neither
      * until phase two decides it and the decision is applied -- so counting only what the families

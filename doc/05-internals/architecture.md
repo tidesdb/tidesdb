@@ -102,37 +102,54 @@ has no directory of its own — every key log sits in the database directory car
 Keys are namespaced inside the shared structures by a four-byte big-endian family index
 prefix, so one skip list and one log hold every family's data in one ordered space.
 
-### The family registry lock
+### The family registry
 
-The families themselves live in a registry behind a read-write lock, and which side of it a
-thread takes is not evenly matched.
+The families live in a registry that separates two questions that used to share one lock: *which
+families exist*, and *may this family's handle still be used*.
 
-Almost everything takes it for **reading**: every flush install, every compaction claim, every
-reaper sweep, every statistics fold. Under load these arrive continuously, and none of them is
-the caller's work. Only `create`, `drop`, `rename` and `clone` take it for **writing**, and those
-are exactly the operations a user issues and waits on.
+Almost everything reads that membership: every flush build and install, every compaction claim,
+every reaper sweep, every statistics fold. Under load these arrive continuously, and none of them is
+the caller's work. Only `create`, `drop`, `rename` and `clone` change it, and those are exactly the
+operations a user issues and waits on.
 
-That asymmetry makes the default lock policy the wrong one. A reader-writer lock admits an arriving
-reader while a writer waits, so a database whose background work never stops never produces the gap
-the writer needs. The writer is not slow; it never runs. A `CREATE TABLE` hangs for minutes while
-the process sits at a full core, which reads as a deadlock and is really starvation.
+That asymmetry is fatal to a reader-writer lock. A reader-writer lock admits an arriving reader
+while a writer waits, so a database whose background work never stops never produces the gap the
+writer needs -- the writer is not slow, it never runs. Announcing the waiting writer so arriving
+readers hold off narrows the window but does not close it: the writer still has to be handed the
+lock, and on a platform whose scheduler does not do that promptly under contention, a
+`CREATE TABLE` sits for minutes at a full core. That reads as a deadlock and is really starvation.
 
-The lock therefore announces a waiting writer. A writer raises a count before it acquires and lowers
-it after, and a reader arriving while that count is non-zero waits for it to fall. The writer's wait
-is bounded by the readers already inside rather than by the load. A reader that slips through
-between reading the count and acquiring costs the writer one more hold, which is why the count is
-enough and a handoff is not needed. `tdb_wprwlock_t` carries this, and the commit gate and the
-manifest take it for the same reason.
+So the readers do not take a lock at all. The registry publishes an **immutable view** of its
+membership, and a reader borrows it. A borrow is two-stage, and the split is the point: a short
+guard covers only the few instructions between reading the published pointer and counting the
+borrow, while a **reference count on the view itself** covers the long hold -- a flush build, which
+runs for as long as its I/O takes. A membership change publishes a new view, so borrows arriving
+afterwards take that one and an unpublished view's count only falls. Waiting for those counts to
+reach zero therefore terminates however busy the readers are, which waiting for *no reader at all*
+could not.
 
-The one rule it depends on is that no reader may take the lock again while holding it, and none
-does. Such a reader would wait on its own writer's announcement and never reach the acquire that
-would release it.
+The wait is on **every** view a departing family was named by, not just the one the change
+displaced. A borrow can be holding an older view still -- a flush borrows one, a create publishes
+over it without waiting, and a later drop that waited only on what *it* displaced would free a
+handle that flush is still using. The registry therefore counts the views it has allocated, and a
+removal waits until only the published one is left, holding the registry meanwhile so nothing can
+publish another.
 
-Two things follow from the same reasoning. A flush waits for its install ticket *before* taking
-the read lock, never while holding it -- waiting under it would both lengthen the hold to include
-every flush ahead and close a cycle, since the worker holding the earlier ticket needs the same
-read lock to install. And a flush never waits for a reader to leave in order to free a memtable;
-it hands the memtable to the reaper instead. See
+The lock that remains is a plain mutex, and only the four membership changes take it. They contend
+with each other and with nothing else, so there is no stream for a writer to lose to.
+
+Lifetime follows from the same mechanism. `drop` publishes a view without the family, waits out the
+borrows that could still name it, and only then frees the handle -- the wait the read lock used to
+provide implicitly. A family's mutable fields work the same way rather than being written in place:
+its name is published and the old one retired, because a flush copies that name onto an sstable
+where it is the first component of a block-cache key, and a torn copy is a wrong key rather than a
+cosmetic defect. A clone swaps its destination's level set while that family is unpublished, since
+the compaction scheduler reads every published family's overlap depth whether or not it is claimed.
+
+Two things follow from the same reasoning. A flush waits for its install ticket *before* it borrows
+the view, never while holding one -- borrowing across the wait would stretch one worker's hold to
+cover every flush queued ahead of it. And a flush never waits for a reader to leave in order to free
+a memtable; it hands the memtable to the reaper instead. See
 [Memtable and WAL](/internals/memtable-and-wal#reclaiming-a-sealed-memtable).
 
 ## Threads

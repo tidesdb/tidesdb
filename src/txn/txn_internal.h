@@ -101,7 +101,7 @@ int txn_require_active(tdb_txn_t *txn);
 
 /**
  * txn_key_hash
- * the 64-bit fnv-1a hash of a cf-namespaced key, which is what picks a write's reservation slot.
+ * the 64-bit xxh3 hash of a cf-namespaced key, which is what picks a write's reservation slot.
  * shared so the two-phase path can name the same slots the prepare claimed
  * @param cf_index the column family the key belongs to
  * @param key the key bytes

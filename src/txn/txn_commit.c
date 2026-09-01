@@ -13,6 +13,7 @@
 #include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
 #include "txn_internal.h"
+#include "xxhash.h" /* XXH3 for the reservation slot and fingerprint hash */
 
 /* the commit half of a transaction -- everything between a caller saying commit and the batch
  * becoming visible. it decides whether the commit may proceed at all (the conflict scan, the
@@ -22,19 +23,9 @@
 
 uint64_t txn_key_hash(uint32_t cf_index, const uint8_t *key, size_t key_size)
 {
-    uint64_t h = 1469598103934665603ULL;     /* fnv offset basis */
-    const uint64_t prime = 1099511628211ULL; /* fnv prime */
-    for (int s = 0; s < 32; s += 8)
-    {
-        h ^= (uint8_t)(cf_index >> s);
-        h *= prime;
-    }
-    for (size_t i = 0; i < key_size; i++)
-    {
-        h ^= key[i];
-        h *= prime;
-    }
-    return h;
+    /* the family namespaces the key through the seed rather than by prefixing it into a staging
+     * buffer, which would cost a copy per call on a path that runs several times per written key */
+    return XXH3_64bits_withSeed(key, key_size, cf_index);
 }
 
 /* order two exclusive upper bounds, either of which may be open. an open bound is above every

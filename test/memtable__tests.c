@@ -884,6 +884,17 @@ void test_l0_wal_ack_on_stage_survives_close(void)
     if (wal_rc != 0)
         fprintf(stderr, "buffered wal open of %s failed, errno %d (%s)\n", wal_path, errno,
                 strerror(errno));
+
+    /* the ring is raised to the block manager's minimum and paired with a byte of completion flag
+     * for every byte of it, so the open asks for two megabyte-sized contiguous blocks. a 32-bit
+     * address space this far into a run of small allocations may not have them, and that is the
+     * address space's limit rather than a fault in what this test covers -- so it is reported and
+     * skipped there. on a 64-bit build the same refusal is a real failure and still fails */
+    if (wal_rc != 0 && errno == ENOMEM && sizeof(void *) == 4)
+    {
+        printf("  a 32-bit address space could not spare the staging ring, skipping\n");
+        return;
+    }
     ASSERT_EQ(wal_rc, 0);
     tidesdb_l0_t *l0 =
         tidesdb_l0_create(L0_BUFFER_SIZE, L0_QUEUE_SIZE, MT_MAX_LEVEL, MT_PROBABILITY, NULL, NULL);

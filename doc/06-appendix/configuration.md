@@ -22,7 +22,7 @@ by the call that takes them and may be freed immediately after.
 | `num_flush_threads` | 2 | Workers writing sealed memtables to sstables |
 | `num_compaction_threads` | 2 | Workers merging sstables |
 | `log_level` | `TDB_LOG_INFO` | Engine log verbosity |
-| `log_to_file` | 0 | Write the log to `tidesdb.log` in the database directory rather than stderr |
+| `log_to_file` | 0 | Write the log to `LOG` in the database directory rather than stderr |
 | `log_truncation_at` | 0 | Truncate that file once it passes this size; 0 never truncates |
 | `block_cache_size` | 64 MiB | The database-wide block cache budget |
 | `max_open_sstables` | 1024 | Ceiling on resident descriptors for sstable key logs and value-log segments together. The reaper reclaims toward a slightly lower figure — a reserve of an eighth, at least 16 and at most half, is held back so a reader can still open a file while it works, leaving 896 at the default. **Cut at open to fit the process open-file ceiling**, which at the defaults it does not: 1024 against the usual 1024 `ulimit -n` leaves nothing for the manifest, so it comes down to 960 and says so at warn. Raise the ceiling with [`tidesdb_raise_open_file_limit`](/reference/database#tidesdb_raise_open_file_limit) to keep the larger figure. See [the descriptor manager](/internals/fd-manager) |

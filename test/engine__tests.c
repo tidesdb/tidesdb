@@ -28,6 +28,8 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define ENGINE_TEST_DB_DIR "." PATH_SEPARATOR "test_engine_db"
+/* where log_to_file routes output, named once so a rename of the file is one edit here */
+#define ENGINE_TEST_LOG_PATH ENGINE_TEST_DB_DIR PATH_SEPARATOR "LOG"
 
 /* a value-log segment small enough that a few dozen spilled values roll past it, and the number of
  * such values to write, so the store must open more than the one segment it starts with */
@@ -2590,7 +2592,7 @@ void test_engine_log_to_file_writes_into_the_database_directory(void)
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
     /* the engine logs the open, the family create and the close at info, so the file has content */
-    FILE *f = fopen(ENGINE_TEST_DB_DIR PATH_SEPARATOR "tidesdb.log", "rb");
+    FILE *f = fopen(ENGINE_TEST_LOG_PATH, "rb");
     ASSERT_TRUE(f != NULL);
     ASSERT_EQ(fseek(f, 0, SEEK_END), 0);
     const long size = ftell(f);
@@ -2602,7 +2604,7 @@ void test_engine_log_to_file_writes_into_the_database_directory(void)
     cfg.log_to_file = 0;
     ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
-    f = fopen(ENGINE_TEST_DB_DIR PATH_SEPARATOR "tidesdb.log", "rb");
+    f = fopen(ENGINE_TEST_LOG_PATH, "rb");
     ASSERT_TRUE(f != NULL);
     ASSERT_EQ(fseek(f, 0, SEEK_END), 0);
     ASSERT_EQ(ftell(f), size);
@@ -2637,7 +2639,7 @@ void test_engine_log_truncation_bounds_the_file(void)
     }
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
-    FILE *f = fopen(ENGINE_TEST_DB_DIR PATH_SEPARATOR "tidesdb.log", "rb");
+    FILE *f = fopen(ENGINE_TEST_LOG_PATH, "rb");
     ASSERT_TRUE(f != NULL);
     ASSERT_EQ(fseek(f, 0, SEEK_END), 0);
     const long size = ftell(f);

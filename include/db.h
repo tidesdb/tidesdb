@@ -315,8 +315,8 @@ typedef struct tidesdb_column_family_config_t
  * open to what this process's open-file ceiling leaves once the manifest, stdio and temporaries are
  * allowed for, and a lowering says so in the log at warn -- raise the ceiling with
  * tidesdb_raise_open_file_limit first if the larger figure is the one you want
- * @param log_to_file 1 to write the log to tidesdb.log inside db_path, 0 for stderr. the sink is
- * process-wide rather than per-database, so the last database opened with this set owns it and
+ * @param log_to_file 1 to write the log to a file named LOG inside db_path, 0 for stderr. the sink
+ * is process-wide rather than per-database, so the last database opened with this set owns it and
  * every other handle in the process logs there too, until that one closes
  * @param log_truncation_at size in bytes past which the log file is truncated and reopened, 0 for
  * never; ignored unless log_to_file is set

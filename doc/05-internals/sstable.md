@@ -26,15 +26,15 @@ A single `CCCCCC.SSSSSSSSSSSS.klog` file — the owning family's id and then the
 zero-padded — containing, in order:
 
 ```
-  +-------------------------------------------------+
-  |  btree nodes          leaves, then the levels   |
-  |                       above them                |
-  +-------------------------------------------------+
-  |  filter partitions    the aux region, written   |
-  |  + directory          when the build finalizes  |
-  +-------------------------------------------------+
-  |  footer               fixed head + variable tail|
-  +-------------------------------------------------+
+  +--------------------------------------------------+
+  |  btree nodes          leaves, then the levels    |
+  |                       above them                 |
+  +--------------------------------------------------+
+  |  filter partitions    the aux region, written    |
+  |  + directory          when the build finalizes   |
+  +--------------------------------------------------+
+  |  footer               fixed head + variable tail |
+  +--------------------------------------------------+
 ```
 
 Values above the database's `value_separation_threshold` are not in this file at all. They live in

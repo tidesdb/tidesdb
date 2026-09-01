@@ -59,7 +59,7 @@ config.memtable_sync_mode = TDB_SYNC_FULL;
 | `log_level` | `TDB_LOG_INFO` |
 | `block_cache_size` | 64 MiB |
 | `max_open_sstables` | 1024 |
-| `log_to_file` | 0 (stderr; 1 writes `tidesdb.log` inside `db_path`) |
+| `log_to_file` | 0 (stderr; 1 writes `LOG` inside `db_path`) |
 | `log_truncation_at` | 0 (no truncation) |
 | `memtable_write_buffer_size` | 64 MiB |
 | `memtable_skip_list_max_level` | 12 |

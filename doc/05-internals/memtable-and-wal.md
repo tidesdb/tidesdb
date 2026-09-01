@@ -74,16 +74,16 @@ A memtable is a pair — an ordered structure and the log that makes it recovera
 state needed to retire it safely:
 
 ```
-  skip_list        the ordered structure; a version chain per key
-  wal              the block manager for this generation's log
-  id, generation   identity; the generation names the log file
-  refcount         structural + transient reader references
-  writers          an epoch guarding in-flight writers
-  flushed          set once the data is durable in L1
-  claimed          set when a flush worker has taken it
-  vlog_token       a value log floor, for the values only this memtable names
-  range_tombstones the intervals deleted in this generation, with their own lock and a
-                   published fragment count so a read that needs none never takes it
+  skip_list         the ordered structure; a version chain per key
+  wal               the block manager for this generation's log
+  id, generation    identity; the generation names the log file
+  refcount          structural + transient reader references
+  writers           an epoch guarding in-flight writers
+  flushed           set once the data is durable in L1
+  claimed           set when a flush worker has taken it
+  vlog_token        a value log floor, for the values only this memtable names
+  range_tombstones  the intervals deleted in this generation, with their own lock and a
+                    published fragment count so a read that needs none never takes it
 ```
 
 The range tombstones sit beside the skip list rather than in it, because they are not keyed by

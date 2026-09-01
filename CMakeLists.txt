@@ -125,7 +125,7 @@ if(TIDESDB_WITH_TSAN)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD" OR CMAKE_SYSTEM_NAME STREQUAL "DragonFly" OR CMAKE_SYSTEM_NAME STREQUAL "SunOS" OR CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
         message(FATAL_ERROR "ThreadSanitizer is not supported on this platform")
     else()
-        # Linux, macOS, FreeBSD support TSan
+        # linux, macos, freebsd support TSan
         add_compile_options(-Wextra -Wall -fsanitize=thread -fno-omit-frame-pointer)
         add_link_options(-fsanitize=thread)
     endif()
@@ -139,17 +139,22 @@ elseif(TIDESDB_WITH_SANITIZER)
         # 4702 (unreachable code)
         add_compile_options(/W4 /std:c17 /experimental:c11atomics /wd4311 /wd4244 /wd4267 /wd4047 /wd4189 /wd4101 /wd4459 /wd4127 /wd4305 /wd4702)
     elseif(MINGW)
-        # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
-    elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD" OR CMAKE_SYSTEM_NAME STREQUAL "DragonFly" OR CMAKE_SYSTEM_NAME STREQUAL "SunOS")
-        # ASan is not supported on OpenBSD, DragonFlyBSD, and OmniOS/Illumos
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD" OR CMAKE_SYSTEM_NAME STREQUAL "DragonFly" OR CMAKE_SYSTEM_NAME STREQUAL "SunOS" OR CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
+        # ASan is unavailable on OpenBSD, DragonFlyBSD and OmniOS/Illumos, and on NetBSD it does not
+        # sit with the ASLR the kernel applies -- the instrumented binary exits before running a
+        # single test, so the suite passes by not running. warnings stay on, the sanitizer does not,
+        # and the refusal lives here rather than in each caller's configure line.
+        #
+        # said out loud, because a caller that asked for a sanitizer and quietly did not get one is
+        # the same green-without-running failure by another route
+        message(STATUS "tidesdb: ${CMAKE_SYSTEM_NAME} cannot run the address sanitizer, building without it")
         add_compile_options(-Wextra -Wall)
     elseif(CMAKE_SYSTEM_NAME MATCHES "BSD")
-        # FreeBSD, NetBSD support sanitizers
+        # FreeBSD and the remaining BSDs run the sanitizers
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)
     else()
-        # Unix/Linux/macOS flags
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)
     endif()
@@ -165,7 +170,6 @@ else()
         # enabled -- both flag real bugs and must not be silenced
         add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4702)
     elseif(MINGW)
-        # MinGW/GCC flags without sanitizers
         add_compile_options(-Wextra -Wall -std=c11)
     else()
         # Unix/Linux/macOS/BSD with GCC or Clang -- warnings belong on the default build, not only
@@ -173,15 +177,6 @@ else()
         add_compile_options(-Wextra -Wall)
     endif()
 endif()
-
-# fuzzing: a guided run has to see coverage from the engine itself, not just from the harness, so
-# the library it links must be instrumented. that instrumentation is deliberately not applied
-# here, where it would reach every target in the build: the callbacks it compiles in are serviced by
-# libFuzzer's runtime, which only the coverage-guided targets link, so instrumenting the library
-# everything else links puts those callbacks inside ordinary test binaries whose own main() never
-# initializes that runtime -- where, under enough threads, they fault. an instrumented copy of the
-# library is built alongside the fuzz targets below and linked only by the ones that carry the
-# runtime. clang only, since it is the only compiler providing libFuzzer.
 
 # vendored third-party headers, added as SYSTEM so their diagnostics never mix into this project's
 # warning output -- the code here is upstream's to change, not ours
@@ -216,8 +211,7 @@ set_target_properties(tidesdb PROPERTIES
 
 target_include_directories(tidesdb PRIVATE src)
 
-# the library compiles clean under these, so wiring them in is what keeps it that way. they are
-# applied to the library target alone -- the test and fuzz sources declare their cases as bare
+# the test and fuzz sources declare their cases as bare
 # test_x(), which trips the prototype and shadow flags in bulk without indicating a defect there.
 # each flag is probed before use so an older GCC, a Clang, or a BSD toolchain that lacks one still
 # configures. -Wswitch-enum is deliberately absent: the compression backends are selected by
@@ -440,7 +434,6 @@ if(APPLE)
         target_include_directories(tidesdb PUBLIC ${MACOS_DEPENDENCY_PREFIX}/include)
         target_link_directories(tidesdb PUBLIC ${MACOS_DEPENDENCY_PREFIX}/lib)
     elseif(USE_HOMEBREW)
-        # auto-detect homebrew installation
         if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
             # Apple Silicon -- Homebrew uses /opt/homebrew
             set(HOMEBREW_PREFIX "/opt/homebrew")
@@ -449,7 +442,6 @@ if(APPLE)
             set(HOMEBREW_PREFIX "/usr/local")
         endif()
 
-        # verify homebrew prefix exists before using it
         if(EXISTS "${HOMEBREW_PREFIX}/bin/brew")
             message(STATUS "Detected Homebrew at ${HOMEBREW_PREFIX}")
             target_include_directories(tidesdb PUBLIC ${HOMEBREW_PREFIX}/include)
@@ -464,12 +456,10 @@ if(APPLE)
         # or rely on CMAKE_PREFIX_PATH being set by the user
     endif()
 
-    # Link against compression libraries for macOS
     target_link_libraries(tidesdb PUBLIC
             m           # math library
             pthread     # pthread library
     )
-    # resolve compression backends via override -> known target -> -l fallback (issue #618)
     _tidesdb_link_enabled_compression()
 
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -526,7 +516,6 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "OpenB
             m           # math library
             pthread     # pthread library
     )
-    # resolve compression backends via override -> known target -> -l fallback (issue #618)
     _tidesdb_link_enabled_compression()
     _tidesdb_link_allocators()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
@@ -539,7 +528,6 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
             m           # math library
             pthread     # pthread library
     )
-    # resolve compression backends via override -> known target -> -l fallback (snappy off here)
     _tidesdb_link_enabled_compression()
     _tidesdb_link_allocators()
 else()
@@ -827,7 +815,6 @@ if(TIDESDB_BUILD_TESTS)
                     "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
             )
 
-            # proceed only when DLLs were found
             if(VCPKG_DLLS)
                 # copy DLLs to build directory after building tests
                 foreach(test_target ${TIDESDB_TEST_TARGETS})
@@ -862,7 +849,6 @@ install(FILES
 	DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tidesdb"
 )
 
-# ===== fuzzers (model-based differential + crash/recovery) =====
 if(TIDESDB_BUILD_FUZZERS)
     set(TIDESDB_FUZZ_MODEL fuzz/fuzz_model.c fuzz/fuzz_harness.c fuzz/fuzz_verify.c
                            fuzz/fuzz_durability.c)
@@ -951,8 +937,6 @@ if(TIDESDB_BUILD_FUZZERS)
         target_link_options(fuzz_tidesdb PRIVATE -fsanitize=fuzzer)
         target_link_libraries(fuzz_tidesdb PRIVATE tidesdb_cov)
 
-        # the coverage-guided decoder target. these decoders are small and branch heavily on the
-        # bytes themselves, which is exactly what coverage guidance is good at reaching
         add_executable(fuzz_decode_guided fuzz/fuzz_decode.c)
         target_include_directories(fuzz_decode_guided PRIVATE include src external fuzz)
         target_compile_options(fuzz_decode_guided PRIVATE -fsanitize=fuzzer)
@@ -961,7 +945,6 @@ if(TIDESDB_BUILD_FUZZERS)
     endif()
 endif()
 
-# ===== benchmark driver (named workloads over a shared db, with background sampling) =====
 if(TIDESDB_BUILD_BENCH)
     add_executable(tidesdb_bench bench/tidesdb_bench.c bench/bench_workloads.c bench/bench_sample.c)
     target_include_directories(tidesdb_bench PRIVATE include src external bench)

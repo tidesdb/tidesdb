@@ -227,7 +227,7 @@ than by what the engine allocated to hold it.
 ## Getting more detail
 
 Raise `log_level` to `TDB_LOG_TRACE` — the most detailed level — and set `log_to_file`, which routes
-output to `tidesdb.log` inside the database directory instead of stderr. Bound it with
+output to a file named `LOG` inside the database directory instead of stderr. Bound it with
 `log_truncation_at` if you leave it on, since a traced engine under load writes steadily. The engine
 logs recovery decisions, self-heals, slow rotations, flush and compaction completions, and
 backpressure events.

@@ -57,8 +57,10 @@ _Static_assert(MANIFEST_CF_NAME_MAX == TDB_MAX_CF_NAME_LEN,
 #define ENGINE_DB_DIR_MODE 0755
 
 /* the file log_to_file routes output to, inside the database directory so it travels with the data
- * it describes rather than depending on the working directory a process happened to start in */
-#define ENGINE_LOG_FILENAME "tidesdb.log"
+ * it describes rather than depending on the working directory a process happened to start in. named
+ * like the LOCK and MANIFEST beside it, and deliberately without the .log the write-ahead logs
+ * carry, so nothing scanning the directory for those has to tell it apart from one */
+#define ENGINE_LOG_FILENAME "LOG"
 
 /* poll interval while a drop waits out an in-flight compaction on the family being dropped */
 #define ENGINE_DROP_QUIESCE_STALL_US 1000

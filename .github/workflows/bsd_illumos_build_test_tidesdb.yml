@@ -157,8 +157,9 @@ jobs:
             echo " Configure CMake"
             echo "*=====================================*"
             export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
-            # ASAN is not compatible with NetBSD ASLR and causes tests to
-            # silently exit without running. build without sanitizer.
+            # no sanitizer here -- ASan does not sit with NetBSD's ASLR and the instrumented
+            # binary exits before running a test, so the suite would pass by not running. the
+            # build system refuses it on this platform too, so this is belt and braces.
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON
 

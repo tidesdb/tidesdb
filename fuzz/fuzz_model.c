@@ -520,6 +520,33 @@ int fuzz_model_prepared_open(const fuzz_model_t *m)
     return m ? m->txn_prepared : 0;
 }
 
+static const fm_op_t *fm_ops_decide(const fm_op_t *ops, size_t count, uint64_t cf_id,
+                                    const uint8_t *key, size_t klen)
+{
+    for (long i = (long)count - 1; i >= 0; i--)
+    {
+        const fm_op_t *op = &ops[i];
+        if (op->cf_id != cf_id) continue;
+        if (op->kind == FM_OP_RANGE_DELETE)
+        {
+            if (fm_op_covers(op, key, klen)) return op;
+            continue;
+        }
+        if (fuzz_key_cmp(op->key, op->klen, key, klen) == 0) return op;
+    }
+    return NULL;
+}
+
+/* whether a point op is the one its batch will actually write. the engine reserves the batch its
+ * commit builds, which is the buffered ops with the superseded ones dropped -- a point write with a
+ * later interval over it, or a later write to the same key, is never claimed at all. checking the
+ * raw buffer instead would demand a conflict on a key the engine never reserved */
+static int fm_op_survives(const fm_op_t *ops, size_t count, size_t at)
+{
+    if (ops[at].kind == FM_OP_RANGE_DELETE) return 1;
+    return fm_ops_decide(ops, count, ops[at].cf_id, ops[at].key, ops[at].klen) == &ops[at];
+}
+
 /* whether a committing entry is one the engine must refuse against a held one. the engine claims an
  * interval against the other intervals only, and checks a point write against both the intervals
  * and the point reservations -- an interval cannot be claimed as a key hash, there being no one key
@@ -552,8 +579,14 @@ int fuzz_model_txn_hits_prepared(const fuzz_model_t *m)
 {
     if (!m || !m->txn_prepared || !m->txn_open) return 0;
     for (size_t i = 0; i < m->buf_count; i++)
+    {
+        if (!fm_op_survives(m->buf, m->buf_count, i)) continue;
         for (size_t j = 0; j < m->pbuf_count; j++)
+        {
+            if (!fm_op_survives(m->pbuf, m->pbuf_count, j)) continue;
             if (fm_op_refused_against(&m->buf[i], &m->pbuf[j])) return 1;
+        }
+    }
     return 0;
 }
 
@@ -717,18 +750,7 @@ static const fm_op_t *fm_buf_decides(const fuzz_model_t *m, const char *cf, cons
 {
     const fm_cf_t *target = fm_cf_find(m, cf);
     if (!target) return NULL;
-    for (long i = (long)m->buf_count - 1; i >= 0; i--)
-    {
-        const fm_op_t *op = &m->buf[i];
-        if (op->cf_id != target->id) continue;
-        if (op->kind == FM_OP_RANGE_DELETE)
-        {
-            if (fm_op_covers(op, key, klen)) return op;
-            continue;
-        }
-        if (fuzz_key_cmp(op->key, op->klen, key, klen) == 0) return op;
-    }
-    return NULL;
+    return fm_ops_decide(m->buf, m->buf_count, target->id, key, klen);
 }
 
 int fuzz_model_get(const fuzz_model_t *m, const char *cf, const uint8_t *key, size_t klen,

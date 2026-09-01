@@ -196,8 +196,15 @@ jobs:
                   [ $((now - last)) -gt 45 ] || continue
                   echo "$now" > "$seen.last"
                   echo "*===== watchdog: pid $p alive ${age}s, sampling ====="
-                  ps -p $p -o pid,lid,pcpu,state,wchan,comm 2>/dev/null | head -40
-                  gdb -p $p -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | head -200
+                  ps -p $p -o pid,lid,pcpu,state,wchan,comm 2>/dev/null
+                  # gdb writes to a file rather than a pipe. piping it through head closes the pipe
+                  # once the cap is reached, and a gdb killed by the resulting SIGPIPE never detaches
+                  # -- which kills the very process being sampled, and truncates the dump to the
+                  # first few threads at that
+                  gdb -p $p -batch -ex 'set pagination off' -ex 'thread apply all bt' \
+                    > /tmp/bt.$p.$now 2>&1
+                  cat /tmp/bt.$p.$now
+                  rm -f /tmp/bt.$p.$now
                 done
                 sleep 5
               done

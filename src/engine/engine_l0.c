@@ -410,14 +410,13 @@ void engine_maybe_rotate(tidesdb_t *db)
      * mutex and a stream that can block -- logging under the rotation lock would hold it across
      * exactly the wait these figures are meant to find */
     if (done_us - started_us >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG_THROTTLED(
-            TDB_LOG_WARN,
-            "slow memtable rotation %llu us, %llu of it taking the lock, generation %llu "
-            "-- open %llu us, create %llu us, publish %llu us, enqueue %llu us",
-            (unsigned long long)(done_us - started_us),
-            (unsigned long long)(acquired_us - started_us), (unsigned long long)cost.gen,
-            (unsigned long long)cost.open_us, (unsigned long long)cost.create_us,
-            (unsigned long long)cost.publish_us, (unsigned long long)cost.enqueue_us);
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "slow memtable rotation %llu us, %llu of it taking the lock, generation %llu "
+                      "-- open %llu us, create %llu us, publish %llu us, enqueue %llu us",
+                      (unsigned long long)(done_us - started_us),
+                      (unsigned long long)(acquired_us - started_us), (unsigned long long)cost.gen,
+                      (unsigned long long)cost.open_us, (unsigned long long)cost.create_us,
+                      (unsigned long long)cost.publish_us, (unsigned long long)cost.enqueue_us);
 
     /* prepared outside the lock on purpose: this is the file creation, ring allocation and flush
      * thread the next rotation would otherwise do while every committer waits behind it. it is
@@ -427,9 +426,8 @@ void engine_maybe_rotate(tidesdb_t *db)
     engine_prepare_spare_wal(db);
     const uint64_t prepared_us = engine_monotonic_us();
     if (prepared_us - prepare_from >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG_THROTTLED(TDB_LOG_WARN,
-                                "slow next-wal prepare %llu us, off the rotation lock",
-                                (unsigned long long)(prepared_us - prepare_from));
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow next-wal prepare %llu us, off the rotation lock",
+                      (unsigned long long)(prepared_us - prepare_from));
 }
 
 int engine_force_rotate(tidesdb_t *db)

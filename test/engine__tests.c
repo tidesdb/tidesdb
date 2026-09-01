@@ -83,7 +83,7 @@ static int tests_failed = 0;
 /* a family's key logs sit in the database directory, their names carrying which family they belong
  * to, so the first family's files are found by prefix rather than by a directory of its own */
 #define ENGINE_TEST_CF0_DIR    ENGINE_TEST_DB_DIR
-#define ENGINE_TEST_CF0_PREFIX "000000."
+#define ENGINE_TEST_CF0_PREFIX "000000000000."
 /* the block manager's preallocation chunk, the extent an untrimmed build would occupy */
 #define ENGINE_TEST_PREALLOC_CHUNK (64u * 1024 * 1024)
 /* room for per-file headers and footers over the data the stats report */
@@ -3247,13 +3247,13 @@ void test_engine_open_sweeps_orphaned_sstables(void)
 
     /* stand in for what a crash leaves: a klog at an id the manifest never recorded, plus the leaf
      * staging file a build writes beside one */
-    const char *orphan = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000.000009999998.klog";
-    const char *stage = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000.000009999999.klog.lstmp";
+    const char *orphan = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000000000.000009999998.klog";
+    const char *stage = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000000000.000009999999.klog.lstmp";
 
     /* an id past the width its field pads to, which a database reaches by drawing one per flush and
      * per compaction output for long enough. the name is written out in full, so anything that
      * recognised these by their padded length would walk straight past this file and leave it */
-    const char *wide = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000.10000000000000.klog";
+    const char *wide = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000000000.10000000000000.klog";
 
     const char *dead[] = {orphan, stage, wide};
     for (size_t i = 0; i < sizeof(dead) / sizeof(dead[0]); i++)
@@ -3306,7 +3306,7 @@ void test_engine_open_keeps_sstables_when_manifest_self_healed(void)
     /* a klog the rebuild will not be able to adopt, which is the case the guard exists for: the
      * rebuild skips it, so the manifest it produces does not name it, and a sweep keyed on that
      * manifest would delete the only copy of whatever it holds */
-    const char *unreadable = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000.000009999998.klog";
+    const char *unreadable = ENGINE_TEST_CF0_DIR PATH_SEPARATOR "000000000000.000009999998.klog";
     FILE *f = fopen(unreadable, "wb");
     ASSERT_TRUE(f != NULL);
     fputs("half a sstable", f);

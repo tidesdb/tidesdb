@@ -221,7 +221,7 @@ void test_klog_filename(void)
     plain.birth_level = 2;
     plain.partition = MANIFEST_NO_PARTITION;
     ASSERT_EQ(sstable_klog_filename(&plain, name, sizeof(name)), TDB_SUCCESS);
-    ASSERT_TRUE(strcmp(name, "000003.000000000007.klog") == 0);
+    ASSERT_TRUE(strcmp(name, "000000000003.000000000007.klog") == 0);
 
     tidesdb_manifest_entry_t parted = {0};
     parted.id = 9;
@@ -229,7 +229,7 @@ void test_klog_filename(void)
     parted.birth_level = 3;
     parted.partition = 4;
     ASSERT_EQ(sstable_klog_filename(&parted, name, sizeof(name)), TDB_SUCCESS);
-    ASSERT_TRUE(strcmp(name, "000012.000000000009.klog") == 0);
+    ASSERT_TRUE(strcmp(name, "000000000012.000000000009.klog") == 0);
 
     /* two families can hold sstables of the same id without colliding, which is the whole point of
      * the family being part of the name now that they share a directory */

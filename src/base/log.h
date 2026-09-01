@@ -9,8 +9,6 @@
 #ifndef __TIDESDB_BASE_LOG_H__
 #define __TIDESDB_BASE_LOG_H__
 
-#include <time.h>
-
 #include "../compat.h"
 #include "db.h" /* tidesdb_log_level_t and the public TDB_LOG_* severities, resolved from include/ */
 #include "io/block_manager.h" /* MAX_FILE_PATH_LENGTH sizes the sink path buffer */
@@ -64,41 +62,6 @@ void tidesdb_log_close_sink(void);
         const int tdb_log_gate = atomic_load_explicit(&_tidesdb_log_level, memory_order_relaxed); \
         if (tdb_log_gate != TDB_LOG_NONE && (level) >= tdb_log_gate)                              \
             tidesdb_log_write((level), __FILE__, __LINE__, fmt, ##__VA_ARGS__);                   \
-    } while (0)
-
-/* the shortest interval between two lines from a throttled site, in seconds. a per-flush or
- * per-merge line is one per unit of work, which under sustained load is thousands of writes through
- * one process-wide mutex to a stream that can block -- and a caller holding that mutex holds up
- * every other thread that logs. the record of what happened is kept, at a rate a reader can use */
-#define TDB_LOG_THROTTLE_SECS 1
-
-/* emit at most one line per TDB_LOG_THROTTLE_SECS from this site, counting what was suppressed and
- * reporting it on the next line that gets through. the state is per-call-site and static, so a site
- * throttles across every thread that reaches it, which is the point -- the cost being avoided is
- * the shared mutex, not this thread's turn at it. the count is relaxed throughout; a line lost to a
- * race on the timestamp is one line, and the suppressed total says so either way */
-#define TDB_DEBUG_LOG_THROTTLED(level, fmt, ...)                                                 \
-    do                                                                                           \
-    {                                                                                            \
-        static _Atomic(int64_t) tdb_log_last = 0;                                                \
-        static _Atomic(uint64_t) tdb_log_skipped = 0;                                            \
-        const int64_t tdb_log_now = (int64_t)time(NULL);                                         \
-        int64_t tdb_log_seen = atomic_load_explicit(&tdb_log_last, memory_order_relaxed);        \
-        if (tdb_log_now - tdb_log_seen >= TDB_LOG_THROTTLE_SECS &&                               \
-            atomic_compare_exchange_strong_explicit(&tdb_log_last, &tdb_log_seen, tdb_log_now,   \
-                                                    memory_order_relaxed, memory_order_relaxed)) \
-        {                                                                                        \
-            const unsigned long long tdb_log_missed =                                            \
-                (unsigned long long)atomic_exchange_explicit(&tdb_log_skipped, 0,                \
-                                                             memory_order_relaxed);              \
-            if (tdb_log_missed == 0)                                                             \
-                TDB_DEBUG_LOG(level, fmt, ##__VA_ARGS__);                                        \
-            else                                                                                 \
-                TDB_DEBUG_LOG(level, fmt " (%llu more since the last of these)", ##__VA_ARGS__,  \
-                              tdb_log_missed);                                                   \
-        }                                                                                        \
-        else                                                                                     \
-            atomic_fetch_add_explicit(&tdb_log_skipped, 1, memory_order_relaxed);                \
     } while (0)
 
 #endif /* __TIDESDB_BASE_LOG_H__ */

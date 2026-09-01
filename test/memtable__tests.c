@@ -581,9 +581,9 @@ void test_wal_filename(void)
 {
     char name[32];
     ASSERT_EQ(tidesdb_wal_filename(42, name, sizeof(name)), TDB_SUCCESS);
-    ASSERT_TRUE(strcmp(name, "0000042.log") == 0);
+    ASSERT_TRUE(strcmp(name, "000000000042.log") == 0);
     ASSERT_EQ(tidesdb_wal_filename(0, name, sizeof(name)), TDB_SUCCESS);
-    ASSERT_TRUE(strcmp(name, "0000000.log") == 0);
+    ASSERT_TRUE(strcmp(name, "000000000000.log") == 0);
 
     char tiny[4];
     ASSERT_EQ(tidesdb_wal_filename(1, tiny, sizeof(tiny)), TDB_ERR_INVALID_ARGS);

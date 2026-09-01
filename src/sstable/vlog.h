@@ -67,7 +67,7 @@
  * shape a key log and a write ahead log use, so a directory listing sorts into write order and
  * reads consistently whatever kind of file is being looked at */
 #define VLOG_SEGMENT_EXT      ".vlog"
-#define VLOG_SEGMENT_DIGITS   7
+#define VLOG_SEGMENT_DIGITS   12
 #define VLOG_SEGMENT_NAME_MAX 32
 
 /* the segment table is sized once at open and never grows, so a segment's slot address is stable

@@ -770,11 +770,10 @@ int flush_install(const flush_ctx_t *fx, flush_job_t *job)
 
             /* one line per output rather than per flush, so the record says which family grew and
              * by how much -- the two things a read-amplification question starts from */
-            TDB_DEBUG_LOG_THROTTLED(
-                TDB_LOG_INFO, "flushed cf %s to l1 sstable %llu, %llu entries %llu bytes",
-                job->outputs[i].cf->name, (unsigned long long)job->outputs[i].id,
-                (unsigned long long)job->outputs[i].num_entries,
-                (unsigned long long)job->outputs[i].size_bytes);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "flushed cf %s to l1 sstable %llu, %llu entries %llu bytes",
+                          job->outputs[i].cf->name, (unsigned long long)job->outputs[i].id,
+                          (unsigned long long)job->outputs[i].num_entries,
+                          (unsigned long long)job->outputs[i].size_bytes);
         }
     }
     else

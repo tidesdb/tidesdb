@@ -113,7 +113,7 @@ At any moment there is one **active** memtable taking writes, and a queue of **s
 memtables that are full and awaiting flush. Reads consult the active one first, then the
 queue newest-first — see [The life of a read](/internals/life-of-a-read).
 
-The log file is named for the generation, `NNNNNNN.log`, zero-padded, so the set on disk
+The log file is named for the generation, `NNNNNNNNNNNN.log`, zero-padded, so the set on disk
 sorts into replay order by name alone. Recovery needs no sidecar index to know what to replay
 or in what order.
 
@@ -411,7 +411,7 @@ wants — rotating on idle is a write a quiet process would not otherwise make.
 
 ## Recovery
 
-On open, every `NNNNNNN.log` still present is replayed in generation order. Each becomes a
+On open, every `NNNNNNNNNNNN.log` still present is replayed in generation order. Each becomes a
 sealed memtable in the queue, and a fresh active memtable is installed above them, so the
 recovered state has exactly the shape a running database has. The recovered generations are
 then flushed normally.

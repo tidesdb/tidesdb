@@ -176,10 +176,10 @@ the write latency tail, and why the engine logs one when it exceeds
 
 Three files carry everything, and the order they are written in is the whole recovery story:
 
-1. **The write-ahead log** (`NNNNNNN.log`) takes a committed batch before the memtable does.
+1. **The write-ahead log** (`NNNNNNNNNNNN.log`) takes a committed batch before the memtable does.
    A crash between the two recovers the batch.
-2. **The sstables** (`CCCCCC.SSSSSSSSSSSS.klog`, named for the owning family's id and the table's)
-   and the **value log** (`NNNNNNN.vlog` segments) hold what has been flushed. They are durable
+2. **The sstables** (`CCCCCCCCCCCC.SSSSSSSSSSSS.klog`, named for the owning family's id and the
+   table's) and the **value log** (`NNNNNNNNNNNN.vlog` segments) hold what has been flushed. They are durable
    before the manifest names them.
 3. **The manifest** (`MANIFEST`) is the catalogue. A file it does not name does not exist as
    far as recovery is concerned, so a crash mid-flush leaves orphans rather than corruption.

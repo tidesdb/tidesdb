@@ -55,9 +55,10 @@ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, u
  */
 void tidesdb_memtable_free(tidesdb_memtable_t *mt);
 
-/* digits in a WAL file name, zero-padded; a WAL is named by its generation alone, matching the
- * sstable klog convention (globally identifiable, no legacy prefix) */
-#define TDB_WAL_ID_DIGITS 7
+/* digits in a WAL file name, zero-padded; a WAL is named by its generation alone, and the width
+ * matches the sstable id so a listing of a database directory lines up whatever kind of file is
+ * being looked at */
+#define TDB_WAL_ID_DIGITS 12
 
 /* column-family indices tracked for the per-cf unflushed-key counter; a family whose dense index
  * lands past this table simply reports no unflushed count, so the bound stays a stats-only cap */

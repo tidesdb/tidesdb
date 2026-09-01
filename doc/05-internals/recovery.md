@@ -65,7 +65,7 @@ directory, and the families past the bound are left uncatalogued with their file
 
 ## Replaying the logs
 
-Each surviving `NNNNNNN.log` is replayed in generation order, and each becomes a sealed
+Each surviving `NNNNNNNNNNNN.log` is replayed in generation order, and each becomes a sealed
 memtable in the queue with a fresh active memtable installed above them. The recovered database
 therefore has **exactly the shape a running one has** — no special post-recovery state, no
 second code path for reads. The recovered generations are then flushed through the ordinary

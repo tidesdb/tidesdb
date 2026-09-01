@@ -31,7 +31,7 @@
  * accumulate for as long as it is written to. padding is presentation only. an id wider than its
  * field is written out in full and read back the same way, and loses nothing but its place in that
  * listing */
-#define TDB_SSTABLE_CF_DIGITS 6
+#define TDB_SSTABLE_CF_DIGITS 12
 #define TDB_SSTABLE_ID_DIGITS 12
 
 /* the widest any of these ids can be and still be a uint64_t, which bounds what a name may

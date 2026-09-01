@@ -34,7 +34,7 @@ holding the reference is flushed -- which is what the floors below are for.
 
 The store is **database-wide**: one set of files serves every column family, because a value's
 identity has nothing to do with which family holds the key. It is a series of append-only
-segment files named `NNNNNNN.vlog`, of which exactly one is open for appends. That segment seals
+segment files named `NNNNNNNNNNNN.vlog`, of which exactly one is open for appends. That segment seals
 when it reaches its target size and a fresh one takes over.
 
 **A sealed segment is immutable for the rest of its life.** Nothing rewrites it, shifts it, or

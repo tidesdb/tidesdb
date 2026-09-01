@@ -994,7 +994,7 @@ Once prepared, the transaction survives a restart:
 
 | Code | Cause |
 | --- | --- |
-| `TDB_ERR_CONFLICT` | Conflict detected at phase one — the transaction is aborted, not prepared |
+| `TDB_ERR_CONFLICT` | Conflict detected at phase one — the transaction is aborted, not prepared. Also raised when too many prepared transactions are undecided at once, since each one holds a slot until it is resolved |
 | `TDB_ERR_INVALID_ARGS` | `NULL` `txn` or `xid`, `xid_size` of 0, or a transaction not in the active state |
 | `TDB_ERR_TXN_EXPIRED` | The transaction is no longer active |
 | `TDB_ERR_TXN_ABORTED` | Another thread called `tidesdb_txn_request_abort` on the transaction |

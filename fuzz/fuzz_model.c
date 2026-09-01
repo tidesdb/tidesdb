@@ -66,9 +66,13 @@ typedef struct
     int64_t deadline;
 } fm_entry_t;
 
-/* a committed column family: its name and a byte-sorted array of entries */
+/* a committed column family: its name, the identity buffered ops refer to it by, and a byte-sorted
+ * array of entries. the id is what an op records, because a name is not a stable identity -- rename
+ * and drop free a name for another family to take, and an op holding the name would then follow it
+ * to whichever family holds it at commit rather than the one it was written against */
 typedef struct
 {
+    uint64_t id;
     char name[FM_NAME_MAX];
     fm_entry_t *entries;
     size_t count;
@@ -89,7 +93,7 @@ typedef enum
  * where a NULL hi runs to the end of the family */
 typedef struct
 {
-    char cf[FM_NAME_MAX];
+    uint64_t cf_id;
     fm_op_kind_t kind;
     uint8_t *key;
     size_t klen;
@@ -112,6 +116,10 @@ struct fuzz_model
     fm_cf_t *cfs;
     size_t cf_count;
     size_t cf_cap;
+
+    /* the next family identity to hand out. it only ever moves forward, so a dropped family's id is
+     * never given to another one, the way the engine does not reuse a cf id either */
+    uint64_t next_cf_id;
 
     /* the sequence clock, drawn at commit and at prepare in the same order the engine draws its
      * own, so the two agree on which of any two writes is newer even though the values differ */
@@ -196,6 +204,16 @@ static fm_cf_t *fm_cf_find(const fuzz_model_t *m, const char *name)
     return NULL;
 }
 
+/* the family an op was written against, or NULL when it has since been dropped. an id of zero names
+ * no family, which is what an op buffered against a family that did not exist carries */
+static fm_cf_t *fm_cf_find_by_id(const fuzz_model_t *m, uint64_t id)
+{
+    if (id == 0) return NULL;
+    for (size_t i = 0; i < m->cf_count; i++)
+        if (m->cfs[i].id == id) return &m->cfs[i];
+    return NULL;
+}
+
 int fuzz_model_cf_exists(const fuzz_model_t *m, const char *name)
 {
     return fm_cf_find(m, name) != NULL;
@@ -214,6 +232,7 @@ int fuzz_model_cf_create(fuzz_model_t *m, const char *name)
     }
     fm_cf_t *cf = &m->cfs[m->cf_count++];
     memset(cf, 0, sizeof(*cf));
+    cf->id = ++m->next_cf_id;
     snprintf(cf->name, sizeof(cf->name), "%s", name);
     return 1;
 }
@@ -398,7 +417,7 @@ static void fm_apply_batch(fuzz_model_t *m, const fm_op_t *ops, size_t count, ui
 {
     for (size_t i = 0; i < count; i++)
     {
-        fm_cf_t *cf = fm_cf_find(m, ops[i].cf);
+        fm_cf_t *cf = fm_cf_find_by_id(m, ops[i].cf_id);
         if (!cf) continue;
         if (ops[i].kind == FM_OP_RANGE_DELETE)
         {
@@ -508,7 +527,7 @@ int fuzz_model_prepared_open(const fuzz_model_t *m)
  * not symmetric */
 static int fm_op_refused_against(const fm_op_t *committing, const fm_op_t *held)
 {
-    if (strcmp(committing->cf, held->cf) != 0) return 0;
+    if (committing->cf_id == 0 || committing->cf_id != held->cf_id) return 0;
     const int held_range = held->kind == FM_OP_RANGE_DELETE;
 
     if (committing->kind != FM_OP_RANGE_DELETE)
@@ -637,7 +656,8 @@ static int fm_buf_append(fuzz_model_t *m, const char *cf, const fm_op_kind_t kin
         m->buf_cap = nc;
     }
     fm_op_t *op = &m->buf[m->buf_count++];
-    snprintf(op->cf, sizeof(op->cf), "%s", cf);
+    const fm_cf_t *target = fm_cf_find(m, cf);
+    op->cf_id = target ? target->id : 0;
     op->kind = kind;
     op->key = nk;
     op->klen = klen;
@@ -695,10 +715,12 @@ int fuzz_model_delete_prefix(fuzz_model_t *m, const char *cf, const uint8_t *pre
 static const fm_op_t *fm_buf_decides(const fuzz_model_t *m, const char *cf, const uint8_t *key,
                                      size_t klen)
 {
+    const fm_cf_t *target = fm_cf_find(m, cf);
+    if (!target) return NULL;
     for (long i = (long)m->buf_count - 1; i >= 0; i--)
     {
         const fm_op_t *op = &m->buf[i];
-        if (strcmp(op->cf, cf) != 0) continue;
+        if (op->cf_id != target->id) continue;
         if (op->kind == FM_OP_RANGE_DELETE)
         {
             if (fm_op_covers(op, key, klen)) return op;
@@ -814,7 +836,7 @@ int fuzz_model_scan(const fuzz_model_t *m, const char *cf, fuzz_model_kv_t **out
     if (m->txn_open)
         for (size_t i = 0; i < m->buf_count; i++)
         {
-            if (strcmp(m->buf[i].cf, cf) != 0 || m->buf[i].kind != FM_OP_PUT) continue;
+            if (m->buf[i].cf_id != c->id || m->buf[i].kind != FM_OP_PUT) continue;
             if (!fm_entry_live(m->buf[i].deadline)) continue;
             /* a later interval covering this put decides the key instead, which is what the
              * identity test catches: the decider is then that interval and not this entry */

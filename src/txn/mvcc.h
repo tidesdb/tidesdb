@@ -21,8 +21,15 @@
  * drives the reservation over a txn's write set. */
 
 /* the commit-status ring records the last this-many sequence numbers; older seqs are treated as
- * committed by the eviction rule (they already applied and cannot still be in flight) */
+ * committed by the eviction rule, which holds for every sequence a commit drew and not for one a
+ * prepare is still sitting on -- those are held below and stay in flight however far they fall */
 #define TDB_MVCC_COMMIT_RING_SIZE 65536
+
+/* prepared batches whose sequence is exempt from the eviction rule at once. a two-phase batch keeps
+ * its sequence in flight for as long as phase two leaves it undecided, which has no bound and so
+ * outlasts the ring, and each undecided batch holds a slot until it is decided. a prepare that
+ * cannot take one is refused rather than left holding keys nothing would defend */
+#define TDB_MVCC_MAX_PREPARED_HOLDS 64
 
 /* number of write-reservation slots and the mask to index one from a key hash */
 #define TDB_MVCC_RESERVATION_SLOTS ((uint32_t)1 << 20)
@@ -223,6 +230,23 @@ void tidesdb_mvcc_get_stats(const tidesdb_mvcc_t *m, tidesdb_mvcc_stats_t *out);
  */
 int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq,
                          uint64_t read_base, uint64_t min_snapshot);
+
+/**
+ * tidesdb_mvcc_prepared_hold
+ * hold seq in flight past the ring's eviction rule until the batch that drew it is decided
+ * @param m the clock
+ * @param seq the sequence the prepare drew and reserves its keys with, which must not be zero
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_CONFLICT when every hold slot is taken
+ */
+int tidesdb_mvcc_prepared_hold(tidesdb_mvcc_t *m, uint64_t seq);
+
+/**
+ * tidesdb_mvcc_prepared_release
+ * let go of seq once phase two has decided the batch, so the eviction rule governs it again
+ * @param m the clock
+ * @param seq the sequence handed to tidesdb_mvcc_prepared_hold; one never held is ignored
+ */
+void tidesdb_mvcc_prepared_release(tidesdb_mvcc_t *m, uint64_t seq);
 
 /**
  * tidesdb_mvcc_release

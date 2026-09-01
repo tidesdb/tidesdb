@@ -143,6 +143,10 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
                              txn->prepared_entries[i].key_size),
                 prepared_seq, seq);
 
+    /* the sequence the prepare held is spent -- every slot naming it has been handed to the one
+     * that just committed, which the ring governs like any other */
+    tidesdb_mvcc_prepared_release(txn->clock, prepared_seq);
+
     txn->commit_seq = seq;
     tidesdb_mvcc_mark(txn->clock, seq, 1);
 
@@ -228,6 +232,7 @@ int tdb_txn_rollback_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
     /* nothing was applied, so nothing to undo; release the reservation and finish */
     if (txn->isolation >= TDB_ISOLATION_SNAPSHOT)
         txn_release_reservations(txn, txn->prepared_entries, txn->prepared_count, txn->commit_seq);
+    tidesdb_mvcc_prepared_release(txn->clock, txn->commit_seq);
     txn->state = TDB_TXN_ABORTED;
     txn_leave_registry(txn);
 

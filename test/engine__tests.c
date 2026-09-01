@@ -15,6 +15,7 @@
 #include "../src/engine/engine_internal.h" /* ENGINE_FIRST_WAL_GENERATION */
 #include "../src/engine/engine_types.h"
 #include "../src/manifest/manifest.h" /* the inner txn a prefix delete is buffered on */
+#include "../src/txn/mvcc.h"          /* TDB_MVCC_COMMIT_RING_SIZE, the eviction window */
 #include "../src/txn/txn.h"           /* tdb_txn_delete_prefix, not yet a public call */
 #include "db.h"
 #include "test_utils.h"
@@ -38,6 +39,14 @@ static int tests_failed = 0;
 
 /* the transaction id an undecided prepare is left under, to pin the log generation holding it */
 #define ENGINE_TEST_PIN_XID "pin-the-generation"
+
+/* how far past the commit ring a test walks the sequence. the eviction rule turns on a
+ * sequence being a whole capacity behind, so a margin puts the prepare clear of the
+ * boundary rather than sitting on it */
+#define ENGINE_TEST_RING_OVERRUN 64
+
+/* in-doubt transactions abandoned in a row, past the hold table so a leak would exhaust it */
+#define ENGINE_TEST_ABANDONED_PREPARES (TDB_MVCC_MAX_PREPARED_HOLDS * 2)
 /* the transaction that prepares and then decides, so its batch is durable as a COMMIT record */
 #define ENGINE_TEST_DECIDED_XID "decided-in-two-phases"
 
@@ -3773,6 +3782,116 @@ void test_engine_prepared_prefix_delete_blocks_a_write_under_it(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* a prepared batch holds a reservation on every key it wrote until phase two decides it, and the
+ * sequences a busy database draws in the meantime do not make that hold any less live. the commit
+ * ring only distinguishes the last TDB_MVCC_COMMIT_RING_SIZE sequences and reads anything older as
+ * committed, which is true of every sequence a commit drew and false of one a prepare is still
+ * sitting on. so this walks the ring clear past the prepare and asks the hold to still refuse the
+ * write it refused when it was young */
+void test_engine_prepared_batch_holds_its_key_past_the_commit_ring(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    /* one prepare, left in doubt for the rest of the test */
+    tidesdb_txn_t *holder = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &holder), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(holder, cf, (const uint8_t *)"held", 4, (const uint8_t *)"p", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(holder, (const uint8_t *)"xid-ring", 8), TDB_SUCCESS);
+
+    /* the write it holds off is refused while its sequence is still inside the ring */
+    tidesdb_txn_t *early = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &early), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(early, cf, (const uint8_t *)"held", 4, (const uint8_t *)"e", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(early), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(early);
+
+    /* now draw enough sequences on another key to walk the prepare's out of the ring */
+    for (uint32_t i = 0; i < TDB_MVCC_COMMIT_RING_SIZE + ENGINE_TEST_RING_OVERRUN; i++)
+    {
+        tidesdb_txn_t *burn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &burn), TDB_SUCCESS);
+        ASSERT_EQ(
+            tidesdb_txn_put(burn, cf, (const uint8_t *)"burn", 4, (const uint8_t *)"b", 1, -1),
+            TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(burn), TDB_SUCCESS);
+        tidesdb_txn_free(burn);
+    }
+
+    /* nothing about the prepare changed, so the same write is refused for the same reason */
+    tidesdb_txn_t *late = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &late), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(late, cf, (const uint8_t *)"held", 4, (const uint8_t *)"l", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(late), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(late);
+
+    /* and phase two still lands the value the batch voted on rather than an interloper's */
+    ASSERT_EQ(tidesdb_txn_commit_prepared(holder), TDB_SUCCESS);
+    tidesdb_txn_free(holder);
+    engine_assert_committed(db, cf, "held", "p");
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* freeing an in-doubt transaction without deciding it abandons it, which the engine supports -- so
+ * the sequence hold the prepare took has to go with it. a hold left behind would keep a sequence
+ * nothing can decide in flight for the life of the database, holding its keys against every later
+ * writer, and the fixed table would fill and refuse every prepare after it */
+void test_engine_abandoned_prepares_do_not_exhaust_the_hold_table(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    for (int i = 0; i < ENGINE_TEST_ABANDONED_PREPARES; i++)
+    {
+        uint8_t key[16];
+        const int klen = snprintf((char *)key, sizeof(key), "abandon%05d", i);
+        ASSERT_TRUE(klen > 0);
+
+        tidesdb_txn_t *t = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(t, cf, key, (size_t)klen, (const uint8_t *)"v", 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_prepare(t, key, (size_t)klen), TDB_SUCCESS);
+        tidesdb_txn_free(t); /* abandoned in doubt, never decided */
+    }
+
+    /* a prepare that follows all of them still gets a slot, and still decides */
+    tidesdb_txn_t *after = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &after), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(after, cf, (const uint8_t *)"after", 5, (const uint8_t *)"v", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(after, (const uint8_t *)"xid-after", 9), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit_prepared(after), TDB_SUCCESS);
+    tidesdb_txn_free(after);
+    engine_assert_committed(db, cf, "after", "v");
+
+    /* the abandoned batch keeps refusing writes to its keys. its PREPARE record is durable, so a
+     * later open can still adopt and decide it, and dropping the claim here would let a write land
+     * under a batch decided afterwards. the claim is left to age out of the ring the way any
+     * unresolved one is, which is the behaviour releasing the sequence hold restores */
+    tidesdb_txn_t *writer = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &writer), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(writer, cf, (const uint8_t *)"abandon00000", 12, (const uint8_t *)"w",
+                              1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(writer), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(writer);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 /* a range whose bounds fall where no prefix could put them. "key00012" through "key00027" shares no
  * prefix that covers it and nothing else, which is the case a prefix delete cannot express at all
  */
@@ -6676,6 +6795,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_txn_timeout_expires, tests_passed);
     RUN_TEST(test_engine_txn_timeout_config_default, tests_passed);
     RUN_TEST(test_engine_cf_id_not_reused_after_drop_reopen, tests_passed);
+    RUN_TEST(test_engine_prepared_batch_holds_its_key_past_the_commit_ring, tests_passed);
+    RUN_TEST(test_engine_abandoned_prepares_do_not_exhaust_the_hold_table, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

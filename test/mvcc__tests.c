@@ -86,6 +86,83 @@ void test_mvcc_eviction_rule(void)
     tidesdb_mvcc_destroy(m);
 }
 
+/* a held sequence is exempt from the eviction rule, which is what keeps an undecided prepare in
+ * flight after the ring has moved a whole capacity past it */
+void test_mvcc_prepared_hold_survives_eviction(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+
+    const uint64_t prepared = 7;
+    const uint64_t high = prepared + TDB_MVCC_COMMIT_RING_SIZE + 1; /* prepared is evicted */
+
+    /* without the hold the eviction rule calls it committed, which is the state the fix corrects */
+    tidesdb_mvcc_mark(m, high, 0);
+    ASSERT_EQ(tidesdb_mvcc_committed(m, prepared), 1);
+
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, prepared), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_mvcc_committed(m, prepared), 0); /* held, so still in flight */
+
+    /* the hold covers its own sequence and nothing else */
+    ASSERT_EQ(tidesdb_mvcc_committed(m, prepared + 1), 1);
+
+    /* and once phase two lets go, the rule governs it again */
+    tidesdb_mvcc_prepared_release(m, prepared);
+    ASSERT_EQ(tidesdb_mvcc_committed(m, prepared), 1);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* the table is fixed, so a prepare past its last slot is refused rather than left unprotected. a
+ * release frees the slot it took and the next prepare gets it */
+void test_mvcc_prepared_hold_table_is_bounded(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+
+    const uint64_t first = 1;
+    for (int i = 0; i < TDB_MVCC_MAX_PREPARED_HOLDS; i++)
+        ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, first + (uint64_t)i), TDB_SUCCESS);
+
+    const uint64_t past_end = first + TDB_MVCC_MAX_PREPARED_HOLDS;
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, past_end), TDB_ERR_CONFLICT);
+
+    /* a sequence that never took a slot releases without disturbing one that did */
+    tidesdb_mvcc_prepared_release(m, past_end);
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, past_end), TDB_ERR_CONFLICT);
+
+    tidesdb_mvcc_prepared_release(m, first);
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, past_end), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(NULL, first), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, 0), TDB_ERR_INVALID_ARGS);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* a held sequence keeps its reservation refusing a later writer of the same key, which is the whole
+ * point of the exemption -- the eviction rule alone would let that writer through */
+void test_mvcc_prepared_hold_keeps_the_reservation_refusing(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+
+    const uint64_t khash = 0x0123456789abcdefULL;
+    const uint64_t prepared = tidesdb_mvcc_next_seq(m);
+    ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, prepared), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, khash, prepared, prepared - 1, 0), 1);
+
+    /* walk the ring clear past the prepare, as a database that keeps committing does */
+    uint64_t seq = 0;
+    for (int i = 0; i < TDB_MVCC_COMMIT_RING_SIZE + 1; i++)
+    {
+        seq = tidesdb_mvcc_next_seq(m);
+        tidesdb_mvcc_mark(m, seq, 1);
+    }
+
+    const uint64_t later = tidesdb_mvcc_next_seq(m);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, khash, later, later - 1, later - 1), 0);
+    tidesdb_mvcc_destroy(m);
+}
+
 /* reseed advances the counter past the recovered max and backfills the trailing ring window so
  * every recovered seq reads committed, whether via the window or the eviction rule */
 void test_mvcc_reseed(void)
@@ -317,6 +394,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_mark_committed, tests_passed);
     RUN_TEST(test_mvcc_visible, tests_passed);
     RUN_TEST(test_mvcc_eviction_rule, tests_passed);
+    RUN_TEST(test_mvcc_prepared_hold_survives_eviction, tests_passed);
+    RUN_TEST(test_mvcc_prepared_hold_table_is_bounded, tests_passed);
+    RUN_TEST(test_mvcc_prepared_hold_keeps_the_reservation_refusing, tests_passed);
     RUN_TEST(test_mvcc_reseed, tests_passed);
     RUN_TEST(test_mvcc_reserve_basic, tests_passed);
     RUN_TEST(test_mvcc_release, tests_passed);

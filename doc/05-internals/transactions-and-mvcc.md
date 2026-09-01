@@ -34,10 +34,14 @@ so a sequence that has been drawn but not finished must be invisible — otherwi
 see half a batch. The ring records, for the most recent sequences, whether each one committed.
 
 The ring is bounded, and what happens past its edge is the interesting part. A sequence older
-than the ring is **treated as committed**, because it must be: it was drawn long enough ago that
-it cannot still be in flight, and it either applied or was abandoned. That eviction rule is what
-keeps the visibility check O(1) and the memory fixed, rather than tracking every sequence ever
-issued.
+than the ring is **treated as committed**, because it was drawn long enough ago that it either
+applied or was abandoned. That eviction rule is what keeps the visibility check O(1) and the memory
+fixed, rather than tracking every sequence ever issued.
+
+One kind of sequence outlives the ring while still being in flight: the one a two-phase transaction
+drew at its prepare and has not had decided. Nothing bounds how long a coordinator takes, so that
+sequence can fall arbitrarily far behind. Those are **held** and stay in flight however far the ring
+moves past them — see [What an undecided prepare keeps alive](#what-an-undecided-prepare-keeps-alive).
 
 **A reservation table** for conflict detection, described below.
 
@@ -401,6 +405,15 @@ original PREPARE any more. A rollback leaves nothing to undo, so the same holds.
 The pin is taken by recovery itself, not by whoever adopts the transaction. A database that reopens
 with a batch in doubt and simply carries on writing — never asking for its in-doubt list — must
 still keep that log, because it holds the only copy of a batch someone may yet decide.
+
+**And its sequence.** The commit-status ring calls anything older than its capacity committed, which
+is true of every sequence a commit drew and false of one a prepare is still sitting on. An undecided
+prepare therefore holds its sequence in a small fixed table that exempts it from the eviction rule,
+and lets go the moment phase two decides. Without the hold, a prepare left undecided for a ring's
+worth of commits would start reading as committed: its key reservations would stop refusing anyone,
+and a later writer would overwrite a key the batch is still going to commit — silently, since every
+party involved believes it is following the rules. The table is bounded like the interval table is,
+so a prepare that cannot take a slot is refused rather than left holding keys nothing would defend.
 
 ## Invariants
 

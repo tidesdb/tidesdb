@@ -61,4 +61,5 @@ consolidation, and its flush thread is the pipelining.
 **[xxHash]** Yann Collet. *xxHash — Extremely fast non-cryptographic hash algorithm.*
 <https://github.com/Cyan4973/xxHash>
 
-XXH3 provides the block checksum every framed record carries.
+XXH3 provides the block checksum every framed record carries, and the key hashes the block
+cache, the manifest index, the partition filter and the write-reservation table index with.

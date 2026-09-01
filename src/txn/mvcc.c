@@ -61,6 +61,10 @@ typedef struct
  * @param stat_marks count of sequences marked committed
  * @param stat_res_won count of write reservations that claimed their slot
  * @param stat_res_lost count of write reservations that lost to a concurrent writer
+ * @param prepared_hold sequences of prepared batches phase two has not decided, which the ring's
+ *                      eviction rule may not call committed; a zero slot is free
+ * @param prepared_hold_count how many slots are taken, so the ordinary case of none reads one
+ *                            counter rather than scanning the table
  */
 struct tidesdb_mvcc
 {
@@ -74,6 +78,8 @@ struct tidesdb_mvcc
     _Atomic(uint64_t) stat_res_won;
     _Atomic(uint64_t) stat_res_lost;
     tdb_wprwlock_t commit_gate;
+    _Atomic(uint64_t) prepared_hold[TDB_MVCC_MAX_PREPARED_HOLDS];
+    _Atomic(int) prepared_hold_count;
     mvcc_range_reservation_t range_res[TDB_MVCC_MAX_RANGE_RESERVATIONS];
     _Atomic(int) range_res_count;
     pthread_mutex_t range_lock;
@@ -85,6 +91,9 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     if (!m) return NULL;
 
     (void)tdb_wprwlock_init(&m->commit_gate);
+
+    for (int i = 0; i < TDB_MVCC_MAX_PREPARED_HOLDS; i++) atomic_init(&m->prepared_hold[i], 0);
+    atomic_init(&m->prepared_hold_count, 0);
 
     memset(m->range_res, 0, sizeof(m->range_res));
     atomic_init(&m->range_res_count, 0);
@@ -292,17 +301,64 @@ void tidesdb_mvcc_get_stats(const tidesdb_mvcc_t *m, tidesdb_mvcc_stats_t *out)
     out->reservations_lost = atomic_load_explicit(&m->stat_res_lost, memory_order_relaxed);
 }
 
+/* whether seq belongs to a prepared batch phase two has not decided, which is the one kind of
+ * sequence that sits below the ring and is still in flight */
+static int mvcc_prepared_held(const tidesdb_mvcc_t *m, uint64_t seq)
+{
+    if (atomic_load_explicit(&m->prepared_hold_count, memory_order_acquire) == 0) return 0;
+    for (int i = 0; i < TDB_MVCC_MAX_PREPARED_HOLDS; i++)
+        if (atomic_load_explicit(&m->prepared_hold[i], memory_order_acquire) == seq) return 1;
+    return 0;
+}
+
+int tidesdb_mvcc_prepared_hold(tidesdb_mvcc_t *m, uint64_t seq)
+{
+    if (!m || seq == 0) return TDB_ERR_INVALID_ARGS;
+
+    /* the count is raised before the slot is filled, so a concurrent reader that sees the count
+     * never finds the table emptier than it is. a reader between the two reads one slot short and
+     * calls the sequence committed, which is why the hold is taken before the reservation names it
+     * -- until then no other thread has that sequence to ask about */
+    atomic_fetch_add_explicit(&m->prepared_hold_count, 1, memory_order_release);
+    for (int i = 0; i < TDB_MVCC_MAX_PREPARED_HOLDS; i++)
+    {
+        uint64_t empty = 0;
+        if (atomic_compare_exchange_strong_explicit(&m->prepared_hold[i], &empty, seq,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+            return TDB_SUCCESS;
+    }
+    atomic_fetch_sub_explicit(&m->prepared_hold_count, 1, memory_order_release);
+    return TDB_ERR_CONFLICT;
+}
+
+void tidesdb_mvcc_prepared_release(tidesdb_mvcc_t *m, uint64_t seq)
+{
+    if (!m || seq == 0) return;
+    for (int i = 0; i < TDB_MVCC_MAX_PREPARED_HOLDS; i++)
+    {
+        uint64_t held = seq;
+        if (atomic_compare_exchange_strong_explicit(&m->prepared_hold[i], &held, 0,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+        {
+            atomic_fetch_sub_explicit(&m->prepared_hold_count, 1, memory_order_release);
+            return;
+        }
+    }
+}
+
 int tidesdb_mvcc_committed(const tidesdb_mvcc_t *m, uint64_t seq)
 {
     if (!m || seq == 0) return 0;
 
     /* a seq more than a ring capacity behind the high-water mark has had its slot recycled by a
      * newer seq, so the slot no longer describes it. such a seq already applied and cannot still be
-     * in flight, so it is committed -- the same assumption recovery makes when it reseeds the
+     * in flight unless a prepare is holding it undecided, so it is committed -- the same assumption
+     * recovery makes when it reseeds the
      * trailing window. without this an old committed version reads the newer seq's in-progress
      * status and is wrongly filtered out of a snapshot read */
     const uint64_t max_seq = atomic_load_explicit(&m->ring_max_seq, memory_order_acquire);
-    if (max_seq >= m->ring_capacity && seq <= max_seq - m->ring_capacity) return 1;
+    if (max_seq >= m->ring_capacity && seq <= max_seq - m->ring_capacity)
+        return !mvcc_prepared_held(m, seq);
 
     return atomic_load_explicit(&m->ring[seq % m->ring_capacity], memory_order_acquire) ==
            TDB_MVCC_COMMITTED;

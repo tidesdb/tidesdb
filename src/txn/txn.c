@@ -127,7 +127,16 @@ void txn_leave_registry(tdb_txn_t *txn)
 void tdb_txn_free(tdb_txn_t *txn)
 {
     if (!txn) return;
-    txn_leave_registry(txn);     /* never leave a freed pointer in the registry */
+    txn_leave_registry(txn); /* never leave a freed pointer in the registry */
+
+    /* an in-doubt transaction freed without a decision is abandoned -- nothing in this process can
+     * resolve it any more, and its key reservations are left to age out of the ring the way any
+     * unresolved claim is. the sequence hold has to go with them, or it would keep a sequence no
+     * one can decide in flight for the life of the database, holding those keys against every
+     * later writer and taking a slot from a prepare that could still be decided */
+    if (txn->state == TDB_TXN_PREPARED && txn->isolation >= TDB_ISOLATION_SNAPSHOT)
+        tidesdb_mvcc_prepared_release(txn->clock, txn->commit_seq);
+
     free(txn->prepared_entries); /* an abandoned in-doubt txn still owns these */
     free(txn->xid);
     tidesdb_writeset_free(txn->writeset);

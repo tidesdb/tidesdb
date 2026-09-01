@@ -635,7 +635,15 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
 
     /* first-committer-wins reservation for snapshot and serializable, before the WAL write */
     const int reserve = txn->isolation >= TDB_ISOLATION_SNAPSHOT;
-    if (reserve && !txn_reserve_writes(txn, entries, count, seq)) rc = TDB_ERR_CONFLICT;
+
+    /* a prepare keeps its sequence in flight until phase two decides it, which outlasts the commit
+     * ring -- so the sequence is held before the reservation names it. taking it here rather than
+     * after the record is durable means a table with no room refuses a prepare that has changed
+     * nothing yet, the way a full interval table refuses a commit */
+    const int prepared = reserve && kind == TDB_WAL_KIND_PREPARE;
+    if (prepared) rc = tidesdb_mvcc_prepared_hold(txn->clock, seq);
+    if (rc == TDB_SUCCESS && reserve && !txn_reserve_writes(txn, entries, count, seq))
+        rc = TDB_ERR_CONFLICT;
 
     /* pace each distinct column family before the durable write */
     if (rc == TDB_SUCCESS) rc = txn_pace_families(backend, entries, count);
@@ -652,6 +660,7 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
         /* release the reservation and abort. the wasted in-progress seq is never made visible and
          * ages out of the ring */
         if (reserve) txn_release_reservations(txn, entries, count, seq);
+        if (prepared) tidesdb_mvcc_prepared_release(txn->clock, seq);
         txn->state = TDB_TXN_ABORTED;
         txn_leave_registry(txn);
         free(entries);

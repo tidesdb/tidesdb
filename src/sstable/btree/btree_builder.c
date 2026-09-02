@@ -660,8 +660,8 @@ static int btree_compress_one_leaf(btree_builder_t *builder, int64_t src_offset,
                                        block->data, block->size, &compressed,
                                        &compressed_size) != TDB_SUCCESS)
     {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "block encode failed, %d stages, %zu bytes",
-                      builder->config.codec_count, block->size);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "block encode failed, %d stages, %llu bytes",
+                      builder->config.codec_count, (unsigned long long)block->size);
         compressed = NULL;
     }
     const uint32_t original_size = (uint32_t)block->size;

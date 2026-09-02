@@ -227,17 +227,20 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
     return 0;
 }
 
-int cf_reload_levels(cf_t *cf, tidesdb_manifest_t *manifest, const int sync_mode)
+int cf_reload_levels(cf_t *cf, tidesdb_manifest_t *manifest, const int sync_mode,
+                     level_set_t **out_displaced)
 {
-    if (!cf || !manifest) return -1;
+    if (!cf || !manifest || !out_displaced) return -1;
 
-    /* close the old sstables before reopening -- their resident klog block managers hold the files
-     * at a preallocated, untruncated size, so a second block manager opened over the same file
-     * would read a stale end-of-file. closing truncates each klog to its logical size first. the
-     * caller has quiesced compaction and flushes and holds the registry write lock, so no reader or
-     * the fd reaper is mid-access on this set as it is dropped. on failure the data stays on disk
-     * and is recovered on the next open */
-    level_set_free(cf->levels);
+    /* the old set is handed back rather than freed here. its resident klog block managers hold the
+     * files at a preallocated, untruncated size, so a second block manager opened over the same
+     * file would read a stale end-of-file -- closing truncates each klog to its logical size first,
+     * and that has to happen before the reopen below. but the compaction scheduler reads a
+     * published family's overlap depth off this very set while holding only a view borrow, and
+     * taking the family out of the view does not end a borrow already in flight. so the close is
+     * the caller's to schedule, once nothing can still reach the set. on failure the data stays on
+     * disk and is recovered on the next open */
+    *out_displaced = cf->levels;
     cf->levels = NULL;
     if (level_set_create(&cf->levels) != 0) return -1;
     return cf_load_entries(cf, manifest, sync_mode, CF_LOAD_STRICT) == 0 ? 0 : -1;

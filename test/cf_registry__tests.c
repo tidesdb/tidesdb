@@ -6,8 +6,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-#include <pthread.h>
-
 #include "../src/base/errors.h"
 #include "../src/base/waitstat.h" /* tdb_monotonic_us, to bound the publish */
 #include "../src/column_family/cf_registry.h"
@@ -197,9 +195,11 @@ void test_cf_registry_iteration(void)
 #define CR_MAX_READERS     48
 
 /* a membership change has to come back in less than this. the failure being guarded against is
- * unbounded, so any bound distinguishes it -- and a tight one keeps the test quick, since a build
- * on the wrong side of the fault pays it on the very first publish rather than after several */
-#define CR_PUBLISH_BUDGET_US 1000000ull
+ * unbounded -- minutes, or never -- so the bound only has to be finite, and it is set well above
+ * the microseconds a publish actually takes so that a slow or oversubscribed runner cannot fail it.
+ * this covers the whole window including the writer thread's first schedule, which on a machine
+ * whose cores are all busy spinning is the one part not under the test's control */
+#define CR_PUBLISH_BUDGET_US 5000000ull
 
 /* enough publishes to catch one that is only occasionally starved, few enough that a build which
  * fails them all still finishes in seconds */
@@ -217,6 +217,8 @@ typedef struct
      * they are opposite faults -- so the reason is recorded rather than inferred from the count */
     _Atomic(int) last_rc;
     _Atomic(int) entered;
+    /* the handles to publish, built while nothing else is running */
+    cf_t *pending[CR_PUBLISH_ROUNDS];
 } cr_load_t;
 
 /* the read the engine actually does on this structure: a point lookup by id, which holds the view
@@ -240,11 +242,11 @@ static void *cr_publisher(void *arg)
     cr_load_t *load = (cr_load_t *)arg;
     for (int i = 0; i < CR_PUBLISH_ROUNDS; i++)
     {
-        char name[TDB_MAX_CF_NAME_LEN];
-        snprintf(name, sizeof(name), "late%d", i);
-        /* built before the clock starts: creating a family touches the filesystem, which is not
-         * what is being measured */
-        cf_t *cf = cr_make_cf(load->env, (uint64_t)(i + 1), name);
+        /* every handle was built before the readers started. building one touches the filesystem,
+         * and doing that here put file creation inside the budget rather than the publish -- on a
+         * loaded runner the thread spent the whole window in it and never reached an add at all,
+         * which reads exactly like the stall this test is for */
+        cf_t *cf = load->pending[i];
 
         const uint64_t started = tdb_monotonic_us();
         atomic_fetch_add_explicit(&load->entered, 1, memory_order_release);
@@ -297,6 +299,14 @@ void test_cf_registry_publish_under_sustained_readers(void)
     atomic_init(&load.worst_us, 0);
     atomic_init(&load.last_rc, TDB_SUCCESS);
     atomic_init(&load.entered, 0);
+
+    /* built here, before a reader exists, so the writer thread's whole life is the publish */
+    for (int i = 0; i < CR_PUBLISH_ROUNDS; i++)
+    {
+        char name[TDB_MAX_CF_NAME_LEN];
+        snprintf(name, sizeof(name), "late%d", i);
+        load.pending[i] = cr_make_cf(&env, (uint64_t)(i + 1), name);
+    }
 
     pthread_t *readers = calloc((size_t)n_readers, sizeof(*readers));
     ASSERT_TRUE(readers != NULL);

@@ -525,8 +525,9 @@ static int vlog_decode_value(const vlog_t *v, const uint8_t *payload, uint32_t p
         /* the length check is the one that catches a value carried forward under one chain and read
          * back under another, since a wrong chain can still decode into the wrong number of bytes
          */
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "value decode failed, %d stages, got %zu want %zu", id_count,
-                      plain ? dlen : (size_t)0, value_len);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "value decode failed, %d stages, got %llu want %llu", id_count,
+                      (unsigned long long)(plain ? dlen : (size_t)0),
+                      (unsigned long long)value_len);
         free(plain);
         return VLOG_ERR_CORRUPTION;
     }

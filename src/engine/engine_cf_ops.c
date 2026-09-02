@@ -237,6 +237,13 @@ static int engine_clone_copy_sstables(tidesdb_t *db, const cf_t *src, cf_t *dst)
     return rc;
 }
 
+/* close a level set a clone displaced, once no borrow can still read its overlap depth */
+static void engine_level_set_reclaim(void *item, void *ctx)
+{
+    (void)ctx;
+    level_set_free((level_set_t *)item);
+}
+
 int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
 {
     if (!db || !src_name || !dst_name) return TDB_ERR_INVALID_ARGS;
@@ -286,21 +293,25 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
             rc = engine_clone_copy_sstables(db, src, dst);
             if (rc == TDB_SUCCESS)
             {
-                /* the reload frees the destination's level set and builds a new one, and the
-                 * compaction scheduler reads every published family's overlap depth whether or not
-                 * it is claimed -- so the claim above does not keep it off this set. the family is
-                 * taken out of the published view for the swap instead, which waits out the borrows
-                 * that could still name it and leaves nothing able to reach the set being freed.
+                /* the reload replaces the destination's level set, and the compaction scheduler
+                 * reads every published family's overlap depth off that set whether or not the
+                 * family is claimed -- so the claim above does not keep it off this one. taking the
+                 * family out of the published view stops a later tick from reaching it, but not one
+                 * already inside its borrow, so the set is retired rather than freed: released once
+                 * no live view names the family, which is the same rule a dropped handle follows.
                  *
                  * the destination is invisible for that window. it is a half-built clone that no
                  * caller has been given yet, and the only cost is that a create racing for the same
                  * name could take it, which fails this clone rather than corrupting either */
                 cf_t *detached = NULL;
+                level_set_t *displaced = NULL;
                 if (cf_registry_remove(db->cfs, dst_name, &detached) != TDB_SUCCESS)
                     rc = TDB_ERR_NOT_FOUND;
                 if (rc == TDB_SUCCESS &&
-                    cf_reload_levels(dst, db->manifest, engine_sstable_bm_sync(db)) != 0)
+                    cf_reload_levels(dst, db->manifest, engine_sstable_bm_sync(db), &displaced) !=
+                        0)
                     rc = TDB_ERR_IO;
+                if (displaced) cf_registry_retire_obj(db->cfs, displaced, engine_level_set_reclaim);
                 if (detached && cf_registry_add(db->cfs, detached) != TDB_SUCCESS)
                     rc = TDB_ERR_EXISTS;
             }

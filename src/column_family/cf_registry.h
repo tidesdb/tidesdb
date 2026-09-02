@@ -161,6 +161,20 @@ void cf_registry_view_leave(cf_registry_t *reg, cf_registry_view_t *view);
  * @param cf the removed family, whose handle the caller is giving up
  * @param reclaim what frees it, invoked with cf once it is unreachable
  */
+/**
+ * cf_registry_retire_obj
+ * free something a family owned once no live view can name that family
+ *
+ * the same rule cf_registry_retire_cf applies, for a part of a family rather than the whole handle.
+ * a clone replaces its destination's level set, and the compaction scheduler reads every published
+ * family's overlap depth off that set while holding only a view borrow -- so the set a swap
+ * displaces has to outlive the borrows that could still reach it
+ * @param reg the registry
+ * @param item the displaced object, whose ownership the caller is giving up
+ * @param reclaim what frees it, invoked with item once it is unreachable
+ */
+void cf_registry_retire_obj(cf_registry_t *reg, void *item, tdb_reclaim_fn reclaim);
+
 void cf_registry_retire_cf(cf_registry_t *reg, cf_t *cf, tdb_reclaim_fn reclaim);
 
 /**

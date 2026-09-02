@@ -444,6 +444,12 @@ void cf_registry_view_leave(cf_registry_t *reg, cf_registry_view_t *view)
         cf_registry_view_reclaim(view, reg);
 }
 
+void cf_registry_retire_obj(cf_registry_t *reg, void *item, tdb_reclaim_fn reclaim)
+{
+    if (!reg || !item || !reclaim) return;
+    cf_registry_retire_item(reg, item, reclaim);
+}
+
 void cf_registry_retire_cf(cf_registry_t *reg, cf_t *cf, tdb_reclaim_fn reclaim)
 {
     if (!reg || !cf || !reclaim) return;

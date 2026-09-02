@@ -46,6 +46,16 @@ static long fuzz_env_long(const char *name, long fallback)
     return v ? strtol(v, NULL, 10) : fallback;
 }
 
+/* the seed needs its own reader rather than the long one above. a seed is a full 64-bit value, and
+ * long is 32 bits on plenty of the platforms this builds for -- passing the default through it
+ * truncates the constant to something else entirely, so the same command would seed one run
+ * differently depending on the machine it ran on */
+static uint64_t fuzz_env_u64(const char *name, uint64_t fallback)
+{
+    const char *v = getenv(name);
+    return v ? (uint64_t)strtoull(v, NULL, 0) : fallback;
+}
+
 static int fuzz_replay_file(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -81,7 +91,7 @@ int main(int argc, char **argv)
     }
 
     const long iters = fuzz_env_long("TIDESDB_FUZZ_ITERS", FUZZ_STANDALONE_DEFAULT_ITERS);
-    uint64_t state = (uint64_t)fuzz_env_long("TIDESDB_FUZZ_SEED", 0x9e3779b97f4a7c15ULL);
+    uint64_t state = fuzz_env_u64("TIDESDB_FUZZ_SEED", 0x9e3779b97f4a7c15ULL);
     if (state == 0) state = 0x9e3779b97f4a7c15ULL;
 
     const char *dump_last = getenv("TIDESDB_FUZZ_DUMP_LAST");

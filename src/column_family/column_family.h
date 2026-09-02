@@ -197,9 +197,12 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, uint64_t cf_id, co
  * @param cf the column family, its dir and name already set to the target
  * @param manifest the db-level manifest to enumerate this family's entries from
  * @param sync_mode block-manager sync mode for reopening klogs
- * @return 0 on success (old level set freed), -1 on failure (old level set retained)
+ * @param out_displaced out -- the level set this replaced, which the caller owns and must free once
+ *        no borrow can still reach it; set on every return, including the failing ones
+ * @return 0 on success, -1 on failure
  */
-int cf_reload_levels(cf_t *cf, tidesdb_manifest_t *manifest, int sync_mode);
+int cf_reload_levels(cf_t *cf, tidesdb_manifest_t *manifest, int sync_mode,
+                     level_set_t **out_displaced);
 
 /**
  * cf_range_tombstone_covering

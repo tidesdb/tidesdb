@@ -831,10 +831,20 @@ int engine_drop_cf(tidesdb_t *db, const char *name)
     const int rc = cf_registry_remove(db->cfs, name, &cf);
     if (rc != TDB_SUCCESS) return rc;
 
-    /* the cf is out of the registry so the scheduler starts no new compaction for it; wait out any
-     * compaction already in flight before freeing the handle it holds */
-    while (atomic_load_explicit(&cf->compacting, memory_order_acquire))
+    /* the claim is taken, not merely observed clear. unpublishing the family stops a later
+     * scheduler tick from finding it, but a tick already inside its borrow has the handle in hand
+     * and can still claim it after the removal returns -- and it goes on using that pointer after
+     * leaving the borrow, which is the one place a family outlives the view it came from. reading
+     * the flag as zero would then be a gap rather than a guarantee, so drop competes for the claim
+     * like a compaction would and keeps it: whoever holds it owns the handle, and drop is
+     * destroying it */
+    int claimed = 0;
+    while (!atomic_compare_exchange_weak_explicit(&cf->compacting, &claimed, 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+    {
+        claimed = 0;
         usleep(ENGINE_DROP_QUIESCE_STALL_US);
+    }
 
     /* clear any commit hook so the db-level gate counter stays exact once the handle is gone */
     if (atomic_load_explicit(&cf->commit_hook_fn, memory_order_acquire))
@@ -873,9 +883,9 @@ int engine_drop_cf(tidesdb_t *db, const char *name)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "cf %s dropped, id %llu retired", name, (unsigned long long)cf_id);
 
     /* deferred rather than freed here. the family is out of the published view so nothing new can
-     * reach it, but a borrow taken before the removal still holds the handle -- and waiting for
-     * those borrows to end is the stall a create used to pay. the registry frees it once no borrow
-     * is in flight */
+     * reach it, but a view published before the removal still names it and a flush holds one of
+     * those for as long as its I/O takes -- and waiting that out is the stall a create used to pay.
+     * the registry frees it once no live view can name it */
     cf_registry_retire_cf(db->cfs, cf, engine_cf_reclaim);
 
     /* the manifest no longer names them, so a file left behind here is unreachable rather than

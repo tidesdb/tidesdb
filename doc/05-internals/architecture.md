@@ -156,6 +156,15 @@ view is necessarily the newest one, and the newest one is the view the drop publ
 not name the family. A count of one is therefore the same proof a wait used to provide, and it is
 read when a view dies and again on the reaper's tick, never waited for.
 
+One family does outlive its borrow, and it is the exception the rule has to name. The compaction
+scheduler collects the families it will plan, marks each with a claim, and *then* leaves the view --
+it works on those handles afterwards, holding them by the claim rather than by the view. So a drop
+takes that claim rather than checking it is clear: unpublishing stops a later tick from finding the
+family, but a tick already inside its borrow can still claim it after the removal returns, and
+reading the flag as zero at that moment is a gap rather than a guarantee. Whoever holds the claim
+owns the handle, and a drop is destroying it, so it competes for the claim like a compaction would
+and keeps it.
+
 A family's mutable fields work the same way rather than being written in place:
 its name is published and the old one queued for release with the handles, because a flush copies
 that name onto an sstable where it is the first component of a block-cache key -- a torn copy is a

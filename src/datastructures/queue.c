@@ -404,8 +404,7 @@ size_t queue_remove_if(queue_t *queue, int (*predicate)(void *data, void *contex
     pthread_mutex_lock(&queue->tail_lock);
 
     size_t removed = 0;
-    queue_node_t *prev = queue->head; /* dummy sentinel */
-    /* exclusive locks held (rwlock-wr + head + tail), so relaxed throughout */
+    queue_node_t *prev = queue->head;
     queue_node_t *cur = atomic_load_explicit(&queue->head->next, memory_order_relaxed);
     while (cur != NULL)
     {

@@ -367,21 +367,6 @@ void engine_maybe_rotate(tidesdb_t *db)
 {
     if (!tidesdb_l0_active_full(db->l0)) return;
 
-    /* a rotation runs on whichever committing thread found the memtable full. the others do not
-     * queue behind it -- a rotation is work that has to happen rather than work this caller must
-     * personally do, and the thread holding the lock is doing it right now. queueing is what a
-     * mutex that hands off by barging turns into starvation, one waiter losing every race for
-     * minutes while the rest stream through, and a waiter here gains nothing by waiting that it
-     * does not get from the holder finishing.
-     *
-     * the caller's write has already landed by this point, so declining costs it nothing. the
-     * memtable stays full until the holder seals it, which is what admission paces against */
-    /* taken before the lock, and compared after it, so the re-check below costs one relaxed load.
-     * measuring the memtable again would take its range tombstone lock, whose read side holds off
-     * while any writer waits -- an unbounded wait, performed while holding the lock every other
-     * committer needs. that is how a rotation came to hold this lock for minutes: not doing slow
-     * work, but blocking on another lock in the middle of it, with every other committer declining
-     * and writing on into a memtable that could no longer seal */
     const uint64_t mark_before = tidesdb_l0_rotation_mark(db->l0);
 
     const uint64_t started_us = engine_monotonic_us();

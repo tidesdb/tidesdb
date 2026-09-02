@@ -20,21 +20,21 @@ static int tests_failed = 0;
 
 static tidesdb_l0_pressure_t pressure_at(int depth, int limit)
 {
-    tidesdb_l0_pressure_t p = {depth, limit, 0, 0, 0, 0, 0, 0, 0, 0};
+    tidesdb_l0_pressure_t p = {.queue_depth = depth, .queue_limit = limit};
     return p;
 }
 
 /* a snapshot weighing only the staging ring, so the ring band can be exercised on its own */
 static tidesdb_l0_pressure_t ring_pressure_at(size_t lag, size_t capacity)
 {
-    tidesdb_l0_pressure_t p = {0, 0, 0, 0, 0, capacity, lag, 0, 0, 0};
+    tidesdb_l0_pressure_t p = {.wal_ring_bytes = capacity, .wal_lag_bytes = lag};
     return p;
 }
 
 /* a snapshot weighing only the flush tier, so its band can be exercised on its own */
 static tidesdb_l0_pressure_t tier_pressure_at(int depth, int slow, int stall)
 {
-    tidesdb_l0_pressure_t p = {0, 0, 0, 0, 0, 0, 0, depth, slow, stall};
+    tidesdb_l0_pressure_t p = {.tier_depth = depth, .tier_slow = slow, .tier_stall = stall};
     return p;
 }
 

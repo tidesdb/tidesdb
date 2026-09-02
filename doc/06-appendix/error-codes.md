@@ -63,8 +63,12 @@ asked for, and the two cases are not equally common.
 holds that family. `tidesdb_flush_memtable`, and `tidesdb_checkpoint` through it, report it for a
 related but distinct reason: the immutable queue had not drained when their bounded wait expired,
 which says flush is behind rather than that anything holds a family.
-This is the ordinary case, and returning immediately is deliberate: these calls never park you
-behind a compaction that could run for minutes. Retry later, or don't; the work you asked for is
+This is the ordinary case. `tidesdb_compact`, `tidesdb_compact_range`,
+`tidesdb_cf_update_runtime_config` and `tidesdb_backup` report it **immediately** rather than park
+you behind a compaction that could run for minutes. `tidesdb_rename_column_family` and
+`tidesdb_clone_column_family` differ: they wait out a bounded quiesce window — a minute — and report
+locked only if the family was still held at the end of it, because both have to reach a moment when
+nothing else is working on the family. Either way, retry later, or don't; the work you asked for is
 in many cases already happening.
 
 **From a read or a scan** it is rare. Transient pressure — a memtable rotating out from under a

@@ -555,9 +555,6 @@ void test_manifest_orphaned_temp_cleanup()
     fprintf(f3, "7\n4000\n1,400,4000,262144\n");
     fclose(f3);
 
-    /*  simulate crash by creating orphaned temp files
-     * these would be left behind if commit crashed before rename */
-    /* verify temp files exist */
     ASSERT_EQ(access(temp1, F_OK), 0);
     ASSERT_EQ(access(temp2, F_OK), 0);
     ASSERT_EQ(access(temp3, F_OK), 0);

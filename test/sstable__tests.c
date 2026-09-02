@@ -473,8 +473,7 @@ void test_builder_roundtrip(void)
     ASSERT_EQ(sst->min_key_size, 5u);
     ASSERT_TRUE(memcmp(sst->min_key, "key00", 5) == 0);
     ASSERT_TRUE(memcmp(sst->max_key, "key09", 5) == 0);
-    ASSERT_TRUE(sst->bloom_dir_offset != 0); /* a bloom was built */
-    /* the build keeps the klog open and hot rather than releasing the fd */
+    ASSERT_TRUE(sst->bloom_dir_offset != 0);
     block_manager_t *hot = atomic_load(&sst->klog_bm);
     ASSERT_TRUE(hot != NULL);
 

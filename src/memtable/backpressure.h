@@ -24,10 +24,6 @@
  * a snapshot of L0 fill the backpressure policy decides on
  * @param queue_depth immutables currently sitting in the L0 queue awaiting flush
  * @param queue_limit configured peak L0 queue depth, or <= 0 for unbounded (never blocks)
- * @param active_bytes bytes in the active L0 memtable, or 0 when the producer did not weigh it. the
- * L0 write-admission path leaves this 0 on purpose -- reading it there costs a pinned load of the
- * shared active slot on every commit -- so a policy driven from that path must decide on the queue
- * fields, and only a producer already holding the active memtable can fill this in
  * @param buffer_size rotation threshold in bytes for the active L0 memtable
  * @param flush_in_progress non-zero while a flush is draining the queue
  * @param wal_ring_bytes capacity of the write-ahead log's staging ring, or 0 when the producer did
@@ -46,7 +42,6 @@ typedef struct
 {
     int queue_depth;
     int queue_limit;
-    size_t active_bytes;
     size_t buffer_size;
     int flush_in_progress;
     size_t wal_ring_bytes;

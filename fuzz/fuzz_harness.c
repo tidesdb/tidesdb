@@ -924,11 +924,6 @@ int fuzz_run(const uint8_t *data, size_t size, int sync_mode)
     s.verbose = getenv("TIDESDB_FUZZ_VERBOSE") != NULL;
     fx_init_codecs();
 
-    /* the engine log is off unless asked for, since a trace of every run would bury the divergence
-     * report. TIDESDB_FUZZ_LOG names the severity and TIDESDB_FUZZ_LOG_FILE the sink to land it in,
-     * so a failing run leaves an engine trace beside the keys the oracle named */
-    /* every database this run opens carries the severity through its config, so the gate follows a
-     * reopen rather than being left wherever the last open put it */
     s.log_level = TDB_LOG_NONE;
     const char *lvl = getenv("TIDESDB_FUZZ_LOG");
     if (lvl)

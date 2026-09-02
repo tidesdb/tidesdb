@@ -471,9 +471,7 @@ void test_block_manager_validate_last_block()
     FILE *file = fopen("validate_test.db", "a+b");
     ASSERT_TRUE(file != NULL);
 
-    /* we append just a size prefix (4 bytes) without the actual data */
-    /* must use little-endian encoding to match block manager's format */
-    uint32_t corrupt_size = 100; /* size that's larger than what we'll actually write */
+    uint32_t corrupt_size = 100;
     uint8_t size_buf[4];
     encode_uint32_le_compat(size_buf, corrupt_size);
     ASSERT_TRUE(fwrite(size_buf, sizeof(size_buf), 1, file) == 1);

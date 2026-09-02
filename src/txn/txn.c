@@ -504,13 +504,6 @@ int tdb_txn_pin_snapshot(tdb_txn_t *txn, const uint64_t seq)
 {
     if (!txn || txn->isolation < TDB_ISOLATION_REPEATABLE_READ) return TDB_ERR_INVALID_ARGS;
 
-    /* only ever backwards. the registry publishes the minimum over the frozen snapshots it holds,
-     * and a reader that raised its own would lift the floor above versions it is about to ask for.
-     * the snapshot handle this reads at is registered in its own right and pins the floor at or
-     * below seq already, so lowering here narrows what this transaction sees without changing what
-     * the floor protects */
-    /* released so a peer's gc-floor scan that loads it sees the lowered value, not the default
-     * this transaction was registered with */
     if (seq < atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire))
         atomic_store_explicit(&txn->snapshot_seq, seq, memory_order_release);
     return TDB_SUCCESS;

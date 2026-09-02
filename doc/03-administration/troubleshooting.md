@@ -149,9 +149,11 @@ cannot open its key log even after the reaper has had its chances. Raise the pro
 `tidesdb_raise_open_file_limit` before opening and set `max_open_sstables` accordingly, or reduce
 the number of sstables by compacting.
 
-From the maintenance calls — compact, rename, clone, reconfigure — it means something else
-entirely, and is ordinary: another exclusive operation holds that family. Those return at once
-rather than parking you behind a compaction that may run for minutes.
+From the maintenance calls it means something else entirely, and is ordinary: another exclusive
+operation holds that family. Compact, reconfigure and backup return at once rather than parking you
+behind a compaction that may run for minutes. Rename and clone wait first — a bounded quiesce window
+of about a minute — and report locked only if the family was held for all of it, so a caller of
+those should expect a wait before the answer rather than an immediate one.
 
 :::caution[Never treat it as "not found"]
 Code that folds `TDB_ERR_LOCKED` into an absence returns silently wrong answers under load. It

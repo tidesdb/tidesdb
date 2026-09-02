@@ -32,10 +32,7 @@ struct sstable_builder
      * these on every node it writes, so a registry walk on that path would be paid per node */
     tidesdb_encoding_stage_t codec[TDB_ENCODING_PIPELINE_MAX];
     int codec_count;
-    const tidesdb_encoding_registry_t *encodings; /* carried onto the produced sstable */
-    /* the pipeline a spilled value is stored under, recorded with the value itself so a later read
-     * undoes exactly what was applied -- compaction carries a value forward by id, so the sstable
-     * referencing it may by then record a different pipeline than the one that wrote it */
+    const tidesdb_encoding_registry_t *encodings;
     uint8_t value_ids[TDB_ENCODING_PIPELINE_MAX];
     int value_id_count;
 

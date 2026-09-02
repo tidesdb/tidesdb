@@ -69,11 +69,7 @@ static sstable_t *open_and_hold(uint64_t id, fd_manager_t *fdm)
     ASSERT_EQ(sstable_open_from_manifest(&sst, TEST_REAPER_DIR, "cf", &entry,
                                          BLOCK_MANAGER_SYNC_NONE, NULL, NULL, fdm, NULL, NULL),
               TDB_SUCCESS);
-    ASSERT_TRUE(sstable_ensure_open(sst) != NULL); /* holds the klog, note_open bumps the count */
-    /* the engine references every candidate for the length of the sweep and drops them after, so a
-     * candidate reaches the reaper at the level set's reference plus that one. holding only the
-     * first here would size the resting count a reference short and test a state no sweep is ever
-     * in -- which is what let a reaper that could never evict anything keep passing */
+    ASSERT_TRUE(sstable_ensure_open(sst) != NULL);
     sstable_ref(sst);
     return sst;
 }

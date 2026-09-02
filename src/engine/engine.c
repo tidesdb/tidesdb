@@ -662,10 +662,6 @@ void engine_close(tidesdb_t *db)
      * which is what an operator reading it back needs to be able to tell */
     if (db->opened) TDB_DEBUG_LOG(TDB_LOG_INFO, "closing %s", db->config.db_path);
 
-    /* dependency order: stop the workers, tear down the txn/l0 write path, then the cfs (which
-     * borrow the vlog), then the shared singletons, then the leaf resources */
-    /* dropped before the reaper it names is stopped, so a descriptor wait raced against the close
-     * finds nothing to call rather than a ticker that is going away */
     fd_manager_set_reaper_wake(&db->fdm, NULL, NULL);
     db->fd_reaper = NULL;
     if (db->threads)

@@ -379,10 +379,6 @@ static int l0_replay_block(tidesdb_l0_t *l0, uint64_t generation, const uint8_t 
         return TDB_ERR_CORRUPTION;
     }
 
-    /* a PREPARE spans WAL generations and stages for the caller's cross-generation pass; a COMMIT
-     * carries its own batch and applies inline, as does a single-phase write batch */
-    /* an abort record names a cancelled batch and carries nothing of its own to apply; the scan
-     * pass already collected it */
     if (wc.kind == TDB_WAL_KIND_ABORT_SEQ) return TDB_SUCCESS;
 
     if (wc.kind != TDB_WAL_KIND_WRITE_BATCH)

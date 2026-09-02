@@ -106,18 +106,20 @@ This is where a writer waits when the engine is not keeping up. **Three signals 
 the strongest wins** — none is allowed to mask another:
 
 - **The queue of sealed memtables awaiting flush.** As it fills, writers are first made to
-  dwell, then held at the limit. This is the one `memtable_l0_queue_stall_threshold`
-  configures.
+  dwell, then held at the limit. `memtable_l0_queue_stall_threshold` is that limit.
 - **The write-ahead log's staging ring.** Its lag is bounded whatever the queue is doing, so
   the ring paces ingest on its own. Its capacity comes from `memtable_write_buffer_size`, not
   from the queue threshold.
 - **The depth of overlapping runs in L1.** A tier that has run past its slow mark paces
-  writers so compaction can catch up.
+  writers so compaction can catch up. Its marks come from the queue threshold too -- dwelling
+  from half of it, waiting at it -- since that setting is the statement of how much backlog
+  this database carries and a tier run is backlog the same way a queued memtable is.
 
 The practical consequence is that **raising the queue threshold does not necessarily reduce
-stalling**, because the dwell may not be coming from the queue at all. Raising it sixteenfold
-on a write-heavy run here changed the total stall not at all; the memtable size did, by a
-factor of three, because it sizes the ring and lowers the flush rate at once.
+stalling**, because the dwell may still be coming from the ring, which that setting does not
+touch. Raising it sixteenfold on a write-heavy run here changed the total stall not at all; the
+memtable size did, by a factor of three, because it sizes the ring and lowers the flush rate at
+once.
 
 There is a ceiling on the wait — a writer held too long is admitted regardless, because a
 flush that never drains would otherwise turn a slow database into a stuck one. Each of those

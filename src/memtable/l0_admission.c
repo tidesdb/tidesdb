@@ -29,11 +29,21 @@
 #define TDB_L0_BACKPRESSURE_CEILING_US 2000000ull
 #define TDB_L0_BACKPRESSURE_LOG_EVERY  1000
 
-/* runs in the flush tier at which a writer starts dwelling, and at which it waits for the tier to
- * drain. the compaction trigger sits below both, so merging is already underway before ingestion is
- * slowed and well underway before it is stopped */
-#define TDB_L0_TIER_SLOW_RUNS  8
-#define TDB_L0_TIER_STALL_RUNS 20
+/* the flush tier is paced on the same tolerance the queue is: a writer dwells from half the
+ * configured depth and waits at the depth itself. the two backlogs measure different things -- the
+ * queue whether flush keeps up, the tier whether merging does -- but the configured threshold is
+ * one statement of how much backlog this database will carry, and it applies to both. deriving them
+ * keeps that true at any setting, where a fixed pair only held at the default it was chosen against
+ */
+static int l0_tier_slow_runs(const tidesdb_l0_t *l0)
+{
+    return l0->l0_queue_size > 0 ? l0->l0_queue_size / 2 : 0;
+}
+
+static int l0_tier_stall_runs(const tidesdb_l0_t *l0)
+{
+    return l0->l0_queue_size > 0 ? l0->l0_queue_size : 0;
+}
 
 /**
  * l0_admission_snapshot
@@ -49,18 +59,18 @@ static void l0_admission_snapshot(const tidesdb_l0_t *l0, tidesdb_l0_pressure_t 
     memset(out, 0, sizeof(*out));
     out->queue_depth = (int)queue_size(l0->queue);
     out->queue_limit = l0->l0_queue_size;
-    /* weighing the active memtable would cost a pinned read of the shared active slot -- three
-     * contended atomics and a full barrier -- on every commit, which costs more than the pacing it
-     * would buy, so admission decides on the backlog alone */
-    out->active_bytes = 0;
+    /* the active memtable's fill is deliberately not among the fields a policy decides on. reading
+     * it here would cost a pinned load of the shared active slot -- three contended atomics and a
+     * full barrier -- on every commit, which is more than the pacing it would buy, so admission
+     * decides on the backlog alone */
     out->buffer_size = l0->write_buffer_size;
     out->flush_in_progress = atomic_load_explicit(&l0->flushes_in_flight, memory_order_relaxed);
 
     /* merge progress, which the queue cannot show: a burst can drain out of memory promptly and
      * still leave a tier of runs every later read has to merge across */
     out->tier_depth = atomic_load_explicit(&l0->tier_depth, memory_order_relaxed);
-    out->tier_slow = TDB_L0_TIER_SLOW_RUNS;
-    out->tier_stall = TDB_L0_TIER_STALL_RUNS;
+    out->tier_slow = l0_tier_slow_runs(l0);
+    out->tier_stall = l0_tier_stall_runs(l0);
 
     /* every field the policy reads has to be set here, including the ones this producer does not
      * weigh: the caller's snapshot is an uninitialised stack struct, so a field left alone is read
@@ -126,8 +136,9 @@ int tidesdb_l0_admit_write(tidesdb_l0_t *l0)
      * out of memory promptly and still leave a tier of runs every later read merges across, so an
      * empty queue is only a free admit while the tier is also shallow */
     const int tier = atomic_load_explicit(&l0->tier_depth, memory_order_relaxed);
+    const int tier_slow = l0_tier_slow_runs(l0);
     const int no_queue_pressure = l0->l0_queue_size <= 0 || queue_size(l0->queue) == 0;
-    if (no_queue_pressure && tier < TDB_L0_TIER_SLOW_RUNS) return TDB_SUCCESS;
+    if (no_queue_pressure && (tier_slow <= 0 || tier < tier_slow)) return TDB_SUCCESS;
 
     uint64_t stalled_us = 0;
     int counted_block = 0;

@@ -119,9 +119,6 @@ void test_planner_merge_always_leaves_the_flush_tier(void)
     ASSERT_TRUE(compaction_planner_triggered(&st, &c, caps));
     ASSERT_TRUE(compaction_planner_target_level(&st, &c, caps) > 1);
 
-    /* and the job the plan emits carries that target, so the merge actually promotes */
-    /* the plan derives its own state from the snapshot, so the tier's file count has to be real
-     * here rather than asserted above -- eight runs in the tier, one level beneath it */
     compaction_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
     compaction_sstable_info_t files[PLANNER_TIER_RUNS + 1];
@@ -299,8 +296,7 @@ void test_plan_grows_a_level_when_the_largest_is_full(void)
 void test_plan_dividing(void)
 {
     compaction_planner_config_t c = cfg();
-    c.dividing_level_offset = 0; /* X = num_levels - 1 = 2 */
-    /* caps at N_L=10000, T=10, base=100: C1=100, C2=1000, C3=10000 */
+    c.dividing_level_offset = 0;
     const compaction_sstable_info_t ssts[] = {
         sst(1, 1, 150, "a", "z"),   /* L1 over its cap (100) -> triggered */
         sst(2, 2, 50, "a", "z"),    /* L2 well under its cap (1000) -> not partitioned */
@@ -383,8 +379,7 @@ static int plan_inputs_disjoint(const compaction_plan_t *plan)
 void test_plan_partitioned(void)
 {
     compaction_planner_config_t c = cfg();
-    c.dividing_level_offset = 0; /* X = 2 */
-    /* L2 is over its cap (1000), so X is full and the merge is partitioned into L3 */
+    c.dividing_level_offset = 0;
     const compaction_sstable_info_t ssts[] = {
         sst(1, 1, 10, "a", "z"),    /* small L1 */
         sst(2, 2, 600, "a", "l"),   /* L2 file overlapping partition 0 */

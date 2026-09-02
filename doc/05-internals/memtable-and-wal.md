@@ -342,11 +342,14 @@ depth against the configured limit:
 The throttle dwell rises with depth — a per-slot step for each slot filled past the
 high-water mark — so pressure is applied gradually rather than as a cliff at the limit.
 
-The flush tier has its own band beside the queue's, on the same three outcomes: below the slow mark
-a deep tier costs a writer nothing, past it the dwell grows with the depth, and at the stall mark the
-writer waits for the tier to drain. The compaction trigger sits below both, so merging is already
-underway before ingestion is slowed and well underway before it is stopped. Whichever band asks for
-more wins, so neither pressure is masked by the other.
+The flush tier has its own band beside the queue's, on the same three outcomes, and it is measured
+in the same unit: runs in the tier, which is the L1 file count the compaction trigger also reads.
+Its marks come from the same configured depth the queue's do — a writer dwells from half of it and
+waits at it — so one setting states how much backlog this database carries and both bands move with
+it. Fixed marks only held against the default they were chosen for: raise the depth for a faster
+device and a tier band left behind it starts throttling for a backlog the queue was configured to
+allow. The compaction trigger sits below both, so merging is already underway before ingestion is
+slowed. Whichever band asks for more wins, so neither pressure is masked by the other.
 
 Blocking has a **ceiling**. A writer held too long is admitted regardless, and the event is
 counted as `write_stall_ceiling_hits`. This is a deliberate choice about failure modes: a

@@ -214,14 +214,8 @@ struct tidesdb_t
 
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) gc_floor_high_water;
-    _Atomic(int)
-        commit_hook_count;       /* live commit hooks across all cfs, gates the post-commit pass */
-    _Atomic(int) vlog_gc_active; /* set while a value-log reclaim is queued or running, so at most
-                                    one runs */
-    /* the database directory's exclusive lock, held for as long as the handle is open. two
-     * processes opening the same directory would each recover the write ahead log, each install
-     * sstables the other's manifest does not name, and neither would be wrong to do so -- the
-     * damage is done before either notices */
+    _Atomic(int) commit_hook_count;
+    _Atomic(int) vlog_gc_active;
     int lock_fd;
     int opened;
     int owns_log_sink;

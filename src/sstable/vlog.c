@@ -558,18 +558,6 @@ int vlog_read(vlog_t *v, vlog_id_t id, uint8_t **out_value, size_t *out_len)
      * concurrently waits for this to drop before it unlinks anything */
     if (!vlog_segment_acquire(v, slot)) return VLOG_ERR_NOT_FOUND;
 
-    /* borrow the verified block rather than take an owned copy of it -- every path below copies the
-     * value into a buffer of its own anyway, so an owned read would allocate and copy the whole
-     * block only to be freed a few lines later. the borrowed bytes live in this thread's read
-     * buffer, so they survive releasing the segment reference */
-    /* the index already knows the value's length, so ask for the whole block in the first read.
-     * left to the block manager's default guess, a value only a little past it -- a 4 KiB value,
-     * say, whose block carries this module's header on top -- costs a second syscall to collect the
-     * remainder. the codec is recorded inside the block and so is not known before reading it,
-     * which makes the uncompressed length an upper bound rather than an exact size: exact for a
-     * value stored verbatim, and generous for a compressed one. asking for more than the block
-     * holds costs nothing -- the reader takes its length from the block's own header -- while
-     * asking for too little is the second syscall this exists to avoid */
     const uint32_t hint = (uint32_t)(VLOG_BLK_HDR_SIZE + value_len);
     uint32_t payload_len = 0;
     const uint8_t *payload = block_manager_borrow_block_data_at_offset(

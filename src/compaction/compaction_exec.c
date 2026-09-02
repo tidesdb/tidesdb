@@ -122,10 +122,7 @@ typedef struct
     block_manager_t *cur_bm;
     sstable_builder_t *cur_builder;
     int cur_open;
-    int cur_partition; /* index of the boundary partition the current output holds */
-    /* the intervals this merge's inputs carried, borrowed, written into every output it produces.
-     * an interval lives as long as a table holding it, so a merge that retires its inputs has to
-     * hand what they carried to what replaces them or the deletes go with the files */
+    int cur_partition;
     const range_tombstone_set_t *carried;
 } ce_sink_t;
 

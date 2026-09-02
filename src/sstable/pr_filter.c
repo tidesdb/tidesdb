@@ -20,7 +20,7 @@
  * the partition records are in build (ascending key) order, so the reader binary-searches them
  * directly. */
 #define BBF_DIR_MAGIC   0x46424254u /* "TBBF" little-endian */
-#define BBF_DIR_VERSION 1u
+#define BBF_DIR_VERSION 10u
 /* magic + version + partition_count */
 #define BBF_DIR_HEADER_BYTES (3 * sizeof(uint32_t))
 /* per-record bytes before the variable first_key -- disk_offset + blob_size + entry_count +

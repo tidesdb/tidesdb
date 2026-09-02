@@ -109,6 +109,13 @@ static void engine_cf_fold(const level_set_snapshot_entry_t *all, int count,
         acc->total_key_bytes += sst->total_key_bytes;
         acc->total_value_bytes += sst->total_value_bytes;
 
+        /* the filter's routing directory, which is resident for as long as the table is open and
+         * is not part of the cache budget. the partition blobs it points at are, so only the
+         * directory is counted here -- reading zero means nothing has probed this table yet, since
+         * the directory is built on first probe rather than at open */
+        out->filter_resident_bytes += pr_filter_reader_resident_bytes(
+            atomic_load_explicit(&sst->bloom, memory_order_acquire));
+
         out->btree_total_nodes += sst->btree_node_count;
         if (sst->btree_height > out->btree_max_height) out->btree_max_height = sst->btree_height;
         acc->btree_height_sum += sst->btree_height;

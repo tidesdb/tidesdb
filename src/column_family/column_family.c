@@ -162,11 +162,13 @@ int cf_create(const char *db_dir, const uint64_t cf_id,
         return -1;
     }
 
-    if (level_set_create(&cf->levels) != 0)
+    level_set_t *fresh = NULL;
+    if (level_set_create(&fresh) != 0)
     {
         cf_free(cf);
         return -1;
     }
+    atomic_store_explicit(&cf->levels, fresh, memory_order_release);
 
     *out = cf;
     return 0;
@@ -216,8 +218,14 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
 
     /* the tables bring their own intervals with them, so opening them is the whole of restoring
      * this family's deletes */
-    if (level_set_create(&cf->levels) != 0 ||
-        cf_load_entries(cf, manifest, sync_mode, CF_LOAD_SELF_HEAL) != 0)
+    level_set_t *fresh = NULL;
+    if (level_set_create(&fresh) != 0)
+    {
+        cf_free(cf);
+        return -1;
+    }
+    atomic_store_explicit(&cf->levels, fresh, memory_order_release);
+    if (cf_load_entries(cf, manifest, sync_mode, CF_LOAD_SELF_HEAL) != 0)
     {
         cf_free(cf);
         return -1;
@@ -240,9 +248,16 @@ int cf_reload_levels(cf_t *cf, tidesdb_manifest_t *manifest, const int sync_mode
      * taking the family out of the view does not end a borrow already in flight. so the close is
      * the caller's to schedule, once nothing can still reach the set. on failure the data stays on
      * disk and is recovered on the next open */
-    *out_displaced = cf->levels;
-    cf->levels = NULL;
-    if (level_set_create(&cf->levels) != 0) return -1;
+    level_set_t *fresh = NULL;
+    if (level_set_create(&fresh) != 0)
+    {
+        *out_displaced = NULL;
+        return -1;
+    }
+    /* one store rather than a clear and a rebuild. the old set went straight to empty through a
+     * null in between, and a scheduler tick loading the field in that window read no set at all --
+     * an overlap depth of zero for a family that had one, which is the signal ingestion paces on */
+    *out_displaced = atomic_exchange_explicit(&cf->levels, fresh, memory_order_acq_rel);
     return cf_load_entries(cf, manifest, sync_mode, CF_LOAD_STRICT) == 0 ? 0 : -1;
 }
 

@@ -214,7 +214,7 @@ the footer's *filter directory offset* and *size*. Little-endian throughout:
 
 ```
   4 bytes  magic 0x46424254 ("TBBF")
-  4 bytes  format version
+  4 bytes  format version (10)
   4 bytes  partition count
   then, per partition:
     8 bytes  blob offset within the key log
@@ -230,10 +230,49 @@ wrong partition and produce a false negative, which is worse than no filter at a
 
 :::note[This directory versions independently of the file holding it]
 It carries its own magic and its own format version, validated on read, rather than inheriting the
-key log's. So its version is **not** the format version at the top of this appendix, and it moves
-only when this layout changes. The blobs it points at are ordinary bloom filters fetched on demand
+key log's. It starts at 10 alongside every other format in this release, but that is alignment, not
+inheritance -- it moves only when *this* layout changes, so a later release can leave it behind
+while the rest move on. The blobs it points at are ordinary bloom filters fetched on demand
 through the block cache, which is what bounds the filter's resident cost to the directory alone.
 :::
+
+## Range tombstone block
+
+The intervals a table carries, at the offset and size the footer records. An offset and size of
+zero mean the table carries none.
+
+```
+  1 byte   format version (10)
+  4 bytes  fragment count (uint32, big-endian)
+  then, per fragment:
+    4 bytes  lower bound length
+    n bytes  lower bound            (inclusive)
+    4 bytes  upper bound length     (0 = unbounded above)
+    n bytes  upper bound            (exclusive)
+    4 bytes  sequence count
+    8 bytes  × count, sequences     (uint64, big-endian, descending)
+```
+
+A fragment is an interval plus **every sequence that deleted it**, rather than one interval per
+delete. Two range deletes over the same span merge into one fragment carrying both sequences, and a
+read compares the key's version against them to decide whether the delete it is standing on is newer
+than the value beneath. A fragment with no sequence covering it is not a delete, so a declared count
+of zero is rejected as corruption rather than read as an interval nothing deleted.
+
+An upper bound length of **zero means unbounded above**, not an empty key. That is why the bound is
+a length rather than a flag: a delete running to the end of the family has no upper key to store, and
+storing one would mean inventing a maximum key the comparator would then have to honour.
+
+:::note[This block is big-endian, and the rest of the file is not]
+The block frame's sizes and the filter directory are little-endian; the fields here are big-endian.
+Nothing depends on the difference — each structure is read by the code that wrote it — but a reader
+written from one of the other layouts will decode a plausible-looking count and walk off the end.
+:::
+
+The declared count is weighed against the bytes actually remaining before anything is allocated: a
+fragment cannot be smaller than its three lengths and one sequence, so a block claiming more
+fragments than that bound allows is refused rather than believed. Every length inside a fragment is
+then checked against what is left, the same way the footer's tail is.
 
 ## BTree leaf node
 
@@ -298,7 +337,7 @@ either unlinked a segment or it has not.
 One framed block per commit, holding a batch:
 
 ```
-  1 byte   format version
+  1 byte   format version (10)
   then a sequence of records, each starting with a 1-byte opcode
 ```
 

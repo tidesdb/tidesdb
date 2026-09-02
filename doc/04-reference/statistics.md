@@ -97,6 +97,19 @@ underlying count can dip below it for an instant when a flush's decrement is obs
 matching apply increment, and that dip is an artefact of reading two independent updates rather
 than a real figure.
 
+**Filter memory.** `filter_resident_bytes` is what this family's partition range filters hold
+**outside the block cache**. Each open sstable keeps one routing directory — every partition's
+offset and its whole first key — and that directory is ordinary heap memory, not charged against
+`block_cache_size`. The filter bit arrays are not counted: those are fetched one partition at a time
+per probe and live in the cache, where the configured budget already bounds them.
+
+Two things follow from how it is built. A directory is created on a table's **first probe**, not at
+open, so this reads zero for a family nothing has read from yet and climbs as tables are touched.
+And its size tracks the number of partitions and the length of the keys, not the volume of data — a
+family with long keys and many small tables can hold more here than one storing far more data under
+short keys. Summing it across families is what answers "the process is larger than the cache budget
+and I want to know why".
+
 **Configuration.** `config` is a copy of the family's current
 [configuration](/appendix/configuration), including any runtime changes applied since it was
 created. It is filled in here so a caller reading the numbers has the settings that produced

@@ -431,6 +431,11 @@ typedef struct tidesdb_config_t
  * @param unflushed_key_count distinct keys resident in the shared memtables for this cf and not yet
  * in any sstable, so total_keys plus this is the live logical key count including what is still in
  * memory
+ * @param filter_resident_bytes memory this family's partition range filters hold outside the block
+ * cache -- one routing directory per sstable, holding each partition's offset and its whole first
+ * key. the filter bit arrays themselves are not counted here: those are fetched per probe and live
+ * in the cache, where block_cache_size already bounds them. a directory is built on a table's first
+ * probe, so this reads zero for a family nothing has read from yet and rises as tables are touched
  */
 typedef struct tidesdb_cf_stats_t
 {
@@ -459,6 +464,7 @@ typedef struct tidesdb_cf_stats_t
     uint64_t user_bytes_written;
     uint64_t compaction_count;
     uint64_t unflushed_key_count;
+    uint64_t filter_resident_bytes;
 } tidesdb_cf_stats_t;
 
 /**

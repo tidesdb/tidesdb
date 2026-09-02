@@ -23,7 +23,10 @@ The consequence is that a cache hit skips both the read and the parse.
 
 :::note[The value log deliberately does not read through it]
 The sstable read path uses this cache — btree nodes and filter partitions — and the value log does
-not. That is a deliberate choice, not an omission. The cache earns its budget on btree nodes
+not. A filter's *partitions* are cached; its routing *directory* is not, because every probe of that
+table starts by consulting it and an evicted directory would have to be re-read and re-parsed before
+the cache could even be asked. It is held by the sstable instead, outside this budget, and reported
+as `filter_resident_bytes`. That is a deliberate choice, not an omission. The cache earns its budget on btree nodes
 because it stores them **parsed**, so a hit skips real work; values are raw bytes the operating
 system's own page cache already holds, and caching them a second time in the engine displaces the
 nodes that make lookups fast. Keying is the other half: a value is reached through its logical id

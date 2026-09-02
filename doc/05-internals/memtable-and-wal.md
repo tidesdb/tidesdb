@@ -382,8 +382,9 @@ taken literally.
 A flush retires the memtable it just installed while holding a borrow of the family view, and it
 holds that borrow across the whole install because the level sets it mutates belong to families the
 borrow keeps alive. So a retire that waited for a reader to leave would hold that borrow for as long
-as that reader stayed -- and a `drop` waits out the borrows naming the family it is freeing, so it
-would then wait just as long.
+as that reader stayed -- and a `drop` cannot free the family until the views naming it are gone, so
+it would then wait just as long. Neither waits any more, for the same reason in both places: a wait
+on readers that keep arriving is a wait that need never end.
 
 The reclaim is therefore bounded. It rechecks whether the readers have gone a fixed number of
 times, and if they have not, it puts the memtable on a **pending list** and returns. The

@@ -211,6 +211,14 @@ The engine's memory is meant to be bounded by the write buffer, the cache capaci
 transactions, so the three of them flat while the process grows is the signal that one of those
 bounds is not being enforced rather than that a limit is set too high.
 
+**First, rule out the one thing those three do not cover.** Each open sstable holds its partition
+range filter's routing directory outside the cache budget, reported per family as
+`filter_resident_bytes`. It is not a leak and it does not grow without bound — it is proportional to
+the number of open tables and the length of their keys — but it is real memory the cache figures do
+not include, and it is the honest answer when the gap is a few tens of megabytes on a store with
+many tables or long keys. It also rises as tables are probed for the first time rather than at open,
+so a store warming up grows here even with the other three flat.
+
 Check `immutable_memtable_count` alongside it. Zero, with writes flowing, means the memtable is not
 sealing — the rotation threshold reads `memtable_bytes`, so if that number is not moving the seal
 never fires and the write buffer grows past its configured size.

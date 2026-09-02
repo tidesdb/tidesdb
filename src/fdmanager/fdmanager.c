@@ -13,6 +13,14 @@
 
 #include "base/log.h"
 
+/* the reader gate and the open path answer the same shortage from opposite ends -- the gate waits
+ * for the reaper to give descriptors back, the open path retries the EMFILE the ceiling reports.
+ * a gate that gives up sooner than the open path retries fails a read on a shortage the open was
+ * about to clear, so the two bounds are one decision and drift between them is caught here rather
+ * than by the read that starts failing */
+_Static_assert(TDB_FD_BUDGET_MAX_RECHECKS == TDB_BM_OPEN_EMFILE_MAX_RETRIES,
+               "the reader gate and the EMFILE retry must wait the same shortage out equally long");
+
 const char *fd_manager_label_name(fd_manager_label_t label)
 {
     switch (label)

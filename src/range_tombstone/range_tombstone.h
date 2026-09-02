@@ -198,7 +198,7 @@ range_tombstone_set_t *range_tombstone_set_clone(const range_tombstone_set_t *se
 
 /* on-disk version of a serialized set, checked on the way back in so a block written by a build
  * this one does not speak is refused rather than read as fragments */
-#define RT_BLOCK_VERSION 1
+#define RT_BLOCK_VERSION 10
 
 /* the smallest a serialized fragment can be -- a zero-length lower bound, an unbounded upper bound
  * and one sequence. it is what bounds the fragment count a block may claim against its own length,

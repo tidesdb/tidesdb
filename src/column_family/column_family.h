@@ -106,7 +106,10 @@ typedef struct cf
     _Atomic(int64_t) *now;
     fd_manager_t *fdm;
     const tidesdb_encoding_registry_t *encodings;
-    level_set_t *levels;
+    /* atomic because a clone replaces it while the compaction scheduler is reading a family's
+     * overlap depth off it. every read of this field is an atomic load by virtue of the qualifier,
+     * so the swap below is the only place that has to say anything */
+    _Atomic(level_set_t *) levels;
     _Atomic(int) compacting;
     uint64_t planned_generation;
     uint64_t planned_gc_floor;

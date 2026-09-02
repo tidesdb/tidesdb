@@ -169,8 +169,13 @@ A family's mutable fields work the same way rather than being written in place:
 its name is published and the old one queued for release with the handles, because a flush copies
 that name onto an sstable where it is the first component of a block-cache key -- a torn copy is a
 wrong key rather than a cosmetic defect, and a copy from a freed one is worse. That copy happens
-inside the flush's build, which is exactly the hold the borrow guard does not cover. A clone swaps its destination's level set while that family is unpublished, since
-the compaction scheduler reads every published family's overlap depth whether or not it is claimed.
+inside the flush's build, which is exactly the hold the borrow guard does not cover.
+
+A clone's destination gets the same treatment for the same reason. Replacing its level set cannot
+free the old one on the spot: the compaction scheduler reads a family's overlap depth off that set
+whether or not the family is claimed, so the claim does not keep it off, and unpublishing the family
+only stops a *later* tick -- not one already inside its borrow. The displaced set is retired instead,
+released once no live view names the family, exactly as a dropped handle is.
 
 The lock that remains is a plain mutex, and only the four membership changes take it. They contend
 with each other and with nothing else, so there is no stream for a writer to lose to -- and since

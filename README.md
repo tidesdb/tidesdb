@@ -11,13 +11,19 @@ It is not a full-featured database, but rather a library that can be used to bui
 ## Features
 - ACID with MVCC
 - Column families
-- Key-value seperation
+- Key-value separation
 - Hybrid LSM+BTree
 - Lock-free internals
 - Extensive transactional API (5 isolation levels), including 2PC-XA
+- Ordered bidirectional iteration, with range-bounded scans
+- Range deletes
+- Configurable compression pipeline (Snappy, LZ4, Zstd)
+- Partition range filters
 - TTL
+- Configurable durability (none, interval, full sync)
+- Extensive statistics and metrics
 - Crash safe and durable
-- Low space, and write amplification
+- Low space and write amplification
 - Cross-platform with file portability on Linux, macOS, Windows, BSD variants, Solaris/Illumos on x86, ARM, RISC-V, PowerPC (32-bit and 64-bit)
 
 

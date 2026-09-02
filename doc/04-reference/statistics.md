@@ -317,6 +317,11 @@ attribute a particular window.
 Safe from any thread at any time. The counters are relaxed atomics on the write path — they are
 reported, never decided on — so reading them neither blocks writers nor perturbs what it measures.
 
+The longest is the one exception, and it is there for the comparison above. It is published and read
+with enough ordering that `total_us` is always at least `max_us`; without it the two could be seen
+in either order, and a reason whose total is still small would report a longest wait larger than the
+sum containing it. The same holds for the per-class write statistics below.
+
 ### Examples
 
 ```c
@@ -391,7 +396,8 @@ Totals are cumulative since open and never reset, so sample twice and subtract f
 
 ### Thread Safety
 
-Safe from any thread at any time; the counters are relaxed atomics on the write path.
+Safe from any thread at any time; the counters are relaxed atomics on the write path, apart from
+`max_us`, which carries enough ordering that `total_us` is always at least as large as it.
 
 ### See Also
 

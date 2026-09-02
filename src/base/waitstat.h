@@ -13,8 +13,12 @@
 
 /* the engine's observability counters -- where a caller waited, and what the device was asked to
  * do. a total alone cannot tell many short waits from one long one, and it is the long one a
- * latency tail is made of, so the longest is kept beside it. every field is relaxed: these are
- * reported, never decided on. */
+ * latency tail is made of, so the longest is kept beside it.
+ *
+ * nothing here is decided on, only reported, so the counters are relaxed -- with one exception. a
+ * reader compares the longest against the total it sits inside, and two relaxed publications can be
+ * seen in either order, which hands that reader a longest larger than the sum containing it. the
+ * longest is therefore released by the writer and acquired by the reader, at both counters. */
 
 /**
  * tdb_wait_stat_t
@@ -204,10 +208,12 @@ static inline void tdb_io_note(tdb_io_stat_t *io, const uint64_t bytes, const ui
     atomic_fetch_add_explicit(&io->ops, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&io->bytes, bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&io->total_us, elapsed_us, memory_order_relaxed);
+    /* released for the same reason tdb_wait_note releases its own: a reader that sees this write in
+     * the slowest must also see it in the total it was added to */
     uint64_t seen = atomic_load_explicit(&io->max_us, memory_order_relaxed);
     while (elapsed_us > seen &&
            !atomic_compare_exchange_weak_explicit(&io->max_us, &seen, elapsed_us,
-                                                  memory_order_relaxed, memory_order_relaxed))
+                                                  memory_order_release, memory_order_relaxed))
         ;
 }
 
@@ -223,10 +229,12 @@ static inline void tdb_io_note(tdb_io_stat_t *io, const uint64_t bytes, const ui
 static inline void tdb_io_read(const tdb_io_stat_t *io, uint64_t *out_ops, uint64_t *out_bytes,
                                uint64_t *out_total_us, uint64_t *out_max_us)
 {
+    /* the slowest first and acquired, the total after, so the pair can only be seen in an order
+     * that keeps total >= max -- the same read tdb_wait_read makes for the same reason */
+    *out_max_us = atomic_load_explicit(&io->max_us, memory_order_acquire);
+    *out_total_us = atomic_load_explicit(&io->total_us, memory_order_relaxed);
     *out_ops = atomic_load_explicit(&io->ops, memory_order_relaxed);
     *out_bytes = atomic_load_explicit(&io->bytes, memory_order_relaxed);
-    *out_total_us = atomic_load_explicit(&io->total_us, memory_order_relaxed);
-    *out_max_us = atomic_load_explicit(&io->max_us, memory_order_relaxed);
 }
 
 #endif /* __TIDESDB_BASE_WAITSTAT_H__ */

@@ -79,10 +79,16 @@ void tdb_epoch_wait_drained(tdb_epoch_t *e);
 typedef _Atomic(int) tdb_refcount_t;
 
 /* ref takes a reference; only safe when the caller already holds one or a lock keeps the object
- * live */
+ * live.
+ *
+ * sequentially consistent by name rather than by default, as the drop below is. a refcount whose
+ * last drop hands the object to a reclaimer needs the drop to publish everything the holder did,
+ * and the acquire of that publication to reach the reclaimer -- the weaker pair that expresses
+ * exactly this is a release drop with an acquire fence on the last one, which is cheaper on a
+ * weakly ordered machine and is a change to make against a measurement rather than for tidiness */
 static inline void tdb_ref(tdb_refcount_t *rc)
 {
-    atomic_fetch_add(rc, 1);
+    atomic_fetch_add_explicit(rc, 1, memory_order_seq_cst);
 }
 
 /**
@@ -94,7 +100,7 @@ static inline void tdb_ref(tdb_refcount_t *rc)
  */
 static inline int tdb_unref(tdb_refcount_t *rc)
 {
-    return atomic_fetch_sub(rc, 1) == 1;
+    return atomic_fetch_sub_explicit(rc, 1, memory_order_seq_cst) == 1;
 }
 
 /**
@@ -130,7 +136,7 @@ static inline int tdb_refcount_end_evict(tdb_refcount_t *rc, const int baseline)
      * acquire frees an object still in use; losing a release leaks one. adding the offset back
      * carries both through, and the caller learns from the result which it was */
     const int restore = baseline - TDB_REFCOUNT_EVICTING;
-    return atomic_fetch_add(rc, restore) + restore;
+    return atomic_fetch_add_explicit(rc, restore, memory_order_seq_cst) + restore;
 }
 
 /* ===== epoch-guarded deferred reclamation ===== */
@@ -157,6 +163,12 @@ typedef struct
 /* brief spin before allocating a deferral node, matching the common case of readers finishing
  * quickly */
 #define TDB_RETIRE_SPIN_ATTEMPTS 64
+
+/* how long the allocation-failure path waits for a guard to clear before giving the item up. it
+ * yields between attempts, so this is a real interval rather than a spin count, and it is bounded
+ * because the alternative is waiting forever on a guard that a read-heavy database keeps occupied
+ */
+#define TDB_RETIRE_OOM_DRAIN_ATTEMPTS 4096
 
 /**
  * tdb_retire
@@ -194,18 +206,23 @@ void tdb_retire_drain(tdb_retire_list_t *list, tdb_retire_match_fn match, void *
  * every rwlock admits an arriving reader while a writer waits unless it is told otherwise, so a
  * structure read continuously by the engine's own background work never lets a writer in at all.
  * the kind that says otherwise is a glibc extension, which leaves the guarantee holding on one
- * platform and a hang reachable on every other -- and the hang is not theoretical, a column family
- * create having waited seven minutes on a netbsd runner behind a compaction reading the manifest
- * once per input file per merge.
+ * platform and a hang reachable on every other.
  *
- * announcing the writer is portable. an arriving reader holds off while one waits, which bounds the
- * writer by a single reader hold. a reader that slips through between the load and the acquire
- * costs that writer one more hold and nothing else, so an announcement is enough and a handoff is
- * not needed.
+ * the turnstile below is what makes the preference real everywhere, and it is worth being exact
+ * about what that buys. it bounds a writer by the readers already inside, which is the difference
+ * between a bounded wait and an unbounded one. it does not make the writer fast: the wait is still
+ * as long as those readers hold, and on a platform whose scheduler does not hand a waiting writer
+ * its turn promptly it can be far longer than that. a column family create starving behind
+ * continuous flush readers survived this lock and was fixed by taking those readers off the lock
+ * altogether -- see the family registry, which now publishes an immutable view instead.
  *
- * safe only where no reader takes the lock again while holding it. such a reader would wait on its
- * own writer announcement and never reach the acquire that would have completed, which is the same
- * deadlock the nonrecursive attribute gives and for the same reason. */
+ * so this is the right primitive for a lock whose readers are occasional, and the wrong answer for
+ * one read continuously. if a writer here ever starves again, the question is what the readers are
+ * doing on it, not whether the preference is strong enough.
+ *
+ * safe only where no reader takes the lock again while holding it. such a reader would block on the
+ * turnstile a writer is holding and never reach the acquire that would have released it, which is
+ * the same deadlock the nonrecursive attribute gives and for the same reason. */
 
 /**
  * tdb_wprwlock_t

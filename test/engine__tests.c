@@ -1231,14 +1231,20 @@ void test_engine_cf_unflushed_keys(void)
     ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
     ASSERT_EQ((int)st.unflushed_key_count, n);
 
-    /* the count survives a reopen -- the wal replay re-lands every resident key */
+    /* the wal replay re-lands every resident key on reopen. it is read after the flush rather than
+     * before it, because an open queues what it replayed for flush straight away -- so the count of
+     * keys still unflushed is only ever a value in transit, and reading it races that flush for
+     * whichever side happens to win. what the replay is being held to is that all n keys came back,
+     * which the settled state says without a race */
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     db = NULL;
     ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
     cf = tidesdb_get_column_family(db, "kv");
     ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
     ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
-    ASSERT_EQ((int)st.unflushed_key_count, n);
+    ASSERT_EQ((int)st.unflushed_key_count, 0);
+    ASSERT_EQ((int)st.total_keys, n);
 
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(ENGINE_TEST_DB_DIR);

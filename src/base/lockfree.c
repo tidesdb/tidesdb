@@ -10,6 +10,8 @@
 
 #include <stdlib.h>
 
+#include "log.h" /* TDB_DEBUG_LOG for the one path that cannot reclaim what it was given */
+
 /**
  * tdb_retire_node
  * one retired item on the lock-free reclamation stack
@@ -115,9 +117,23 @@ void tdb_retire(tdb_retire_list_t *list, void *item, tdb_epoch_t *guard, tdb_rec
     tdb_retire_node_t *node = malloc(sizeof(*node));
     if (!node)
     {
-        /* out of memory for a deferral node, fall back to a spin-wait and reclaim inline */
-        tdb_epoch_wait_drained(guard);
-        reclaim(item, ctx);
+        /* no node to defer onto, so the only way to reclaim is to wait the readers out here. that
+         * wait is for a moment with no reader at all, which the guard this most often runs against
+         * -- a level set, entered by every read of it -- may not have while the database is being
+         * read. so it is bounded, and an item whose readers never all left together is given up on
+         * rather than spun on: leaking one layout under an allocation failure costs memory, and
+         * hanging the thread that was trying to free it costs the database */
+        for (int i = 0; i < TDB_RETIRE_OOM_DRAIN_ATTEMPTS; i++)
+        {
+            if (tdb_epoch_active(guard) == 0)
+            {
+                reclaim(item, ctx);
+                return;
+            }
+            cpu_yield();
+        }
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "no memory to defer a reclaim and its readers did not clear, leaking it");
         return;
     }
 

@@ -1,23 +1,12 @@
 /**
  *
- * Copyright (C) TidesDB
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
  *
- * Original Author: Alex Gaetano Padula
- *
- * Licensed under the Mozilla Public License, v. 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.mozilla.org/en-US/MPL/2.0/
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-
-#include "../src/compress.h"
+#include "../src/base/encoding/compress.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -31,8 +20,9 @@ static int tests_failed = 0;
  * @param data the data to compress
  * @param data_size the size of the data
  */
-static void test_compress_decompress_algorithm(compression_algorithm algo, const char *algo_name,
-                                               uint8_t *data, size_t data_size)
+static void test_compress_decompress_algorithm(tidesdb_compression_algorithm_t algo,
+                                               const char *algo_name, uint8_t *data,
+                                               size_t data_size)
 {
     (void)algo_name; /* unused currently.. */
     size_t compressed_size;
@@ -293,12 +283,14 @@ void test_invalid_compression_algorithm()
     size_t compressed_size;
 
     /* use invalid algorithm value */
-    uint8_t *result = compress_data(data, data_size, &compressed_size, (compression_algorithm)999);
+    uint8_t *result =
+        compress_data(data, data_size, &compressed_size, (tidesdb_compression_algorithm_t)999);
     ASSERT_TRUE(result == NULL);
 
     /* test decompression with invalid algorithm */
     size_t decompressed_size;
-    result = decompress_data(data, data_size, &decompressed_size, (compression_algorithm)999);
+    result =
+        decompress_data(data, data_size, &decompressed_size, (tidesdb_compression_algorithm_t)999);
     ASSERT_TRUE(result == NULL);
 }
 
@@ -342,6 +334,25 @@ void test_decompress_rejects_implausible_prefix()
 #endif
 }
 
+/* zstd is the one codec carrying no ratio bound, because its run-length mode can expand a block
+ * arbitrarily and any ratio would reject legitimate data. that leaves the addressable cap as the
+ * only thing between a corrupt prefix and an allocation of whatever it claims, so unlike the
+ * ratio-bounded codecs above it has nothing behind the cap to catch a claim that slips past */
+void test_decompress_rejects_an_unaddressable_prefix_for_zstd()
+{
+    uint8_t data[] = "a small buffer to compress with zstd";
+    size_t compressed_size;
+
+    uint8_t *compressed = compress_data(data, sizeof(data), &compressed_size, TDB_COMPRESS_ZSTD);
+    ASSERT_TRUE(compressed != NULL);
+
+    encode_uint64_le_compat(compressed, (uint64_t)UINT32_MAX + 1);
+    size_t decompressed_size;
+    ASSERT_TRUE(decompress_data(compressed, compressed_size, &decompressed_size,
+                                TDB_COMPRESS_ZSTD) == NULL);
+    free(compressed);
+}
+
 void test_highly_compressible_roundtrip()
 {
     /* an all-zero block compresses near each codec's maximum ratio, so it is the worst legitimate
@@ -380,7 +391,7 @@ void test_highly_compressible_roundtrip()
 
 typedef struct
 {
-    compression_algorithm algo;
+    tidesdb_compression_algorithm_t algo;
     const char *name;
 } algo_entry_t;
 
@@ -769,6 +780,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_invalid_compression_algorithm, tests_passed);
     RUN_TEST(test_compress_null_out_param, tests_passed);
     RUN_TEST(test_decompress_rejects_implausible_prefix, tests_passed);
+    RUN_TEST(test_decompress_rejects_an_unaddressable_prefix_for_zstd, tests_passed);
     RUN_TEST(test_highly_compressible_roundtrip, tests_passed);
     RUN_TEST(test_size_encoding_portability, tests_passed);
     RUN_TEST(test_uint32_max_boundary, tests_passed);

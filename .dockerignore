@@ -1,8 +1,0 @@
-.git
-build
-build-*
-*.o
-*.so
-*.so.*
-mariadb-plugin
-artwork

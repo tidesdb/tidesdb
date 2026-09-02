@@ -157,8 +157,9 @@ jobs:
             echo " Configure CMake"
             echo "*=====================================*"
             export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
-            # ASAN is not compatible with NetBSD ASLR and causes tests to
-            # silently exit without running. build without sanitizer.
+            # no sanitizer here -- ASan does not sit with NetBSD's ASLR and the instrumented
+            # binary exits before running a test, so the suite would pass by not running. the
+            # build system refuses it on this platform too, so this is belt and braces.
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON
 
@@ -173,7 +174,12 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
-            ctest -V --output-on-failure --timeout 5400 --build-config Release
+
+            # 300s per test, not the 5400 the other jobs use. nothing here legitimately runs
+            # beyond ninety seconds, and this platform has intermittently parked one test for
+            # minutes -- at the default a single stall holds the runner for the whole ninety-minute
+            # ceiling, so the timeout is what turns that into a prompt failure
+            ctest -V --output-on-failure --timeout 300 --build-config Release
 
   omnios-build:
     runs-on: ubuntu-latest

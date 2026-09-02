@@ -15,9 +15,11 @@
 *.a
 *.lib
 *.exe
+*.txt
 *.out
 *.app
 build-*
+Testing/*
 cmake-build-debug
 cmake-build-release
 .idea
@@ -27,3 +29,5 @@ build-wmu.log
 .vscode
 vcpkg_installed
 .vs
+fuzz/corpus
+doc/*.pdf

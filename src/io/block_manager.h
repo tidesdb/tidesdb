@@ -1,0 +1,722 @@
+/**
+ *
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+#ifndef __BLOCK_MANAGER_H__
+#define __BLOCK_MANAGER_H__
+#include "base/waitstat.h" /* tdb_io_stat_t for per-class write accounting */
+#include "compat.h"
+
+/* max file path length for block manager file(s) */
+#define MAX_FILE_PATH_LENGTH (1024 * 4)
+
+/* TDB in hex */
+#define BLOCK_MANAGER_MAGIC 0x544442
+/* 3-byte mask for magic number validation */
+#define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
+#define BLOCK_MANAGER_VERSION    10
+
+/* header field sizes */
+/* magic number size in bytes */
+#define BLOCK_MANAGER_MAGIC_SIZE 3
+/* version field size in bytes */
+#define BLOCK_MANAGER_VERSION_SIZE 1
+/* reserved bytes rounding the header to eight, written as zeros and not read back */
+#define BLOCK_MANAGER_HEADER_PADDING_SIZE 4
+/* file header is magic + version + padding */
+#define BLOCK_MANAGER_HEADER_SIZE \
+    (BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE + BLOCK_MANAGER_HEADER_PADDING_SIZE)
+
+/* block field sizes */
+/* block size field (uint32_t) -- supports blocks up to 4GB, though try to keep it under! */
+#define BLOCK_MANAGER_SIZE_FIELD_SIZE 4
+/* the checksum field, 4 bytes -- the low 32 bits of XXH3 */
+#define BLOCK_MANAGER_CHECKSUM_LENGTH 4
+
+/* block header is size + checksum */
+#define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
+    (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
+
+/* block footer for fast validation -- a repeat of the size field then the magic. the magic sits one
+ * size field into the footer, which is what a reader offsets by to reach it */
+#define BLOCK_MANAGER_FOOTER_MAGIC        0x42445442 /* "BTDB" reversed */
+#define BLOCK_MANAGER_FOOTER_MAGIC_SIZE   4
+#define BLOCK_MANAGER_FOOTER_MAGIC_OFFSET BLOCK_MANAGER_SIZE_FIELD_SIZE
+#define BLOCK_MANAGER_FOOTER_SIZE         (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_FOOTER_MAGIC_SIZE)
+
+/* number of iovecs emitted per block in pwritev ( header, payload, footer ) */
+#define BLOCK_MANAGER_IOVECS_PER_BLOCK 3
+
+/* default file permissions (rw-r--r--) */
+#define BLOCK_MANAGER_FILE_MODE 0644
+
+/* preallocation tunables -- control how aggressively on-disk allocation extends
+ * ahead of writes to avoid the kernel's file-extending lock on every pwrite.
+ * extending writes serialize on the per-inode lock (e.g., ext4 i_rwsem) regardless
+ * of disjoint offsets, so preallocation happens in chunks and pwrites land in-place. */
+#define BLOCK_MANAGER_PREALLOC_CHUNK (64ull * 1024 * 1024) /* extend by 64 MB at a time */
+/* the per-instance lowwater derives from the chunk by this shift (chunk >> 4 = chunk / 16), which
+ * reproduces the default 64 MB chunk / 4 MB lowwater ratio for any chunk size */
+#define BLOCK_MANAGER_PREALLOC_LOWWATER_SHIFT 4
+
+typedef enum
+{
+    BLOCK_MANAGER_SYNC_NONE, /* no per-write fsync; durability left to the caller */
+    BLOCK_MANAGER_SYNC_FULL, /* fdatasync each write, unless O_DSYNC already made it durable */
+} block_manager_sync_mode_t;
+
+typedef enum
+{
+    BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION =
+        0, /* no error on validation, truncate to last valid block */
+    BLOCK_MANAGER_STRICT_BLOCK_VALIDATION = 1 /* error on validation */
+} tidesdb_block_validation_mode_t;
+
+/**
+ * block_manager_t
+ * block manager struct
+ * used for block managers in TidesDB
+ * @param fd the file descriptor the block manager is managing
+ * @param file_path the path of the file
+ * @param sync_mode sync mode for this block manager
+ * @param sync_full_cached cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL), atomic so a
+ *                         runtime sync-mode change cannot race the read on the write path
+ * @param current_file_size track file size in memory to avoid syscalls
+ * @param preallocated_size on-disk allocation high water mark; pwrites within
+ *                          [HEADER_SIZE, preallocated_size) avoid extending the file
+ *                          and skip the kernel's per-inode write lock fast path.
+ *                          set to UINT64_MAX if preallocation is unsupported on this
+ *                          platform/fs to disable further attempts.
+ * @param prealloc_chunk per-instance preallocation chunk -- the on-disk extent grows by this many
+ *                       bytes at a time. block_manager_open uses BLOCK_MANAGER_PREALLOC_CHUNK;
+ *                       block_manager_open_pre may set a smaller value, or 0 to disable
+ *                       preallocation entirely (tiny append logs like the manifest, so a copy of
+ * the live file carries no trailing reserved zeros). lowwater derives as chunk >> 4
+ * @param io_stat where this handle's writes are accounted, or NULL for one nobody is accounting.
+ * the opener sets it, since only the opener knows what kind of file this is
+ * @param buffered 1 when buffered append mode is enabled, 0 on the direct path
+ * @param ring staging ring buffer of ring_size bytes that appenders copy their framed record into
+ * @param done_ring per-ring-position completion flags; an appender sets done_ring[off % ring_size]
+ *                  after copying its record and the flush thread advances over the contiguous run
+ * @param ring_size ring capacity in bytes
+ * @param buf_flushed contiguous file offset the flush thread has pwritten, the durability watermark
+ * @param flush_tid the single flush thread that owns every pwrite in buffered mode
+ * @param flush_stop set at close so the flush thread drains the ring and exits
+ * @param flush_error errno set if a flush-thread pwrite or fdatasync failed
+ * @param flush_sleeping 1 while the flush thread is parked waiting for work
+ * @param durable_waiters count of appenders parked waiting for buf_flushed to advance
+ * @param buf_mtx guards the buffered condition variables
+ * @param buf_work_cv the flush thread parks here when the ring has no released work
+ * @param buf_durable_cv appenders park here waiting for buf_flushed to advance
+ */
+typedef struct
+{
+    int fd;
+    char file_path[MAX_FILE_PATH_LENGTH];
+    block_manager_sync_mode_t sync_mode;
+    _Atomic int sync_full_cached;
+    /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
+    ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
+    ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;
+    ATOMIC_ALIGN(8) _Atomic uint64_t prealloc_chunk;
+
+    tdb_io_stat_t *io_stat;
+
+    /**** buffered append mode (Aether decoupled fill + single flush thread)
+     * when active, concurrent appenders reserve a file offset (current_file_size fetch-add), copy
+     * their framed block into the staging ring in parallel, and release in offset order; one flush
+     * thread pwrites contiguous released runs to the fd and advances buf_flushed. only the flush
+     * thread touches the fd, so concurrent appenders never serialize on the inode write lock. the
+     * on-disk bytes are byte-identical to the direct path, so recovery and readers are unchanged.
+     * enabled per-bm via block_manager_open_buffered; zero/NULL on the direct path.
+     * current_file_size doubles as the reservation watermark (the next file offset handed out). */
+    int buffered;
+    uint8_t *ring;
+    _Atomic unsigned char *done_ring;
+    uint64_t ring_size;
+    ATOMIC_ALIGN(8) _Atomic uint64_t buf_flushed;
+    pthread_t flush_tid;
+    _Atomic int flush_stop;
+    _Atomic int flush_error;
+    _Atomic int flush_sleeping;
+    _Atomic int durable_waiters;
+    pthread_mutex_t buf_mtx;
+    pthread_cond_t buf_work_cv;
+    pthread_cond_t buf_durable_cv;
+} block_manager_t;
+
+/**
+ * block_manager_block_t
+ * block struct
+ * used for blocks in TidesDB
+ * @param size the size of the data in the block
+ * @param data the data in the block
+ * @param inline_data 1 if data is allocated inline with this struct (single allocation)
+ */
+typedef struct
+{
+    uint64_t size;
+    void *data;
+    uint8_t inline_data;
+} block_manager_block_t;
+
+/**
+ * block_manager_cursor_t
+ * block cursor struct
+ * used for block cursors in TidesDB
+ * @param bm the block manager
+ * @param current_pos the current position of the cursor
+ * @param current_block_size the size of the current block
+ * @param block_size_valid 1 if current_block_size is cached and valid, 0 otherwise
+ */
+typedef struct
+{
+    block_manager_t *bm;
+    uint64_t current_pos;
+    uint64_t current_block_size;
+    int block_size_valid;
+} block_manager_cursor_t;
+
+/**
+ * block_manager_set_io_stat
+ * route this handle's write accounting to a caller-owned counter, so bytes and time can be
+ * attributed to the kind of file rather than pooled. the counter must outlive the handle
+ * @param bm the block manager, may be NULL
+ * @param io the counter to accumulate into, or NULL to stop accounting
+ */
+void block_manager_set_io_stat(block_manager_t *bm, tdb_io_stat_t *io);
+
+/**
+ * block_manager_open
+ * opens a block manager
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode);
+
+/**
+ * block_manager_open_pre
+ * like block_manager_open but with a caller-chosen preallocation chunk. pass a small chunk for a
+ * tiny file, or 0 to disable preallocation entirely so the file grows to exactly what is written
+ * (tiny append logs like the manifest, so a copy of the live file carries no trailing reserved
+ * zeros) rather than reserve a full BLOCK_MANAGER_PREALLOC_CHUNK extent.
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
+ * @param prealloc_chunk bytes to extend the on-disk extent by at a time; 0 disables preallocation
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_open_pre(block_manager_t **bm, const char *file_path, int sync_mode,
+                           uint64_t prealloc_chunk);
+
+/**
+ * block_manager_open_buffered
+ * like block_manager_open but enables buffered append mode -- concurrent appenders stage into an
+ * in-memory ring and a single flush thread does all the pwrites, so many writers no longer
+ * serialize on the file inode write lock. use for the WAL, where many transactions append
+ * concurrently. reads, recovery, and the on-disk format are identical to the direct path.
+ * @param bm output block manager
+ * @param file_path path of the file
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
+ * @param ring_size staging ring capacity in bytes (0 = a sensible default); rounded up internally
+ * @return 0 on success, -1 on failure
+ */
+int block_manager_open_buffered(block_manager_t **bm, const char *file_path, int sync_mode,
+                                uint64_t ring_size);
+
+/**
+ * block_manager_wait_durable
+ * block until the buffered flush thread has written (and, in SYNC_FULL, fdatasync'd) every byte up
+ * to file offset `offset`. used by a committer that needs its WAL record durable before returning.
+ * on a non-buffered block manager this returns 0 immediately (the direct path is already durable
+ * per its sync mode).
+ * @param bm the block manager
+ * @param offset the file offset that must be durable
+ * @return 0 on success, -1 if the flush thread reported an I/O error
+ */
+int block_manager_wait_durable(block_manager_t *bm, uint64_t offset);
+
+/**
+ * block_manager_close
+ * closes a block manager gracefully
+ * @param bm the block manager to close
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_close(block_manager_t *bm);
+
+/**
+ * block_manager_block_create
+ * creates a new block
+ * @param size the size of the data in block
+ * @param data the data to be placed in block
+ * @return a new block
+ */
+block_manager_block_t *block_manager_block_create(uint64_t size, const void *data);
+
+/**
+ * block_manager_block_create_from_buffer
+ * creates a new block taking ownership of buffer (no copy)
+ * @param size the size of the data in block
+ * @param data the data buffer (will be freed with block)
+ * @return a new block
+ */
+block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, void *data);
+
+/**
+ * block_manager_block_write
+ * @param bm the block manager to write the block to
+ * @param block the block to write
+ * @return block offset if successful, -1 if not
+ */
+int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
+
+/**
+ * block_manager_block_write_durable
+ * append one block and return only once its bytes have reached the file, which on a buffered
+ * manager means waiting for the flush thread to carry the frontier past this record rather than
+ * returning at the staging ring. what "reached the file" means still follows the sync mode -- the
+ * page cache under SYNC_NONE, the device under SYNC_FULL. lets concurrent appenders each stage and
+ * wait for their own record instead of queueing behind one writer, since the ring reserves space
+ * with a single atomic and the flush thread coalesces whatever completed into one write
+ * @param bm the block manager to write the block to
+ * @param block the block to write
+ * @return block offset if successful, -1 if not
+ */
+int64_t block_manager_block_write_durable(block_manager_t *bm, block_manager_block_t *block);
+
+/**
+ * block_manager_write_raw
+ * write raw data directly to the block manager without allocating a block_manager_block_t.
+ * avoids the malloc/memcpy/free cycle of block_create + block_write + block_release.
+ * the data pointer only needs to be valid during this call.
+ * @param bm the block manager
+ * @param data pointer to the data to write
+ * @param size size of the data in bytes
+ * @return the offset where the block was written, or -1 on failure
+ */
+int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t size);
+
+/**
+ * block_manager_checksum
+ * the block checksum every framing path agrees on. exposed so a caller that patches a block's bytes
+ * in memory and stores the new checksum itself computes the same function the block manager
+ * verifies with, rather than keeping a second copy of the choice that can drift from this one
+ * @param data the bytes to checksum
+ * @param size the number of bytes
+ * @return the checksum stored in a block's header
+ */
+uint32_t block_manager_checksum(const void *data, size_t size);
+
+/**
+ * block_manager_block_write_batch
+ * writes multiple blocks in a single I/O operation, framing each and emitting them as one vectored
+ * write rather than one call per block.
+ *
+ * nothing calls this today. it is kept because the batching it does is exactly what a caller
+ * writing many blocks at once would want, and the framing is already correct; a caller adopting it
+ * is a change to that caller, not to this
+ * @param bm the block manager to write the blocks to
+ * @param blocks array of blocks to write
+ * @param count number of blocks
+ * @param offsets output array for block offsets (must be pre-allocated with count elements)
+ * @return number of successfully written blocks, -1 on critical failure
+ */
+int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t **blocks,
+                                    size_t count, int64_t *offsets);
+
+/**
+ * block_manager_write_at
+ * writes raw bytes at a specific offset (for patching existing data)
+ * use with care, this bypasses block checksums
+ * @param bm the block manager
+ * @param offset the file offset to write at
+ * @param data the data to write
+ * @param size the size of data to write
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_write_at(block_manager_t *bm, int64_t offset, const uint8_t *data, size_t size);
+
+/**
+ * block_manager_truncate_to
+ * truncates the file to an exact size and resets the append and preallocation cursors to match.
+ * the caller must have quiesced all writers first, mirroring block_manager_truncate. used by vlog
+ * compaction to drop the dead tail after live slots have been shifted down.
+ * @param bm the block manager
+ * @param new_size target size in bytes, must be at least the file header size
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_truncate_to(block_manager_t *bm, uint64_t new_size);
+
+/**
+ * block_manager_update_checksum
+ * recalculates and updates the checksum of a block after in-place modification
+ * use this after block_manager_write_at to fix the checksum
+ * @param bm the block manager
+ * @param block_offset the file offset of the block (start of block header)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_update_checksum(block_manager_t *bm, int64_t block_offset);
+
+/**
+ * block_manager_block_free
+ * frees a block
+ * @param block the block to free
+ */
+void block_manager_block_free(block_manager_block_t *block);
+
+/**
+ * block_manager_cursor_init
+ * initializes a block manager cursor (heap allocated)
+ * @param cursor the cursor to initialize
+ * @param bm the block manager to initialize the cursor on
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *bm);
+
+/**
+ * block_manager_cursor_init_stack
+ * initializes a pre-allocated block manager cursor (stack or caller-allocated)
+ * avoids heap allocation in hot paths
+ * @param cursor pointer to pre-allocated cursor struct
+ * @param bm the block manager to initialize the cursor on
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manager_t *bm);
+
+/**
+ * block_manager_cursor_next
+ * moves the cursor to the next block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_next(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_read
+ * reads the block at the cursor current position
+ * @param cursor the cursor to read from
+ * @return the block read from the cursor
+ */
+block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_read_and_advance
+ * reads the block at cursor position and advances cursor to next block in one operation
+ * this is more efficient than separate read + next calls as it avoids redundant pread
+ * @param cursor the cursor to read from and advance
+ * @return the block read from the cursor, NULL on error or EOF
+ */
+block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_free
+ * frees a cursor
+ * @param cursor the cursor to free
+ */
+void block_manager_cursor_free(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_prev
+ * moves the cursor to the previous block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_prev(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_skip_corrupt
+ * advances the cursor past a partially-written block at the current position.
+ *
+ * distinguishes three failure modes. a partial write (size > 0, footer magic absent)
+ * advances the cursor and returns 0. genuine corruption (size > 0, footer magic valid but
+ * checksum bad) returns -1. a zero-filled hole (size == 0) has an undeterminable block extent
+ * and returns -1.
+ *
+ * only call after block_manager_cursor_read returns NULL to attempt recovery.
+ * @param cursor the cursor positioned at the suspect block
+ * @return 0 if cursor was advanced past a partial write, -1 otherwise
+ */
+int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_resync_past_hole
+ * recovers forward past a zero-filled reservation hole left by a failed concurrent append. only
+ * acts when the size field at the cursor is zero -- a nonzero size with a valid footer but a bad
+ * checksum is genuine data corruption that block_manager_cursor_skip_corrupt deliberately stops on,
+ * so this never overrides that refusal. scans forward for the next checksum-valid block frame in
+ * the file and repositions the cursor at its start. the checksum gate makes the scan
+ * false-positive proof, and a zero region such as the preallocation tail holds no footer magic so
+ * it resolves to end of data. only call after block_manager_cursor_read returns NULL and
+ * block_manager_cursor_skip_corrupt returns -1.
+ * @param cursor the cursor positioned at the suspect block
+ * @return 0 if the cursor was repositioned at the next valid block, -1 if the size field was
+ *         nonzero (not a hole) or no valid block remains before end of file
+ */
+int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_truncate
+ * truncates a block manager to 0 removing all blocks
+ * @param bm the block manager to truncate
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_truncate(block_manager_t *bm);
+
+/**
+ * block_manager_last_modified
+ * gets the last modified time of a block manager file
+ * @param bm the block manager to get the last modified time of
+ * @return the last modified time of the block manager
+ */
+time_t block_manager_last_modified(block_manager_t *bm);
+
+/**
+ * block_manager_count_blocks
+ * counts the number of blocks in a block managed file
+ * @param bm the block manager to count the blocks of
+ * @return the number of blocks in the block manager
+ */
+int block_manager_count_blocks(block_manager_t *bm);
+
+/**
+ * block_manager_cursor_has_next
+ * checks if the cursor has a next block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor has a next block, 0 if not.  Can return -1 if error
+ */
+int block_manager_cursor_has_next(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_has_prev
+ * checks if the cursor has a previous block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor has a previous block, 0 if not.  Can return -1 if error
+ */
+int block_manager_cursor_has_prev(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_goto_last
+ * moves the cursor to the last block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto_last(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_goto_last_before
+ * moves the cursor to the last block whose footer ends at end_offset, using
+ * footer-based O(1) positioning. lets callers seek to the last block of a
+ * logical region (e.g. an sstable's data blocks) without walking past
+ * trailing blocks appended after that region.
+ * @param cursor the cursor to move
+ * @param end_offset byte offset immediately after the target block's footer
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto_last_before(block_manager_cursor_t *cursor, uint64_t end_offset);
+
+/**
+ * block_manager_cursor_goto
+ * moves the cursor to a specific block
+ * @param cursor the cursor to move
+ * @param pos the position to move the cursor to
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos);
+
+/**
+ * block_manager_cursor_goto_first
+ * moves the cursor to the first block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_get_size
+ * gets the total size of a block manager file
+ * @param bm the block manager to get the size of
+ * @param size the size of the block manager
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_get_size(block_manager_t *bm, uint64_t *size);
+
+/**
+ * block_manager_framed_size
+ * on-disk footprint of a payload once framed (header + payload + footer), i.e. the bytes a
+ * block_manager_write_raw/block_write of this payload appends to the file. lets callers count
+ * framed write volume without depending on the framing layout.
+ * @param payload_size size of the payload in bytes
+ * @return framed size in bytes
+ */
+uint64_t block_manager_framed_size(uint32_t payload_size);
+
+/**
+ * block_manager_buffered_lag
+ * how far the staging ring is from full, for a caller pacing ingest against it. reserved-minus-
+ * written is what an appender will collide with: a reservation whose ring slot still holds
+ * unwritten bytes stops dead until the flush thread reaches it, so a caller that can slow down
+ * before the ring fills never meets that wall. two atomic loads, cheap enough for a per-append
+ * check
+ * @param bm the block manager
+ * @param out_lag receives bytes reserved but not yet written
+ * @param out_capacity receives the ring capacity, 0 on the direct path where there is no ring
+ * @return 0 on success, -1 on a bad argument
+ */
+int block_manager_buffered_lag(block_manager_t *bm, uint64_t *out_lag, uint64_t *out_capacity);
+
+/**
+ * block_manager_escalate_fsync
+ * escalates an fsync syscall to the underlying block manager file
+ * @param bm the block manager to fsync
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_escalate_fsync(block_manager_t *bm);
+
+/**
+ * block_manager_last_errno
+ * the errno of the write or sync that failed on this handle, or 0 when none has. reading errno
+ * directly is not enough in buffered mode, where the failing syscall runs on the flush thread and
+ * the caller's own errno says nothing about it
+ * @param bm the block manager
+ * @return the sticky errno, or 0
+ */
+int block_manager_last_errno(const block_manager_t *bm);
+
+/**
+ * tdb_errno_to_result
+ * map an errno from a failed file operation to the result code that describes it, so a full device
+ * is reported as such rather than folded into a generic io failure
+ * @param err the errno to map, 0 treated as an unspecified io failure
+ * @return TDB_ERR_NO_SPACE for ENOSPC and EDQUOT, otherwise TDB_ERR_IO
+ */
+int tdb_errno_to_result(int err);
+
+/**
+ * block_manager_cursor_at_last
+ * checks if the cursor is at the last block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor is at the last block, 0 if not.  can return -1 if error
+ */
+int block_manager_cursor_at_last(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_at_first
+ * checks if the cursor is at the first block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor is at the first block, 0 if not.  can return -1 if error
+ */
+int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_at_second
+ * checks if the cursor is at the second block from start
+ * @param cursor the cursor to check
+ * @return 1 if the cursor is at the second block, 0 if not.  can return -1 if error
+ */
+int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_validate_last_block
+ * validates the integrity of the last block in a block manager file
+ * @param bm the block manager
+ * @param validation the type of validation to apply, either strict or permissive
+ * @return 0 if valid or successfully recovered, -1 if validation fails. in strict mode any
+ *         corruption returns -1 and the file is left untouched; in permissive mode the file is
+ *         truncated to the last valid block
+ */
+int block_manager_validate_last_block(block_manager_t *bm,
+                                      tidesdb_block_validation_mode_t validation);
+
+/**
+ * convert_sync_mode
+ * converts TidesDB sync mode enum values to block manager sync mode enum values
+ * this method provides compatibility between the public TidesDB API (which uses
+ * TDB_SYNC_NONE/TDB_SYNC_FULL) and the internal block manager API (which uses
+ * BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL)
+ * @param tdb_sync_mode the TidesDB sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)
+ * @return the corresponding block manager sync mode enum value
+ */
+block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
+
+/**
+ * block_manager_set_sync_mode
+ * updates the sync mode of an existing block manager
+ * @param bm the block manager to update
+ * @param sync_mode the sync mode, either enum spelling -- the public TDB_SYNC_NONE/TDB_SYNC_FULL
+ *                  or the matching BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL, which the
+ *                  engine pins to the same values so a module that cannot see db.h can still
+ *                  name one
+ */
+void block_manager_set_sync_mode(block_manager_t *bm, int sync_mode);
+
+/**
+ * block_manager_get_block_size_at_offset
+ * reads the size of a block at a specific file offset
+ * useful for determining allocation size before reading block data
+ * @param bm the block manager to read from
+ * @param offset the file offset of the block (start of block header)
+ * @param size output parameter for block data size (not including header)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_get_block_size_at_offset(block_manager_t *bm, uint64_t offset, uint32_t *size);
+
+/**
+ * block_manager_read_at_offset
+ * reads data at a specific file offset (not block-aligned)
+ * useful for reading values from vlog where offset points to data within a block
+ * @param bm the block manager to read from
+ * @param offset the file offset to read from (absolute position in file)
+ * @param size the number of bytes to read
+ * @param data output buffer (caller must allocate)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t size, uint8_t *data);
+
+/**
+ * block_manager_read_block_data_at_offset
+ * reads a complete block (header + data) at a specific file offset in one I/O operation
+ * optimized for vlog reads -- combines size lookup and data read into single pread
+ * @param bm the block manager to read from
+ * @param offset the file offset of the block (start of block header)
+ * @param data output buffer pointer (allocated by function, caller must free)
+ * @param data_size output parameter for actual data size (not including header)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_read_block_data_at_offset(block_manager_t *bm, uint64_t offset, uint8_t **data,
+                                            uint32_t *data_size);
+
+/**
+ * block_manager_borrow_block_data_at_offset
+ * reads and verifies the block at a specific file offset and hands back a borrowed pointer to its
+ * payload, which stays valid only until this thread's next block read. a caller that copies the
+ * payload straight into a buffer of its own -- resolving a separated value, say -- would otherwise
+ * pay for an allocation and a copy in block_manager_read_block_data_at_offset that it immediately
+ * discards. a caller that needs to keep the bytes past its next read wants that function instead
+ * @param bm the block manager to read from
+ * @param offset the file offset of the block (start of block header)
+ * @param payload_hint payload bytes to fetch alongside the header when the caller already knows the
+ *                     size, so a block larger than the default read hint still costs one syscall
+ *                     instead of two; 0 asks for the default
+ * @param data_size output parameter for the payload size (not including header)
+ * @return borrowed pointer to the verified payload, or NULL on a read, bounds, or checksum failure
+ */
+const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, uint64_t offset,
+                                                         uint32_t payload_hint,
+                                                         uint32_t *data_size);
+
+#endif /* __BLOCK_MANAGER_H__ */

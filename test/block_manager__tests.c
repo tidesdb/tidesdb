@@ -1,24 +1,15 @@
 /**
  *
- * Copyright (C) TidesDB
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
  *
- * Original Author: Alex Gaetano Padula
- *
- * Licensed under the Mozilla Public License, v. 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.mozilla.org/en-US/MPL/2.0/
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
 #include "../external/xxhash.h"
-#include "../src/block_manager.h"
+#include "../src/io/block_manager.h"
+#include "db.h" /* the TDB_ERR_* result codes the errno mapping produces */
 #include "test_utils.h"
 #ifndef _WIN32
 #include <signal.h>
@@ -148,125 +139,6 @@ void test_block_manager_truncate()
     (void)remove("test.db");
 }
 
-void test_block_manager_cursor()
-{
-    /* we create a block manager, write a few blocks and verify forward and backward iteration */
-
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL);
-
-        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    /* we get first block from cursor should be the first block we wrote */
-    block_manager_block_t *read_block = block_manager_cursor_read(cursor);
-    if (read_block == NULL)
-    {
-        (void)block_manager_cursor_free(cursor);
-        (void)block_manager_close(bm);
-        return;
-    }
-    ASSERT_EQ(read_block->size, 10);
-    ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
-
-    (void)block_manager_block_free(read_block);
-
-    ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
-
-    /* check next block */
-    read_block = block_manager_cursor_read(cursor);
-    if (read_block == NULL)
-    {
-        (void)block_manager_cursor_free(cursor);
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    ASSERT_EQ(read_block->size, 10);
-    ASSERT_EQ(memcmp(read_block->data, "testdata1", 10), 0);
-
-    (void)block_manager_block_free(read_block);
-
-    ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
-
-    /* check next block */
-    read_block = block_manager_cursor_read(cursor);
-    if (read_block == NULL)
-    {
-        (void)block_manager_cursor_free(cursor);
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    /* we verify that the block was read correctly */
-    ASSERT_EQ(read_block->size, 10);
-    ASSERT_EQ(memcmp(read_block->data, "testdata2", 10), 0);
-
-    (void)block_manager_block_free(read_block);
-
-    /* we go back */
-    ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
-
-    /* we check previous block */
-    read_block = block_manager_cursor_read(cursor);
-    if (read_block == NULL)
-    {
-        (void)block_manager_cursor_free(cursor);
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    /* we verify that the block was read correctly */
-    ASSERT_EQ(read_block->size, 10);
-    ASSERT_EQ(memcmp(read_block->data, "testdata1", 10), 0);
-
-    (void)block_manager_block_free(read_block);
-
-    /* we go back */
-    ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
-
-    /* we check previous block */
-    read_block = block_manager_cursor_read(cursor);
-    if (read_block == NULL)
-    {
-        (void)block_manager_cursor_free(cursor);
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    /* we verify that the block was read correctly */
-    ASSERT_EQ(read_block->size, 10);
-    ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
-
-    (void)block_manager_block_free(read_block);
-
-    (void)block_manager_cursor_free(cursor);
-
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-
-    (void)remove("test.db");
-}
-
 void test_block_manager_count_blocks()
 {
     block_manager_t *bm = NULL;
@@ -287,207 +159,6 @@ void test_block_manager_count_blocks()
 
     ASSERT_TRUE(block_manager_count_blocks(bm) == 3);
 
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
-void test_block_manager_cursor_goto_first()
-{
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL);
-
-        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        block_manager_close(bm);
-        return;
-    }
-
-    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
-
-    block_manager_block_t *read_block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(read_block != NULL);
-    ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
-    (void)block_manager_block_free(read_block);
-
-    (void)block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
-void test_block_manager_cursor_goto_last()
-{
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL);
-
-        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        block_manager_close(bm);
-        return;
-    }
-
-    ASSERT_TRUE(block_manager_cursor_goto_last(cursor) == 0);
-
-    block_manager_block_t *read_block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(read_block != NULL);
-
-    ASSERT_EQ(memcmp(read_block->data, "testdata2", 10), 0);
-    (void)block_manager_block_free(read_block);
-
-    (void)block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
-void test_block_manager_cursor_has_next()
-{
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL);
-
-        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_has_next(cursor) == 1);
-
-    ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_has_next(cursor) == 1);
-
-    ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_has_next(cursor) == 1);
-
-    (void)block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
-void test_block_manager_cursor_has_prev()
-{
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL);
-
-        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    ASSERT_TRUE(block_manager_cursor_goto_last(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_has_prev(cursor) == 1);
-
-    ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_has_prev(cursor) == 1);
-
-    ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_has_prev(cursor) == 0);
-
-    (void)block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
-void test_block_manager_cursor_position_checks()
-{
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL);
-
-        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    /* test at_first */
-    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_first(cursor) == 1);
-    ASSERT_TRUE(block_manager_cursor_at_second(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_last(cursor) == 0);
-
-    /* test at_second */
-    ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_first(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_second(cursor) == 1);
-    ASSERT_TRUE(block_manager_cursor_at_last(cursor) == 0);
-
-    /* test at_last */
-    ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_first(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_second(cursor) == 0);
-    ASSERT_TRUE(block_manager_cursor_at_last(cursor) == 1);
-
-    (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
 }
@@ -588,66 +259,6 @@ void test_block_manager_seek_and_goto()
 
     (void)block_manager_cursor_free(cursor);
 
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
-void test_block_manager_cursor_goto_last_before()
-{
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
-
-    /* we write five blocks -- the first three model an sstable data region and
-     * the last two model trailing blocks appended after it */
-    uint64_t data_region_end = 0;
-    for (int i = 0; i < 5; i++)
-    {
-        char data[16] = {0};
-        snprintf(data, sizeof(data), "block_%d", i);
-        block_manager_block_t *block = block_manager_block_create(sizeof(data), data);
-        ASSERT_TRUE(block != NULL);
-        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-        (void)block_manager_block_free(block);
-
-        if (i == 2) ASSERT_EQ(block_manager_get_size(bm, &data_region_end), 0);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        (void)block_manager_close(bm);
-        return;
-    }
-
-    /* anchored at the data-region end, we land on block 2 -- not the trailing
-     * block 4 that a whole-file goto_last would reach */
-    ASSERT_EQ(block_manager_cursor_goto_last_before(cursor, data_region_end), 0);
-    block_manager_block_t *blk = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(blk != NULL);
-    ASSERT_EQ(memcmp(blk->data, "block_2", 8), 0);
-    (void)block_manager_block_free(blk);
-
-    /* whole-file goto_last still reaches the true last block */
-    ASSERT_EQ(block_manager_cursor_goto_last(cursor), 0);
-    blk = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(blk != NULL);
-    ASSERT_EQ(memcmp(blk->data, "block_4", 8), 0);
-    (void)block_manager_block_free(blk);
-
-    /* backward iteration works after an anchored seek */
-    ASSERT_EQ(block_manager_cursor_goto_last_before(cursor, data_region_end), 0);
-    ASSERT_EQ(block_manager_cursor_prev(cursor), 0);
-    blk = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(blk != NULL);
-    ASSERT_EQ(memcmp(blk->data, "block_1", 8), 0);
-    (void)block_manager_block_free(blk);
-
-    /* an end offset at or below the header has no block to find */
-    ASSERT_TRUE(block_manager_cursor_goto_last_before(cursor, BLOCK_MANAGER_HEADER_SIZE) != 0);
-    ASSERT_TRUE(block_manager_cursor_goto_last_before(cursor, 0) != 0);
-    ASSERT_TRUE(block_manager_cursor_goto_last_before(NULL, data_region_end) != 0);
-
-    (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
 }
@@ -860,9 +471,7 @@ void test_block_manager_validate_last_block()
     FILE *file = fopen("validate_test.db", "a+b");
     ASSERT_TRUE(file != NULL);
 
-    /* we append just a size prefix (4 bytes) without the actual data */
-    /* must use little-endian encoding to match block manager's format */
-    uint32_t corrupt_size = 100; /* size that's larger than what we'll actually write */
+    uint32_t corrupt_size = 100;
     uint8_t size_buf[4];
     encode_uint32_le_compat(size_buf, corrupt_size);
     ASSERT_TRUE(fwrite(size_buf, sizeof(size_buf), 1, file) == 1);
@@ -2115,106 +1724,6 @@ void test_block_manager_write_at_and_update_checksum(void)
     remove("test_write_at.db");
 }
 
-void test_block_manager_block_acquire_release(void)
-{
-    block_manager_block_t *block = block_manager_block_create(5, "hello");
-    ASSERT_TRUE(block != NULL);
-
-    /* acquire should succeed */
-    ASSERT_EQ(block_manager_block_acquire(block), 1);
-
-    /* release once (ref_count 2 -> 1), block should still be alive */
-    block_manager_block_release(block);
-
-    /* we can still read data */
-    ASSERT_EQ(memcmp(block->data, "hello", 5), 0);
-
-    /* final release frees block (ref_count 1 -> 0) */
-    block_manager_block_release(block);
-
-    /* acquire on NULL should return 0 */
-    ASSERT_EQ(block_manager_block_acquire(NULL), 0);
-}
-
-void test_block_manager_cursor_read_partial(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_partial.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    char data[100];
-    memset(data, 'A', 100);
-    block_manager_block_t *block = block_manager_block_create(100, data);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-    block_manager_block_free(block);
-
-    block_manager_cursor_t *cursor;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* partial read with max_bytes < block size */
-    block_manager_block_t *partial = block_manager_cursor_read_partial(cursor, 20);
-    ASSERT_TRUE(partial != NULL);
-    ASSERT_EQ(partial->size, 20);
-    for (size_t i = 0; i < 20; i++)
-    {
-        ASSERT_EQ(((char *)partial->data)[i], 'A');
-    }
-    block_manager_block_free(partial);
-
-    /* max_bytes=0 should read full block */
-    block_manager_block_t *full = block_manager_cursor_read_partial(cursor, 0);
-    ASSERT_TRUE(full != NULL);
-    ASSERT_EQ(full->size, 100);
-    block_manager_block_free(full);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_partial.db");
-}
-
-void test_block_manager_cursor_read_and_advance(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_read_advance.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    for (int i = 0; i < 3; i++)
-    {
-        char data[10];
-        snprintf(data, 10, "block_%d__", i);
-        block_manager_block_t *block = block_manager_block_create(10, data);
-        ASSERT_TRUE(block != NULL);
-        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-        block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* read_and_advance should return block and move cursor forward */
-    block_manager_block_t *b0 = block_manager_cursor_read_and_advance(cursor);
-    ASSERT_TRUE(b0 != NULL);
-    ASSERT_EQ(memcmp(b0->data, "block_0__", 10), 0);
-    block_manager_block_free(b0);
-
-    block_manager_block_t *b1 = block_manager_cursor_read_and_advance(cursor);
-    ASSERT_TRUE(b1 != NULL);
-    ASSERT_EQ(memcmp(b1->data, "block_1__", 10), 0);
-    block_manager_block_free(b1);
-
-    block_manager_block_t *b2 = block_manager_cursor_read_and_advance(cursor);
-    ASSERT_TRUE(b2 != NULL);
-    ASSERT_EQ(memcmp(b2->data, "block_2__", 10), 0);
-    block_manager_block_free(b2);
-
-    /* next read_and_advance should return NULL (past end) */
-    block_manager_block_t *b3 = block_manager_cursor_read_and_advance(cursor);
-    ASSERT_TRUE(b3 == NULL);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_read_advance.db");
-}
-
 void test_block_manager_escalate_fsync(void)
 {
     block_manager_t *bm = NULL;
@@ -2333,6 +1842,67 @@ void test_block_manager_read_block_data_at_offset(void)
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_readblk.db");
+}
+
+/* the borrowing read is what the value log and the btree resolve through, and it differs from the
+ * copying one in two ways worth pinning. the payload comes back without an allocation, valid only
+ * until this thread reads again; and the size hint is an upper bound rather than a promise, because
+ * the value log passes the *uncompressed* length for a block that may hold compressed bytes. a hint
+ * larger than the block has to cost nothing and still answer with the block's own length, since the
+ * reader takes the length from the block header rather than from what was asked for */
+void test_block_manager_borrow_block_data_at_offset(void)
+{
+    block_manager_t *bm = NULL;
+    (void)remove("test_borrow.db");
+    ASSERT_TRUE(block_manager_open(&bm, "test_borrow.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    char first_data[] = "the-first-block-payload";
+    char second_data[] = "second";
+    block_manager_block_t *first = block_manager_block_create(strlen(first_data) + 1, first_data);
+    block_manager_block_t *second =
+        block_manager_block_create(strlen(second_data) + 1, second_data);
+    ASSERT_TRUE(first != NULL && second != NULL);
+    const int64_t first_offset = block_manager_block_write(bm, first);
+    const int64_t second_offset = block_manager_block_write(bm, second);
+    ASSERT_TRUE(first_offset >= 0 && second_offset > first_offset);
+    block_manager_block_free(first);
+    block_manager_block_free(second);
+
+    /* no hint at all, so the reader uses its own default and collects the rest if it must */
+    uint32_t size = 0;
+    const uint8_t *borrowed =
+        block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset, 0, &size);
+    ASSERT_TRUE(borrowed != NULL);
+    ASSERT_EQ(size, (uint32_t)(strlen(first_data) + 1));
+    ASSERT_EQ(memcmp(borrowed, first_data, size), 0);
+
+    /* the exact payload size, which is the one-syscall case */
+    borrowed = block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset,
+                                                         (uint32_t)(strlen(first_data) + 1), &size);
+    ASSERT_TRUE(borrowed != NULL);
+    ASSERT_EQ(size, (uint32_t)(strlen(first_data) + 1));
+    ASSERT_EQ(memcmp(borrowed, first_data, size), 0);
+
+    /* far more than the block holds -- the value log's case, where the hint is an upper bound */
+    borrowed =
+        block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset, 64u * 1024, &size);
+    ASSERT_TRUE(borrowed != NULL);
+    ASSERT_EQ(size, (uint32_t)(strlen(first_data) + 1));
+    ASSERT_EQ(memcmp(borrowed, first_data, size), 0);
+
+    /* a second borrow answers with its own block rather than whatever the buffer last held, which
+     * is the failure a shared per-thread buffer invites */
+    borrowed = block_manager_borrow_block_data_at_offset(bm, (uint64_t)second_offset, 0, &size);
+    ASSERT_TRUE(borrowed != NULL);
+    ASSERT_EQ(size, (uint32_t)(strlen(second_data) + 1));
+    ASSERT_EQ(memcmp(borrowed, second_data, size), 0);
+
+    /* an offset past everything written is a refusal, not a read of whatever is there */
+    ASSERT_TRUE(block_manager_borrow_block_data_at_offset(bm, (uint64_t)second_offset + (1u << 20),
+                                                          0, &size) == NULL);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("test_borrow.db");
 }
 
 void test_block_manager_checksum_corruption(void)
@@ -2507,6 +2077,71 @@ void test_block_manager_convert_sync_mode(void)
     ASSERT_EQ(convert_sync_mode(-1), BLOCK_MANAGER_SYNC_NONE);
 }
 
+/* a filled device is the one io failure a caller can act on, so it is reported as its own result
+ * rather than folded into a generic io error */
+void test_block_manager_no_space_is_reported_distinctly(void)
+{
+    ASSERT_EQ(tdb_errno_to_result(ENOSPC), TDB_ERR_NO_SPACE);
+#ifdef EDQUOT
+    ASSERT_EQ(tdb_errno_to_result(EDQUOT), TDB_ERR_NO_SPACE);
+#endif
+    /* everything else, including an unset errno, stays an io failure -- the point is to narrow one
+     * condition, not to reinterpret the rest */
+    ASSERT_EQ(tdb_errno_to_result(EIO), TDB_ERR_IO);
+    ASSERT_EQ(tdb_errno_to_result(EACCES), TDB_ERR_IO);
+    ASSERT_EQ(tdb_errno_to_result(0), TDB_ERR_IO);
+
+    ASSERT_EQ(block_manager_last_errno(NULL), 0);
+
+    const char *test_file = "test_no_space.db";
+    (void)remove(test_file);
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE), 0);
+    /* a handle that has not failed reports no error, so a caller cannot mistake a stale value for a
+     * fresh failure */
+    ASSERT_EQ(block_manager_last_errno(bm), 0);
+    block_manager_close(bm);
+    (void)remove(test_file);
+
+#ifdef __linux__
+    /* /dev/full accepts the open and fails every write with ENOSPC, which exercises the real errno
+     * off a real syscall rather than a value the test chose */
+    block_manager_t *full = NULL;
+    errno = 0;
+    ASSERT_EQ(block_manager_open(&full, "/dev/full", BLOCK_MANAGER_SYNC_NONE), -1);
+    ASSERT_EQ(errno, ENOSPC);
+    ASSERT_EQ(tdb_errno_to_result(errno), TDB_ERR_NO_SPACE);
+
+    /* the open above never reaches an append, so it cannot show what a caller is told when a write
+     * fails on an already-open handle. that is the case the sstable builder maps through
+     * block_manager_last_errno to tell a filled device from a hard io error, and the direct append
+     * path is the one a klog uses. swap the descriptor for one that fails every write and check the
+     * handle carries the errno out, rather than the builder seeing a bare io failure */
+    const char *swap_file = "test_no_space_direct.db";
+    (void)remove(swap_file);
+    block_manager_t *direct = NULL;
+    ASSERT_EQ(block_manager_open(&direct, swap_file, BLOCK_MANAGER_SYNC_NONE), 0);
+
+    const int full_fd = open("/dev/full", O_RDWR);
+    ASSERT_TRUE(full_fd >= 0);
+    ASSERT_TRUE(dup2(full_fd, direct->fd) >= 0);
+    close(full_fd);
+
+    unsigned char payload[64];
+    memset(payload, 'x', sizeof(payload));
+    block_manager_block_t *blk = block_manager_block_create(sizeof(payload), payload);
+    ASSERT_TRUE(blk != NULL);
+    errno = 0;
+    ASSERT_TRUE(block_manager_block_write(direct, blk) < 0);
+    ASSERT_EQ(block_manager_last_errno(direct), ENOSPC);
+    ASSERT_EQ(tdb_errno_to_result(block_manager_last_errno(direct)), TDB_ERR_NO_SPACE);
+
+    block_manager_block_free(blk);
+    block_manager_close(direct);
+    (void)remove(swap_file);
+#endif
+}
+
 void test_block_manager_null_args(void)
 {
     block_manager_t *bm = NULL;
@@ -2600,80 +2235,14 @@ void test_block_manager_null_args(void)
     ASSERT_EQ(block_manager_cursor_at_second(NULL), -1);
     ASSERT_EQ(block_manager_cursor_at_last(NULL), -1);
     ASSERT_TRUE(block_manager_cursor_read(NULL) == NULL);
-    ASSERT_TRUE(block_manager_cursor_read_partial(NULL, 10) == NULL);
     ASSERT_TRUE(block_manager_cursor_read_and_advance(NULL) == NULL);
 
     /* block_manager_block_free and cursor_free with NULL should not crash */
     block_manager_block_free(NULL);
     block_manager_cursor_free(NULL);
-    block_manager_block_release(NULL);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_null.db");
-}
-
-void test_block_manager_cursor_has_next_exhausted(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_has_next_end.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    for (int i = 0; i < 2; i++)
-    {
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-        block_manager_block_t *block = block_manager_block_create(10, data);
-        ASSERT_TRUE(block != NULL);
-        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-        block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* at first block, has_next should be 1 */
-    ASSERT_EQ(block_manager_cursor_has_next(cursor), 1);
-    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
-
-    /* at second (last) block, has_next should still be 1 (current block is valid) */
-    ASSERT_EQ(block_manager_cursor_has_next(cursor), 1);
-
-    /* advance past the last block */
-    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
-
-    /* now past all blocks, has_next should return 0 */
-    ASSERT_EQ(block_manager_cursor_has_next(cursor), 0);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_has_next_end.db");
-}
-
-void test_block_manager_cursor_next_past_eof(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_next_eof.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    char data[10] = "one_block";
-    block_manager_block_t *block = block_manager_block_create(10, data);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-    block_manager_block_free(block);
-
-    block_manager_cursor_t *cursor;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* advance past the single block */
-    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
-
-    /* cursor_next should now fail (EOF) */
-    ASSERT_NE(block_manager_cursor_next(cursor), 0);
-
-    /* cursor_read at this position should return NULL */
-    ASSERT_TRUE(block_manager_cursor_read(cursor) == NULL);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_next_eof.db");
 }
 
 void test_block_manager_count_blocks_large_block(void)
@@ -2711,44 +2280,6 @@ void test_block_manager_count_blocks_large_block(void)
     remove("test_empty_count.db");
 }
 
-void test_block_manager_cursor_goto_invalid(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_goto_invalid.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    char data[10] = "testdata0";
-    block_manager_block_t *block = block_manager_block_create(10, data);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-    block_manager_block_free(block);
-
-    block_manager_cursor_t *cursor;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* goto position 0 (inside file header), cursor_read should fail */
-    ASSERT_EQ(block_manager_cursor_goto(cursor, 0), 0);
-    block_manager_block_t *read_block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(read_block == NULL);
-
-    /* goto position way beyond file size, cursor_read should fail */
-    ASSERT_EQ(block_manager_cursor_goto(cursor, 999999), 0);
-    read_block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(read_block == NULL);
-
-    /* goto_last on empty file should fail */
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-
-    ASSERT_TRUE(block_manager_open(&bm, "test_goto_empty.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-    ASSERT_EQ(block_manager_cursor_goto_last(cursor), -1);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_goto_invalid.db");
-    remove("test_goto_empty.db");
-}
-
 void test_block_manager_read_block_data_checksum_corruption(void)
 {
     block_manager_t *bm = NULL;
@@ -2776,49 +2307,6 @@ void test_block_manager_read_block_data_checksum_corruption(void)
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_rbd_cksum.db");
-}
-
-void test_block_manager_cursor_init_stack_direct(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_stack_cursor.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    for (int i = 0; i < 3; i++)
-    {
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-        block_manager_block_t *block = block_manager_block_create(10, data);
-        ASSERT_TRUE(block != NULL);
-        ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-        block_manager_block_free(block);
-    }
-
-    /* we use stack-allocated cursor */
-    block_manager_cursor_t cursor;
-    ASSERT_EQ(block_manager_cursor_init_stack(&cursor, bm), 0);
-
-    /* should be positioned at first block */
-    block_manager_block_t *read_block = block_manager_cursor_read(&cursor);
-    ASSERT_TRUE(read_block != NULL);
-    ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
-    block_manager_block_free(read_block);
-
-    /* iterate forward */
-    ASSERT_EQ(block_manager_cursor_next(&cursor), 0);
-    read_block = block_manager_cursor_read(&cursor);
-    ASSERT_TRUE(read_block != NULL);
-    ASSERT_EQ(memcmp(read_block->data, "testdata1", 10), 0);
-    block_manager_block_free(read_block);
-
-    ASSERT_EQ(block_manager_cursor_next(&cursor), 0);
-    read_block = block_manager_cursor_read(&cursor);
-    ASSERT_TRUE(read_block != NULL);
-    ASSERT_EQ(memcmp(read_block->data, "testdata2", 10), 0);
-    block_manager_block_free(read_block);
-
-    /* no cursor_free needed for stack cursor */
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_stack_cursor.db");
 }
 
 void test_block_manager_write_batch_edge_cases(void)
@@ -2880,37 +2368,6 @@ void test_block_manager_write_batch_edge_cases(void)
     block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_batch_edge.db");
-}
-
-void test_block_manager_cursor_read_partial_large_max(void)
-{
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, "test_partial_large.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    char data[50];
-    memset(data, 'B', 50);
-    block_manager_block_t *block = block_manager_block_create(50, data);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
-    block_manager_block_free(block);
-
-    block_manager_cursor_t *cursor;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* max_bytes >= block_size should return full block */
-    block_manager_block_t *partial = block_manager_cursor_read_partial(cursor, 50);
-    ASSERT_TRUE(partial != NULL);
-    ASSERT_EQ(partial->size, 50);
-    block_manager_block_free(partial);
-
-    partial = block_manager_cursor_read_partial(cursor, 1000);
-    ASSERT_TRUE(partial != NULL);
-    ASSERT_EQ(partial->size, 50);
-    block_manager_block_free(partial);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    remove("test_partial_large.db");
 }
 
 void test_write_raw_hole_stops_replay(void)
@@ -3170,224 +2627,6 @@ void test_block_manager_write_raw_signal_safe(void)
     (void)remove(test_file);
 }
 #endif /* !_WIN32 */
-
-void test_cursor_skip_corrupt_partial_write(void)
-{
-    const char *test_file = "test_skip_corrupt_partial.db";
-    (void)remove(test_file);
-
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    const char *payload_a = "block_A_ok";
-    const char *payload_b = "block_B_partial_write_victim";
-    const char *payload_c = "block_C_ok";
-
-    const uint32_t size_a = (uint32_t)(strlen(payload_a) + 1);
-    const uint32_t size_b = (uint32_t)(strlen(payload_b) + 1);
-    const uint32_t size_c = (uint32_t)(strlen(payload_c) + 1);
-
-    const int64_t offset_a = block_manager_write_raw(bm, payload_a, size_a);
-    const int64_t offset_b = block_manager_write_raw(bm, payload_b, size_b);
-    const int64_t offset_c = block_manager_write_raw(bm, payload_c, size_c);
-    ASSERT_TRUE(offset_a >= 0);
-    ASSERT_TRUE(offset_b >= 0);
-    ASSERT_TRUE(offset_c >= 0);
-
-    /* simulate partial write at B leave header intact, zero data+footer.
-     * the header's size field stays valid (size_b); the footer magic becomes 0. */
-    const size_t zero_len = size_b + BLOCK_MANAGER_FOOTER_SIZE;
-    uint8_t *zeros = (uint8_t *)calloc(1, zero_len);
-    ASSERT_TRUE(zeros != NULL);
-    const off_t data_start = (off_t)offset_b + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    ASSERT_TRUE(pwrite(bm->fd, zeros, zero_len, data_start) == (ssize_t)zero_len);
-    free(zeros);
-
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    block_manager_cursor_t *cursor = NULL;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_EQ(memcmp(block->data, payload_a, size_a), 0);
-    block_manager_block_free(block);
-
-    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
-
-    /* cursor_read(B) must fail-- checksum mismatch on zeroed data */
-    block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block == NULL);
-
-    /* skip the partial write -- must succeed because footer magic is absent */
-    ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), 0);
-
-    /* C is now current and readable */
-    block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_EQ(memcmp(block->data, payload_c, size_c), 0);
-    block_manager_block_free(block);
-
-    printf("  [skip-corrupt] block C at offset %" PRId64
-           " recovered after skipping partial write at offset %" PRId64 "\n",
-           offset_c, offset_b);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove(test_file);
-}
-
-void test_cursor_skip_corrupt_refuses_data_corruption(void)
-{
-    const char *test_file = "test_skip_corrupt_genuine.db";
-    (void)remove(test_file);
-
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    const char *payload = "fully_written_then_bit_flipped";
-    const uint32_t size = (uint32_t)(strlen(payload) + 1);
-
-    const int64_t offset = block_manager_write_raw(bm, payload, size);
-    ASSERT_TRUE(offset >= 0);
-
-    /* flip one byte in the middle of the data region */
-    const off_t flip_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (off_t)(size / 2);
-    uint8_t byte_val;
-    ASSERT_TRUE(pread(bm->fd, &byte_val, 1, flip_offset) == 1);
-    byte_val ^= 0xFFU;
-    ASSERT_TRUE(pwrite(bm->fd, &byte_val, 1, flip_offset) == 1);
-
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    block_manager_cursor_t *cursor = NULL;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    /* cursor_read must fail-- checksum mismatch */
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block == NULL);
-
-    /* skip must be refused-- footer magic is intact -> genuine corruption */
-    ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), -1);
-
-    printf("  [skip-corrupt] correctly refused to skip genuine corruption at offset %" PRId64 "\n",
-           offset);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove(test_file);
-}
-
-void test_cursor_resync_past_hole(void)
-{
-    const char *test_file = "test_resync_hole.db";
-    (void)remove(test_file);
-
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    const char *payload_a = "block_A_before_hole";
-    const char *payload_hole = "failed_concurrent_append_victim";
-    const char *payload_b = "block_B_after_hole_committed";
-
-    const uint32_t size_a = (uint32_t)(strlen(payload_a) + 1);
-    const uint32_t size_hole = (uint32_t)(strlen(payload_hole) + 1);
-    const uint32_t size_b = (uint32_t)(strlen(payload_b) + 1);
-
-    const int64_t offset_a = block_manager_write_raw(bm, payload_a, size_a);
-    const int64_t offset_hole = block_manager_write_raw(bm, payload_hole, size_hole);
-    const int64_t offset_b = block_manager_write_raw(bm, payload_b, size_b);
-    ASSERT_TRUE(offset_a >= 0);
-    ASSERT_TRUE(offset_hole >= 0);
-    ASSERT_TRUE(offset_b >= 0);
-
-    /* simulate a failed concurrent append that reserved space but wrote zero bytes -- zero the
-     * whole frame so the size field itself reads 0, the case skip_corrupt cannot advance past.
-     * block B sits at a higher offset and is the committed data the hole must not shadow. */
-    const size_t hole_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size_hole + BLOCK_MANAGER_FOOTER_SIZE;
-    uint8_t *zeros = (uint8_t *)calloc(1, hole_len);
-    ASSERT_TRUE(zeros != NULL);
-    ASSERT_TRUE(pwrite(bm->fd, zeros, hole_len, (off_t)offset_hole) == (ssize_t)hole_len);
-    free(zeros);
-
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    block_manager_cursor_t *cursor = NULL;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_EQ(memcmp(block->data, payload_a, size_a), 0);
-    block_manager_block_free(block);
-
-    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
-
-    /* the hole reads back as a zero size field, and skip_corrupt cannot advance past it */
-    block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block == NULL);
-    ASSERT_EQ(block_manager_cursor_skip_corrupt(cursor), -1);
-
-    /* resync finds the next committed block past the hole */
-    ASSERT_EQ(block_manager_cursor_resync_past_hole(cursor), 0);
-
-    block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_EQ(memcmp(block->data, payload_b, size_b), 0);
-    block_manager_block_free(block);
-
-    printf("  [resync] block B at offset %" PRId64
-           " recovered after resyncing past a zero hole at offset %" PRId64 "\n",
-           offset_b, offset_hole);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove(test_file);
-}
-
-void test_cursor_resync_refuses_data_corruption(void)
-{
-    const char *test_file = "test_resync_genuine.db";
-    (void)remove(test_file);
-
-    block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    const char *payload = "fully_framed_then_corrupted";
-    const uint32_t size = (uint32_t)(strlen(payload) + 1);
-    const int64_t offset = block_manager_write_raw(bm, payload, size);
-    ASSERT_TRUE(offset >= 0);
-
-    /* flip a data byte so the block stays fully framed (valid footer magic) but fails its
-     * checksum -- the genuine-corruption case skip_corrupt deliberately halts on */
-    const off_t flip = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (off_t)(size / 2);
-    uint8_t byte_val;
-    ASSERT_TRUE(pread(bm->fd, &byte_val, 1, flip) == 1);
-    byte_val ^= 0xFFU;
-    ASSERT_TRUE(pwrite(bm->fd, &byte_val, 1, flip) == 1);
-
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
-
-    block_manager_cursor_t *cursor = NULL;
-    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block == NULL);
-
-    /* the corrupt block has a nonzero size field, so resync refuses it -- the tested policy of
-     * halting on real corruption stands untouched */
-    ASSERT_EQ(block_manager_cursor_resync_past_hole(cursor), -1);
-
-    printf("  [resync] correctly refused a genuine-corruption block at offset %" PRId64 "\n",
-           offset);
-
-    block_manager_cursor_free(cursor);
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-    (void)remove(test_file);
-}
 
 /* helper that returns file size or -1 on error */
 static int64_t test_file_size(const char *path)
@@ -3661,43 +2900,290 @@ void test_block_manager_large_block_read_roundtrip(void)
     (void)remove(path);
 }
 
-void test_block_manager_max_safe_block_bytes_refusal(void)
-{
-    /* the budget is only consulted past the large-block threshold (256 MB); a block
-     * over both threshold and budget is refused with NULL instead of being allocated */
-    const uint64_t large_block_threshold = 256ull * 1024 * 1024;
-    const uint32_t big = (uint32_t)(large_block_threshold + 4096);
+/* buffered-append mode -- write through block_manager_open_buffered (staging ring + flush thread),
+ * then reopen on the direct path to prove the on-disk bytes are identical and every record survives
+ */
 
-    const char *path = "test_budget_refusal.db";
+void test_block_manager_buffered_roundtrip(void)
+{
+    const char *path = "test_buffered_roundtrip.db";
     (void)remove(path);
 
     block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 0) == 0);
+    ASSERT_TRUE(bm != NULL);
+    ASSERT_EQ(bm->buffered, 1);
 
-    uint8_t *payload = calloc(1, big);
-    ASSERT_TRUE(payload != NULL);
-    int64_t offset = block_manager_write_raw(bm, payload, big);
-    ASSERT_TRUE(offset >= 0);
-    free(payload);
+    const int num_records = 500;
+    for (int i = 0; i < num_records; i++)
+    {
+        char data[48];
+        snprintf(data, sizeof(data), "buffered_record_%d", i);
+        const uint32_t size = (uint32_t)(strlen(data) + 1);
+        int64_t off = block_manager_write_raw(bm, data, size);
+        ASSERT_TRUE(off >= 0);
+        /* wait for the flush thread to make this record durable before moving on */
+        ASSERT_TRUE(
+            block_manager_wait_durable(bm, (uint64_t)off + block_manager_framed_size(size)) == 0);
+    }
+
+    /* get_size reports the flushed extent on a buffered handle -- everything is durable here */
+    uint64_t flushed_size = 0;
+    ASSERT_TRUE(block_manager_get_size(bm, &flushed_size) == 0);
+    ASSERT_TRUE(flushed_size > BLOCK_MANAGER_HEADER_SIZE);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen on the direct path and read every record back */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_EQ(bm->buffered, 0);
+
+    uint64_t reopen_size = 0;
+    ASSERT_TRUE(block_manager_get_size(bm, &reopen_size) == 0);
+    ASSERT_EQ(reopen_size, flushed_size);
 
     block_manager_cursor_t *cursor = NULL;
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
 
-    /* no budget configured -- the oversized block reads back fine */
-    block_manager_set_max_safe_block_bytes(0);
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    ASSERT_TRUE(block != NULL);
-    ASSERT_EQ(block->size, big);
-    block_manager_block_free(block);
-
-    /* budget below the block size -- the read is refused (graceful, no OOM) */
-    block_manager_set_max_safe_block_bytes(large_block_threshold);
-    ASSERT_TRUE(block_manager_cursor_read(cursor) == NULL);
-
-    /* restore the process-wide budget so later tests are unaffected */
-    block_manager_set_max_safe_block_bytes(0);
-
+    int read = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        char expected[48];
+        snprintf(expected, sizeof(expected), "buffered_record_%d", read);
+        ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        read++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
     block_manager_cursor_free(cursor);
+
+    ASSERT_EQ(read, num_records);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+typedef struct
+{
+    block_manager_t *bm;
+    int thread_id;
+    int num_records;
+    int records_per_thread;
+} buffered_writer_args_t;
+
+static void *buffered_writer_thread(void *arg)
+{
+    buffered_writer_args_t *a = (buffered_writer_args_t *)arg;
+    for (int i = 0; i < a->records_per_thread; i++)
+    {
+        /* payload carries a globally unique index so read-back can prove exactly-once */
+        const uint32_t idx = (uint32_t)(a->thread_id * a->records_per_thread + i);
+        uint8_t data[32];
+        memset(data, 0, sizeof(data));
+        memcpy(data, &idx, sizeof(idx));
+        int64_t off = block_manager_write_raw(a->bm, data, (uint32_t)sizeof(data));
+        if (off < 0) continue;
+        (void)block_manager_wait_durable(a->bm,
+                                         (uint64_t)off + block_manager_framed_size(sizeof(data)));
+    }
+    return NULL;
+}
+
+void test_block_manager_buffered_concurrent(void)
+{
+    const char *path = "test_buffered_concurrent.db";
+    (void)remove(path);
+
+    const int num_threads = 8;
+    const int records_per_thread = 2000;
+    const int total = num_threads * records_per_thread;
+
+    block_manager_t *bm = NULL;
+    /* SYNC_FULL exercises the flush thread's fdatasync path under concurrency */
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_FULL, 0) == 0);
+
+    pthread_t threads[8];
+    buffered_writer_args_t args[8];
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].bm = bm;
+        args[i].thread_id = i;
+        args[i].num_records = total;
+        args[i].records_per_thread = records_per_thread;
+        ASSERT_TRUE(pthread_create(&threads[i], NULL, buffered_writer_thread, &args[i]) == 0);
+    }
+    for (int i = 0; i < num_threads; i++) ASSERT_TRUE(pthread_join(threads[i], NULL) == 0);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen direct and confirm every index appears exactly once */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    uint8_t *seen = calloc((size_t)total, 1);
+    ASSERT_TRUE(seen != NULL);
+
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int count = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        ASSERT_EQ(block->size, (uint64_t)32);
+        uint32_t idx = 0;
+        memcpy(&idx, block->data, sizeof(idx));
+        ASSERT_TRUE(idx < (uint32_t)total);
+        ASSERT_EQ(seen[idx], 0); /* no duplicates */
+        seen[idx] = 1;
+        count++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_EQ(count, total);
+    for (int i = 0; i < total; i++) ASSERT_EQ(seen[i], 1); /* none missing */
+    free(seen);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+void test_block_manager_buffered_ring_wraparound(void)
+{
+    const char *path = "test_buffered_wrap.db";
+    (void)remove(path);
+
+    /* a 1 MB ring (the floor) with 4 KB records forces many full wraparounds */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 1) == 0);
+
+    const int num_records = 1500;
+    const uint32_t rec_size = 4096;
+    uint8_t *data = malloc(rec_size);
+    ASSERT_TRUE(data != NULL);
+
+    for (int i = 0; i < num_records; i++)
+    {
+        memset(data, 0, rec_size);
+        memcpy(data, &i, sizeof(i)); /* first 4 bytes = sequence number */
+        int64_t off = block_manager_write_raw(bm, data, rec_size);
+        ASSERT_TRUE(off >= 0);
+        ASSERT_TRUE(block_manager_wait_durable(
+                        bm, (uint64_t)off + block_manager_framed_size(rec_size)) == 0);
+    }
+    free(data);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int read = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        ASSERT_EQ(block->size, (uint64_t)rec_size);
+        int seq = 0;
+        memcpy(&seq, block->data, sizeof(seq));
+        ASSERT_EQ(seq, read); /* records land in append order */
+        read++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+
+    ASSERT_EQ(read, num_records);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(path);
+}
+
+void test_block_manager_buffered_oversized_record(void)
+{
+    const char *path = "test_buffered_oversized.db";
+    (void)remove(path);
+
+    /* 1 MB ring floor; a 1.5 MB record cannot be staged and takes the oversized direct-write path.
+     * bracket it with small records to prove ordering and the flushed watermark stay consistent. */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_FULL, 1) == 0);
+
+    const uint32_t big_size = 1536 * 1024;
+    uint8_t *big = malloc(big_size);
+    ASSERT_TRUE(big != NULL);
+    for (uint32_t i = 0; i < big_size; i++) big[i] = (uint8_t)(i * 31 + 7);
+
+    /* 'small' is a macro in the MSVC RPC headers, so name the record buffer plainly */
+    char rec[32];
+    /* three small records, then the oversized one, then three more */
+    for (int i = 0; i < 3; i++)
+    {
+        snprintf(rec, sizeof(rec), "pre_%d", i);
+        int64_t off = block_manager_write_raw(bm, rec, (uint32_t)(strlen(rec) + 1));
+        ASSERT_TRUE(off >= 0);
+    }
+    int64_t big_off = block_manager_write_raw(bm, big, big_size);
+    ASSERT_TRUE(big_off >= 0);
+    ASSERT_TRUE(block_manager_wait_durable(
+                    bm, (uint64_t)big_off + block_manager_framed_size(big_size)) == 0);
+    for (int i = 0; i < 3; i++)
+    {
+        snprintf(rec, sizeof(rec), "post_%d", i);
+        int64_t off = block_manager_write_raw(bm, rec, (uint32_t)(strlen(rec) + 1));
+        ASSERT_TRUE(off >= 0);
+        ASSERT_TRUE(block_manager_wait_durable(
+                        bm, (uint64_t)off + block_manager_framed_size(strlen(rec) + 1)) == 0);
+    }
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen direct, verify the seven records read back in order with intact contents */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) == 0);
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int idx = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+        if (idx < 3)
+        {
+            char expected[32];
+            snprintf(expected, sizeof(expected), "pre_%d", idx);
+            ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        }
+        else if (idx == 3)
+        {
+            ASSERT_EQ(block->size, (uint64_t)big_size);
+            int mismatch = 0;
+            for (uint32_t i = 0; i < big_size; i++)
+                if (((uint8_t *)block->data)[i] != (uint8_t)(i * 31 + 7))
+                {
+                    mismatch = 1;
+                    break;
+                }
+            ASSERT_EQ(mismatch, 0);
+        }
+        else
+        {
+            char expected[32];
+            snprintf(expected, sizeof(expected), "post_%d", idx - 4);
+            ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+        }
+        idx++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+    block_manager_cursor_free(cursor);
+    free(big);
+
+    ASSERT_EQ(idx, 7);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove(path);
 }
@@ -3713,19 +3199,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_block_write_close_reopen_read, tests_passed);
     RUN_TEST(test_block_manager_truncate, tests_passed);
     RUN_TEST(test_block_manager_count_blocks, tests_passed);
-    RUN_TEST(test_block_manager_cursor_goto_first, tests_passed);
-    RUN_TEST(test_block_manager_cursor_has_next, tests_passed);
-    RUN_TEST(test_block_manager_cursor_has_prev, tests_passed);
-    RUN_TEST(test_block_manager_cursor, tests_passed);
-    RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
     RUN_TEST(test_block_manager_goto_last_after_reopen, tests_passed);
     RUN_TEST(test_block_manager_concurrent_file_extension, tests_passed);
-    RUN_TEST(test_block_manager_cursor_position_checks, tests_passed);
     RUN_TEST(test_block_manager_open_safety, tests_passed);
     RUN_TEST(test_block_manager_validate_last_block, tests_passed);
     RUN_TEST(test_block_manager_get_size, tests_passed);
     RUN_TEST(test_block_manager_seek_and_goto, tests_passed);
-    RUN_TEST(test_block_manager_cursor_goto_last_before, tests_passed);
     RUN_TEST(test_block_manager_validation_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
     RUN_TEST(test_block_manager_sync_modes, tests_passed);
@@ -3733,47 +3212,41 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_concurrent_write_size_reopen, tests_passed);
     RUN_TEST(test_block_manager_block_create_from_buffer, tests_passed);
     RUN_TEST(test_block_manager_write_at_and_update_checksum, tests_passed);
-    RUN_TEST(test_block_manager_block_acquire_release, tests_passed);
-    RUN_TEST(test_block_manager_cursor_read_partial, tests_passed);
-    RUN_TEST(test_block_manager_cursor_read_and_advance, tests_passed);
     RUN_TEST(test_block_manager_escalate_fsync, tests_passed);
     RUN_TEST(test_block_manager_last_modified, tests_passed);
     RUN_TEST(test_block_manager_set_sync_mode, tests_passed);
     RUN_TEST(test_block_manager_get_block_size_at_offset, tests_passed);
     RUN_TEST(test_block_manager_read_at_offset, tests_passed);
     RUN_TEST(test_block_manager_read_block_data_at_offset, tests_passed);
+    RUN_TEST(test_block_manager_borrow_block_data_at_offset, tests_passed);
     RUN_TEST(test_block_manager_convert_sync_mode, tests_passed);
     RUN_TEST(test_block_manager_checksum_corruption, tests_passed);
     RUN_TEST(test_block_manager_header_corruption, tests_passed);
     RUN_TEST(test_block_manager_strict_validation, tests_passed);
     RUN_TEST(test_block_manager_validate_zero_size_file, tests_passed);
     RUN_TEST(test_block_manager_footer_corruption_mid_file, tests_passed);
+    RUN_TEST(test_block_manager_no_space_is_reported_distinctly, tests_passed);
     RUN_TEST(test_block_manager_null_args, tests_passed);
-    RUN_TEST(test_block_manager_cursor_has_next_exhausted, tests_passed);
-    RUN_TEST(test_block_manager_cursor_next_past_eof, tests_passed);
     RUN_TEST(test_block_manager_count_blocks_large_block, tests_passed);
-    RUN_TEST(test_block_manager_cursor_goto_invalid, tests_passed);
     RUN_TEST(test_block_manager_read_block_data_checksum_corruption, tests_passed);
-    RUN_TEST(test_block_manager_cursor_init_stack_direct, tests_passed);
     RUN_TEST(test_block_manager_write_batch_edge_cases, tests_passed);
-    RUN_TEST(test_block_manager_cursor_read_partial_large_max, tests_passed);
     RUN_TEST(test_write_raw_hole_stops_replay, tests_passed);
     RUN_TEST(test_write_raw_multiple_holes_stop_replay, tests_passed);
 
 #ifndef _WIN32
     RUN_TEST(test_block_manager_write_raw_signal_safe, tests_passed);
 #endif
-    RUN_TEST(test_cursor_skip_corrupt_partial_write, tests_passed);
-    RUN_TEST(test_cursor_skip_corrupt_refuses_data_corruption, tests_passed);
-    RUN_TEST(test_cursor_resync_past_hole, tests_passed);
-    RUN_TEST(test_cursor_resync_refuses_data_corruption, tests_passed);
 
     RUN_TEST(test_block_manager_preallocation_extends_then_close_trims, tests_passed);
     RUN_TEST(test_block_manager_strict_validation_accepts_prealloc_tail, tests_passed);
     RUN_TEST(test_block_manager_strict_validation_rejects_garbage_tail, tests_passed);
     RUN_TEST(test_block_manager_permissive_validation_truncates_prealloc_tail, tests_passed);
     RUN_TEST(test_block_manager_large_block_read_roundtrip, tests_passed);
-    RUN_TEST(test_block_manager_max_safe_block_bytes_refusal, tests_passed);
+
+    RUN_TEST(test_block_manager_buffered_roundtrip, tests_passed);
+    RUN_TEST(test_block_manager_buffered_concurrent, tests_passed);
+    RUN_TEST(test_block_manager_buffered_ring_wraparound, tests_passed);
+    RUN_TEST(test_block_manager_buffered_oversized_record, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

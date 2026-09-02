@@ -11,6 +11,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y clang-format-14
     - name: Run clang-format style check for C/C++/Protobuf programs
+      # every directory holding first-party sources, not just src -- include/db.h is the public
+      # header, and the test, fuzz and bench trees are maintained code too. external/ is vendored
+      # and deliberately left alone
       run: |
-        find src -regextype posix-egrep -regex '.*\.(c|C|cc|cpp|cxx|c\+\+|h|H|hh|hpp|hxx|h\+\+|proto|cu)$' -print0 | \
+        find src include test fuzz bench -regextype posix-egrep \
+          -regex '.*\.(c|C|cc|cpp|cxx|c\+\+|h|H|hh|hpp|hxx|h\+\+|proto|cu)$' -print0 | \
         xargs -0 clang-format-14 --dry-run --Werror --style=file --fallback-style=llvm

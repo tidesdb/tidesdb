@@ -1,0 +1,245 @@
+{
+  "$comment": "Table of contents for the TidesDB manual, in reading order. This tree is the docs for whatever release it is checked out at -- the version comes from project(VERSION) in CMakeLists.txt, mirrored in vcpkg.json, and is not repeated here. Astro reads this to build navigation and the print order.",
+  "title": "TidesDB Manual",
+  "parts": [
+    {
+      "id": "preface",
+      "title": "Preface",
+      "dir": "00-preface",
+      "chapters": [
+        {
+          "file": "preface.md",
+          "slug": "preface",
+          "title": "Preface"
+        }
+      ]
+    },
+    {
+      "id": "getting-started",
+      "title": "Getting Started",
+      "dir": "01-getting-started",
+      "chapters": [
+        {
+          "file": "first-database.md",
+          "slug": "getting-started",
+          "title": "Your First Database"
+        }
+      ]
+    },
+    {
+      "id": "concepts",
+      "title": "Concepts",
+      "dir": "02-concepts",
+      "chapters": [
+        {
+          "file": "data-model.md",
+          "slug": "concepts/data-model",
+          "title": "Data Model"
+        },
+        {
+          "file": "transactions.md",
+          "slug": "concepts/transactions",
+          "title": "Transactions and Isolation"
+        },
+        {
+          "file": "durability.md",
+          "slug": "concepts/durability",
+          "title": "Durability"
+        }
+      ]
+    },
+    {
+      "id": "administration",
+      "title": "Administration",
+      "dir": "03-administration",
+      "chapters": [
+        {
+          "file": "building.md",
+          "slug": "administration/building",
+          "title": "Building and Installing"
+        },
+        {
+          "file": "operations.md",
+          "slug": "administration/operations",
+          "title": "Operations"
+        },
+        {
+          "file": "monitoring.md",
+          "slug": "administration/monitoring",
+          "title": "Monitoring"
+        },
+        {
+          "file": "troubleshooting.md",
+          "slug": "administration/troubleshooting",
+          "title": "Troubleshooting"
+        }
+      ]
+    },
+    {
+      "id": "reference",
+      "title": "C API Reference",
+      "dir": "04-reference",
+      "chapters": [
+        {
+          "file": "database.md",
+          "slug": "reference/database",
+          "title": "Database Operations"
+        },
+        {
+          "file": "column-family.md",
+          "slug": "reference/column-family",
+          "title": "Column Family Operations"
+        },
+        {
+          "file": "transaction.md",
+          "slug": "reference/transaction",
+          "title": "Transaction Operations"
+        },
+        {
+          "file": "iterator.md",
+          "slug": "reference/iterator",
+          "title": "Iterator Operations"
+        },
+        {
+          "file": "maintenance.md",
+          "slug": "reference/maintenance",
+          "title": "Maintenance Operations"
+        },
+        {
+          "file": "statistics.md",
+          "slug": "reference/statistics",
+          "title": "Statistics"
+        }
+      ]
+    },
+    {
+      "id": "internals",
+      "title": "Internals",
+      "dir": "05-internals",
+      "chapters": [
+        {
+          "file": "architecture.md",
+          "slug": "internals/architecture",
+          "title": "Architecture"
+        },
+        {
+          "file": "life-of-a-write.md",
+          "slug": "internals/life-of-a-write",
+          "title": "The Life of a Write"
+        },
+        {
+          "file": "life-of-a-read.md",
+          "slug": "internals/life-of-a-read",
+          "title": "The Life of a Read"
+        },
+        {
+          "file": "memtable-and-wal.md",
+          "slug": "internals/memtable-and-wal",
+          "title": "Memtable and Write-Ahead Log"
+        },
+        {
+          "file": "block-manager.md",
+          "slug": "internals/block-manager",
+          "title": "Block Manager"
+        },
+        {
+          "file": "sstable.md",
+          "slug": "internals/sstable",
+          "title": "SSTable"
+        },
+        {
+          "file": "value-log.md",
+          "slug": "internals/value-log",
+          "title": "Value log"
+        },
+        {
+          "file": "manifest.md",
+          "slug": "internals/manifest",
+          "title": "Manifest"
+        },
+        {
+          "file": "compaction.md",
+          "slug": "internals/compaction",
+          "title": "Compaction"
+        },
+        {
+          "file": "block-cache.md",
+          "slug": "internals/block-cache",
+          "title": "Block Cache"
+        },
+        {
+          "file": "fd-manager.md",
+          "slug": "internals/fd-manager",
+          "title": "File Descriptor Manager"
+        },
+        {
+          "file": "thread-manager.md",
+          "slug": "internals/thread-manager",
+          "title": "Thread Manager"
+        },
+        {
+          "file": "transactions-and-mvcc.md",
+          "slug": "internals/transactions-and-mvcc",
+          "title": "Transactions and MVCC"
+        },
+        {
+          "file": "iterators.md",
+          "slug": "internals/iterators",
+          "title": "Iterators and the Merge"
+        },
+        {
+          "file": "recovery.md",
+          "slug": "internals/recovery",
+          "title": "Recovery"
+        },
+        {
+          "file": "invariants.md",
+          "slug": "internals/invariants",
+          "title": "Invariants"
+        },
+        {
+          "file": "testing-and-tools.md",
+          "slug": "internals/testing-and-tools",
+          "title": "Testing and Tools"
+        },
+        {
+          "file": "design-lineage.md",
+          "slug": "internals/design-lineage",
+          "title": "Design Lineage"
+        }
+      ]
+    },
+    {
+      "id": "appendix",
+      "title": "Appendixes",
+      "dir": "06-appendix",
+      "chapters": [
+        {
+          "file": "error-codes.md",
+          "slug": "appendix/error-codes",
+          "title": "Error Codes"
+        },
+        {
+          "file": "formats.md",
+          "slug": "appendix/formats",
+          "title": "On-Disk Formats"
+        },
+        {
+          "file": "configuration.md",
+          "slug": "appendix/configuration",
+          "title": "Configuration Reference"
+        },
+        {
+          "file": "glossary.md",
+          "slug": "appendix/glossary",
+          "title": "Glossary"
+        },
+        {
+          "file": "references.md",
+          "slug": "appendix/references",
+          "title": "References"
+        }
+      ]
+    }
+  ]
+}

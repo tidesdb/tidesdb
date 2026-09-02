@@ -148,16 +148,26 @@ cf_registry_view_t *cf_registry_view_enter(cf_registry_t *reg, cf_t ***out_cfs, 
 void cf_registry_view_leave(cf_registry_t *reg, cf_registry_view_t *view);
 
 /**
- * cf_registry_wait_readers_drained
- * wait until no borrow of the published view is outstanding
+ * cf_registry_retire_cf
+ * free a removed family once no live view can still name it
  *
- * a family removed from the registry is still named by a view a reader borrowed before the removal
- * was published, so the handle cannot be freed until those readers have gone. the wait is on that
- * displaced view alone, whose borrows can only fall once a newer one is published -- waiting for no
- * reader at all would never come back under work that reads continuously
+ * a family taken out of the published view is unreachable to anything arriving afterwards, but a
+ * view published before the removal still names it, and a flush holds one of those by reference
+ * count for as long as its I/O takes. freeing the handle under that is a use after free, and
+ * waiting for those views to die is the stall this registry is built to avoid, so the free is
+ * queued and taken by whichever view dies last -- or by cf_registry_sweep, if that view had already
+ * died
  * @param reg the registry
- * @param view the displaced view to wait out
+ * @param cf the removed family, whose handle the caller is giving up
+ * @param reclaim what frees it, invoked with cf once it is unreachable
  */
-void cf_registry_wait_readers_drained(cf_registry_t *reg, cf_registry_view_t *view);
+void cf_registry_retire_cf(cf_registry_t *reg, cf_t *cf, tdb_reclaim_fn reclaim);
+
+/**
+ * cf_registry_sweep
+ * reclaim whatever the registry deferred and can now free; a periodic background pass
+ * @param reg the registry
+ */
+void cf_registry_sweep(cf_registry_t *reg);
 
 #endif /* __TIDESDB_CF_REGISTRY_H__ */

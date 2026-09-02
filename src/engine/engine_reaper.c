@@ -116,6 +116,12 @@ static void engine_deferred_free_tick(void *ctx)
     /* immutables a flush could not free inline, because readers still held them when it finished.
      * swept here rather than waited on there, so a flush never waits on a reader to leave */
     tidesdb_l0_reclaim_pending(db->l0);
+
+    /* and the same for the registry: views a membership change displaced, and families a drop
+     * removed, both of which a borrow taken before the change can still be reading. after the leave
+     * above rather than before it, because this tick's own borrow is one of the ones that would
+     * hold the sweep off */
+    cf_registry_sweep(db->cfs);
 }
 
 /* the interval wal-sync tick: fsync the active WAL so interval-mode commits become durable within

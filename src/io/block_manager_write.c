@@ -150,7 +150,7 @@ void bm_buf_pool_release(uint8_t *ring, _Atomic unsigned char *done_ring, uint64
     }
     pthread_mutex_unlock(&bm_buf_pool_mtx);
     free(ring);
-    free(done_ring);
+    free((void *)done_ring);
 }
 
 /**
@@ -472,11 +472,11 @@ static int64_t bm_buffered_append(block_manager_t *bm, const void *data, const u
         if (bm_wait_flushed(bm, off) != 0) return -1;
 
         struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
-        iov[0].iov_base = header;
+        iov[0].iov_base = (void *)header;
         iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
         iov[1].iov_base = (void *)(uintptr_t)data;
         iov[1].iov_len = size;
-        iov[2].iov_base = footer;
+        iov[2].iov_base = (void *)footer;
         iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
         int rc = tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)off) ==
                          (ssize_t)total
@@ -540,11 +540,11 @@ static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint
 
     /* header + data + footer in a single pwritev -- zero copy from data */
     struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
-    iov[0].iov_base = header;
+    iov[0].iov_base = (void *)header;
     iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     iov[1].iov_base = (void *)(uintptr_t)data;
     iov[1].iov_len = size;
-    iov[2].iov_base = footer;
+    iov[2].iov_base = (void *)footer;
     iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
 #ifdef TDB_FAULT_INJECTION
@@ -679,11 +679,11 @@ static size_t bm_batch_build_frames(block_manager_block_t **blocks, size_t count
         bm_encode_frame(hdr, ftr, (uint32_t)block->size,
                         compute_checksum(block->data, block->size));
 
-        iov[iov_idx].iov_base = hdr;
+        iov[iov_idx].iov_base = (void *)hdr;
         iov[iov_idx].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
         iov[iov_idx + 1].iov_base = block->data;
         iov[iov_idx + 1].iov_len = block->size;
-        iov[iov_idx + 2].iov_base = ftr;
+        iov[iov_idx + 2].iov_base = (void *)ftr;
         iov[iov_idx + 2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
 
         iov_idx += BLOCK_MANAGER_IOVECS_PER_BLOCK;
@@ -777,7 +777,11 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
     const size_t iov_cap = valid_count * BLOCK_MANAGER_IOVECS_PER_BLOCK;
     unsigned char *alloc = malloc(meta_size + iov_cap * sizeof(struct iovec));
     if (!alloc) return -1;
-    struct iovec *iov = (struct iovec *)(alloc + meta_size);
+    /* the iovecs sit past the frame bytes, and land aligned because malloc returns a maximally
+     * aligned block and every frame is a fixed header plus footer -- sixteen bytes, so any number
+     * of them leaves the offset a multiple of eight. cast through void * to say that is established
+     */
+    struct iovec *iov = (struct iovec *)(void *)(alloc + meta_size);
 
     const size_t iov_idx = bm_batch_build_frames(blocks, count, base_offset, alloc, iov, offsets);
     const int write_rc = bm_batch_writev(bm, iov, iov_idx, base_offset);

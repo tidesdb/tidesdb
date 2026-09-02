@@ -388,7 +388,7 @@ int block_manager_close(block_manager_t *bm)
         if (atomic_load_explicit(&bm->flush_error, memory_order_acquire))
         {
             free(bm->ring);
-            free(bm->done_ring);
+            free((void *)bm->done_ring);
         }
         else
             bm_buf_pool_release(bm->ring, bm->done_ring, bm->ring_size);
@@ -579,7 +579,7 @@ int block_manager_open_buffered(block_manager_t **bm, const char *file_path, con
     if (!b->ring || !b->done_ring)
     {
         free(b->ring);
-        free(b->done_ring);
+        free((void *)b->done_ring);
         b->ring = NULL;
         b->done_ring = NULL;
         (void)block_manager_close(b);
@@ -607,7 +607,7 @@ int block_manager_open_buffered(block_manager_t **bm, const char *file_path, con
         pthread_cond_destroy(&b->buf_work_cv);
         pthread_cond_destroy(&b->buf_durable_cv);
         free(b->ring);
-        free(b->done_ring);
+        free((void *)b->done_ring);
         b->ring = NULL;
         b->done_ring = NULL;
         (void)block_manager_close(b);

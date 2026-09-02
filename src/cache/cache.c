@@ -544,7 +544,7 @@ void cache_get_stats(cache_t *cache, cache_stats_t *stats)
 static void cache_shard_destroy(cache_shard_t *shard)
 {
     free(shard->frames);
-    free(shard->buckets);
+    free((void *)shard->buckets);
 }
 
 /**
@@ -602,7 +602,7 @@ static int cache_shard_init(cache_shard_t *shard, const int num_frames, const si
     if (!shard->frames || !shard->buckets)
     {
         free(shard->frames);
-        free(shard->buckets);
+        free((void *)shard->buckets);
         return -1;
     }
 

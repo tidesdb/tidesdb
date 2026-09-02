@@ -1063,7 +1063,10 @@ static vlog_id_t g_uniq_ids[V_UNIQ_THREADS][V_UNIQ_PER];
 /* every writer gets its own ids, whatever the interleaving; a reused id would alias two values */
 static void *uniq_worker(void *arg)
 {
-    const long t = (long)arg;
+    /* intptr_t rather than long, which is the integer a pointer round-trips through everywhere --
+     * on windows long stays 32 bits while pointers are 64, so long truncates the value it carries
+     */
+    const intptr_t t = (intptr_t)arg;
     uint8_t *b = pattern(V_SMALL, (unsigned)t);
     for (int i = 0; i < V_UNIQ_PER; i++)
     {
@@ -1081,7 +1084,7 @@ void test_concurrent_ids_are_unique(void)
     g_uniq_v = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
 
     pthread_t th[V_UNIQ_THREADS];
-    for (long t = 0; t < V_UNIQ_THREADS; t++)
+    for (intptr_t t = 0; t < V_UNIQ_THREADS; t++)
         ASSERT_EQ(pthread_create(&th[t], NULL, uniq_worker, (void *)t), 0);
     for (int t = 0; t < V_UNIQ_THREADS; t++) pthread_join(th[t], NULL);
 

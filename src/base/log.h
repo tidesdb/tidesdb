@@ -31,7 +31,8 @@ extern char _tidesdb_log_path[MAX_FILE_PATH_LENGTH]; /* sink file path, reopened
  * @param fmt printf-style format string
  * @param ... format arguments
  */
-void tidesdb_log_write(int level, const char *file, int line, const char *fmt, ...);
+void tidesdb_log_write(int level, const char *file, int line, const char *fmt, ...)
+    TDB_PRINTF_FMT(4, 5);
 
 /**
  * tidesdb_log_set_sink

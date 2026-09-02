@@ -816,6 +816,13 @@ int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_famil
     return TDB_SUCCESS;
 }
 
+/* free a dropped family, once the registry says no borrow can still name it */
+static void engine_cf_reclaim(void *item, void *ctx)
+{
+    (void)ctx;
+    cf_free((cf_t *)item); /* closes the cf's sstables */
+}
+
 int engine_drop_cf(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return TDB_ERR_INVALID_ARGS;
@@ -864,7 +871,12 @@ int engine_drop_cf(tidesdb_t *db, const char *name)
         result = TDB_ERR_IO;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "cf %s dropped, id %llu retired", name, (unsigned long long)cf_id);
-    cf_free(cf); /* closes the cf's sstables */
+
+    /* deferred rather than freed here. the family is out of the published view so nothing new can
+     * reach it, but a borrow taken before the removal still holds the handle -- and waiting for
+     * those borrows to end is the stall a create used to pay. the registry frees it once no borrow
+     * is in flight */
+    cf_registry_retire_cf(db->cfs, cf, engine_cf_reclaim);
 
     /* the manifest no longer names them, so a file left behind here is unreachable rather than
      * dangerous: the next open cannot adopt what nothing points at */

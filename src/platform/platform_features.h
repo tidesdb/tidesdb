@@ -37,6 +37,23 @@
 #define UNUSED
 #endif
 
+/* cross-platform printf-style checking for a variadic function that forwards its format onward.
+ * it earns two things at once -- the call sites get their arguments checked against the format, and
+ * the forwarding call inside stops being an unchecked non-literal format, which is what a compiler
+ * otherwise has to warn about because it cannot see where the string came from */
+#if defined(__MINGW32__) || defined(__MINGW64__)
+/* mingw reads plain printf as the msvcrt one, which has no %zu, and would reject the formats this
+ * codebase writes -- correctly for that runtime, but it is not the runtime in use. building to c11
+ * turns mingw's own ansi stdio on, so the archetype naming it is the one that describes what
+ * actually formats these strings */
+#define TDB_PRINTF_FMT(fmt_index, first_arg) \
+    __attribute__((format(gnu_printf, fmt_index, first_arg)))
+#elif defined(__GNUC__) || defined(__clang__)
+#define TDB_PRINTF_FMT(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
+#else
+#define TDB_PRINTF_FMT(fmt_index, first_arg)
+#endif
+
 /* cross-platform thread-local storage */
 #if defined(_MSC_VER)
 #define THREAD_LOCAL __declspec(thread)

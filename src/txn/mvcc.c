@@ -111,7 +111,7 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     m->reservation = calloc(TDB_MVCC_RESERVATION_SLOTS, sizeof(_Atomic(uint64_t)));
     if (!m->reservation)
     {
-        free(m->ring);
+        free((void *)m->ring);
         free(m);
         return NULL;
     }
@@ -247,8 +247,8 @@ void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m)
     if (!m) return;
     tdb_wprwlock_destroy(&m->commit_gate);
     pthread_mutex_destroy(&m->range_lock);
-    free(m->ring);
-    free(m->reservation);
+    free((void *)m->ring);
+    free((void *)m->reservation);
     free(m);
 }
 

@@ -125,7 +125,7 @@ void test_retire_drain_match(void)
     tdb_epoch_exit(&guard_a);
     tdb_epoch_exit(&guard_b);
 
-    tdb_retire_drain(&list, match_guard, &guard_a); /* only A */
+    tdb_retire_drain(&list, match_guard, (void *)&guard_a); /* only A */
     ASSERT_EQ(atomic_load(&g_reclaimed), 1);
     tdb_retire_drain(&list, NULL, NULL); /* the rest */
     ASSERT_EQ(atomic_load(&g_reclaimed), 2);

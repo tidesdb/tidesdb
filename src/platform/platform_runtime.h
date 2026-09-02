@@ -19,6 +19,11 @@
  * Windows MinGW        -- no-op fallback */
 #if defined(__linux__)
 #include <sys/prctl.h>
+#elif defined(__OpenBSD__)
+/* pthread_set_name_np is declared here rather than in pthread.h. without it the call below is an
+ * implicit declaration, which C99 onwards does not allow and which assumes a return type and
+ * argument conventions the real function need not share */
+#include <pthread_np.h>
 #endif
 static inline void tdb_set_thread_name(const char *name)
 {
@@ -262,12 +267,13 @@ static inline size_t get_available_memory_impl(void)
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
 static inline size_t get_available_memory_impl(void)
 {
-    /* BSD systems use sysctl.. */
+    /* BSD systems use sysctl.., and the two families ask for different things -- a page count and a
+     * page size on one, a single uvm summary on the other -- so each declares only what it reads */
+#if defined(__FreeBSD__) || defined(__DragonFly__)
     unsigned long free_pages = 0;
     unsigned long page_size = 0;
     size_t len = sizeof(free_pages);
 
-#if defined(__FreeBSD__) || defined(__DragonFly__)
     if (sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &len, NULL, 0) == 0)
     {
         len = sizeof(page_size);
@@ -279,7 +285,7 @@ static inline size_t get_available_memory_impl(void)
 #elif defined(__OpenBSD__) || defined(__NetBSD__)
     int mib[2];
     struct uvmexp uvmexp;
-    len = sizeof(uvmexp);
+    size_t len = sizeof(uvmexp);
 
     mib[0] = CTL_VM;
     mib[1] = VM_UVMEXP;

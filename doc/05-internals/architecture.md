@@ -124,27 +124,48 @@ membership, and a reader borrows it. A borrow is two-stage, and the split is the
 guard covers only the few instructions between reading the published pointer and counting the
 borrow, while a **reference count on the view itself** covers the long hold -- a flush build, which
 runs for as long as its I/O takes. A membership change publishes a new view, so borrows arriving
-afterwards take that one and an unpublished view's count only falls. Waiting for those counts to
-reach zero therefore terminates however busy the readers are, which waiting for *no reader at all*
-could not.
+afterwards take that one.
 
-The wait is on **every** view a departing family was named by, not just the one the change
-displaced. A borrow can be holding an older view still -- a flush borrows one, a create publishes
-over it without waiting, and a later drop that waited only on what *it* displaced would free a
-handle that flush is still using. The registry therefore counts the views it has allocated, and a
-removal waits until only the published one is left, holding the registry meanwhile so nothing can
-publish another.
+That much makes the readers cheap. What makes the writer *finish* is the second rule, and it is the
+one that took several attempts to get right: **a membership change never waits for a reader.**
+
+The tempting version waits. An unpublished view's count only falls, the argument goes, so waiting
+for it to reach zero must terminate however busy the readers are -- unlike waiting for no reader at
+all. The argument is true and the code built on it still hangs, because reaching zero is not the
+only thing such a wait needs. The short guard has to be empty too, to rule out a reader that read
+the published pointer before the exchange and has not yet counted its borrow, and *that* is a global
+quiescent point: an instant when no reader anywhere is inside the guard. Readers arriving
+continuously never produce one. Measured, with more readers than cores: one publish completed out of
+twenty attempts, and the slowest took over two minutes at a full core.
+
+So nothing is waited out. The displaced view is handed to deferred reclamation, which tries briefly
+to reclaim it and otherwise leaves it on a retire list for the reaper. The publishing thread stores
+the new pointer and returns -- under the same load that starved it before, in microseconds.
+
+The same rule covers lifetime, which is the part that cannot simply be dropped. A borrow can be
+holding an *older* view still: a flush borrows one, a create publishes over it, and a drop that
+freed its handle immediately would free it under that flush. So `drop` publishes a view without the
+family and queues the handle; the family leaves the membership at once, which is what the caller
+waits on, and only the free is deferred, which nothing waits on.
+
+What releases that queue is a count rather than a wait, and the count has to be the right one. The
+borrow guard is too short: it covers the few instructions around taking a reference, while a flush
+holds its view *by reference count* for as long as its I/O takes and reads the handle throughout. So
+the queue is released on the number of **live views** instead. Publication is monotonic, so one live
+view is necessarily the newest one, and the newest one is the view the drop published -- which does
+not name the family. A count of one is therefore the same proof a wait used to provide, and it is
+read when a view dies and again on the reaper's tick, never waited for.
+
+A family's mutable fields work the same way rather than being written in place:
+its name is published and the old one queued for release with the handles, because a flush copies
+that name onto an sstable where it is the first component of a block-cache key -- a torn copy is a
+wrong key rather than a cosmetic defect, and a copy from a freed one is worse. That copy happens
+inside the flush's build, which is exactly the hold the borrow guard does not cover. A clone swaps its destination's level set while that family is unpublished, since
+the compaction scheduler reads every published family's overlap depth whether or not it is claimed.
 
 The lock that remains is a plain mutex, and only the four membership changes take it. They contend
-with each other and with nothing else, so there is no stream for a writer to lose to.
-
-Lifetime follows from the same mechanism. `drop` publishes a view without the family, waits out the
-borrows that could still name it, and only then frees the handle -- the wait the read lock used to
-provide implicitly. A family's mutable fields work the same way rather than being written in place:
-its name is published and the old one retired, because a flush copies that name onto an sstable
-where it is the first component of a block-cache key, and a torn copy is a wrong key rather than a
-cosmetic defect. A clone swaps its destination's level set while that family is unpublished, since
-the compaction scheduler reads every published family's overlap depth whether or not it is claimed.
+with each other and with nothing else, so there is no stream for a writer to lose to -- and since
+none of them waits for a reader while holding it, the one they contend for is never held long.
 
 Two things follow from the same reasoning. A flush waits for its install ticket *before* it borrows
 the view, never while holding one -- borrowing across the wait would stretch one worker's hold to

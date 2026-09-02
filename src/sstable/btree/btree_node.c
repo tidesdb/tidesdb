@@ -98,10 +98,14 @@ static int btree_leaf_alloc_arrays(btree_node_t *n, const size_t off, const size
         arena_alloc(arena, entries_sz + keys_ptr_sz + key_sizes_sz + values_ptr_sz, 0);
     if (!meta_buf) return -1;
 
-    n->entries = (btree_entry_t *)meta_buf;
-    n->keys = (uint8_t **)(meta_buf + entries_sz);
-    n->key_sizes = (size_t *)(meta_buf + entries_sz + keys_ptr_sz);
-    n->values = (uint8_t **)(meta_buf + entries_sz + keys_ptr_sz + key_sizes_sz);
+    /* through void *, which is what says the alignment is established rather than assumed. the
+     * arena hands back a maximally aligned block, and every offset below is a whole number of
+     * pointers or size_ts into it, so each array starts where its type requires. casting straight
+     * from uint8_t * is what a compiler cannot see that through */
+    n->entries = (btree_entry_t *)(void *)meta_buf;
+    n->keys = (uint8_t **)(void *)(meta_buf + entries_sz);
+    n->key_sizes = (size_t *)(void *)(meta_buf + entries_sz + keys_ptr_sz);
+    n->values = (uint8_t **)(void *)(meta_buf + entries_sz + keys_ptr_sz + key_sizes_sz);
 
     /* only values needs zeroing (sparse -- vlog entries have no inline value) */
     memset(n->values, 0, values_ptr_sz);
@@ -113,9 +117,9 @@ static int btree_leaf_alloc_arrays(btree_node_t *n, const size_t off, const size
     uint8_t *temp_buf = arena_alloc(arena, offsets_sz + lens_sz + lens_sz, 0);
     if (!temp_buf) return -1;
 
-    scratch->key_offsets = (uint16_t *)temp_buf;
-    scratch->prefix_lens = (size_t *)(temp_buf + offsets_sz);
-    scratch->suffix_lens = (size_t *)(temp_buf + offsets_sz + lens_sz);
+    scratch->key_offsets = (uint16_t *)(void *)temp_buf;
+    scratch->prefix_lens = (size_t *)(void *)(temp_buf + offsets_sz);
+    scratch->suffix_lens = (size_t *)(void *)(temp_buf + offsets_sz + lens_sz);
     return 0;
 }
 
@@ -368,9 +372,9 @@ static int btree_decode_internal(btree_node_t *n, const uint8_t *data, const siz
     uint8_t *ibuf = arena_alloc(arena, internal_total, 0);
     if (!ibuf) return -1;
 
-    n->child_offsets = (int64_t *)ibuf;
-    n->keys = (num_keys > 0) ? (uint8_t **)(ibuf + child_sz) : NULL;
-    n->key_sizes = (num_keys > 0) ? (size_t *)(ibuf + child_sz + ikeys_ptr_sz) : NULL;
+    n->child_offsets = (int64_t *)(void *)ibuf;
+    n->keys = (num_keys > 0) ? (uint8_t **)(void *)(ibuf + child_sz) : NULL;
+    n->key_sizes = (num_keys > 0) ? (size_t *)(void *)(ibuf + child_sz + ikeys_ptr_sz) : NULL;
 
     BT_NEED(8);
     int64_t base_offset = decode_int64_le_compat(data + off);

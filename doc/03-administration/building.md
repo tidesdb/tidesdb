@@ -15,7 +15,7 @@ against nothing but the C standard library and the platform's threads.
 
 ## Requirements
 
-- **CMake** 3.25 or newer
+- **CMake** 3.12 or newer
 - A **C11** compiler with atomics
 - A threads implementation (pthreads, or the Win32 equivalent)
 

@@ -1,6 +1,6 @@
 {
   "name": "tidesdb",
-  "version-string": "10.0.0",
+  "version-string": "10.0.1",
   "description": "TidesDB is a high-performance durable, transactional embeddable storage engine.",
   "dependencies": ["zstd", "snappy", "lz4", "pthreads"],
   "features": {

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.12)
 
 option(TIDESDB_WITH_MIMALLOC "Use mimalloc as the memory allocator" OFF)
 option(TIDESDB_WITH_TCMALLOC "Use tcmalloc as the memory allocator" OFF)
@@ -11,7 +11,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 10.0.0
+	VERSION 10.0.1
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)

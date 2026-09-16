@@ -22,6 +22,8 @@ static int tests_failed = 0;
 #define HASH_SLOT       0x12345u
 #define HASH_FP_A(slot) (((uint64_t)1 << TDB_MVCC_RES_SEQ_BITS) | (slot))
 #define HASH_FP_B(slot) (((uint64_t)2 << TDB_MVCC_RES_SEQ_BITS) | (slot))
+/* nth distinct fingerprint landing in the same bucket, for filling every way */
+#define HASH_FP_N(n, slot) (((uint64_t)(n) << TDB_MVCC_RES_SEQ_BITS) | (slot))
 
 /* the sequence counter starts at 1 and hands out monotonically increasing seqs */
 void test_mvcc_seq_counter(void)
@@ -231,35 +233,54 @@ void test_mvcc_release(void)
     tidesdb_mvcc_destroy(m);
 }
 
-/* a committed occupant of a different key colliding into the slot is suppressed when it is at or
- * below the oldest open snapshot, and kept conservative when it is newer */
+/* a committed occupant of a different key colliding into the bucket no longer costs the
+ * commit its reservation: the table is set-associative, so the colliding key keeps its
+ * record in one way and this key takes another. the refusal is kept for the case the ways
+ * cannot absorb, where every one of them holds a live key no open snapshot can retire */
 void test_mvcc_reserve_collision(void)
 {
     tidesdb_mvcc_t *m = tidesdb_mvcc_create();
     ASSERT_TRUE(m != NULL);
-    const uint64_t ha = HASH_FP_A(HASH_SLOT); /* same slot... */
+    const uint64_t ha = HASH_FP_A(HASH_SLOT); /* same bucket... */
     const uint64_t hb = HASH_FP_B(HASH_SLOT); /* ...different fingerprint */
 
-    /* key A commits at seq 10 in the shared slot */
     ASSERT_EQ(tidesdb_mvcc_reserve(m, ha, 10, 0, 0), 1);
     tidesdb_mvcc_mark(m, 10, 1);
 
-    /* key B (different fingerprint) with an old-enough occupant relative to min_snapshot ->
-     * suppress the collision and claim (min_snapshot 100 means seq 10 is below every open snapshot)
-     */
+    /* key B, occupant old enough to retire -> claim */
     ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 11, 5, 100), 1);
+    tidesdb_mvcc_destroy(m);
 
-    /* reset the slot, replay, but now the occupant is newer than the oldest open snapshot -> stay
-     * conservative and treat it as a conflict */
-    tidesdb_mvcc_release(m, hb, 11);
-    tidesdb_mvcc_release(m, ha, 10); /* not owner after B claimed; harmless */
+    /* occupant newer than the oldest open snapshot. direct-mapped, this had to be a
+     * conflict; with ways to spare both keys keep a reservation */
     tidesdb_mvcc_t *m2 = tidesdb_mvcc_create();
     ASSERT_TRUE(m2 != NULL);
     ASSERT_EQ(tidesdb_mvcc_reserve(m2, ha, 10, 0, 0), 1);
     tidesdb_mvcc_mark(m2, 10, 1);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hb, 11, 5, 5), 0); /* 10 > min_snapshot 5 -> conflict */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hb, 11, 5, 5), 1);
     tidesdb_mvcc_destroy(m2);
-    tidesdb_mvcc_destroy(m);
+
+    /* a same-key writer is still refused: the guarantee the conservatism protected */
+    tidesdb_mvcc_t *m3 = tidesdb_mvcc_create();
+    ASSERT_TRUE(m3 != NULL);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m3, ha, 10, 0, 0), 1);
+    tidesdb_mvcc_mark(m3, 10, 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m3, ha, 11, 5, 5), 0); /* same key, committed past read */
+    tidesdb_mvcc_destroy(m3);
+
+    /* every way full of live unretirable keys: nowhere to record a reservation, so the
+     * commit stays conservative exactly as it did before */
+    tidesdb_mvcc_t *m4 = tidesdb_mvcc_create();
+    ASSERT_TRUE(m4 != NULL);
+    for (uint32_t w = 0; w < TDB_MVCC_RESERVATION_WAYS; w++)
+    {
+        const uint64_t hw = HASH_FP_N(w + 10, HASH_SLOT);
+        ASSERT_EQ(tidesdb_mvcc_reserve(m4, hw, 100 + w, 0, 0), 1);
+        tidesdb_mvcc_mark(m4, 100 + w, 1);
+    }
+    const uint64_t hlate = HASH_FP_N(200, HASH_SLOT);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m4, hlate, 300, 5, 5), 0);
+    tidesdb_mvcc_destroy(m4);
 }
 
 /* per-seq occurrence counters, indexed by the drawn sequence number (1..CC_TOTAL_SEQS) */

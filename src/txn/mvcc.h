@@ -33,7 +33,21 @@
 
 /* number of write-reservation slots and the mask to index one from a key hash */
 #define TDB_MVCC_RESERVATION_SLOTS ((uint32_t)1 << 20)
-#define TDB_MVCC_RESERVATION_MASK  (TDB_MVCC_RESERVATION_SLOTS - 1)
+
+/* the table is set-associative: a key hashes to a bucket and may occupy any way
+ * within it. a direct-mapped table has to refuse a commit whenever an unrelated
+ * key holds the one slot it could use and that slot cannot be retired, because
+ * claiming it would destroy the record the other key's next writer needs. with
+ * several ways the colliding key keeps its record and this one still gets a
+ * reservation, so the refusal only remains for the case where every way of the
+ * bucket is held by a live, unretirable, differently-fingerprinted key.
+ *
+ * eight ways of eight bytes is one 64-byte cache line per bucket, and the slot
+ * count is unchanged, so the table is the same size it was. */
+#define TDB_MVCC_RESERVATION_LINE    ((size_t)64)
+#define TDB_MVCC_RESERVATION_WAYS    ((uint32_t)8)
+#define TDB_MVCC_RESERVATION_BUCKETS (TDB_MVCC_RESERVATION_SLOTS / TDB_MVCC_RESERVATION_WAYS)
+#define TDB_MVCC_RESERVATION_MASK    (TDB_MVCC_RESERVATION_BUCKETS - 1)
 
 /* a reservation slot packs a 16-bit key fingerprint (high bits) and the claiming 48-bit commit_seq
  * (low bits); the fingerprint tells a real same-key conflict from a hash collision using the slot

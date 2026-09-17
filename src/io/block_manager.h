@@ -85,6 +85,8 @@ typedef enum
  * @param sync_mode sync mode for this block manager
  * @param sync_full_cached cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL), atomic so a
  *                         runtime sync-mode change cannot race the read on the write path
+ * @param opened_with_odsync whether the current descriptor was actually opened with O_DSYNC;
+ *                           immutable except while reopen_fd holds the handle exclusively
  * @param current_file_size track file size in memory to avoid syscalls
  * @param preallocated_size on-disk allocation high water mark; pwrites within
  *                          [HEADER_SIZE, preallocated_size) avoid extending the file
@@ -119,6 +121,7 @@ typedef struct
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
     _Atomic int sync_full_cached;
+    int opened_with_odsync;
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t preallocated_size;

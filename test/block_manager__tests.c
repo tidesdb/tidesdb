@@ -1777,6 +1777,119 @@ void test_block_manager_set_sync_mode(void)
     remove("test_setmode.db");
 }
 
+#ifdef __linux__
+static void bm_replace_fd_with_dev_null(block_manager_t *bm)
+{
+    const int null_fd = open("/dev/null", O_RDWR);
+    ASSERT_TRUE(null_fd >= 0);
+    ASSERT_TRUE(dup2(null_fd, bm->fd) >= 0);
+    close(null_fd);
+}
+
+void test_block_manager_runtime_full_syncs_direct_descriptor(void)
+{
+    const char *path = "test_runtime_full_direct.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+    block_manager_set_sync_mode(bm, BLOCK_MANAGER_SYNC_FULL);
+    bm_replace_fd_with_dev_null(bm);
+
+    const char payload[] = "runtime-full-direct";
+    block_manager_block_t *block = block_manager_block_create(sizeof(payload), payload);
+    ASSERT_TRUE(block != NULL);
+    errno = 0;
+    ASSERT_TRUE(block_manager_block_write(bm, block) < 0);
+    ASSERT_EQ(block_manager_last_errno(bm), EINVAL);
+    block_manager_block_free(block);
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
+void test_block_manager_runtime_full_syncs_buffered_descriptor(void)
+{
+    const char *path = "test_runtime_full_buffered.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 1), 0);
+    block_manager_set_sync_mode(bm, BLOCK_MANAGER_SYNC_FULL);
+    bm_replace_fd_with_dev_null(bm);
+
+    const char payload[] = "runtime-full-buffered";
+    const int64_t offset = block_manager_write_raw(bm, payload, sizeof(payload));
+    ASSERT_TRUE(offset >= 0);
+    ASSERT_EQ(block_manager_wait_durable(
+                  bm, (uint64_t)offset + block_manager_framed_size(sizeof(payload))),
+              -1);
+    ASSERT_EQ(block_manager_last_errno(bm), EINVAL);
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+#endif
+
+void test_block_manager_full_open_tracks_descriptor_sync(void)
+{
+    const char *path = "test_full_open_odsync.db";
+    (void)remove(path);
+    const int expected_opened_with_odsync = (O_DSYNC != 0);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_FULL), 0);
+    ASSERT_EQ(bm->opened_with_odsync, expected_opened_with_odsync);
+
+#ifndef _WIN32
+    const int flags = fcntl(bm->fd, F_GETFL);
+    ASSERT_TRUE(flags >= 0);
+    ASSERT_EQ((flags & O_DSYNC) != 0, expected_opened_with_odsync);
+#endif
+
+    const char payload[] = "full-open";
+    block_manager_block_t *block = block_manager_block_create(sizeof(payload), payload);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+    block_manager_block_free(block);
+
+    ASSERT_EQ(block_manager_truncate(bm), 0);
+    ASSERT_EQ(bm->opened_with_odsync, expected_opened_with_odsync);
+#ifndef _WIN32
+    const int reopened_flags = fcntl(bm->fd, F_GETFL);
+    ASSERT_TRUE(reopened_flags >= 0);
+    ASSERT_EQ((reopened_flags & O_DSYNC) != 0, expected_opened_with_odsync);
+#endif
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
+void test_block_manager_runtime_full_reopen_tracks_descriptor_sync(void)
+{
+    const char *path = "test_runtime_full_reopen.db";
+    (void)remove(path);
+    const int expected_opened_with_odsync = (O_DSYNC != 0);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+    ASSERT_EQ(bm->opened_with_odsync, 0);
+
+    block_manager_set_sync_mode(bm, BLOCK_MANAGER_SYNC_FULL);
+    ASSERT_EQ(bm->opened_with_odsync, 0);
+    ASSERT_EQ(block_manager_truncate(bm), 0);
+    ASSERT_EQ(bm->opened_with_odsync, expected_opened_with_odsync);
+
+    const char payload[] = "runtime-full-reopen";
+    block_manager_block_t *block = block_manager_block_create(sizeof(payload), payload);
+    ASSERT_TRUE(block != NULL);
+    ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
+    block_manager_block_free(block);
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
 void test_block_manager_get_block_size_at_offset(void)
 {
     block_manager_t *bm = NULL;
@@ -3215,6 +3328,13 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_escalate_fsync, tests_passed);
     RUN_TEST(test_block_manager_last_modified, tests_passed);
     RUN_TEST(test_block_manager_set_sync_mode, tests_passed);
+
+#ifdef __linux__
+    RUN_TEST(test_block_manager_runtime_full_syncs_direct_descriptor, tests_passed);
+    RUN_TEST(test_block_manager_runtime_full_syncs_buffered_descriptor, tests_passed);
+#endif
+    RUN_TEST(test_block_manager_full_open_tracks_descriptor_sync, tests_passed);
+    RUN_TEST(test_block_manager_runtime_full_reopen_tracks_descriptor_sync, tests_passed);
     RUN_TEST(test_block_manager_get_block_size_at_offset, tests_passed);
     RUN_TEST(test_block_manager_read_at_offset, tests_passed);
     RUN_TEST(test_block_manager_read_block_data_at_offset, tests_passed);

@@ -413,14 +413,17 @@ typedef struct
     int fail_wal;
     int fail_apply;
     int last_wal_kind;
+    uint32_t paced_families[8];
+    int fail_bp_call;
 } mockbe;
 
 static int mb_bp(void *ctx, uint32_t cf_index)
 {
-    (void)cf_index;
     mockbe *m = (mockbe *)ctx;
+    if (m->bp_calls < (int)(sizeof(m->paced_families) / sizeof(m->paced_families[0])))
+        m->paced_families[m->bp_calls] = cf_index;
     m->bp_calls++;
-    return m->fail_bp ? -1 : 0;
+    return m->fail_bp || m->bp_calls == m->fail_bp_call ? -1 : 0;
 }
 static int mb_wal(void *ctx, const uint8_t *batch, size_t size)
 {
@@ -466,6 +469,106 @@ void test_txn_commit(void)
     ASSERT_EQ(tidesdb_mvcc_committed(clock, tdb_txn_commit_seq(t)), 1);
     ASSERT_EQ(put(t, 0, "c", "3"), TDB_ERR_INVALID_ARGS); /* finished */
 
+    tdb_txn_free(t);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* repeated families, colliding ids and the id boundaries are paced once, in first-seen order */
+void test_txn_commit_paces_first_seen_families(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe m = {0};
+    tdb_txn_backend_t be = mkbackend(&m);
+    const uint32_t families[] = {0, UINT32_MAX, 0, 64, UINT32_MAX, 128, 64};
+
+    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    for (int i = 0; i < (int)(sizeof(families) / sizeof(families[0])); i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "k%d", i);
+        ASSERT_EQ(put(t, families[i], key, "v"), TDB_SUCCESS);
+    }
+    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_EQ(m.bp_calls, 4);
+    ASSERT_EQ(m.paced_families[0], 0U);
+    ASSERT_EQ(m.paced_families[1], UINT32_MAX);
+    ASSERT_EQ(m.paced_families[2], 64U);
+    ASSERT_EQ(m.paced_families[3], 128U);
+    ASSERT_EQ(m.wal_calls, 1);
+    ASSERT_EQ(m.apply_calls, 1);
+    ASSERT_EQ(m.last_apply_count, 7);
+    ASSERT_EQ(tdb_txn_state(t), TDB_TXN_COMMITTED);
+    tdb_txn_free(t);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* grouped writes make the preceding-entry scan expensive even with only a few distinct families
+ */
+void test_txn_commit_paces_large_grouped_families(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe m = {0};
+    tdb_txn_backend_t be = mkbackend(&m);
+    const uint32_t families[] = {0, UINT32_MAX, 64, 128};
+
+    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    for (int i = 0; i < 512; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "k%d", i);
+        ASSERT_EQ(put(t, families[i / 128], key, "v"), TDB_SUCCESS);
+    }
+    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_EQ(m.bp_calls, 4);
+    for (int i = 0; i < 4; i++) ASSERT_EQ(m.paced_families[i], families[i]);
+    ASSERT_EQ(m.wal_calls, 1);
+    ASSERT_EQ(m.apply_calls, 1);
+    ASSERT_EQ(m.last_apply_count, 512);
+    tdb_txn_free(t);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* a refused family stops pacing immediately, before either the wal append or the apply */
+void test_txn_commit_backpressure_failure(void)
+{
+    for (int fail_call = 1; fail_call <= 2; fail_call++)
+    {
+        tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+        mockbe m = {.fail_bp_call = fail_call};
+        tdb_txn_backend_t be = mkbackend(&m);
+        tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+        ASSERT_EQ(put(t, 0, "a", "1"), TDB_SUCCESS);
+        ASSERT_EQ(put(t, 0, "b", "2"), TDB_SUCCESS);
+        ASSERT_EQ(put(t, UINT32_MAX, "c", "3"), TDB_SUCCESS);
+        ASSERT_EQ(put(t, 64, "d", "4"), TDB_SUCCESS);
+        ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_ERR_IO);
+        ASSERT_EQ(m.bp_calls, fail_call);
+        ASSERT_EQ(m.paced_families[0], 0U);
+        if (fail_call == 2) ASSERT_EQ(m.paced_families[1], UINT32_MAX);
+        ASSERT_EQ(m.wal_calls, 0);
+        ASSERT_EQ(m.apply_calls, 0);
+        ASSERT_EQ(tdb_txn_state(t), TDB_TXN_ABORTED);
+        ASSERT_EQ(tdb_txn_commit_seq(t), 0ULL);
+        tdb_txn_free(t);
+        tidesdb_mvcc_destroy(clock);
+    }
+}
+
+/* an absent pacing hook still allows the same multi-family commit */
+void test_txn_commit_without_backpressure(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe m = {0};
+    tdb_txn_backend_t be = mkbackend(&m);
+    be.backpressure = NULL;
+    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    ASSERT_EQ(put(t, 0, "a", "1"), TDB_SUCCESS);
+    ASSERT_EQ(put(t, UINT32_MAX, "b", "2"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_EQ(m.bp_calls, 0);
+    ASSERT_EQ(m.wal_calls, 1);
+    ASSERT_EQ(m.apply_calls, 1);
+    ASSERT_EQ(m.last_apply_count, 2);
     tdb_txn_free(t);
     tidesdb_mvcc_destroy(clock);
 }
@@ -897,6 +1000,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_read_conflict_none, tests_passed);
     RUN_TEST(test_txn_write_scan_conflict, tests_passed);
     RUN_TEST(test_txn_commit, tests_passed);
+    RUN_TEST(test_txn_commit_paces_first_seen_families, tests_passed);
+    RUN_TEST(test_txn_commit_paces_large_grouped_families, tests_passed);
+    RUN_TEST(test_txn_commit_backpressure_failure, tests_passed);
+    RUN_TEST(test_txn_commit_without_backpressure, tests_passed);
     RUN_TEST(test_txn_commit_readonly, tests_passed);
     RUN_TEST(test_txn_commit_dedup, tests_passed);
     RUN_TEST(test_txn_commit_wal_failure, tests_passed);

@@ -136,10 +136,16 @@ int get_file_size(const int fd, uint64_t *size)
  */
 static int bm_fd_uses_odsync(const int fd)
 {
+#ifdef _WIN32
+    /* windows descriptors need explicit synchronization */
+    (void)fd;
+    return 0;
+#else
     if (!odsync_available()) return 0;
 
     const int flags = fcntl(fd, F_GETFL);
     return flags != -1 && (flags & O_DSYNC) != 0;
+#endif
 }
 
 /**

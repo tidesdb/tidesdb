@@ -1829,19 +1829,23 @@ void test_block_manager_runtime_full_syncs_buffered_descriptor(void)
     ASSERT_EQ(block_manager_close(bm), 0);
     (void)remove(path);
 }
+#endif
 
 void test_block_manager_full_open_tracks_descriptor_sync(void)
 {
     const char *path = "test_full_open_odsync.db";
     (void)remove(path);
+    const int expected_opened_with_odsync = (O_DSYNC != 0);
 
     block_manager_t *bm = NULL;
     ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_FULL), 0);
-    ASSERT_EQ(bm->opened_with_odsync, 1);
+    ASSERT_EQ(bm->opened_with_odsync, expected_opened_with_odsync);
 
+#ifndef _WIN32
     const int flags = fcntl(bm->fd, F_GETFL);
     ASSERT_TRUE(flags >= 0);
-    ASSERT_EQ(O_DSYNC != 0 && (flags & O_DSYNC) != 0, 1);
+    ASSERT_EQ((flags & O_DSYNC) != 0, expected_opened_with_odsync);
+#endif
 
     const char payload[] = "full-open";
     block_manager_block_t *block = block_manager_block_create(sizeof(payload), payload);
@@ -1850,10 +1854,12 @@ void test_block_manager_full_open_tracks_descriptor_sync(void)
     block_manager_block_free(block);
 
     ASSERT_EQ(block_manager_truncate(bm), 0);
-    ASSERT_EQ(bm->opened_with_odsync, 1);
+    ASSERT_EQ(bm->opened_with_odsync, expected_opened_with_odsync);
+#ifndef _WIN32
     const int reopened_flags = fcntl(bm->fd, F_GETFL);
     ASSERT_TRUE(reopened_flags >= 0);
-    ASSERT_EQ(O_DSYNC != 0 && (reopened_flags & O_DSYNC) != 0, 1);
+    ASSERT_EQ((reopened_flags & O_DSYNC) != 0, expected_opened_with_odsync);
+#endif
 
     ASSERT_EQ(block_manager_close(bm), 0);
     (void)remove(path);
@@ -1863,6 +1869,7 @@ void test_block_manager_runtime_full_reopen_tracks_descriptor_sync(void)
 {
     const char *path = "test_runtime_full_reopen.db";
     (void)remove(path);
+    const int expected_opened_with_odsync = (O_DSYNC != 0);
 
     block_manager_t *bm = NULL;
     ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
@@ -1871,7 +1878,7 @@ void test_block_manager_runtime_full_reopen_tracks_descriptor_sync(void)
     block_manager_set_sync_mode(bm, BLOCK_MANAGER_SYNC_FULL);
     ASSERT_EQ(bm->opened_with_odsync, 0);
     ASSERT_EQ(block_manager_truncate(bm), 0);
-    ASSERT_EQ(bm->opened_with_odsync, 1);
+    ASSERT_EQ(bm->opened_with_odsync, expected_opened_with_odsync);
 
     const char payload[] = "runtime-full-reopen";
     block_manager_block_t *block = block_manager_block_create(sizeof(payload), payload);
@@ -1882,7 +1889,6 @@ void test_block_manager_runtime_full_reopen_tracks_descriptor_sync(void)
     ASSERT_EQ(block_manager_close(bm), 0);
     (void)remove(path);
 }
-#endif
 
 void test_block_manager_get_block_size_at_offset(void)
 {
@@ -3326,9 +3332,9 @@ int main(int argc, char **argv)
 #ifdef __linux__
     RUN_TEST(test_block_manager_runtime_full_syncs_direct_descriptor, tests_passed);
     RUN_TEST(test_block_manager_runtime_full_syncs_buffered_descriptor, tests_passed);
+#endif
     RUN_TEST(test_block_manager_full_open_tracks_descriptor_sync, tests_passed);
     RUN_TEST(test_block_manager_runtime_full_reopen_tracks_descriptor_sync, tests_passed);
-#endif
     RUN_TEST(test_block_manager_get_block_size_at_offset, tests_passed);
     RUN_TEST(test_block_manager_read_at_offset, tests_passed);
     RUN_TEST(test_block_manager_read_block_data_at_offset, tests_passed);

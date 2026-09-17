@@ -30,6 +30,19 @@
 #define ATOMIC_ALIGN(n)
 #endif
 
+/* cross-platform aligned allocation. msvc has no aligned_alloc, and memory from
+ * _aligned_malloc must be returned through _aligned_free rather than free, so the
+ * pair has to be chosen together */
+#if defined(_MSC_VER)
+#include <malloc.h>
+#define TDB_ALIGNED_ALLOC(align, size) _aligned_malloc((size), (align))
+#define TDB_ALIGNED_FREE(p)            _aligned_free((void *)(p))
+#else
+#include <stdlib.h>
+#define TDB_ALIGNED_ALLOC(align, size) aligned_alloc((align), (size))
+#define TDB_ALIGNED_FREE(p)            free((void *)(p))
+#endif
+
 /* cross-platform unused attribute for static functions */
 #if defined(__GNUC__) || defined(__clang__)
 #define UNUSED __attribute__((unused))

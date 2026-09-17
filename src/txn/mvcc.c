@@ -108,7 +108,12 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     for (size_t i = 0; i < TDB_MVCC_COMMIT_RING_SIZE; i++)
         atomic_init(&m->ring[i], TDB_MVCC_IN_PROGRESS);
 
-    m->reservation = calloc(TDB_MVCC_RESERVATION_SLOTS, sizeof(_Atomic(uint64_t)));
+    /* a bucket is one cache line, so the table starts on a line boundary; unaligned,
+     * every bucket would straddle two lines and cost a second miss on the hot path.
+     * the size is a whole number of lines, which aligned_alloc requires */
+    const size_t res_bytes = (size_t)TDB_MVCC_RESERVATION_SLOTS * sizeof(_Atomic(uint64_t));
+    m->reservation = TDB_ALIGNED_ALLOC(TDB_MVCC_RESERVATION_LINE, res_bytes);
+    if (m->reservation) memset((void *)m->reservation, 0, res_bytes);
     if (!m->reservation)
     {
         free((void *)m->ring);
@@ -248,7 +253,7 @@ void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m)
     tdb_wprwlock_destroy(&m->commit_gate);
     pthread_mutex_destroy(&m->range_lock);
     free((void *)m->ring);
-    free((void *)m->reservation);
+    TDB_ALIGNED_FREE(m->reservation);
     free(m);
 }
 
@@ -392,50 +397,82 @@ int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_s
     if (!m) return 1;
     _Atomic(uint64_t) *res = m->reservation;
     const uint64_t myseq = commit_seq & TDB_MVCC_RES_SEQ_MASK;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
+    const uint32_t base =
+        ((uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK) * TDB_MVCC_RESERVATION_WAYS;
     const uint16_t myfp = (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS);
     const uint64_t mine = TDB_MVCC_RES_PACK(myfp, myseq);
 
     for (;;)
     {
-        const uint64_t cur = atomic_load_explicit(&res[slot], memory_order_acquire);
-        const uint64_t cseq = TDB_MVCC_RES_SEQ(cur);
-        if (cseq == myseq)
+        uint64_t way[TDB_MVCC_RESERVATION_WAYS];
+        int victim = -1;
+
+        /* the bucket is one cache line, so reading all of it is nearly free. committed()
+         * is not: it indexes the ring at random and usually misses, so it is only paid
+         * for a matching fingerprint, the one case that can refuse this commit */
+        for (uint32_t w = 0; w < TDB_MVCC_RESERVATION_WAYS; w++)
         {
-            /* already held by this seq -- a duplicate key or a colliding sibling */
+            const uint64_t cur = atomic_load_explicit(&res[base + w], memory_order_acquire);
+            way[w] = cur;
+            const uint64_t cseq = TDB_MVCC_RES_SEQ(cur);
+
+            if (cseq == myseq)
+            {
+                /* already held by this seq -- a duplicate key or a colliding sibling */
+                atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
+                return 1;
+            }
+
+            /* the fingerprint is a pure function of the key hash, so only a matching way
+             * can be holding this key, and only it can decide this commit */
+            if (cseq != 0 && TDB_MVCC_RES_FP(cur) == myfp)
+            {
+                if (!tidesdb_mvcc_committed(m, cseq) || cseq > read_base)
+                {
+                    atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
+                    return 0;
+                }
+                victim = (int)w; /* this key's own older committed version */
+                break;
+            }
+
+            if (cseq == 0 && victim < 0) victim = (int)w;
+        }
+
+        /* every way is taken by another key. only now is it worth probing the ring to
+         * find which of them can be retired, preferring the one that costs least */
+        if (victim < 0)
+        {
+            int best_rank = 3;
+            for (uint32_t w = 0; w < TDB_MVCC_RESERVATION_WAYS; w++)
+            {
+                const uint64_t cseq = TDB_MVCC_RES_SEQ(way[w]);
+                if (!tidesdb_mvcc_committed(m, cseq)) continue;
+                const int rank = (cseq <= min_snapshot) ? 1 : (cseq <= read_base) ? 2 : -1;
+                if (rank >= 0 && rank < best_rank)
+                {
+                    best_rank = rank;
+                    victim = (int)w;
+                }
+            }
+            if (victim < 0)
+            {
+                /* every way holds a live key no open snapshot can retire. the table has
+                 * nowhere to record this reservation, so the commit stays conservative
+                 * exactly as the direct-mapped table always did */
+                atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
+                return 0;
+            }
+        }
+
+        uint64_t expect = way[victim];
+        if (atomic_compare_exchange_weak_explicit(&res[base + victim], &expect, mine,
+                                                  memory_order_acq_rel, memory_order_acquire))
+        {
             atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
             return 1;
         }
-
-        /* an in-flight occupant could be a concurrent same-key committer this txn must lose to, and
-         * it cannot be told from a colliding key without its applied version, so abort
-         * conservatively. committed (and evicted) seqs pass tidesdb_mvcc_committed, so this fires
-         * only for a genuine in-flight occupant */
-        if (cseq != 0 && !tidesdb_mvcc_committed(m, cseq))
-        {
-            atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
-            return 0;
-        }
-
-        /* a committed seq landed past the version this txn read. a matching fingerprint means a
-         * real same-key writer and this txn loses; a differing fingerprint is a hash collision,
-         * harmless unless it is newer than the oldest open snapshot, where a concurrent writer of
-         * that colliding key could still depend on the slot and the reservation stays
-         * conservative */
-        if (cseq > read_base && (TDB_MVCC_RES_FP(cur) == myfp || cseq > min_snapshot))
-        {
-            atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
-            return 0;
-        }
-
-        uint64_t expect = cur;
-        if (atomic_compare_exchange_weak_explicit(&res[slot], &expect, mine, memory_order_acq_rel,
-                                                  memory_order_acquire))
-        {
-            atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
-            return 1;
-        }
-        /* cas lost to a concurrent claimer -- re-read and re-evaluate this slot */
+        /* cas lost to a concurrent claimer -- re-read the bucket and re-evaluate */
     }
 }
 
@@ -443,24 +480,36 @@ void tidesdb_mvcc_reassign(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t from_s
 {
     if (!m || from_seq == 0 || to_seq == 0) return;
     _Atomic(uint64_t) *res = m->reservation;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
+    const uint32_t base =
+        ((uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK) * TDB_MVCC_RESERVATION_WAYS;
     const uint16_t fp = (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS);
-    uint64_t expect = TDB_MVCC_RES_PACK(fp, from_seq & TDB_MVCC_RES_SEQ_MASK);
+    const uint64_t held = TDB_MVCC_RES_PACK(fp, from_seq & TDB_MVCC_RES_SEQ_MASK);
     const uint64_t want = TDB_MVCC_RES_PACK(fp, to_seq & TDB_MVCC_RES_SEQ_MASK);
-    /* move the slot only if the old seq still owns it; a failed cas means a newer committer already
-     * took it, and that newer claim is the one that should stand */
-    atomic_compare_exchange_strong_explicit(&res[slot], &expect, want, memory_order_acq_rel,
-                                            memory_order_acquire);
+    /* move whichever way still holds the old seq; a failed cas means a newer committer
+     * already took it, and that newer claim is the one that should stand */
+    for (uint32_t w = 0; w < TDB_MVCC_RESERVATION_WAYS; w++)
+    {
+        uint64_t expect = held;
+        if (atomic_compare_exchange_strong_explicit(&res[base + w], &expect, want,
+                                                    memory_order_acq_rel, memory_order_acquire))
+            return;
+    }
 }
 
 void tidesdb_mvcc_release(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq)
 {
     if (!m || commit_seq == 0) return;
     _Atomic(uint64_t) *res = m->reservation;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
+    const uint32_t base =
+        ((uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK) * TDB_MVCC_RESERVATION_WAYS;
     const uint16_t fp = (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS);
-    uint64_t expect = TDB_MVCC_RES_PACK(fp, commit_seq & TDB_MVCC_RES_SEQ_MASK);
-    /* clear the slot only if this seq owns it; a failed cas means a newer committer took it */
-    atomic_compare_exchange_strong_explicit(&res[slot], &expect, 0, memory_order_acq_rel,
-                                            memory_order_acquire);
+    const uint64_t held = TDB_MVCC_RES_PACK(fp, commit_seq & TDB_MVCC_RES_SEQ_MASK);
+    /* clear whichever way this seq owns; a failed cas means a newer committer took it */
+    for (uint32_t w = 0; w < TDB_MVCC_RESERVATION_WAYS; w++)
+    {
+        uint64_t expect = held;
+        if (atomic_compare_exchange_strong_explicit(&res[base + w], &expect, 0,
+                                                    memory_order_acq_rel, memory_order_acquire))
+            return;
+    }
 }

@@ -129,6 +129,20 @@ int get_file_size(const int fd, uint64_t *size)
 }
 
 /**
+ * bm_fd_uses_odsync
+ * report whether the current descriptor was opened with O_DSYNC
+ * @param fd the descriptor to inspect
+ * @return non-zero when O_DSYNC is present in its open flags
+ */
+static int bm_fd_uses_odsync(const int fd)
+{
+    if (!odsync_available()) return 0;
+
+    const int flags = fcntl(fd, F_GETFL);
+    return flags != -1 && (flags & O_DSYNC) != 0;
+}
+
+/**
  * reopen_fd
  * closes and reopens the block manager file descriptor with the same flags.
  * not safe against concurrent readers, a reader that already captured bm->fd will
@@ -150,6 +164,7 @@ int reopen_fd(block_manager_t *bm)
     bm->fd = open(bm->file_path, flags, BLOCK_MANAGER_FILE_MODE);
     if (bm->fd == -1) return -1;
 
+    bm->opened_with_odsync = bm_fd_uses_odsync(bm->fd);
     return 0;
 }
 
@@ -229,6 +244,7 @@ static void bm_init_fields(block_manager_t *m, const block_manager_sync_mode_t s
 
     m->sync_mode = sync_mode;
     atomic_init(&m->sync_full_cached, sync_mode == BLOCK_MANAGER_SYNC_FULL);
+    m->opened_with_odsync = 0;
 }
 
 /**
@@ -309,6 +325,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         errno = open_errno;
         return -1;
     }
+
+    new_bm->opened_with_odsync = bm_fd_uses_odsync(new_bm->fd);
 
     strncpy(new_bm->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
     new_bm->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
@@ -416,9 +434,8 @@ int block_manager_close(block_manager_t *bm)
         }
     }
 
-    /* final sync on close -- only needed when O_DSYNC wasn't used;
-     * with O_DSYNC every write is already durable */
-    if (is_sync_full(bm) && !odsync_available())
+    /* final sync on close -- only needed when this descriptor was not opened with O_DSYNC */
+    if (is_sync_full(bm) && !bm->opened_with_odsync)
     {
         (void)fdatasync(bm->fd);
     }

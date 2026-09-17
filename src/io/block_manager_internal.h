@@ -165,13 +165,13 @@ static inline int pwrite_all(int fd, const void *buf, size_t nbyte, off_t offset
 /**
  * bm_sync_after_write
  * make a just-written range durable when the block manager fsyncs every write, skipping the
- * fdatasync when O_DSYNC already made the write durable
+ * fdatasync only when the current descriptor was opened with O_DSYNC
  * @param bm the block manager
  * @return 0 on success, -1 on error
  */
 static inline int bm_sync_after_write(block_manager_t *bm)
 {
-    if (is_sync_full(bm) && !odsync_available()) return fdatasync(bm->fd) == 0 ? 0 : -1;
+    if (is_sync_full(bm) && !bm->opened_with_odsync) return fdatasync(bm->fd) == 0 ? 0 : -1;
     return 0;
 }
 

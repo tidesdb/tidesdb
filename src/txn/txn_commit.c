@@ -482,7 +482,8 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
      * scheduler already runs, read here as one relaxed load -- running the scan on this path would
      * mean every registry shard, once per written key. it is only ever stale low, and low is the
      * conservative direction */
-    const uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
+    uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
+    int refreshed_min_snapshot = 0;
 
     /* the intervals this batch writes are claimed first, so a point write that arrives afterwards
      * meets them. an interval cannot be claimed as a key hash -- there is no one key to hash -- so
@@ -512,7 +513,17 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
         if (txn->readset && tidesdb_readset_seq(txn->readset, entries[i].cf_index, entries[i].key,
                                                 entries[i].key_size, &rseq))
             read_base = rseq;
-        if (!tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot)) return 0;
+        if (!tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot))
+        {
+            /* A stale published floor can retain an unrelated committed slot.
+             * Refresh once for this transaction; the registry's global oldest
+             * live snapshot still protects an older concurrent transaction. */
+            if (refreshed_min_snapshot || !txn->registry) return 0;
+            tidesdb_txn_registry_publish_min_snapshot(txn->registry);
+            min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
+            refreshed_min_snapshot = 1;
+            if (!tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot)) return 0;
+        }
     }
     return 1;
 }

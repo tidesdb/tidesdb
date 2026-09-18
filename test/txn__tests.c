@@ -10,6 +10,7 @@
 
 #include "../src/txn/registry.h"
 #include "../src/txn/txn.h"
+#include "../src/txn/txn_internal.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -985,6 +986,106 @@ void test_txn_2pc_conflict(void)
     tidesdb_mvcc_destroy(clock);
 }
 
+/* Find distinct keys that share the reservation slot but not its stored fingerprint. */
+static int find_reservation_collision(char a[32], char b[32])
+{
+    uint32_t *first = calloc((size_t)TDB_MVCC_RESERVATION_SLOTS, sizeof(*first));
+    if (!first) return 0;
+    for (uint32_t i = 1; i != 100000; i++)
+    {
+        char candidate[32];
+        const int n = snprintf(candidate, sizeof(candidate), "reserve-%u", i);
+        const uint64_t h = txn_key_hash(0, (const uint8_t *)candidate, (size_t)n);
+        const uint32_t slot = (uint32_t)h & TDB_MVCC_RESERVATION_MASK;
+        const uint32_t prior = first[slot];
+        if (prior)
+        {
+            char prior_key[32];
+            const int pn = snprintf(prior_key, sizeof(prior_key), "reserve-%u", prior);
+            const uint64_t ph = txn_key_hash(0, (const uint8_t *)prior_key, (size_t)pn);
+            if ((uint16_t)(ph >> TDB_MVCC_RES_SEQ_BITS) != (uint16_t)(h >> TDB_MVCC_RES_SEQ_BITS))
+            {
+                snprintf(a, 32, "%s", prior_key);
+                snprintf(b, 32, "%s", candidate);
+                free(first);
+                return 1;
+            }
+        }
+        else
+            first[slot] = i;
+    }
+    free(first);
+    return 0;
+}
+
+/* A stale published floor must not turn an old, different-fingerprint slot into a conflict. */
+void test_txn_reservation_refreshes_stale_floor_once(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
+    mockbe be_m = {0};
+    tdb_txn_backend_t be = mkbackend(&be_m);
+    char a[32], b[32];
+    ASSERT_TRUE(clock && reg && find_reservation_collision(a, b));
+
+    (void)tidesdb_mvcc_next_seq(clock);
+    tidesdb_mvcc_mark(clock, 1, 1);
+    tsrc old_a = {0, 1, a, 1, "old"};
+    tidesdb_source_t source = tsource(&old_a);
+
+    tdb_txn_t *prior = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
+    ASSERT_EQ(put(prior, 0, b, "other"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(prior, &be, &source, 1), TDB_SUCCESS);
+    tdb_txn_free(prior);
+    ASSERT_EQ(tidesdb_txn_registry_published_min_snapshot(reg), 0);
+
+    tdb_txn_t *current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
+    ASSERT_EQ(tdb_txn_snapshot(current), 2);
+    ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
+    ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_SUCCESS);
+    tdb_txn_free(current);
+    tidesdb_txn_registry_destroy(reg);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* The refresh must preserve a genuinely live older snapshot's collision guard. */
+void test_txn_reservation_refresh_keeps_live_old_snapshot(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
+    mockbe be_m = {0};
+    tdb_txn_backend_t be = mkbackend(&be_m);
+    char a[32], b[32];
+    ASSERT_TRUE(clock && reg && find_reservation_collision(a, b));
+
+    (void)tidesdb_mvcc_next_seq(clock);
+    tidesdb_mvcc_mark(clock, 1, 1);
+    tsrc old_a = {0, 1, a, 1, "old"};
+    tidesdb_source_t source = tsource(&old_a);
+    tdb_txn_t *old = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
+    tdb_txn_t *prior = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
+    ASSERT_EQ(put(prior, 0, b, "other"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(prior, &be, &source, 1), TDB_SUCCESS);
+    tdb_txn_free(prior);
+
+    tdb_txn_t *current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
+    ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
+    ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_ERR_CONFLICT);
+    ASSERT_EQ(tidesdb_txn_registry_published_min_snapshot(reg), 1);
+    tdb_txn_free(current);
+    tdb_txn_free(old);
+
+    current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
+    ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
+    ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_SUCCESS);
+    tdb_txn_free(current);
+    tidesdb_txn_registry_destroy(reg);
+    tidesdb_mvcc_destroy(clock);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -1022,6 +1123,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_savepoints, tests_passed);
     RUN_TEST(test_txn_savepoint_remark, tests_passed);
     RUN_TEST(test_txn_null_safe, tests_passed);
+    RUN_TEST(test_txn_reservation_refreshes_stale_floor_once, tests_passed);
+    RUN_TEST(test_txn_reservation_refresh_keeps_live_old_snapshot, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

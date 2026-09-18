@@ -517,21 +517,11 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
     return 1;
 }
 
-/**
- * txn_pace_families
- * let the backend pace this commit once per distinct column family it writes, before the durable
- * write. the write set is small enough that scanning back over it beats keeping a set of the
- * families already paced
- * @param backend the commit backend, whose backpressure hook may be absent
- * @param entries the encoded write set
- * @param count the number of entries
- * @return TDB_SUCCESS, or TDB_ERR_IO when the backend refused to admit the write
+/* preserve the allocation-free path for a single entry and when the family set cannot be allocated
  */
-static int txn_pace_families(const tdb_txn_backend_t *backend, const tidesdb_wal_entry_t *entries,
-                             int count)
+static int txn_pace_families_scan(const tdb_txn_backend_t *backend,
+                                  const tidesdb_wal_entry_t *entries, int count)
 {
-    if (!backend->backpressure) return TDB_SUCCESS;
-
     for (int i = 0; i < count; i++)
     {
         int seen = 0;
@@ -544,6 +534,57 @@ static int txn_pace_families(const tdb_txn_backend_t *backend, const tidesdb_wal
         if (!seen && backend->backpressure(backend->ctx, entries[i].cf_index) != 0)
             return TDB_ERR_IO;
     }
+    return TDB_SUCCESS;
+}
+
+/**
+ * txn_pace_families
+ * let the backend pace this commit once per distinct column family it writes, before the durable
+ * write. remember families in a set so a large batch does not repeatedly scan preceding entries.
+ * walk the entries in their original order, preserving the order of the backpressure callbacks
+ * @param backend the commit backend, whose backpressure hook may be absent
+ * @param entries the encoded write set
+ * @param count the number of entries
+ * @return TDB_SUCCESS, or TDB_ERR_IO when the backend refused to admit the write
+ */
+static int txn_pace_families(const tdb_txn_backend_t *backend, const tidesdb_wal_entry_t *entries,
+                             int count)
+{
+    if (!backend->backpressure) return TDB_SUCCESS;
+    if (count <= 1) return txn_pace_families_scan(backend, entries, count);
+
+    size_t slots = 64;
+    const size_t need = (size_t)count > SIZE_MAX / 2 ? SIZE_MAX : (size_t)count * 2;
+    while (slots < need && slots <= SIZE_MAX / 2) slots <<= 1;
+    if (slots < need || slots > SIZE_MAX / sizeof(uint32_t))
+        return txn_pace_families_scan(backend, entries, count);
+
+    /* a separate occupancy array leaves every column family id usable, including zero */
+    uint32_t *families = malloc(slots * sizeof(*families));
+    uint8_t *occupied = calloc(slots, sizeof(*occupied));
+    if (!families || !occupied)
+    {
+        free(families);
+        free(occupied);
+        return txn_pace_families_scan(backend, entries, count);
+    }
+    for (int i = 0; i < count; i++)
+    {
+        const uint32_t family = entries[i].cf_index;
+        size_t slot = ((uint64_t)family * UINT64_C(11400714819323198485)) & (slots - 1);
+        while (occupied[slot] && families[slot] != family) slot = (slot + 1) & (slots - 1);
+        if (occupied[slot]) continue;
+        occupied[slot] = 1;
+        families[slot] = family;
+        if (backend->backpressure(backend->ctx, family) != 0)
+        {
+            free(occupied);
+            free(families);
+            return TDB_ERR_IO;
+        }
+    }
+    free(occupied);
+    free(families);
     return TDB_SUCCESS;
 }
 

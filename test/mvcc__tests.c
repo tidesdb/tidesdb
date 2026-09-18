@@ -148,7 +148,7 @@ void test_mvcc_prepared_hold_keeps_the_reservation_refusing(void)
     const uint64_t khash = 0x0123456789abcdefULL;
     const uint64_t prepared = tidesdb_mvcc_next_seq(m);
     ASSERT_EQ(tidesdb_mvcc_prepared_hold(m, prepared), TDB_SUCCESS);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, khash, prepared, prepared - 1, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, khash, prepared, prepared - 1, 0, NULL), 1);
 
     /* walk the ring clear past the prepare, as a database that keeps committing does */
     uint64_t seq = 0;
@@ -159,7 +159,7 @@ void test_mvcc_prepared_hold_keeps_the_reservation_refusing(void)
     }
 
     const uint64_t later = tidesdb_mvcc_next_seq(m);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, khash, later, later - 1, later - 1), 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, khash, later, later - 1, later - 1, NULL), 0);
     tidesdb_mvcc_destroy(m);
 }
 
@@ -198,18 +198,20 @@ void test_mvcc_reserve_basic(void)
     const uint64_t h = HASH_FP_A(HASH_SLOT);
 
     /* empty slot claims */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 10, 5, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 10, 5, 0, NULL), 1);
     /* the same committer re-claiming is idempotent */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 10, 5, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 10, 5, 0, NULL), 1);
 
     /* a different committer sees an in-flight occupant (seq 10 not marked committed) -> conflict */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 11, 5, 0), 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 11, 5, 0, NULL), 0);
 
     /* once 10 commits, a committer whose read base is past 10 may claim; one whose base is behind
      * 10 (and same fingerprint) loses to the newer same-key writer */
     tidesdb_mvcc_mark(m, 10, 1);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 5, 0), 0);  /* 10 > read_base 5, fp matches -> lose */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 10, 0), 1); /* read_base 10 covers seq 10 -> win */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 5, 0, NULL),
+              TDB_MVCC_RES_REFRESH); /* 10 > read_base 5, fp matches -> lose */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 10, 0, NULL),
+              1); /* read_base 10 covers seq 10 -> win */
     tidesdb_mvcc_destroy(m);
 }
 
@@ -220,14 +222,14 @@ void test_mvcc_release(void)
     ASSERT_TRUE(m != NULL);
     const uint64_t h = HASH_FP_A(HASH_SLOT);
 
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 20, 0, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 20, 0, 0, NULL), 1);
     tidesdb_mvcc_release(m, h, 20);
     /* slot is unclaimed again -> a fresh committer claims cleanly */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 21, 0, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 21, 0, 0, NULL), 1);
 
     /* releasing with a stale seq we no longer own is a no-op (slot stays owned by 21) */
     tidesdb_mvcc_release(m, h, 20);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 22, 0, 0), 0); /* 21 in-flight still holds it */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 22, 0, 0, NULL), 0); /* 21 in-flight still holds it */
     tidesdb_mvcc_destroy(m);
 }
 
@@ -241,13 +243,13 @@ void test_mvcc_reserve_collision(void)
     const uint64_t hb = HASH_FP_B(HASH_SLOT); /* ...different fingerprint */
 
     /* key A commits at seq 10 in the shared slot */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, ha, 10, 0, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, ha, 10, 0, 0, NULL), 1);
     tidesdb_mvcc_mark(m, 10, 1);
 
     /* key B (different fingerprint) with an old-enough occupant relative to min_snapshot ->
      * suppress the collision and claim (min_snapshot 100 means seq 10 is below every open snapshot)
      */
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 11, 5, 100), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 11, 5, 100, NULL), 1);
 
     /* reset the slot, replay, but now the occupant is newer than the oldest open snapshot -> stay
      * conservative and treat it as a conflict */
@@ -255,10 +257,54 @@ void test_mvcc_reserve_collision(void)
     tidesdb_mvcc_release(m, ha, 10); /* not owner after B claimed; harmless */
     tidesdb_mvcc_t *m2 = tidesdb_mvcc_create();
     ASSERT_TRUE(m2 != NULL);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m2, ha, 10, 0, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, ha, 10, 0, 0, NULL), 1);
     tidesdb_mvcc_mark(m2, 10, 1);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hb, 11, 5, 5), 0); /* 10 > min_snapshot 5 -> conflict */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hb, 11, 5, 5, NULL),
+              TDB_MVCC_RES_REFRESH); /* 10 > min_snapshot 5 -> conflict */
     tidesdb_mvcc_destroy(m2);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* the fingerprint is not a full key. an old committed match needs an actual-key check, while
+ * an in-flight occupant and one above the live floor remain protected */
+void test_mvcc_reserve_fingerprint_ticket(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    const uint64_t h = HASH_FP_A(HASH_SLOT);
+    uint64_t ticket = 0;
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 10, 0, 0, NULL), TDB_MVCC_RES_WON);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 11, 5, 10, &ticket), TDB_MVCC_RES_CONFLICT);
+    ASSERT_EQ(ticket, 0);
+    tidesdb_mvcc_mark(m, 10, 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 11, 5, 9, &ticket), TDB_MVCC_RES_REFRESH);
+    ASSERT_EQ(ticket, 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 11, 5, 10, &ticket), TDB_MVCC_RES_CHECK_KEY);
+    ASSERT_TRUE(ticket != 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve_checked(m, HASH_FP_B(HASH_SLOT), 11, ticket), 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve_checked(m, h, 11, ticket), 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 5, 11, NULL), TDB_MVCC_RES_CONFLICT);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* a new writer can land while the caller probes the actual key. its slot must not be overwritten
+ * by the ticket for an older occupant, even when the newer writer has already committed */
+void test_mvcc_reserve_fingerprint_ticket_changed(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    const uint64_t h = HASH_FP_A(HASH_SLOT);
+    uint64_t ticket = 0;
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 10, 0, 0, NULL), TDB_MVCC_RES_WON);
+    tidesdb_mvcc_mark(m, 10, 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 5, 10, &ticket), TDB_MVCC_RES_CHECK_KEY);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 11, 10, 10, NULL), TDB_MVCC_RES_WON);
+    ASSERT_EQ(tidesdb_mvcc_reserve_checked(m, h, 12, ticket), 0);
+    tidesdb_mvcc_mark(m, 11, 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve_checked(m, h, 12, ticket), 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 12, 10, 10, NULL), TDB_MVCC_RES_REFRESH);
+    ASSERT_EQ(tidesdb_mvcc_reserve_checked(m, h, 12, 0), 0);
+    ASSERT_EQ(tidesdb_mvcc_reserve_checked(NULL, h, 12, ticket), 0);
     tidesdb_mvcc_destroy(m);
 }
 
@@ -308,7 +354,7 @@ typedef struct
 static void *cc_reserve_worker(void *arg)
 {
     cc_reserve_arg *a = (cc_reserve_arg *)arg;
-    a->won = tidesdb_mvcc_reserve(a->m, a->key_hash, a->commit_seq, 0, 0);
+    a->won = tidesdb_mvcc_reserve(a->m, a->key_hash, a->commit_seq, 0, 0, NULL);
     return NULL;
 }
 
@@ -357,10 +403,10 @@ void test_mvcc_stats(void)
     tidesdb_mvcc_mark(m, 2, 0); /* in-progress, not counted */
 
     const uint64_t h = HASH_FP_A(HASH_SLOT);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 1, 5, 0), 1); /* won */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 1, 5, 0, NULL), 1); /* won */
     tidesdb_mvcc_mark(m, 1, 1);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 2, 0, 0),
-              0); /* lost: 1 committed > read_base 0, fp match */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, h, 2, 0, 0, NULL),
+              TDB_MVCC_RES_REFRESH); /* lost: 1 committed > read_base 0, fp match */
 
     tidesdb_mvcc_get_stats(m, &st);
     ASSERT_TRUE(st.seqs_assigned == 2);
@@ -379,7 +425,8 @@ void test_mvcc_null_safe(void)
 {
     ASSERT_EQ(tidesdb_mvcc_committed(NULL, 5), 0);
     ASSERT_EQ(tidesdb_mvcc_visible(NULL, 5, 10), 0);
-    ASSERT_EQ(tidesdb_mvcc_reserve(NULL, 1, 1, 0, 0), 1); /* no clock -> nothing to conflict with */
+    ASSERT_EQ(tidesdb_mvcc_reserve(NULL, 1, 1, 0, 0, NULL),
+              1); /* no clock -> nothing to conflict with */
     tidesdb_mvcc_mark(NULL, 5, 1);
     tidesdb_mvcc_release(NULL, 1, 1);
     tidesdb_mvcc_reseed(NULL, 5);
@@ -401,6 +448,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_reserve_basic, tests_passed);
     RUN_TEST(test_mvcc_release, tests_passed);
     RUN_TEST(test_mvcc_reserve_collision, tests_passed);
+    RUN_TEST(test_mvcc_reserve_fingerprint_ticket, tests_passed);
+    RUN_TEST(test_mvcc_reserve_fingerprint_ticket_changed, tests_passed);
     RUN_TEST(test_mvcc_seq_concurrent_unique, tests_passed);
     RUN_TEST(test_mvcc_reserve_single_winner, tests_passed);
     RUN_TEST(test_mvcc_stats, tests_passed);

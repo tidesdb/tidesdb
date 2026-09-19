@@ -470,19 +470,22 @@ static int txn_check_conflicts(tdb_txn_t *txn, const tidesdb_source_t *sources, 
  * @param entries the encoded write set
  * @param count the number of entries
  * @param seq the commit sequence being reserved at
- * @return 1 when every key was reserved, 0 when another committer holds one
+ * @param sources the current source stack for resolving fingerprint aliases
+ * @param num_sources number of sources
+ * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or an actual-key probe error
  */
 static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count,
-                              uint64_t seq)
+                              uint64_t seq, const tidesdb_source_t *sources, int num_sources)
 {
     /* read once for the whole write set rather than per key. this is the bound below which a
      * committed occupant of a slot cannot still be depended on, and it is what lets the slot's
-     * fingerprint tell a real same-key writer from a hash collision; without it every collision
+     * fingerprint rule out a same-key writer on a mismatch; without it every collision
      * aborts a commit that had no real conflict. the published value is a scan the compaction
      * scheduler already runs, read here as one relaxed load -- running the scan on this path would
      * mean every registry shard, once per written key. it is only ever stale low, and low is the
      * conservative direction */
-    const uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
+    uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
+    int refreshed_min_snapshot = 0;
 
     /* the intervals this batch writes are claimed first, so a point write that arrives afterwards
      * meets them. an interval cannot be claimed as a key hash -- there is no one key to hash -- so
@@ -494,7 +497,7 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
         if (!tidesdb_mvcc_reserve_range(txn->clock, entries[i].cf_index, entries[i].key,
                                         entries[i].key_size, entries[i].value,
                                         entries[i].value_size, seq))
-            return 0;
+            return TDB_ERR_CONFLICT;
     }
 
     for (int i = 0; i < count; i++)
@@ -504,7 +507,7 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
         /* an interval another transaction is committing, or holds in doubt, covers this key */
         if (tidesdb_mvcc_range_blocks(txn->clock, entries[i].cf_index, entries[i].key,
                                       entries[i].key_size, seq))
-            return 0;
+            return TDB_ERR_CONFLICT;
 
         const uint64_t h = txn_key_hash(entries[i].cf_index, entries[i].key, entries[i].key_size);
         uint64_t read_base = atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
@@ -512,9 +515,30 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
         if (txn->readset && tidesdb_readset_seq(txn->readset, entries[i].cf_index, entries[i].key,
                                                 entries[i].key_size, &rseq))
             read_base = rseq;
-        if (!tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot)) return 0;
+        uint64_t observed = 0;
+        tidesdb_mvcc_reservation_result_t result =
+            tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot, &observed);
+        if (result != TDB_MVCC_RES_WON && !refreshed_min_snapshot && txn->registry)
+        {
+            /* refresh once per transaction, retaining the global oldest live snapshot */
+            tidesdb_txn_registry_publish_min_snapshot(txn->registry);
+            min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
+            refreshed_min_snapshot = 1;
+            result = tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot, &observed);
+        }
+        if (result == TDB_MVCC_RES_CHECK_KEY)
+        {
+            int newer = 0;
+            const int rc = txn_probe_newer(sources, num_sources, entries[i].cf_index,
+                                           entries[i].key, entries[i].key_size, read_base, &newer);
+            if (rc != TDB_SUCCESS) return rc;
+            if (newer || !tidesdb_mvcc_reserve_checked(txn->clock, h, seq, observed))
+                return TDB_ERR_CONFLICT;
+        }
+        else if (result != TDB_MVCC_RES_WON)
+            return TDB_ERR_CONFLICT;
     }
-    return 1;
+    return TDB_SUCCESS;
 }
 
 /* preserve the allocation-free path for a single entry and when the family set cannot be allocated
@@ -683,8 +707,8 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
      * nothing yet, the way a full interval table refuses a commit */
     const int prepared = reserve && kind == TDB_WAL_KIND_PREPARE;
     if (prepared) rc = tidesdb_mvcc_prepared_hold(txn->clock, seq);
-    if (rc == TDB_SUCCESS && reserve && !txn_reserve_writes(txn, entries, count, seq))
-        rc = TDB_ERR_CONFLICT;
+    if (rc == TDB_SUCCESS && reserve)
+        rc = txn_reserve_writes(txn, entries, count, seq, sources, num_sources);
 
     /* pace each distinct column family before the durable write */
     if (rc == TDB_SUCCESS) rc = txn_pace_families(backend, entries, count);

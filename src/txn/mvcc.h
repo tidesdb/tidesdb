@@ -214,22 +214,43 @@ void tidesdb_mvcc_reseed(tidesdb_mvcc_t *m, uint64_t max_recovered_seq);
  */
 void tidesdb_mvcc_get_stats(const tidesdb_mvcc_t *m, tidesdb_mvcc_stats_t *out);
 
+/* a fingerprint is only a candidate identity; checking the actual key stays in the txn layer */
+typedef enum
+{
+    TDB_MVCC_RES_CONFLICT = 0,
+    TDB_MVCC_RES_WON = 1,
+    TDB_MVCC_RES_REFRESH,
+    TDB_MVCC_RES_CHECK_KEY
+} tidesdb_mvcc_reservation_result_t;
+
 /**
  * tidesdb_mvcc_reserve
- * try to claim one write key's reservation slot for commit_seq (first-committer-wins). the caller
- * loops this over its write set and, on a conflict, releases the slots it already claimed and
- * aborts. conflict is decided from the slot alone: an in-flight occupant, or a committed seq past
- * the version this txn read whose fingerprint matches (a real same-key writer) or that is newer
- * than the oldest open snapshot (a possible concurrent writer of a colliding key)
+ * try to claim one write key's reservation slot without mistaking a fingerprint for a full key
  * @param m the clock
- * @param key_hash the 64-bit hash of the write key (slot index and fingerprint are derived from it)
+ * @param key_hash the key hash supplying the slot and fingerprint
  * @param commit_seq this committer's sequence number
- * @param read_base the seq this txn read for the key, or its snapshot seq for a blind write
- * @param min_snapshot the oldest open snapshot seq among active txns
- * @return 1 if the slot was claimed, 0 on conflict
+ * @param read_base the version read for this key, or the snapshot for a blind write
+ * @param min_snapshot the global oldest live snapshot, possibly stale low
+ * @param observed out, the exact packed occupant on CHECK_KEY; may be NULL if not used
+ * @return WON, CONFLICT for an in-flight writer, REFRESH for a committed occupant above the
+ *         floor, or CHECK_KEY for a matching fingerprint at or below the floor
  */
-int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq,
-                         uint64_t read_base, uint64_t min_snapshot);
+tidesdb_mvcc_reservation_result_t tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash,
+                                                       uint64_t commit_seq, uint64_t read_base,
+                                                       uint64_t min_snapshot, uint64_t *observed);
+
+/**
+ * tidesdb_mvcc_reserve_checked
+ * claim an ambiguous slot only if it still holds the occupant checked against the actual key
+ * @param m the clock
+ * @param key_hash the same key hash passed to reserve
+ * @param commit_seq this committer's sequence number
+ * @param observed the CHECK_KEY ticket; the caller must have proved no newer actual-key version
+ *                 above read_base after receiving it, before calling this function
+ * @return 1 if claimed, 0 if another writer changed the slot or the ticket is invalid
+ */
+int tidesdb_mvcc_reserve_checked(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq,
+                                 uint64_t observed);
 
 /**
  * tidesdb_mvcc_prepared_hold

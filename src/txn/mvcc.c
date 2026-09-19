@@ -386,10 +386,11 @@ void tidesdb_mvcc_reseed(tidesdb_mvcc_t *m, uint64_t max_recovered_seq)
                               memory_order_release);
 }
 
-int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq,
-                         uint64_t read_base, uint64_t min_snapshot)
+tidesdb_mvcc_reservation_result_t tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash,
+                                                       uint64_t commit_seq, uint64_t read_base,
+                                                       uint64_t min_snapshot, uint64_t *observed)
 {
-    if (!m) return 1;
+    if (!m) return TDB_MVCC_RES_WON;
     _Atomic(uint64_t) *res = m->reservation;
     const uint64_t myseq = commit_seq & TDB_MVCC_RES_SEQ_MASK;
     const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
@@ -404,7 +405,7 @@ int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_s
         {
             /* already held by this seq -- a duplicate key or a colliding sibling */
             atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
-            return 1;
+            return TDB_MVCC_RES_WON;
         }
 
         /* an in-flight occupant could be a concurrent same-key committer this txn must lose to, and
@@ -414,18 +415,18 @@ int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_s
         if (cseq != 0 && !tidesdb_mvcc_committed(m, cseq))
         {
             atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
-            return 0;
+            return TDB_MVCC_RES_CONFLICT;
         }
 
-        /* a committed seq landed past the version this txn read. a matching fingerprint means a
-         * real same-key writer and this txn loses; a differing fingerprint is a hash collision,
-         * harmless unless it is newer than the oldest open snapshot, where a concurrent writer of
-         * that colliding key could still depend on the slot and the reservation stays
-         * conservative */
+        /* a committed occupant newer than the global floor may still protect a live writer.
+         * below that floor a matching fingerprint is ambiguous, so the caller checks the actual
+         * key and uses this exact occupant as a compare-and-swap ticket */
         if (cseq > read_base && (TDB_MVCC_RES_FP(cur) == myfp || cseq > min_snapshot))
         {
             atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
-            return 0;
+            if (cseq > min_snapshot) return TDB_MVCC_RES_REFRESH;
+            if (observed) *observed = cur;
+            return TDB_MVCC_RES_CHECK_KEY;
         }
 
         uint64_t expect = cur;
@@ -433,10 +434,24 @@ int tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_s
                                                   memory_order_acquire))
         {
             atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
-            return 1;
+            return TDB_MVCC_RES_WON;
         }
         /* cas lost to a concurrent claimer -- re-read and re-evaluate this slot */
     }
+}
+
+int tidesdb_mvcc_reserve_checked(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq,
+                                 uint64_t observed)
+{
+    if (!m || TDB_MVCC_RES_SEQ(observed) == 0 ||
+        TDB_MVCC_RES_FP(observed) != (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS))
+        return 0;
+    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
+    const uint64_t mine = TDB_MVCC_RES_PACK(TDB_MVCC_RES_FP(observed), commit_seq);
+    const int won = atomic_compare_exchange_strong_explicit(
+        &m->reservation[slot], &observed, mine, memory_order_acq_rel, memory_order_acquire);
+    atomic_fetch_add_explicit(won ? &m->stat_res_won : &m->stat_res_lost, 1, memory_order_relaxed);
+    return won;
 }
 
 void tidesdb_mvcc_reassign(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t from_seq, uint64_t to_seq)

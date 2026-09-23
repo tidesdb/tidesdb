@@ -191,7 +191,7 @@ jobs:
             # process and throws its state away; this attaches gdb first, so a hang prints
             # every thread's stack before anything is killed. gdb writes to a file -- piped into
             # head, SIGPIPE kills gdb and gdb takes the traced process down with it
-            PROBE_RUNS=10
+            PROBE_RUNS=40
             PROBE_LIMIT_S=240
             probe_run=1
             while [ "$probe_run" -le "$PROBE_RUNS" ]; do

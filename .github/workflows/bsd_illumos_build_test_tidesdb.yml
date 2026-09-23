@@ -146,6 +146,9 @@ jobs:
               [ "$ok" = 1 ] && break
             done
             [ "$ok" = 1 ] || { echo "all mirrors failed to provide packages"; exit 1; }
+            # TEMPORARY-NETBSD-HANG-PROBE: a debugger to attach to a hung test. base usually
+            # ships gdb in the comp set; the package is only the fallback, and best effort
+            command -v gdb >/dev/null 2>&1 || /usr/sbin/pkg_add gdb || true
           run: |
             echo "*=====================================*"
             echo " System Information"
@@ -160,8 +163,11 @@ jobs:
             # no sanitizer here -- ASan does not sit with NetBSD's ASLR and the instrumented
             # binary exits before running a test, so the suite would pass by not running. the
             # build system refuses it on this platform too, so this is belt and braces.
+            # TEMPORARY-NETBSD-HANG-PROBE: RelWithDebInfo so a hang's stacks carry function
+            # names and lines rather than bare addresses
             cmake -S . -B build \
-              -DTIDESDB_BUILD_TESTS=ON
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
             echo ""
             echo "*=====================================*"
@@ -174,6 +180,52 @@ jobs:
             echo " Run Tests"
             echo "*=====================================*"
             cd build
+
+            echo ""
+            echo "*=====================================*"
+            echo " TEMPORARY: hang probe"
+            echo "*=====================================*"
+            # TEMPORARY-NETBSD-HANG-PROBE: run the test that intermittently parks forever here,
+            # repeatedly, and watch it ourselves rather than through ctest. ctest's timeout kills
+            # the process and throws its state away; this attaches gdb first, so a hang prints
+            # every thread's stack before anything is killed. gdb writes to a file -- piped into
+            # head, SIGPIPE kills gdb and gdb takes the traced process down with it
+            PROBE_TEST=test_engine_create_completes_under_sustained_flush
+            PROBE_RUNS=25
+            PROBE_LIMIT_S=120
+            probe_run=1
+            while [ "$probe_run" -le "$PROBE_RUNS" ]; do
+              rm -rf ./test_engine_db
+              ./engine_tests "$PROBE_TEST" > probe.log 2>&1 &
+              probe_pid=$!
+              probe_s=0
+              while kill -0 "$probe_pid" 2>/dev/null && [ "$probe_s" -lt "$PROBE_LIMIT_S" ]; do
+                sleep 1
+                probe_s=$((probe_s + 1))
+              done
+              if kill -0 "$probe_pid" 2>/dev/null; then
+                echo "HUNG on run $probe_run of $PROBE_RUNS after ${PROBE_LIMIT_S}s -- dumping every thread"
+                gdb -p "$probe_pid" -batch \
+                  -ex "set pagination off" \
+                  -ex "info threads" \
+                  -ex "thread apply all bt full" > probe_stacks.txt 2>&1
+                echo "----- test output (tail) -----"
+                tail -n 60 probe.log
+                echo "----- stacks -----"
+                cat probe_stacks.txt
+                kill -9 "$probe_pid" 2>/dev/null
+                exit 1
+              fi
+              wait "$probe_pid"
+              probe_rc=$?
+              if [ "$probe_rc" -ne 0 ]; then
+                echo "probe run $probe_run failed rc=$probe_rc without hanging"
+                tail -n 60 probe.log
+                exit 1
+              fi
+              echo "probe run $probe_run/$PROBE_RUNS passed in ${probe_s}s"
+              probe_run=$((probe_run + 1))
+            done
 
             # 300s per test, not the 5400 the other jobs use. nothing here legitimately runs
             # beyond ninety seconds, and this platform has intermittently parked one test for

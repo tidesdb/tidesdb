@@ -181,57 +181,44 @@ jobs:
             echo "*=====================================*"
             cd build
 
-            echo ""
-            echo "*=====================================*"
-            echo " TEMPORARY: hang probe"
-            echo "*=====================================*"
-            # TEMPORARY-NETBSD-HANG-PROBE: run the whole engine_tests binary repeatedly and watch
-            # it ourselves rather than through ctest. the hanging test passes run alone, so it
-            # needs the process state the earlier tests leave behind. ctest's timeout kills the
-            # process and throws its state away; this attaches gdb first, so a hang prints
-            # every thread's stack before anything is killed. gdb writes to a file -- piped into
-            # head, SIGPIPE kills gdb and gdb takes the traced process down with it
-            PROBE_RUNS=40
-            PROBE_LIMIT_S=240
-            probe_run=1
-            while [ "$probe_run" -le "$PROBE_RUNS" ]; do
-              rm -rf ./test_engine_db
-              ./engine_tests > probe.log 2>&1 &
-              probe_pid=$!
-              probe_s=0
-              while kill -0 "$probe_pid" 2>/dev/null && [ "$probe_s" -lt "$PROBE_LIMIT_S" ]; do
-                sleep 1
-                probe_s=$((probe_s + 1))
-              done
-              if kill -0 "$probe_pid" 2>/dev/null; then
-                echo "HUNG on run $probe_run of $PROBE_RUNS after ${PROBE_LIMIT_S}s -- dumping every thread"
-                gdb -p "$probe_pid" -batch \
-                  -ex "set pagination off" \
-                  -ex "info threads" \
-                  -ex "thread apply all bt full" > probe_stacks.txt 2>&1
-                echo "----- test output (tail) -----"
-                tail -n 60 probe.log
-                echo "----- stacks -----"
-                cat probe_stacks.txt
-                kill -9 "$probe_pid" 2>/dev/null
-                exit 1
-              fi
-              wait "$probe_pid"
-              probe_rc=$?
-              if [ "$probe_rc" -ne 0 ]; then
-                echo "probe run $probe_run failed rc=$probe_rc without hanging"
-                tail -n 60 probe.log
-                exit 1
-              fi
-              echo "probe run $probe_run/$PROBE_RUNS passed in ${probe_s}s"
-              probe_run=$((probe_run + 1))
-            done
-
             # 300s per test, not the 5400 the other jobs use. nothing here legitimately runs
             # beyond ninety seconds, and this platform has intermittently parked one test for
             # minutes -- at the default a single stall holds the runner for the whole ninety-minute
             # ceiling, so the timeout is what turns that into a prompt failure
-            ctest -V --output-on-failure --timeout 300 --build-config Release
+            # TEMPORARY-NETBSD-HANG-PROBE: the hang has only ever appeared under ctest, never in
+            # the same binary run directly, so watch ctest's own test process. one that is still
+            # the running test after HANG_S gets every thread's stack dumped by gdb before
+            # ctest's timeout kills it. gdb writes to a file -- piped into head, SIGPIPE kills gdb
+            # and gdb takes the traced process down with it
+            HANG_S=150
+            ctest -V --output-on-failure --timeout 300 --build-config Release &
+            ctest_pid=$!
+            seen_pid=""
+            seen_s=0
+            dumped_pid=""
+            while kill -0 "$ctest_pid" 2>/dev/null; do
+              sleep 5
+              cur_pid=$(pgrep -P "$ctest_pid" | head -n 1)
+              if [ -n "$cur_pid" ] && [ "$cur_pid" = "$seen_pid" ]; then
+                seen_s=$((seen_s + 5))
+              else
+                seen_pid="$cur_pid"
+                seen_s=0
+              fi
+              if [ -n "$cur_pid" ] && [ "$seen_s" -ge "$HANG_S" ] && [ "$cur_pid" != "$dumped_pid" ]; then
+                echo "HUNG pid $cur_pid ($(ps -o comm= -p "$cur_pid")) after ${HANG_S}s -- dumping every thread"
+                gdb -p "$cur_pid" -batch \
+                  -ex "set pagination off" \
+                  -ex "info threads" \
+                  -ex "thread apply all bt full" > hang_stacks.txt 2>&1
+                echo "----- stacks -----"
+                cat hang_stacks.txt
+                echo "----- end stacks -----"
+                dumped_pid="$cur_pid"
+              fi
+            done
+            wait "$ctest_pid"
+            exit $?
 
   omnios-build:
     runs-on: ubuntu-latest

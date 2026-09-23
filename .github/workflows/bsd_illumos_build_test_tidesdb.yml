@@ -185,18 +185,18 @@ jobs:
             echo "*=====================================*"
             echo " TEMPORARY: hang probe"
             echo "*=====================================*"
-            # TEMPORARY-NETBSD-HANG-PROBE: run the test that intermittently parks forever here,
-            # repeatedly, and watch it ourselves rather than through ctest. ctest's timeout kills
-            # the process and throws its state away; this attaches gdb first, so a hang prints
+            # TEMPORARY-NETBSD-HANG-PROBE: run the whole engine_tests binary repeatedly and watch
+            # it ourselves rather than through ctest. the hanging test passes run alone, so it
+            # needs the process state the earlier tests leave behind. ctest's timeout kills the
+            # process and throws its state away; this attaches gdb first, so a hang prints
             # every thread's stack before anything is killed. gdb writes to a file -- piped into
             # head, SIGPIPE kills gdb and gdb takes the traced process down with it
-            PROBE_TEST=test_engine_create_completes_under_sustained_flush
-            PROBE_RUNS=25
-            PROBE_LIMIT_S=120
+            PROBE_RUNS=10
+            PROBE_LIMIT_S=240
             probe_run=1
             while [ "$probe_run" -le "$PROBE_RUNS" ]; do
               rm -rf ./test_engine_db
-              ./engine_tests "$PROBE_TEST" > probe.log 2>&1 &
+              ./engine_tests > probe.log 2>&1 &
               probe_pid=$!
               probe_s=0
               while kill -0 "$probe_pid" 2>/dev/null && [ "$probe_s" -lt "$PROBE_LIMIT_S" ]; do

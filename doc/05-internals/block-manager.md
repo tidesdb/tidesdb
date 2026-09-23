@@ -79,6 +79,14 @@ itself carries the durability rather than a following `fdatasync`. Where it is u
 manager falls back to an explicit `fdatasync` per write. The distinction matters for
 performance, not semantics — both mean the bytes are on the device when the call returns.
 
+Which of the two applies is decided by **the descriptor, not the platform**. The manager records
+whether the handle it currently holds was actually opened `O_DSYNC`, and skips the explicit sync
+only when that is true. Asking whether the *platform* supports the flag is the same question only
+while a file keeps the mode it was opened with: a family switched from `NONE` to `FULL` at runtime
+changes the mode it asks for without the already-open descriptor acquiring the flag, and a
+platform-level test would then skip a sync that nothing else was going to perform. The flag is
+re-read whenever the descriptor is reopened.
+
 Truncation is a special case: `ftruncate` is not covered by `O_DSYNC`, so a truncation always
 syncs explicitly.
 

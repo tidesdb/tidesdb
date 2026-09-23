@@ -132,27 +132,42 @@ Each key hashes into a slot in a fixed table. A slot packs two things:
   [ 16-bit key fingerprint ][ 48-bit claiming commit sequence ]
 ```
 
-The fingerprint is what lets the check stay local on a fixed-size table. Two different keys can
-land in the same slot; without a fingerprint the commit could not tell a genuine same-key conflict
-from a hash collision, and would have to read another committer's applied version to disambiguate.
-With it, **the slot alone answers the question** — no reaching into anyone else's data.
+The fingerprint is what keeps the common case local. Two different keys can land in the same slot,
+and without a fingerprint the commit could not tell a genuine same-key conflict from a hash
+collision. With it, most claims are settled by the slot alone.
 
-:::note[The bound the fingerprint is checked against is a cached minimum]
-The fingerprint only decides the outcome for an occupant no newer than the oldest open snapshot; a
-newer one is treated as a conflict whatever its fingerprint says, because a concurrent writer of the
-colliding key could still depend on the slot.
+The reservation therefore answers with more than won or lost. It returns **WON**; **CONFLICT** for
+an occupant still in flight, which cannot be told from a same-key committer without its applied
+version; **REFRESH** when the occupant is committed but sits above what this commit believes the
+oldest live snapshot to be; or **CHECK_KEY**, handing back the exact occupant it saw.
 
-Computing that minimum exactly means scanning every registry shard, and a reservation runs once per
-written key, so the commit path does not compute it. The registry publishes the value instead,
-refreshed on the compaction scheduler's tick, and the commit path reads it as a single relaxed load
-hoisted once for the whole write set. A stale reading is only ever *low*, which is the conservative
-direction: it makes more occupants count as newer, so it can reject a commit that would have been
-admitted, and can never admit one that should have been rejected.
+:::caution[A fingerprint is not a key, and the commit no longer pretends otherwise]
+A fingerprint match is not proof of a same-key conflict, and a mismatch past the snapshot bound is
+not proof of one either. Treating either as decisive is how a commit is rejected for a collision
+with an unrelated key — which, on a loaded table, is most commits.
+
+So **REFRESH** makes the commit republish the registry minimum and retry the claim, *once per
+transaction*, rather than deciding on a stale bound. And **CHECK_KEY** is resolved exactly: the
+commit probes the real key for a version newer than what it read, and only if none exists does it
+claim the slot with `tidesdb_mvcc_reserve_checked`, which succeeds only if the slot still holds the
+occupant that was checked. Reaching into the data is the *fallback*, taken when the slot genuinely
+cannot answer, not the ordinary path.
+:::
+
+:::note[The bound is a published minimum, refreshed on demand]
+Computing the oldest live snapshot exactly means scanning every registry shard, and a reservation
+runs once per written key, so the commit path does not compute it up front. The registry publishes
+the value — refreshed on the compaction scheduler's tick, and again by any commit whose claim did
+not win outright — and the commit reads it as a single load hoisted over the whole write set. A
+stale reading is only ever *low*, which is the conservative direction: it makes more occupants look
+recent, so it can send a claim down the refresh or check path, and can never admit one that should
+have been rejected.
 
 The empty registry is the case that needs care. The scan answers `UINT64_MAX`, a sentinel meaning
 nothing constrains you rather than a real minimum, and publishing it would let a transaction
 beginning afterwards hold a snapshot *below* the published value -- the one direction a reader of
-this may not tolerate. The publisher stores zero for an empty set instead.
+this may not tolerate. The publisher stores zero for an empty set instead, which is why the exact
+check above matters: with the bound at zero every committed occupant looks recent.
 :::
 
 The subtlety is what each key is validated *against*. Not the transaction's snapshot, but **the

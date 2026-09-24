@@ -160,15 +160,8 @@ jobs:
             # no sanitizer here -- ASan does not sit with NetBSD's ASLR and the instrumented
             # binary exits before running a test, so the suite would pass by not running. the
             # build system refuses it on this platform too, so this is belt and braces.
-            #
-            # every test runs through a launcher that sends its output to a file and prints the
-            # file afterwards. on this platform a test writing into ctest's pipe has parked for
-            # the whole timeout, inside a write whose bytes ctest had already received, and the
-            # same binaries run clean with their output on a file
-            chmod +x .github/scripts/ctest_output_to_file.sh
             cmake -S . -B build \
-              -DTIDESDB_BUILD_TESTS=ON \
-              -DCMAKE_TEST_LAUNCHER="$PWD/.github/scripts/ctest_output_to_file.sh"
+              -DTIDESDB_BUILD_TESTS=ON
 
             echo ""
             echo "*=====================================*"

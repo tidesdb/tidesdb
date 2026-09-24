@@ -437,19 +437,29 @@ static inline int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
  * handle and the function's void* return, so pthread_join can hand it back (callers that pass a
  * non-NULL retval, such as the queue tests, rely on it). join frees the block, so every created
  * thread must be joined (the engine has no detached threads). */
+/* the record lives until both the thread has run its body and the creator has joined or detached
+ * it, whichever comes last, so it is released by a count that starts at two */
+#define TDB_WIN_THREAD_OWNERS 2
 typedef struct
 {
     HANDLE handle;
     void *(*fn)(void *);
     void *arg;
     void *retval;
+    LONG owners;
 } tdb_win_thread_t;
 typedef tdb_win_thread_t *pthread_t;
+
+static inline void tdb_win_thread_release(tdb_win_thread_t *t)
+{
+    if (InterlockedDecrement(&t->owners) == 0) free(t);
+}
 
 static inline unsigned __stdcall tdb_win_thread_trampoline(void *p)
 {
     tdb_win_thread_t *t = (tdb_win_thread_t *)p;
     t->retval = t->fn(t->arg);
+    tdb_win_thread_release(t);
     return 0;
 }
 
@@ -496,6 +506,7 @@ static inline int pthread_create(pthread_t *th, const void *attr, void *(*fn)(vo
     t->fn = fn;
     t->arg = arg;
     t->retval = NULL;
+    t->owners = TDB_WIN_THREAD_OWNERS;
     h = _beginthreadex(NULL, stacksize, tdb_win_thread_trampoline, t, 0, NULL);
     if (h == 0)
     {
@@ -512,7 +523,16 @@ static inline int pthread_join(pthread_t th, void **retval)
     WaitForSingleObject(th->handle, INFINITE);
     if (retval) *retval = th->retval; /* the trampoline stored it before the thread exited */
     CloseHandle(th->handle);
-    free(th);
+    tdb_win_thread_release(th);
+    return 0;
+}
+/* the creator gives up its half of the record; the thread frees it when its body returns, or it is
+ * freed here if the body has already returned */
+static inline int pthread_detach(pthread_t th)
+{
+    if (!th) return EINVAL;
+    CloseHandle(th->handle);
+    tdb_win_thread_release(th);
     return 0;
 }
 

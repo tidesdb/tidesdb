@@ -603,7 +603,7 @@ static int ce_merge_subdivided(const compaction_ctx_t *cx, const compaction_job_
                                sstable_t *const *inputs, int n_inputs, int k, ce_sink_t *sink)
 {
     ce_range_task_t *tasks = calloc((size_t)k, sizeof(*tasks));
-    pthread_t *tids = calloc((size_t)k, sizeof(*tids));
+    tdb_thread_t *tids = calloc((size_t)k, sizeof(*tids));
     if (!tasks || !tids)
     {
         free(tasks);
@@ -634,13 +634,13 @@ static int ce_merge_subdivided(const compaction_ctx_t *cx, const compaction_job_
      * the caller is never idle waiting on work it could have done */
     for (int i = 0; i < k - 1; i++)
     {
-        if (pthread_create(&tids[i], NULL, ce_range_thread, &tasks[i]) != 0) break;
+        if (tdb_thread_start(&tids[i], ce_range_thread, &tasks[i]) != 0) break;
         started++;
     }
     /* a range whose thread never started is run here too, so a failure to spawn costs parallelism
      * rather than correctness */
     for (int i = started; i < k; i++) ce_range_thread(&tasks[i]);
-    for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
+    for (int i = 0; i < started; i++) tdb_thread_finish(&tids[i]);
 
     int rc = TDB_SUCCESS;
     for (int i = 0; i < k; i++)

@@ -13,10 +13,10 @@ sidebar:
 
 The engine runs several kinds of background work: worker pools draining queues, and periodic
 tickers. Each needs the same lifecycle — create threads, signal shutdown, wake anything
-blocked, join, and account for the ones still alive.
+blocked, wait for each to exit, and account for the ones still alive.
 
 Hand-rolling that per subsystem is how shutdown bugs are made. Each site invents its own stop
-flag and its own join, they drift, and a thread that blocks on a queue nobody will ever post
+flag and its own wait, they drift, and a thread that blocks on a queue nobody will ever post
 to becomes a hang at close. Worse, the *order* of shutdown ends up implicit: whichever pool
 happens to be stopped first.
 
@@ -64,10 +64,18 @@ Closing a database drains and stops in order:
 
 1. Stop accepting new work.
 2. Stop the background processes in reverse registration order — each signalled, woken if
-   blocked, and joined.
+   blocked, and waited for.
 3. Drain what remains: sealed memtables still queued are written out, or their logs are closed
    without unlinking so the data survives to be recovered.
 4. Release the shared stores.
+
+No thread in the engine is ever joined. Each one is detached when it starts and announces its own
+exit on a condition variable, and that is what a stop waits for. The distinction matters on NetBSD,
+whose scheduler adds a joined thread's CPU estimate to the joiner without a ceiling and hands every
+new thread its creator's estimate. A thread that has joined enough busy threads then sits below the
+priority a running thread can ever settle at, as does everything it creates afterwards, and none of
+them is scheduled again while a busier thread is runnable. A flush worker that closed a log per
+memtable would sink that way, and so would any caller that opened a database after closing one.
 
 Step 3 is where the ordering earns itself. Draining the flush queue requires that no worker is
 still pulling from it, and that no compaction is still installing into a level set being torn
@@ -150,5 +158,5 @@ and is logged when it exceeds `ENGINE_SLOW_ROTATE_WARN_US`.
 | One registry owns every background process | Otherwise shutdown order is implicit and drifts |
 | Processes stop in reverse registration order | A later subsystem may depend on an earlier one |
 | A pool never owns the queue it drains | The engine needs the queue after the workers are gone |
-| Every stop signals, wakes, and joins | A thread blocked on an empty queue would hang the close |
+| Every stop signals, wakes, and waits for the exit | A thread blocked on an empty queue would hang the close |
 | A ticker runs its tick before its first wait | Startup work must not be delayed by a full interval |

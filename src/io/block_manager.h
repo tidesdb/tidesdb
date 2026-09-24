@@ -8,6 +8,7 @@
  */
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
+#include "base/thread.h"   /* the flush thread, retired without a join */
 #include "base/waitstat.h" /* tdb_io_stat_t for per-class write accounting */
 #include "compat.h"
 
@@ -106,7 +107,7 @@ typedef enum
  *                  after copying its record and the flush thread advances over the contiguous run
  * @param ring_size ring capacity in bytes
  * @param buf_flushed contiguous file offset the flush thread has pwritten, the durability watermark
- * @param flush_tid the single flush thread that owns every pwrite in buffered mode
+ * @param flush_thread the single flush thread that owns every pwrite in buffered mode
  * @param flush_stop set at close so the flush thread drains the ring and exits
  * @param flush_error errno set if a flush-thread pwrite or fdatasync failed
  * @param flush_sleeping 1 while the flush thread is parked waiting for work
@@ -142,7 +143,7 @@ typedef struct
     _Atomic unsigned char *done_ring;
     uint64_t ring_size;
     ATOMIC_ALIGN(8) _Atomic uint64_t buf_flushed;
-    pthread_t flush_tid;
+    tdb_thread_t flush_thread;
     _Atomic int flush_stop;
     _Atomic int flush_error;
     _Atomic int flush_sleeping;

@@ -192,7 +192,7 @@ set(TIDESDB_SOURCES
     src/sstable/vlog.c src/sstable/vlog_reclaim.c src/sstable/vlog_segment.c src/sstable/sstable.c
     src/sstable/sstable_footer.c
     src/sstable/sstable_read.c src/sstable/sstable_builder.c
-    src/base/log.c src/base/errors.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/wal_record.c src/txn/source.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
+    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/wal_record.c src/txn/source.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
     external/xxhash.c)
 
 # vendored sources are compiled as-is; their diagnostics belong upstream, and letting them into this
@@ -670,6 +670,7 @@ if(TIDESDB_BUILD_TESTS)
     # them is a test that is built but never linked, or built but never run
     set(TIDESDB_TESTS
         base_log_tests
+        base_thread_tests
         base_serialization_tests
         encoding_tests
         base_lockfree_tests

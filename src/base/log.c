@@ -41,6 +41,11 @@ char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 #define TDB_LOG_LOCK_NAPS   100
 #define TDB_LOG_LOCK_NAP_US 1000
 
+/* the marker lines the sink writes about itself, one when the file was truncated and one before the
+ * first line to get through after others were dropped */
+#define TDB_LOG_TRUNCATED_FMT "[LOG TRUNCATED - exceeded %zu bytes]\n"
+#define TDB_LOG_DROPPED_FMT   "[LOG DROPPED - %llu lines while the sink was blocked]\n"
+
 /* serializes sink writes and the truncation reopen so a concurrent writer never touches a closed
  * file
  */
@@ -92,9 +97,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
 
     const uint64_t dropped =
         atomic_exchange_explicit(&tidesdb_log_dropped, 0, memory_order_relaxed);
-    if (dropped > 0)
-        fprintf(log_out, "[LOG DROPPED - %llu lines while the sink was blocked]\n",
-                (unsigned long long)dropped);
+    if (dropped > 0) fprintf(log_out, TDB_LOG_DROPPED_FMT, (unsigned long long)dropped);
 
     fprintf(log_out, "[%04d-%02d-%02dT%02d:%02d:%02d.%03dZ] [%s] %s:%d: ",
             tm_info.tm_year + TDB_LOG_TM_YEAR_BASE, tm_info.tm_mon + TDB_LOG_TM_MONTH_BASE,
@@ -122,8 +125,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
                 if (_tidesdb_log_file)
                 {
                     tdb_setlinebuf(_tidesdb_log_file);
-                    fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
-                            _tidesdb_log_truncate);
+                    fprintf(_tidesdb_log_file, TDB_LOG_TRUNCATED_FMT, _tidesdb_log_truncate);
                     fflush(_tidesdb_log_file);
                 }
             }

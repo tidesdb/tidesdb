@@ -11,7 +11,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 10.0.1
+	VERSION 10.0.2
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)

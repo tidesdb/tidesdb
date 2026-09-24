@@ -17,13 +17,18 @@ Everything else in this manual happens between those two calls.
 The handle, `tidesdb_t *`, is opaque and thread-safe. One handle serves every thread in
 the process, and a directory is held by **one handle at a time**.
 
-That is enforced rather than left to the caller. Opening takes an exclusive lock file in the
-database directory, and a second open — from this process or from another — is refused with
-`TDB_ERR_LOCKED` rather than being allowed to corrupt the store. Both axes are covered: the lock
-itself keeps other processes out, and a recorded owner pid keeps the same process out, since
-`fcntl` locks are per-process and would otherwise let one caller re-lock a directory it already
-holds. The lock is released last of all on close, so the directory is available again as soon as
-[`tidesdb_close`](#tidesdb_close) returns.
+That is enforced rather than left to the caller. Opening takes an exclusive lock on a `LOCK` file
+in the database directory, and a second open — from this process or from another — is refused with
+`TDB_ERR_LOCKED` rather than being allowed to corrupt the store. The lock belongs to the open file,
+not to the process: `F_OFD_SETLK` on Linux and illumos, `flock` on macOS and the BSDs, `LockFileEx`
+on Windows. So one lock covers both cases. A second open from the same process opens the file again
+and is refused by the lock itself, and nothing else the process does with the file can release it.
+The lock is released last of all on close, so the directory is available again as soon as
+[`tidesdb_close`](#tidesdb_close) returns. A process that dies releases it too, since the operating
+system drops the lock with the descriptor.
+
+A child created with `fork` and no `exec` shares the parent's descriptor, and with it the lock,
+until it exits. Neither can open the directory a second time while that shared descriptor is open.
 
 ## tidesdb_default_config
 

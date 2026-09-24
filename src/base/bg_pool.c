@@ -16,6 +16,7 @@
 #endif
 
 #include "log.h"
+#include "thread.h"
 
 /* max stored thread-name prefix, sized to the 16-char os thread-name limit so the final
  * "<prefix>.<index>" is truncated by snprintf rather than overrunning */
@@ -34,7 +35,7 @@
  */
 struct bg_pool
 {
-    pthread_t *threads;
+    tdb_thread_t *threads;
     int num_threads;
     _Atomic(int) live;
     queue_t *queue;
@@ -107,7 +108,7 @@ static bg_pool_t *bg_pool_start_impl(const int num_threads, queue_t *queue, cons
 
     bg_pool_t *pool = calloc(1, sizeof(*pool));
     if (!pool) return NULL;
-    pool->threads = calloc((size_t)num_threads, sizeof(pthread_t));
+    pool->threads = calloc((size_t)num_threads, sizeof(tdb_thread_t));
     if (!pool->threads)
     {
         free(pool);
@@ -132,7 +133,7 @@ static bg_pool_t *bg_pool_start_impl(const int num_threads, queue_t *queue, cons
             targ->index = i;
         }
         atomic_fetch_add_explicit(&pool->live, 1, memory_order_acq_rel);
-        if (!targ || pthread_create(&pool->threads[i], NULL, bg_pool_thread, targ) != 0)
+        if (!targ || tdb_thread_start(&pool->threads[i], bg_pool_thread, targ) != 0)
         {
             /* creation failed -- free the unused arg, undo this slot's live bump, then shut down
              * and join whatever did start so the caller never leaks a half-built pool */
@@ -166,7 +167,7 @@ void bg_pool_stop(bg_pool_t *pool)
     if (!pool) return;
     queue_shutdown(pool->queue);
     for (int i = 0; i < pool->num_threads; i++)
-        if (pool->threads) pthread_join(pool->threads[i], NULL);
+        if (pool->threads) tdb_thread_finish(&pool->threads[i]);
     free(pool->threads);
     free(pool);
 }

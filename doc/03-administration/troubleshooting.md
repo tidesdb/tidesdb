@@ -245,6 +245,12 @@ backpressure events.
 The sink is process-wide, not per-database. If your process opens several, the last one opened with
 `log_to_file` owns the file and the others log into it too, until that handle closes.
 
+A sink that stops accepting output, such as stderr piped to a reader that has stalled, never parks
+the engine behind it. One line is written at a time, and a thread that finds the sink held by a
+writer stuck in its write waits a bounded moment, then drops its line and carries on. The next line
+that gets through is preceded by `[LOG DROPPED - N lines while the sink was blocked]`, so a gap in
+the log is marked. The thread stuck in the write itself stays there until the sink moves.
+
 A rotation the engine considers slow is logged specifically, because it runs on a committing thread
 and lands directly in write latency where it is otherwise invisible. The line carries the duration
 it measured and a breakdown of where it went — opening the next log, allocating the memtable,

@@ -12,6 +12,7 @@
 #include <time.h>
 
 #include "log.h"
+#include "thread.h"
 #include "waitstat.h" /* tdb_wait_deadline and the condvar clock it pairs with */
 
 /**
@@ -27,7 +28,7 @@
  */
 struct bg_ticker
 {
-    pthread_t thread;
+    tdb_thread_t thread;
     _Atomic(int) active;
     pthread_mutex_t mtx;
     pthread_cond_t cond;
@@ -69,7 +70,7 @@ bg_ticker_t *bg_ticker_start(const uint64_t interval_us, bg_ticker_fn tick, void
     pthread_mutex_init(&ticker->mtx, NULL);
     tdb_cond_init_monotonic(&ticker->cond);
 
-    if (pthread_create(&ticker->thread, NULL, bg_ticker_thread, ticker) != 0)
+    if (tdb_thread_start(&ticker->thread, bg_ticker_thread, ticker) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "could not start a ticker thread on a %llu us interval",
                       (unsigned long long)interval_us);
@@ -94,7 +95,7 @@ void bg_ticker_stop(bg_ticker_t *ticker)
     if (!ticker) return;
     atomic_store_explicit(&ticker->active, 0, memory_order_release);
     bg_ticker_wake(ticker);
-    pthread_join(ticker->thread, NULL);
+    tdb_thread_finish(&ticker->thread);
     pthread_mutex_destroy(&ticker->mtx);
     pthread_cond_destroy(&ticker->cond);
     free(ticker);

@@ -76,7 +76,7 @@ API can be read as a list of intentions and the engine as a list of mechanisms.
 | `src/fdmanager/` | A descriptor budget that waits out file-descriptor pressure inside the engine, so exhaustion becomes backpressure instead of failure. |
 | `src/io/` | The block manager: framing, durability, preallocation, and the buffered append ring. |
 | `src/datastructures/` | The skip list backing the memtable, and the queue backing the work queues. |
-| `src/base/` | Errors, logging, serialization, arena allocation, and the lock-free reclamation primitives everything else uses. |
+| `src/base/` | Errors, logging, serialization, arena allocation, thread start and finish, and the lock-free reclamation primitives everything else uses. |
 | `src/internal/` | The memtable type and the two tombstone flag bits the write path carries from the memtable down into an sstable. |
 | `src/platform/`, `src/threadmanager/` | Portability and thread pools. |
 

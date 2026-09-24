@@ -405,7 +405,7 @@ int block_manager_close(block_manager_t *bm)
         pthread_mutex_lock(&bm->buf_mtx);
         pthread_cond_signal(&bm->buf_work_cv);
         pthread_mutex_unlock(&bm->buf_mtx);
-        pthread_join(bm->flush_tid, NULL);
+        tdb_thread_finish(&bm->flush_thread);
         /* a clean drain left every done-ring flag cleared, so return the warm buffer pair to the
          * pool for the next WAL. a flush error may have left flags set, so free that pair instead.
          */
@@ -623,7 +623,7 @@ int block_manager_open_buffered(block_manager_t **bm, const char *file_path, con
     tdb_cond_init_monotonic(&b->buf_durable_cv);
     b->buffered = 1;
 
-    if (pthread_create(&b->flush_tid, NULL, bm_flush_thread, b) != 0)
+    if (tdb_thread_start(&b->flush_thread, bm_flush_thread, b) != 0)
     {
         b->buffered = 0;
         pthread_mutex_destroy(&b->buf_mtx);

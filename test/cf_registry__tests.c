@@ -196,10 +196,13 @@ void test_cf_registry_iteration(void)
 
 /* a membership change has to come back in less than this. the failure being guarded against is
  * unbounded -- minutes, or never -- so the bound only has to be finite, and it is set well above
- * the microseconds a publish actually takes so that a slow or oversubscribed runner cannot fail it.
- * this covers the whole window including the writer thread's first schedule, which on a machine
- * whose cores are all busy spinning is the one part not under the test's control */
+ * the microseconds a publish actually takes so a slow or oversubscribed runner cannot fail it */
 #define CR_PUBLISH_BUDGET_US 5000000ull
+
+/* how long the writer thread may take to run at all. starting it is the scheduler's job, not the
+ * registry's, and with every core spinning a new thread can wait seconds for its first slice, so
+ * the publish budget starts once the writer has entered rather than when it was created */
+#define CR_WRITER_START_BUDGET_US 60000000ull
 
 /* enough publishes to catch one that is only occasionally starved, few enough that a build which
  * fails them all still finishes in seconds */
@@ -322,6 +325,10 @@ void test_cf_registry_publish_under_sustained_readers(void)
 
     /* watched rather than joined: a writer stuck in the fault never returns, and joining it would
      * hang the suite instead of failing it */
+    const uint64_t start_deadline = tdb_monotonic_us() + CR_WRITER_START_BUDGET_US;
+    while (atomic_load_explicit(&load.entered, memory_order_acquire) == 0 &&
+           tdb_monotonic_us() < start_deadline)
+        usleep(1000);
     const uint64_t deadline = tdb_monotonic_us() + CR_PUBLISH_BUDGET_US;
     while (atomic_load_explicit(&load.published, memory_order_acquire) < CR_PUBLISH_ROUNDS &&
            tdb_monotonic_us() < deadline)
@@ -341,6 +348,10 @@ void test_cf_registry_publish_under_sustained_readers(void)
     /* an add that came back with an error is a different fault from one that never came back, and
      * only the second is what this test exists for */
     ASSERT_EQ(atomic_load(&load.last_rc), TDB_SUCCESS);
+
+    /* a writer that never ran touched no registry code, so it is kept apart from one that entered
+     * and never came back */
+    ASSERT_TRUE(atomic_load(&load.entered) > 0);
 
     /* asserted before the joins, since a writer still inside the fault is exactly the case this
      * catches and there is nothing to join it to */

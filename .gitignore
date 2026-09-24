@@ -29,5 +29,4 @@ build-wmu.log
 .vscode
 vcpkg_installed
 .vs
-fuzz/corpus
 doc/*.pdf

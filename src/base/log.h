@@ -24,7 +24,8 @@ extern char _tidesdb_log_path[MAX_FILE_PATH_LENGTH]; /* sink file path, reopened
 /**
  * tidesdb_log_write
  * write one timestamped line to the configured sink, reopening and truncating the file when it
- * grows past the configured threshold
+ * grows past the configured threshold, and dropping and counting the line when another writer holds
+ * the sink past a bounded wait so the next line written reports the count
  * @param level severity, one of the TDB_LOG_* levels from db.h
  * @param file source file name, typically __FILE__
  * @param line source line number, typically __LINE__

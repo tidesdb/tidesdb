@@ -232,8 +232,8 @@ the dwell itself, paid by the commits that would otherwise have hit the wall.
 
 :::caution[A clean close is what makes the weakest mode safe]
 Nothing waits for a staged record under `TDB_SYNC_NONE`, so the only thing that guarantees it
-reaches disk on an orderly shutdown is that closing a block manager joins its flush thread and
-drains the ring before touching the descriptor. Break that and the mode loses data on a clean
+reaches disk on an orderly shutdown is that closing a block manager waits for its flush thread to
+drain the ring and exit before touching the descriptor. Break that and the mode loses data on a clean
 close, silently, which no crash test would catch.
 :::
 

@@ -8,6 +8,7 @@
  */
 
 #include "../src/base/encoding/serialization.h" /* TDB_CF_INDEX_MAX */
+#include "../src/base/thread.h"                 /* threads retired without a join */
 #include "../src/base/waitstat.h" /* tdb_monotonic_us, for a duration the wall clock cannot give */
 #include "../src/column_family/column_family.h" /* cf_t, for level inspection */
 #include "../src/column_family/level/level_set.h"
@@ -2389,8 +2390,8 @@ void test_engine_rename_completes_under_concurrent_writes(void)
     w.cf = busy;
     atomic_init(&w.stop, 0);
     atomic_init(&w.commits, 0);
-    pthread_t writer;
-    ASSERT_EQ(pthread_create(&writer, NULL, engine_test_commit_until_stopped, &w), 0);
+    tdb_thread_t writer;
+    ASSERT_EQ(tdb_thread_start(&writer, engine_test_commit_until_stopped, &w), 0);
 
     /* let the writer get going, so the rename genuinely overlaps live commits and live flushes */
     while (atomic_load(&w.commits) < ENGINE_TEST_RENAME_MIN_COMMITS)
@@ -2409,7 +2410,7 @@ void test_engine_rename_completes_under_concurrent_writes(void)
     ASSERT_TRUE(atomic_load(&w.commits) > c0);
 
     atomic_store(&w.stop, 1);
-    pthread_join(writer, NULL);
+    tdb_thread_finish(&writer);
 
     ASSERT_TRUE(tidesdb_get_column_family(db, "renamed") != NULL);
     ASSERT_TRUE(tidesdb_get_column_family(db, "kv") == NULL);
@@ -2549,16 +2550,16 @@ void test_engine_preparing_a_spare_log_strands_no_file(void)
     ASSERT_TRUE(before >= 0);
 
     _Atomic(int) gate = 0;
-    pthread_t threads[ENGINE_TEST_SPARE_PREPARERS];
+    tdb_thread_t threads[ENGINE_TEST_SPARE_PREPARERS];
     engine_spare_prepare_arg_t args[ENGINE_TEST_SPARE_PREPARERS];
     for (int i = 0; i < ENGINE_TEST_SPARE_PREPARERS; i++)
     {
         args[i].db = db;
         args[i].gate = &gate;
-        ASSERT_EQ(pthread_create(&threads[i], NULL, engine_test_prepare_spare_wal, &args[i]), 0);
+        ASSERT_EQ(tdb_thread_start(&threads[i], engine_test_prepare_spare_wal, &args[i]), 0);
     }
     atomic_store_explicit(&gate, 1, memory_order_release);
-    for (int i = 0; i < ENGINE_TEST_SPARE_PREPARERS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < ENGINE_TEST_SPARE_PREPARERS; i++) tdb_thread_finish(&threads[i]);
 
     /* one spare was installed, so at most one log joined the directory */
     const int after = engine_count_wal_logs_on_disk(db_path);
@@ -3357,15 +3358,15 @@ void test_engine_create_completes_under_sustained_flush(void)
     w.cf = busy;
     atomic_init(&w.stop, 0);
     atomic_init(&w.commits, 0);
-    pthread_t writers[ENGINE_TEST_CREATE_WRITERS];
+    tdb_thread_t writers[ENGINE_TEST_CREATE_WRITERS];
     for (int i = 0; i < ENGINE_TEST_CREATE_WRITERS; i++)
-        ASSERT_EQ(pthread_create(&writers[i], NULL, engine_test_commit_until_stopped, &w), 0);
+        ASSERT_EQ(tdb_thread_start(&writers[i], engine_test_commit_until_stopped, &w), 0);
 
     /* the readers are what keep the shared reader epoch occupied, so a flush finishing an install
      * finds the immutable it just wrote still pinned */
-    pthread_t readers[ENGINE_TEST_CREATE_READERS];
+    tdb_thread_t readers[ENGINE_TEST_CREATE_READERS];
     for (int i = 0; i < ENGINE_TEST_CREATE_READERS; i++)
-        ASSERT_EQ(pthread_create(&readers[i], NULL, engine_test_read_until_stopped, &w), 0);
+        ASSERT_EQ(tdb_thread_start(&readers[i], engine_test_read_until_stopped, &w), 0);
 
     while (atomic_load(&w.commits) < ENGINE_TEST_CREATE_MIN_COMMITS)
         usleep(ENGINE_TEST_LOCKED_BACKOFF_US);
@@ -3379,8 +3380,8 @@ void test_engine_create_completes_under_sustained_flush(void)
     const long long elapsed = (long long)((tdb_monotonic_us() - started_us) / 1000000ull);
 
     atomic_store(&w.stop, 1);
-    for (int i = 0; i < ENGINE_TEST_CREATE_WRITERS; i++) pthread_join(writers[i], NULL);
-    for (int i = 0; i < ENGINE_TEST_CREATE_READERS; i++) pthread_join(readers[i], NULL);
+    for (int i = 0; i < ENGINE_TEST_CREATE_WRITERS; i++) tdb_thread_finish(&writers[i]);
+    for (int i = 0; i < ENGINE_TEST_CREATE_READERS; i++) tdb_thread_finish(&readers[i]);
 
     ASSERT_EQ(rc, TDB_SUCCESS);
 
@@ -3716,9 +3717,9 @@ void test_engine_read_survives_a_compaction_moving_levels(void)
     atomic_init(&st.stop, 0);
     atomic_init(&st.missing, 0);
 
-    pthread_t readers[ENGINE_LAYOUT_RACE_READERS];
+    tdb_thread_t readers[ENGINE_LAYOUT_RACE_READERS];
     for (int i = 0; i < ENGINE_LAYOUT_RACE_READERS; i++)
-        ASSERT_EQ(pthread_create(&readers[i], NULL, engine_layout_race_reader, &st), 0);
+        ASSERT_EQ(tdb_thread_start(&readers[i], engine_layout_race_reader, &st), 0);
 
     /* drive the table down the levels under the reader. each pass can move it into a level that was
      * empty a moment earlier, which is the shape the mask snapshot gets wrong */
@@ -3728,7 +3729,7 @@ void test_engine_read_survives_a_compaction_moving_levels(void)
         ASSERT_TRUE(rc == TDB_SUCCESS || rc == TDB_ERR_LOCKED);
     }
     atomic_store(&st.stop, 1);
-    for (int i = 0; i < ENGINE_LAYOUT_RACE_READERS; i++) pthread_join(readers[i], NULL);
+    for (int i = 0; i < ENGINE_LAYOUT_RACE_READERS; i++) tdb_thread_finish(&readers[i]);
 
     ASSERT_EQ(atomic_load(&st.missing), 0);
 

@@ -146,9 +146,6 @@ jobs:
               [ "$ok" = 1 ] && break
             done
             [ "$ok" = 1 ] || { echo "all mirrors failed to provide packages"; exit 1; }
-            # TEMPORARY-NETBSD-HANG-PROBE: a debugger to attach to a hung test. base usually
-            # ships gdb in the comp set; the package is only the fallback, and best effort
-            command -v gdb >/dev/null 2>&1 || /usr/sbin/pkg_add gdb || true
           run: |
             echo "*=====================================*"
             echo " System Information"
@@ -163,11 +160,8 @@ jobs:
             # no sanitizer here -- ASan does not sit with NetBSD's ASLR and the instrumented
             # binary exits before running a test, so the suite would pass by not running. the
             # build system refuses it on this platform too, so this is belt and braces.
-            # TEMPORARY-NETBSD-HANG-PROBE: RelWithDebInfo so a hang's stacks carry function
-            # names and lines rather than bare addresses
             cmake -S . -B build \
-              -DTIDESDB_BUILD_TESTS=ON \
-              -DCMAKE_BUILD_TYPE=RelWithDebInfo
+              -DTIDESDB_BUILD_TESTS=ON
 
             echo ""
             echo "*=====================================*"
@@ -185,40 +179,7 @@ jobs:
             # beyond ninety seconds, and this platform has intermittently parked one test for
             # minutes -- at the default a single stall holds the runner for the whole ninety-minute
             # ceiling, so the timeout is what turns that into a prompt failure
-            # TEMPORARY-NETBSD-HANG-PROBE: the hang has only ever appeared under ctest, never in
-            # the same binary run directly, so watch ctest's own test process. one that is still
-            # the running test after HANG_S gets every thread's stack dumped by gdb before
-            # ctest's timeout kills it. gdb writes to a file -- piped into head, SIGPIPE kills gdb
-            # and gdb takes the traced process down with it
-            HANG_S=150
-            ctest -V --output-on-failure --timeout 300 --build-config Release &
-            ctest_pid=$!
-            seen_pid=""
-            seen_s=0
-            dumped_pid=""
-            while kill -0 "$ctest_pid" 2>/dev/null; do
-              sleep 5
-              cur_pid=$(pgrep -P "$ctest_pid" | head -n 1)
-              if [ -n "$cur_pid" ] && [ "$cur_pid" = "$seen_pid" ]; then
-                seen_s=$((seen_s + 5))
-              else
-                seen_pid="$cur_pid"
-                seen_s=0
-              fi
-              if [ -n "$cur_pid" ] && [ "$seen_s" -ge "$HANG_S" ] && [ "$cur_pid" != "$dumped_pid" ]; then
-                echo "HUNG pid $cur_pid ($(ps -o comm= -p "$cur_pid")) after ${HANG_S}s -- dumping every thread"
-                gdb -p "$cur_pid" -batch \
-                  -ex "set pagination off" \
-                  -ex "info threads" \
-                  -ex "thread apply all bt full" > hang_stacks.txt 2>&1
-                echo "----- stacks -----"
-                cat hang_stacks.txt
-                echo "----- end stacks -----"
-                dumped_pid="$cur_pid"
-              fi
-            done
-            wait "$ctest_pid"
-            exit $?
+            ctest -V --output-on-failure --timeout 300 --build-config Release
 
   omnios-build:
     runs-on: ubuntu-latest

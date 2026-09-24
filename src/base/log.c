@@ -33,10 +33,40 @@ size_t _tidesdb_log_truncate = 0;
 /* global sink file path, used to reopen the file when truncation fires */
 char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 
+/* a log call waits for the sink this long, as yields and then naps, before dropping its line. a
+ * write to a pipe or terminal whose reader has stalled can block indefinitely, and waiting behind
+ * it without limit would park every thread that logs, flush install and memtable rotation among
+ * them. ordinary contention clears in microseconds, well inside the yields */
+#define TDB_LOG_LOCK_YIELDS 64
+#define TDB_LOG_LOCK_NAPS   100
+#define TDB_LOG_LOCK_NAP_US 1000
+
 /* serializes sink writes and the truncation reopen so a concurrent writer never touches a closed
  * file
  */
 static pthread_mutex_t tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* lines dropped because the sink stayed held past the wait, reported by the next line written */
+static _Atomic(uint64_t) tidesdb_log_dropped = 0;
+
+/**
+ * tidesdb_log_lock_bounded
+ * take the sink lock, yielding and then napping between attempts, and give up once the wait is
+ * spent
+ * @return 1 holding the lock, 0 when another writer kept it for the whole wait
+ */
+static int tidesdb_log_lock_bounded(void)
+{
+    for (int attempt = 0; attempt < TDB_LOG_LOCK_YIELDS + TDB_LOG_LOCK_NAPS; attempt++)
+    {
+        if (pthread_mutex_trylock(&tidesdb_log_mutex) == 0) return 1;
+        if (attempt < TDB_LOG_LOCK_YIELDS)
+            cpu_yield();
+        else
+            usleep(TDB_LOG_LOCK_NAP_US);
+    }
+    return 0;
+}
 
 void tidesdb_log_write(const int level, const char *file, const int line, const char *fmt, ...)
 {
@@ -52,9 +82,19 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
                             : (level == TDB_LOG_WARN) ? "WARN"
                                                       : "ERROR";
 
-    pthread_mutex_lock(&tidesdb_log_mutex);
+    if (!tidesdb_log_lock_bounded())
+    {
+        atomic_fetch_add_explicit(&tidesdb_log_dropped, 1, memory_order_relaxed);
+        return;
+    }
 
     FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
+
+    const uint64_t dropped =
+        atomic_exchange_explicit(&tidesdb_log_dropped, 0, memory_order_relaxed);
+    if (dropped > 0)
+        fprintf(log_out, "[LOG DROPPED - %llu lines while the sink was blocked]\n",
+                (unsigned long long)dropped);
 
     fprintf(log_out, "[%04d-%02d-%02dT%02d:%02d:%02d.%03dZ] [%s] %s:%d: ",
             tm_info.tm_year + TDB_LOG_TM_YEAR_BASE, tm_info.tm_mon + TDB_LOG_TM_MONTH_BASE,

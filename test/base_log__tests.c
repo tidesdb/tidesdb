@@ -138,6 +138,98 @@ void test_log_set_sink_null_routes_stderr(void)
     remove(TEST_LOG_PATH);
 }
 
+#ifdef _WIN32
+#include <fcntl.h>
+#define test_pipe(fds)           _pipe((fds), TEST_LOG_PIPE_BYTES, _O_BINARY)
+#define test_pipe_read(fd, b, n) _read((fd), (b), (unsigned int)(n))
+#define test_pipe_close(fd)      _close(fd)
+#define test_fdopen(fd, mode)    _fdopen((fd), (mode))
+#else
+#define test_pipe(fds)           pipe(fds)
+#define test_pipe_read(fd, b, n) read((fd), (b), (n))
+#define test_pipe_close(fd)      close(fd)
+#define test_fdopen(fd, mode)    fdopen((fd), (mode))
+#endif
+
+/* capacity asked of the pipe where the platform takes one, and a message several times any pipe's
+ * capacity so writing it blocks until the reader drains */
+#define TEST_LOG_PIPE_BYTES     4096
+#define TEST_LOG_BLOCKING_BYTES (1024 * 1024)
+
+/* long enough for the blocking writer to take the sink and park in its write */
+#define TEST_LOG_SETTLE_US 200000
+
+typedef struct
+{
+    const char *message;
+    _Atomic(int) started;
+    _Atomic(int) finished;
+} test_log_blocker_t;
+
+static void *test_log_blocking_writer(void *arg)
+{
+    test_log_blocker_t *b = arg;
+    atomic_store(&b->started, 1);
+    tidesdb_log_write(TDB_LOG_INFO, "unit.c", 1, "%s", b->message);
+    atomic_store(&b->finished, 1);
+    return NULL;
+}
+
+/* a writer parked on a sink nobody drains holds the sink, and another thread's line is dropped
+ * after a bounded wait rather than parking behind it, then reported once the sink moves again */
+void test_log_blocked_sink_does_not_park_other_writers(void)
+{
+    int fds[2];
+    ASSERT_TRUE(test_pipe(fds) == 0);
+    FILE *w = test_fdopen(fds[1], "wb");
+    ASSERT_TRUE(w != NULL);
+    tidesdb_log_set_sink(w, 0, NULL);
+
+    char *big = malloc(TEST_LOG_BLOCKING_BYTES + 1);
+    ASSERT_TRUE(big != NULL);
+    memset(big, 'x', TEST_LOG_BLOCKING_BYTES);
+    big[TEST_LOG_BLOCKING_BYTES] = '\0';
+
+    test_log_blocker_t blocker = {.message = big, .started = 0, .finished = 0};
+    pthread_t t;
+    ASSERT_TRUE(pthread_create(&t, NULL, test_log_blocking_writer, &blocker) == 0);
+    while (!atomic_load(&blocker.started)) usleep(1000);
+    usleep(TEST_LOG_SETTLE_US);
+    ASSERT_TRUE(!atomic_load(&blocker.finished));
+
+    /* the call under test, it must return while the blocker still holds the sink */
+    tidesdb_log_write(TDB_LOG_INFO, "unit.c", 2, "dropped line");
+    ASSERT_TRUE(!atomic_load(&blocker.finished));
+
+    /* drain the blocker's line so it finishes, then write one more line and read to its end */
+    char buf[65536];
+    size_t seen = 0;
+    while (seen <= TEST_LOG_BLOCKING_BYTES)
+    {
+        const long n = (long)test_pipe_read(fds[0], buf, sizeof(buf));
+        ASSERT_TRUE(n > 0);
+        seen += (size_t)n;
+    }
+    pthread_join(t, NULL);
+
+    tidesdb_log_write(TDB_LOG_INFO, "unit.c", 3, "after the sink moved");
+    size_t len = 0;
+    buf[0] = '\0';
+    while (strstr(buf, "after the sink moved") == NULL && len < sizeof(buf) - 1)
+    {
+        const long n = (long)test_pipe_read(fds[0], buf + len, sizeof(buf) - 1 - len);
+        ASSERT_TRUE(n > 0);
+        len += (size_t)n;
+        buf[len] = '\0';
+    }
+    ASSERT_TRUE(strstr(buf, "LOG DROPPED - 1 lines") != NULL);
+    ASSERT_TRUE(strstr(buf, "dropped line") == NULL);
+
+    tidesdb_log_close_sink();
+    test_pipe_close(fds[0]);
+    free(big);
+}
+
 /* closing an already-stderr sink is a harmless no-op */
 void test_log_close_sink_idempotent(void)
 {
@@ -156,6 +248,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_log_truncation, tests_passed);
     RUN_TEST(test_log_set_sink_null_routes_stderr, tests_passed);
     RUN_TEST(test_log_close_sink_idempotent, tests_passed);
+    RUN_TEST(test_log_blocked_sink_does_not_park_other_writers, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

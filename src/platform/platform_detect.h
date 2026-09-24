@@ -77,7 +77,7 @@
 
 /* file lock error codes */
 #define TDB_LOCK_SUCCESS 0 /* lock acquired successfully */
-#define TDB_LOCK_HELD    1 /* lock is held by another process (EWOULDBLOCK/EAGAIN) */
+#define TDB_LOCK_HELD    1 /* lock is held through another open of the file (EWOULDBLOCK/EAGAIN) */
 #define TDB_LOCK_ERROR   2 /* irrecoverable error */
 
 /* default retry count for EINTR during lock acquisition */

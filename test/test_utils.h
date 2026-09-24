@@ -150,6 +150,8 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
  * @param flag the argument that puts the child into its child mode
  * @param phase which crash phase the child should run
  * @param nth the crash point within that phase, as a decimal string
+ * @param exit_code set to the child's exit status when it exited normally and -1 when it died, or
+ *                  NULL when the caller does not need it
  * @return 0 once the child has exited, or -1 if it could not be started
  */
 /* the status a child reports when the exec itself failed, chosen as the shell's convention for a
@@ -157,11 +159,14 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
 #define TEST_SPAWN_EXEC_FAILED 127
 
 static UNUSED int test_spawn_self(const char *exe, const char *flag, const char *phase,
-                                  const char *nth)
+                                  const char *nth, int *exit_code)
 {
 #ifdef _WIN32
     const char *const args[] = {exe, flag, phase, nth, NULL};
-    return _spawnv(_P_WAIT, exe, args) == -1 ? -1 : 0;
+    const intptr_t status = _spawnv(_P_WAIT, exe, args);
+    if (status == -1) return -1;
+    if (exit_code) *exit_code = (int)status;
+    return 0;
 #else
     const pid_t pid = fork();
     if (pid < 0) return -1;
@@ -183,6 +188,7 @@ static UNUSED int test_spawn_self(const char *exe, const char *flag, const char 
         fprintf(stderr, "could not exec the child %s -- the crash phase never ran\n", exe);
         return -1;
     }
+    if (exit_code) *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return 0;
 #endif
 }

@@ -32,6 +32,16 @@ static int tests_failed = 0;
 #define CR_PHASE_FLUSH   "flush"
 #define CR_PHASE_WAL     "wal"
 #define CR_PHASE_COMPACT "compact"
+#define CR_PHASE_OPEN    "open"
+
+/* how the open phase's child reports what tidesdb_open returned, distinct from each other and from
+ * the status of a child that failed to start */
+#define CR_OPEN_EXIT_OPENED 0
+#define CR_OPEN_EXIT_LOCKED 3
+#define CR_OPEN_EXIT_OTHER  4
+
+/* the open phase takes no crash point, but the child's argument list is fixed */
+#define CR_OPEN_NTH "0"
 
 /* this binary's own path, kept from argv so a child can be started from it */
 static const char *cr_exe = NULL;
@@ -78,7 +88,7 @@ static void cr_run_round(const char *phase, uint64_t nth)
 {
     char nth_text[32];
     snprintf(nth_text, sizeof(nth_text), "%llu", (unsigned long long)nth);
-    ASSERT_EQ(test_spawn_self(cr_exe, CR_CHILD_FLAG, phase, nth_text), 0);
+    ASSERT_EQ(test_spawn_self(cr_exe, CR_CHILD_FLAG, phase, nth_text, NULL), 0);
 }
 
 static _Atomic(int) cr_flush_done = 0;
@@ -407,6 +417,54 @@ void test_crash_recovery_torn_compaction(void)
     (void)remove_directory(CR_DIR);
 }
 
+/* the open phase's child: try to open the database another process may hold, and report what the
+ * open returned through the exit status */
+static void cr_open_child(char *dir)
+{
+    tidesdb_config_t cfg = cr_config(dir);
+    tidesdb_t *db = NULL;
+    const int rc = tidesdb_open(&cfg, &db);
+    if (rc == TDB_SUCCESS)
+    {
+        (void)tidesdb_close(db);
+        _exit(CR_OPEN_EXIT_OPENED);
+    }
+    _exit(rc == TDB_ERR_LOCKED ? CR_OPEN_EXIT_LOCKED : CR_OPEN_EXIT_OTHER);
+}
+
+/* start the open phase's child against the directory and return what it reported */
+static int cr_open_from_another_process(void)
+{
+    int code = -1;
+    ASSERT_EQ(test_spawn_self(cr_exe, CR_CHILD_FLAG, CR_PHASE_OPEN, CR_OPEN_NTH, &code), 0);
+    return code;
+}
+
+/* a directory held by one process is refused to every other, and a refused open from the holder
+ * itself must not loosen that. on platforms whose locks belong to the process, the check for a
+ * same-process reopen closed a second descriptor on the lock file, and posix drops every lock a
+ * process holds on a file when it closes any descriptor on it -- so the holder's own refused
+ * reopen released its lock and the next process opened the database underneath it */
+void test_open_refused_across_processes_after_a_same_process_refusal(void)
+{
+    (void)remove_directory(CR_DIR);
+    char dir[] = CR_DIR;
+    tidesdb_config_t cfg = cr_config(dir);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+
+    ASSERT_EQ(cr_open_from_another_process(), CR_OPEN_EXIT_LOCKED);
+
+    tidesdb_t *second = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &second), TDB_ERR_LOCKED);
+    ASSERT_EQ(cr_open_from_another_process(), CR_OPEN_EXIT_LOCKED);
+
+    /* and closing hands the directory on */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    ASSERT_EQ(cr_open_from_another_process(), CR_OPEN_EXIT_OPENED);
+    (void)remove_directory(CR_DIR);
+}
+
 /* the child half of a round -- run the named phase at the given crash point and never return. an
  * unknown phase exits non-zero, so a mistyped name fails the round rather than passing quietly by
  * doing nothing at all */
@@ -416,6 +474,7 @@ static void cr_run_child(const char *phase, uint64_t nth)
     if (strcmp(phase, CR_PHASE_FLUSH) == 0) cr_child(dir, nth);
     if (strcmp(phase, CR_PHASE_WAL) == 0) cr_wal_child(dir, nth);
     if (strcmp(phase, CR_PHASE_COMPACT) == 0) cr_compact_child(dir, nth);
+    if (strcmp(phase, CR_PHASE_OPEN) == 0) cr_open_child(dir);
     _exit(2);
 }
 
@@ -434,6 +493,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_crash_recovery_torn_flush, tests_passed);
     RUN_TEST(test_crash_recovery_torn_wal_append, tests_passed);
     RUN_TEST(test_crash_recovery_torn_compaction, tests_passed);
+    RUN_TEST(test_open_refused_across_processes_after_a_same_process_refusal, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

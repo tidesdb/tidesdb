@@ -137,15 +137,23 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
 #include <io.h>
 #include <process.h>
 #else
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+/* the caller's environment, handed to the child unchanged; posix declares it but no header does */
+extern char **environ;
 #endif
 
 /* re-run this test binary as a child process and wait for it to finish. a crash test needs a real
  * process to lose, and fork is not portable -- so the child re-enters main and dispatches on the
  * arguments it was given rather than inheriting the parent's address space. that is also the
  * sturdier shape where threads are involved, since a forked child of a threaded process inherits
- * only the forking thread
+ * only the forking thread.
+ *
+ * the child is started with posix_spawn rather than fork and exec. a parent that holds a database
+ * open has its background threads running, and fork from a threaded process runs every library's
+ * fork handler in both halves -- under the address sanitizer on FreeBSD that parked the parent for
+ * good. posix_spawn goes straight to the exec with nothing of ours running in between
  * @param exe this binary's path, as main received it in argv[0]
  * @param flag the argument that puts the child into its child mode
  * @param phase which crash phase the child should run
@@ -168,22 +176,19 @@ static UNUSED int test_spawn_self(const char *exe, const char *flag, const char 
     if (exit_code) *exit_code = (int)status;
     return 0;
 #else
-    const pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0)
-    {
-        char *const args[] = {(char *)exe, (char *)flag, (char *)phase, (char *)nth, NULL};
-        execv(exe, args);
-        _exit(TEST_SPAWN_EXEC_FAILED); /* only reached when the exec itself failed */
-    }
+    char *const args[] = {(char *)exe, (char *)flag, (char *)phase, (char *)nth, NULL};
+    pid_t pid = 0;
+    const int spawn_rc = posix_spawn(&pid, exe, NULL, NULL, args, environ);
     int status = 0;
-    (void)waitpid(pid, &status, 0);
+    if (spawn_rc == 0) (void)waitpid(pid, &status, 0);
 
     /* the child is meant to die abnormally, so its status says almost nothing -- except in the one
      * case where it never became the child at all. an exec that failed is reported rather than
      * swallowed, because a caller that cannot tell it apart from a crash goes on to read a database
-     * nothing ever wrote and fails somewhere far away from the reason */
-    if (WIFEXITED(status) && WEXITSTATUS(status) == TEST_SPAWN_EXEC_FAILED)
+     * nothing ever wrote and fails somewhere far away from the reason. most spawns report that
+     * failure directly; one that reports it through the child uses the shell's exit status for it
+     */
+    if (spawn_rc != 0 || (WIFEXITED(status) && WEXITSTATUS(status) == TEST_SPAWN_EXEC_FAILED))
     {
         fprintf(stderr, "could not exec the child %s -- the crash phase never ran\n", exe);
         return -1;

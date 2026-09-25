@@ -322,7 +322,11 @@ three conditions together:
   read is a key that comes back the moment the interval stops being carried.
 
 Together those say the merge has just done the last of the interval's work, so its outputs are
-written without it. The test that pins the drop and the test that pins the carry are the same pair:
+written without it. A merge can also keep no version at all — every tombstone it read a base
+tombstone no sibling holds — while still carrying an interval it has not finished. It then writes a
+table holding the intervals and nothing else, the same table a flush writes for a family reached only
+by a delete, because an interval lives only in a table and a merge with no output would leave it
+nowhere. The test that pins the drop and the test that pins the carry are the same pair:
 `test_cf_source_compaction_drops_an_interval_it_has_finished` and
 `test_cf_source_compaction_carries_input_intervals`, the second of which leaves a table outside the
 merge holding a covered key precisely so the interval must survive.

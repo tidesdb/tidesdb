@@ -52,6 +52,25 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n);
 void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, size_t size);
 
 /**
+ * bloom_filter_hash
+ * the one hash every index bit of an entry derives from, so a caller that must know its element
+ * count before it can size a filter can keep this per entry and add from it later
+ * @param entry the entry bytes
+ * @param size the entry length
+ * @return the 64-bit hash bloom_filter_add and the serialized query both split
+ */
+uint64_t bloom_filter_hash(const uint8_t *entry, size_t size);
+
+/**
+ * bloom_filter_add_hash
+ * add an entry by the hash bloom_filter_hash gave for it, setting the same bits bloom_filter_add
+ * would have; a no-op if bf is NULL
+ * @param bf the filter to add to
+ * @param hash the entry's hash from bloom_filter_hash
+ */
+void bloom_filter_add_hash(const bloom_filter_t *bf, uint64_t hash);
+
+/**
  * bloom_filter_serialize
  * serialize a filter to a compact buffer: a big-endian m and h header, then the raw bitset as
  * big-endian words, sized exactly. the format is probed in place by

@@ -258,6 +258,56 @@ void test_bbf_single_key()
     store_free(&store);
 }
 
+/* keys in a small table, a full partition, and the one key that spills into a second partition */
+#define TEST_BBF_SMALL_KEYS     1000
+#define TEST_BBF_FULL_PARTITION TDB_PR_FILTER_DEFAULT_PARTITION_ENTRIES
+#define TEST_BBF_SPILL_KEYS     (TDB_PR_FILTER_DEFAULT_PARTITION_ENTRIES + 1)
+/* a full partition holds this many times the keys of the small table, so its filter must hold at
+ * least half that many times the bits, which no partition sized for a full table could satisfy */
+#define TEST_BBF_SIZE_RATIO_FLOOR (TEST_BBF_FULL_PARTITION / TEST_BBF_SMALL_KEYS / 2)
+/* the most a one-key partition may add to the store, header and one word included */
+#define TEST_BBF_ONE_KEY_BLOB_MAX 64
+
+/**
+ * partition_bytes
+ * build a filter over n keys and return the bytes its partitions took, the directory excluded
+ * @param n keys to add
+ * @return partition blob bytes
+ */
+static size_t partition_bytes(const int n)
+{
+    bbf_store_t store = {0};
+    pr_filter_builder_t *b = NULL;
+    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
+    for (int i = 0; i < n; i++)
+    {
+        uint8_t key[16];
+        size_t klen = make_key(i, key);
+        ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+    }
+    uint64_t dir_off = 0;
+    uint32_t dir_size = 0;
+    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
+    pr_filter_builder_free(b);
+    const size_t bytes = store.len - dir_size;
+    store_free(&store);
+    return bytes;
+}
+
+/* a partition's bits track the keys it holds. a small table's filter is a small fraction of a full
+ * partition's, and the one key that spills into a second partition costs a one-key filter, not a
+ * second full one -- sized up front for a full partition, every partial partition cost the same as
+ * a full one */
+void test_bbf_partition_bits_track_its_keys()
+{
+    const size_t small = partition_bytes(TEST_BBF_SMALL_KEYS);
+    const size_t full = partition_bytes(TEST_BBF_FULL_PARTITION);
+    const size_t spilled = partition_bytes(TEST_BBF_SPILL_KEYS);
+    ASSERT_TRUE(small * TEST_BBF_SIZE_RATIO_FLOOR < full);
+    ASSERT_TRUE(spilled > full);
+    ASSERT_TRUE(spilled - full <= TEST_BBF_ONE_KEY_BLOB_MAX);
+}
+
 /* a directory whose partition count exceeds what its bytes could hold is rejected, leaving the
  * reader unset so a caller cannot mistake the failure for an opened filter */
 void test_bbf_implausible_partition_count_is_rejected()
@@ -447,6 +497,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_bbf_false_positive_rate, tests_passed);
     RUN_TEST(test_bbf_empty_build, tests_passed);
     RUN_TEST(test_bbf_single_key, tests_passed);
+    RUN_TEST(test_bbf_partition_bits_track_its_keys, tests_passed);
     RUN_TEST(test_bbf_implausible_partition_count_is_rejected, tests_passed);
     RUN_TEST(test_bbf_free_null_safe, tests_passed);
     RUN_TEST(test_bbf_block_manager_backed, tests_passed);

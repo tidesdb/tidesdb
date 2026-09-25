@@ -71,8 +71,13 @@ struct pr_filter_builder
     pr_filter_write_fn write_fn;
     void *write_ctx;
 
-    bloom_filter_t *current; /* partition being filled, NULL between partitions */
-    uint32_t current_count;
+    /* the open partition's keys, as the hashes their bits derive from. a bloom filter's bit count
+     * is fixed when it is created, and the count of keys a partition ends up holding is only known
+     * when it is sealed, so the hashes are held until then and the filter is built to the exact
+     * count. sizing the filter up front for a full partition made every partial partition, which is
+     * the last one of every table and the only one of a small table, cost as much as a full one */
+    uint64_t *current_hashes; /* partition_entries slots, allocated once */
+    uint32_t current_count;   /* hashes held, 0 between partitions */
     uint8_t *current_first_key;
     uint32_t current_first_key_len;
 
@@ -120,6 +125,12 @@ int pr_filter_builder_new(pr_filter_builder_t **out, double fpr, uint32_t partit
     b->partition_entries = partition_entries;
     b->write_fn = write_fn;
     b->write_ctx = write_ctx;
+    b->current_hashes = malloc((size_t)partition_entries * sizeof(*b->current_hashes));
+    if (!b->current_hashes)
+    {
+        free(b);
+        return -1;
+    }
     *out = b;
     return 0;
 }
@@ -129,10 +140,17 @@ int pr_filter_builder_new(pr_filter_builder_t **out, double fpr, uint32_t partit
  * is open. */
 static int bbf_seal_current(pr_filter_builder_t *b)
 {
-    if (!b->current) return 0;
+    if (b->current_count == 0) return 0;
+
+    /* built now, to the count the partition actually holds */
+    bloom_filter_t *filter = NULL;
+    if (bloom_filter_new(&filter, b->fpr, (int)b->current_count) != 0) return -1;
+    for (uint32_t i = 0; i < b->current_count; i++)
+        bloom_filter_add_hash(filter, b->current_hashes[i]);
 
     size_t blob_size = 0;
-    uint8_t *blob = bloom_filter_serialize(b->current, &blob_size);
+    uint8_t *blob = bloom_filter_serialize(filter, &blob_size);
+    bloom_filter_free(filter);
     if (!blob || blob_size == 0 || blob_size > UINT32_MAX)
     {
         free(blob);
@@ -162,8 +180,6 @@ static int bbf_seal_current(pr_filter_builder_t *b)
 
     b->current_first_key = NULL;
     b->current_first_key_len = 0;
-    bloom_filter_free(b->current);
-    b->current = NULL;
     b->current_count = 0;
     return 0;
 }
@@ -174,27 +190,19 @@ int pr_filter_builder_add(pr_filter_builder_t *b, const uint8_t *key, size_t key
     if (!key || key_size == 0) return -1;
     if (b->failed) return -1;
 
-    if (!b->current)
+    if (b->current_count == 0)
     {
-        if (bloom_filter_new(&b->current, b->fpr, (int)b->partition_entries) != 0)
-        {
-            b->failed = 1;
-            return -1;
-        }
         b->current_first_key = malloc(key_size);
         if (!b->current_first_key)
         {
-            bloom_filter_free(b->current);
-            b->current = NULL;
             b->failed = 1;
             return -1;
         }
         memcpy(b->current_first_key, key, key_size);
         b->current_first_key_len = (uint32_t)key_size;
-        b->current_count = 0;
     }
 
-    bloom_filter_add(b->current, key, key_size);
+    b->current_hashes[b->current_count] = bloom_filter_hash(key, key_size);
     b->current_count++;
     b->total_entries++;
 
@@ -288,7 +296,7 @@ int pr_filter_builder_finish(pr_filter_builder_t *b, uint64_t *out_dir_offset,
 void pr_filter_builder_free(pr_filter_builder_t *b)
 {
     if (!b) return;
-    if (b->current) bloom_filter_free(b->current);
+    free(b->current_hashes);
     free(b->current_first_key);
     bbf_partitions_free(b->parts, b->num_parts);
     free(b);

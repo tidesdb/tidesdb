@@ -117,6 +117,15 @@ a false negative, and a bloom filter that can report a false negative is worse t
 The partitions are accumulated during the build and written together at the end, so the
 btree's data blocks stay contiguous rather than being interleaved with filter blobs.
 
+Each partition is sized to the keys it holds. A bloom filter's bit count is fixed when it is
+created, and how many keys a partition ends up with is known only when it is sealed, so the
+builder keeps each key's hash until then and builds the partition's filter to the exact count.
+The distinction matters at the edges: the last partition of every table is partial, and a
+small table has only that one, so a filter sized up front for a full partition would cost a
+small table as much as a large one. The filter also takes each key once, however many versions
+of it the table carries, since a repeated key sets no new bit and would only count toward the
+partition's size.
+
 ## The shared value log
 
 A value at or above the database's `value_separation_threshold` is not stored in the btree. The

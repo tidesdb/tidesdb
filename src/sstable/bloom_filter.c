@@ -37,11 +37,20 @@ static inline uint32_t bf_fast_range(uint32_t hash, uint32_t range)
 }
 
 /* split one xxhash of the key into the two 32-bit base hashes double hashing combines */
-static inline void bf_derive_hashes(const uint8_t *entry, size_t size, uint32_t *h1, uint32_t *h2)
+static inline void bf_split_hash(const uint64_t hash, uint32_t *h1, uint32_t *h2)
 {
-    const uint64_t hash = XXH3_64bits(entry, size);
     *h1 = (uint32_t)hash;
     *h2 = (uint32_t)(hash >> 32);
+}
+
+static inline void bf_derive_hashes(const uint8_t *entry, size_t size, uint32_t *h1, uint32_t *h2)
+{
+    bf_split_hash(XXH3_64bits(entry, size), h1, h2);
+}
+
+uint64_t bloom_filter_hash(const uint8_t *entry, const size_t size)
+{
+    return XXH3_64bits(entry, size);
 }
 
 int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
@@ -93,21 +102,27 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
     return 0;
 }
 
-void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
+void bloom_filter_add_hash(const bloom_filter_t *bf, const uint64_t hash)
 {
-    if (TDB_UNLIKELY(bf == NULL || entry == NULL || size == 0)) return;
+    if (TDB_UNLIKELY(bf == NULL)) return;
 
     const unsigned int h = bf->h;
     const unsigned int m = bf->m;
     uint64_t *const bitset = bf->bitset;
 
     uint32_t h1, h2;
-    bf_derive_hashes(entry, size, &h1, &h2);
+    bf_split_hash(hash, &h1, &h2);
     for (unsigned int i = 0; i < h; i++)
     {
         const uint32_t index = bf_fast_range(h1 + i * h2, m);
         BF_SET_BIT(bitset, index);
     }
+}
+
+void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
+{
+    if (TDB_UNLIKELY(bf == NULL || entry == NULL || size == 0)) return;
+    bloom_filter_add_hash(bf, XXH3_64bits(entry, size));
 }
 
 uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)

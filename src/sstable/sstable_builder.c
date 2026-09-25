@@ -242,19 +242,20 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key, 
                           ttl, entry_flags) != 0)
         return TDB_ERR_MEMORY;
 
-    if (builder->bloom_builder && pr_filter_builder_add(builder->bloom_builder, key, key_size) != 0)
-        return TDB_ERR_MEMORY;
-
     /* count a distinct key only when this key differs from the previous one, so the footer
      * separates unique keys from the total version count. versions arrive newest first, so the
      * first occurrence of a key is its newest version, the one whose key and value bytes the size
-     * stats attribute */
+     * stats attribute. the filter takes the key once too, since a version adds no bit the key has
+     * not already set and would only count toward the partition's size and rollover */
     int is_new_distinct = 1;
     if (builder->has_prev)
         is_new_distinct =
             !(builder->prev_key_size == key_size && memcmp(builder->prev_key, key, key_size) == 0);
     if (is_new_distinct)
     {
+        if (builder->bloom_builder &&
+            pr_filter_builder_add(builder->bloom_builder, key, key_size) != 0)
+            return TDB_ERR_MEMORY;
         builder->distinct_key_count++;
         builder->total_key_bytes += key_size;
         if (!(flags & TDB_KV_FLAG_TOMBSTONE)) builder->total_value_bytes += value_size;

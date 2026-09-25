@@ -30,8 +30,10 @@
  */
 
 /* default number of keys per partition before rollover. at fpr 0.01 a partition holds roughly
- * 1.2 bytes of filter per key, so the default keeps each partition blob around 80 KiB -- large
- * enough to amortize the per-partition header, small enough to page and evict cheaply */
+ * 1.2 bytes of filter per key, so the default keeps a full partition blob around 80 KiB -- large
+ * enough to amortize the per-partition header, small enough to page and evict cheaply. a partition
+ * is sized to the keys it actually holds when it is sealed, so a table's last partition, or the
+ * only one of a small table, costs bits in proportion to its keys rather than a full blob */
 #define TDB_PR_FILTER_DEFAULT_PARTITION_ENTRIES 65536
 
 /**

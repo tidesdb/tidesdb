@@ -386,57 +386,187 @@ void tidesdb_mvcc_reseed(tidesdb_mvcc_t *m, uint64_t max_recovered_seq)
                               memory_order_release);
 }
 
+/**
+ * mvcc_res_slot
+ * the slot a probe of a key's run lands on, wrapping at the table's end
+ * @param key_hash the key hash naming the run
+ * @param probe the position within the run
+ * @return the slot index
+ */
+static inline uint32_t mvcc_res_slot(const uint64_t key_hash, const uint32_t probe)
+{
+    return ((uint32_t)key_hash + probe) & TDB_MVCC_RESERVATION_MASK;
+}
+
+/**
+ * mvcc_res_swap_exact
+ * swap the slot in a key's run that holds exactly expect for want. a key is recorded in whichever
+ * slot of its run had room, so the run is searched rather than the base slot alone
+ * @param m the clock
+ * @param key_hash the key hash naming the run
+ * @param expect the packed occupant the slot must still hold
+ * @param want the packed value to install
+ * @return 1 when a slot held expect and now holds want, 0 when none did
+ */
+static int mvcc_res_swap_exact(tidesdb_mvcc_t *m, const uint64_t key_hash, const uint64_t expect,
+                               const uint64_t want)
+{
+    for (uint32_t p = 0; p < TDB_MVCC_RESERVATION_PROBES; p++)
+    {
+        uint64_t seen = expect;
+        if (atomic_compare_exchange_strong_explicit(&m->reservation[mvcc_res_slot(key_hash, p)],
+                                                    &seen, want, memory_order_acq_rel,
+                                                    memory_order_acquire))
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * mvcc_res_survey_t
+ * what one pass over a key's run found
+ * @param claim the first slot with room for this claim, or -1 when the run has none
+ * @param claim_cur the occupant that slot held, the compare value for taking it
+ * @param check the packed same-fingerprint committed occupant above read_base but at or below the
+ *              floor, the one the caller checks the actual key against; 0 when there is none
+ * @param same_above_floor 1 when a same-fingerprint committed occupant sits above read_base and
+ *                         above the floor, which no free slot may bypass
+ * @param stranger_above_floor 1 when a different key's committed occupant above the floor kept a
+ *                             slot from being taken
+ */
+typedef struct
+{
+    int claim;
+    uint64_t claim_cur;
+    uint64_t check;
+    int same_above_floor;
+    int stranger_above_floor;
+} mvcc_res_survey_t;
+
+/* a survey's verdict before any slot is claimed */
+#define MVCC_RES_SURVEY_OPEN     0
+#define MVCC_RES_SURVEY_HELD     1
+#define MVCC_RES_SURVEY_CONFLICT (-1)
+
+/**
+ * mvcc_res_survey
+ * read every slot of a key's run once and classify what it holds against this claim
+ * @param m the clock
+ * @param key_hash the key hash naming the run
+ * @param mine this claim, packed
+ * @param read_base the version read for this key, or the snapshot for a blind write
+ * @param min_snapshot the global oldest live snapshot
+ * @param out receives the survey
+ * @return HELD when this claim is already recorded, CONFLICT when a same-fingerprint writer is in
+ *         flight, else OPEN with out filled for the caller to act on
+ */
+static int mvcc_res_survey(tidesdb_mvcc_t *m, const uint64_t key_hash, const uint64_t mine,
+                           const uint64_t read_base, const uint64_t min_snapshot,
+                           mvcc_res_survey_t *out)
+{
+    const uint16_t myfp = TDB_MVCC_RES_FP(mine);
+    out->claim = -1;
+    out->claim_cur = 0;
+    out->check = 0;
+    out->same_above_floor = 0;
+    out->stranger_above_floor = 0;
+    for (uint32_t p = 0; p < TDB_MVCC_RESERVATION_PROBES; p++)
+    {
+        const uint64_t cur =
+            atomic_load_explicit(&m->reservation[mvcc_res_slot(key_hash, p)], memory_order_acquire);
+        const uint64_t cseq = TDB_MVCC_RES_SEQ(cur);
+        const int same_fp = TDB_MVCC_RES_FP(cur) == myfp;
+        if (cur == mine) return MVCC_RES_SURVEY_HELD;
+        if (cseq == 0)
+        {
+            if (out->claim < 0) out->claim = (int)p;
+            continue;
+        }
+        if (!tidesdb_mvcc_committed(m, cseq))
+        {
+            /* a same-fingerprint committer in flight is one this claim must lose to; a different
+             * key in flight, this committer's own sibling included, keeps its slot and costs
+             * nothing */
+            if (same_fp) return MVCC_RES_SURVEY_CONFLICT;
+            continue;
+        }
+        if (cseq > read_base && (same_fp || cseq > min_snapshot))
+        {
+            /* a committed same-key occupant above what this claim read is the window between the
+             * conflict scan and here, and is never bypassed for a free slot. a stranger above the
+             * live floor may still protect a writer with an old snapshot, so its slot stays */
+            if (cseq > min_snapshot)
+            {
+                if (same_fp)
+                    out->same_above_floor = 1;
+                else
+                    out->stranger_above_floor = 1;
+            }
+            else if (cseq > TDB_MVCC_RES_SEQ(out->check))
+                out->check = cur;
+            continue;
+        }
+        if (out->claim < 0)
+        {
+            out->claim = (int)p;
+            out->claim_cur = cur;
+        }
+    }
+    return MVCC_RES_SURVEY_OPEN;
+}
+
 tidesdb_mvcc_reservation_result_t tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash,
                                                        uint64_t commit_seq, uint64_t read_base,
                                                        uint64_t min_snapshot, uint64_t *observed)
 {
     if (!m) return TDB_MVCC_RES_WON;
-    _Atomic(uint64_t) *res = m->reservation;
-    const uint64_t myseq = commit_seq & TDB_MVCC_RES_SEQ_MASK;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
     const uint16_t myfp = (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS);
-    const uint64_t mine = TDB_MVCC_RES_PACK(myfp, myseq);
+    const uint64_t mine = TDB_MVCC_RES_PACK(myfp, commit_seq & TDB_MVCC_RES_SEQ_MASK);
 
     for (;;)
     {
-        const uint64_t cur = atomic_load_explicit(&res[slot], memory_order_acquire);
-        const uint64_t cseq = TDB_MVCC_RES_SEQ(cur);
-        if (cseq == myseq)
+        mvcc_res_survey_t survey;
+        const int verdict = mvcc_res_survey(m, key_hash, mine, read_base, min_snapshot, &survey);
+        if (verdict == MVCC_RES_SURVEY_HELD)
         {
-            /* already held by this seq -- a duplicate key or a colliding sibling */
             atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
             return TDB_MVCC_RES_WON;
         }
-
-        /* an in-flight occupant could be a concurrent same-key committer this txn must lose to, and
-         * it cannot be told from a colliding key without its applied version, so abort
-         * conservatively. committed (and evicted) seqs pass tidesdb_mvcc_committed, so this fires
-         * only for a genuine in-flight occupant */
-        if (cseq != 0 && !tidesdb_mvcc_committed(m, cseq))
+        if (verdict == MVCC_RES_SURVEY_CONFLICT)
         {
             atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
             return TDB_MVCC_RES_CONFLICT;
         }
-
-        /* a committed occupant newer than the global floor may still protect a live writer.
-         * below that floor a matching fingerprint is ambiguous, so the caller checks the actual
-         * key and uses this exact occupant as a compare-and-swap ticket */
-        if (cseq > read_base && (TDB_MVCC_RES_FP(cur) == myfp || cseq > min_snapshot))
+        /* a same-key committed occupant above what this claim read is answered before any slot is
+         * taken: above the floor the refresh may bring it within reach of a check, at or below it
+         * the caller checks the actual key and turns the ticket into the claim */
+        if (survey.same_above_floor)
         {
             atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
-            if (cseq > min_snapshot) return TDB_MVCC_RES_REFRESH;
-            if (observed) *observed = cur;
+            return TDB_MVCC_RES_REFRESH;
+        }
+        if (survey.check != 0)
+        {
+            atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
+            if (observed) *observed = survey.check;
             return TDB_MVCC_RES_CHECK_KEY;
         }
-
-        uint64_t expect = cur;
-        if (atomic_compare_exchange_weak_explicit(&res[slot], &expect, mine, memory_order_acq_rel,
-                                                  memory_order_acquire))
+        if (survey.claim < 0)
+        {
+            /* no slot in the run has room. a stranger above the floor may give way once the floor
+             * is refreshed; a run full of keys in flight leaves nowhere to record this claim */
+            atomic_fetch_add_explicit(&m->stat_res_lost, 1, memory_order_relaxed);
+            return survey.stranger_above_floor ? TDB_MVCC_RES_REFRESH : TDB_MVCC_RES_CONFLICT;
+        }
+        uint64_t expect = survey.claim_cur;
+        if (atomic_compare_exchange_weak_explicit(
+                &m->reservation[mvcc_res_slot(key_hash, (uint32_t)survey.claim)], &expect, mine,
+                memory_order_acq_rel, memory_order_acquire))
         {
             atomic_fetch_add_explicit(&m->stat_res_won, 1, memory_order_relaxed);
             return TDB_MVCC_RES_WON;
         }
-        /* cas lost to a concurrent claimer -- re-read and re-evaluate this slot */
+        /* cas lost to a concurrent claimer -- survey the run again */
     }
 }
 
@@ -446,10 +576,8 @@ int tidesdb_mvcc_reserve_checked(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t 
     if (!m || TDB_MVCC_RES_SEQ(observed) == 0 ||
         TDB_MVCC_RES_FP(observed) != (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS))
         return 0;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
     const uint64_t mine = TDB_MVCC_RES_PACK(TDB_MVCC_RES_FP(observed), commit_seq);
-    const int won = atomic_compare_exchange_strong_explicit(
-        &m->reservation[slot], &observed, mine, memory_order_acq_rel, memory_order_acquire);
+    const int won = mvcc_res_swap_exact(m, key_hash, observed, mine);
     atomic_fetch_add_explicit(won ? &m->stat_res_won : &m->stat_res_lost, 1, memory_order_relaxed);
     return won;
 }
@@ -457,25 +585,18 @@ int tidesdb_mvcc_reserve_checked(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t 
 void tidesdb_mvcc_reassign(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t from_seq, uint64_t to_seq)
 {
     if (!m || from_seq == 0 || to_seq == 0) return;
-    _Atomic(uint64_t) *res = m->reservation;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
     const uint16_t fp = (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS);
-    uint64_t expect = TDB_MVCC_RES_PACK(fp, from_seq & TDB_MVCC_RES_SEQ_MASK);
-    const uint64_t want = TDB_MVCC_RES_PACK(fp, to_seq & TDB_MVCC_RES_SEQ_MASK);
-    /* move the slot only if the old seq still owns it; a failed cas means a newer committer already
-     * took it, and that newer claim is the one that should stand */
-    atomic_compare_exchange_strong_explicit(&res[slot], &expect, want, memory_order_acq_rel,
-                                            memory_order_acquire);
+    /* move the slot only if the old seq still owns it; a failed swap means a newer committer
+     * already took it, and that newer claim is the one that should stand */
+    (void)mvcc_res_swap_exact(m, key_hash, TDB_MVCC_RES_PACK(fp, from_seq & TDB_MVCC_RES_SEQ_MASK),
+                              TDB_MVCC_RES_PACK(fp, to_seq & TDB_MVCC_RES_SEQ_MASK));
 }
 
 void tidesdb_mvcc_release(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq)
 {
     if (!m || commit_seq == 0) return;
-    _Atomic(uint64_t) *res = m->reservation;
-    const uint32_t slot = (uint32_t)key_hash & TDB_MVCC_RESERVATION_MASK;
     const uint16_t fp = (uint16_t)(key_hash >> TDB_MVCC_RES_SEQ_BITS);
-    uint64_t expect = TDB_MVCC_RES_PACK(fp, commit_seq & TDB_MVCC_RES_SEQ_MASK);
-    /* clear the slot only if this seq owns it; a failed cas means a newer committer took it */
-    atomic_compare_exchange_strong_explicit(&res[slot], &expect, 0, memory_order_acq_rel,
-                                            memory_order_acquire);
+    /* clear the slot only if this seq owns it; a failed swap means a newer committer took it */
+    (void)mvcc_res_swap_exact(m, key_hash,
+                              TDB_MVCC_RES_PACK(fp, commit_seq & TDB_MVCC_RES_SEQ_MASK), 0);
 }

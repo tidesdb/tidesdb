@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "../src/base/thread.h" /* threads retired without a join */
 #include "db.h"
 #include "test_utils.h"
 
@@ -551,6 +552,105 @@ void test_txn_request_abort_makes_the_transaction_fail_with_its_own_code(void)
     (void)remove_directory(TXNAPI_DB_DIR);
 }
 
+/* concurrent committers whose write sets never share a key. every key hashes into a fixed table
+ * of reservation slots, so with a few hundred keys per commit two commits in flight at once share a
+ * slot more often than not, and the reservation used to refuse any commit whose slot another
+ * commit held in flight, whatever the keys were */
+#define TXNAPI_DISJOINT_WRITERS 2
+#define TXNAPI_DISJOINT_ROUNDS  40
+#define TXNAPI_DISJOINT_KEYS    500
+
+/**
+ * txnapi_disjoint_t
+ * one writer's share of the disjoint commit test and what it saw
+ * @param db the open database
+ * @param cf the family every writer commits to
+ * @param id this writer's number, the prefix that keeps its keys apart from the others'
+ * @param conflicts commits refused with TDB_ERR_CONFLICT
+ * @param failures commits refused with anything else
+ */
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int id;
+    _Atomic(int) conflicts;
+    _Atomic(int) failures;
+} txnapi_disjoint_t;
+
+/**
+ * txnapi_disjoint_writer
+ * commit TXNAPI_DISJOINT_ROUNDS batches of TXNAPI_DISJOINT_KEYS fresh keys at snapshot isolation
+ * @param arg the txnapi_disjoint_t
+ * @return NULL
+ */
+static void *txnapi_disjoint_writer(void *arg)
+{
+    txnapi_disjoint_t *w = arg;
+    for (int round = 0; round < TXNAPI_DISJOINT_ROUNDS; round++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin_with_isolation(w->db, TDB_ISOLATION_SNAPSHOT, &txn) != TDB_SUCCESS)
+        {
+            atomic_fetch_add(&w->failures, 1);
+            continue;
+        }
+        for (int k = 0; k < TXNAPI_DISJOINT_KEYS; k++)
+        {
+            char key[32];
+            const int n = snprintf(key, sizeof(key), "w%d-%04d-%04d", w->id, round, k);
+            if (tidesdb_txn_put(txn, w->cf, (const uint8_t *)key, (size_t)n, (const uint8_t *)"v",
+                                1, -1) != TDB_SUCCESS)
+                atomic_fetch_add(&w->failures, 1);
+        }
+        const int rc = tidesdb_txn_commit(txn);
+        if (rc == TDB_ERR_CONFLICT)
+            atomic_fetch_add(&w->conflicts, 1);
+        else if (rc != TDB_SUCCESS)
+            atomic_fetch_add(&w->failures, 1);
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+/* committers that never write the same key never conflict, however their commits overlap */
+void test_txn_api_disjoint_commits_never_conflict(void)
+{
+    (void)remove_directory(TXNAPI_DB_DIR);
+    char dir[] = TXNAPI_DB_DIR;
+    tidesdb_t *db = txnapi_open(dir);
+    tidesdb_column_family_t *cf = txnapi_make_cf(db, TXNAPI_CF, TDB_ISOLATION_SNAPSHOT);
+
+    txnapi_disjoint_t writers[TXNAPI_DISJOINT_WRITERS];
+    tdb_thread_t threads[TXNAPI_DISJOINT_WRITERS];
+    for (int i = 0; i < TXNAPI_DISJOINT_WRITERS; i++)
+    {
+        writers[i].db = db;
+        writers[i].cf = cf;
+        writers[i].id = i;
+        atomic_init(&writers[i].conflicts, 0);
+        atomic_init(&writers[i].failures, 0);
+        ASSERT_EQ(tdb_thread_start(&threads[i], txnapi_disjoint_writer, &writers[i]), 0);
+    }
+    int conflicts = 0;
+    int failures = 0;
+    for (int i = 0; i < TXNAPI_DISJOINT_WRITERS; i++)
+    {
+        tdb_thread_finish(&threads[i]);
+        conflicts += atomic_load(&writers[i].conflicts);
+        failures += atomic_load(&writers[i].failures);
+    }
+    printf("  %d writers x %d commits of %d disjoint keys: %d conflicts, %d other failures\n",
+           TXNAPI_DISJOINT_WRITERS, TXNAPI_DISJOINT_ROUNDS, TXNAPI_DISJOINT_KEYS, conflicts,
+           failures);
+    fflush(stdout);
+    ASSERT_EQ(failures, 0);
+    ASSERT_EQ(conflicts, 0);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(TXNAPI_DB_DIR);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -566,6 +666,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_reset_discards_the_buffered_writes_and_the_savepoints, tests_passed);
     RUN_TEST(test_txn_contains_answers_where_the_read_answers, tests_passed);
     RUN_TEST(test_read_snapshot_reflects_the_isolation_level, tests_passed);
+    RUN_TEST(test_txn_api_disjoint_commits_never_conflict, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

@@ -19,9 +19,12 @@ static int tests_failed = 0;
 
 /* two hashes landing in the same reservation slot but with different fingerprints, to exercise the
  * collision path; the low bits index the slot, the high 16 bits are the fingerprint */
-#define HASH_SLOT       0x12345u
-#define HASH_FP_A(slot) (((uint64_t)1 << TDB_MVCC_RES_SEQ_BITS) | (slot))
-#define HASH_FP_B(slot) (((uint64_t)2 << TDB_MVCC_RES_SEQ_BITS) | (slot))
+#define HASH_SLOT         0x12345u
+#define HASH_FP(fp, slot) (((uint64_t)(fp) << TDB_MVCC_RES_SEQ_BITS) | (slot))
+#define HASH_FP_A(slot)   HASH_FP(1, slot)
+#define HASH_FP_B(slot)   HASH_FP(2, slot)
+/* the first fingerprint free for filling a run with strangers, past the named ones above */
+#define HASH_FP_STRANGERS 3
 
 /* the sequence counter starts at 1 and hands out monotonically increasing seqs */
 void test_mvcc_seq_counter(void)
@@ -234,7 +237,9 @@ void test_mvcc_release(void)
 }
 
 /* a committed occupant of a different key colliding into the slot is suppressed when it is at or
- * below the oldest open snapshot, and kept conservative when it is newer */
+ * below the oldest open snapshot. when it is newer it keeps its slot, since it may still protect a
+ * writer with an old snapshot, and the colliding key records itself in the next slot of the run;
+ * only a run with no room left answers with a refresh */
 void test_mvcc_reserve_collision(void)
 {
     tidesdb_mvcc_t *m = tidesdb_mvcc_create();
@@ -251,17 +256,76 @@ void test_mvcc_reserve_collision(void)
      */
     ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 11, 5, 100, NULL), 1);
 
-    /* reset the slot, replay, but now the occupant is newer than the oldest open snapshot -> stay
-     * conservative and treat it as a conflict */
+    /* replay, but now the occupant is newer than the oldest open snapshot. B still claims, in the
+     * next slot of the run, and A's occupant is left where a same-key writer will meet it */
     tidesdb_mvcc_release(m, hb, 11);
     tidesdb_mvcc_release(m, ha, 10); /* not owner after B claimed; harmless */
     tidesdb_mvcc_t *m2 = tidesdb_mvcc_create();
     ASSERT_TRUE(m2 != NULL);
     ASSERT_EQ(tidesdb_mvcc_reserve(m2, ha, 10, 0, 0, NULL), 1);
     tidesdb_mvcc_mark(m2, 10, 1);
-    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hb, 11, 5, 5, NULL),
-              TDB_MVCC_RES_REFRESH); /* 10 > min_snapshot 5 -> conflict */
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hb, 11, 5, 5, NULL), TDB_MVCC_RES_WON);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, ha, 12, 5, 5, NULL), TDB_MVCC_RES_REFRESH);
+
+    /* fill the rest of the run with committed strangers above the floor; the next colliding key
+     * has nowhere to record itself and asks for a refresh, which with a raised floor lets it take
+     * one of them over */
+    for (uint32_t fp = HASH_FP_STRANGERS; fp < HASH_FP_STRANGERS + TDB_MVCC_RESERVATION_PROBES - 2;
+         fp++)
+    {
+        ASSERT_EQ(tidesdb_mvcc_reserve(m2, HASH_FP(fp, HASH_SLOT), 20 + fp, 5, 5, NULL),
+                  TDB_MVCC_RES_WON);
+        tidesdb_mvcc_mark(m2, 20 + fp, 1);
+    }
+    tidesdb_mvcc_mark(m2, 11, 1);
+    const uint64_t hz = HASH_FP(HASH_FP_STRANGERS + TDB_MVCC_RESERVATION_PROBES, HASH_SLOT);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hz, 40, 5, 5, NULL), TDB_MVCC_RES_REFRESH);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m2, hz, 40, 5, 100, NULL), TDB_MVCC_RES_WON);
     tidesdb_mvcc_destroy(m2);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* two committers of different keys whose runs coincide both record their claims, and each still
+ * refuses a same-key committer for as long as it is in flight. one slot per key made the second of
+ * them abort against a key it never wrote */
+void test_mvcc_reserve_in_flight_strangers_coexist(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    const uint64_t ha = HASH_FP_A(HASH_SLOT);
+    const uint64_t hb = HASH_FP_B(HASH_SLOT);
+
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, ha, 10, 0, 0, NULL), TDB_MVCC_RES_WON);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 11, 0, 0, NULL), TDB_MVCC_RES_WON);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, ha, 12, 0, 0, NULL), TDB_MVCC_RES_CONFLICT);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 13, 0, 0, NULL), TDB_MVCC_RES_CONFLICT);
+
+    /* the claim is found wherever in the run it landed: released, the key is free again */
+    tidesdb_mvcc_release(m, hb, 11);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 13, 0, 0, NULL), TDB_MVCC_RES_WON);
+
+    /* and a reassigned claim keeps refusing under its new sequence */
+    tidesdb_mvcc_reassign(m, hb, 13, 14);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 15, 0, 0, NULL), TDB_MVCC_RES_CONFLICT);
+    tidesdb_mvcc_mark(m, 14, 1);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hb, 15, 14, 0, NULL), TDB_MVCC_RES_WON);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* a run whose every slot holds a different key in flight has nowhere to record one more, and the
+ * one more conflicts rather than going unrecorded */
+void test_mvcc_reserve_run_full_of_strangers(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    for (uint32_t fp = HASH_FP_STRANGERS; fp < HASH_FP_STRANGERS + TDB_MVCC_RESERVATION_PROBES;
+         fp++)
+        ASSERT_EQ(tidesdb_mvcc_reserve(m, HASH_FP(fp, HASH_SLOT), 20 + fp, 0, 0, NULL),
+                  TDB_MVCC_RES_WON);
+    const uint64_t hz = HASH_FP(HASH_FP_STRANGERS + TDB_MVCC_RESERVATION_PROBES, HASH_SLOT);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hz, 40, 0, 0, NULL), TDB_MVCC_RES_CONFLICT);
+    tidesdb_mvcc_release(m, HASH_FP(HASH_FP_STRANGERS, HASH_SLOT), 20 + HASH_FP_STRANGERS);
+    ASSERT_EQ(tidesdb_mvcc_reserve(m, hz, 40, 0, 0, NULL), TDB_MVCC_RES_WON);
     tidesdb_mvcc_destroy(m);
 }
 
@@ -448,6 +512,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_reserve_basic, tests_passed);
     RUN_TEST(test_mvcc_release, tests_passed);
     RUN_TEST(test_mvcc_reserve_collision, tests_passed);
+    RUN_TEST(test_mvcc_reserve_in_flight_strangers_coexist, tests_passed);
+    RUN_TEST(test_mvcc_reserve_run_full_of_strangers, tests_passed);
     RUN_TEST(test_mvcc_reserve_fingerprint_ticket, tests_passed);
     RUN_TEST(test_mvcc_reserve_fingerprint_ticket_changed, tests_passed);
     RUN_TEST(test_mvcc_seq_concurrent_unique, tests_passed);

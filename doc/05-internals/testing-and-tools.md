@@ -171,6 +171,17 @@ Partitioning the keyspace is what keeps the oracle exact under concurrency: each
 precisely what it wrote, so any disagreement is a real engine fault rather than a race in the
 checker.
 
+The same partitioning is an oracle for the commit path. The workers cycle through every isolation
+level, and at snapshot and above a commit reserves its keys against every other committer in
+flight, so a commit refused with `TDB_ERR_CONFLICT` is a conflict between keys that nobody shares:
+one the engine invented. To make such refusals likely rather than rare, a worker periodically
+commits a batch of hundreds of keys from a key space of its own in one go, the shape of a bulk
+load, so two such commits in flight at once carry write sets wide enough for their reservations to
+share slots, and deletes prefixes inside its own slice, which reserves an interval the same way.
+Every such commit must succeed. This is the check that would have caught the
+one-slot reservation refusing commits of disjoint keys, which a benchmark can only report as a
+higher retry rate.
+
 ### `fuzz_decode` — untrusted input
 
 Feeds mutated bytes to the decoders — sstable footers, column-family configurations, WAL records,

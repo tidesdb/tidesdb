@@ -35,6 +35,14 @@
 #define TDB_MVCC_RESERVATION_SLOTS ((uint32_t)1 << 20)
 #define TDB_MVCC_RESERVATION_MASK  (TDB_MVCC_RESERVATION_SLOTS - 1)
 
+/* a key's reservation lives in one of the consecutive slots starting at its hash slot, its run, and
+ * every operation on a key walks the run. one slot per key left a committer whose slot another key
+ * held in flight with nowhere to record its own claim, and leaving a claim unrecorded would let a
+ * third committer of the same key through, so it aborted on every such collision. with a run the
+ * claim goes in the next free slot and only a same-fingerprint occupant in flight is a conflict.
+ * four slots span at most two cache lines and put a run full of strangers beyond reach */
+#define TDB_MVCC_RESERVATION_PROBES 4
+
 /* a reservation slot packs a 16-bit key fingerprint (high bits) and the claiming 48-bit commit_seq
  * (low bits); the fingerprint tells a real same-key conflict from a hash collision using the slot
  * alone, without ever reading another committer's applied version */
@@ -225,15 +233,17 @@ typedef enum
 
 /**
  * tidesdb_mvcc_reserve
- * try to claim one write key's reservation slot without mistaking a fingerprint for a full key
+ * try to claim one write key's reservation in its run without mistaking a fingerprint for a full
+ * key
  * @param m the clock
- * @param key_hash the key hash supplying the slot and fingerprint
+ * @param key_hash the key hash supplying the run and fingerprint
  * @param commit_seq this committer's sequence number
  * @param read_base the version read for this key, or the snapshot for a blind write
  * @param min_snapshot the global oldest live snapshot, possibly stale low
  * @param observed out, the exact packed occupant on CHECK_KEY; may be NULL if not used
- * @return WON, CONFLICT for an in-flight writer, REFRESH for a committed occupant above the
- *         floor, or CHECK_KEY for a matching fingerprint at or below the floor
+ * @return WON, CONFLICT for a same-fingerprint writer in flight or a run with no free slot, REFRESH
+ *         for a committed occupant above the floor that blocks the claim, or CHECK_KEY for a
+ *         same-fingerprint committed occupant at or below the floor
  */
 tidesdb_mvcc_reservation_result_t tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash,
                                                        uint64_t commit_seq, uint64_t read_base,
@@ -241,7 +251,7 @@ tidesdb_mvcc_reservation_result_t tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64
 
 /**
  * tidesdb_mvcc_reserve_checked
- * claim an ambiguous slot only if it still holds the occupant checked against the actual key
+ * claim the slot in the key's run that still holds the occupant checked against the actual key
  * @param m the clock
  * @param key_hash the same key hash passed to reserve
  * @param commit_seq this committer's sequence number
@@ -271,8 +281,8 @@ void tidesdb_mvcc_prepared_release(tidesdb_mvcc_t *m, uint64_t seq);
 
 /**
  * tidesdb_mvcc_release
- * release a write key's reservation slot if it still holds commit_seq; a slot now owned by a newer
- * committer is left alone
+ * release a write key's reservation, wherever in its run it sits, if it still holds commit_seq; a
+ * slot now owned by a newer committer is left alone
  * @param m the clock
  * @param key_hash the 64-bit hash of the write key
  * @param commit_seq the sequence this committer claimed the slot with

@@ -25,19 +25,49 @@
  * cache and the value log -- is exercised under real contention. each worker checks every read
  * against its model as it goes, and after the threads join the harness checks the whole committed
  * set once more, so a race that drops, duplicates, or corrupts a committed value is caught. there
- * is no cross-worker conflict, so the oracle needs no linearization; the point is the shared
- * structures, not transaction isolation. */
+ * is no cross-worker conflict, so the oracle needs no linearization.
+ *
+ * that same disjointness is an oracle for the commit path. the workers run at every isolation
+ * level, and at snapshot and above a commit reserves its keys and checks them against concurrent
+ * committers, so any commit refused with TDB_ERR_CONFLICT is a conflict between keys nobody shares
+ * -- a refusal the engine invented. a wide batch puts hundreds of keys from a key space of the
+ * worker's own and commits them at once, the shape of a bulk load, so two such commits in flight
+ * together carry enough keys that a hash collision between them is the ordinary case rather than
+ * the rare one; a prefix delete inside a worker's own slice reserves an interval the same way. both
+ * must always commit */
 
-#define FC_WORKERS          4    /* worker threads, one disjoint key prefix each; at most 26 */
-#define FC_OPS_PER_WORKER   6000 /* operations each worker runs per iteration */
-#define FC_KEY_ALPHABET     5 /* distinct suffix characters, keeping the key space small and dense */
-#define FC_MAX_SUFFIX       3    /* longest key suffix after the one-byte worker prefix */
-#define FC_VALUE_TABLE      12   /* one in this many put values spills to the value log */
-#define FC_SPILL_VLEN       1500 /* the spilled value length, above the default klog threshold */
-#define FC_WRITE_BUFFER     8192 /* a small memtable so flushes fire often and race the writers */
-#define FC_CF               "c0"
-#define FC_STANDALONE_ITERS 30
-#define FC_BUSY_RETRIES     1000 /* a busy fd reservation is retryable, never a definitive result */
+#define FC_WORKERS        4    /* worker threads, one disjoint key prefix each; at most 26 */
+#define FC_OPS_PER_WORKER 6000 /* operations each worker runs per iteration */
+#define FC_KEY_ALPHABET   5  /* distinct suffix characters, keeping the key space small and dense */
+#define FC_MAX_SUFFIX     3  /* longest key suffix after the one-byte worker prefix */
+#define FC_VALUE_TABLE    12 /* one in this many put values spills to the value log */
+#define FC_SPILL_VLEN     1500 /* the spilled value length, above the default klog threshold */
+#define FC_WRITE_BUFFER   8192 /* a small memtable so flushes fire often and race the writers */
+#define FC_CF             "c0"
+/* the wide key space: the worker's prefix byte, a marker no ordinary key carries, then
+ * FC_WIDE_SUFFIX characters from a wider alphabet, so a batch can hold hundreds of distinct keys. a
+ * batch of a few hundred keys against another in flight shares a reservation slot about one time in
+ * ten, and a wide commit is in flight for as long as its keys take to apply */
+#define FC_WIDE_MARK      'z'
+#define FC_WIDE_ALPHABET  16
+#define FC_WIDE_SUFFIX    3
+#define FC_WIDE_KEY_LEN   (2 + FC_WIDE_SUFFIX)
+#define FC_WIDE_KEY_SPACE (FC_WIDE_ALPHABET * FC_WIDE_ALPHABET * FC_WIDE_ALPHABET)
+#define FC_WIDE_MIN_KEYS  128
+#define FC_WIDE_MAX_KEYS  512
+/* a wide batch's values stay this small: its keys are what the reservations are about, and a batch
+ * of hundreds of spilled values would span several memtables and sit in admission for each */
+#define FC_WIDE_VALUE_MAX 8
+/* one wide batch in this many op-14 turns, enough to keep two in flight together now and then
+ * without the batches outweighing the rest of the stream */
+#define FC_WIDE_ONE_IN 16
+/* one prefix delete in this many op-15 turns. a commit carrying an interval holds the commit gate
+ * exclusively, so it waits out every commit in flight and every later one waits on it; issued on
+ * every turn, the deletes serialised the whole commit path and the harness measured exclusion
+ * rather than reservations. rare, they still drive the interval path under concurrency */
+#define FC_PREFIX_DELETE_ONE_IN 4
+#define FC_STANDALONE_ITERS     30
+#define FC_BUSY_RETRIES         1000 /* a busy fd reservation is retryable, never a definitive result */
 
 #define FC_CHECK(cond, ...)                        \
     do                                             \
@@ -63,7 +93,17 @@ typedef struct
     uint64_t tag; /* makes every put value distinct so a stale read is caught */
     int id;
     int nops;
+    tidesdb_isolation_level_t
+        isolation; /* every transaction this worker opens runs at this level */
 } fc_worker_t;
+
+/* the isolation levels the workers cycle through by id. three of the default four reserve their
+ * keys at commit, so most pairs of commits in flight together are pairs of reservers, and one runs
+ * at the default level so the path that reserves nothing is driven alongside them */
+static const tidesdb_isolation_level_t fc_isolations[] = {
+    TDB_ISOLATION_SNAPSHOT, TDB_ISOLATION_SERIALIZABLE, TDB_ISOLATION_SNAPSHOT,
+    TDB_ISOLATION_READ_COMMITTED};
+#define FC_ISOLATION_COUNT ((int)(sizeof(fc_isolations) / sizeof(fc_isolations[0])))
 
 static uint64_t fc_rng(uint64_t *state)
 {
@@ -84,6 +124,21 @@ static size_t fc_gen_key(fc_worker_t *w, uint8_t *key)
     for (size_t i = 0; i < suffix; i++)
         key[1 + i] = (uint8_t)('a' + (fc_rng(&w->rng) % FC_KEY_ALPHABET));
     return suffix + 1;
+}
+
+/* fill key with the index-th key of this worker's wide key space, so a batch that walks indices
+ * puts distinct keys; indices past the space wrap */
+static size_t fc_wide_key_at(const fc_worker_t *w, size_t index, uint8_t *key)
+{
+    key[0] = (uint8_t)('a' + w->id);
+    key[1] = (uint8_t)FC_WIDE_MARK;
+    index %= FC_WIDE_KEY_SPACE;
+    for (size_t i = FC_WIDE_KEY_LEN - 1; i >= 2; i--)
+    {
+        key[i] = (uint8_t)('a' + index % FC_WIDE_ALPHABET);
+        index /= FC_WIDE_ALPHABET;
+    }
+    return FC_WIDE_KEY_LEN;
 }
 
 /* fill value with a tag-derived byte pattern so no two puts share a value, and return its length */
@@ -139,7 +194,9 @@ static void fc_check_get(fc_worker_t *w, tidesdb_txn_t *txn)
                             (mvl && memcmp(mv, cvv, mvl) != 0));
 
     tidesdb_txn_t *read = txn;
-    if (!read) FC_CHECK(tidesdb_txn_begin(w->db, &read) == TDB_SUCCESS, "read txn begin");
+    if (!read)
+        FC_CHECK(tidesdb_txn_begin_with_isolation(w->db, w->isolation, &read) == TDB_SUCCESS,
+                 "read txn begin w%d", w->id);
     const uint64_t snap = tidesdb_txn_read_snapshot(read);
 
     uint8_t *dv = NULL;
@@ -226,6 +283,58 @@ static void fc_do_delete(fc_worker_t *w, tidesdb_txn_t *txn)
     FC_CHECK(fuzz_model_delete(w->model, FC_CF, key, klen), "model delete w%d", w->id);
 }
 
+/* put a wide run of distinct keys from the worker's wide key space, so the commit that follows
+ * carries a write set wide enough for its reservations to share slots with another committer's */
+static void fc_do_wide_put(fc_worker_t *w, tidesdb_txn_t *txn)
+{
+    const size_t count =
+        FC_WIDE_MIN_KEYS + (size_t)(fc_rng(&w->rng) % (FC_WIDE_MAX_KEYS - FC_WIDE_MIN_KEYS + 1));
+    const size_t start = (size_t)(fc_rng(&w->rng) % FC_WIDE_KEY_SPACE);
+    for (size_t i = 0; i < count; i++)
+    {
+        uint8_t key[FC_WIDE_KEY_LEN], val[FC_WIDE_VALUE_MAX];
+        const size_t klen = fc_wide_key_at(w, start + i, key);
+        const size_t vlen = fc_gen_value(w, val, sizeof(val));
+        FC_CHECK(tidesdb_txn_put(txn, w->cf, key, klen, val, vlen, -1) == TDB_SUCCESS,
+                 "wide put w%d", w->id);
+        FC_CHECK(fuzz_model_put(w->model, FC_CF, key, klen, val, vlen, FUZZ_TTL_NONE),
+                 "model wide put w%d", w->id);
+    }
+}
+
+/* delete every key under the worker's prefix plus one character, in the transaction and the model;
+ * at snapshot isolation and above this reserves an interval rather than keys */
+static void fc_do_delete_prefix(fc_worker_t *w, tidesdb_txn_t *txn)
+{
+    uint8_t prefix[2];
+    prefix[0] = (uint8_t)('a' + w->id);
+    prefix[1] = (uint8_t)('a' + (fc_rng(&w->rng) % FC_KEY_ALPHABET));
+    FC_CHECK(tidesdb_txn_delete_prefix(txn, w->cf, prefix, sizeof(prefix)) == TDB_SUCCESS,
+             "txn delete prefix w%d", w->id);
+    FC_CHECK(fuzz_model_delete_prefix(w->model, FC_CF, prefix, sizeof(prefix)),
+             "model delete prefix w%d", w->id);
+}
+
+/* open the worker's transaction at its isolation level, in the engine and the model */
+static void fc_begin(fc_worker_t *w, tidesdb_txn_t **txn)
+{
+    FC_CHECK(tidesdb_txn_begin_with_isolation(w->db, w->isolation, txn) == TDB_SUCCESS,
+             "begin w%d isolation %d", w->id, (int)w->isolation);
+    fuzz_model_txn_begin(w->model);
+}
+
+/* commit the worker's transaction in the engine and the model. no worker shares a key with another,
+ * so a conflict here has no writer behind it and is a fault whatever the isolation level */
+static void fc_commit(fc_worker_t *w, tidesdb_txn_t **txn)
+{
+    const int rc = tidesdb_txn_commit(*txn);
+    FC_CHECK(rc == TDB_SUCCESS, "commit w%d isolation %d rc %d, disjoint keys never conflict",
+             w->id, (int)w->isolation, rc);
+    fuzz_model_txn_commit(w->model);
+    tidesdb_txn_free(*txn);
+    *txn = NULL;
+}
+
 /* one worker thread: drive a deterministic operation stream against the shared database, keeping
  * the private model in lockstep and checking every read as it goes */
 static void *fc_worker(void *arg)
@@ -237,20 +346,12 @@ static void *fc_worker(void *arg)
         const uint64_t op = fc_rng(&w->rng) % 16;
         if (op <= 5) /* put */
         {
-            if (!txn)
-            {
-                FC_CHECK(tidesdb_txn_begin(w->db, &txn) == TDB_SUCCESS, "begin w%d", w->id);
-                fuzz_model_txn_begin(w->model);
-            }
+            if (!txn) fc_begin(w, &txn);
             fc_do_put(w, txn);
         }
         else if (op <= 8) /* delete */
         {
-            if (!txn)
-            {
-                FC_CHECK(tidesdb_txn_begin(w->db, &txn) == TDB_SUCCESS, "begin w%d", w->id);
-                fuzz_model_txn_begin(w->model);
-            }
+            if (!txn) fc_begin(w, &txn);
             fc_do_delete(w, txn);
         }
         else if (op <= 11) /* get, read-your-writes when a txn is open */
@@ -259,13 +360,20 @@ static void *fc_worker(void *arg)
         }
         else if (op == 12) /* commit */
         {
-            if (txn)
+            if (txn) fc_commit(w, &txn);
+        }
+        else if (op == 14) /* a wide batch committed at once, the shape of a bulk load */
+        {
+            if (fc_rng(&w->rng) % FC_WIDE_ONE_IN == 0)
             {
-                FC_CHECK(tidesdb_txn_commit(txn) == TDB_SUCCESS, "commit w%d", w->id);
-                fuzz_model_txn_commit(w->model);
-                tidesdb_txn_free(txn);
-                txn = NULL;
+                if (!txn) fc_begin(w, &txn);
+                fc_do_wide_put(w, txn);
+                fc_commit(w, &txn);
             }
+        }
+        else if (op == 15 && txn) /* now and then, an interval reservation inside the own slice */
+        {
+            if (fc_rng(&w->rng) % FC_PREFIX_DELETE_ONE_IN == 0) fc_do_delete_prefix(w, txn);
         }
         else if (op == 13) /* rollback */
         {
@@ -367,6 +475,7 @@ static void fc_run(uint64_t seed, const char *dir)
         workers[i].tag = 0;
         workers[i].id = i;
         workers[i].nops = FC_OPS_PER_WORKER;
+        workers[i].isolation = fc_isolations[i % FC_ISOLATION_COUNT];
     }
 
     for (int i = 0; i < FC_WORKERS; i++)

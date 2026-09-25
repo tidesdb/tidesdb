@@ -1154,7 +1154,9 @@ void test_txn_reservation_refreshes_stale_floor_once(void)
     tidesdb_mvcc_destroy(clock);
 }
 
-/* The refresh must preserve a genuinely live older snapshot's collision guard. */
+/* A live older snapshot's collision guard is preserved: the committed occupant it may still need
+ * to meet keeps its slot, while an unrelated key colliding into that slot records itself beside it
+ * and commits. One slot per key refused the unrelated commit to keep the guard. */
 void test_txn_reservation_refresh_keeps_live_old_snapshot(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
@@ -1177,9 +1179,13 @@ void test_txn_reservation_refresh_keeps_live_old_snapshot(void)
     tdb_txn_t *current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
     ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
     ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_ERR_CONFLICT);
-    ASSERT_EQ(tidesdb_txn_registry_published_min_snapshot(reg), 1);
+    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_SUCCESS);
     tdb_txn_free(current);
+
+    /* the guard itself: the old snapshot writing the key committed above it still meets that
+     * commit's occupant, which the unrelated claim left in place */
+    ASSERT_EQ(put(old, 0, b, "late"), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(old, &be, &source, 1), TDB_ERR_CONFLICT);
     tdb_txn_free(old);
 
     current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);

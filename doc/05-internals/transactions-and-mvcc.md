@@ -126,7 +126,7 @@ deadlines.
 At snapshot and serializable isolation, a commit must not silently overwrite a write it did not
 see. The check is a reservation over the transaction's write set.
 
-Each key hashes into a slot in a fixed table. A slot packs two things:
+Each key hashes into a fixed table of slots. A slot packs two things:
 
 ```
   [ 16-bit key fingerprint ][ 48-bit claiming commit sequence ]
@@ -134,12 +134,20 @@ Each key hashes into a slot in a fixed table. A slot packs two things:
 
 The fingerprint is what keeps the common case local. Two different keys can land in the same slot,
 and without a fingerprint the commit could not tell a genuine same-key conflict from a hash
-collision. With it, most claims are settled by the slot alone.
+collision. With it, most claims are settled by the slots alone.
+
+A key's claim lives in one of the four consecutive slots starting at its hash slot, its **run**, and
+every operation on a key walks the run. This is what lets two commits in flight at once share a
+slot without either losing: the second records its claim in the next free slot of the run, and a
+committer of either key still meets the claim it has to lose to. With one slot per key there was
+nowhere to put the second claim, and leaving it unrecorded would have let a third committer of the
+same key through, so the commit was refused on every such collision — with a few hundred keys per
+commit, more often than not.
 
 The reservation therefore answers with more than won or lost. It returns **WON**; **CONFLICT** for
-an occupant still in flight, which cannot be told from a same-key committer without its applied
-version; **REFRESH** when the occupant is committed but sits above what this commit believes the
-oldest live snapshot to be; or **CHECK_KEY**, handing back the exact occupant it saw.
+a same-fingerprint occupant still in flight, or a run every slot of which holds a key in flight;
+**REFRESH** when a committed occupant sits above what this commit believes the oldest live snapshot
+to be; or **CHECK_KEY**, handing back the exact occupant it saw.
 
 :::caution[A fingerprint is not a key, and the commit no longer pretends otherwise]
 A fingerprint match is not proof of a same-key conflict, and a mismatch past the snapshot bound is

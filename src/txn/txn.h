@@ -467,9 +467,9 @@ uint64_t tdb_txn_read_snapshot(const tdb_txn_t *txn);
  * tdb_txn_read_release. at read committed the ceiling is the watermark, and it is published to the
  * registry so a collection taking its floor while the read is in flight stays at or below it; a
  * collection that took its floor as the ceiling was being published is seen through the floor's
- * high-water mark, and the ceiling is taken again above it. holds nest: an iterator's ceiling stays
- * published under the point reads made while it is open. the other levels hold nothing here -- a
- * frozen snapshot is registered for its whole life and read-uncommitted resolves to the newest
+ * high-water mark, and the ceiling is taken again above it. holds nest, so an iterator's ceiling
+ * stays published under the point reads made while it is open. the other levels hold nothing here
+ * -- a frozen snapshot is registered for its whole life and read-uncommitted resolves to the newest
  * version, which no collection drops
  * @param txn the transaction
  * @param ceiling out -- the sequence to read at

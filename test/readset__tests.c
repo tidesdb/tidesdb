@@ -39,6 +39,37 @@ void test_readset_record(void)
     tidesdb_readset_free(rs);
 }
 
+/* keys enough to widen the index several times over */
+#define RS_INDEX_KEYS 3000
+
+/* a key read again is found by the index however many reads came before it, so the set neither
+ * duplicates it nor walks its entries to find it */
+void test_readset_dedup_at_scale(void)
+{
+    tidesdb_readset_t *rs = tidesdb_readset_create();
+    ASSERT_TRUE(rs != NULL);
+    char k[16];
+    for (int i = 0; i < RS_INDEX_KEYS; i++)
+    {
+        snprintf(k, sizeof(k), "k%05d", i);
+        ASSERT_EQ(rec(rs, (uint32_t)(i % 2), k, (uint64_t)i + 1), TDB_SUCCESS);
+    }
+    ASSERT_EQ(tidesdb_readset_count(rs), RS_INDEX_KEYS);
+    for (int i = 0; i < RS_INDEX_KEYS; i++)
+    {
+        snprintf(k, sizeof(k), "k%05d", i);
+        ASSERT_EQ(rec(rs, (uint32_t)(i % 2), k, (uint64_t)i + RS_INDEX_KEYS), TDB_SUCCESS);
+    }
+    ASSERT_EQ(tidesdb_readset_count(rs), RS_INDEX_KEYS); /* every re-read folded into its entry */
+    tidesdb_readset_entry_t e;
+    for (int i = 0; i < RS_INDEX_KEYS; i++)
+    {
+        ASSERT_TRUE(tidesdb_readset_at(rs, i, &e));
+        ASSERT_EQ((int)e.seq, i + RS_INDEX_KEYS);
+    }
+    tidesdb_readset_free(rs);
+}
+
 /* re-reading a key keeps the higher observed seq rather than appending */
 void test_readset_dedup_max_seq(void)
 {
@@ -139,6 +170,7 @@ int main(int argc, char **argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_readset_record, tests_passed);
     RUN_TEST(test_readset_dedup_max_seq, tests_passed);
+    RUN_TEST(test_readset_dedup_at_scale, tests_passed);
     RUN_TEST(test_readset_growth, tests_passed);
     RUN_TEST(test_readset_record_range, tests_passed);
     RUN_TEST(test_readset_null_safe, tests_passed);

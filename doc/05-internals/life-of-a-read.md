@@ -38,7 +38,8 @@ passes it, and then all of it is. See [Transactions and MVCC](/internals/transac
 
 The transaction's write set is consulted first. A transaction always sees its own uncommitted
 writes, and a key it has deleted reads as absent to it even though the tombstone is not
-durable anywhere.
+durable anywhere. The set answers from a skip list over its keys, so the cost is the same in a
+transaction of a hundred writes and one of a hundred thousand.
 
 If the read is a tracking [`tidesdb_txn_get`](/reference/transaction#tidesdb_txn_get), the
 key and the version found are recorded in the read footprint here. That record is what a

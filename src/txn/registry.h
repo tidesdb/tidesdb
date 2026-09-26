@@ -64,7 +64,7 @@ uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg);
 
 /**
  * tidesdb_txn_registry_take_floor
- * the reclamation floor for a collection about to run: the smallest sequence any live transaction
+ * the reclamation floor for a collection about to run, the smallest sequence any live transaction
  * still reads at, frozen snapshots and the ceilings of read committed reads in flight alike, and
  * never above the watermark, since nothing a collection reads is above it. the floor is published
  * as the high-water mark and the ceilings are scanned again behind a full barrier, so a read that

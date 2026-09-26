@@ -977,6 +977,51 @@ static void ryow_scan(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, int forwa
 /* a scan inside a transaction reads the transaction's own buffered writes: new puts appear,
  * overwrites win over committed values, deletes hide the underlying rows, a put-then-delete
  * vanishes, and none of it leaks to a concurrent transaction until commit */
+/* a transaction's own buffered prefix delete hides the committed keys under it from its own scan,
+ * exactly as it hides them from its own point reads, and a key it writes under the prefix after the
+ * delete comes back while one it wrote before the delete does not */
+void test_engine_scan_honours_own_prefix_delete(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    ryow_commit(db, cf, "user:1", "A");
+    ryow_commit(db, cf, "user:2", "B");
+    ryow_commit(db, cf, "zz", "Z");
+
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &w), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"user:4", 6, (const uint8_t *)"D", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_delete_prefix(w, cf, (const uint8_t *)"user:", 5), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"user:3", 6, (const uint8_t *)"C", 1, -1),
+              TDB_SUCCESS);
+
+    /* the point read already answers this way; the scan has to agree with it */
+    uint8_t *v = NULL;
+    size_t vl = 0;
+    ASSERT_EQ(tidesdb_txn_get(w, cf, (const uint8_t *)"user:1", 6, &v, &vl), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(tidesdb_txn_get(w, cf, (const uint8_t *)"user:4", 6, &v, &vl), TDB_ERR_NOT_FOUND);
+
+    char buf[256];
+    ryow_scan(w, cf, 1, buf, sizeof(buf));
+    ASSERT_TRUE(strcmp(buf, "user:3:C,zz:Z,") == 0);
+    ryow_scan(w, cf, 0, buf, sizeof(buf));
+    ASSERT_TRUE(strcmp(buf, "zz:Z,user:3:C,") == 0);
+
+    ASSERT_EQ(tidesdb_txn_rollback(w), TDB_SUCCESS);
+    tidesdb_txn_free(w);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 void test_engine_scan_reads_own_writes(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -6936,6 +6981,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_bounded_iterator_returns_the_whole_range_and_nothing_else, tests_passed);
     RUN_TEST(test_engine_compaction_converges_an_interleaved_store, tests_passed);
     RUN_TEST(test_engine_scan_reads_own_writes, tests_passed);
+    RUN_TEST(test_engine_scan_honours_own_prefix_delete, tests_passed);
     RUN_TEST(test_engine_cf_stats, tests_passed);
     RUN_TEST(test_engine_cf_estimate_cardinality, tests_passed);
     RUN_TEST(test_engine_cf_unflushed_keys, tests_passed);

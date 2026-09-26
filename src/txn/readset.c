@@ -12,7 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "db.h" /* TDB_SUCCESS / TDB_ERR_* result codes */
+#include "db.h"        /* TDB_SUCCESS / TDB_ERR_* result codes */
+#include "key_index.h" /* the index of each read key's entry */
 
 /* initial array capacity for the keys and for the intervals, grown by doubling */
 #define TDB_READSET_INITIAL_CAP 16
@@ -59,6 +60,9 @@ typedef struct
  * @param entries recorded reads, one per distinct key
  * @param count number of entries
  * @param capacity allocated length of entries
+ * @param index the position of each key's entry, so recording a read costs the same however many
+ *              the transaction has made; a record that walked the entries to find a key already
+ *              read cost as much as the transaction had already read
  * @param ranges the intervals scans covered, one per freed iterator
  * @param range_count number of ranges
  * @param range_capacity allocated length of ranges
@@ -71,6 +75,7 @@ struct tidesdb_readset
     readset_entry *entries;
     int count;
     int capacity;
+    tdb_key_index_t index;
     readset_range *ranges;
     int range_count;
     int range_capacity;
@@ -87,6 +92,7 @@ tidesdb_readset_t *tidesdb_readset_create(void)
         free(rs);
         return NULL;
     }
+    tdb_key_index_init(&rs->index);
     return rs;
 }
 
@@ -95,6 +101,7 @@ static void readset_drop_all(tidesdb_readset_t *rs)
 {
     for (int i = 0; i < rs->count; i++) free(rs->entries[i].key);
     rs->count = 0;
+    tdb_key_index_clear(&rs->index);
     for (int i = 0; i < rs->range_count; i++)
     {
         free(rs->ranges[i].lo);
@@ -108,24 +115,29 @@ void tidesdb_readset_free(tidesdb_readset_t *rs)
 {
     if (!rs) return;
     readset_drop_all(rs);
+    tdb_key_index_free(&rs->index);
     free(rs->entries);
     free(rs->ranges);
     pthread_rwlock_destroy(&rs->lock);
     free(rs);
 }
 
+/* the index's view of the entry at a position, its family and key */
+static int readset_entry_view(const void *ctx, const int position, uint32_t *cf_index,
+                              const uint8_t **key, size_t *key_size)
+{
+    const readset_entry *e = &((const tidesdb_readset_t *)ctx)->entries[position];
+    *cf_index = e->cf_index;
+    *key = e->key;
+    *key_size = e->key_size;
+    return 1;
+}
+
 /* index of a key in the entry array, or -1; caller holds a lock or owns the set */
 static int readset_index(const tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
                          size_t key_size)
 {
-    for (int i = 0; i < rs->count; i++)
-    {
-        const readset_entry *e = &rs->entries[i];
-        if (e->cf_index == cf_index && e->key_size == key_size &&
-            memcmp(e->key, key, key_size) == 0)
-            return i;
-    }
-    return -1;
+    return tdb_key_index_find(&rs->index, rs, readset_entry_view, cf_index, key, key_size);
 }
 
 /* copy a bound, or NULL when it is empty or cannot be copied; *ok is cleared on a failed copy */
@@ -181,7 +193,21 @@ int tidesdb_readset_record(tidesdb_readset_t *rs, uint32_t cf_index, const uint8
     }
     rs->entries[rs->count] = (readset_entry){cf_index, key_copy, key_size, seq};
     rs->count++;
-    atomic_fetch_add_explicit(&rs->mem_bytes, (int64_t)(sizeof(readset_entry) + key_size),
+    /* indexed once it is in the array, so the index never names an entry the array does not hold;
+     * a read that could not be indexed is not recorded, and the caller reports the failure, since
+     * a read the set cannot find again would be validated against nothing */
+    const int64_t before = (int64_t)tdb_key_index_bytes(&rs->index);
+    if (tdb_key_index_put(&rs->index, rs, readset_entry_view, rs->count - 1, rs->count) !=
+        TDB_SUCCESS)
+    {
+        rs->count--;
+        free(key_copy);
+        pthread_rwlock_unlock(&rs->lock);
+        return TDB_ERR_MEMORY;
+    }
+    atomic_fetch_add_explicit(&rs->mem_bytes,
+                              (int64_t)(sizeof(readset_entry) + key_size) +
+                                  (int64_t)tdb_key_index_bytes(&rs->index) - before,
                               memory_order_relaxed);
     pthread_rwlock_unlock(&rs->lock);
     return TDB_SUCCESS;

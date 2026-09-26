@@ -178,36 +178,36 @@ static int mt_position(memtable_merge_source_t *s, int forward)
     return 0;
 }
 
-/* seek to the start (dir forward) or end (dir backward) of the family's prefix range, then resolve
- */
-static int mt_seek_family_edge(memtable_merge_source_t *s, int forward)
+/* move a cursor over a family-prefixed skip list to the start (forward) or the end (backward) of
+ * one family's key range; the caller then resolves what it finds there */
+static void ms_cursor_to_family_edge(skip_list_cursor_t *cursor, const uint32_t cf_index,
+                                     const int forward)
 {
     uint8_t prefix[TDB_CF_PREFIX_SIZE];
     if (forward)
     {
-        tdb_encode_be32(s->cf_index, prefix);
-        (void)skip_list_cursor_seek_ge(s->cursor, prefix, sizeof(prefix));
-        return mt_position(s, 1);
+        tdb_encode_be32(cf_index, prefix);
+        (void)skip_list_cursor_seek_ge(cursor, prefix, sizeof(prefix));
+        return;
     }
     /* the largest key below the next family's prefix is this family's last key */
-    if (s->cf_index == UINT32_MAX)
-        (void)skip_list_cursor_goto_last(s->cursor);
+    if (cf_index == UINT32_MAX)
+        (void)skip_list_cursor_goto_last(cursor);
     else
     {
-        tdb_encode_be32(s->cf_index + 1, prefix);
-        (void)skip_list_cursor_seek_for_prev(s->cursor, prefix, sizeof(prefix));
+        tdb_encode_be32(cf_index + 1, prefix);
+        (void)skip_list_cursor_seek_for_prev(cursor, prefix, sizeof(prefix));
     }
-    return mt_position(s, 0);
 }
 
 /* build the prefixed lookup key for a user key seek */
-static int mt_build_prefixed(memtable_merge_source_t *s, const uint8_t *key, size_t key_size,
+static int ms_build_prefixed(const uint32_t cf_index, const uint8_t *key, size_t key_size,
                              uint8_t *stack, size_t stack_cap, uint8_t **out, size_t *out_size)
 {
     const size_t total = TDB_CF_PREFIX_SIZE + key_size;
     uint8_t *buf = total <= stack_cap ? stack : malloc(total);
     if (!buf) return -1;
-    tdb_encode_be32(s->cf_index, buf);
+    tdb_encode_be32(cf_index, buf);
     memcpy(buf + TDB_CF_PREFIX_SIZE, key, key_size);
     *out = buf;
     *out_size = total;
@@ -216,11 +216,15 @@ static int mt_build_prefixed(memtable_merge_source_t *s, const uint8_t *key, siz
 
 static int mt_first(void *ctx)
 {
-    return mt_seek_family_edge((memtable_merge_source_t *)ctx, 1);
+    memtable_merge_source_t *s = ctx;
+    ms_cursor_to_family_edge(s->cursor, s->cf_index, 1);
+    return mt_position(s, 1);
 }
 static int mt_last(void *ctx)
 {
-    return mt_seek_family_edge((memtable_merge_source_t *)ctx, 0);
+    memtable_merge_source_t *s = ctx;
+    ms_cursor_to_family_edge(s->cursor, s->cf_index, 0);
+    return mt_position(s, 0);
 }
 
 static int mt_next(void *ctx)
@@ -256,7 +260,8 @@ static int mt_seek(void *ctx, const uint8_t *key, size_t key_size)
     uint8_t stack[MT_SEEK_STACK_BUF];
     uint8_t *prefixed = NULL;
     size_t prefixed_size = 0;
-    if (mt_build_prefixed(s, key, key_size, stack, sizeof(stack), &prefixed, &prefixed_size) != 0)
+    if (ms_build_prefixed(s->cf_index, key, key_size, stack, sizeof(stack), &prefixed,
+                          &prefixed_size) != 0)
     {
         s->positioned = 0;
         return 0;
@@ -272,7 +277,8 @@ static int mt_seek_for_prev(void *ctx, const uint8_t *key, size_t key_size)
     uint8_t stack[MT_SEEK_STACK_BUF];
     uint8_t *prefixed = NULL;
     size_t prefixed_size = 0;
-    if (mt_build_prefixed(s, key, key_size, stack, sizeof(stack), &prefixed, &prefixed_size) != 0)
+    if (ms_build_prefixed(s->cf_index, key, key_size, stack, sizeof(stack), &prefixed,
+                          &prefixed_size) != 0)
     {
         s->positioned = 0;
         return 0;
@@ -363,178 +369,191 @@ void memtable_merge_source(memtable_merge_source_t *s, merge_source_t *out)
 
 /* ===== writeset overlay source -- a transaction's own buffered puts and deletes ===== */
 
-/* one snapshotted buffered op, its key and value borrowed from the write set */
-typedef struct
+struct writeset_merge_source
 {
-    const uint8_t *key;
+    const tidesdb_writeset_t *ws; /* the set the positions under the cursor are read back from */
+    skip_list_cursor_t *cursor;   /* over the set's key list, family-prefixed like the memtable's */
+    uint32_t cf_index;
+    uint64_t
+        seq; /* reported for every entry, the read snapshot, so the overlay wins over the store */
+    int positioned;
+    const uint8_t *key; /* the resolved entry, borrowed from the set until the next mutation */
     size_t key_size;
     const uint8_t *value;
     size_t value_size;
     int64_t ttl;
     uint8_t deleted;
-} ws_entry_t;
-
-struct writeset_merge_source
-{
-    ws_entry_t *ents; /* sorted by key, one latest entry per key */
-    int n;
-    int pos; /* current cursor position, outside [0, n) when unpositioned */
-    uint64_t seq;
 };
 
-/* one collected op paired with its insertion index, so a sort by key then index leaves the latest
- * write of each key last in its run */
-typedef struct
+/* resolve the node under the cursor to the write it names -- the head version's value is the
+ * position of the key's newest write -- and decide how it reads: a tombstone, or a point write an
+ * interval delete buffered after it covers, reads as deleted */
+static int wss_resolve(writeset_merge_source_t *s)
 {
+    uint8_t *pkey = NULL, *value = NULL;
+    size_t pkey_size = 0, value_size = 0;
+    int64_t ttl = 0;
+    uint8_t flags = 0;
+    uint64_t seq = 0;
+    if (skip_list_cursor_get_with_seq(s->cursor, &pkey, &pkey_size, &value, &value_size, NULL, &ttl,
+                                      &flags, &seq) != 0 ||
+        value_size != sizeof(uint64_t))
+        return 0;
+    uint64_t position = 0;
+    memcpy(&position, value, sizeof(position));
     tidesdb_writeset_op_t op;
-    int idx;
-} ws_collect_t;
-
-static int ws_collect_cmp(const void *a, const void *b)
-{
-    const ws_collect_t *x = a, *y = b;
-    const int c = tdb_key_cmp(x->op.key, x->op.key_size, y->op.key, y->op.key_size);
-    if (c != 0) return c;
-    return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
+    if (!tidesdb_writeset_op_at(s->ws, (int)position, &op)) return 0;
+    const int covered =
+        tidesdb_writeset_covering(s->ws, s->cf_index, op.key, op.key_size, (int)position) >= 0;
+    const int tombstone = covered || (op.flags & TDB_WAL_ENTRY_TOMBSTONE) != 0;
+    s->key = op.key;
+    s->key_size = op.key_size;
+    s->value = tombstone ? NULL : op.value;
+    s->value_size = tombstone ? 0 : op.value_size;
+    s->ttl = op.ttl;
+    s->deleted = (uint8_t)(tombstone ? 1 : 0);
+    return 1;
 }
 
-writeset_merge_source_t *writeset_merge_source_new(const tidesdb_writeset_t *ws, uint32_t cf_index,
-                                                   uint64_t seq)
+/* walk nodes in the scan direction to the first that is this family's, resolving it, and stop where
+ * the family's key range ends */
+static int wss_position(writeset_merge_source_t *s, int forward)
 {
-    const int total = ws ? tidesdb_writeset_count(ws) : 0;
-    if (total <= 0) return NULL;
-
-    ws_collect_t *collected = malloc((size_t)total * sizeof(*collected));
-    if (!collected) return NULL;
-    int m = 0;
-    for (int i = 0; i < total; i++)
+    while (skip_list_cursor_valid(s->cursor))
     {
-        tidesdb_writeset_op_t op;
-        if (tidesdb_writeset_op_at(ws, i, &op) && op.cf_index == cf_index)
+        uint8_t *pkey = NULL, *value = NULL;
+        size_t pkey_size = 0, value_size = 0;
+        if (skip_list_cursor_get_with_seq(s->cursor, &pkey, &pkey_size, &value, &value_size, NULL,
+                                          NULL, NULL, NULL) != 0 ||
+            pkey_size < TDB_CF_PREFIX_SIZE)
+            break;
+        const uint32_t cf = tdb_decode_be32(pkey);
+        if (cf == s->cf_index)
         {
-            collected[m].op = op;
-            collected[m].idx = i;
-            m++;
+            s->positioned = wss_resolve(s);
+            return s->positioned;
         }
+        if ((forward && cf > s->cf_index) || (!forward && cf < s->cf_index)) break;
+        if ((forward ? skip_list_cursor_next(s->cursor) : skip_list_cursor_prev(s->cursor)) != 0)
+            break;
     }
-    if (m == 0)
-    {
-        free(collected);
-        return NULL;
-    }
-    qsort(collected, (size_t)m, sizeof(*collected), ws_collect_cmp);
-
-    writeset_merge_source_t *s = calloc(1, sizeof(*s));
-    ws_entry_t *ents = malloc((size_t)m * sizeof(*ents));
-    if (!s || !ents)
-    {
-        free(s);
-        free(ents);
-        free(collected);
-        return NULL;
-    }
-    /* keep the last op of each equal-key run, which the index tiebreak left as the latest write */
-    int out = 0;
-    for (int i = 0; i < m; i++)
-    {
-        if (i + 1 < m && tdb_key_cmp(collected[i].op.key, collected[i].op.key_size,
-                                     collected[i + 1].op.key, collected[i + 1].op.key_size) == 0)
-            continue;
-        const int deleted = (collected[i].op.flags & TDB_WAL_ENTRY_TOMBSTONE) != 0;
-        ents[out].key = collected[i].op.key;
-        ents[out].key_size = collected[i].op.key_size;
-        ents[out].value = deleted ? NULL : collected[i].op.value;
-        ents[out].value_size = deleted ? 0 : collected[i].op.value_size;
-        ents[out].ttl = collected[i].op.ttl;
-        ents[out].deleted = deleted ? 1 : 0;
-        out++;
-    }
-    free(collected);
-    s->ents = ents;
-    s->n = out;
-    s->pos = -1;
-    s->seq = seq;
-    return s;
+    s->positioned = 0;
+    return 0;
 }
 
 static int wss_first(void *ctx)
 {
     writeset_merge_source_t *s = ctx;
-    s->pos = 0;
-    return s->n > 0;
+    ms_cursor_to_family_edge(s->cursor, s->cf_index, 1);
+    return wss_position(s, 1);
 }
 static int wss_last(void *ctx)
 {
     writeset_merge_source_t *s = ctx;
-    s->pos = s->n - 1;
-    return s->n > 0;
+    ms_cursor_to_family_edge(s->cursor, s->cf_index, 0);
+    return wss_position(s, 0);
 }
 static int wss_next(void *ctx)
 {
     writeset_merge_source_t *s = ctx;
-    s->pos++;
-    return s->pos >= 0 && s->pos < s->n;
+    if (skip_list_cursor_next(s->cursor) != 0)
+    {
+        s->positioned = 0;
+        return 0;
+    }
+    return wss_position(s, 1);
 }
 static int wss_prev(void *ctx)
 {
     writeset_merge_source_t *s = ctx;
-    s->pos--;
-    return s->pos >= 0 && s->pos < s->n;
+    if (skip_list_cursor_prev(s->cursor) != 0)
+    {
+        s->positioned = 0;
+        return 0;
+    }
+    return wss_position(s, 0);
 }
 static int wss_valid(void *ctx)
 {
-    writeset_merge_source_t *s = ctx;
-    return s->pos >= 0 && s->pos < s->n;
+    return ((writeset_merge_source_t *)ctx)->positioned;
 }
-
-/* leftmost entry whose key is greater than or equal to the target */
 static int wss_seek(void *ctx, const uint8_t *key, size_t key_size)
 {
     writeset_merge_source_t *s = ctx;
-    int lo = 0, hi = s->n;
-    while (lo < hi)
+    uint8_t stack[MT_SEEK_STACK_BUF];
+    uint8_t *prefixed = NULL;
+    size_t prefixed_size = 0;
+    if (ms_build_prefixed(s->cf_index, key, key_size, stack, sizeof(stack), &prefixed,
+                          &prefixed_size) != 0)
     {
-        const int mid = lo + (hi - lo) / 2;
-        if (tdb_key_cmp(s->ents[mid].key, s->ents[mid].key_size, key, key_size) < 0)
-            lo = mid + 1;
-        else
-            hi = mid;
+        s->positioned = 0;
+        return 0;
     }
-    s->pos = lo;
-    return s->pos < s->n;
+    (void)skip_list_cursor_seek_ge(s->cursor, prefixed, prefixed_size);
+    if (prefixed != stack) free(prefixed);
+    return wss_position(s, 1);
 }
-
-/* rightmost entry whose key is less than or equal to the target */
 static int wss_seek_for_prev(void *ctx, const uint8_t *key, size_t key_size)
 {
     writeset_merge_source_t *s = ctx;
-    int lo = 0, hi = s->n;
-    while (lo < hi)
+    uint8_t stack[MT_SEEK_STACK_BUF];
+    uint8_t *prefixed = NULL;
+    size_t prefixed_size = 0;
+    if (ms_build_prefixed(s->cf_index, key, key_size, stack, sizeof(stack), &prefixed,
+                          &prefixed_size) != 0)
     {
-        const int mid = lo + (hi - lo) / 2;
-        if (tdb_key_cmp(s->ents[mid].key, s->ents[mid].key_size, key, key_size) <= 0)
-            lo = mid + 1;
-        else
-            hi = mid;
+        s->positioned = 0;
+        return 0;
     }
-    s->pos = lo - 1;
-    return s->pos >= 0;
+    (void)skip_list_cursor_seek_for_prev(s->cursor, prefixed, prefixed_size);
+    if (prefixed != stack) free(prefixed);
+    return wss_position(s, 0);
 }
-
 static void wss_get(void *ctx, const uint8_t **key, size_t *key_size, uint64_t *seq,
                     const uint8_t **value, size_t *value_size, uint64_t *vlog_offset, int64_t *ttl,
                     uint8_t *deleted)
 {
     writeset_merge_source_t *s = ctx;
-    const ws_entry_t *e = &s->ents[s->pos];
-    *key = e->key;
-    *key_size = e->key_size;
+    *key = s->key;
+    *key_size = s->key_size;
     *seq = s->seq;
-    *value = e->value;
-    *value_size = e->value_size;
-    *vlog_offset = 0; /* buffered writes are inline, never spilled */
-    *ttl = e->ttl;
-    *deleted = e->deleted;
+    *value = s->value;
+    *value_size = s->value_size;
+    *vlog_offset = 0; /* a buffered value is always inline; the commit separates it later */
+    *ttl = s->ttl;
+    *deleted = s->deleted;
+}
+
+/* an interval the transaction itself has buffered covers the key, at the overlay's own sequence --
+ * so it deletes every committed version below and yields to a write of the key the transaction
+ * buffered after it, which the resolve above already reports live at that same sequence */
+static int writeset_source_covers(void *ctx, const uint8_t *key, size_t key_size, uint64_t snapshot,
+                                  uint64_t *out_seq)
+{
+    (void)snapshot;
+    writeset_merge_source_t *s = (writeset_merge_source_t *)ctx;
+    if (tidesdb_writeset_covering(s->ws, s->cf_index, key, key_size, -1) < 0) return 0;
+    *out_seq = s->seq;
+    return 1;
+}
+
+writeset_merge_source_t *writeset_merge_source_new(const tidesdb_writeset_t *ws, uint32_t cf_index,
+                                                   uint64_t seq)
+{
+    /* a family the set holds nothing of needs no source; the key list is the set's own, so nothing
+     * is copied or sorted here however much the transaction has buffered */
+    if (!ws || !tidesdb_writeset_touches(ws, cf_index)) return NULL;
+    writeset_merge_source_t *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    if (skip_list_cursor_init(&s->cursor, tidesdb_writeset_keys(ws)) != 0)
+    {
+        free(s);
+        return NULL;
+    }
+    s->ws = ws;
+    s->cf_index = cf_index;
+    s->seq = seq;
+    return s;
 }
 
 void writeset_merge_source(writeset_merge_source_t *s, merge_source_t *out)
@@ -551,11 +570,12 @@ void writeset_merge_source(writeset_merge_source_t *s, merge_source_t *out)
     out->seek_for_prev = wss_seek_for_prev;
     out->get = wss_get;
     out->ctx = s;
+    out->covers = writeset_source_covers;
 }
 
 void writeset_merge_source_free(writeset_merge_source_t *s)
 {
     if (!s) return;
-    free(s->ents);
+    skip_list_cursor_free(s->cursor);
     free(s);
 }

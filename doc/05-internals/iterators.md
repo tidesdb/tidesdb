@@ -169,8 +169,10 @@ Reaching for the begin sequence directly would be wrong rather than merely coars
 read-committed transaction has none, and filtering a scan against it would hide every live row.
 
 Over that committed view the scan folds the transaction's **own buffered writes**: its uncommitted
-puts appear, and its deletes hide the rows beneath them, exactly as point reads resolve them
-through the write set.
+puts appear, its deletes hide the rows beneath them, and its interval deletes hide every committed
+key under them while a key it wrote under one afterwards shows, exactly as point reads resolve them
+through the write set. The overlay is a cursor over the write set's own key list, so opening an
+iterator costs nothing that grows with the transaction.
 
 Making that true requires holding things alive. An iterator's sources pin what they read: memtables
 by epoch or reference count, sstables by the reference their level-set layout holds. A compaction

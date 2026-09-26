@@ -10,15 +10,21 @@
 #define __TIDESDB_TXN_WRITESET_H__
 
 #include "../compat.h"
+#include "../datastructures/skip_list/skip_list.h" /* the key list a scan walks */
 #include "wal_record.h" /* op flag bits (TDB_WAL_ENTRY_TOMBSTONE / SINGLE_DELETE) are shared */
 
 /* a transaction's buffered write set -- the ordered ops it has put or deleted but not yet
  * committed. this is the whole of a txn's uncommitted state (buffer-at-commit: nothing is durable
- * until commit), so it is also the read-your-own-writes source. every mutation goes through this
- * one guarded api: the owner appends and truncates behind a write lock, and a serializable peer
- * scanning this set for conflict detection holds the read lock, so no op-array mutation can race a
- * cross-txn reader. each op's key and value live in a single coalesced allocation (value follows
- * key), so only one pointer is freed per op and a caller can never double-free the value. */
+ * until commit), so it is also the read-your-own-writes source. the ops are kept in insertion
+ * order, which is what savepoints and the commit's replay order rest on, and beside them in a skip
+ * list over the family-prefixed keys, the order the memtable keeps, with the newest write of each
+ * key at the head -- so a lookup reads one head and a scan walks the list, and both cost the same
+ * in a transaction of a hundred writes and one of a hundred thousand. the interval deletes, few and
+ * covering keys they were never written beside, stay in a short list of their own. every mutation
+ * goes through this one guarded api: the owner appends and truncates behind a write lock, and a
+ * peer reading the set holds the read lock, so no op-array mutation can race a cross-txn reader.
+ * each op's key and value live in a single coalesced allocation (value follows key), so only one
+ * pointer is freed per op and a caller can never double-free the value. */
 
 typedef struct tidesdb_writeset tidesdb_writeset_t;
 
@@ -113,13 +119,61 @@ int tidesdb_writeset_lookup(const tidesdb_writeset_t *ws, uint32_t cf_index, con
                             size_t key_size, tidesdb_writeset_op_t *out);
 
 /**
+ * tidesdb_writeset_keys
+ * the key list, for a scan to walk with a cursor: family-prefixed keys, each holding one version
+ * per write of it, newest first, whose value is the position of that write. borrowed, valid until
+ * the set is freed; the positions it holds are read back through tidesdb_writeset_op_at
+ * @param ws the write set
+ * @return the key list, or NULL if ws is NULL
+ */
+skip_list_t *tidesdb_writeset_keys(const tidesdb_writeset_t *ws);
+
+/**
+ * tidesdb_writeset_newest
+ * the position of the newest point write of a key, what read-your-own-writes and the commit's dedup
+ * both resolve a key to; interval deletes are not consulted
+ * @param ws the write set
+ * @param cf_index the target column family's prefix index
+ * @param key the key bytes
+ * @param key_size length of key
+ * @return the position, or -1 when the key has no point write buffered
+ */
+int tidesdb_writeset_newest(const tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
+                            size_t key_size);
+
+/**
+ * tidesdb_writeset_covering
+ * the position of the newest buffered interval delete of a family that covers a key and was
+ * buffered after a given position, so a caller holding the key's own write asks only about the
+ * intervals that came after it
+ * @param ws the write set
+ * @param cf_index the target column family's prefix index
+ * @param key the key bytes
+ * @param key_size length of key
+ * @param after the position an interval must have been buffered after, -1 for any
+ * @return the position, or -1 when no such interval is buffered
+ */
+int tidesdb_writeset_covering(const tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
+                              size_t key_size, int after);
+
+/**
+ * tidesdb_writeset_touches
+ * whether the set buffers anything of a family at all, a point write or an interval delete, which
+ * is what decides whether a scan of that family needs the set as a source
+ * @param ws the write set
+ * @param cf_index the target column family's prefix index
+ * @return non-zero when it does
+ */
+int tidesdb_writeset_touches(const tidesdb_writeset_t *ws, uint32_t cf_index);
+
+/**
  * tidesdb_writeset_truncate
  * drop ops back to the first count of them (a savepoint rollback), freeing the rest, under the
  * write lock
  * @param ws the write set
  * @param count the number of ops to keep; clamped to the current count, a negative is treated as 0
  */
-void tidesdb_writeset_truncate(tidesdb_writeset_t *ws, int count);
+int tidesdb_writeset_truncate(tidesdb_writeset_t *ws, int count);
 
 /**
  * tidesdb_writeset_mem_bytes

@@ -24,7 +24,9 @@ Copying rather than borrowing is deliberate: a caller may free its buffers the m
 call returns, and a transaction may live a long time before it commits.
 
 The write set preserves insertion order, which is what makes savepoints work — a savepoint
-is a position in that sequence, and rolling back to it discards the tail.
+is a position in that sequence, and rolling back to it discards the tail. It also files the write
+under its key in a skip list of its own, so the transaction's later reads and scans find their own
+writes without walking everything buffered before them.
 
 This is also where a transaction that has outlived a timeout finds out. Nothing ages it in the
 background; the check happens on the way into an operation, so a stale transaction is aborted here

@@ -322,9 +322,23 @@ The **write set** buffers operations in insertion order. Order is what makes sav
 savepoint is a position in the sequence, rolling back to it discards the tail, and releasing it
 forgets the mark without discarding anything.
 
+Beside the ordered ops the set keeps the same skip list the memtable keeps, over the family-prefixed
+keys, holding for each key one version per write of it with the write's position as the value and
+the newest at the head. A read-your-own-writes lookup reads one head; a scan inside the transaction
+walks the list with the memtable's own cursor and folds it over the committed view. Both once walked
+the ops instead — the lookup comparing every buffered key, the scan sorting a copy of them per
+iterator — so every operation of a transaction cost as much as it had already buffered, and a bulk
+load of a hundred thousand rows was quadratic in the rows, twenty-one seconds where it now takes a
+fraction of one. The interval deletes are few and cover keys they were never written beside, so they
+stay in a short list of their own, walked newest first: a key's newest point write answers unless an
+interval buffered after it covers it, and a scan honours the transaction's own interval deletes the
+same way, hiding the committed keys under them and showing a key the transaction wrote under one
+afterwards. The commit's dedup asks the same list which write of a key is the newest.
+
 The **read set** records what tracking reads observed — key and version — and the intervals the
 transaction's scans covered, each at the snapshot it scanned at. It exists to feed the read
-validation at commit and, at a prepare, the read claims.
+validation at commit and, at a prepare, the read claims. A key read again is found through an index
+over the entries rather than a walk of them, for the same reason.
 
 Both are per-transaction and single-threaded, which is why a transaction handle is not
 thread-safe. The one exception is the flag

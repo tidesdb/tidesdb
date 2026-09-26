@@ -76,61 +76,12 @@ static int txn_op_superseded_by(const tidesdb_writeset_op_t *op, const tidesdb_w
     return later->key_size == op->key_size && memcmp(later->key, op->key, op->key_size) == 0;
 }
 
-/* the dedup set's floor, so a small batch does not pay a resize walk to reach a useful width */
-#define TDB_DEDUP_MIN_SLOTS 64
-
-/* the dedup asks, for every op, whether a later one already writes everything it does. asked
- * pairwise that is quadratic, and a bulk-loading transaction is exactly the case with the most ops
- * -- so the walk runs backward instead, testing each op against a summary of what follows it. point
- * writes are retired by the newest write of the same key, which an open-addressed set answers in
- * constant time; interval deletes cannot be summarized that way, but a batch holds few of them, so
- * they stay a list every op is checked against.
- * @param slot op index plus one, 0 for an empty slot; the index is kept so a collision can compare
- *             the key rather than trust the hash
- * @param mask one less than the power-of-two slot count
- */
-typedef struct
-{
-    int *slot;
-    uint64_t mask;
-} txn_dedup_set_t;
-
-/* whether the set already holds a point write of this op's key, meaning a later one supersedes it
- */
-static int txn_dedup_seen(const txn_dedup_set_t *set, tidesdb_writeset_t *ws,
-                          const tidesdb_writeset_op_t *op)
-{
-    uint64_t at = txn_key_hash(op->cf_index, op->key, op->key_size) & set->mask;
-    while (set->slot[at] != 0)
-    {
-        tidesdb_writeset_op_t other;
-        if (tidesdb_writeset_op_at(ws, set->slot[at] - 1, &other) &&
-            other.cf_index == op->cf_index && other.key_size == op->key_size &&
-            memcmp(other.key, op->key, op->key_size) == 0)
-            return 1;
-        at = (at + 1) & set->mask;
-    }
-    return 0;
-}
-
-/* record this op as the newest point write of its key seen so far */
-static void txn_dedup_insert(const txn_dedup_set_t *set, tidesdb_writeset_t *ws, const int index,
-                             const tidesdb_writeset_op_t *op)
-{
-    uint64_t at = txn_key_hash(op->cf_index, op->key, op->key_size) & set->mask;
-    while (set->slot[at] != 0)
-    {
-        tidesdb_writeset_op_t other;
-        if (tidesdb_writeset_op_at(ws, set->slot[at] - 1, &other) &&
-            other.cf_index == op->cf_index && other.key_size == op->key_size &&
-            memcmp(other.key, op->key, op->key_size) == 0)
-            return; /* a newer write of this key is already the one that speaks for it */
-        at = (at + 1) & set->mask;
-    }
-    set->slot[at] = index + 1;
-}
-
-/* mark every op a later one supersedes, walking backward so each is tested against what follows
+/**
+ * txn_mark_superseded
+ * mark every op a later one supersedes. a point write is superseded by a later write of its key,
+ * which the write set already knows as the key's newest position, and by a later interval delete
+ * covering it; an interval delete is superseded only by a later interval containing it whole. the
+ * intervals are few and asked pairwise, which is the same answer a walk of every pair gave
  * @param ws the write set
  * @param n the op count
  * @param superseded out, one byte per op, set non-zero for an op a later one covers
@@ -138,18 +89,8 @@ static void txn_dedup_insert(const txn_dedup_set_t *set, tidesdb_writeset_t *ws,
  */
 static int txn_mark_superseded(tidesdb_writeset_t *ws, const int n, unsigned char *superseded)
 {
-    /* held at least twice the op count so a probe walks a short run */
-    uint64_t cap = TDB_DEDUP_MIN_SLOTS;
-    while (cap < (uint64_t)n * 2) cap <<= 1;
-
-    txn_dedup_set_t set = {.slot = calloc((size_t)cap, sizeof(*set.slot)), .mask = cap - 1};
     int *ranges = malloc((size_t)n * sizeof(*ranges));
-    if (!set.slot || !ranges)
-    {
-        free(set.slot);
-        free(ranges);
-        return -1;
-    }
+    if (!ranges) return -1;
 
     int nranges = 0;
     for (int i = n - 1; i >= 0; i--)
@@ -157,8 +98,6 @@ static int txn_mark_superseded(tidesdb_writeset_t *ws, const int n, unsigned cha
         tidesdb_writeset_op_t op;
         if (!tidesdb_writeset_op_at(ws, i, &op)) continue;
 
-        /* the interval deletes are asked pairwise, which is the same answer the quadratic walk gave
-         * and cheap while a batch holds few of them */
         int sup = 0;
         for (int r = 0; r < nranges && !sup; r++)
         {
@@ -169,17 +108,11 @@ static int txn_mark_superseded(tidesdb_writeset_t *ws, const int n, unsigned cha
 
         if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE)
             ranges[nranges++] = i;
-        else
-        {
-            if (!sup) sup = txn_dedup_seen(&set, ws, &op);
-            /* recorded whether or not it survives -- an op it lost to speaks for the key from here
-             * back, exactly as the pairwise walk had every later op to compare against */
-            txn_dedup_insert(&set, ws, i, &op);
-        }
+        else if (!sup)
+            sup = tidesdb_writeset_newest(ws, op.cf_index, op.key, op.key_size) != i;
         superseded[i] = (unsigned char)sup;
     }
 
-    free(set.slot);
     free(ranges);
     return 0;
 }

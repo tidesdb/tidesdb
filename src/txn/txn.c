@@ -363,7 +363,7 @@ uint64_t tdb_txn_read_floor(const tdb_txn_t *txn)
     return tdb_txn_snapshot_floor(txn);
 }
 
-/* the store half of a get, at a ceiling the caller holds: the external source stack at that
+/* the store half of a get, at a ceiling the caller holds -- the external source stack at that
  * snapshot, absorbing a transient busy internally, with the read recorded for validation when the
  * level keeps a read set */
 static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
@@ -561,7 +561,14 @@ int tdb_txn_rollback_to_savepoint(tdb_txn_t *txn, const char *name)
     const int idx = txn_savepoint_index(txn, name);
     if (idx < 0) return TDB_ERR_NOT_FOUND;
 
-    tidesdb_writeset_truncate(txn->writeset, txn->sp_counts[idx]);
+    /* a set that could not be rebuilt whole after the truncation is not one this transaction may go
+     * on reading through, so the transaction ends here rather than read past its own writes */
+    if (tidesdb_writeset_truncate(txn->writeset, txn->sp_counts[idx]) != TDB_SUCCESS)
+    {
+        txn->state = TDB_TXN_ABORTED;
+        txn_leave_registry(txn);
+        return TDB_ERR_MEMORY;
+    }
 
     /* keep the target savepoint so it can be rolled back to again (standard sql), dropping only the
      * savepoints taken after it */

@@ -26,6 +26,91 @@ static int op_val_is(const tidesdb_writeset_op_t *o, const char *s)
     return o->value_size == strlen(s) && memcmp(o->value, s, o->value_size) == 0;
 }
 
+/* keys enough to widen the index several times over, across three families */
+#define WS_INDEX_KEYS          5000
+#define WS_INDEX_FAMILIES      3
+#define WS_INDEX_REWRITE_EVERY 7
+
+/* the lookup is answered from the key list rather than a walk of the ops, so it has to stay right
+ * as the list grows, when a key is written again, when another family holds the same bytes, and
+ * when a savepoint rollback discards a tail that held the newest write of a key */
+void test_writeset_lookup_follows_growth_rewrites_and_truncation(void)
+{
+    tidesdb_writeset_t *ws = tidesdb_writeset_create();
+    ASSERT_TRUE(ws != NULL);
+    char k[16], v[16];
+    for (int i = 0; i < WS_INDEX_KEYS; i++)
+    {
+        snprintf(k, sizeof(k), "k%05d", i);
+        snprintf(v, sizeof(v), "a%05d", i);
+        ASSERT_EQ(put(ws, (uint32_t)(i % WS_INDEX_FAMILIES), k, v, 0), TDB_SUCCESS);
+    }
+    for (int i = 0; i < WS_INDEX_KEYS; i += WS_INDEX_REWRITE_EVERY)
+    {
+        snprintf(k, sizeof(k), "k%05d", i);
+        ASSERT_EQ(put(ws, (uint32_t)(i % WS_INDEX_FAMILIES), k, "again", 0), TDB_SUCCESS);
+    }
+    tidesdb_writeset_op_t o;
+    for (int i = 0; i < WS_INDEX_KEYS; i++)
+    {
+        snprintf(k, sizeof(k), "k%05d", i);
+        snprintf(v, sizeof(v), "a%05d", i);
+        const uint32_t cf = (uint32_t)(i % WS_INDEX_FAMILIES);
+        ASSERT_TRUE(tidesdb_writeset_lookup(ws, cf, (const uint8_t *)k, strlen(k), &o));
+        ASSERT_TRUE(op_val_is(&o, i % WS_INDEX_REWRITE_EVERY == 0 ? "again" : v));
+        /* the same bytes under another family are not this key */
+        ASSERT_TRUE(!tidesdb_writeset_lookup(ws, cf + WS_INDEX_FAMILIES, (const uint8_t *)k,
+                                             strlen(k), &o));
+    }
+
+    /* a tail written after a savepoint goes with the rollback, and a key the tail rewrote reads
+     * back as the write below the savepoint */
+    const int mark = tidesdb_writeset_count(ws);
+    ASSERT_EQ(put(ws, 0, "k00000", "after the mark", 0), TDB_SUCCESS);
+    ASSERT_EQ(put(ws, 0, "z00000", "new after the mark", 0), TDB_SUCCESS);
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"k00000", 6, &o) &&
+                op_val_is(&o, "after the mark"));
+    tidesdb_writeset_truncate(ws, mark);
+    ASSERT_EQ(tidesdb_writeset_count(ws), mark);
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"k00000", 6, &o) &&
+                op_val_is(&o, "again"));
+    ASSERT_TRUE(!tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"z00000", 6, &o));
+
+    tidesdb_writeset_truncate(ws, 0);
+    ASSERT_TRUE(!tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"k00000", 6, &o));
+    ASSERT_EQ(put(ws, 0, "k00000", "fresh", 0), TDB_SUCCESS);
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"k00000", 6, &o) &&
+                op_val_is(&o, "fresh"));
+    tidesdb_writeset_free(ws);
+}
+
+/* an interval delete answers for a key only when it is newer than the key's own point write, and
+ * the point write answers again once a savepoint rollback has discarded the interval */
+void test_writeset_lookup_orders_intervals_against_point_writes(void)
+{
+    tidesdb_writeset_t *ws = tidesdb_writeset_create();
+    ASSERT_TRUE(ws != NULL);
+    tidesdb_writeset_op_t o;
+    ASSERT_EQ(put(ws, 0, "user:1", "old", 0), TDB_SUCCESS);
+    const int mark = tidesdb_writeset_count(ws);
+    ASSERT_EQ(tidesdb_writeset_put(ws, 0, (const uint8_t *)"user:", 5, (const uint8_t *)"user;", 5,
+                                   -1, TDB_WAL_ENTRY_TOMBSTONE | TDB_WAL_ENTRY_RANGE_DELETE),
+              TDB_SUCCESS);
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"user:1", 6, &o) &&
+                (o.flags & TDB_WAL_ENTRY_RANGE_DELETE)); /* the interval is newer */
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"user:9", 6, &o) &&
+                (o.flags & TDB_WAL_ENTRY_RANGE_DELETE)); /* a key never written, still covered */
+    ASSERT_TRUE(!tidesdb_writeset_lookup(ws, 1, (const uint8_t *)"user:1", 6, &o)); /* other cf */
+    ASSERT_EQ(put(ws, 0, "user:1", "new", 0), TDB_SUCCESS);
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"user:1", 6, &o) &&
+                op_val_is(&o, "new")); /* the point write is newer than the interval */
+    tidesdb_writeset_truncate(ws, mark);
+    ASSERT_TRUE(tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"user:1", 6, &o) &&
+                op_val_is(&o, "old")); /* both the interval and the rewrite are gone */
+    ASSERT_TRUE(!tidesdb_writeset_lookup(ws, 0, (const uint8_t *)"user:9", 6, &o));
+    tidesdb_writeset_free(ws);
+}
+
 /* ops append in order and are readable back by index */
 void test_writeset_append(void)
 {
@@ -216,6 +301,8 @@ void test_writeset_write_after_a_prefix_delete_wins(void)
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
+    RUN_TEST(test_writeset_lookup_follows_growth_rewrites_and_truncation, tests_passed);
+    RUN_TEST(test_writeset_lookup_orders_intervals_against_point_writes, tests_passed);
     RUN_TEST(test_writeset_prefix_delete_shadows_the_keys_under_it, tests_passed);
     RUN_TEST(test_writeset_write_after_a_prefix_delete_wins, tests_passed);
     RUN_TEST(test_writeset_append, tests_passed);

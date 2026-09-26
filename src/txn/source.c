@@ -11,7 +11,7 @@
 tidesdb_source_result_t tidesdb_source_stack_range_has_newer(
     const tidesdb_source_t *sources, const int count, const uint32_t cf_index, const uint8_t *lo,
     const size_t lo_size, const uint8_t *hi, const size_t hi_size, const uint64_t seq_floor,
-    int *newer)
+    const uint64_t seq_ceiling, int *newer)
 {
     if (!sources || count <= 0 || !newer) return TDB_SOURCE_BUSY;
     *newer = 0;
@@ -26,8 +26,8 @@ tidesdb_source_result_t tidesdb_source_stack_range_has_newer(
          * reason to retry rather than as a clear run */
         if (!s->range_has_newer) return TDB_SOURCE_BUSY;
 
-        const tidesdb_source_result_t r =
-            s->range_has_newer(s->ctx, cf_index, lo, lo_size, hi, hi_size, seq_floor, newer);
+        const tidesdb_source_result_t r = s->range_has_newer(
+            s->ctx, cf_index, lo, lo_size, hi, hi_size, seq_floor, seq_ceiling, newer);
         if (r == TDB_SOURCE_BUSY) return TDB_SOURCE_BUSY;
         if (*newer) return TDB_SOURCE_FOUND; /* one is enough to decide the commit */
         if (r == TDB_SOURCE_FOUND) held = 1;
@@ -60,7 +60,8 @@ tidesdb_source_result_t tidesdb_source_stack_get(const tidesdb_source_t *sources
 tidesdb_source_result_t tidesdb_source_stack_has_newer(const tidesdb_source_t *sources,
                                                        const int count, const uint32_t cf_index,
                                                        const uint8_t *key, const size_t key_size,
-                                                       const uint64_t seq_floor, int *newer)
+                                                       const uint64_t seq_floor,
+                                                       const uint64_t seq_ceiling, int *newer)
 {
     if (!sources || !key || !newer) return TDB_SOURCE_NOT_FOUND;
     *newer = 0;
@@ -72,16 +73,16 @@ tidesdb_source_result_t tidesdb_source_stack_has_newer(const tidesdb_source_t *s
         if (s->has_newer)
         {
             const tidesdb_source_result_t r =
-                s->has_newer(s->ctx, cf_index, key, key_size, seq_floor, newer);
+                s->has_newer(s->ctx, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
             if (r == TDB_SOURCE_FOUND || r == TDB_SOURCE_BUSY) return r;
             continue;
         }
 
         /* a source with no cheap answer still has to be consulted, so fall back to the full lookup
-         * and decide from the version it returns */
+         * at the ceiling and decide from the version it returns */
         if (!s->get) continue;
         tidesdb_source_version_t v;
-        const tidesdb_source_result_t r = s->get(s->ctx, cf_index, key, key_size, UINT64_MAX, &v);
+        const tidesdb_source_result_t r = s->get(s->ctx, cf_index, key, key_size, seq_ceiling, &v);
         if (r == TDB_SOURCE_BUSY) return r;
         if (r == TDB_SOURCE_FOUND)
         {

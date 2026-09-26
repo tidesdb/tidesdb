@@ -775,6 +775,39 @@ void test_txn_api_batch_is_atomic_to_readers(void)
     (void)remove_directory(TXNAPI_DB_DIR);
 }
 
+/* the database counts the commits it made and the commits it refused, so a caller can read the
+ * retry rate a level above read committed is paying without instrumenting every call site */
+void test_txn_api_stats_count_commits_and_conflicts(void)
+{
+    (void)remove_directory(TXNAPI_DB_DIR);
+    char dir[] = TXNAPI_DB_DIR;
+    tidesdb_t *db = txnapi_open(dir);
+    tidesdb_column_family_t *cf = txnapi_make_cf(db, TXNAPI_CF, TDB_ISOLATION_SNAPSHOT);
+
+    tidesdb_db_stats_t before;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &before), TDB_SUCCESS);
+
+    tidesdb_txn_t *first = NULL, *second = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &first), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &second), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(first, cf, (const uint8_t *)"k", 1, (const uint8_t *)"1", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(second, cf, (const uint8_t *)"k", 1, (const uint8_t *)"2", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(first), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(second), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(first);
+    tidesdb_txn_free(second);
+
+    tidesdb_db_stats_t after;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &after), TDB_SUCCESS);
+    ASSERT_TRUE(after.txn_commits == before.txn_commits + 1);
+    ASSERT_TRUE(after.txn_conflicts == before.txn_conflicts + 1);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(TXNAPI_DB_DIR);
+}
+
 /* one commit of a hundred thousand keys, the size of a table load, never refuses itself: its claims
  * are its own, however many of them there are */
 void test_txn_api_wide_commit_never_conflicts_with_itself(void)
@@ -820,6 +853,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_api_concurrent_wide_commits_both_succeed, tests_passed);
     RUN_TEST(test_txn_api_wide_commit_never_conflicts_with_itself, tests_passed);
     RUN_TEST(test_txn_api_batch_is_atomic_to_readers, tests_passed);
+    RUN_TEST(test_txn_api_stats_count_commits_and_conflicts, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

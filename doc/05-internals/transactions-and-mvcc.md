@@ -43,6 +43,13 @@ aborted for the same reason. A sequence is committed only after its batch is app
 everything at or below the watermark is whole and final, and a ceiling taken from it never admits
 a version that could still change or disappear.
 
+Carrying it forward is a store of the committer's own decision followed by loads of its neighbours',
+and the two are separated by a full barrier. Without one, two committers deciding neighbouring
+sequences at the same instant could each miss the other's store while it sat in a store buffer; each
+would stop at the other's slot, the watermark would stand below both, and the higher committer would
+wait on a publication no one was left to make until some third commit arrived. With the barrier at
+least one of the two sees the other's decision and carries it.
+
 A commit does not return until the watermark has passed its own sequence. The wait is on the
 commits in flight below it, each inside its own commit window, and it is what makes a commit's
 writes visible to the caller's very next transaction — the watermark publishes in order, and
@@ -262,9 +269,19 @@ itself, and repeatable-read and serializable scan the read set the same way, the
 intervals scanned both.
 
 The question that scan asks is narrow. Not *what is the newest version of this key*, but only
-**does any version of it exist above my snapshot**. That distinction is worth a great deal, because
-answering the first question means descending a btree in every overlapping sstable at every level,
-parsing nodes and verifying checksums, purely to discard the answer.
+**does any version of it exist above my snapshot and below my own sequence**. That distinction is
+worth a great deal, because answering the first question means descending a btree in every
+overlapping sstable at every level, parsing nodes and verifying checksums, purely to discard the
+answer.
+
+The upper bound matters as much as the lower. The scan runs after the commit has drawn its sequence,
+and a writer that drew a higher one may already have applied its batch — commits overlap, and the
+apply is the last step of each. That writer is ordered after this commit, so its version stales
+nothing this commit read and contests nothing it writes; it is that writer's own validation, against
+this commit's version, that decides between them. Asking about every version there is refused both,
+and a pair of concurrent writers to one key could each be refused on account of the other. So the
+store is asked only about versions sequenced below the commit; writers above it are not its concern,
+and writers below it that have not applied yet are in the claim set.
 
 Every sstable records the newest sequence it contains in its footer. An sstable whose newest
 sequence is at or below the transaction's snapshot **cannot** hold a conflicting version, so the
@@ -317,9 +334,24 @@ transaction is still the only one that moves its state.
 
 ## The registry
 
-Live transactions are registered so the engine can compute the oldest live snapshot. The registry
-is on the commit path, so its cost matters: each transaction holds its own slot and leaves in
-constant time rather than by scanning a list.
+Live transactions are registered so the engine can compute the reclamation floor: the smallest
+sequence any of them still reads at. A repeatable-read or stronger transaction holds it at its frozen
+snapshot for its whole life. A read-committed transaction holds it only while a read or a scan is in
+flight, at the ceiling that read took from the watermark — a read takes its ceiling and then reads
+the store, and a collection starting in between would otherwise keep one version per key and drop
+the ones the read still resolves to. The ceiling is published before the store is read and withdrawn
+after; a scan's stays published until its iterator is freed, and a point read inside an open scan
+does not lift it. Read-uncommitted resolves to the newest version, which no collection drops, so it
+registers nothing.
+
+A collection takes the floor in two scans with its high-water mark published between them, behind a
+full barrier, and a read publishes its ceiling behind one before it checks the mark. So a read whose
+ceiling the first scan missed is either seen by the second, and the floor stays at or below it, or
+sees a mark above its ceiling and takes the ceiling again above the floor it missed. The floor is
+never above the watermark, since nothing a collection reads is above it.
+
+The registry is on the commit path, so its cost matters: each transaction holds its own slot and
+leaves in constant time rather than by scanning a list.
 
 It is also **sharded**, because joining and leaving are per-transaction rather than per unit of
 work — every transaction does both exactly once, whatever else it does — so a single lock made
@@ -345,11 +377,13 @@ count is chosen against that bound rather than against the number of cores.
 
 The two readers of the set treat the sharding differently, and deliberately:
 
-- **The oldest live snapshot** takes one shard at a time. The answer can come out too low but
+- **The reclamation floor** takes one shard at a time. The answer can come out too low but
   never too high, and too low is the safe direction for a reclamation floor — it keeps a version
   some reader might still want. It cannot come out too high, because a transaction registering
   after its shard was read draws its snapshot from a monotonic clock and so is above the minimum
-  already, and one that leaves only raises the true minimum above what was reported.
+  already, and one that leaves only raises the true minimum above what was reported. A read-committed
+  ceiling published after its shard was read is the one case that argument does not cover, and the
+  second scan behind the high-water mark is what covers it.
 - **Enumeration**, which the statistics call lists live transactions with, holds every shard for
   the whole walk, so it reports one instant of the live set rather than a smear across shards. The
   shards are taken in index order, the only order anything takes them in, so two walks cannot

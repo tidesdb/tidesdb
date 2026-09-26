@@ -228,6 +228,13 @@ static int mvcc_decided(const tidesdb_mvcc_t *m, const uint64_t seq)
  */
 static void mvcc_advance_watermark(tidesdb_mvcc_t *m)
 {
+    /* the caller has just stored its own slot, and the loads below read its neighbours'. two
+     * committers deciding neighbouring sequences at once each store then load, and without a full
+     * barrier between the two a store still in its buffer lets both loads miss both stores -- each
+     * then stops at the other's slot, the watermark stands below both, and the higher committer
+     * waits on a publication no one is left to make. the fence orders the store ahead of the loads
+     * on both sides, so at least one of them sees the other's decision and carries it */
+    atomic_thread_fence(memory_order_seq_cst);
     uint64_t visible = atomic_load_explicit(&m->visible_seq, memory_order_acquire);
     for (size_t step = 0; step < m->ring_capacity; step++)
     {

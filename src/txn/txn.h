@@ -452,14 +452,56 @@ uint64_t tdb_txn_snapshot(const tdb_txn_t *txn);
 /**
  * tdb_txn_read_snapshot
  * the sequence a read filters at right now, honouring the isolation level -- read-uncommitted sees
- * everything, read-committed draws the current seq afresh on each call, and repeatable-read and
- * stronger return the snapshot frozen at begin. iterators must use this rather than
- * tdb_txn_snapshot so a read-committed scan sees data committed before it started instead of the
- * placeholder 0.
+ * everything, read-committed reads the watermark afresh on each call, and repeatable-read and
+ * stronger return the snapshot frozen at begin. a read that goes on to read the store takes its
+ * ceiling through tdb_txn_read_hold instead, so the ceiling is held against the reclamation floor
+ * for as long as the read lasts; this is the value alone, for a caller that only reports it
  * @param txn the transaction
  * @return the read snapshot sequence, or 0 if txn is NULL
  */
 uint64_t tdb_txn_read_snapshot(const tdb_txn_t *txn);
+
+/**
+ * tdb_txn_read_hold
+ * take the ceiling a read or a scan filters at and hold it against the reclamation floor until
+ * tdb_txn_read_release. at read committed the ceiling is the watermark, and it is published to the
+ * registry so a collection taking its floor while the read is in flight stays at or below it; a
+ * collection that took its floor as the ceiling was being published is seen through the floor's
+ * high-water mark, and the ceiling is taken again above it. holds nest: an iterator's ceiling stays
+ * published under the point reads made while it is open. the other levels hold nothing here -- a
+ * frozen snapshot is registered for its whole life and read-uncommitted resolves to the newest
+ * version, which no collection drops
+ * @param txn the transaction
+ * @param ceiling out -- the sequence to read at
+ * @return 0 with the hold taken, or -1 when collections kept landing on the ceiling faster than it
+ *         could be taken, which a caller treats as a transient failure
+ */
+int tdb_txn_read_hold(tdb_txn_t *txn, uint64_t *ceiling);
+
+/**
+ * tdb_txn_read_release
+ * give back one hold taken with tdb_txn_read_hold; the last one releases the published ceiling
+ * @param txn the transaction
+ */
+void tdb_txn_read_release(tdb_txn_t *txn);
+
+/**
+ * tdb_txn_snapshot_floor
+ * the sequence this transaction's frozen snapshot holds the reclamation floor at -- its snapshot at
+ * repeatable read and stronger, and nothing at the levels that freeze none
+ * @param txn the transaction
+ * @return the snapshot, or UINT64_MAX when the level freezes none or txn is NULL
+ */
+uint64_t tdb_txn_snapshot_floor(const tdb_txn_t *txn);
+
+/**
+ * tdb_txn_read_floor
+ * the sequence this transaction holds the reclamation floor at right now: the frozen snapshot at
+ * repeatable read and stronger, the ceiling of the read in flight at read committed
+ * @param txn the transaction
+ * @return the floor, or UINT64_MAX when nothing is held or txn is NULL
+ */
+uint64_t tdb_txn_read_floor(const tdb_txn_t *txn);
 
 /**
  * tdb_txn_pin_snapshot

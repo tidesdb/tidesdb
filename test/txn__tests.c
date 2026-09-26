@@ -6,7 +6,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-#include <pthread.h>
 #include <string.h>
 
 #include "../src/base/keycmp.h"
@@ -77,7 +76,8 @@ static tidesdb_source_result_t tsrc_get(void *ctx, uint32_t cf_index, const uint
  * commit asks about an interval it scanned or deletes */
 static tidesdb_source_result_t tsrc_range_has_newer(void *ctx, uint32_t cf_index, const uint8_t *lo,
                                                     size_t lo_size, const uint8_t *hi,
-                                                    size_t hi_size, uint64_t seq_floor, int *newer)
+                                                    size_t hi_size, uint64_t seq_floor,
+                                                    uint64_t seq_ceiling, int *newer)
 {
     (void)cf_index;
     tsrc *m = (tsrc *)ctx;
@@ -87,7 +87,7 @@ static tidesdb_source_result_t tsrc_range_has_newer(void *ctx, uint32_t cf_index
     const size_t key_size = strlen(m->key);
     if (tdb_key_cmp(lo, lo_size, key, key_size) > 0) return TDB_SOURCE_NOT_FOUND;
     if (hi_size > 0 && tdb_key_cmp(key, key_size, hi, hi_size) >= 0) return TDB_SOURCE_NOT_FOUND;
-    *newer = m->seq > seq_floor;
+    *newer = m->seq > seq_floor && m->seq <= seq_ceiling;
     return TDB_SOURCE_FOUND;
 }
 
@@ -921,7 +921,8 @@ void test_txn_read_conflict(void)
     ASSERT_TRUE(get_is(t, 0, "k", &src, 1, "vk")); /* records read of k at seq 5 */
     put(t, 0, "j", "vj");                          /* a write so commit is not read-only */
 
-    m.seq = 10; /* a newer committed version of k appears under us */
+    advance_clock(clock, 4); /* a newer version of k commits under us, at 10, decided */
+    m.seq = 10;
     ASSERT_EQ(tdb_txn_commit(t, &be, &src, 1), TDB_ERR_CONFLICT);
     ASSERT_EQ(tdb_txn_state(t), TDB_TXN_ABORTED);
     tdb_txn_free(t);
@@ -957,6 +958,7 @@ void test_txn_write_scan_conflict(void)
     tidesdb_source_t src = tsource(&m);
 
     tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL); /* snapshot 0 */
+    advance_clock(clock, 5); /* the version at 5 committed after the snapshot, below the commit */
     put(t, 0, "k", "new");
     ASSERT_EQ(tdb_txn_commit(t, &be, &src, 1), TDB_ERR_CONFLICT); /* seq 5 > snapshot 0 */
     ASSERT_EQ(tdb_txn_state(t), TDB_TXN_ABORTED);
@@ -1127,6 +1129,7 @@ void test_txn_2pc_conflict(void)
     const uint8_t xid[] = {1, 1};
 
     tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL); /* snapshot 0 */
+    advance_clock(clock, 5); /* the version at 5 committed after the snapshot, below the prepare */
     put(t, 0, "k", "new");
     ASSERT_EQ(tdb_txn_prepare(t, &be, &src, 1, xid, sizeof(xid)), TDB_ERR_CONFLICT);
     ASSERT_EQ(tdb_txn_state(t), TDB_TXN_ABORTED);
@@ -1319,6 +1322,119 @@ static int run_write_skew_inside_probe(tidesdb_isolation_level_t iso)
  * one commit at serializable and at repeatable read: the second finds the first's write claim below
  * its own sequence on the key it read. the probe alone would have cleared both, since the second
  * had not committed when the first looked */
+/* a writer that drew its sequence after this commit's and applied before this commit validated is
+ * ordered after it, so neither the read this commit validates nor the key it writes under
+ * first-committer-wins is stale against that writer. validating against every version there is,
+ * rather than the ones sequenced below the commit, refused both */
+void test_txn_validation_ignores_a_writer_sequenced_above_the_commit(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    advance_clock(clock, 3); /* k@2 is decided and visible */
+    tsrc m = {0, 1, "k", 2, "old"};
+    tidesdb_source_t src = tsource(&m);
+    mockbe be_m = {0};
+    tdb_txn_backend_t be = mkbackend(&be_m);
+
+    /* repeatable read validates the version it read */
+    tdb_txn_t *rr = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
+    ASSERT_TRUE(get_is(rr, 0, "k", &src, 1, "old"));
+    put(rr, 0, "other", "x");
+    /* the next sequence is the one this commit draws; a writer one above it has already applied */
+    m.seq = tidesdb_mvcc_current_seq(clock) + 1;
+    m.value = "later";
+    ASSERT_EQ(tdb_txn_commit(rr, &be, &src, 1), TDB_SUCCESS);
+    tdb_txn_free(rr);
+
+    /* snapshot validates the key it writes, first committer wins */
+    m.seq = 2;
+    m.value = "old";
+    tdb_txn_t *si = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(si, 0, "k", "mine");
+    m.seq = tidesdb_mvcc_current_seq(clock) + 1;
+    m.value = "later";
+    ASSERT_EQ(tdb_txn_commit(si, &be, &src, 1), TDB_SUCCESS);
+    tdb_txn_free(si);
+
+    tidesdb_mvcc_destroy(clock);
+}
+
+/**
+ * floor_probe
+ * a source that takes the reclamation floor from inside a read, standing where a flush or a merge
+ * beginning while the read is in flight would
+ * @param reg the registry the floor is taken from
+ * @param ceiling_seen the ceiling the read arrived with
+ * @param floor_seen the floor taken during it
+ */
+typedef struct
+{
+    tidesdb_txn_registry_t *reg;
+    tidesdb_mvcc_t *clock;
+    uint64_t ceiling_seen;
+    uint64_t floor_seen;
+} floor_probe;
+
+static tidesdb_source_result_t floor_probe_get(void *ctx, uint32_t cf_index, const uint8_t *key,
+                                               size_t key_size, uint64_t snapshot,
+                                               tidesdb_source_version_t *out)
+{
+    (void)cf_index;
+    (void)key;
+    (void)key_size;
+    (void)out;
+    floor_probe *p = (floor_probe *)ctx;
+    p->ceiling_seen = snapshot;
+    p->floor_seen = tidesdb_txn_registry_take_floor(p->reg, tidesdb_mvcc_visible_seq(p->clock));
+    return TDB_SOURCE_NOT_FOUND;
+}
+
+/* a read committed read takes its ceiling from the watermark and then reads the store, and a flush
+ * or a merge that takes the reclamation floor meanwhile must not rise above that ceiling -- it
+ * would keep one version per key and drop the ones this read still resolves to. the ceiling is held
+ * only for the read; between reads the transaction pins nothing */
+void test_txn_read_committed_read_holds_the_floor(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
+    advance_clock(clock, 5); /* the watermark, and so the read's ceiling, stands at 5 */
+
+    tdb_txn_t *rc = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, reg);
+    floor_probe p = {reg, clock, 0, 0};
+    tidesdb_source_t src = {.name = "probe",
+                            .get = floor_probe_get,
+                            .has_newer = NULL,
+                            .range_has_newer = NULL,
+                            .ctx = &p};
+    uint8_t *v = NULL;
+    size_t vs = 0;
+    ASSERT_EQ(tdb_txn_get(rc, 0, (const uint8_t *)"k", 1, &src, 1, &v, &vs), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ((int)p.ceiling_seen, 5);
+    ASSERT_TRUE(p.floor_seen <= p.ceiling_seen);
+    ASSERT_EQ((int)tidesdb_txn_registry_floor_high_water(reg), 5);
+
+    /* between reads the transaction pins nothing, so the floor is the watermark itself, and a
+     * committed sequence moves it */
+    advance_clock(clock, 2);
+    ASSERT_EQ((int)tidesdb_txn_registry_take_floor(reg, tidesdb_mvcc_visible_seq(clock)), 7);
+    ASSERT_TRUE(tidesdb_txn_registry_min_snapshot(reg) == UINT64_MAX); /* no frozen snapshot */
+
+    /* a scan holds its ceiling until it is freed, and a point read inside it does not lift it */
+    uint64_t scan = 0, point = 0;
+    ASSERT_EQ(tdb_txn_read_hold(rc, &scan), 0);
+    ASSERT_EQ((int)scan, 7);
+    advance_clock(clock, 3);
+    ASSERT_EQ(tdb_txn_read_hold(rc, &point), 0);
+    ASSERT_EQ((int)point, 10);
+    tdb_txn_read_release(rc);
+    ASSERT_EQ((int)tidesdb_txn_registry_take_floor(reg, tidesdb_mvcc_visible_seq(clock)), 7);
+    tdb_txn_read_release(rc);
+    ASSERT_EQ((int)tidesdb_txn_registry_take_floor(reg, tidesdb_mvcc_visible_seq(clock)), 10);
+
+    tdb_txn_free(rc);
+    tidesdb_txn_registry_destroy(reg);
+    tidesdb_mvcc_destroy(clock);
+}
+
 void test_txn_write_skew_inside_the_probe_yields_one(void)
 {
     ASSERT_EQ(run_write_skew_inside_probe(TDB_ISOLATION_SERIALIZABLE), 1);
@@ -1377,6 +1493,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_null_safe, tests_passed);
     RUN_TEST(test_txn_write_skew_inside_the_probe_yields_one, tests_passed);
     RUN_TEST(test_txn_snapshot_allows_write_skew_inside_the_probe, tests_passed);
+    RUN_TEST(test_txn_validation_ignores_a_writer_sequenced_above_the_commit, tests_passed);
+    RUN_TEST(test_txn_read_committed_read_holds_the_floor, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

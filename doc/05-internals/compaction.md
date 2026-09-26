@@ -281,9 +281,11 @@ For each key it decides what survives:
 
 - The **newest version** always survives.
 - **Older versions** are dropped once no live snapshot could still need them. The floor is the
-  oldest snapshot any live transaction holds, exposed as `min_snapshot_seq`. A long-running
-  transaction holds that floor down and keeps garbage alive — a real operational effect, and
-  the reason a forgotten open transaction shows up as space that will not reclaim.
+  smallest sequence any live transaction still reads at: the oldest frozen snapshot, exposed as
+  `min_snapshot_seq`, and the ceiling of any read-committed read in flight, held only for the
+  read. A long-running transaction holds that floor down and keeps garbage alive — a real
+  operational effect, and the reason a forgotten open transaction shows up as space that will not
+  reclaim.
 - **Expired entries** are dropped.
 - **Versions a range tombstone covers** are dropped once that tombstone sits at or below the floor,
   the base version included — nothing can resolve to it any more. See below.

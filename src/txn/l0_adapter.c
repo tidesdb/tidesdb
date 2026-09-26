@@ -171,11 +171,12 @@ static int l0_backend_apply(void *ctx, const tidesdb_wal_entry_t *entries, int c
 static tidesdb_source_result_t l0_source_range_has_newer(void *ctx, uint32_t cf_index,
                                                          const uint8_t *lo, size_t lo_size,
                                                          const uint8_t *hi, size_t hi_size,
-                                                         uint64_t seq_floor, int *newer)
+                                                         uint64_t seq_floor, uint64_t seq_ceiling,
+                                                         int *newer)
 {
     tidesdb_l0_txn_ctx_t *actx = (tidesdb_l0_txn_ctx_t *)ctx;
-    const int rc =
-        tidesdb_l0_range_has_newer(actx->l0, cf_index, lo, lo_size, hi, hi_size, seq_floor, newer);
+    const int rc = tidesdb_l0_range_has_newer(actx->l0, cf_index, lo, lo_size, hi, hi_size,
+                                              seq_floor, seq_ceiling, newer);
     if (rc != TDB_SUCCESS) return TDB_SOURCE_BUSY;
     return *newer ? TDB_SOURCE_FOUND : TDB_SOURCE_NOT_FOUND;
 }

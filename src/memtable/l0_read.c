@@ -297,12 +297,13 @@ int tidesdb_l0_get_at_seq(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *ke
  * @param phi exclusive prefixed upper bound
  * @param phi_size length of phi
  * @param seq_floor the sequence a version must exceed
+ * @param seq_ceiling the sequence a version must not exceed to count at all
  * @param newer out, set non-zero as soon as one is found
  * @return TDB_SUCCESS, or TDB_ERR_MEMORY when the cursor could not be built
  */
 static int l0_mt_range_has_newer(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt, const uint8_t *plo,
                                  const size_t plo_size, const uint8_t *phi, const size_t phi_size,
-                                 const uint64_t seq_floor, int *newer)
+                                 const uint64_t seq_floor, const uint64_t seq_ceiling, int *newer)
 {
     skip_list_cursor_t *cur = NULL;
     if (skip_list_cursor_init(&cur, mt->skip_list) != 0) return TDB_ERR_MEMORY;
@@ -326,11 +327,11 @@ static int l0_mt_range_has_newer(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt,
          * space gets -- there is no next family's prefix to stop at */
         if (phi && skip_list_compare_keys(mt->skip_list, key, key_size, phi, phi_size) >= 0) break;
 
-        /* every version of this key, since an older one can sit above the floor while the newest
-         * belongs to this very transaction */
+        /* every version of this key, since an older one can sit inside the window while the newest
+         * belongs to a commit sequenced above the one asking */
         for (;;)
         {
-            if (seq > seq_floor && !tidesdb_l0_seq_aborted(l0, seq))
+            if (seq > seq_floor && seq <= seq_ceiling && !tidesdb_l0_seq_aborted(l0, seq))
             {
                 *newer = 1;
                 break;
@@ -348,7 +349,7 @@ static int l0_mt_range_has_newer(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt,
 
 int tidesdb_l0_range_has_newer(tidesdb_l0_t *l0, const uint32_t cf_index, const uint8_t *lo,
                                const size_t lo_size, const uint8_t *hi, const size_t hi_size,
-                               const uint64_t seq_floor, int *newer)
+                               const uint64_t seq_floor, const uint64_t seq_ceiling, int *newer)
 {
     if (!l0 || !newer) return TDB_ERR_INVALID_ARGS;
     *newer = 0;
@@ -389,7 +390,8 @@ int tidesdb_l0_range_has_newer(tidesdb_l0_t *l0, const uint32_t cf_index, const 
     {
         rc = TDB_SUCCESS;
         for (int i = 0; i < n && rc == TDB_SUCCESS && !*newer; i++)
-            rc = l0_mt_range_has_newer(l0, mts[i], plo, plo_size, phi, phi_size, seq_floor, newer);
+            rc = l0_mt_range_has_newer(l0, mts[i], plo, plo_size, phi, phi_size, seq_floor,
+                                       seq_ceiling, newer);
         tidesdb_l0_unpin_memtables(mts, n);
     }
 

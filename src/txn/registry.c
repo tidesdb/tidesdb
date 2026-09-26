@@ -49,10 +49,14 @@ typedef struct
  * tidesdb_txn_registry
  * the live-transaction set, split across independent shards selected by joining thread
  * @param shards the shard array
+ * @param floor_high_water the highest reclamation floor any collection has taken, raised as the
+ * floor is taken. a read committed read publishes its ceiling and then reads this, so a collection
+ * whose scan missed the ceiling is still seen by the read it missed
  */
 struct tidesdb_txn_registry
 {
     tidesdb_txn_registry_shard_t shards[TDB_TXN_REGISTRY_SHARDS];
+    _Atomic(uint64_t) floor_high_water;
 };
 
 /* the shard a joining transaction takes, claimed once per thread from a global counter.
@@ -159,16 +163,19 @@ void tidesdb_txn_registry_remove(tidesdb_txn_registry_t *reg, tdb_txn_t *txn)
     pthread_rwlock_unlock(&shard->lock);
 }
 
-uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg)
-{
-    if (!reg) return UINT64_MAX;
+/* what one live transaction holds the floor at, read by a scan */
+typedef uint64_t (*registry_floor_fn)(const tdb_txn_t *txn);
 
-    /* one shard at a time rather than the whole registry frozen. the answer can only come out too
-     * low, never too high, and too low is the safe direction for a gc floor -- it keeps a version a
-     * reader might still want. it cannot come out too high because both ways the set moves fail
-     * safe: a transaction added after its shard was read draws its snapshot from a monotonic clock,
-     * so it is above the minimum and could not have lowered it, and a transaction that leaves only
-     * raises the true minimum above what was reported */
+/* the smallest floor any live transaction holds, by the given measure. one shard at a time rather
+ * than the whole registry frozen. the answer can only come out too low, never too high, and too low
+ * is the safe direction for a reclamation floor -- it keeps a version a reader might still want. it
+ * cannot come out too high because both ways the set moves fail safe: a transaction added after its
+ * shard was read draws its snapshot from a monotonic clock, so it is above the minimum and could
+ * not have lowered it, and a transaction that leaves only raises the true minimum above what was
+ * reported. a read committed ceiling published after its shard was read is the one case this does
+ * not cover, and tidesdb_txn_registry_take_floor closes it with the high-water mark */
+static uint64_t registry_min(tidesdb_txn_registry_t *reg, const registry_floor_fn floor_of)
+{
     uint64_t min = UINT64_MAX;
     for (int s = 0; s < TDB_TXN_REGISTRY_SHARDS; s++)
     {
@@ -176,12 +183,48 @@ uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg)
         pthread_rwlock_rdlock(&shard->lock);
         for (int i = 0; i < shard->count; i++)
         {
-            const uint64_t snap = tdb_txn_snapshot(shard->txns[i]);
-            if (snap < min) min = snap;
+            const uint64_t held = floor_of(shard->txns[i]);
+            if (held < min) min = held;
         }
         pthread_rwlock_unlock(&shard->lock);
     }
     return min;
+}
+
+uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg)
+{
+    return reg ? registry_min(reg, tdb_txn_snapshot_floor) : UINT64_MAX;
+}
+
+void tidesdb_txn_registry_raise_floor_high_water(tidesdb_txn_registry_t *reg, const uint64_t seq)
+{
+    if (!reg) return;
+    uint64_t seen = atomic_load_explicit(&reg->floor_high_water, memory_order_relaxed);
+    while (seq > seen &&
+           !atomic_compare_exchange_weak_explicit(&reg->floor_high_water, &seen, seq,
+                                                  memory_order_release, memory_order_relaxed))
+        ;
+}
+
+uint64_t tidesdb_txn_registry_floor_high_water(const tidesdb_txn_registry_t *reg)
+{
+    return reg ? atomic_load_explicit(&reg->floor_high_water, memory_order_acquire) : 0;
+}
+
+uint64_t tidesdb_txn_registry_take_floor(tidesdb_txn_registry_t *reg, const uint64_t watermark)
+{
+    if (!reg) return watermark;
+
+    /* published before the second scan, with a full barrier between. a read committed read stores
+     * its ceiling, fences, and reads the mark, so a read whose store the first scan missed either
+     * shows in the second scan, and the floor stays at or below it, or reads a mark at or above the
+     * floor it missed and takes its ceiling again above it. one of the two, never neither */
+    const uint64_t first = registry_min(reg, tdb_txn_read_floor);
+    const uint64_t bounded = first < watermark ? first : watermark;
+    tidesdb_txn_registry_raise_floor_high_water(reg, bounded);
+    atomic_thread_fence(memory_order_seq_cst);
+    const uint64_t second = registry_min(reg, tdb_txn_read_floor);
+    return second < bounded ? second : bounded;
 }
 
 int tidesdb_txn_registry_for_each(tidesdb_txn_registry_t *reg, tidesdb_txn_visit_fn visit,

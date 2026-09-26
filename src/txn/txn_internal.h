@@ -28,6 +28,14 @@
  * @param snapshot_seq the sequence reads filter at (per level). atomic because a peer's gc-floor
  * scan reads it from another thread while a time-travel begin is still lowering it -- the
  * transaction is registered before it pins, so that the floor is capped before the window opens
+ * @param read_ceiling at read committed, the ceiling of the read or scan in flight, UINT64_MAX
+ * between them. a read takes its ceiling from the watermark and then reads the store, and a
+ * collection that took its floor meanwhile would keep one version per key and drop the ones the
+ * read still resolves to; published here for the floor scan to see, and held only while a read or
+ * an iterator is open. atomic because the scan reads it from another thread
+ * @param read_holds how many reads and iterators of a read committed transaction are in flight;
+ * the ceiling is published by the first and released by the last, so a scan's lower ceiling is not
+ * lifted by a point read inside it
  * @param commit_seq the assigned commit sequence, 0 until commit or prepare
  * @param prepared_entries the entries staged by prepare, applied at phase-2 commit, NULL otherwise
  * @param prepared_count number of prepared entries
@@ -60,6 +68,8 @@ struct tdb_txn
     int64_t deadline;
     tidesdb_isolation_level_t isolation;
     _Atomic(uint64_t) snapshot_seq;
+    _Atomic(uint64_t) read_ceiling;
+    int read_holds;
     uint64_t commit_seq;
     tidesdb_wal_entry_t *prepared_entries;
     int prepared_count;

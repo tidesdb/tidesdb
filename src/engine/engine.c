@@ -203,28 +203,30 @@ static tidesdb_source_result_t engine_sstable_source_get(void *ctx, uint32_t cf_
  * asking whether a key changed since its snapshot reaches the per-cf metadata skip */
 static tidesdb_source_result_t engine_sstable_source_has_newer(void *ctx, uint32_t cf_index,
                                                                const uint8_t *key, size_t key_size,
-                                                               uint64_t seq_floor, int *newer)
+                                                               uint64_t seq_floor,
+                                                               uint64_t seq_ceiling, int *newer)
 {
     tidesdb_t *db = (tidesdb_t *)ctx;
     cf_t *cf = cf_registry_get_by_id(db->cfs, cf_index);
     if (!cf) return TDB_SOURCE_NOT_FOUND;
     tidesdb_source_t s;
     cf_source(cf, &s);
-    return s.has_newer(s.ctx, cf_index, key, key_size, seq_floor, newer);
+    return s.has_newer(s.ctx, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
 }
 
 /* the db-level interval probe, resolving the cf-index the same way the read source does so a commit
  * checking a prefix delete reaches the per-cf metadata skip */
 static tidesdb_source_result_t engine_sstable_source_range_has_newer(
     void *ctx, uint32_t cf_index, const uint8_t *lo, size_t lo_size, const uint8_t *hi,
-    size_t hi_size, uint64_t seq_floor, int *newer)
+    size_t hi_size, uint64_t seq_floor, uint64_t seq_ceiling, int *newer)
 {
     tidesdb_t *db = (tidesdb_t *)ctx;
     cf_t *cf = cf_registry_get_by_id(db->cfs, cf_index);
     if (!cf) return TDB_SOURCE_NOT_FOUND;
     tidesdb_source_t s;
     cf_source(cf, &s);
-    return s.range_has_newer(s.ctx, cf_index, lo, lo_size, hi, hi_size, seq_floor, newer);
+    return s.range_has_newer(s.ctx, cf_index, lo, lo_size, hi, hi_size, seq_floor, seq_ceiling,
+                             newer);
 }
 
 /* move one value into the shared value log when the database's policy separates it, so its bytes
@@ -270,7 +272,9 @@ int engine_replay_superseded(void *ctx, const uint32_t cf_index, const uint8_t *
                              const size_t key_size, const uint64_t seq)
 {
     int newer = 0;
-    if (engine_sstable_source_has_newer(ctx, cf_index, key, key_size, seq, &newer) !=
+    /* every version an sstable holds is decided, and the filter asks about all of them, so the
+     * window has no ceiling */
+    if (engine_sstable_source_has_newer(ctx, cf_index, key, key_size, seq, UINT64_MAX, &newer) !=
         TDB_SOURCE_FOUND)
         return 0;
     return newer;
@@ -378,6 +382,8 @@ static int engine_open_init(tidesdb_t *db, const tidesdb_config_t *config)
     atomic_init(&db->wal_generation, ENGINE_FIRST_WAL_GENERATION);
     atomic_init(&db->closing, 0);
     atomic_init(&db->prepare_gen_floor, UINT64_MAX);
+    atomic_init(&db->txn_commits, 0);
+    atomic_init(&db->txn_conflicts, 0);
 
     /* the database directory must exist; an already-present directory is not an error */
     if (mkdir(db->db_path, ENGINE_DB_DIR_MODE) != 0 && errno != EEXIST) return TDB_ERR_IO;
@@ -495,12 +501,6 @@ static void engine_open_reseed(tidesdb_t *db, uint64_t wal_max_seq)
                   (unsigned long long)manifest_seq, (unsigned long long)sstable_seq,
                   (unsigned long long)prepared_seq);
     tidesdb_mvcc_reseed(db->clock, reseed);
-
-    /* nothing before this open is reconstructable. what an earlier run collected is not recorded
-     * anywhere -- the sstables hold whatever survived it -- so the oldest readable point starts at
-     * the sequence recovery resumed from rather than at zero, which would claim every sequence this
-     * database ever issued can still be read exactly */
-    atomic_store_explicit(&db->gc_floor_high_water, reseed, memory_order_release);
 }
 
 /**
@@ -571,6 +571,12 @@ static int engine_open_txn(tidesdb_t *db)
 
     db->txn_registry = tidesdb_txn_registry_create();
     if (!db->txn_registry) return TDB_ERR_MEMORY;
+    /* nothing before this open is reconstructable. what an earlier run collected is not recorded
+     * anywhere -- the sstables hold whatever survived it -- so the oldest readable point starts at
+     * the sequence recovery resumed the clock from rather than at zero, which would claim every
+     * sequence this database ever issued can still be read exactly */
+    tidesdb_txn_registry_raise_floor_high_water(db->txn_registry,
+                                                tidesdb_mvcc_visible_seq(db->clock));
     return TDB_SUCCESS;
 }
 

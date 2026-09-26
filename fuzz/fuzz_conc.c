@@ -67,18 +67,24 @@
 #define FC_STANDALONE_ITERS     30
 #define FC_BUSY_RETRIES         1000 /* a busy fd reservation is retryable, never a definitive result */
 
-#define FC_CHECK(cond, ...)                        \
-    do                                             \
-    {                                              \
-        if (!(cond))                               \
-        {                                          \
-            fprintf(stderr, "CONC ORACLE FAIL: "); \
-            fprintf(stderr, __VA_ARGS__);          \
-            fprintf(stderr, "\n");                 \
-            fflush(stderr);                        \
-            abort();                               \
-        }                                          \
+#define FC_CHECK(cond, ...)                                                                \
+    do                                                                                     \
+    {                                                                                      \
+        if (!(cond))                                                                       \
+        {                                                                                  \
+            fprintf(stderr, "CONC ORACLE FAIL (iteration %ld, seed %llu): ", fc_iteration, \
+                    (unsigned long long)fc_iteration_seed);                                \
+            fprintf(stderr, __VA_ARGS__);                                                  \
+            fprintf(stderr, "\n");                                                         \
+            fflush(stderr);                                                                \
+            abort();                                                                       \
+        }                                                                                  \
     } while (0)
+
+/* the iteration running and the seed it runs from, named in every failure so one iteration can be
+ * rerun on its own with TIDESDB_FUZZ_ONLY_SEED */
+static long fc_iteration;
+static uint64_t fc_iteration_seed;
 
 /* one worker's private state; the database and column family are shared, everything else is
  * per-thread so the harness itself has no shared mutable state and races only inside the engine */
@@ -174,6 +180,41 @@ static int fc_db_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint
     return 0;
 }
 
+/* how a key the model holds and the database did not is followed up before the run aborts. it is
+ * read again at read committed, where a version the watermark has passed is visible, and at read
+ * uncommitted, where every applied version is, over a spread of delays. the pattern names the fault
+ * -- a miss that clears is a read-path race, one that stays is a lost write, and one that only read
+ * uncommitted sees is a version the watermark never reached */
+#define FC_MISS_FOLLOWUPS 5
+static const unsigned fc_miss_delay_us[FC_MISS_FOLLOWUPS] = {0, 1000, 10000, 100000, 1000000};
+
+/* one follow-up read at the given isolation, returning the engine's result code */
+static int fc_reread(fc_worker_t *w, tidesdb_isolation_level_t isolation, const uint8_t *key,
+                     size_t klen)
+{
+    tidesdb_txn_t *t = NULL;
+    if (tidesdb_txn_begin_with_isolation(w->db, isolation, &t) != TDB_SUCCESS) return TDB_ERR_IO;
+    uint8_t *v = NULL;
+    size_t vl = 0;
+    const int rc = tidesdb_txn_get(t, w->cf, key, klen, &v, &vl);
+    if (rc == TDB_SUCCESS) free(v);
+    (void)tidesdb_txn_rollback(t);
+    tidesdb_txn_free(t);
+    return rc;
+}
+
+static void fc_report_miss(fc_worker_t *w, const uint8_t *key, size_t klen)
+{
+    for (int i = 0; i < FC_MISS_FOLLOWUPS; i++)
+    {
+        if (fc_miss_delay_us[i] != 0) usleep(fc_miss_delay_us[i]);
+        const int rc = fc_reread(w, TDB_ISOLATION_READ_COMMITTED, key, klen);
+        const int ru = fc_reread(w, TDB_ISOLATION_READ_UNCOMMITTED, key, klen);
+        fprintf(stderr, "  follow-up +%u us: read committed rc=%d, read uncommitted rc=%d\n",
+                fc_miss_delay_us[i], rc, ru);
+    }
+}
+
 /* compare a single key's value in the database against the worker's model, under the worker's open
  * transaction when one is active (read-your-writes) or a throwaway read transaction otherwise */
 static void fc_check_get(fc_worker_t *w, tidesdb_txn_t *txn)
@@ -201,14 +242,19 @@ static void fc_check_get(fc_worker_t *w, tidesdb_txn_t *txn)
     size_t dvl = 0;
     const int db_present = fc_db_get(read, w->cf, key, klen, &dv, &dvl);
 
+    if (model_present && !db_present) fc_report_miss(w, key, klen);
     FC_CHECK(db_present == model_present,
-             "get presence mismatch w%d key0=%c model=%d db=%d ryw=%d snap=%llu", w->id, key[0],
-             model_present, db_present, ryw, (unsigned long long)snap);
+             "get presence mismatch w%d key=%.*s model=%d db=%d ryw=%d open=%d isolation=%d "
+             "snap=%llu",
+             w->id, (int)klen, (const char *)key, model_present, db_present, ryw, txn != NULL,
+             (int)w->isolation, (unsigned long long)snap);
     if (db_present)
     {
         FC_CHECK(fuzz_value_eq(dv, dvl, mv, mvl),
-                 "get value mismatch w%d ryw=%d snap=%llu klen=%zu model_vlen=%zu db_vlen=%zu",
-                 w->id, ryw, (unsigned long long)snap, klen, mvl, dvl);
+                 "get value mismatch w%d key=%.*s ryw=%d snap=%llu model_vlen=%zu model_v0=%u "
+                 "db_vlen=%zu db_v0=%u",
+                 w->id, (int)klen, (const char *)key, ryw, (unsigned long long)snap, mvl,
+                 mvl ? mv[0] : 0u, dvl, dvl ? dv[0] : 0u);
         free(dv);
     }
     if (!txn)
@@ -414,8 +460,12 @@ static void fc_verify_final(fc_worker_t *workers, int n, tidesdb_t *db, tidesdb_
         {
             uint8_t *dv = NULL;
             size_t dvl = 0;
-            FC_CHECK(fc_db_get(t, cf, mk[i].key, mk[i].klen, &dv, &dvl), "final lost key w%d", w);
-            FC_CHECK(fuzz_value_eq(dv, dvl, mk[i].val, mk[i].vlen), "final value w%d", w);
+            FC_CHECK(fc_db_get(t, cf, mk[i].key, mk[i].klen, &dv, &dvl),
+                     "final lost key w%d key=%.*s", w, (int)mk[i].klen, (const char *)mk[i].key);
+            FC_CHECK(fuzz_value_eq(dv, dvl, mk[i].val, mk[i].vlen),
+                     "final value w%d key=%.*s model_vlen=%zu model_v0=%u db_vlen=%zu db_v0=%u", w,
+                     (int)mk[i].klen, (const char *)mk[i].key, mk[i].vlen,
+                     mk[i].vlen ? mk[i].val[0] : 0u, dvl, dvl ? dv[0] : 0u);
             free(dv);
         }
         free(mk);
@@ -499,7 +549,25 @@ int main(void)
     uint64_t state = seed_env ? (uint64_t)strtoull(seed_env, NULL, 10) : 0x243f6a8885a308d3ULL;
     if (state == 0) state = 0x243f6a8885a308d3ULL;
 
-    for (long it = 0; it < iters; it++) fc_run(fc_rng(&state), dir);
+    /* one iteration by its own seed, the one a failure names, so a failing run is cut down to the
+     * scenario that failed rather than replayed from the start */
+    const char *only_env = getenv("TIDESDB_FUZZ_ONLY_SEED");
+    if (only_env)
+    {
+        fc_iteration = 0;
+        fc_iteration_seed = (uint64_t)strtoull(only_env, NULL, 10);
+        fc_run(fc_iteration_seed, dir);
+        fprintf(stderr, "conc fuzz: iteration seed %llu passed\n",
+                (unsigned long long)fc_iteration_seed);
+        return 0;
+    }
+
+    for (long it = 0; it < iters; it++)
+    {
+        fc_iteration = it;
+        fc_iteration_seed = fc_rng(&state);
+        fc_run(fc_iteration_seed, dir);
+    }
     fprintf(stderr, "conc fuzz: %ld iterations passed\n", iters);
     return 0;
 }

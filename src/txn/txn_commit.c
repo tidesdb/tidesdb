@@ -283,18 +283,19 @@ void txn_release_claims(tdb_txn_t *txn)
     txn->claims = NULL;
 }
 
-/* ask the sources whether a version of a key exists above seq_floor, retrying a transient busy
- * internally. a source able to answer from its metadata skips the lookup entirely, which is what
- * keeps a commit's conflict scan off the read path. returns TDB_SUCCESS, or TDB_ERR_IO if busy
- * never cleared */
+/* ask the sources whether a version of a key exists above seq_floor and at or below seq_ceiling,
+ * retrying a transient busy internally. a source able to answer from its metadata skips the lookup
+ * entirely, which is what keeps a commit's conflict scan off the read path. returns TDB_SUCCESS, or
+ * TDB_ERR_IO if busy never cleared */
 static int txn_probe_newer(const tidesdb_source_t *sources, int num_sources, uint32_t cf_index,
-                           const uint8_t *key, size_t key_size, uint64_t seq_floor, int *newer)
+                           const uint8_t *key, size_t key_size, uint64_t seq_floor,
+                           uint64_t seq_ceiling, int *newer)
 {
     *newer = 0;
     for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
     {
         const tidesdb_source_result_t r = tidesdb_source_stack_has_newer(
-            sources, num_sources, cf_index, key, key_size, seq_floor, newer);
+            sources, num_sources, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
         if (r != TDB_SOURCE_BUSY) return TDB_SUCCESS;
         if (attempt < TDB_TXN_BUSY_SPIN_THRESHOLD)
             cpu_pause();
@@ -315,18 +316,21 @@ static int txn_probe_newer(const tidesdb_source_t *sources, int num_sources, uin
  * @param hi exclusive upper bound, or NULL with hi_size 0 to run to the end of the family
  * @param hi_size length of hi
  * @param seq_floor the sequence a version must exceed to conflict
+ * @param seq_ceiling the sequence a version must not exceed to count at all
  * @param newer out, set non-zero when one exists
  * @return TDB_SUCCESS, or TDB_ERR_IO if busy never cleared
  */
 static int txn_probe_range_newer(const tidesdb_source_t *sources, int num_sources,
                                  uint32_t cf_index, const uint8_t *lo, size_t lo_size,
-                                 const uint8_t *hi, size_t hi_size, uint64_t seq_floor, int *newer)
+                                 const uint8_t *hi, size_t hi_size, uint64_t seq_floor,
+                                 uint64_t seq_ceiling, int *newer)
 {
     *newer = 0;
     for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
     {
-        const tidesdb_source_result_t r = tidesdb_source_stack_range_has_newer(
-            sources, num_sources, cf_index, lo, lo_size, hi, hi_size, seq_floor, newer);
+        const tidesdb_source_result_t r =
+            tidesdb_source_stack_range_has_newer(sources, num_sources, cf_index, lo, lo_size, hi,
+                                                 hi_size, seq_floor, seq_ceiling, newer);
         if (r != TDB_SOURCE_BUSY) return TDB_SUCCESS;
         if (attempt < TDB_TXN_BUSY_SPIN_THRESHOLD)
             cpu_pause();
@@ -350,13 +354,17 @@ static int txn_validates_reads(const tdb_txn_t *txn)
  * version read, or held by a commit in flight whose sequence is below this one's, the writer whose
  * version this commit read before it existed -- or if any interval it scanned holds one, a phantom.
  * runs after the draw, so every writer that drew before this commit is either in the store or in
- * the claim set
+ * the claim set. the store is asked only about versions below this commit's own sequence: a writer
+ * drawn after it that applied first is ordered after it, and its version stales nothing this
+ * commit read
  * @param txn the committing transaction, its sequence drawn
  * @param sources the source stack
  * @param num_sources how many
+ * @param below the highest sequence a store version may carry to count, the commit's own less one
  * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error
  */
-static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources)
+static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources,
+                              const uint64_t below)
 {
     if (!txn->readset) return TDB_SUCCESS;
     const int n = tidesdb_readset_count(txn->readset);
@@ -365,8 +373,8 @@ static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, i
         tidesdb_readset_entry_t rd;
         if (!tidesdb_readset_at(txn->readset, i, &rd)) continue;
         int newer = 0;
-        const int rc =
-            txn_probe_newer(sources, num_sources, rd.cf_index, rd.key, rd.key_size, rd.seq, &newer);
+        const int rc = txn_probe_newer(sources, num_sources, rd.cf_index, rd.key, rd.key_size,
+                                       rd.seq, below, &newer);
         if (rc != TDB_SUCCESS) return rc;
         if (newer) return TDB_ERR_CONFLICT;
         if (tidesdb_mvcc_read_stale(txn->clock, &txn->commit, rd.cf_index, rd.key,
@@ -381,7 +389,7 @@ static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, i
         if (!tidesdb_readset_range_at(txn->readset, i, &sc)) continue;
         int newer = 0;
         const int rc = txn_probe_range_newer(sources, num_sources, sc.cf_index, sc.lo, sc.lo_size,
-                                             sc.hi, sc.hi_size, sc.seq, &newer);
+                                             sc.hi, sc.hi_size, sc.seq, below, &newer);
         if (rc != TDB_SUCCESS) return rc;
         if (newer) return TDB_ERR_CONFLICT;
         if (tidesdb_mvcc_range_stale(txn->clock, &txn->commit, sc.cf_index, sc.lo, sc.lo_size,
@@ -402,11 +410,12 @@ static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, i
  * @param txn the committing transaction, its sequence drawn
  * @param sources the source stack
  * @param num_sources how many
+ * @param below the highest sequence a store version may carry to count, the commit's own less one
  * @param first_committer_wins non-zero at snapshot and above
  * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error
  */
 static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources,
-                               int first_committer_wins)
+                               const uint64_t below, int first_committer_wins)
 {
     const uint64_t snapshot = atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
     const int n = tidesdb_writeset_count(txn->writeset);
@@ -420,7 +429,7 @@ static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, 
         {
             if (first_committer_wins)
                 rc = txn_probe_range_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
-                                           op.value, op.value_size, snapshot, &newer);
+                                           op.value, op.value_size, snapshot, below, &newer);
             if (rc == TDB_SUCCESS && !newer && first_committer_wins &&
                 tidesdb_mvcc_range_stale(txn->clock, &txn->commit, op.cf_index, op.key, op.key_size,
                                          op.value, op.value_size, 1))
@@ -430,7 +439,7 @@ static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, 
         {
             if (first_committer_wins)
                 rc = txn_probe_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
-                                     snapshot, &newer);
+                                     snapshot, below, &newer);
             if (rc == TDB_SUCCESS && !newer &&
                 tidesdb_mvcc_write_blocked(
                     txn->clock, &txn->commit, op.cf_index, op.key, (uint32_t)op.key_size,
@@ -453,14 +462,17 @@ static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, 
  * @param txn the committing transaction, its sequence drawn
  * @param sources the source stack
  * @param num_sources how many
+ * @param seq the sequence this commit drew; only store versions below it are its concern
  * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error
  */
-static int txn_validate(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources)
+static int txn_validate(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources,
+                        const uint64_t seq)
 {
+    const uint64_t below = seq - 1;
     int rc = TDB_SUCCESS;
-    if (txn_validates_reads(txn)) rc = txn_validate_reads(txn, sources, num_sources);
+    if (txn_validates_reads(txn)) rc = txn_validate_reads(txn, sources, num_sources, below);
     if (rc == TDB_SUCCESS)
-        rc = txn_validate_writes(txn, sources, num_sources,
+        rc = txn_validate_writes(txn, sources, num_sources, below,
                                  txn->isolation >= TDB_ISOLATION_SNAPSHOT);
     return rc;
 }
@@ -740,7 +752,8 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
      */
     const uint64_t seq = tidesdb_mvcc_draw(txn->clock, claims ? &txn->commit : NULL);
     for (int i = 0; i < count; i++) entries[i].seq = seq;
-    if (txn->isolation > TDB_ISOLATION_READ_COMMITTED) rc = txn_validate(txn, sources, num_sources);
+    if (txn->isolation > TDB_ISOLATION_READ_COMMITTED)
+        rc = txn_validate(txn, sources, num_sources, seq);
 
     /* the values the database separates go to the value log here, before the record that names
      * them */

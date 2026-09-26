@@ -503,6 +503,86 @@ void test_mvcc_seq_concurrent_unique(void)
     tidesdb_mvcc_destroy(m);
 }
 
+/* rounds two neighbouring committers run in lockstep, and the spins one waits on the other before
+ * giving up */
+#define CC_NEIGHBOUR_ROUNDS  200000
+#define CC_LOCKSTEP_SPIN_MAX (1L << 30)
+
+/**
+ * cc_neighbour_arg
+ * one of two committers deciding neighbouring sequences at the same instant
+ * @param m the clock
+ * @param arrivals the count both increment at each step, so a step begins only once both are there
+ * @param seqs the sequence each drew this round, read by the checker after both have marked
+ * @param stalls rounds the watermark stood below the higher sequence once both had marked it
+ * @param id 0 or 1, which checks and which slot of seqs is its own
+ */
+typedef struct
+{
+    tidesdb_mvcc_t *m;
+    _Atomic(int) *arrivals;
+    _Atomic(uint64_t) *seqs;
+    int stalls;
+    int id;
+} cc_neighbour_arg;
+
+/* both committers pass every step together; the count only rises, so the n-th step waits for 2n */
+static void cc_lockstep(_Atomic(int) *arrivals, const int step)
+{
+    atomic_fetch_add_explicit(arrivals, 1, memory_order_seq_cst);
+    for (long spins = 0; atomic_load_explicit(arrivals, memory_order_seq_cst) < 2 * step; spins++)
+        ASSERT_TRUE(spins < CC_LOCKSTEP_SPIN_MAX);
+}
+
+static void *cc_neighbour_worker(void *arg)
+{
+    cc_neighbour_arg *a = (cc_neighbour_arg *)arg;
+    int step = 0;
+    for (int round = 0; round < CC_NEIGHBOUR_ROUNDS; round++)
+    {
+        const uint64_t seq = tidesdb_mvcc_draw(a->m, NULL);
+        atomic_store_explicit(&a->seqs[a->id], seq, memory_order_seq_cst);
+        cc_lockstep(a->arrivals, ++step);
+        tidesdb_mvcc_mark(a->m, seq, 1);
+        cc_lockstep(a->arrivals, ++step);
+        if (a->id == 0)
+        {
+            const uint64_t other = atomic_load_explicit(&a->seqs[1], memory_order_seq_cst);
+            const uint64_t highest = seq > other ? seq : other;
+            if (tidesdb_mvcc_visible_seq(a->m) < highest) a->stalls++;
+        }
+        cc_lockstep(a->arrivals, ++step);
+    }
+    return NULL;
+}
+
+/* two committers holding neighbouring sequences mark them at the same instant, and nobody else
+ * commits after them. each publishes its own decision and then reads the other's, so if both reads
+ * could miss both writes the watermark would stop below the higher sequence with no third commit
+ * left to carry it, and that committer would wait on a publication that never comes. every round
+ * must end with the watermark at the higher of the two */
+void test_mvcc_two_neighbours_publish_each_other(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    _Atomic(int) arrivals;
+    atomic_init(&arrivals, 0);
+    _Atomic(uint64_t) seqs[2];
+    atomic_init(&seqs[0], 0);
+    atomic_init(&seqs[1], 0);
+    cc_neighbour_arg args[2] = {
+        {.m = m, .arrivals = &arrivals, .seqs = seqs, .stalls = 0, .id = 0},
+        {.m = m, .arrivals = &arrivals, .seqs = seqs, .stalls = 0, .id = 1}};
+    pthread_t threads[2];
+    for (int t = 0; t < 2; t++)
+        ASSERT_EQ(pthread_create(&threads[t], NULL, cc_neighbour_worker, &args[t]), 0);
+    for (int t = 0; t < 2; t++) pthread_join(threads[t], NULL);
+    printf("  %d rounds of two neighbouring commits: %d left the watermark behind\n",
+           CC_NEIGHBOUR_ROUNDS, args[0].stalls);
+    ASSERT_EQ(args[0].stalls, 0);
+    tidesdb_mvcc_destroy(m);
+}
+
 /**
  * cc_claim_arg
  * one committer of the herd racing to claim the same key
@@ -598,6 +678,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_range_stale_orders_by_sequence, tests_passed);
     RUN_TEST(test_mvcc_orphaned_intervals_keep_holding, tests_passed);
     RUN_TEST(test_mvcc_seq_concurrent_unique, tests_passed);
+    RUN_TEST(test_mvcc_two_neighbours_publish_each_other, tests_passed);
     RUN_TEST(test_mvcc_claim_single_winner, tests_passed);
     RUN_TEST(test_mvcc_null_safe, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

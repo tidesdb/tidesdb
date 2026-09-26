@@ -402,13 +402,14 @@ int tidesdb_memtable_range_tombstone_covering(const tidesdb_l0_t *l0, tidesdb_me
  * family
  * @param hi_size length of hi, 0 for the end of the family
  * @param seq_floor the sequence a version must exceed to count as newer
+ * @param seq_ceiling the sequence a version must not exceed to count at all
  * @param newer out, set non-zero as soon as one is found
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_MEMORY, or TDB_ERR_BUSY when the probe could
  *         not see all of L0 and so cannot clear the commit
  */
 int tidesdb_l0_range_has_newer(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *lo,
                                size_t lo_size, const uint8_t *hi, size_t hi_size,
-                               uint64_t seq_floor, int *newer);
+                               uint64_t seq_floor, uint64_t seq_ceiling, int *newer);
 
 /**
  * tidesdb_l0_set_vlog

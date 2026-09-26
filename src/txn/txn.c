@@ -50,6 +50,8 @@ tdb_txn_t *tdb_txn_begin(tidesdb_mvcc_t *clock, tidesdb_isolation_level_t isolat
     txn->state = TDB_TXN_ACTIVE;
     txn->registry_shard = -1;
     txn->registry_index = -1;
+    atomic_init(&txn->read_ceiling, UINT64_MAX);
+    txn->read_holds = 0;
 
     /* repeatable-read and stronger record their reads so commit can validate them; lower levels
      * never conflict on reads, so they carry no read set */
@@ -81,10 +83,12 @@ tdb_txn_t *tdb_txn_begin(tidesdb_mvcc_t *clock, tidesdb_isolation_level_t isolat
                               memory_order_relaxed);
 
     /* join the live-transaction registry, done last so the snapshot is already set before a peer's
-     * gc-floor scan can observe this txn. only repeatable-read and stronger join. a failed join is
-     * not fatal -- the txn still runs correctly, only the gc floor and serializable checks lose it
-     */
-    if (registry && isolation >= TDB_ISOLATION_REPEATABLE_READ &&
+     * gc-floor scan can observe this txn. repeatable-read and stronger hold the floor at their
+     * frozen snapshot for their whole life; read-committed holds it at the ceiling of a read only
+     * while that read is in flight, and joins so the floor scan can see the ceiling at all.
+     * read-uncommitted resolves to the newest version, which no collection drops, so it stays out.
+     * a failed join is not fatal -- the txn still runs correctly, only the gc floor loses it */
+    if (registry && isolation >= TDB_ISOLATION_READ_COMMITTED &&
         tidesdb_txn_registry_add(registry, txn) == TDB_SUCCESS)
         txn->registry = registry;
 
@@ -297,34 +301,75 @@ static uint64_t txn_read_snapshot(const tdb_txn_t *txn)
     return atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
 }
 
-static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
-                        const tidesdb_source_t *sources, int num_sources, uint8_t **value,
-                        size_t *value_size, int record_read)
+/* how many times a read committed read takes its ceiling again because a collection published a
+ * floor above it meanwhile. each retake reads the watermark afresh, which stands at or above every
+ * floor published before it, so one settles it unless another collection lands in between */
+#define TDB_TXN_READ_HOLD_MAX_RETAKES 16
+
+int tdb_txn_read_hold(tdb_txn_t *txn, uint64_t *ceiling)
 {
-    if (!key || !value || !value_size) return TDB_ERR_INVALID_ARGS;
-    const int active = txn_require_active(txn);
-    if (active != TDB_SUCCESS) return active;
-
-    /* read-your-own-writes, so the txn's own buffered write wins and a buffered delete reads as
-     * not-found */
-    tidesdb_writeset_op_t own;
-    if (tidesdb_writeset_lookup(txn->writeset, cf_index, key, key_size, &own))
+    if (!txn || !ceiling) return -1;
+    if (txn->isolation != TDB_ISOLATION_READ_COMMITTED || !txn->registry)
     {
-        if (own.flags & TDB_WAL_ENTRY_TOMBSTONE) return TDB_ERR_NOT_FOUND;
-        uint8_t *copy = NULL;
-        if (own.value_size)
-        {
-            copy = malloc(own.value_size);
-            if (!copy) return TDB_ERR_MEMORY;
-            memcpy(copy, own.value, own.value_size);
-        }
-        *value = copy;
-        *value_size = own.value_size;
-        return TDB_SUCCESS;
+        *ceiling = txn_read_snapshot(txn);
+        return 0;
     }
+    /* an outer hold, an open iterator, already publishes a ceiling at or below this read's, and
+     * lower protects more; the read itself still filters at the watermark of its own moment */
+    if (txn->read_holds > 0)
+    {
+        txn->read_holds++;
+        *ceiling = txn_read_snapshot(txn);
+        return 0;
+    }
+    for (int retake = 0; retake < TDB_TXN_READ_HOLD_MAX_RETAKES; retake++)
+    {
+        const uint64_t c = tidesdb_mvcc_visible_seq(txn->clock);
+        atomic_store_explicit(&txn->read_ceiling, c, memory_order_release);
+        /* the store above and the load below are one half of a pair with the collection's -- it
+         * publishes its high-water mark, fences, and scans the ceilings. with both sides fenced,
+         * either the scan sees this ceiling and the floor stays at or below it, or this load sees
+         * a mark at or above the floor it missed and the ceiling is taken again above it */
+        atomic_thread_fence(memory_order_seq_cst);
+        if (tidesdb_txn_registry_floor_high_water(txn->registry) <= c)
+        {
+            txn->read_holds = 1;
+            *ceiling = c;
+            return 0;
+        }
+    }
+    atomic_store_explicit(&txn->read_ceiling, UINT64_MAX, memory_order_release);
+    return -1;
+}
 
-    /* the external source stack at the read's snapshot, absorbing a transient busy internally */
-    const uint64_t snapshot = txn_read_snapshot(txn);
+void tdb_txn_read_release(tdb_txn_t *txn)
+{
+    if (!txn || txn->isolation != TDB_ISOLATION_READ_COMMITTED || !txn->registry) return;
+    if (txn->read_holds > 0 && --txn->read_holds == 0)
+        atomic_store_explicit(&txn->read_ceiling, UINT64_MAX, memory_order_release);
+}
+
+uint64_t tdb_txn_snapshot_floor(const tdb_txn_t *txn)
+{
+    if (!txn || txn->isolation < TDB_ISOLATION_REPEATABLE_READ) return UINT64_MAX;
+    return atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
+}
+
+uint64_t tdb_txn_read_floor(const tdb_txn_t *txn)
+{
+    if (!txn) return UINT64_MAX;
+    if (txn->isolation == TDB_ISOLATION_READ_COMMITTED)
+        return atomic_load_explicit(&txn->read_ceiling, memory_order_acquire);
+    return tdb_txn_snapshot_floor(txn);
+}
+
+/* the store half of a get, at a ceiling the caller holds: the external source stack at that
+ * snapshot, absorbing a transient busy internally, with the read recorded for validation when the
+ * level keeps a read set */
+static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         const tidesdb_source_t *sources, int num_sources, const uint64_t snapshot,
+                         uint8_t **value, size_t *value_size, int record_read)
+{
     for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
     {
         tidesdb_source_version_t v;
@@ -368,6 +413,41 @@ static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
     }
     return TDB_ERR_IO; /* transient contention never cleared -- internal failure, not a public busy
                         */
+}
+
+static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources, uint8_t **value,
+                        size_t *value_size, int record_read)
+{
+    if (!key || !value || !value_size) return TDB_ERR_INVALID_ARGS;
+    const int active = txn_require_active(txn);
+    if (active != TDB_SUCCESS) return active;
+
+    /* read-your-own-writes, so the txn's own buffered write wins and a buffered delete reads as
+     * not-found */
+    tidesdb_writeset_op_t own;
+    if (tidesdb_writeset_lookup(txn->writeset, cf_index, key, key_size, &own))
+    {
+        if (own.flags & TDB_WAL_ENTRY_TOMBSTONE) return TDB_ERR_NOT_FOUND;
+        uint8_t *copy = NULL;
+        if (own.value_size)
+        {
+            copy = malloc(own.value_size);
+            if (!copy) return TDB_ERR_MEMORY;
+            memcpy(copy, own.value, own.value_size);
+        }
+        *value = copy;
+        *value_size = own.value_size;
+        return TDB_SUCCESS;
+    }
+
+    /* the ceiling is held against the reclamation floor for as long as the store is being read */
+    uint64_t snapshot = 0;
+    if (tdb_txn_read_hold(txn, &snapshot) != 0) return TDB_ERR_IO;
+    const int rc = txn_get_store(txn, cf_index, key, key_size, sources, num_sources, snapshot,
+                                 value, value_size, record_read);
+    tdb_txn_read_release(txn);
+    return rc;
 }
 
 int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,

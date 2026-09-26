@@ -134,14 +134,12 @@ typedef struct
  * @param fd_reaper the descriptor-eviction ticker, borrowed from the threadmanager that owns it, so
  * a caller held at the descriptor budget can make it sweep rather than wait out its tick
  * @param next_sstable_id the db-level monotonic sstable id sequence flush and compaction draw from
- * @param gc_floor_high_water the highest reclamation floor any collection has ever taken.
- * everything at or above it has never been eligible for collection, so a read there resolves to
- * exactly what was true; below it a merge has already kept one version per key and dropped the
- * rest, which is what makes an older point in time unanswerable rather than merely stale. raised
- * where a floor is taken rather than where the work finishes, so a job already collecting is
- * accounted for before a reader can conclude its sequence is safe
  * @param commit_hook_count the number of column families with a live commit hook, so the commit
  * path skips the post-commit hook pass entirely when it is zero
+ * @param txn_commits transactions committed since this handle opened, single-phase and phase two
+ * together, read-only ones included
+ * @param txn_conflicts commits and prepares refused with a conflict since this handle opened; read
+ * against txn_commits it is the retry rate the levels above read committed are paying
  * @param vlog_gc_active set while a value-log reclaim job is queued or running, so at most one runs
  * at a time
  * @param opened set once open fully succeeds, so close persists the clock only for a built engine
@@ -213,8 +211,9 @@ struct tidesdb_t
     bg_ticker_t *fd_reaper;
 
     _Atomic(uint64_t) next_sstable_id;
-    _Atomic(uint64_t) gc_floor_high_water;
     _Atomic(int) commit_hook_count;
+    _Atomic(uint64_t) txn_commits;
+    _Atomic(uint64_t) txn_conflicts;
     _Atomic(int) vlog_gc_active;
     int lock_fd;
     int opened;

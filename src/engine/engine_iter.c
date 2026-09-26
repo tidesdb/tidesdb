@@ -132,11 +132,18 @@ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, si
         engine_iter_take(it, &it->bound_lo, &it->bound_lo_size, lower, lower_size, 0);
     if (it->tracked && upper && upper_size > 0)
         engine_iter_take(it, &it->bound_hi, &it->bound_hi_size, upper, upper_size, 0);
-    /* the isolation-aware read snapshot, not the frozen begin snapshot: a read-committed scan must
-       draw the current seq at iterator creation so it sees data committed before it started,
-       matching what point reads already do through txn_read_snapshot. tdb_txn_snapshot returns 0
-       under read-committed and would filter every live row out. */
-    const uint64_t snapshot = tdb_txn_read_snapshot(txn->inner);
+    /* the isolation-aware read ceiling, not the frozen begin snapshot: a read-committed scan reads
+       at the watermark of its creation, as a point read does, and holds that ceiling against the
+       reclamation floor until the iterator is freed, since the scan resolves to versions at or
+       below it for as long as it runs */
+    uint64_t snapshot = 0;
+    if (tdb_txn_read_hold(txn->inner, &snapshot) != 0)
+    {
+        free(it->bound_lo);
+        free(it->bound_hi);
+        free(it);
+        return TDB_ERR_IO;
+    }
     /* fold the transaction's own buffered writes over the committed snapshot so a scan inside the
      * transaction sees its uncommitted puts and its deletes hide the underlying rows, matching what
      * point reads already do through the write set. the overlay reports the read snapshot as its
@@ -148,6 +155,7 @@ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, si
     const int rc = cf_iter_new_bounded(cf, txn->db->l0, snapshot, ws_src, &bounds, &it->inner);
     if (rc != TDB_SUCCESS)
     {
+        tdb_txn_read_release(txn->inner);
         free(it->bound_lo);
         free(it->bound_hi);
         free(it);
@@ -187,6 +195,7 @@ void engine_iter_free(tidesdb_iter_t *it)
     if (!it) return;
     engine_iter_record(it);
     cf_iter_free(it->inner);
+    tdb_txn_read_release(it->txn->inner);
     free(it->lo);
     free(it->hi);
     free(it->bound_lo);

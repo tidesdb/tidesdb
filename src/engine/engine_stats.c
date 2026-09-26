@@ -406,6 +406,8 @@ int engine_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *out)
     out->write_stall_ceiling_hits = admission.ceiling_hits;
 
     engine_db_txn_stats(db, out);
+    out->txn_commits = atomic_load_explicit(&db->txn_commits, memory_order_relaxed);
+    out->txn_conflicts = atomic_load_explicit(&db->txn_conflicts, memory_order_relaxed);
     engine_db_vlog_stats(db, out);
     return TDB_SUCCESS;
 }

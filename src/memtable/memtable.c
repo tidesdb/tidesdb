@@ -75,6 +75,7 @@ tidesdb_memtable_t *tidesdb_memtable_create(block_manager_t *wal, uint64_t id, u
     atomic_init(&mt->flushed, 0);
     atomic_init(&mt->claimed, 0);
     atomic_init(&mt->vlog_token, VLOG_BUILD_TOKEN_NONE);
+    atomic_init(&mt->high_seq, 0);
 
     /* the set itself waits for the first range delete, so a database that never issues one carries
      * nothing but the empty count and the lock */
@@ -151,6 +152,11 @@ tidesdb_l0_t *tidesdb_l0_create(size_t write_buffer_size, int l0_queue_size, int
     atomic_init(&l0->admit_ceiling_hits, 0);
     atomic_init(&l0->admit_max_us, 0);
     atomic_init(&l0->aborted_count, 0);
+    for (int i = 0; i < TDB_L0_MAX_ABORTED_SEQS; i++)
+    {
+        atomic_init(&l0->aborted_seqs[i], 0);
+        l0->aborted_gens[i] = 0;
+    }
     pthread_mutex_init(&l0->aborted_lock, NULL);
     pthread_mutex_init(&l0->admit_mtx, NULL);
     /* on the clock the park's deadline is built from, so a wall clock step cannot hold a blocked
@@ -386,6 +392,16 @@ static void l0_protect_reference(tidesdb_l0_t *l0, tidesdb_memtable_t *mt, uint6
         vlog_build_lower(l0->vlog, token, segment);
 }
 
+/* raise the memtable's high sequence to seq if it is higher; a concurrent raise past it ends the
+ * loop just as a successful swap does */
+static void l0_note_seq(tidesdb_memtable_t *mt, const uint64_t seq)
+{
+    uint64_t cur = atomic_load_explicit(&mt->high_seq, memory_order_relaxed);
+    while (seq > cur && !atomic_compare_exchange_weak_explicit(
+                            &mt->high_seq, &cur, seq, memory_order_release, memory_order_relaxed))
+        ;
+}
+
 /* the shared body behind both applies -- pin the active memtable, prefix the key, put, and count a
  * newly distinct key. put_entry decides whether the version holds the bytes or an id */
 static int l0_apply_entry(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size_t key_size,
@@ -424,6 +440,7 @@ static int l0_apply_entry(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *ke
                                                          value_size, ttl, seq, flags, &created);
     const int rc = put == 0 ? TDB_SUCCESS : TDB_ERR_MEMORY;
     if (rc == TDB_SUCCESS && created) l0_count_new_key(l0, cf_index);
+    if (rc == TDB_SUCCESS) l0_note_seq(mt, seq);
 
     if (pkey != stack_key) free(pkey);
     l0_unpin_write(mt);
@@ -512,6 +529,7 @@ int tidesdb_l0_apply_range_tombstone(tidesdb_l0_t *l0, const uint32_t cf_index, 
                               range_tombstone_set_count(mt->range_tombstones),
                               memory_order_release);
     tdb_wprwlock_unlock(&mt->range_tombstone_lock);
+    if (rc == TDB_SUCCESS) l0_note_seq(mt, seq);
 
     if (plo != stack_lo) free(plo);
     if (phi != stack_hi) free(phi);
@@ -638,20 +656,41 @@ int tidesdb_l0_wal_append_one(tidesdb_l0_t *l0, const uint8_t *batch, size_t siz
     return rc;
 }
 
+/* the generation of the memtable active now, the youngest that can hold an abandoned batch's
+ * entries; with no active memtable nothing can, and the record is kept for good */
+static uint64_t l0_active_generation(tidesdb_l0_t *l0)
+{
+    uint64_t generation = UINT64_MAX;
+    tidesdb_memtable_t *mt = l0_pin_active_read(l0);
+    if (mt)
+    {
+        generation = mt->generation;
+        l0_unpin_read(mt);
+    }
+    return generation;
+}
+
 int tidesdb_l0_mark_aborted(tidesdb_l0_t *l0, const uint64_t seq)
 {
     if (!l0 || seq == 0) return TDB_ERR_INVALID_ARGS;
+    const uint64_t generation = l0_active_generation(l0);
 
     pthread_mutex_lock(&l0->aborted_lock);
     const int n = atomic_load_explicit(&l0->aborted_count, memory_order_relaxed);
-    if (n >= TDB_L0_MAX_ABORTED_SEQS)
+    /* a forgotten slot reads zero and is taken before the table grows. a reader walking meanwhile
+     * sees either the zero, which matches no sequence, or the new sequence, which it should */
+    int slot = n;
+    for (int i = 0; i < n && slot == n; i++)
+        if (atomic_load_explicit(&l0->aborted_seqs[i], memory_order_relaxed) == 0) slot = i;
+    if (slot >= TDB_L0_MAX_ABORTED_SEQS)
     {
         pthread_mutex_unlock(&l0->aborted_lock);
         return TDB_ERR_MEMORY_LIMIT;
     }
-    l0->aborted_seqs[n] = seq;
+    l0->aborted_gens[slot] = generation;
+    atomic_store_explicit(&l0->aborted_seqs[slot], seq, memory_order_release);
     /* published after the slot is written, so a reader that sees the new count sees the sequence */
-    atomic_store_explicit(&l0->aborted_count, n + 1, memory_order_release);
+    if (slot == n) atomic_store_explicit(&l0->aborted_count, n + 1, memory_order_release);
     pthread_mutex_unlock(&l0->aborted_lock);
     return TDB_SUCCESS;
 }
@@ -659,14 +698,25 @@ int tidesdb_l0_mark_aborted(tidesdb_l0_t *l0, const uint64_t seq)
 int tidesdb_l0_seq_aborted(const tidesdb_l0_t *l0, const uint64_t seq)
 {
     if (!l0) return 0;
-    /* entries are only ever appended, so a reader needs no lock -- it takes the published count and
-     * walks that many slots, every one of which was written before the count that admits it. the
-     * table is empty in every database that has not had a commit fail, which is the common case and
-     * costs one relaxed load */
+    /* a reader needs no lock -- it takes the published count and walks that many slots, each of
+     * which holds a sequence or a zero. the table is empty in every database that has not had a
+     * commit fail, which is the common case and costs one relaxed load */
     const int n = atomic_load_explicit(&l0->aborted_count, memory_order_acquire);
     for (int i = 0; i < n; i++)
-        if (l0->aborted_seqs[i] == seq) return 1;
+        if (atomic_load_explicit(&l0->aborted_seqs[i], memory_order_acquire) == seq) return 1;
     return 0;
+}
+
+/* forget every abandoned sequence recorded while a memtable of this generation or an older one was
+ * active; a batch that landed in none of the memtables still resident cannot be read anywhere */
+static void l0_forget_aborted_through(tidesdb_l0_t *l0, const uint64_t generation)
+{
+    pthread_mutex_lock(&l0->aborted_lock);
+    const int n = atomic_load_explicit(&l0->aborted_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++)
+        if (l0->aborted_gens[i] <= generation)
+            atomic_store_explicit(&l0->aborted_seqs[i], 0, memory_order_release);
+    pthread_mutex_unlock(&l0->aborted_lock);
 }
 
 int tidesdb_l0_rotate(tidesdb_l0_t *l0, tidesdb_memtable_t *new_mt)
@@ -818,6 +868,7 @@ void tidesdb_l0_retire_immutable(tidesdb_l0_t *l0, tidesdb_memtable_t *mt)
     (void)queue_remove_if(l0->queue, l0_match_memtable, mt, NULL);
     atomic_fetch_add_explicit(&l0->visible_changes, 1, memory_order_release);
     atomic_fetch_sub_explicit(&l0->flushes_in_flight, 1, memory_order_relaxed);
+    l0_forget_aborted_through(l0, mt->generation);
     tidesdb_l0_reclaim(l0, mt);
 }
 

@@ -182,11 +182,22 @@ static void engine_invoke_commit_hooks(tidesdb_t *db, tdb_txn_t *inner, uint64_t
     }
 }
 
+/* count a commit's outcome, so the statistics carry how many commits were made and how many were
+ * refused for a conflict; every other failure is reported to the caller and counted nowhere */
+static void engine_count_commit(tidesdb_t *db, const int rc)
+{
+    if (rc == TDB_SUCCESS)
+        atomic_fetch_add_explicit(&db->txn_commits, 1, memory_order_relaxed);
+    else if (rc == TDB_ERR_CONFLICT)
+        atomic_fetch_add_explicit(&db->txn_conflicts, 1, memory_order_relaxed);
+}
+
 int engine_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn) return TDB_ERR_INVALID_ARGS;
     tidesdb_t *db = txn->db;
     const int rc = tdb_txn_commit(txn->inner, &db->backend, db->sources, ENGINE_NUM_SOURCES);
+    engine_count_commit(db, rc);
     if (rc == TDB_SUCCESS)
     {
         engine_account_commit(db, txn->inner);
@@ -213,6 +224,8 @@ int engine_txn_prepare(tidesdb_txn_t *txn, const uint8_t *xid, size_t xid_size)
     const int rc =
         tdb_txn_prepare(txn->inner, &db->backend, db->sources, ENGINE_NUM_SOURCES, xid, xid_size);
     const uint64_t last = atomic_load_explicit(&db->wal_generation, memory_order_acquire);
+    /* a prepare that is refused is a conflict like any other; one that holds is not yet a commit */
+    if (rc == TDB_ERR_CONFLICT) engine_count_commit(db, rc);
     /* only a write transaction leaves anything durable to protect; a read-only prepare finishes
      * outright and needs no phase two, so it must not pin the log */
     if (rc == TDB_SUCCESS && tdb_txn_state(txn->inner) == TDB_TXN_PREPARED)
@@ -240,6 +253,7 @@ int engine_txn_commit_prepared(tidesdb_txn_t *txn)
     if (!txn) return TDB_ERR_INVALID_ARGS;
     tidesdb_t *db = txn->db;
     const int rc = tdb_txn_commit_prepared(txn->inner, &db->backend);
+    engine_count_commit(db, rc);
     if (rc == TDB_SUCCESS)
     {
         engine_prepared_resolved(db, txn->prepare_generation, txn->prepare_generation_last);
@@ -284,8 +298,9 @@ int engine_recover_prepared(tidesdb_t *db, tidesdb_prepared_txn_t *out, const in
         if (handle)
         {
             handle->db = db;
-            handle->inner = tdb_txn_adopt_prepared(db->clock, rec->xid, rec->xid_size, rec->entries,
-                                                   rec->count, rec->commit_seq);
+            handle->inner =
+                tdb_txn_adopt_prepared(db->clock, rec->xid, rec->xid_size, rec->entries, rec->count,
+                                       rec->commit_seq, rec->reads, rec->read_count);
         }
         if (!handle || !handle->inner)
         {
@@ -296,7 +311,7 @@ int engine_recover_prepared(tidesdb_t *db, tidesdb_prepared_txn_t *out, const in
         }
         /* recovery already pinned this generation for every in-doubt batch, so the handle only
          * needs to remember which one to release when its coordinator finally decides */
-        handle->prepare_generation = rec->generation;
+        handle->prepare_generation = rec->first_generation;
         handle->prepare_generation_last = rec->generation;
 
         out[n].txn = handle;
@@ -352,23 +367,12 @@ void engine_txn_free(tidesdb_txn_t *txn)
 
 uint64_t engine_take_gc_floor(tidesdb_t *db)
 {
-    const uint64_t floor = tidesdb_txn_registry_min_snapshot(db->txn_registry);
-
-    /* raised to the highest floor ever taken, never lowered. a reader asking whether a sequence is
-     * still reconstructable compares against this, and it has to account for a collection that has
-     * already read a floor and not yet finished -- recording it here rather than at completion is
-     * what closes that window */
-    uint64_t seen = atomic_load_explicit(&db->gc_floor_high_water, memory_order_relaxed);
-    while (floor > seen &&
-           !atomic_compare_exchange_weak_explicit(&db->gc_floor_high_water, &seen, floor,
-                                                  memory_order_relaxed, memory_order_relaxed))
-        ;
-    return floor;
+    return tidesdb_txn_registry_take_floor(db->txn_registry, tidesdb_mvcc_visible_seq(db->clock));
 }
 
 uint64_t engine_oldest_readable_seq(const tidesdb_t *db)
 {
-    return db ? atomic_load_explicit(&db->gc_floor_high_water, memory_order_acquire) : 0;
+    return db ? tidesdb_txn_registry_floor_high_water(db->txn_registry) : 0;
 }
 
 int engine_txn_begin_at_seq(tidesdb_t *db, uint64_t seq, tidesdb_txn_t **out)
@@ -392,7 +396,7 @@ int engine_txn_begin_at_seq(tidesdb_t *db, uint64_t seq, tidesdb_txn_t **out)
      * eligible for collection and the point in time is exact. above it a merge has already kept one
      * version per key and dropped the rest, and answering from what survived would report a key
      * that existed as absent */
-    if (atomic_load_explicit(&db->gc_floor_high_water, memory_order_acquire) > seq)
+    if (tidesdb_txn_registry_floor_high_water(db->txn_registry) > seq)
     {
         engine_txn_free(*out);
         *out = NULL;

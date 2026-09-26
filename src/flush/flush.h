@@ -58,6 +58,10 @@
  *                        outlive the log holding its decision and come back as a false in-doubt
  *                        transaction; may be NULL
  * @param on_wal_retained_ctx opaque context passed to on_wal_retained
+ * @param visible_seq the clock's watermark, borrowed for the clock's life, or NULL to build without
+ *                    waiting on one. a flush waits until the watermark has passed the immutable's
+ *                    highest sequence before it reads a key, so every version it writes is decided
+ *                    and one a commit abandoned is dropped rather than made permanent in an sstable
  */
 typedef struct
 {
@@ -76,6 +80,7 @@ typedef struct
     int (*wal_generation_pinned)(void *ctx, uint64_t generation);
     void (*on_wal_retained)(void *ctx, const char *path, uint64_t generation);
     void *on_wal_retained_ctx;
+    const _Atomic(uint64_t) *visible_seq;
 } flush_ctx_t;
 
 /**

@@ -265,11 +265,6 @@ static void engine_compaction_scheduler_tick(void *ctx)
     tidesdb_t *db = (tidesdb_t *)ctx;
     if (atomic_load_explicit(&db->closing, memory_order_acquire)) return;
 
-    /* the tick already scans the live transactions for its own gc floor, so publishing the answer
-     * here costs nothing and gives the commit path a minimum it can read with one load. a commit
-     * cannot run the scan itself -- it would be every registry shard, once per written key */
-    tidesdb_txn_registry_publish_min_snapshot(db->txn_registry);
-
     cf_t **live = NULL;
     int n = 0;
     cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);

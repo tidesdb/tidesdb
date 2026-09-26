@@ -188,19 +188,19 @@ static void fx_ensure_txn(fx_state_t *s)
  * read-uncommitted and read-committed run no commit-time conflict detection at all --
  * txn_write_phase gates it on isolation above read-committed -- so a refusal at those levels is
  * always a fault. every level above runs detection and may legitimately refuse, and the oracle
- * cannot predict when, because all three checks are one-sided. the write reservation is a hash with
- * a 16-bit fingerprint that also loses conservatively against any newer sequence, read-set
- * revalidation refuses on a version that merely moved, and the serializable dangerous-structure
- * rule is the conservative Cahill pivot. so a refusal is permitted, never predicted.
+ * cannot predict when: read validation refuses on a version that merely moved and on a key that
+ * appeared inside a scanned interval, and a prepared batch's read claims refuse a writer of a key
+ * it read, which the model does not follow. so a refusal is permitted, never predicted.
  *
- * one refusal is required rather than permitted: a live prepared batch holds a reservation on its
- * keys until phase two decides it, so a transaction that both reserves and writes one of those keys
- * has to lose. a batch adopted after a restart is below snapshot isolation and holds no
- * reservation, so it requires nothing */
+ * one refusal is required rather than permitted: a prepared batch holds its keys and intervals
+ * until phase two decides it, whether it prepared in this process at repeatable read or above or
+ * was adopted after a restart, so a transaction promising first-committer-wins that writes one of
+ * those keys or inside one of those intervals has to lose */
 void fx_conflict_expectation(const fx_state_t *s, int *required, int *allowed)
 {
     const int reserves = s->txn_iso >= FX_ISO_RESERVES;
-    const int held = s->prepared && !s->prepared_recovered && s->prepared_iso >= FX_ISO_RESERVES;
+    const int held =
+        s->prepared && (s->prepared_recovered || s->prepared_iso >= TDB_ISOLATION_REPEATABLE_READ);
     *allowed = s->txn_iso > TDB_ISOLATION_READ_COMMITTED;
     *required = reserves && held && fuzz_model_txn_hits_prepared(s->model);
 }

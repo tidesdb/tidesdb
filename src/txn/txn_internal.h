@@ -28,6 +28,14 @@
  * @param snapshot_seq the sequence reads filter at (per level). atomic because a peer's gc-floor
  * scan reads it from another thread while a time-travel begin is still lowering it -- the
  * transaction is registered before it pins, so that the floor is capped before the window opens
+ * @param read_ceiling at read committed, the ceiling of the read or scan in flight, UINT64_MAX
+ * between them. a read takes its ceiling from the watermark and then reads the store, and a
+ * collection that took its floor meanwhile would keep one version per key and drop the ones the
+ * read still resolves to; published here for the floor scan to see, and held only while a read or
+ * an iterator is open. atomic because the scan reads it from another thread
+ * @param read_holds how many reads and iterators of a read committed transaction are in flight;
+ * the ceiling is published by the first and released by the last, so a scan's lower ceiling is not
+ * lifted by a point read inside it
  * @param commit_seq the assigned commit sequence, 0 until commit or prepare
  * @param prepared_entries the entries staged by prepare, applied at phase-2 commit, NULL otherwise
  * @param prepared_count number of prepared entries
@@ -48,6 +56,10 @@
  * @param state the lifecycle state
  * @param abort_requested set by another thread to make this transaction fail its next operation;
  *        the only field a thread other than the owner ever writes
+ * @param commit this transaction's record in the clock's claim set while a commit or a prepare is
+ *               in flight -- the keys it holds and the sequence they are ordered by
+ * @param claims the claims that record chains, one per written key and, for a prepare at
+ *               repeatable read or above, one per read key; NULL when nothing is held
  */
 struct tdb_txn
 {
@@ -56,6 +68,8 @@ struct tdb_txn
     int64_t deadline;
     tidesdb_isolation_level_t isolation;
     _Atomic(uint64_t) snapshot_seq;
+    _Atomic(uint64_t) read_ceiling;
+    int read_holds;
     uint64_t commit_seq;
     tidesdb_wal_entry_t *prepared_entries;
     int prepared_count;
@@ -74,6 +88,8 @@ struct tdb_txn
     /* written by whichever thread aborts this transaction, read by the owner. atomic because those
      * are different threads; everything else here stays plain because only the owner touches it */
     _Atomic(int) abort_requested;
+    tidesdb_mvcc_commit_t commit;
+    tidesdb_mvcc_claim_t *claims;
 };
 
 /* bounded internal retries for a transient source BUSY before giving up; the engine absorbs BUSY so
@@ -101,42 +117,30 @@ int txn_require_active(tdb_txn_t *txn);
 
 /**
  * txn_key_hash
- * the 64-bit xxh3 hash of a cf-namespaced key, which is what picks a write's reservation slot.
- * shared so the two-phase path can name the same slots the prepare claimed
+ * the 64-bit xxh3 hash of a cf-namespaced key, which picks the chain a claim on it hangs from.
+ * shared so the two-phase path names the same chains the prepare claimed
  * @param cf_index the column family the key belongs to
  * @param key the key bytes
  * @param key_size length of key
- * @return the hash, whose low bits select the slot and whose high bits are its fingerprint
+ * @return the hash
  */
 uint64_t txn_key_hash(uint32_t cf_index, const uint8_t *key, size_t key_size);
 
 /**
- * txn_writes_an_interval
- * whether this transaction writes an interval rather than only keys. such a batch holds the commit
- * gate exclusively, because the key-hash reservation it would otherwise rely on cannot express one
- * @param ws the write set
- * @return non-zero when any op is a prefix delete
- */
-int txn_writes_an_interval(const tidesdb_writeset_t *ws);
-
-/**
- * txn_release_reservations
- * release the first-committer-wins write reservations a commit or prepare took, so an aborted or
- * rolled-back transaction stops blocking its keys
+ * txn_release_claims
+ * drop every claim a commit or prepare holds and the intervals it holds, once its sequence is
+ * decided or its batch is given up, so its keys stop refusing other writers; frees the claims array
  * @param txn the transaction
- * @param entries the entries whose keys were reserved
- * @param count number of entries
- * @param seq the sequence the reservations were claimed under
  */
-void txn_release_reservations(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count,
-                              uint64_t seq);
+void txn_release_claims(tdb_txn_t *txn);
 
 /**
  * txn_write_phase
- * the shared first phase of committing -- conflict-check, draw and mark-in-progress a commit seq,
- * build the deduplicated entries, reserve the write set, pace on backpressure, and durably append
- * the WAL record of the given kind. on failure it releases the reservation, aborts the transaction,
- * leaves the registry, frees the entries, and returns the error
+ * the shared first phase of committing -- build the deduplicated entries, pace on backpressure,
+ * claim the write set and its intervals, draw and mark-in-progress a commit seq, validate, and
+ * durably append the WAL record of the given kind. on failure it drops the claims, marks a drawn
+ * seq aborted, aborts the transaction, leaves the registry, frees the entries, and returns the
+ * error
  * @param txn the transaction
  * @param backend the injected commit backend
  * @param sources the source stack conflict detection reads

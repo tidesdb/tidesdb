@@ -590,6 +590,51 @@ void test_compaction_keeps_tombstone_with_sibling(void)
     ce_db_close(&db);
 }
 
+/* a merge that drops every version it read still hands on an interval it has not finished. the
+ * interval lives only in a table, so a merge writing none would leave it nowhere, and the key a
+ * sibling outside the merge holds under it would come back */
+void test_compaction_empty_merge_carries_intervals(void)
+{
+    ce_db_t db;
+    ce_db_open(&db);
+
+    const ce_entry_t put[] = {{"fab", "v", 1, 0}}; /* covered, in a table outside the merge */
+    (void)ce_flush(&db, put, 1, 1);
+    /* the interval and a point tombstone share a table, as a flush of one memtable writes them */
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db.l0, 0, (const uint8_t *)"bf", 2, NULL, 0, 2),
+              TDB_SUCCESS);
+    const ce_entry_t del_a[] = {{"acc", NULL, 3, 1}};
+    const uint64_t id1 = ce_flush(&db, del_a, 1, 2);
+    const ce_entry_t del_b[] = {{"ddbd", NULL, 4, 1}};
+    const uint64_t id2 = ce_flush(&db, del_b, 1, 3);
+    ASSERT_EQ(level_set_count(db.cf->levels, LEVEL_SET_L1), 3);
+
+    /* both tombstones are base tombstones no sibling holds, so the merge keeps no version at all */
+    const uint64_t inputs[2] = {id1, id2};
+    const compaction_job_t job = {.input_ids = inputs,
+                                  .n_inputs = 2,
+                                  .target_level = LEVEL_SET_L1,
+                                  .is_largest_level = 1,
+                                  .split = COMPACTION_SPLIT_NONE,
+                                  .file_max = 0};
+    const compaction_ctx_t cx = {.cf = db.cf,
+                                 .manifest = db.manifest,
+                                 .manifest_path = db.manifest_path,
+                                 .next_sstable_id = &db.next_id,
+                                 .gc_floor = UINT64_MAX,
+                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                                 .value_threshold = db.value_threshold};
+    ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
+
+    /* the merge wrote a table for the interval alone, and the covered key stays deleted */
+    ASSERT_EQ(level_set_count(db.cf->levels, LEVEL_SET_L1), 2);
+    uint64_t seq = 0;
+    ASSERT_EQ(cf_range_tombstone_covering(db.cf, (const uint8_t *)"fab", 3, UINT64_MAX, &seq), 1);
+    ASSERT_EQ((int)seq, 2);
+
+    ce_db_close(&db);
+}
+
 /* ===== two compactions of one family, running at once against overlapping inputs =====
  *
  * a family's compaction claim is taken for a whole plan rather than for a job, and the plan's jobs
@@ -709,6 +754,7 @@ int main(int argc, char **argv)
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_within_boundaries, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_excludes_spilled_values, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_keeps_tombstone_with_sibling, tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_empty_merge_carries_intervals, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_concurrent_merges_return_every_reference,
                              tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

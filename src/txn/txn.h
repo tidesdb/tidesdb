@@ -182,6 +182,24 @@ int tdb_txn_get_notrack(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
                         size_t *value_size);
 
 /**
+ * tdb_txn_record_scan
+ * record the interval a scan covered into the conflict footprint, at the transaction's snapshot, so
+ * the commit refuses a key another commit put inside it -- a phantom. kept only by the levels that
+ * validate their reads; at every other level the call is a no-op
+ * @param txn the transaction the scan belonged to
+ * @param cf_index the scanned column family's prefix index
+ * @param lo the inclusive lower bound of what was covered; a bound below every key is one zero byte
+ * @param lo_size length of lo, greater than zero
+ * @param hi the exclusive upper bound, or NULL with hi_size 0 when the scan ran to the end
+ * @param hi_size length of hi
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL txn or an empty lower bound, or
+ *         TDB_ERR_MEMORY when the footprint could not be kept and isolation can no longer be
+ * promised
+ */
+int tdb_txn_record_scan(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                        const uint8_t *hi, size_t hi_size);
+
+/**
  * tdb_txn_contains
  * whether a key is present (a non-tracking existence probe that frees any value internally)
  * @param txn the transaction
@@ -317,8 +335,9 @@ int tdb_txn_rollback_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend);
  * tdb_txn_adopt_prepared
  * rebuild a transaction recovery found durably prepared but undecided, so the coordinator resolves
  * it through the same phase-two calls a live prepared transaction uses. it holds no snapshot and
- * joins no registry, since the process that took them is gone; only the batch and its sequence
- * survive
+ * joins no registry, since the process that took them is gone, but it holds its keys, intervals
+ * and reads again exactly as a live prepare does, so a writer of one of them is refused until the
+ * coordinator decides
  * @param clock the borrowed MVCC clock, marked when phase two commits
  * @param xid the transaction id from the PREPARE record, copied here
  * @param xid_size length of xid, must be greater than zero
@@ -326,11 +345,15 @@ int tdb_txn_rollback_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend);
  *                owned by the caller, which must outlive the returned transaction
  * @param count number of entries
  * @param commit_seq the sequence the batch commits at, taken when it originally prepared
+ * @param reads the keys the batch read, from the record written ahead of its PREPARE, whose bytes
+ *              the caller keeps alive as it does the entries'; NULL when the record carried none
+ * @param read_count number of read keys
  * @return the prepared transaction, or NULL on bad args or allocation failure
  */
 tdb_txn_t *tdb_txn_adopt_prepared(tidesdb_mvcc_t *clock, const uint8_t *xid, size_t xid_size,
                                   const tidesdb_wal_entry_t *entries, int count,
-                                  uint64_t commit_seq);
+                                  uint64_t commit_seq, const tidesdb_wal_entry_t *reads,
+                                  int read_count);
 
 /**
  * tdb_txn_commit_seq
@@ -429,14 +452,56 @@ uint64_t tdb_txn_snapshot(const tdb_txn_t *txn);
 /**
  * tdb_txn_read_snapshot
  * the sequence a read filters at right now, honouring the isolation level -- read-uncommitted sees
- * everything, read-committed draws the current seq afresh on each call, and repeatable-read and
- * stronger return the snapshot frozen at begin. iterators must use this rather than
- * tdb_txn_snapshot so a read-committed scan sees data committed before it started instead of the
- * placeholder 0.
+ * everything, read-committed reads the watermark afresh on each call, and repeatable-read and
+ * stronger return the snapshot frozen at begin. a read that goes on to read the store takes its
+ * ceiling through tdb_txn_read_hold instead, so the ceiling is held against the reclamation floor
+ * for as long as the read lasts; this is the value alone, for a caller that only reports it
  * @param txn the transaction
  * @return the read snapshot sequence, or 0 if txn is NULL
  */
 uint64_t tdb_txn_read_snapshot(const tdb_txn_t *txn);
+
+/**
+ * tdb_txn_read_hold
+ * take the ceiling a read or a scan filters at and hold it against the reclamation floor until
+ * tdb_txn_read_release. at read committed the ceiling is the watermark, and it is published to the
+ * registry so a collection taking its floor while the read is in flight stays at or below it; a
+ * collection that took its floor as the ceiling was being published is seen through the floor's
+ * high-water mark, and the ceiling is taken again above it. holds nest: an iterator's ceiling stays
+ * published under the point reads made while it is open. the other levels hold nothing here -- a
+ * frozen snapshot is registered for its whole life and read-uncommitted resolves to the newest
+ * version, which no collection drops
+ * @param txn the transaction
+ * @param ceiling out -- the sequence to read at
+ * @return 0 with the hold taken, or -1 when collections kept landing on the ceiling faster than it
+ *         could be taken, which a caller treats as a transient failure
+ */
+int tdb_txn_read_hold(tdb_txn_t *txn, uint64_t *ceiling);
+
+/**
+ * tdb_txn_read_release
+ * give back one hold taken with tdb_txn_read_hold; the last one releases the published ceiling
+ * @param txn the transaction
+ */
+void tdb_txn_read_release(tdb_txn_t *txn);
+
+/**
+ * tdb_txn_snapshot_floor
+ * the sequence this transaction's frozen snapshot holds the reclamation floor at -- its snapshot at
+ * repeatable read and stronger, and nothing at the levels that freeze none
+ * @param txn the transaction
+ * @return the snapshot, or UINT64_MAX when the level freezes none or txn is NULL
+ */
+uint64_t tdb_txn_snapshot_floor(const tdb_txn_t *txn);
+
+/**
+ * tdb_txn_read_floor
+ * the sequence this transaction holds the reclamation floor at right now: the frozen snapshot at
+ * repeatable read and stronger, the ceiling of the read in flight at read committed
+ * @param txn the transaction
+ * @return the floor, or UINT64_MAX when nothing is held or txn is NULL
+ */
+uint64_t tdb_txn_read_floor(const tdb_txn_t *txn);
 
 /**
  * tdb_txn_pin_snapshot

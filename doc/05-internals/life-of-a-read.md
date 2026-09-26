@@ -25,13 +25,14 @@ is visible if its sequence is at or below it.
 | Isolation | Ceiling |
 | --- | --- |
 | `TDB_ISOLATION_READ_UNCOMMITTED` | Unbounded — everything, including sequences still in progress |
-| `TDB_ISOLATION_READ_COMMITTED` | The current sequence, re-read per operation |
-| Repeatable read and above | Frozen when the transaction began |
+| `TDB_ISOLATION_READ_COMMITTED` | The watermark, re-read per operation and held against the reclamation floor while the operation reads the store |
+| Repeatable read and above | The watermark when the transaction began, frozen |
 
-A sequence that has been drawn but not yet marked committed is invisible at every level
-except read-uncommitted. That is what makes a multi-key batch atomic to readers without any
-lock: the batch's sequence flips from in-progress to committed in one step, and until it
-does, none of it can be seen.
+The watermark is the highest sequence below which every drawn sequence has been decided, and a
+sequence is committed only once its batch is applied in full. So a sequence that has been drawn
+but not yet decided is above every ceiling at every level except read-uncommitted, and a
+multi-key batch is atomic to readers without any lock: none of it can be seen until the watermark
+passes it, and then all of it is. See [Transactions and MVCC](/internals/transactions-and-mvcc).
 
 ## Stage 1 — The transaction's own writes
 
@@ -129,15 +130,21 @@ layout cannot free a table a reader is still inside.
 
 A bitmap published with each layout says which levels hold anything, so a read skips the empty
 ones without touching them. The mask is a **snapshot**, though, and the levels it does visit are
-scanned against the live layout — so a merge that moves a table into a level the mask called empty
-would be skipped while the level it came from reads as already emptied.
+scanned against the live layout — and a merge changes both. A walk that mixes the two, the mask
+from before the merge with the layout from after it or the reverse, scans levels the tables have
+left and skips the level they moved to. What it finds is an absence, or an older version from
+further down that comes back as the newest, and neither was ever true.
 
-That is harmless when a **flush** did it: a flush installs its sstables and only retires the
-memtable they came from afterwards, so through that whole window the keys are still in L0, which
-every read consults first. It is **not** harmless when a compaction did it, because a compaction's
-keys left L0 long ago and nothing backs them up. So the read records the layout generation before
-the walk and checks it again on a miss; a shape that moved underneath reports a retryable busy
-rather than an absence that was never true.
+So the layout generation is a **sequence lock** around the publish: it is bumped to odd before the
+layout, the mask and the interval count change, and to even after. The read records it before the
+walk and checks it again before it trusts anything: a hit, a miss, and a miss that an interval is
+about to answer for, since a walk that missed the key only because the table carrying it moved would
+otherwise report it deleted at an interval the version had long outlived. A walk that started on an
+odd generation began inside a publish, and a walk that finds the generation changed saw one land;
+both report a retryable busy rather than an answer that was never true. Under load the publish is
+not brief: a compaction thread can be preempted between the two bumps for a whole scheduler
+quantum, and every read that completes inside that quantum sees a mixed shape. The parity rule is
+what makes those reads retry instead of answering.
 
 ## A range delete is not found where the key is
 

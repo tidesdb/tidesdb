@@ -122,12 +122,12 @@ static uint64_t cs_flush(cs_db_t *db, const cs_entry_t *entries, int n, uint64_t
     return id;
 }
 
-/* merge every L1 sstable down into one L2 sstable, so a later L1 flush shadows it from above */
-static void cs_grow_to_l2(cs_db_t *db, const uint64_t *ids, int n)
+/* merge the given sstables down into one sstable at the target level */
+static void cs_compact_to(cs_db_t *db, const uint64_t *ids, int n, int target_level)
 {
     const compaction_job_t job = {.input_ids = ids,
                                   .n_inputs = n,
-                                  .target_level = 2,
+                                  .target_level = target_level,
                                   .is_largest_level = 1,
                                   .split = COMPACTION_SPLIT_NONE,
                                   .file_max = 0};
@@ -139,6 +139,12 @@ static void cs_grow_to_l2(cs_db_t *db, const uint64_t *ids, int n)
                                  .sync_mode = BLOCK_MANAGER_SYNC_NONE,
                                  .value_threshold = CS_SPILL_THRESHOLD};
     ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
+}
+
+/* merge every L1 sstable down into one L2 sstable, so a later L1 flush shadows it from above */
+static void cs_grow_to_l2(cs_db_t *db, const uint64_t *ids, int n)
+{
+    cs_compact_to(db, ids, n, 2);
 }
 
 /* read one key through cf_source at a snapshot, returning the result and filling out */
@@ -266,6 +272,173 @@ void test_cf_source_top_down_levels(void)
     cs_db_close(&db);
 }
 
+/**
+ * cs_mover_t
+ * a table being moved between L1 and L2 for as long as a reader is asking about its key
+ * @param cf the family
+ * @param table the sstable being moved, referenced by the test
+ * @param size the table's catalogued size, restated on every move
+ * @param stop set by the reader once it has asked enough
+ * @param level_a the level the first move lands the table in
+ * @param level_b the level every other move lands it in
+ */
+typedef struct
+{
+    cf_t *cf;
+    sstable_t *table;
+    uint64_t size;
+    _Atomic(int) stop;
+    int level_a;
+    int level_b;
+} cs_mover_t;
+
+static void *cs_move_between_levels(void *arg)
+{
+    cs_mover_t *m = (cs_mover_t *)arg;
+    int level = m->level_a;
+    while (!atomic_load_explicit(&m->stop, memory_order_acquire))
+    {
+        const int out_level[1] = {level};
+        const uint64_t out_size[1] = {m->size};
+        sstable_t *const one[1] = {m->table};
+        if (level_set_swap(m->cf->levels, one, 1, one, out_level, out_size, 1) != 0) break;
+        level = level == m->level_a ? m->level_b : m->level_a;
+    }
+    return NULL;
+}
+
+/* how many times the reader asks while the table moves under it */
+#define CS_MOVE_READS 20000
+
+/* a read snapshots which levels hold anything and scans each against the live layout, so a merge
+ * that takes the newest version's table out of the level the read is about to scan and lands it in
+ * a level the snapshot called empty leaves the read to walk on and find an older version deeper
+ * down. the newest version's table moves between L1 and L2 without pause while a reader asks for
+ * the key, with the old version fixed at L3; every answer must be the newest version or a retryable
+ * busy, never the old one */
+void test_cf_source_a_move_into_an_empty_level_never_hides_the_newer_version(void)
+{
+    cs_db_t db;
+    cs_db_open(&db);
+
+    const cs_entry_t old[] = {{"k", "old", 0, 1, 0}};
+    const uint64_t id0 = cs_flush(&db, old, 1, 1);
+    const uint64_t l1[1] = {id0};
+    cs_compact_to(&db, l1, 1, 3); /* k@old at L3 */
+    const cs_entry_t fresh[] = {{"k", "new", 0, 10, 0}};
+    (void)cs_flush(&db, fresh, 1, 2); /* k@new at L1, and L2 empty */
+    ASSERT_EQ(level_set_count(db.cf->levels, 1), 1);
+    ASSERT_EQ(level_set_count(db.cf->levels, 2), 0);
+    ASSERT_EQ(level_set_count(db.cf->levels, 3), 1);
+
+    sstable_t *table = NULL;
+    ASSERT_EQ(level_set_overlapping(db.cf->levels, 1, (const uint8_t *)"k", 1, (const uint8_t *)"k",
+                                    1, &table, 1),
+              1);
+    ASSERT_TRUE(table != NULL);
+    cs_mover_t mover = {.cf = db.cf,
+                        .table = table,
+                        .size = level_set_level_bytes(db.cf->levels, 1),
+                        .level_a = 2,
+                        .level_b = 1};
+    atomic_init(&mover.stop, 0);
+    pthread_t thread;
+    ASSERT_EQ(pthread_create(&thread, NULL, cs_move_between_levels, &mover), 0);
+
+    int stale = 0, busy = 0;
+    for (int i = 0; i < CS_MOVE_READS; i++)
+    {
+        tidesdb_source_version_t out;
+        const tidesdb_source_result_t r = cs_get(db.cf, "k", UINT64_MAX, &out);
+        if (r == TDB_SOURCE_BUSY)
+        {
+            busy++;
+            continue;
+        }
+        /* an absence would be the miss guard failing; it counts against the read the same way */
+        if (r != TDB_SOURCE_FOUND || out.seq != 10) stale++;
+        if (r == TDB_SOURCE_FOUND) free(out.value);
+    }
+    atomic_store_explicit(&mover.stop, 1, memory_order_release);
+    pthread_join(thread, NULL);
+    printf("  %d reads while the table moved: %d busy, %d stale\n", CS_MOVE_READS, busy, stale);
+    ASSERT_EQ(stale, 0);
+
+    if (sstable_unref(table)) sstable_close(table);
+    cs_db_close(&db);
+}
+
+/* an interval that once covered the key sits at an old sequence in a table of its own, and the
+ * key's newer version moves between two levels while a reader asks. a walk whose level snapshot
+ * predates the move scans the level the table has left and skips the one it landed in, finds
+ * nothing, and has an interval to answer with -- so it reported the key deleted, at a sequence a
+ * version it never saw had long outlived. every answer must be the newer version or a retryable
+ * busy, never the deletion */
+void test_cf_source_a_move_into_an_empty_level_never_lets_an_old_interval_answer(void)
+{
+    cs_db_t db;
+    cs_db_open(&db);
+
+    /* the interval [j, l) at seq 3 covers k; it rides in a table whose only key sits outside it, so
+     * the table is never a candidate for k and the interval is all it contributes */
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db.l0, 0, (const uint8_t *)"j", 1,
+                                               (const uint8_t *)"l", 1, 3),
+              TDB_SUCCESS);
+    const cs_entry_t beside[] = {{"z", "vz", 0, 2, 0}};
+    (void)cs_flush(&db, beside, 1, 1);
+
+    const cs_entry_t fresh[] = {{"k", "new", 0, 10, 0}};
+    const uint64_t id1 = cs_flush(&db, fresh, 1, 2);
+    const uint64_t l1[1] = {id1};
+    cs_compact_to(&db, l1, 1, 2); /* k@new at L2, the interval's table alone at L1, L3 empty */
+    ASSERT_EQ(level_set_count(db.cf->levels, 1), 1);
+    ASSERT_EQ(level_set_count(db.cf->levels, 2), 1);
+    ASSERT_EQ(level_set_count(db.cf->levels, 3), 0);
+    cs_assert_live(db.cf, "k", UINT64_MAX, "new", 10);
+
+    sstable_t *table = NULL;
+    ASSERT_EQ(level_set_overlapping(db.cf->levels, 2, (const uint8_t *)"k", 1, (const uint8_t *)"k",
+                                    1, &table, 1),
+              1);
+    ASSERT_TRUE(table != NULL);
+    cs_mover_t mover = {.cf = db.cf,
+                        .table = table,
+                        .size = level_set_level_bytes(db.cf->levels, 2),
+                        .level_a = 3,
+                        .level_b = 2};
+    atomic_init(&mover.stop, 0);
+    pthread_t thread;
+    ASSERT_EQ(pthread_create(&thread, NULL, cs_move_between_levels, &mover), 0);
+
+    int deleted = 0, absent = 0, busy = 0;
+    for (int i = 0; i < CS_MOVE_READS; i++)
+    {
+        tidesdb_source_version_t out;
+        const tidesdb_source_result_t r = cs_get(db.cf, "k", UINT64_MAX, &out);
+        if (r == TDB_SOURCE_BUSY)
+        {
+            busy++;
+            continue;
+        }
+        if (r == TDB_SOURCE_NOT_FOUND)
+            absent++;
+        else if (out.deleted)
+            deleted++;
+        else
+            ASSERT_EQ((int)out.seq, 10);
+        if (r == TDB_SOURCE_FOUND) free(out.value);
+    }
+    atomic_store_explicit(&mover.stop, 1, memory_order_release);
+    pthread_join(thread, NULL);
+    printf("  %d reads while the table moved: %d busy, %d deleted, %d absent\n", CS_MOVE_READS,
+           busy, deleted, absent);
+    ASSERT_EQ(deleted, 0);
+    ASSERT_EQ(absent, 0);
+
+    if (sstable_unref(table)) sstable_close(table);
+    cs_db_close(&db);
+}
+
 /* the level walk stops at the first level holding the key rather than comparing what each holds, so
  * an older version in L1 shadows a newer one in L2. compaction only ever moves keys downward, which
  * is what makes the walk right; this pins what it costs if anything ever moves one the other way */
@@ -389,6 +562,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_cf_source_spilled_value, tests_passed);
     RUN_TEST(test_cf_source_top_down_levels, tests_passed);
     RUN_TEST(test_cf_source_l1_shadows_a_newer_l2, tests_passed);
+    RUN_TEST(test_cf_source_a_move_into_an_empty_level_never_hides_the_newer_version, tests_passed);
+    RUN_TEST(test_cf_source_a_move_into_an_empty_level_never_lets_an_old_interval_answer,
+             tests_passed);
     RUN_TEST(test_cf_source_compaction_carries_input_intervals, tests_passed);
     RUN_TEST(test_cf_source_compaction_drops_an_interval_it_has_finished, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

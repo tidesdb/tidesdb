@@ -9,9 +9,9 @@ sidebar:
 
 # Design Lineage
 
-Two published designs shape TidesDB's storage layer, and a third shapes its write path. This
-chapter states what each contributes, what TidesDB implements as published, and — more usefully —
-where it departs and why.
+Two published designs shape TidesDB's storage layer, a third shapes its write path, and a body of
+work on isolation shapes its transactions. This chapter states what each contributes, what TidesDB
+implements as published, and — more usefully — where it departs and why.
 
 Being explicit about the departures matters. A reader who knows the papers will otherwise assume
 behaviour TidesDB does not have.
@@ -31,6 +31,13 @@ SSD-Conscious Storage.* FAST '16. Shapes key/value separation.
 **Aether** — Ryan Johnson, Ippokratis Pandis, Radu Stoica, Manos Athanassoulis, Anastasia
 Ailamaki. *Aether: A Scalable Approach to Logging.* PVLDB 3(1), 2010. Shapes the write-ahead
 log's append path.
+
+**The isolation literature** — Berenson et al. (SIGMOD 1995) and Adya (MIT 1999, ICDE 2000) for
+what each level must forbid; Fekete et al. (TODS 2005), Cahill et al. (SIGMOD 2008) and Ports and
+Grittner (VLDB 2012) for making snapshot isolation serializable; Gómez Ferro and Yabandeh
+(EuroSys 2012) for write-snapshot isolation; Kung and Robinson (TODS 1981), Silo (SOSP 2013) and
+Hekaton (VLDB 2011) for the optimistic protocol itself; Omid, Centiman and Deuteronomy for what a
+bounded conflict structure costs. Together they shape the transaction layer.
 
 ## Spooky, and what TidesDB takes from it
 
@@ -233,6 +240,74 @@ ring's allocation *is* the consolidation, and the flush thread *is* the pipelini
 The divergence is that TidesDB does not implement a consolidation array as a separate structure.
 The ring's single reserving atomic already serves that purpose, and measurement found no remaining
 allocation contention to remove.
+
+## Isolation, and what TidesDB takes from the literature
+
+The transaction layer is specified against Adya's phenomena rather than the ANSI wording, because
+Berenson et al. showed the ANSI wording under-specifies them. Read uncommitted forbids G0, read
+committed G1, repeatable read G2-item as well, snapshot isolation G1 and the snapshot-write rule, and
+serializable G2 over predicates. Those are the contracts the [MVCC
+chapter](/internals/transactions-and-mvcc) holds each level to, and the tests hold the engine to.
+
+### What TidesDB implements as published
+
+**First-committer-wins**, as Berenson et al. define it: a transaction at snapshot or above is
+refused if a concurrent transaction wrote a key it also wrote. Fekete et al. observe that the
+committer need only check concurrent transactions that have *already* committed, since the ones
+still active will check for its writes when their turn comes, and that refusing the second claimant
+while the first is in flight admits exactly the same histories. TidesDB's check is that split: the
+store answers for the committed, the claim set answers for the ones in flight.
+
+**Write-snapshot isolation**, from Gómez Ferro and Yabandeh: a transaction does not commit if its
+read set was modified by a concurrent transaction, and that rule alone is serializable. Repeatable
+read and serializable validate every key they read this way, against the store and against the
+lower-sequence writers in flight. It is why repeatable read here refuses write skew between
+transactions that read by key, which the ANSI level does not promise.
+
+**The optimistic order**, from Kung and Robinson through Silo: claim the write set in one global
+order, fence, draw the sequence, then validate. Silo locks its write set and chooses its transaction
+id after validation for the same reason TidesDB claims before it draws — a validator with a lower
+sequence must be certain of seeing the claims of anyone sequenced above it. Hekaton's backward
+validation "as of the end of the transaction" is why a read is validated at the committer's own
+sequence rather than at its snapshot.
+
+**A prepared transaction keeps its read footprint held**, as PostgreSQL keeps SIREAD locks for one
+(Ports and Grittner): the prepared side has voted and cannot be the victim, so the writer of a key
+it read is refused for as long as it is in doubt. TidesDB writes those keys ahead of the PREPARE
+record so the hold survives a restart, which the paper has no need to do.
+
+**Predicate validation by re-checking what a scan covered**, in the spirit of Silo's node set and
+Hekaton's re-run scans: an iterator records the interval it covered, and the commit asks the store
+and the commits in flight whether a key appeared inside it. That is what lifts serializable from
+PL-3 over point reads to PL-3.
+
+### Where TidesDB diverges
+
+**No dangerous-structure rule.** Cahill's SSI aborts a pivot transaction with an incoming and an
+outgoing read-write edge, and the authors note it makes false positive detections. TidesDB keeps
+the SIREAD idea for prepares and otherwise validates reads directly, Yabandeh's way, which refuses
+exactly the histories where a read went stale and no others. The price is that repeatable read
+becomes stricter than its ANSI namesake; the gain is that no serializable commit is refused for a
+shape that would have serialized.
+
+**No bounded conflict structure.** Omid's conflict map, Centiman's truncated write sets and Kung
+and Robinson's finite history all trade false aborts for bounded state, and each paper says so.
+TidesDB's claims are exact and owned by the committer, compared by bytes as Deuteronomy compares a
+full key on a hash match, so two commits of different keys never conflict and a commit never
+conflicts with itself however wide. The one bound left is the commit-status ring's width, which
+stalls a draw rather than refusing a commit.
+
+**Predicates are intervals, not locks on pages or relations.** PostgreSQL escalates predicate locks
+by granularity; an LSM has no pages a scan touches in a stable way, so the footprint is the key
+interval itself, checked against the store's footer sequences and the sorted claims in flight. A
+scan to the end of a family covers everything above its start, which is the coarse case the
+granularity ladder would also reach.
+
+**Durable read claims across a restart.** None of the surveyed systems carries a prepared
+transaction's read set through a crash; the ones that keep SIREAD locks keep them in memory.
+TidesDB records the keys as their own log record ahead of the PREPARE, since a two-phase
+participant that recovers with its writes held but its reads unprotected would let a concurrent
+writer invalidate a vote it already cast.
 
 ## What is novel here
 

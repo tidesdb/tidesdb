@@ -206,8 +206,10 @@ int engine_snapshot_create(tidesdb_t *db, tidesdb_snapshot_t **out);
 /**
  * engine_take_gc_floor
  * read the reclamation floor for a collection and record it as the oldest point any collection has
- * run against. raised here, where the floor is taken, rather than where the work completes -- a job
- * already collecting has to be visible to a reader deciding whether its sequence is still safe
+ * run against: the smallest sequence any live transaction still reads at, a frozen snapshot or the
+ * ceiling of a read committed read in flight, and never above the watermark. raised here, where the
+ * floor is taken, rather than where the work completes -- a job already collecting has to be
+ * visible to a reader deciding whether its sequence is still safe
  * @param db the engine
  * @return the floor to retain against
  */

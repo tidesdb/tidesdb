@@ -84,6 +84,7 @@ static flush_ctx_t engine_flush_ctx(tidesdb_t *db, cf_t *const *cfs, int n_cfs)
 {
     return (flush_ctx_t){.l0 = db->l0,
                          .cfs = cfs,
+                         .visible_seq = tidesdb_mvcc_watermark_ref(db->clock),
                          .wal_generation_pinned = engine_wal_generation_pinned,
                          .on_wal_retained = engine_note_retained_wal,
                          .on_wal_retained_ctx = db,

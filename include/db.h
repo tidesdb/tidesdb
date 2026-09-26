@@ -51,12 +51,13 @@ typedef enum
     /* the newest committed version, with the ceiling re-read on every operation */
     TDB_ISOLATION_READ_COMMITTED = 1,
     /* the ceiling is frozen when the transaction begins, and a commit validates that every key it
-       read still holds the version it read */
+       read still holds the version it read and that no key appeared inside a range it scanned,
+       against commits still in flight as well as committed ones */
     TDB_ISOLATION_REPEATABLE_READ = 2,
-    /* frozen ceiling, and a commit reserves each key it writes on a first-committer-wins basis
-       rather than validating what it read */
+    /* frozen ceiling, and a commit claims each key it writes on a first-committer-wins basis rather
+       than validating what it read */
     TDB_ISOLATION_SNAPSHOT = 3,
-    /* both of the checks above, plus the one that catches write skew */
+    /* both of the checks above */
     TDB_ISOLATION_SERIALIZABLE = 4
 } tidesdb_isolation_level_t;
 
@@ -526,11 +527,20 @@ typedef struct
  * as vlog_file_size, since it is shared rather than owned by any one family
  * @param num_open_sstables currently open sstable file handles
  * @param global_seq current db-global sequence number (the mvcc clock)
- * @param min_snapshot_seq the oldest live-transaction snapshot, the compaction gc floor
- * @param active_txn_count live transactions joined to the registry, which is repeatable-read and
- * stronger only -- read-uncommitted and read-committed transactions need no snapshot reservation
- * and so are not counted, and read-committed is the default
+ * @param min_snapshot_seq the oldest frozen snapshot any live transaction holds, at repeatable read
+ * and stronger; the part of the reclamation floor that a long transaction holds down. a
+ * collection's floor also honours the ceiling of every read committed read in flight, but only for
+ * the read
+ * @param active_txn_count live transactions joined to the registry, which is read committed and
+ * stronger -- read uncommitted transactions resolve to the newest version, which no collection
+ * drops, so they hold nothing and are not counted
  * @param txn_memory_bytes bytes held by in-flight transactions, over the same registered set
+ * @param txn_commits transactions committed since the database opened, single-phase and phase two
+ * together
+ * @param txn_conflicts commits and prepares refused with TDB_ERR_CONFLICT since the database
+ * opened. only the levels above read committed can be refused, so read against txn_commits this is
+ * the retry rate they are paying; a rate that climbs under a workload that did not change is
+ * contention worth looking at
  * @param memtable_bytes memory the active memtable occupies, the figure memtable_write_buffer_size
  * is compared against, so it counts skip list nodes and version structs as well as key and value
  * bytes
@@ -594,6 +604,8 @@ typedef struct tidesdb_db_stats_t
     uint64_t min_snapshot_seq;
     int active_txn_count;
     int64_t txn_memory_bytes;
+    uint64_t txn_commits;
+    uint64_t txn_conflicts;
     size_t memtable_bytes;
     int is_flushing;
     uint32_t next_cf_index;
@@ -1272,7 +1284,12 @@ int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name);
  * a scan reaches the same sstables a point read does, so every call here can report TDB_ERR_LOCKED
  * for the same reason and with the same remedy -- the position did not move, nothing is wrong with
  * the iterator, and the step should be retried. it is not the end of the range; that is what
- * tidesdb_iter_valid reports. */
+ * tidesdb_iter_valid reports.
+ *
+ * at repeatable read and serializable an iterator records the interval it covered into its
+ * transaction's read footprint when it is freed, so the commit is refused if another transaction
+ * put a key inside it meanwhile. free an iterator before committing; the other levels record
+ * nothing */
 
 /**
  * tidesdb_iter_new

@@ -150,13 +150,15 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
      * family shares -- and with only the first level or two populated, most of that was spent
      * confirming emptiness.
      *
-     * the mask is a snapshot and each level below is scanned against the live layout, so a merge
-     * that moves a table into a level this mask calls empty is skipped. that is safe when a flush
-     * did it -- its keys are still in the memtable it has not retired yet, and L0 is consulted
-     * before any of this -- but a compaction's keys left L0 long ago, so nothing backs them up. the
-     * generation is read here and again on a miss, and a shape that moved under the walk asks the
-     * caller to retry rather than reporting an absence that was never true */
+     * the mask is a snapshot and each level below is scanned against the live layout, and a merge
+     * changes both. a walk that mixes the two -- the mask from before it, the layout from after, or
+     * the reverse -- scans levels the tables have left and skips the one they moved to, and what it
+     * finds is an absence or an older version from further down, neither of them true. the
+     * generation brackets a publish, odd while one is in flight, and it is read here and again
+     * before any answer is trusted. a walk that started inside a publish, or saw one land, asks the
+     * caller to retry */
     const uint64_t layout_at_entry = level_set_generation(cf->levels);
+    if (layout_at_entry & LEVEL_SET_PUBLISHING) return TDB_SOURCE_BUSY;
     const uint32_t occupied = level_set_occupancy(cf->levels);
 
     /* an interval covers a range the table carrying it need not hold a single key of, so it cannot
@@ -177,6 +179,16 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
             cf_source_scan_level(cf, level, key, key_size, snapshot, &best, &vlog_id);
         if (r == TDB_SOURCE_BUSY) return TDB_SOURCE_BUSY;
         if (r == TDB_SOURCE_NOT_FOUND) continue;
+
+        /* a hit is trusted only if the shape stood still too. a merge that took the newest version
+         * out of a level this walk had already passed and landed it in one the mask called empty
+         * leaves this older version as the first one found, and it would be returned as the newest
+         */
+        if (level_set_generation(cf->levels) != layout_at_entry)
+        {
+            free(best.value);
+            return TDB_SOURCE_BUSY;
+        }
 
         if (covered && tomb_seq > best.seq)
         {
@@ -199,6 +211,12 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
         return TDB_SOURCE_FOUND;
     }
 
+    /* nothing held it, which is only trustworthy if the shape stood still while it was looked for.
+     * asked before the interval answers below, since a walk that scanned the level a table had just
+     * left and skipped the one it landed in found nothing for the same reason, and an interval that
+     * a version it never saw had outlived would otherwise report that version deleted */
+    if (level_set_generation(cf->levels) != layout_at_entry) return TDB_SOURCE_BUSY;
+
     /* no level held the key, but a tombstone covering it still answers -- and answering is what
      * stops the read falling through to a source that would report it absent for a different reason
      */
@@ -207,10 +225,6 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
         cf_source_deleted_at(tomb_seq, out);
         return TDB_SOURCE_FOUND;
     }
-
-    /* nothing held it, which is only trustworthy if the shape stood still while it was looked for
-     */
-    if (level_set_generation(cf->levels) != layout_at_entry) return TDB_SOURCE_BUSY;
     return TDB_SOURCE_NOT_FOUND;
 }
 
@@ -220,7 +234,7 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
  * question here is whether a newer version exists anywhere, and a skipped sstable answers no */
 static tidesdb_source_result_t cf_source_newer_in_level(cf_t *cf, int level, const uint8_t *key,
                                                         size_t key_size, uint64_t seq_floor,
-                                                        int *newer)
+                                                        uint64_t seq_ceiling, int *newer)
 {
     /* one layout load for both the candidates and the size they needed, as in cf_source_scan_level
      * -- this probe runs once per written key on every commit above read committed, so its share of
@@ -260,7 +274,7 @@ static tidesdb_source_result_t cf_source_newer_in_level(cf_t *cf, int level, con
         uint64_t voff = 0, seq = 0;
         int64_t ttl = -1;
         uint8_t deleted = 0;
-        const int rc = sstable_get_at_seq(cands[i], key, key_size, UINT64_MAX, &value, &value_size,
+        const int rc = sstable_get_at_seq(cands[i], key, key_size, seq_ceiling, &value, &value_size,
                                           &voff, &seq, &ttl, &deleted);
         if (rc == TDB_SUCCESS)
         {
@@ -322,7 +336,8 @@ static int cf_source_table_in_range(const sstable_t *sst, const uint8_t *lo, con
  */
 static int cf_source_table_range_has_newer(sstable_t *sst, const uint8_t *lo, const size_t lo_size,
                                            const uint8_t *hi, const size_t hi_size,
-                                           const uint64_t seq_floor, int *newer)
+                                           const uint64_t seq_floor, const uint64_t seq_ceiling,
+                                           int *newer)
 {
     sstable_iter_t *it = NULL;
     if (sstable_iter_new(sst, CF_SOURCE_RANGE_NO_CACHE, &it) != TDB_SUCCESS) return -1;
@@ -345,7 +360,7 @@ static int cf_source_table_range_has_newer(sstable_t *sst, const uint8_t *lo, co
                              &deleted) != TDB_SUCCESS)
             break;
         if (hi_size > 0 && tdb_key_cmp(key, key_size, hi, hi_size) >= 0) break;
-        if (seq > seq_floor)
+        if (seq > seq_floor && seq <= seq_ceiling)
         {
             *newer = 1;
             break;
@@ -363,7 +378,8 @@ static int cf_source_table_range_has_newer(sstable_t *sst, const uint8_t *lo, co
 static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_index,
                                                          const uint8_t *lo, size_t lo_size,
                                                          const uint8_t *hi, size_t hi_size,
-                                                         uint64_t seq_floor, int *newer)
+                                                         uint64_t seq_floor, uint64_t seq_ceiling,
+                                                         int *newer)
 {
     (void)cf_index; /* per-cf source; the composer routes only this cf's keys here */
     cf_t *cf = (cf_t *)ctx;
@@ -392,7 +408,7 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
 
         held = 1;
         if (cf_source_table_range_has_newer(tables[i], lo, lo_size, hi, hi_size, seq_floor,
-                                            newer) != 0)
+                                            seq_ceiling, newer) != 0)
             failed = 1;
     }
     for (int i = 0; i < n; i++)
@@ -404,7 +420,8 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
 }
 
 static tidesdb_source_result_t cf_source_has_newer(void *ctx, uint32_t cf_index, const uint8_t *key,
-                                                   size_t key_size, uint64_t seq_floor, int *newer)
+                                                   size_t key_size, uint64_t seq_floor,
+                                                   uint64_t seq_ceiling, int *newer)
 {
     (void)cf_index;
     cf_t *cf = (cf_t *)ctx;
@@ -416,7 +433,7 @@ static tidesdb_source_result_t cf_source_has_newer(void *ctx, uint32_t cf_index,
      * other order, and this is what catches this one. a family that has never deleted a range
      * answers from one load */
     uint64_t tomb = 0;
-    if (cf_range_tombstone_covering(cf, key, key_size, UINT64_MAX, &tomb) && tomb > seq_floor)
+    if (cf_range_tombstone_covering(cf, key, key_size, seq_ceiling, &tomb) && tomb > seq_floor)
     {
         *newer = 1;
         return TDB_SOURCE_FOUND;
@@ -427,6 +444,7 @@ static tidesdb_source_result_t cf_source_has_newer(void *ctx, uint32_t cf_index,
      * the same guard -- a conflict probe that missed a version because the shape moved under it
      * would clear a commit that should have been refused */
     const uint64_t layout_at_entry = level_set_generation(cf->levels);
+    if (layout_at_entry & LEVEL_SET_PUBLISHING) return TDB_SOURCE_BUSY;
     const uint32_t occupied = level_set_occupancy(cf->levels);
 
     for (int level = LEVEL_SET_L1; level <= LEVEL_SET_MAX_LEVELS; level++)
@@ -434,7 +452,7 @@ static tidesdb_source_result_t cf_source_has_newer(void *ctx, uint32_t cf_index,
         if (!(occupied & (1u << (level - 1)))) continue;
 
         const tidesdb_source_result_t r =
-            cf_source_newer_in_level(cf, level, key, key_size, seq_floor, newer);
+            cf_source_newer_in_level(cf, level, key, key_size, seq_floor, seq_ceiling, newer);
         if (r == TDB_SOURCE_BUSY || r == TDB_SOURCE_FOUND) return r;
     }
     if (level_set_generation(cf->levels) != layout_at_entry) return TDB_SOURCE_BUSY;

@@ -122,19 +122,6 @@ int tidesdb_writeset_lookup(const tidesdb_writeset_t *ws, uint32_t cf_index, con
 void tidesdb_writeset_truncate(tidesdb_writeset_t *ws, int count);
 
 /**
- * tidesdb_writeset_contains
- * whether a key is present as a write op, taken under the read lock so a serializable peer can scan
- * a running txn's write set safely for rw-antidependency detection
- * @param ws the write set
- * @param cf_index the target column family's prefix index
- * @param key the key bytes
- * @param key_size length of key
- * @return 1 if the key is written by this set, 0 otherwise
- */
-int tidesdb_writeset_contains(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
-                              size_t key_size);
-
-/**
  * tidesdb_writeset_mem_bytes
  * the approximate heap the write set holds (op structs plus coalesced key/value buffers), for the
  * per-txn memory accounting

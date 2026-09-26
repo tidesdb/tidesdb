@@ -41,34 +41,30 @@ int tdb_txn_prepare(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     }
     memcpy(xid_copy, xid, xid_size);
 
-    /* the gate is held only for the prepare, not for the in-doubt window that follows -- that
-     * window has no bound, and holding it would stop every other committer for as long as the
-     * transaction stays undecided. what covers the window instead is the interval reservation the
-     * prepare takes and keeps until phase two resolves it */
-    const int gated = txn->isolation >= TDB_ISOLATION_SNAPSHOT;
-    if (gated) tidesdb_mvcc_commit_gate_lock(txn->clock, txn_writes_an_interval(txn->writeset));
-
     tidesdb_wal_entry_t *entries = NULL;
     int count = 0;
     uint64_t seq = 0;
     const int rc = txn_write_phase(txn, backend, sources, num_sources, TDB_WAL_KIND_PREPARE, xid,
                                    xid_size, &entries, &count, &seq);
-    if (gated) tidesdb_mvcc_commit_gate_unlock(txn->clock);
     if (rc != TDB_SUCCESS)
     {
         free(xid_copy);
         return rc; /* already aborted and left the registry */
     }
 
-    /* stage for phase two -- durable but not applied and not marked committed, so the seq stays
-     * in-progress and invisible. the txn keeps its registry membership and reservation until
-     * resolved, so its snapshot still pins the gc floor */
+    /* stage for phase two -- durable but not applied. the txn keeps its registry membership and its
+     * claims until resolved, so its snapshot still pins the gc floor and its keys stay held. the
+     * sequence it drew never carries a version, since phase two commits at a fresh one, so for the
+     * watermark it is spent here and now, and the claims are marked as a prepared batch's, which
+     * every later commit reads as coming above its own */
     txn->prepared_entries = entries;
     txn->prepared_count = count;
     txn->commit_seq = seq;
     txn->xid = xid_copy;
     txn->xid_size = xid_size;
     txn->state = TDB_TXN_PREPARED;
+    tidesdb_mvcc_commit_prepared(&txn->commit);
+    tidesdb_mvcc_mark_aborted(txn->clock, seq);
     return TDB_SUCCESS;
 }
 
@@ -110,9 +106,7 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
      * order rather than by sequence, so the older batch would shadow the newer writes. deciding the
      * sequence now keeps a batch's position and its age in agreement, the invariant the read path,
      * tombstone collection, and the generation layout all rest on */
-    const uint64_t prepared_seq = txn->commit_seq; /* what the prepare drew, and reserved with */
-    const uint64_t seq = tidesdb_mvcc_next_seq(txn->clock);
-    tidesdb_mvcc_mark(txn->clock, seq, 0);
+    const uint64_t seq = tidesdb_mvcc_draw(txn->clock, NULL);
     for (int i = 0; i < txn->prepared_count; i++) txn->prepared_entries[i].seq = seq;
 
     /* the COMMIT record carries the write set, so it is both the decision and the only durable copy
@@ -120,43 +114,25 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
      * and in this generation, which makes a second replay land exactly where the first one did */
     const int wr = txn_append_record(backend, TDB_WAL_KIND_COMMIT, txn->xid, txn->xid_size,
                                      txn->prepared_entries, txn->prepared_count);
-    if (wr != TDB_SUCCESS) return wr; /* stays prepared -- the coordinator retries */
+    if (wr != TDB_SUCCESS)
+    {
+        /* stays prepared -- the coordinator retries, and the retry draws another sequence, so the
+         * one drawn here is spent for the watermark */
+        tidesdb_mvcc_mark_aborted(txn->clock, seq);
+        return wr;
+    }
 
     /* durable now, so apply and mark visible. a failed in-memory apply is recovered from the COMMIT
      * record on the next open */
     (void)backend->apply(backend->ctx, txn->prepared_entries, txn->prepared_count);
 
-    /* hand each reservation from the prepare's sequence to the one that just committed. the prepare
-     * claimed these slots with a sequence phase two then replaced, and that sequence is never
-     * marked committed -- so a slot left naming it reads to every later writer of the key as a
-     * committer still in flight, and they abort against a transaction that finished long ago. it
-     * happens here, once the batch is durable and applied, because until then the commit is not
-     * certain: an append that failed leaves the transaction prepared for a retry that draws a
-     * different sequence, and the slots have to still name the prepare's for that retry to find
-     * them. the hold is never dropped, only renamed, so no concurrent writer of the key slips
-     * between the two states */
-    if (txn->isolation >= TDB_ISOLATION_SNAPSHOT)
-        for (int i = 0; i < txn->prepared_count; i++)
-            tidesdb_mvcc_reassign(
-                txn->clock,
-                txn_key_hash(txn->prepared_entries[i].cf_index, txn->prepared_entries[i].key,
-                             txn->prepared_entries[i].key_size),
-                prepared_seq, seq);
-
-    /* the sequence the prepare held is spent -- every slot naming it has been handed to the one
-     * that just committed, which the ring governs like any other */
-    tidesdb_mvcc_prepared_release(txn->clock, prepared_seq);
-
     txn->commit_seq = seq;
     tidesdb_mvcc_mark(txn->clock, seq, 1);
+    tidesdb_mvcc_wait_visible(txn->clock, seq);
 
-    /* the intervals go once the batch is visible, and not before. a key reservation is renamed
-     * rather than dropped because the slot is what a later writer of that key reads; an interval
-     * has no slot of its own to read, so what replaces it here is the committed delete itself,
-     * which a later writer's conflict scan finds. releasing earlier would leave the window between
-     * the two with nothing covering it. it is keyed by the sequence the prepare took, which phase
-     * two replaced, so the release names that one rather than the sequence just committed */
-    tidesdb_mvcc_release_range(txn->clock, prepared_seq);
+    /* the claims and the intervals go once the batch is visible, and not before: from here the
+     * store holds the versions a later writer's validation finds */
+    txn_release_claims(txn);
 
     txn->state = TDB_TXN_COMMITTED;
     txn_leave_registry(txn);
@@ -168,22 +144,76 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
     return TDB_SUCCESS;
 }
 
+/**
+ * txn_adopt_claims
+ * hold a recovered in-doubt batch's keys, intervals and reads exactly as a live prepare holds them,
+ * so a writer of one of them is refused for as long as the coordinator leaves the batch in doubt.
+ * every batch here prepared before the crash, so the keys are registered rather than contested
+ * @param txn the adopted transaction, its prepared entries and sequence in place
+ * @param reads the keys the batch read, from the record written ahead of its PREPARE, or NULL
+ * @param read_count how many
+ * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_CONFLICT when an interval could not be held
+ */
+static int txn_adopt_claims(tdb_txn_t *txn, const tidesdb_wal_entry_t *reads, const int read_count)
+{
+    tidesdb_mvcc_claim_t *claims =
+        malloc((size_t)(txn->prepared_count + read_count) * sizeof(*claims));
+    if (!claims) return TDB_ERR_MEMORY;
+    int n = 0;
+    for (int i = 0; i < txn->prepared_count; i++)
+    {
+        const tidesdb_wal_entry_t *e = &txn->prepared_entries[i];
+        if (e->flags & TDB_WAL_ENTRY_RANGE_DELETE) continue;
+        tidesdb_mvcc_claim_init(&claims[n++], e->cf_index, e->key, (uint32_t)e->key_size,
+                                TDB_MVCC_CLAIM_WRITE,
+                                txn_key_hash(e->cf_index, e->key, e->key_size));
+    }
+    for (int i = 0; i < read_count; i++)
+    {
+        const tidesdb_wal_entry_t *r = &reads[i];
+        tidesdb_mvcc_claim_init(&claims[n++], r->cf_index, r->key, (uint32_t)r->key_size,
+                                TDB_MVCC_CLAIM_READ,
+                                txn_key_hash(r->cf_index, r->key, r->key_size));
+    }
+    tidesdb_mvcc_commit_init(&txn->commit, claims, n);
+    txn->claims = claims;
+    int held = tidesdb_mvcc_claim(txn->clock, &txn->commit, 0);
+    for (int i = 0; held && i < txn->prepared_count; i++)
+    {
+        const tidesdb_wal_entry_t *e = &txn->prepared_entries[i];
+        if (e->flags & TDB_WAL_ENTRY_RANGE_DELETE)
+            held = tidesdb_mvcc_claim_range(txn->clock, &txn->commit, e->cf_index, e->key,
+                                            e->key_size, e->value, e->value_size, 0);
+    }
+    if (!held)
+    {
+        txn_release_claims(txn);
+        tidesdb_mvcc_commit_init(&txn->commit, NULL, 0);
+        return TDB_ERR_CONFLICT;
+    }
+    tidesdb_mvcc_commit_prepared(&txn->commit);
+    return TDB_SUCCESS;
+}
+
 tdb_txn_t *tdb_txn_adopt_prepared(tidesdb_mvcc_t *clock, const uint8_t *xid, const size_t xid_size,
                                   const tidesdb_wal_entry_t *entries, const int count,
-                                  const uint64_t commit_seq)
+                                  const uint64_t commit_seq, const tidesdb_wal_entry_t *reads,
+                                  const int read_count)
 {
-    if (!clock || !xid || xid_size == 0 || (count > 0 && !entries)) return NULL;
+    if (!clock || !xid || xid_size == 0 || (count > 0 && !entries) || read_count < 0 ||
+        (read_count > 0 && !reads))
+        return NULL;
 
     tdb_txn_t *txn = calloc(1, sizeof(*txn));
     if (!txn) return NULL;
 
     txn->clock = clock;
     txn->commit_seq = commit_seq;
-    /* below snapshot isolation, so resolving it does not try to release reservations that died with
-     * the process that took them, and with no registry to leave */
+    /* with no registry to leave; the claims below are what it holds in this process */
     txn->isolation = TDB_ISOLATION_READ_COMMITTED;
     atomic_store_explicit(&txn->snapshot_seq, commit_seq, memory_order_release);
     txn->state = TDB_TXN_PREPARED;
+    tidesdb_mvcc_commit_init(&txn->commit, NULL, 0);
 
     txn->xid = malloc(xid_size);
     if (!txn->xid)
@@ -206,6 +236,11 @@ tdb_txn_t *tdb_txn_adopt_prepared(tidesdb_mvcc_t *clock, const uint8_t *xid, con
         }
         memcpy(txn->prepared_entries, entries, (size_t)count * sizeof(*entries));
         txn->prepared_count = count;
+        if (txn_adopt_claims(txn, reads, read_count) != TDB_SUCCESS)
+        {
+            tdb_txn_free(txn);
+            return NULL;
+        }
     }
     return txn;
 }
@@ -229,10 +264,8 @@ int tdb_txn_rollback_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
     free(buf);
     if (wr != 0) return TDB_ERR_IO; /* stays prepared -- retry */
 
-    /* nothing was applied, so nothing to undo; release the reservation and finish */
-    if (txn->isolation >= TDB_ISOLATION_SNAPSHOT)
-        txn_release_reservations(txn, txn->prepared_entries, txn->prepared_count, txn->commit_seq);
-    tidesdb_mvcc_prepared_release(txn->clock, txn->commit_seq);
+    /* nothing was applied, so nothing to undo; drop the claims and finish */
+    txn_release_claims(txn);
     txn->state = TDB_TXN_ABORTED;
     txn_leave_registry(txn);
 

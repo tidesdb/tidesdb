@@ -30,77 +30,14 @@ This is also where a transaction that has outlived a timeout finds out. Nothing 
 background; the check happens on the way into an operation, so a stale transaction is aborted here
 and this `put` returns `TDB_ERR_TXN_EXPIRED` rather than buffering anything.
 
-## Stage 2 — Commit begins: conflict detection
+## Stage 2 — Commit begins: admission
 
 A read-only transaction stops here: with nothing in the write set there is nothing durable
 to do, so it is marked committed and leaves.
 
-For everything else, the isolation level decides what is validated, and the two checks are not
-stacked one on top of the other — each level runs the one that suits how it prevents anomalies.
-
-- Below `TDB_ISOLATION_REPEATABLE_READ` there is no check at all; commit proceeds.
-- `TDB_ISOLATION_REPEATABLE_READ` and `TDB_ISOLATION_SERIALIZABLE` validate the **read footprint**:
-  every key the transaction read is probed for a newer committed version, which is what stops a
-  non-repeatable read or a phantom.
-- `TDB_ISOLATION_SNAPSHOT` and `TDB_ISOLATION_SERIALIZABLE` scan their **write keys** for a version
-  newer than the snapshot — a writer that already applied and so is invisible to the reservation
-  taken in stage 4.
-- `TDB_ISOLATION_SERIALIZABLE` alone then runs the dangerous-structure check that catches write skew.
-
-A [range delete](/reference/transaction#tidesdb_txn_delete_range) is scanned over its interval
-rather than as a key: *does any key in these bounds sit above my snapshot*. Probing its lower bound
-as though it were a key would clear a commit about to delete data another transaction had just
-written.
-
-:::note[A batch carrying an interval commits alone]
-At snapshot and above, a commit that deletes a range takes the database's commit gate exclusively;
-every other commit at those levels holds it shared and never waits on another. The gate is held for
-the **whole commit**, not just the reservation, because a batch that has reserved but not yet marked
-its sequence visible is precisely the write the scan above would otherwise miss.
-
-A two-phase transaction takes it only for its prepare — the in-doubt window that follows has no
-bound, and the interval reservation in stage 4 covers that window instead.
-:::
-
-Snapshot deliberately does not validate reads: first-committer-wins reservation is how it prevents
-lost updates, and validating the read set on top of it would abort transactions the level is
-defined to allow.
-
-A conflict aborts here, before anything durable has been written.
-
-## Stage 3 — Sequencing
-
-The transaction draws a commit sequence from the database clock and immediately marks it
-**in progress**.
-
-The mark matters. A sequence that has been drawn but not completed must be invisible: a
-reader whose snapshot is above it must not see a half-applied batch. Marking it in progress
-first, and committed only at the very end, is what makes the batch atomic to readers without
-a lock.
-
-## Stage 4 — Reservation
-
-Under snapshot and serializable isolation, every key in the batch is reserved on a
-first-committer-wins basis.
-
-The subtlety is what each key is validated *against*. Not the transaction's snapshot, but
-**the version this transaction actually read for that key** — recorded when
-[`tidesdb_txn_get`](/reference/transaction#tidesdb_txn_get) was called. A blind write with no
-prior read falls back to the snapshot. This is why a read-modify-write is checked correctly
-while a blind overwrite is not penalised for reading nothing, and it is why
-[`tidesdb_txn_get_notrack`](/reference/transaction#tidesdb_txn_get_notrack) exists: a probe
-that does not feed the write should not narrow the window the write is validated over.
-
-An interval has no key to hash, so a range delete claims the interval itself in a second, small
-table, and every point write checks that table before taking its own slot. The table is almost
-always empty, so the check is a single atomic load of its count. The claim is released when the transaction
-resolves, which is what carries a two-phase range delete through its in-doubt window.
-
-A lost reservation is `TDB_ERR_CONFLICT`, and still nothing durable has happened.
-
-## Stage 5 — Admission
-
-Before the durable write, the batch is paced once per distinct column family it touches.
+Before anything is drawn or held, the batch is paced once per distinct column family it touches.
+Admission runs first so that a writer waiting here holds no claim another committer could meet
+and no sequence the watermark would have to wait on.
 
 This is where a writer waits when the engine is not keeping up. **Three signals feed it, and
 the strongest wins** — none is allowed to mask another:
@@ -125,13 +62,101 @@ There is a ceiling on the wait — a writer held too long is admitted regardless
 flush that never drains would otherwise turn a slow database into a stuck one. Each of those
 outcomes is counted, and `write_stall_ceiling_hits` climbing is the serious one.
 
+## Stage 3 — Claims
+
+At `TDB_ISOLATION_REPEATABLE_READ` and above, every key the batch writes is entered in the
+database's **in-flight claim set** before the sequence is drawn. A claim names the key itself, byte
+for byte, under the commit that holds it. It is not a hashed slot, so two commits of different keys
+never collide on one, however wide either is. A commit takes its claims in one fixed order — family,
+then key — so two commits sharing keys meet at the same first key and exactly one of them yields
+rather than each holding half.
+
+What a claim meets decides it:
+
+- At `TDB_ISOLATION_SNAPSHOT` and `TDB_ISOLATION_SERIALIZABLE`, a write claim that finds another
+  commit's write claim on the same key is **refused**. That commit is in flight, one of the two must
+  lose, and the later claimant does: first-committer-wins.
+- At `TDB_ISOLATION_REPEATABLE_READ` a write claim is recorded and refuses nothing. Two blind
+  writers of one key both commit at that level; what the claim is for is being *seen* by another
+  commit's validation in stage 5.
+- A **read claim** — which a prepare at repeatable read or above takes on every key it read —
+  refuses every later writer of that key at repeatable read or above for as long as the prepare is
+  undecided.
+- An **interval** a [range delete](/reference/transaction#tidesdb_txn_delete_range) writes has no
+  key to claim, so it is held in a second, small table, entered first and then, under
+  first-committer-wins, checked against every claim in flight. A point write inside it is refused
+  under first-committer-wins and recorded beside it at repeatable read; the interval is refused by a
+  claim of any kind already inside it, or by another interval meeting it, and at repeatable read is
+  recorded without refusing, as a write claim is. Held first and checked second, a range delete and
+  a point write inside it find each other whichever was first.
+
+A refused claim is `TDB_ERR_CONFLICT`. The claims already taken are dropped, and nothing durable
+has happened.
+
+**Why before the draw.** Any commit whose sequence is lower than this one's finished claiming before
+this one drew, so the validation of stage 5, which runs after the draw, is guaranteed to see its
+claims. In the other order a commit could draw, validate against a set that did not yet hold its
+rival, and the rival do the same — both through.
+
+## Stage 4 — Sequencing
+
+The transaction draws a commit sequence from the database clock and immediately marks it
+**in progress**; its claims now carry that sequence, which is what a later validator compares
+against.
+
+A sequence that has been drawn but not completed must be invisible: a reader must never see a
+half-applied batch. What guarantees it is the **watermark**, the highest sequence below which every
+drawn sequence has been decided — every reader's ceiling comes from it, so an in-progress sequence
+is above every ceiling until the commit decides it. That is also why every path that fails after
+this point marks the sequence **aborted** rather than leaving it: the watermark waits on each drawn
+sequence, and one left undecided would hold every later reader's ceiling down.
+
+## Stage 5 — Conflict detection
+
+With the sequence drawn, the isolation level decides what is validated, and the two checks are not
+stacked one on top of the other — each level runs the one that suits how it prevents anomalies.
+
+- Below `TDB_ISOLATION_REPEATABLE_READ` there is no check at all; commit proceeds.
+- `TDB_ISOLATION_REPEATABLE_READ` and `TDB_ISOLATION_SERIALIZABLE` validate the **read footprint**:
+  every key the transaction read is probed for a committed version newer than the one it read, and
+  checked against the claim set for another commit's write claim **sequenced below this one** — a
+  writer in flight whose version does not exist yet but will land before this commit does. Either
+  is a stale read. Every interval a scan of the transaction covered is probed the same way, in the
+  store and among the commits in flight, for a key inside it — a phantom.
+- `TDB_ISOLATION_SNAPSHOT` and `TDB_ISOLATION_SERIALIZABLE` scan their **write keys** for a version
+  newer than the one this transaction read for that key — a writer that already committed and left
+  the claim set, which stage 3 could not have met.
+
+The version a write is validated against is not the transaction's snapshot but **the version this
+transaction actually read for that key**, recorded when
+[`tidesdb_txn_get`](/reference/transaction#tidesdb_txn_get) was called. A blind write with no prior
+read falls back to the snapshot. This is why a read-modify-write is checked correctly while a blind
+overwrite is not penalised for reading nothing, and it is why
+[`tidesdb_txn_get_notrack`](/reference/transaction#tidesdb_txn_get_notrack) exists: a probe that
+does not feed the write should not narrow the window the write is validated over.
+
+A [range delete](/reference/transaction#tidesdb_txn_delete_range) is scanned over its interval
+rather than as a key: *does any key in these bounds sit above my snapshot*, in the store and among
+the commits in flight sequenced below this one. Probing its lower bound as though it were a key
+would clear a commit about to delete data another transaction had just written. The interval it
+holds from stage 3 is released once the batch is visible, which is what carries a two-phase range
+delete through its in-doubt window; the table is almost always empty, so a point write's check of
+it is a single atomic load of its count.
+
+Snapshot deliberately does not validate reads: first-committer-wins is how it prevents lost
+updates, and validating the read set on top of it would abort transactions the level is defined to
+allow. Serializable validates both, the keys it read and the intervals its scans covered, so a
+write skew that depends on a scan having seen no row is refused with the rest.
+
+A conflict aborts here, before anything durable has been written; the claims go with it.
+
 ## Stage 6 — Separating the large values
 
 Before the record is written, every value at or above the database's `value_separation_threshold`
 is appended to the [value log](/internals/value-log), and its entry keeps the returned id and the
 value's logical length in place of the bytes. A family that set `keep_values_inline` is left out.
 
-**The order is what makes it safe.** It runs after the reservation and the admission wait have both
+**The order is what makes it safe.** It runs after the validation and the admission wait have both
 let this commit through, so a conflict or a refused admission leaves nothing behind in the value
 log; and it runs before the record naming the values is appended, so the bytes are on the device
 before anything points at them. Under a syncing mode both are barriered before the commit is
@@ -188,8 +213,11 @@ caller was told it failed. Three things happen instead, in this order:
 1. An **abort record** naming the sequence is appended, which is what replay consults to leave
    the batch out.
 2. The backend **abandons** the sequence, keeping whatever the failed apply already landed out
-   of reads and out of any flush before that next open.
-3. The reservations are released and the transaction is marked aborted.
+   of reads; the flush of that memtable, which waits for the sequence to be decided before it
+   builds, drops those entries rather than writing them. The record is kept until the memtable
+   that was active retires, since no younger one can hold the batch.
+3. The claims are dropped, the sequence is marked aborted so the watermark passes it, and the
+   transaction is marked aborted.
 
 The abort record is best effort by construction: if appending it fails there is nothing further
 to try, so the failure is logged rather than returned, and the batch would replay on the next
@@ -198,9 +226,12 @@ and it is why the failure is logged loudly rather than swallowed.
 
 ## Stage 9 — Publication
 
-The sequence is marked committed, and the batch becomes visible to every reader whose
-snapshot is at or above it. The transaction leaves the registry, which releases the snapshot
-it was holding — and with it, possibly, the floor that was keeping older versions alive.
+The sequence is marked committed and the watermark is carried forward over every decided sequence
+above it. The commit then waits for the watermark to pass its own sequence — a wait on the commits
+still in flight below it — so that when it returns, its batch is inside every ceiling taken
+afterwards, the caller's next transaction included. The transaction leaves the registry, which
+releases the snapshot it was holding — and with it, possibly, the floor that was keeping older
+versions alive.
 
 Any commit hooks registered on the affected families fire here, synchronously, on the
 committing thread. Work done in a hook is latency every writer pays.
@@ -234,6 +265,12 @@ on that log must hold a pin on the memtable across the wait.
 A flush worker takes a sealed memtable and demultiplexes it: one shared skip list holding
 every family's keys, prefixed by family index, becomes one sstable per family that has data
 in it.
+
+Before it reads a key it waits for the watermark to pass the memtable's highest sequence. A batch
+still in flight when the memtable rotated is not written until its commit or abort is known, so an
+sstable only ever holds decided versions, and a batch abandoned after rotation is dropped here
+rather than made permanent. The wait is on the commits in flight below that sequence, each inside
+its own commit window, and nothing inside a commit window waits on a flush, so it cannot deadlock.
 
 The flush walks each key's **version chain** and keeps what the reclamation floor still protects:
 every version above it, and the newest at or below it as the base. That is the rule a merge
@@ -305,13 +342,13 @@ annihilate immediately.
           |
   tidesdb_txn_commit
           |
-     conflict check       snapshot+ only, aborts before anything durable
+     admission            paced against the flush queue, holding nothing yet
           |
-     draw sequence        marked in progress -> invisible
+     conflict check       repeatable read and above, aborts before anything durable
+          |
+     draw sequence        marked in progress -> above the watermark, invisible
           |
      reserve keys         first-committer-wins, vs the version actually read
-          |
-     admission            paced against the flush queue
           |
      separate values      large ones to the value log; the record carries the id
           |               after the reservation, before the record naming them
@@ -319,7 +356,8 @@ annihilate immediately.
           |                                   ^ gap-free, or recovery truncates
      memtable apply       durable before visible
           |
-     mark committed       now visible; hooks fire
+     mark committed       the watermark passes it -> visible; the commit returns once it has;
+          |               hooks fire
           |
      maybe rotate         on this thread if it takes the lock; enqueue before swap
           |

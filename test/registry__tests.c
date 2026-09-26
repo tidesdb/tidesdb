@@ -15,11 +15,12 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-/* begin a repeatable-read txn whose snapshot is `snap` by advancing the clock so current_seq is
- * snap + 1 (current_seq = n+1 after n next_seq calls) */
+/* begin a repeatable-read txn whose snapshot is `snap` by drawing and deciding sequences until the
+ * watermark stands at it; a snapshot is the watermark, so drawing alone would not move it */
 static tdb_txn_t *begin_at_snapshot(tidesdb_mvcc_t *clock, uint64_t snap)
 {
-    while (tidesdb_mvcc_current_seq(clock) <= snap) (void)tidesdb_mvcc_next_seq(clock);
+    while (tidesdb_mvcc_visible_seq(clock) < snap)
+        tidesdb_mvcc_mark(clock, tidesdb_mvcc_draw(clock, NULL), 1);
     tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
     return t;
 }
@@ -97,52 +98,6 @@ void test_registry_min_snapshot(void)
     tidesdb_mvcc_destroy(clock);
 }
 
-/* the published minimum is what the commit path reads instead of running the scan, and it may only
- * ever be stale low. the case that could break that is the registry emptying and refilling: the
- * scan answers UINT64_MAX for an empty set, and publishing that sentinel would leave the cache
- * above the snapshot of the very next transaction */
-void test_registry_published_min_never_exceeds_the_true_min(void)
-{
-    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
-
-    /* nothing published yet reads as zero, which constrains nothing wrongly */
-    ASSERT_TRUE(tidesdb_txn_registry_published_min_snapshot(reg) == 0);
-
-    tdb_txn_t *a = begin_at_snapshot(clock, 10);
-    tdb_txn_t *b = begin_at_snapshot(clock, 20);
-    ASSERT_EQ(tidesdb_txn_registry_add(reg, a), TDB_SUCCESS);
-    ASSERT_EQ(tidesdb_txn_registry_add(reg, b), TDB_SUCCESS);
-    tidesdb_txn_registry_publish_min_snapshot(reg);
-    ASSERT_TRUE(tidesdb_txn_registry_published_min_snapshot(reg) == 10);
-
-    /* the holder of the minimum leaves, so the true minimum rises above the published one. stale
-     * low is the safe direction and the cache is allowed to sit there until the next publish */
-    tidesdb_txn_registry_remove(reg, a);
-    ASSERT_TRUE(tidesdb_txn_registry_min_snapshot(reg) == 20);
-    ASSERT_TRUE(tidesdb_txn_registry_published_min_snapshot(reg) == 10);
-
-    /* empty publishes zero rather than the sentinel */
-    tidesdb_txn_registry_remove(reg, b);
-    ASSERT_TRUE(tidesdb_txn_registry_min_snapshot(reg) == UINT64_MAX);
-    tidesdb_txn_registry_publish_min_snapshot(reg);
-    ASSERT_TRUE(tidesdb_txn_registry_published_min_snapshot(reg) == 0);
-
-    /* and a transaction beginning after that empty publish is still above it, which is the
-     * property the whole cache rests on */
-    tdb_txn_t *c = begin_at_snapshot(clock, 30);
-    ASSERT_EQ(tidesdb_txn_registry_add(reg, c), TDB_SUCCESS);
-    ASSERT_TRUE(tidesdb_txn_registry_published_min_snapshot(reg) <=
-                tidesdb_txn_registry_min_snapshot(reg));
-
-    tidesdb_txn_registry_remove(reg, c);
-    tdb_txn_free(a);
-    tdb_txn_free(b);
-    tdb_txn_free(c);
-    tidesdb_txn_registry_destroy(reg);
-    tidesdb_mvcc_destroy(clock);
-}
-
 /* the locked scan sees every registered txn */
 void test_registry_scan(void)
 {
@@ -173,7 +128,8 @@ void test_registry_integration(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
     tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
-    while (tidesdb_mvcc_current_seq(clock) <= 4) (void)tidesdb_mvcc_next_seq(clock);
+    while (tidesdb_mvcc_visible_seq(clock) < 4)
+        tidesdb_mvcc_mark(clock, tidesdb_mvcc_draw(clock, NULL), 1);
 
     /* repeatable-read joins */
     tdb_txn_t *rr = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, reg);
@@ -255,7 +211,6 @@ int main(int argc, char **argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_registry_empty, tests_passed);
     RUN_TEST(test_registry_min_snapshot, tests_passed);
-    RUN_TEST(test_registry_published_min_never_exceeds_the_true_min, tests_passed);
     RUN_TEST(test_registry_scan, tests_passed);
     RUN_TEST(test_registry_integration, tests_passed);
     RUN_TEST(test_registry_spans_shards, tests_passed);

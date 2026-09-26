@@ -954,6 +954,39 @@ void test_l0_sync_active_wal_null(void)
     ASSERT_EQ(tidesdb_l0_sync_active_wal(NULL), TDB_ERR_INVALID_ARGS);
 }
 
+/* an abandoned sequence is remembered only while a memtable that could hold its entries is
+ * resident. the table fills with sequences abandoned under one memtable, and retiring that memtable
+ * forgets them all and frees their slots */
+void test_l0_forgets_abandoned_sequences_once_their_memtables_retire(void)
+{
+    tidesdb_l0_t *l0 =
+        tidesdb_l0_create(L0_BUFFER_SIZE, L0_QUEUE_SIZE, MT_MAX_LEVEL, MT_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0 != NULL);
+    tidesdb_l0_set_active(
+        l0, tidesdb_memtable_create(NULL, 0, 0, MT_MAX_LEVEL, MT_PROBABILITY, NULL, NULL));
+
+    const uint64_t first = 100;
+    for (uint64_t i = 0; i < TDB_L0_MAX_ABORTED_SEQS; i++)
+        ASSERT_EQ(tidesdb_l0_mark_aborted(l0, first + i), TDB_SUCCESS);
+    const uint64_t one_more = first + TDB_L0_MAX_ABORTED_SEQS;
+    ASSERT_EQ(tidesdb_l0_mark_aborted(l0, one_more), TDB_ERR_MEMORY_LIMIT);
+    ASSERT_EQ(tidesdb_l0_seq_aborted(l0, first), 1);
+
+    /* the memtable they were abandoned under rotates out and retires, as after its flush */
+    ASSERT_EQ(tidesdb_l0_rotate(l0, tidesdb_memtable_create(NULL, 1, 1, MT_MAX_LEVEL,
+                                                            MT_PROBABILITY, NULL, NULL)),
+              TDB_SUCCESS);
+    tidesdb_memtable_t *retired = tidesdb_l0_claim_immutable(l0);
+    ASSERT_TRUE(retired != NULL);
+    tidesdb_l0_retire_immutable(l0, retired);
+
+    ASSERT_EQ(tidesdb_l0_seq_aborted(l0, first), 0);
+    ASSERT_EQ(tidesdb_l0_mark_aborted(l0, one_more), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_seq_aborted(l0, one_more), 1);
+
+    tidesdb_l0_destroy(l0);
+}
+
 /* read one key at a snapshot ceiling, reporting only what the range tombstone tests care about --
  * whether the key resolved and whether what resolved was a delete */
 static int rt_read(tidesdb_l0_t *l0, const uint32_t cf_index, const char *key,
@@ -1216,6 +1249,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_l0_wal_ack_on_stage_survives_close, tests_passed);
     RUN_TEST(test_l0_sync_active_wal, tests_passed);
     RUN_TEST(test_l0_sync_active_wal_null, tests_passed);
+    RUN_TEST(test_l0_forgets_abandoned_sequences_once_their_memtables_retire, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

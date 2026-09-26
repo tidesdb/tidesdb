@@ -1,6 +1,6 @@
 ---
 title: Transactions and MVCC
-description: The sequence clock, snapshots, the commit-status ring, first-committer-wins reservations, and two-phase commit.
+description: The sequence clock, snapshots, the commit-status ring, the in-flight claim set, and two-phase commit.
 slug: internals/transactions-and-mvcc
 part: internals
 sidebar:
@@ -24,26 +24,49 @@ hashes, not engine structures — so it builds and tests standalone.
 
 ## The clock
 
-Three things live in the clock:
+Four things live in the clock:
 
 **A monotonic counter.** Every commit draws a sequence from it. Sequences are never reused; the
 counter only moves forward, including across restarts (see [Recovery](/internals/recovery)).
 
 **A commit-status ring.** Drawing a sequence and completing a commit are not the same instant,
 so a sequence that has been drawn but not finished must be invisible — otherwise a reader could
-see half a batch. The ring records, for the most recent sequences, whether each one committed.
+see half a batch. The ring records, for the most recent sequences, whether each one is in
+progress, committed, or aborted, each slot tagged with the sequence it describes so a slot reused
+by a later sequence never reads as a decision about an earlier one.
 
-The ring is bounded, and what happens past its edge is the interesting part. A sequence older
-than the ring is **treated as committed**, because it was drawn long enough ago that it either
-applied or was abandoned. That eviction rule is what keeps the visibility check O(1) and the memory
-fixed, rather than tracking every sequence ever issued.
+**A watermark.** Readers do not consult the ring. What they take their ceiling from is the
+**watermark**: the highest sequence below which every drawn sequence has been decided, committed
+or aborted. Every commit ends by deciding its sequence and carrying the watermark forward over
+every decided sequence above it, and every failure path after the draw decides the sequence as
+aborted for the same reason. A sequence is committed only after its batch is applied in full, so
+everything at or below the watermark is whole and final, and a ceiling taken from it never admits
+a version that could still change or disappear.
 
-One kind of sequence outlives the ring while still being in flight: the one a two-phase transaction
-drew at its prepare and has not had decided. Nothing bounds how long a coordinator takes, so that
-sequence can fall arbitrarily far behind. Those are **held** and stay in flight however far the ring
-moves past them — see [What an undecided prepare keeps alive](#what-an-undecided-prepare-keeps-alive).
+Carrying it forward is a store of the committer's own decision followed by loads of its neighbours',
+and the two are separated by a full barrier. Without one, two committers deciding neighbouring
+sequences at the same instant could each miss the other's store while it sat in a store buffer; each
+would stop at the other's slot, the watermark would stand below both, and the higher committer would
+wait on a publication no one was left to make until some third commit arrived. With the barrier at
+least one of the two sees the other's decision and carries it.
 
-**A reservation table** for conflict detection, described below.
+A commit does not return until the watermark has passed its own sequence. The wait is on the
+commits in flight below it, each inside its own commit window, and it is what makes a commit's
+writes visible to the caller's very next transaction — the watermark publishes in order, and
+"returned" means "published".
+
+The ring is bounded, and the bound is enforced rather than assumed: the clock will not draw a
+sequence a ring's width above the watermark, so a slot the watermark has yet to read is never
+recycled underneath it, and a slot always describes the sequence it is asked about. Nothing reads
+the ring below the watermark — a reader's question is answered by the watermark alone — so there is
+no rule for sequences that have aged out of it.
+
+The sequence a two-phase transaction drew at its prepare is spent the moment its record is durable:
+phase two commits at a fresh one, so no version ever carries it, and it is decided as aborted so the
+watermark passes it. What holds the batch's keys through the in-doubt window is not the ring but the
+claim set — see [Two-phase commit](#two-phase-commit).
+
+**An in-flight claim set** for conflict detection, described below.
 
 ## Snapshots
 
@@ -52,17 +75,23 @@ A snapshot is a sequence ceiling, and the isolation level decides what it is:
 | Level | Ceiling |
 | --- | --- |
 | Read uncommitted | Unbounded — even in-progress sequences are visible |
-| Read committed | The current sequence, re-read for each operation |
-| Repeatable read, snapshot, serializable | Frozen when the transaction begins |
+| Read committed | The watermark, re-read for each operation |
+| Repeatable read, snapshot, serializable | The watermark when the transaction begins, frozen |
 
 Freezing at begin is what makes repeated reads stable: the ceiling does not move, so a version
-that committed after the transaction started is invisible no matter how many times it looks.
+that committed after the transaction started is invisible no matter how many times it looks. Taking
+it from the watermark rather than from the sequence counter is what makes the snapshot a
+snapshot: every sequence at or below it is already decided, so nothing that was in flight when the
+transaction began can land inside its view later, and no batch is ever seen half applied.
 
 The ceiling is not quite the only filter. A commit whose batch reached the log but failed to enter
 the memtable leaves entries behind at a sequence that never committed, and those are stepped over
 in favour of an older visible version at **every** level — including read uncommitted, whose
 unbounded ceiling would otherwise return them. "Uncommitted" means a sequence still in flight, not
-one that was given up on.
+one that was given up on. A flush waits for every sequence in a memtable to be decided before it
+builds, so those entries are dropped there and never reach an sstable; the memtable is the only
+place they can ever be, and the record of them is forgotten once the memtables that could hold
+them have retired.
 
 A snapshot costs nothing to take — it is a number — but holding one is not free. The oldest live
 snapshot is the floor below which [compaction](/internals/compaction) may drop old versions and
@@ -72,8 +101,8 @@ as `min_snapshot_seq` in the database statistics and as space that will not recl
 ## Named snapshots
 
 A transaction's snapshot is a number it draws at begin and drops when it ends. A **named snapshot**
-is the same number held deliberately: `tidesdb_snapshot_create` captures the current sequence and
-keeps it, and a transaction opened against it reads as of that point.
+is the same number held deliberately: `tidesdb_snapshot_create` captures the watermark and keeps
+it, and a transaction opened against it reads as of that point.
 
 The mechanism is already everywhere. Every read resolves at a ceiling, and the memtable and the
 btree both take the newest version at or below one, so reading the past needs no new path — only a
@@ -121,56 +150,60 @@ of the read, not against the snapshot's sequence, so an entry whose lifetime has
 tombstone through a snapshot taken while it was live. A snapshot travels over versions, not over
 deadlines.
 
-## Reservations: first-committer-wins
+## Claims: what a commit in flight holds
 
-At snapshot and serializable isolation, a commit must not silently overwrite a write it did not
-see. The check is a reservation over the transaction's write set.
+At repeatable read and above, a commit must not silently overwrite a write it did not see, and must
+not commit on a read that a commit sequenced before it has already invalidated. Each question has
+two halves: a rival that has already committed, which the data itself answers (the conflict scan
+below), and a rival that is committing *right now*, which nothing in the data can answer yet. The
+**in-flight claim set** answers the second.
 
-Each key hashes into a slot in a fixed table. A slot packs two things:
+A claim names a key — its family, its bytes and its owner, the commit holding it. The set is a hash
+table of chains under striped locks, and a claim is compared by its bytes, never by its hash alone,
+so two different keys in one chain are two claims, not a collision. Nothing about it is a fixed
+number of slots per key: two commits of different keys never conflict on it, however wide either is,
+and a commit never refuses itself. A table of hashed slots — one per key, then a run of four — did
+both, and a table load of a hundred thousand rows in one transaction was refused for colliding with
+its own keys.
 
-```
-  [ 16-bit key fingerprint ][ 48-bit claiming commit sequence ]
-```
+Claims are taken **before the sequence is drawn**, in one fixed order — family, then key bytes. The
+order is what makes two commits sharing keys meet at the same first key, so exactly one yields
+rather than each holding half. The position is what makes validation sound: any commit whose
+sequence is below mine had finished claiming before I drew, so my validation, which runs after my
+draw, sees its claims. In the other order two commits could each validate against a set that did not
+yet hold the other, and both go through.
 
-The fingerprint is what keeps the common case local. Two different keys can land in the same slot,
-and without a fingerprint the commit could not tell a genuine same-key conflict from a hash
-collision. With it, most claims are settled by the slot alone.
+What a claim meets when it joins its chain decides it:
 
-The reservation therefore answers with more than won or lost. It returns **WON**; **CONFLICT** for
-an occupant still in flight, which cannot be told from a same-key committer without its applied
-version; **REFRESH** when the occupant is committed but sits above what this commit believes the
-oldest live snapshot to be; or **CHECK_KEY**, handing back the exact occupant it saw.
+- A **write claim** meeting another owner's write claim is refused at snapshot and serializable —
+  that owner is in flight, one of the two must lose, and the later claimant does. First-committer-
+  wins, decided at the claim rather than after the fact.
+- At repeatable read a write claim is recorded and refuses nothing; two blind writers of one key
+  both commit there. What it is for is being seen by a rival's read validation.
+- A **read claim** — taken by a prepare at repeatable read or above on every key it read — is never
+  refused, and refuses every later write claim on its key for as long as its owner is undecided. Why
+  a prepare needs one is in [Two-phase commit](#two-phase-commit).
 
-:::caution[A fingerprint is not a key, and the commit no longer pretends otherwise]
-A fingerprint match is not proof of a same-key conflict, and a mismatch past the snapshot bound is
-not proof of one either. Treating either as decisive is how a commit is rejected for a collision
-with an unrelated key — which, on a loaded table, is most commits.
+A claim carries its owner's sequence once drawn; until then it reads as *drawing*, and a validator
+that meets one spins for the store, which is a few instructions away. Validation at repeatable read
+and serializable asks the set, for every key the transaction read, whether another owner's write
+claim sits **below my sequence**: that writer lands before me, my read of the key is stale at my
+position, and I am refused. For every interval a scan of the transaction covered it asks the same of
+every commit in flight — a write claim on a key inside it below my sequence is a phantom about to
+exist — which is what the list of commits in flight is for, since an interval has no one chain to
+look in. A write claim above my sequence is not my problem — that commit is sequenced after me and
+validates against mine. A prepared owner's write claims read as **future**, since its final sequence
+will exceed every current one, so a reader of a key it writes is serialized before the batch and not
+refused, while a writer of that key at snapshot or above is.
 
-So **REFRESH** makes the commit republish the registry minimum and retry the claim, *once per
-transaction*, rather than deciding on a stale bound. And **CHECK_KEY** is resolved exactly: the
-commit probes the real key for a version newer than what it read, and only if none exists does it
-claim the slot with `tidesdb_mvcc_reserve_checked`, which succeeds only if the slot still holds the
-occupant that was checked. Reaching into the data is the *fallback*, taken when the slot genuinely
-cannot answer, not the ordinary path.
-:::
+The claims go with the commit. A refused claim drops the ones already taken, a failed commit drops
+them all, and a successful one drops them once the watermark has passed its sequence, so a rival
+validating against the data finds what the claims were standing in for. Nothing is renamed, aged out
+or handed over.
 
-:::note[The bound is a published minimum, refreshed on demand]
-Computing the oldest live snapshot exactly means scanning every registry shard, and a reservation
-runs once per written key, so the commit path does not compute it up front. The registry publishes
-the value — refreshed on the compaction scheduler's tick, and again by any commit whose claim did
-not win outright — and the commit reads it as a single load hoisted over the whole write set. A
-stale reading is only ever *low*, which is the conservative direction: it makes more occupants look
-recent, so it can send a claim down the refresh or check path, and can never admit one that should
-have been rejected.
+Losing a claim is `TDB_ERR_CONFLICT`, raised before anything durable has been written.
 
-The empty registry is the case that needs care. The scan answers `UINT64_MAX`, a sentinel meaning
-nothing constrains you rather than a real minimum, and publishing it would let a transaction
-beginning afterwards hold a snapshot *below* the published value -- the one direction a reader of
-this may not tolerate. The publisher stores zero for an empty set instead, which is why the exact
-check above matters: with the bound at zero every committed occupant looks recent.
-:::
-
-The subtlety is what each key is validated *against*. Not the transaction's snapshot, but **the
+The subtlety is what each write is validated *against*. Not the transaction's snapshot, but **the
 version this transaction actually read for that key**, recorded when
 [`tidesdb_txn_get`](/reference/transaction#tidesdb_txn_get) was called. A blind write with no prior
 read falls back to the snapshot.
@@ -180,26 +213,31 @@ be tracked, so the write is validated against what it was based on. A probe whos
 determine what is written should be untracked, because widening the footprint only creates
 conflicts that are not real.
 
-Losing a reservation is `TDB_ERR_CONFLICT`, raised before anything durable has been written.
-
-### An interval has no key to hash
+### An interval has no key to claim
 
 A [range delete](/reference/transaction#tidesdb_txn_delete_range) writes an interval, not a key, so
-there is no hash for it to claim and no fingerprint that could describe it. Two transactions — one
-deleting a range, one writing a key inside it — can never collide in the table above, however they
-are ordered.
+there is no key for it to claim and no one chain a writer inside it could look in.
 
-Two things close that, and they cover different windows.
+**A second, small table holds the intervals themselves**, at repeatable read and above, taken with
+the claims and before the draw. A point write checks that table alongside its chain: an interval
+another commit holds over its key refuses it under first-committer-wins, and is recorded beside it
+at repeatable read. Under first-committer-wins the interval is checked the other way as it is taken
+— entered in the table first, then compared against every commit in flight, whose claims are
+complete arrays by the time the commit is on the list — so a point writer and a range delete meeting
+in the same instant find each other whichever was first, and one of the two yields. An interval also
+yields to another interval meeting it, and to a prepared reader holding a key inside it, which cannot
+be the one to yield. At repeatable read the interval is entered and refuses nothing, exactly as a
+write claim at that level is; what it is for is being met by the writers at snapshot and above and
+by the readers validating under it. After the draw a range delete under first-committer-wins
+validates like a write: the store for a version inside the interval above its snapshot, and the
+commits in flight for a write claim inside it sequenced below it.
 
-**A second, small table holds the intervals themselves.** A batch writing one claims it before
-reserving any of its keys, and every point write checks that table before taking its own slot. The
-table is almost always empty, so the check is one relaxed load; only when a range delete is actually
-in flight does a write compare its key against a handful of bounds. That is also what carries a
-**two-phase** range delete through the window between its prepare and its commit.
+The table is almost always empty, so a point write's check is one relaxed load; only when a range
+delete is actually in flight does a write compare its key against a handful of bounds. That is also
+what carries a **two-phase** range delete through the window between its prepare and its commit.
 
-The interval goes back **once the batch is visible, and not before**. A key reservation is renamed
-rather than dropped, because the slot itself is what a later writer of that key reads; an interval
-has no slot of its own to read, so what replaces it is the committed delete, which a later writer's
+The interval goes back **once the batch is visible, and not before** — with the batch's key claims,
+and for the same reason: what replaces either is the committed write, which a later writer's
 conflict scan finds. Releasing earlier leaves the gap between the two uncovered, and not releasing
 at all spends the table: it has a fixed number of slots, so one leaked per commit ends with every
 later range delete in the database refused as a conflict that no retry could clear.
@@ -209,28 +247,41 @@ The slots are a fixed width, which is where the public
 delete's bounds comes from. A longer bound is turned away at the API rather than narrowed to fit,
 since a narrowed bound describes a wider range than the caller asked for.
 
-**A commit gate covers the rest.** The interval table alone still leaves the reverse order open: a
-point write that has already reserved, and is not yet visible, cannot be seen by a range delete's
-conflict scan. So a commit carrying one takes the database's commit gate exclusively and runs alone,
-while every other commit at snapshot or above holds it shared and never waits on another. The gate
-is held for the whole commit rather than just the reservation, because a batch that has reserved but
-not yet marked its sequence visible is exactly the write the delete must not miss.
+### A scan's footprint
 
-A two-phase transaction takes the gate only for its **prepare**. The in-doubt window that follows
-has no bound, and holding it there would stall every other committer for as long as the transaction
-stayed undecided — the held interval covers that window instead.
+An iterator at repeatable read or serializable keeps the interval it has covered — from the key it
+sought or the first key of its range to the last key it stood on, or to the end when it ran off it,
+absent keys included — and hands it to the transaction's read set when it is freed. At commit the
+interval is validated like a read: the store is asked whether any version inside it sits above the
+snapshot, and the commits in flight whether one sequenced below this commit writes a key inside it.
+Either is a **phantom**, a row the scan would have seen had it run a moment later, and the commit is
+refused. That is what makes serializable PL-3 rather than PL-3 over point reads alone: a write skew
+that depends on a scan having seen no row is refused with the rest. Snapshot isolation validates no
+read and keeps no footprint. An iterator whose footprint cannot be recorded fails its transaction
+rather than let it commit unchecked.
 
 ## The conflict scan, and what it does not read
 
-The reservation catches a transaction that is committing *right now*. It cannot catch one that
-committed and finished between this transaction's snapshot and its commit — that writer has already
-released its slot. So a commit at snapshot isolation or above also scans its write set against the
-data itself, and repeatable-read and serializable scan the read set the same way.
+The claim set catches a transaction that is committing *right now*. It cannot catch one that
+committed and finished between this transaction's snapshot and its commit — that writer has dropped
+its claims. So a commit at snapshot isolation or above also scans its write set against the data
+itself, and repeatable-read and serializable scan the read set the same way, the keys read and the
+intervals scanned both.
 
 The question that scan asks is narrow. Not *what is the newest version of this key*, but only
-**does any version of it exist above my snapshot**. That distinction is worth a great deal, because
-answering the first question means descending a btree in every overlapping sstable at every level,
-parsing nodes and verifying checksums, purely to discard the answer.
+**does any version of it exist above my snapshot and below my own sequence**. That distinction is
+worth a great deal, because answering the first question means descending a btree in every
+overlapping sstable at every level, parsing nodes and verifying checksums, purely to discard the
+answer.
+
+The upper bound matters as much as the lower. The scan runs after the commit has drawn its sequence,
+and a writer that drew a higher one may already have applied its batch — commits overlap, and the
+apply is the last step of each. That writer is ordered after this commit, so its version stales
+nothing this commit read and contests nothing it writes; it is that writer's own validation, against
+this commit's version, that decides between them. Asking about every version there is refused both,
+and a pair of concurrent writers to one key could each be refused on account of the other. So the
+store is asked only about versions sequenced below the commit; writers above it are not its concern,
+and writers below it that have not applied yet are in the claim set.
 
 Every sstable records the newest sequence it contains in its footer. An sstable whose newest
 sequence is at or below the transaction's snapshot **cannot** hold a conflicting version, so the
@@ -271,8 +322,9 @@ The **write set** buffers operations in insertion order. Order is what makes sav
 savepoint is a position in the sequence, rolling back to it discards the tail, and releasing it
 forgets the mark without discarding anything.
 
-The **read set** records what tracking reads observed — key and version — and exists only to feed
-the reservation check at commit.
+The **read set** records what tracking reads observed — key and version — and the intervals the
+transaction's scans covered, each at the snapshot it scanned at. It exists to feed the read
+validation at commit and, at a prepare, the read claims.
 
 Both are per-transaction and single-threaded, which is why a transaction handle is not
 thread-safe. The one exception is the flag
@@ -282,9 +334,24 @@ transaction is still the only one that moves its state.
 
 ## The registry
 
-Live transactions are registered so the engine can compute the oldest live snapshot. The registry
-is on the commit path, so its cost matters: each transaction holds its own slot and leaves in
-constant time rather than by scanning a list.
+Live transactions are registered so the engine can compute the reclamation floor: the smallest
+sequence any of them still reads at. A repeatable-read or stronger transaction holds it at its frozen
+snapshot for its whole life. A read-committed transaction holds it only while a read or a scan is in
+flight, at the ceiling that read took from the watermark — a read takes its ceiling and then reads
+the store, and a collection starting in between would otherwise keep one version per key and drop
+the ones the read still resolves to. The ceiling is published before the store is read and withdrawn
+after; a scan's stays published until its iterator is freed, and a point read inside an open scan
+does not lift it. Read-uncommitted resolves to the newest version, which no collection drops, so it
+registers nothing.
+
+A collection takes the floor in two scans with its high-water mark published between them, behind a
+full barrier, and a read publishes its ceiling behind one before it checks the mark. So a read whose
+ceiling the first scan missed is either seen by the second, and the floor stays at or below it, or
+sees a mark above its ceiling and takes the ceiling again above the floor it missed. The floor is
+never above the watermark, since nothing a collection reads is above it.
+
+The registry is on the commit path, so its cost matters: each transaction holds its own slot and
+leaves in constant time rather than by scanning a list.
 
 It is also **sharded**, because joining and leaving are per-transaction rather than per unit of
 work — every transaction does both exactly once, whatever else it does — so a single lock made
@@ -303,32 +370,31 @@ a thread other than the one that began it.
 
 :::note[The shard count is bounded by the walk, not by the core count]
 More shards spread the join and leave further, but the enumeration below holds **every** shard for
-its whole walk, so a serializable commit acquires that many locks at once. Past about sixty a
-thread holds more locks than tooling will model — ThreadSanitizer caps a thread there and aborts —
-and it is a lot of lock traffic for one commit regardless. The count is chosen against that bound
-rather than against the number of cores.
+its whole walk, so a statistics call acquires that many locks at once. Past about sixty a thread
+holds more locks than tooling will model — ThreadSanitizer caps a thread there and aborts. The
+count is chosen against that bound rather than against the number of cores.
 :::
 
 The two readers of the set treat the sharding differently, and deliberately:
 
-- **The oldest live snapshot** takes one shard at a time. The answer can come out too low but
+- **The reclamation floor** takes one shard at a time. The answer can come out too low but
   never too high, and too low is the safe direction for a reclamation floor — it keeps a version
   some reader might still want. It cannot come out too high, because a transaction registering
   after its shard was read draws its snapshot from a monotonic clock and so is above the minimum
-  already, and one that leaves only raises the true minimum above what was reported.
-- **Serializable validation** holds every shard for the whole walk, so it decides against one
-  instant of the live set rather than a smear across shards. A peer appearing between two shards
-  could otherwise be missed by this validation and by its own. The shards are taken in index
-  order, the only order anything takes them in, so the walks cannot deadlock against each other.
-  Holding all of them is affordable precisely because this walk is rare — a serializable commit
-  or a statistics call, never the ordinary write path, which touches one shard.
+  already, and one that leaves only raises the true minimum above what was reported. A read-committed
+  ceiling published after its shard was read is the one case that argument does not cover, and the
+  second scan behind the high-water mark is what covers it.
+- **Enumeration**, which the statistics call lists live transactions with, holds every shard for
+  the whole walk, so it reports one instant of the live set rather than a smear across shards. The
+  shards are taken in index order, the only order anything takes them in, so two walks cannot
+  deadlock against each other. Holding all of them is affordable precisely because the walk is
+  rare — never the write path, which touches one shard.
 
 ## Timeouts
 
-A transaction that is begun and never resolved is not merely idle. It holds its snapshot, and at
-snapshot and serializable isolation its write reservations, so the reclamation floor cannot rise
-past it -- compaction may not drop the versions below that floor, and the value log may not reclaim
-their bytes. A leaked transaction therefore costs disk for as long as the database is open, and
+A transaction that is begun and never resolved is not merely idle. It holds its snapshot, so the
+reclamation floor cannot rise past it -- compaction may not drop the versions below that floor, and
+the value log may not reclaim their bytes. A leaked transaction therefore costs disk for as long as the database is open, and
 nothing else in the engine can decide it is safe to let go of.
 
 A timeout bounds that. It is off by default (`txn_timeout_seconds` is 0), applies to every
@@ -348,11 +414,14 @@ Two properties are worth knowing:
 Ordinary commit decides and applies in one step. Two-phase commit splits the decision from the
 application so an external coordinator can gather votes from several participants first.
 
-**Phase one — prepare.** Runs the same conflict checks as commit and durably logs the write batch
-under a caller-supplied transaction id, but leaves the writes invisible and unapplied. The
-transaction holds its snapshot and its reservations until it is resolved — so an undecided
-prepared transaction applies backpressure to anything contending for its keys, and holds the
-`min_snapshot_seq` floor down. Deciding promptly is not optional in a busy system.
+**Phase one — prepare.** Takes the same claims and runs the same conflict checks as commit, and
+durably logs the write batch under a caller-supplied transaction id, but leaves the writes invisible
+and unapplied. The transaction keeps its claims until it is resolved — on the keys it wrote, and at
+repeatable read or above on the keys it read as well — so an undecided prepared transaction applies
+backpressure to anything contending for its keys, and its snapshot holds the `min_snapshot_seq`
+floor down. Deciding promptly is not optional in a busy system. The sequence the prepare drew is
+spent for the watermark as soon as its record is durable — no version ever carries it, since phase
+two commits at a fresh one — so an undecided prepare never holds readers' ceilings down.
 
 A read-only transaction prepares with nothing durable and needs no phase two.
 
@@ -376,25 +445,29 @@ prepared transaction decided later. Re-sequencing at decision time makes replay 
 application agree: the batch lands where it was decided, not where it voted.
 :::
 
-Re-sequencing decides what happens to the reservations. The prepare claimed a slot for every key
-it wrote, each naming the sequence it drew then — and that sequence is superseded, so it is never
-marked committed. Phase two therefore **hands each slot over** to the sequence that committed,
-once the batch is durable and applied.
+Re-sequencing is also why a prepare holds its **reads**. Its reads were validated at prepare time,
+and phase two lands the batch above everything that committed while it was in doubt. A transaction
+that wrote a key the prepare read, committing inside that window, would leave the batch with a
+stale read at its final position — the shape every anomaly needs — and the prepared side can no
+longer be the one to yield, since a participant that voted yes must be able to commit. So the
+writer is refused: at repeatable read and above the prepare takes a read claim on every key it read,
+and a writer of such a key is refused for as long as the batch is undecided.
 
-A slot left naming the superseded sequence would read, to every later writer of that key, as a
-committer still in flight: they would lose a conflict to a transaction that had already finished,
-and go on losing it until the ring aged the sequence out — permanently on a quiet database, and
-not at all on a busy one.
+Its write claims read as *future* to every validator while it is in doubt. A reader of a key it
+writes is not refused — it is serialized before the batch, and its read is consistent — while a
+writer of that key at snapshot or above is, first-committer-wins. The claims are dropped once phase
+two has applied and marked the batch, or rolled it back. Nothing is handed over between the
+prepare's sequence and the one phase two commits at, because a claim is held by presence, not by
+the sequence it names.
 
-The hold is renamed rather than dropped and retaken. Releasing it would leave the slot empty, and
-a writer whose snapshot predates the commit would then claim it freely and overwrite the batch
-with no conflict raised — the precise failure the reservation exists to prevent. Renaming keeps
-the hold unbroken and leaves the slot naming a sequence that later comparisons can be made
-against.
-
-The hand-over waits for the batch to be durable because a failed append leaves the transaction
-prepared for a retry that draws a different sequence, and the slots must still name the prepare's
-for that retry to find them.
+An in-doubt batch adopted after a restart claims its keys again, and holds its intervals again, from
+the entries its PREPARE record carries, and its reads again from the record written immediately
+ahead of it: at repeatable read and above the prepare appends its read keys as a record of their own
+under the same xid before the PREPARE, so a PREPARE that is durable always has its reads, and
+recovery holds the keys for the PREPARE that follows. Read keys no PREPARE ever followed — the
+prepare failed between the two appends — are dropped with the staging map. A prepared handle freed
+without a decision — abandoned, which the engine allows — leaves its claims with the clock in its
+place, since the record is durable and a later open may still commit it.
 
 A transient I/O failure in phase two leaves the transaction **prepared**, not aborted, so the
 coordinator can retry the same decision. Anything else would let a participant unilaterally
@@ -421,29 +494,31 @@ The pin is taken by recovery itself, not by whoever adopts the transaction. A da
 with a batch in doubt and simply carries on writing — never asking for its in-doubt list — must
 still keep that log, because it holds the only copy of a batch someone may yet decide.
 
-**And its sequence.** The commit-status ring calls anything older than its capacity committed, which
-is true of every sequence a commit drew and false of one a prepare is still sitting on. An undecided
-prepare therefore holds its sequence in a small fixed table that exempts it from the eviction rule,
-and lets go the moment phase two decides. Without the hold, a prepare left undecided for a ring's
-worth of commits would start reading as committed: its key reservations would stop refusing anyone,
-and a later writer would overwrite a key the batch is still going to commit — silently, since every
-party involved believes it is following the rules. The table is bounded like the interval table is,
-so a prepare that cannot take a slot is refused rather than left holding keys nothing would defend.
+**Not its sequence.** The sequence the prepare drew is decided as spent the moment its record is
+durable, and the commit-status ring may age it out like any other. What keeps the batch's keys held
+is its claims, which are held by presence rather than by any sequence, so a prepare left undecided
+for a ring's worth of commits refuses exactly what it refused when it was young.
 
 ## Invariants
 
 | Invariant | Why |
 | --- | --- |
 | A sequence is never reused, across restarts included | Reuse would make two different writes indistinguishable |
-| A drawn but uncommitted sequence is invisible | Otherwise a reader sees half a batch |
-| Sequences past the ring's edge count as committed | They cannot still be in flight; this bounds the ring |
+| A drawn but undecided sequence is invisible | Every reader's ceiling is the watermark, below which every sequence is decided; otherwise a reader sees half a batch |
+| Every drawn sequence is decided, committed or aborted, on every path | The watermark waits on each one; an undecided sequence would hold every later reader's ceiling down |
+| A commit returns only once the watermark has passed its sequence | The caller's next transaction must see what it just committed; publication is in order |
+| No sequence is drawn a ring's width above the watermark | The slot the watermark has yet to read must not be recycled underneath it |
 | A write is validated against the version actually read | Validating against the snapshot alone misses read-modify-write races |
-| The reservation slot carries a key fingerprint | Distinguishes a real conflict from a hash collision without reading others' data |
+| A claim is compared by its key's bytes, never by its hash alone | Two keys in one chain are two claims; a hash collision refused a commit that had no conflict |
+| Claims are taken before the sequence is drawn | A commit sequenced below mine finished claiming before I drew, so my validation sees it; the other order lets two rivals miss each other |
+| A prepare at repeatable read or above holds what it read | Phase two lands it above everything that committed in doubt; a writer of a key it read committing inside that window would leave it a stale read at its final position, and the prepared side cannot yield |
+| An interval is held before the draw and checked both ways | A point writer meets it in the table, and it meets the point writer in the list of commits in flight, so the two find each other whichever was first; without that a range delete and a write inside it could each validate against a set that did not yet hold the other |
+| A scan's footprint is validated like a read | A key another commit put inside the interval a scan covered is a phantom, whether it is in the store above the snapshot or still a claim in flight below this commit; refusing it is what makes serializable hold over predicates and not only over the keys it read |
 | Compaction may not drop above `min_snapshot_seq` | A live snapshot must still see what it could see |
 | A flush retains against that floor too, not only a merge | A memtable holds the whole chain, so a flush that took the newest version alone would drop what the floor was protecting and a frozen reader would find a live key absent |
 | A named snapshot is registered, not just remembered | The floor is the minimum the registry holds; a sequence kept outside it protects nothing, and reading there answers from whatever a merge happened to leave |
 | Phase two draws a fresh sequence | The batch must land where decided, not where it voted |
-| A decided prepare's reservations move to the sequence that committed | The sequence the prepare reserved with is superseded and never marked committed, so a slot left naming it reads as a committer still in flight and refuses every later writer of that key |
+| A prepare's claims go only with its decision | Held by presence rather than by sequence, they neither age out of the ring nor need handing over to the sequence phase two commits at; one left behind after the decision would refuse every later writer of a finished transaction's key |
 | A failed phase two leaves the transaction prepared | A participant must not abandon a decision unilaterally |
 | An undecided prepare pins its own log generation, and only that one | Its PREPARE record is the only copy of the batch. Pinning on a database-wide count instead keeps every log ever written whenever a coordinator always has one in flight |
 | A decided prepare frees its generation at once | The commit record carries the write set and replay applies it inline, so nothing needs the original PREPARE |

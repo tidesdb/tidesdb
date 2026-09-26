@@ -272,7 +272,9 @@ int tidesdb_l0_scan_aborts(block_manager_t *wal, tidesdb_l0_aborted_set_t *out)
 /* fold one two-phase record into the staging map, applying a COMMIT's batch inline. a COMMIT
  * carries the write set at the sequence phase two drew when it decided, so it replays exactly like
  * an ordinary write batch and lands in this generation, in sequence order with everything around
- * it. only a PREPARE is held back, since an undecided batch has nowhere to land yet.
+ * it. only a PREPARE is held back, since an undecided batch has nowhere to land yet, and the read
+ * keys that precede it are held with it. a kind this binary does not know is refused by the stage,
+ * so a log written by a newer one fails the open rather than replaying with a record left out.
  *
  * replaying exactly like a write batch means being filtered like one. the log holding a COMMIT is
  * kept for as long as any prepare in its generation is undecided, which is unbounded, so the record

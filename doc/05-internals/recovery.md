@@ -139,7 +139,9 @@ sequence the coordinator may yet commit at.
 ## In-doubt transactions
 
 A `PREPARE` record with no matching `COMMIT` or `ROLLBACK` after it is **staged**, not applied.
-Its batch is held, its sequence is accounted for in the reseed, and it surfaces through
+Its batch is held, its keys and intervals are claimed against later writers again, so are the keys
+it read when a record of them precedes the `PREPARE`, its sequence is accounted for in the reseed,
+and it surfaces through
 [`tidesdb_recover_prepared`](/reference/transaction#tidesdb_recover_prepared) as a live handle in
 the prepared state.
 

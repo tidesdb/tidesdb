@@ -284,8 +284,9 @@ int engine_recover_prepared(tidesdb_t *db, tidesdb_prepared_txn_t *out, const in
         if (handle)
         {
             handle->db = db;
-            handle->inner = tdb_txn_adopt_prepared(db->clock, rec->xid, rec->xid_size, rec->entries,
-                                                   rec->count, rec->commit_seq);
+            handle->inner =
+                tdb_txn_adopt_prepared(db->clock, rec->xid, rec->xid_size, rec->entries, rec->count,
+                                       rec->commit_seq, rec->reads, rec->read_count);
         }
         if (!handle || !handle->inner)
         {
@@ -296,7 +297,7 @@ int engine_recover_prepared(tidesdb_t *db, tidesdb_prepared_txn_t *out, const in
         }
         /* recovery already pinned this generation for every in-doubt batch, so the handle only
          * needs to remember which one to release when its coordinator finally decides */
-        handle->prepare_generation = rec->generation;
+        handle->prepare_generation = rec->first_generation;
         handle->prepare_generation_last = rec->generation;
 
         out[n].txn = handle;

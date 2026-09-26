@@ -124,6 +124,7 @@ One framed block per committed batch. The payload:
 | 1 | `TDB_WAL_KIND_PREPARE` | Two-phase commit phase one: durable but not applied |
 | 2 | `TDB_WAL_KIND_COMMIT` | Phase two, commit — carries the batch to apply |
 | 3 | `TDB_WAL_KIND_ROLLBACK` | Phase two, abandon |
+| 5 | `TDB_WAL_KIND_PREPARE_READS` | The keys a prepare at repeatable read or above had read, written immediately ahead of its `PREPARE` under the same xid. Each entry carries a key and no value. Recovery holds them for the `PREPARE` that follows, so a batch adopted in doubt after a restart refuses a writer of a key it read exactly as the live prepare did. A binary that does not know the kind refuses the log rather than applying the keys as writes, which is why they are a kind of their own rather than entries inside the `PREPARE` |
 | 4 | `TDB_WAL_KIND_ABORT_SEQ` | Names an already-durable sequence that replay must not apply. The sequence rides in the xid slot as 8 big-endian bytes, so the record is the usual framing with an xid length of 8 and an entry count of 0. A distinct kind rather than a rollback, which is keyed by a caller's transaction id and could legitimately be 8 bytes long |
 
 `TDB_WAL_KIND_ABORT_SEQ` exists because a write batch's presence in the log *is* its commitment, so a batch

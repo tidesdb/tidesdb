@@ -25,13 +25,14 @@ is visible if its sequence is at or below it.
 | Isolation | Ceiling |
 | --- | --- |
 | `TDB_ISOLATION_READ_UNCOMMITTED` | Unbounded — everything, including sequences still in progress |
-| `TDB_ISOLATION_READ_COMMITTED` | The current sequence, re-read per operation |
-| Repeatable read and above | Frozen when the transaction began |
+| `TDB_ISOLATION_READ_COMMITTED` | The watermark, re-read per operation |
+| Repeatable read and above | The watermark when the transaction began, frozen |
 
-A sequence that has been drawn but not yet marked committed is invisible at every level
-except read-uncommitted. That is what makes a multi-key batch atomic to readers without any
-lock: the batch's sequence flips from in-progress to committed in one step, and until it
-does, none of it can be seen.
+The watermark is the highest sequence below which every drawn sequence has been decided, and a
+sequence is committed only once its batch is applied in full. So a sequence that has been drawn
+but not yet decided is above every ceiling at every level except read-uncommitted, and a
+multi-key batch is atomic to readers without any lock: none of it can be seen until the watermark
+passes it, and then all of it is. See [Transactions and MVCC](/internals/transactions-and-mvcc).
 
 ## Stage 1 — The transaction's own writes
 

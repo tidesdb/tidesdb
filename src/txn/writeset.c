@@ -202,26 +202,6 @@ void tidesdb_writeset_truncate(tidesdb_writeset_t *ws, int count)
     pthread_rwlock_unlock(&ws->lock);
 }
 
-int tidesdb_writeset_contains(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
-                              size_t key_size)
-{
-    if (!ws || !key) return 0;
-    int found = 0;
-    pthread_rwlock_rdlock(&ws->lock);
-    for (int i = 0; i < ws->count; i++)
-    {
-        const writeset_op *op = &ws->ops[i];
-        if (op->cf_index == cf_index && op->key_size == key_size &&
-            memcmp(op->buf, key, key_size) == 0)
-        {
-            found = 1;
-            break;
-        }
-    }
-    pthread_rwlock_unlock(&ws->lock);
-    return found;
-}
-
 int64_t tidesdb_writeset_mem_bytes(const tidesdb_writeset_t *ws)
 {
     return ws ? atomic_load_explicit(&ws->mem_bytes, memory_order_relaxed) : 0;

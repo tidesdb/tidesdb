@@ -61,12 +61,14 @@ conflict detection would be waste.
 **The upper three check, but not all for the same thing**, and the difference decides which of
 them you want:
 
-- **Repeatable read** validates **what it read**. Every key it recorded a read for is checked for
-  a newer committed version, which is what stops a value moving under it. It takes no reservation
-  on what it writes, so two transactions blindly writing the same key still both succeed.
+- **Repeatable read** validates **what it read**. Every key it read, and every range its scans
+  covered, is checked for a newer version, committed or about to be, which is what stops a value
+  moving under it, stops a row appearing in a range it scanned, and stops two transactions that
+  each read what the other writes from both committing. It refuses no second writer of a key it
+  writes, so two transactions blindly writing the same key still both succeed.
 - **Snapshot** validates **what it wrote**, on a first-committer-wins basis. It is the level that
   stops a lost update, and it does not check reads.
-- **Serializable** does both, and adds the check that catches write skew.
+- **Serializable** does both.
 
 Whichever check fires, the loser gets `TDB_ERR_CONFLICT` at commit, before anything durable is
 written.
@@ -82,8 +84,9 @@ everywhere.
 
 A transaction's snapshot lasts as long as the transaction. When a point in time is wanted for
 longer — a consistent export, a comparison against a known-good state — name it instead:
-`tidesdb_snapshot_create` captures the current sequence, and a transaction opened against that
-snapshot reads as of it, point reads and scans alike.
+`tidesdb_snapshot_create` captures the watermark — the newest point below which every commit is
+decided and published — and a transaction opened against that snapshot reads as of it, point reads
+and scans alike.
 
 A snapshot holds the reclamation floor for as long as it lives, which is what keeps the versions it
 names readable, and is also what it costs. Treat one exactly as you would a long-running
@@ -141,9 +144,9 @@ supply, but leaves it invisible and unapplied. If prepare succeeds, the transact
 
 **Commit-prepared** or **rollback-prepared** applies the decision.
 
-Between the two the transaction holds its snapshot and its key reservations. That is real
-backpressure: anything contending for those keys is blocked, and the reclamation floor is held
-down. **Decide promptly.**
+Between the two the transaction holds its snapshot and its claims on the keys it wrote, and at
+repeatable read or above on the keys it read. That is real backpressure: anything contending for
+those keys is blocked, and the reclamation floor is held down. **Decide promptly.**
 
 A prepared transaction survives a restart. On the next open,
 `tidesdb_recover_prepared` hands back everything that was prepared and never decided, so a

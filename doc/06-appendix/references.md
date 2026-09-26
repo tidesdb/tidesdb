@@ -62,4 +62,4 @@ consolidation, and its flush thread is the pipelining.
 <https://github.com/Cyan4973/xxHash>
 
 XXH3 provides the block checksum every framed record carries, and the key hashes the block
-cache, the manifest index, the partition filter and the write-reservation table index with.
+cache, the manifest index, the partition filter and the in-flight claim set index with.

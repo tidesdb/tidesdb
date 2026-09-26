@@ -552,13 +552,14 @@ void test_txn_request_abort_makes_the_transaction_fail_with_its_own_code(void)
     (void)remove_directory(TXNAPI_DB_DIR);
 }
 
-/* concurrent committers whose write sets never share a key. every key hashes into a fixed table
- * of reservation slots, so with a few hundred keys per commit two commits in flight at once share a
- * slot more often than not, and the reservation used to refuse any commit whose slot another
- * commit held in flight, whatever the keys were */
+/* concurrent committers whose write sets never share a key. a claim names the key itself, so
+ * nothing two commits of different keys hold can collide, however many keys each carries and
+ * however their commits overlap; a table of hashed slots refused most such pairs of a few hundred
+ * keys */
 #define TXNAPI_DISJOINT_WRITERS 2
 #define TXNAPI_DISJOINT_ROUNDS  40
 #define TXNAPI_DISJOINT_KEYS    500
+#define TXNAPI_WIDE_KEYS        100000 /* the TPC-C item table, loaded in one transaction */
 
 /**
  * txnapi_disjoint_t
@@ -566,6 +567,8 @@ void test_txn_request_abort_makes_the_transaction_fail_with_its_own_code(void)
  * @param db the open database
  * @param cf the family every writer commits to
  * @param id this writer's number, the prefix that keeps its keys apart from the others'
+ * @param rounds how many commits the writer makes
+ * @param keys how many fresh keys each commit carries
  * @param conflicts commits refused with TDB_ERR_CONFLICT
  * @param failures commits refused with anything else
  */
@@ -574,20 +577,22 @@ typedef struct
     tidesdb_t *db;
     tidesdb_column_family_t *cf;
     int id;
+    int rounds;
+    int keys;
     _Atomic(int) conflicts;
     _Atomic(int) failures;
 } txnapi_disjoint_t;
 
 /**
  * txnapi_disjoint_writer
- * commit TXNAPI_DISJOINT_ROUNDS batches of TXNAPI_DISJOINT_KEYS fresh keys at snapshot isolation
+ * commit the writer's rounds of fresh keys at snapshot isolation
  * @param arg the txnapi_disjoint_t
  * @return NULL
  */
 static void *txnapi_disjoint_writer(void *arg)
 {
     txnapi_disjoint_t *w = arg;
-    for (int round = 0; round < TXNAPI_DISJOINT_ROUNDS; round++)
+    for (int round = 0; round < w->rounds; round++)
     {
         tidesdb_txn_t *txn = NULL;
         if (tidesdb_txn_begin_with_isolation(w->db, TDB_ISOLATION_SNAPSHOT, &txn) != TDB_SUCCESS)
@@ -595,10 +600,10 @@ static void *txnapi_disjoint_writer(void *arg)
             atomic_fetch_add(&w->failures, 1);
             continue;
         }
-        for (int k = 0; k < TXNAPI_DISJOINT_KEYS; k++)
+        for (int k = 0; k < w->keys; k++)
         {
             char key[32];
-            const int n = snprintf(key, sizeof(key), "w%d-%04d-%04d", w->id, round, k);
+            const int n = snprintf(key, sizeof(key), "w%d-%04d-%06d", w->id, round, k);
             if (tidesdb_txn_put(txn, w->cf, (const uint8_t *)key, (size_t)n, (const uint8_t *)"v",
                                 1, -1) != TDB_SUCCESS)
                 atomic_fetch_add(&w->failures, 1);
@@ -614,7 +619,7 @@ static void *txnapi_disjoint_writer(void *arg)
 }
 
 /* committers that never write the same key never conflict, however their commits overlap */
-void test_txn_api_disjoint_commits_never_conflict(void)
+static void txnapi_run_disjoint_writers(const int rounds, const int keys)
 {
     (void)remove_directory(TXNAPI_DB_DIR);
     char dir[] = TXNAPI_DB_DIR;
@@ -628,6 +633,8 @@ void test_txn_api_disjoint_commits_never_conflict(void)
         writers[i].db = db;
         writers[i].cf = cf;
         writers[i].id = i;
+        writers[i].rounds = rounds;
+        writers[i].keys = keys;
         atomic_init(&writers[i].conflicts, 0);
         atomic_init(&writers[i].failures, 0);
         ASSERT_EQ(tdb_thread_start(&threads[i], txnapi_disjoint_writer, &writers[i]), 0);
@@ -641,11 +648,154 @@ void test_txn_api_disjoint_commits_never_conflict(void)
         failures += atomic_load(&writers[i].failures);
     }
     printf("  %d writers x %d commits of %d disjoint keys: %d conflicts, %d other failures\n",
-           TXNAPI_DISJOINT_WRITERS, TXNAPI_DISJOINT_ROUNDS, TXNAPI_DISJOINT_KEYS, conflicts,
-           failures);
+           TXNAPI_DISJOINT_WRITERS, rounds, keys, conflicts, failures);
     fflush(stdout);
     ASSERT_EQ(failures, 0);
     ASSERT_EQ(conflicts, 0);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(TXNAPI_DB_DIR);
+}
+
+void test_txn_api_disjoint_commits_never_conflict(void)
+{
+    txnapi_run_disjoint_writers(TXNAPI_DISJOINT_ROUNDS, TXNAPI_DISJOINT_KEYS);
+}
+
+/* two table loads of a hundred thousand keys each, committed at once with no key in common, both
+ * succeed. the run of hashed slots let a single such commit through but refused the second of two,
+ * since with that many keys in flight every run had a stranger in it */
+void test_txn_api_concurrent_wide_commits_both_succeed(void)
+{
+    txnapi_run_disjoint_writers(1, TXNAPI_WIDE_KEYS);
+}
+
+#define TXNAPI_ATOMIC_ROUNDS  3000 /* commits of the two-key batch the readers race */
+#define TXNAPI_ATOMIC_READERS 2
+
+/**
+ * txnapi_atomic_t
+ * what the readers of the batch-atomicity test share and count
+ * @param db the open database
+ * @param cf the family the batch is written to
+ * @param done set by the writer once its last batch has committed
+ * @param pairs reads that found both keys
+ * @param torn pairs whose two keys came from different batches
+ */
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    _Atomic(int) done;
+    _Atomic(long) pairs;
+    _Atomic(long) torn;
+} txnapi_atomic_t;
+
+/* the round a value was written in, which is what the two keys of one batch must agree on */
+static long txnapi_round_of(const uint8_t *value, size_t size)
+{
+    char text[32] = {0};
+    memcpy(text, value, size < sizeof(text) - 1 ? size : sizeof(text) - 1);
+    return strtol(text, NULL, 10);
+}
+
+static void *txnapi_atomic_writer(void *arg)
+{
+    txnapi_atomic_t *a = arg;
+    for (long round = 1; round <= TXNAPI_ATOMIC_ROUNDS; round++)
+    {
+        char value[32];
+        const int n = snprintf(value, sizeof(value), "%ld", round);
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(a->db, &txn) != TDB_SUCCESS) break;
+        (void)tidesdb_txn_put(txn, a->cf, (const uint8_t *)"a", 1, (const uint8_t *)value,
+                              (size_t)n, -1);
+        (void)tidesdb_txn_put(txn, a->cf, (const uint8_t *)"b", 1, (const uint8_t *)value,
+                              (size_t)n, -1);
+        (void)tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+    }
+    atomic_store(&a->done, 1);
+    return NULL;
+}
+
+static void *txnapi_atomic_reader(void *arg)
+{
+    txnapi_atomic_t *a = arg;
+    while (!atomic_load(&a->done))
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin_with_isolation(a->db, TDB_ISOLATION_SNAPSHOT, &txn) != TDB_SUCCESS)
+            continue;
+        uint8_t *va = NULL, *vb = NULL;
+        size_t la = 0, lb = 0;
+        const int ra = tidesdb_txn_get(txn, a->cf, (const uint8_t *)"a", 1, &va, &la);
+        const int rb = tidesdb_txn_get(txn, a->cf, (const uint8_t *)"b", 1, &vb, &lb);
+        if (ra == TDB_SUCCESS && rb == TDB_SUCCESS)
+        {
+            atomic_fetch_add(&a->pairs, 1);
+            if (txnapi_round_of(va, la) != txnapi_round_of(vb, lb)) atomic_fetch_add(&a->torn, 1);
+        }
+        free(va);
+        free(vb);
+        (void)tidesdb_txn_rollback(txn);
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+/* a committed batch is atomic to every reader: a snapshot transaction reading the two keys a batch
+ * writes together never sees one from an earlier batch than the other, however the reads race the
+ * apply */
+void test_txn_api_batch_is_atomic_to_readers(void)
+{
+    (void)remove_directory(TXNAPI_DB_DIR);
+    char dir[] = TXNAPI_DB_DIR;
+    tidesdb_t *db = txnapi_open(dir);
+    txnapi_atomic_t a;
+    a.db = db;
+    a.cf = txnapi_make_cf(db, TXNAPI_CF, TDB_ISOLATION_SNAPSHOT);
+    atomic_init(&a.done, 0);
+    atomic_init(&a.pairs, 0);
+    atomic_init(&a.torn, 0);
+
+    tdb_thread_t writer, readers[TXNAPI_ATOMIC_READERS];
+    ASSERT_EQ(tdb_thread_start(&writer, txnapi_atomic_writer, &a), 0);
+    for (int i = 0; i < TXNAPI_ATOMIC_READERS; i++)
+        ASSERT_EQ(tdb_thread_start(&readers[i], txnapi_atomic_reader, &a), 0);
+    tdb_thread_finish(&writer);
+    for (int i = 0; i < TXNAPI_ATOMIC_READERS; i++) tdb_thread_finish(&readers[i]);
+
+    printf("  %ld pair reads, %ld torn\n", atomic_load(&a.pairs), atomic_load(&a.torn));
+    fflush(stdout);
+    ASSERT_TRUE(atomic_load(&a.pairs) > 0);
+    ASSERT_EQ(atomic_load(&a.torn), 0);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(TXNAPI_DB_DIR);
+}
+
+/* one commit of a hundred thousand keys, the size of a table load, never refuses itself: its claims
+ * are its own, however many of them there are */
+void test_txn_api_wide_commit_never_conflicts_with_itself(void)
+{
+    (void)remove_directory(TXNAPI_DB_DIR);
+    char dir[] = TXNAPI_DB_DIR;
+    tidesdb_t *db = txnapi_open(dir);
+    tidesdb_column_family_t *cf = txnapi_make_cf(db, TXNAPI_CF, TDB_ISOLATION_SNAPSHOT);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn), TDB_SUCCESS);
+    for (int k = 0; k < TXNAPI_WIDE_KEYS; k++)
+    {
+        char key[16];
+        const int n = snprintf(key, sizeof(key), "i%06d", k);
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (const uint8_t *)key, (size_t)n, (const uint8_t *)"v", 1, -1),
+            TDB_SUCCESS);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
 
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(TXNAPI_DB_DIR);
@@ -667,6 +817,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_contains_answers_where_the_read_answers, tests_passed);
     RUN_TEST(test_read_snapshot_reflects_the_isolation_level, tests_passed);
     RUN_TEST(test_txn_api_disjoint_commits_never_conflict, tests_passed);
+    RUN_TEST(test_txn_api_concurrent_wide_commits_both_succeed, tests_passed);
+    RUN_TEST(test_txn_api_wide_commit_never_conflicts_with_itself, tests_passed);
+    RUN_TEST(test_txn_api_batch_is_atomic_to_readers, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

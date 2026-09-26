@@ -106,21 +106,6 @@ void test_writeset_truncate(void)
     tidesdb_writeset_free(ws);
 }
 
-/* contains reports whether a key is written, scoped by cf-index */
-void test_writeset_contains(void)
-{
-    tidesdb_writeset_t *ws = tidesdb_writeset_create();
-    ASSERT_TRUE(ws != NULL);
-    put(ws, 0, "x", "v", 0);
-    put(ws, 0, "y", NULL, TDB_WAL_ENTRY_TOMBSTONE); /* a tombstone still counts as written */
-
-    ASSERT_EQ(tidesdb_writeset_contains(ws, 0, (const uint8_t *)"x", 1), 1);
-    ASSERT_EQ(tidesdb_writeset_contains(ws, 0, (const uint8_t *)"y", 1), 1);
-    ASSERT_EQ(tidesdb_writeset_contains(ws, 0, (const uint8_t *)"z", 1), 0);
-    ASSERT_EQ(tidesdb_writeset_contains(ws, 1, (const uint8_t *)"x", 1), 0); /* other cf */
-    tidesdb_writeset_free(ws);
-}
-
 /* growth past the initial capacity keeps every op intact */
 void test_writeset_growth(void)
 {
@@ -150,7 +135,6 @@ void test_writeset_null_safe(void)
     ASSERT_EQ(put(NULL, 0, "k", "v", 0), TDB_ERR_INVALID_ARGS);
     tidesdb_writeset_op_t o;
     ASSERT_EQ(tidesdb_writeset_lookup(NULL, 0, (const uint8_t *)"k", 1, &o), 0);
-    ASSERT_EQ(tidesdb_writeset_contains(NULL, 0, (const uint8_t *)"k", 1), 0);
     tidesdb_writeset_truncate(NULL, 0);
     tidesdb_writeset_free(NULL);
 
@@ -238,7 +222,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_writeset_ryow, tests_passed);
     RUN_TEST(test_writeset_tombstone_no_value, tests_passed);
     RUN_TEST(test_writeset_truncate, tests_passed);
-    RUN_TEST(test_writeset_contains, tests_passed);
     RUN_TEST(test_writeset_growth, tests_passed);
     RUN_TEST(test_writeset_null_safe, tests_passed);
     RUN_TEST(test_writeset_keeps_a_live_entry_with_an_empty_value, tests_passed);

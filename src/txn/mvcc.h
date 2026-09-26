@@ -13,170 +13,144 @@
 #include "db.h" /* TDB_MAX_RANGE_BOUND_SIZE, the public limit this table's slot width sets */
 
 /* the MVCC clock -- the whole basis of which writes a read sees. it owns the monotonic sequence
- * counter, the commit-status ring that records whether each recent seq committed, and the
- * write-reservation table that gives snapshot/serializable commits their first-committer-wins
- * conflict check. it is pure: it knows sequence numbers and precomputed key hashes, not engine
- * structs, so it builds and unit-tests standalone. the transaction manager draws seqs and snapshots
- * from it, marks a commit's seq committed, filters reads through its visibility predicate, and
- * drives the reservation over a txn's write set. */
+ * counter, the commit-status ring that records whether each recent seq committed, the watermark
+ * every reader's ceiling is taken from, and the claim set that gives commits their write-write and
+ * read-write checks against one another, over keys and over intervals alike. it is pure: it knows
+ * sequence numbers, key bytes and precomputed key hashes, not engine structs, so it builds and
+ * unit-tests standalone. the transaction manager draws seqs and snapshots from it, claims and
+ * validates a txn's keys and intervals through it, and marks a commit's seq committed. */
 
-/* the commit-status ring records the last this-many sequence numbers; older seqs are treated as
- * committed by the eviction rule, which holds for every sequence a commit drew and not for one a
- * prepare is still sitting on -- those are held below and stay in flight however far they fall */
+/* the commit-status ring records the last this-many sequence numbers, each as in progress,
+ * committed or aborted. the ring is what the watermark reads, and it is read only above the
+ * watermark; no sequence is drawn a ring's width above it, so a slot always describes the sequence
+ * asked about */
 #define TDB_MVCC_COMMIT_RING_SIZE 65536
 
-/* prepared batches whose sequence is exempt from the eviction rule at once. a two-phase batch keeps
- * its sequence in flight for as long as phase two leaves it undecided, which has no bound and so
- * outlasts the ring, and each undecided batch holds a slot until it is decided. a prepare that
- * cannot take one is refused rather than left holding keys nothing would defend */
-#define TDB_MVCC_MAX_PREPARED_HOLDS 64
+/* the in-flight claim set. every commit at repeatable read and above claims the keys it writes
+ * before it draws its sequence and validates after, and a prepare keeps its claims until phase two
+ * decides it. a claim is a node the committer owns, chained from the bucket its key hashes to and
+ * compared by bytes, so the set has no capacity of its own and never mistakes one key for another.
+ * the chains are guarded by striped locks; a stripe is a set of buckets sharing one */
+#define TDB_MVCC_CLAIM_BUCKETS ((uint32_t)1 << 18)
+#define TDB_MVCC_CLAIM_STRIPES ((uint32_t)1 << 12)
 
-/* number of write-reservation slots and the mask to index one from a key hash */
-#define TDB_MVCC_RESERVATION_SLOTS ((uint32_t)1 << 20)
-#define TDB_MVCC_RESERVATION_MASK  (TDB_MVCC_RESERVATION_SLOTS - 1)
+/* a chain longer than this is refused rather than walked; nothing but a fault reaches it */
+#define TDB_MVCC_CLAIM_WALK_MAX ((uint32_t)1 << 20)
 
-/* a key's reservation lives in one of the consecutive slots starting at its hash slot, its run, and
- * every operation on a key walks the run. one slot per key left a committer whose slot another key
- * held in flight with nowhere to record its own claim, and leaving a claim unrecorded would let a
- * third committer of the same key through, so it aborted on every such collision. with a run the
- * claim goes in the next free slot and only a same-fingerprint occupant in flight is a conflict.
- * four slots span at most two cache lines and put a run full of strangers beyond reach */
-#define TDB_MVCC_RESERVATION_PROBES 4
+/* the commits in flight an interval is checked against before the walk refuses rather than trusts;
+ * the list holds the committers of the moment, so nothing but a fault reaches it */
+#define TDB_MVCC_INFLIGHT_WALK_MAX ((uint32_t)1 << 16)
 
-/* a reservation slot packs a 16-bit key fingerprint (high bits) and the claiming 48-bit commit_seq
- * (low bits); the fingerprint tells a real same-key conflict from a hash collision using the slot
- * alone, without ever reading another committer's applied version */
-#define TDB_MVCC_RES_SEQ_BITS 48
+/* what a claim is for. a write claim is what first-committer-wins and read validation look for; a
+ * read claim is taken only by a prepare at repeatable read or above, for the keys it read, so a
+ * writer of one of them is refused while the prepare is undecided -- the batch cannot be the one to
+ * yield once it has voted */
+#define TDB_MVCC_CLAIM_WRITE 0
+#define TDB_MVCC_CLAIM_READ  1
+
+/* what an owner's sequence reads as while it is between drawing and publishing, and once its batch
+ * is prepared and will commit above everything current */
+#define TDB_MVCC_SEQ_DRAWING (UINT64_MAX - 1)
+#define TDB_MVCC_SEQ_FUTURE  UINT64_MAX
+
+/* intervals held at once, by commits in flight and two-phase transactions in doubt. both are rare,
+ * so a table this size is not a bound a real workload meets -- and a commit that cannot take a slot
+ * reports a conflict rather than proceeding unchecked */
+#define TDB_MVCC_MAX_RANGE_RESERVATIONS 32
+
+/* the longest bound the table stores, which is the public limit on an interval delete's bounds --
+ * the two are the same number because this table is the reason for it. a bound past it is turned
+ * away at the api, so an interval refused here is one the table had no free slot for */
+#define TDB_MVCC_MAX_RANGE_BYTES TDB_MAX_RANGE_BOUND_SIZE
 
 typedef struct tidesdb_mvcc tidesdb_mvcc_t;
+typedef struct tidesdb_mvcc_claim tidesdb_mvcc_claim_t;
+typedef struct tidesdb_mvcc_commit tidesdb_mvcc_commit_t;
 
 /**
- * tidesdb_mvcc_stats_t
- * a point-in-time snapshot of MVCC clock activity, for observability
- * @param seqs_assigned commit sequences drawn (roughly the number of commits started)
- * @param commits_marked sequences marked committed
- * @param reservations_won write reservations that claimed their slot
- * @param reservations_lost write reservations that lost to a concurrent writer (write-write
- * conflict)
+ * tidesdb_mvcc_commit
+ * one commit's claims and the sequence they are ordered by, in flight from the claim to the release
+ * @param seq 0 until the draw, TDB_MVCC_SEQ_DRAWING during it, the drawn sequence after, and
+ *            TDB_MVCC_SEQ_FUTURE once the batch is prepared
+ * @param claims the claims, an array the owner keeps in place until tidesdb_mvcc_unclaim returns;
+ *               sorted by family and key by the claim call
+ * @param n_claims how many
+ * @param next_inflight the next commit in the clock's list of commits in flight, which is what an
+ *                      interval is checked against
+ * @param held non-zero while the commit is in flight -- from the claim call to the release --
+ *             whether or not it holds any key, since it may hold intervals alone
  */
-typedef struct
+struct tidesdb_mvcc_commit
 {
-    uint64_t seqs_assigned;
-    uint64_t commits_marked;
-    uint64_t reservations_won;
-    uint64_t reservations_lost;
-} tidesdb_mvcc_stats_t;
+    _Atomic(uint64_t) seq;
+    tidesdb_mvcc_claim_t *claims;
+    int n_claims;
+    tidesdb_mvcc_commit_t *next_inflight;
+    int held;
+};
+
+/**
+ * tidesdb_mvcc_claim
+ * one key a commit holds, chained from the bucket its hash selects
+ * @param hash the key's hash, which selects the bucket and screens a comparison
+ * @param owner the commit holding it
+ * @param key the key bytes, borrowed from the owner for the claim's life
+ * @param key_size length of key
+ * @param cf_index the family the key belongs to
+ * @param kind TDB_MVCC_CLAIM_WRITE or TDB_MVCC_CLAIM_READ
+ * @param next the next claim in the bucket's chain
+ */
+struct tidesdb_mvcc_claim
+{
+    uint64_t hash;
+    tidesdb_mvcc_commit_t *owner;
+    const uint8_t *key;
+    uint32_t key_size;
+    uint32_t cf_index;
+    uint8_t kind;
+    tidesdb_mvcc_claim_t *next;
+};
 
 /**
  * tidesdb_mvcc_create
- * create the MVCC clock with the sequence counter at 1, an all-in-progress commit ring, and an
- * empty reservation table
+ * create the MVCC clock with the sequence counter at 1, an empty commit ring, the watermark at
+ * zero, and an empty claim set
  * @return the clock, or NULL on allocation failure
  */
 tidesdb_mvcc_t *tidesdb_mvcc_create(void);
 
 /**
  * tidesdb_mvcc_destroy
- * free the MVCC clock and its ring and reservation table
+ * free the MVCC clock, its ring and its claim set; the claims themselves belong to their owners
  * @param m the clock, may be NULL
  */
 void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m);
 
-/* interval reservations held at once. one belongs to a commit in flight or a two-phase transaction
- * in doubt, both of which are rare, so a table this size is not a bound a real workload meets --
- * and a commit that cannot take a slot reports a conflict rather than proceeding unchecked */
-#define TDB_MVCC_MAX_RANGE_RESERVATIONS 32
-
-/* the longest bound a reservation stores, which is the public limit on an interval delete's bounds
- * -- the two are the same number because this table is the reason for it. a bound past it is turned
- * away at the api, so a reservation refused here is one the table had no free slot for */
-#define TDB_MVCC_MAX_RANGE_BYTES TDB_MAX_RANGE_BOUND_SIZE
-
-/**
- * tidesdb_mvcc_reserve_range
- * hold an interval against concurrent point writes for as long as this transaction is unresolved.
- * the key-hash reservation a point write takes cannot express an interval, so this is what a range
- * delete claims instead -- and it is what carries a two-phase range delete through the window
- * between its prepare and its commit, where the commit gate cannot help because that window has no
- * bound
- * @param m the clock
- * @param cf_index the family the interval belongs to
- * @param lo the inclusive lower bound
- * @param lo_size length of lo
- * @param hi the exclusive upper bound, or NULL with hi_size 0 for open above
- * @param hi_size length of hi, 0 for open above
- * @param owner_seq the sequence this transaction reserved at, its identity here
- * @return 1 when the interval is held, 0 when another transaction already holds one meeting it, a
- *         bound is longer than the table stores, or the table is full
- */
-int tidesdb_mvcc_reserve_range(tidesdb_mvcc_t *m, uint32_t cf_index, const uint8_t *lo,
-                               size_t lo_size, const uint8_t *hi, size_t hi_size,
-                               uint64_t owner_seq);
-
-/**
- * tidesdb_mvcc_release_range
- * drop every interval a transaction holds, once it is resolved either way
- * @param m the clock
- * @param owner_seq the sequence the intervals were reserved at
- */
-void tidesdb_mvcc_release_range(tidesdb_mvcc_t *m, uint64_t owner_seq);
-
-/**
- * tidesdb_mvcc_range_blocks
- * whether another transaction holds an interval covering this key. a database with none held
- * answers from a single relaxed load, which is every database that never deletes a range
- * @param m the clock
- * @param cf_index the family the key belongs to
- * @param key the key a point write is about to reserve
- * @param key_size length of key
- * @param owner_seq the asking transaction's sequence, so its own intervals do not block it
- * @return non-zero when some other transaction's interval covers the key
- */
-int tidesdb_mvcc_range_blocks(const tidesdb_mvcc_t *m, uint32_t cf_index, const uint8_t *key,
-                              size_t key_size, uint64_t owner_seq);
-
-/**
- * tidesdb_mvcc_commit_gate_lock
- * hold the database's commit gate for the length of one commit, from before its conflict scan until
- * its batch is marked visible. an ordinary commit holds it shared and so never waits on another;
- * one carrying a prefix delete holds it exclusively and runs alone
- *
- * this is what closes the window the reservation table cannot. a point write reserves the hash of
- * the key it writes, and a prefix delete has no key to hash -- it writes an interval -- so the two
- * can never collide there however they are ordered. running the interval alone is what makes the
- * conflict scan's answer still true by the time the delete commits
- * @param m the clock, or NULL for a no-op
- * @param exclusive non-zero for a batch containing a prefix delete, zero for any other
- */
-void tidesdb_mvcc_commit_gate_lock(tidesdb_mvcc_t *m, int exclusive);
-
-/**
- * tidesdb_mvcc_commit_gate_unlock
- * release the commit gate
- * @param m the clock, or NULL for a no-op
- */
-void tidesdb_mvcc_commit_gate_unlock(tidesdb_mvcc_t *m);
-
-/**
- * tidesdb_mvcc_next_seq
- * draw and consume the next commit sequence number
- * @param m the clock
- * @return the assigned sequence number (monotonic, starting at 1)
- */
-uint64_t tidesdb_mvcc_next_seq(tidesdb_mvcc_t *m);
-
 /**
  * tidesdb_mvcc_current_seq
- * the next sequence number that would be assigned; a snapshot taken at begin is this minus one, and
- * the highest seq already assigned is this minus one
+ * the next sequence number that would be assigned; the highest seq already drawn is this minus one,
+ * which may still be in flight, so a reader's ceiling comes from tidesdb_mvcc_visible_seq instead
  * @param m the clock
  * @return the current value of the sequence counter
  */
 uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m);
 
 /**
+ * tidesdb_mvcc_visible_seq
+ * the watermark, the highest sequence below which every drawn sequence has committed or aborted.
+ * a ceiling taken from it never admits a sequence still in flight, so a snapshot holds still for
+ * its whole life and no reader sees a batch half applied. a sequence that committed above it is
+ * not yet in any new ceiling, which is the lag of an in-order publish, bounded by the slowest
+ * commit in flight
+ * @param m the clock, or NULL for zero
+ * @return the watermark
+ */
+uint64_t tidesdb_mvcc_visible_seq(const tidesdb_mvcc_t *m);
+
+/**
  * tidesdb_mvcc_mark
- * record whether a sequence has committed in the ring, advancing the ring high-water mark
+ * record a drawn sequence in the ring as in progress, or as committed once its batch has been
+ * applied in full, and on committed carry the watermark forward over every decided sequence
  * @param m the clock
  * @param seq the sequence to mark (a zero seq is ignored)
  * @param committed non-zero to mark committed, zero to mark in-progress
@@ -184,125 +158,217 @@ uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m);
 void tidesdb_mvcc_mark(tidesdb_mvcc_t *m, uint64_t seq, int committed);
 
 /**
- * tidesdb_mvcc_committed
- * whether a sequence counts as committed -- its ring slot reads committed, or it has fallen more
- * than a ring capacity behind the high-water mark (evicted, so it already applied and must be
- * committed)
- * @param m the clock
- * @param seq the sequence to test
- * @return 1 if committed, 0 otherwise (including a zero seq)
+ * tidesdb_mvcc_watermark_ref
+ * the watermark itself, for a module that has to wait on it without knowing the clock -- the flush,
+ * which builds only once every sequence in a memtable is decided
+ * @param m the clock, which must outlive every use of the reference
+ * @return the watermark, read with an acquire load, or NULL for a NULL clock
  */
-int tidesdb_mvcc_committed(const tidesdb_mvcc_t *m, uint64_t seq);
+const _Atomic(uint64_t) *tidesdb_mvcc_watermark_ref(const tidesdb_mvcc_t *m);
 
 /**
- * tidesdb_mvcc_visible
- * the full read-visibility predicate: a nonzero seq at or below the reader's snapshot that has
- * committed
+ * tidesdb_mvcc_wait_visible
+ * wait until the watermark has passed a committed sequence, so that a commit returns only once its
+ * writes are inside every ceiling taken afterwards, the caller's own next transaction included. the
+ * wait is on the commits in flight below seq, each of which decides its sequence within its own
+ * commit window
  * @param m the clock
- * @param seq the version's sequence number
- * @param snapshot the reader's snapshot sequence
- * @return 1 if the version is visible to the reader, 0 otherwise
+ * @param seq the sequence this caller marked committed
  */
-int tidesdb_mvcc_visible(const tidesdb_mvcc_t *m, uint64_t seq, uint64_t snapshot);
+void tidesdb_mvcc_wait_visible(const tidesdb_mvcc_t *m, uint64_t seq);
+
+/**
+ * tidesdb_mvcc_mark_aborted
+ * record that a drawn sequence will never commit, and carry the watermark forward. every sequence
+ * drawn must end here or in a committed mark, since the watermark waits on each one; a prepare's
+ * sequence ends here as soon as its record is durable, because phase two commits at a fresh one
+ * @param m the clock
+ * @param seq the sequence to mark (a zero seq is ignored)
+ */
+void tidesdb_mvcc_mark_aborted(tidesdb_mvcc_t *m, uint64_t seq);
 
 /**
  * tidesdb_mvcc_reseed
- * after recovery, advance the clock so the next seq follows the highest recovered seq and the ring
- * high-water covers it, so every recovered seq reads committed via the eviction rule
+ * after recovery, advance the clock so the next seq follows the highest recovered seq and stand
+ * the watermark at it so every recovered version is readable
  * @param m the clock
  * @param max_recovered_seq the highest sequence seen during recovery
  */
 void tidesdb_mvcc_reseed(tidesdb_mvcc_t *m, uint64_t max_recovered_seq);
 
 /**
- * tidesdb_mvcc_get_stats
- * snapshot the clock's activity counters
- * @param m the clock
- * @param out receives the counters (zeroed if m is NULL)
+ * tidesdb_mvcc_commit_init
+ * arm a commit's claim record over an array of claims the owner keeps in place until unclaimed
+ * @param commit the record, owned by the caller
+ * @param claims the claims, filled with tidesdb_mvcc_claim_init; may be NULL when n_claims is 0
+ * @param n_claims how many
  */
-void tidesdb_mvcc_get_stats(const tidesdb_mvcc_t *m, tidesdb_mvcc_stats_t *out);
-
-/* a fingerprint is only a candidate identity; checking the actual key stays in the txn layer */
-typedef enum
-{
-    TDB_MVCC_RES_CONFLICT = 0,
-    TDB_MVCC_RES_WON = 1,
-    TDB_MVCC_RES_REFRESH,
-    TDB_MVCC_RES_CHECK_KEY
-} tidesdb_mvcc_reservation_result_t;
+void tidesdb_mvcc_commit_init(tidesdb_mvcc_commit_t *commit, tidesdb_mvcc_claim_t *claims,
+                              int n_claims);
 
 /**
- * tidesdb_mvcc_reserve
- * try to claim one write key's reservation in its run without mistaking a fingerprint for a full
- * key
- * @param m the clock
- * @param key_hash the key hash supplying the run and fingerprint
- * @param commit_seq this committer's sequence number
- * @param read_base the version read for this key, or the snapshot for a blind write
- * @param min_snapshot the global oldest live snapshot, possibly stale low
- * @param observed out, the exact packed occupant on CHECK_KEY; may be NULL if not used
- * @return WON, CONFLICT for a same-fingerprint writer in flight or a run with no free slot, REFRESH
- *         for a committed occupant above the floor that blocks the claim, or CHECK_KEY for a
- *         same-fingerprint committed occupant at or below the floor
+ * tidesdb_mvcc_claim_init
+ * fill one claim; the key bytes are borrowed and must outlive the claim
+ * @param claim the claim to fill
+ * @param cf_index the family the key belongs to
+ * @param key the key bytes
+ * @param key_size length of key
+ * @param kind TDB_MVCC_CLAIM_WRITE or TDB_MVCC_CLAIM_READ
+ * @param hash the key's 64-bit hash over the family and the bytes
  */
-tidesdb_mvcc_reservation_result_t tidesdb_mvcc_reserve(tidesdb_mvcc_t *m, uint64_t key_hash,
-                                                       uint64_t commit_seq, uint64_t read_base,
-                                                       uint64_t min_snapshot, uint64_t *observed);
+void tidesdb_mvcc_claim_init(tidesdb_mvcc_claim_t *claim, uint32_t cf_index, const uint8_t *key,
+                             uint32_t key_size, uint8_t kind, uint64_t hash);
 
 /**
- * tidesdb_mvcc_reserve_checked
- * claim the slot in the key's run that still holds the occupant checked against the actual key
+ * tidesdb_mvcc_claim
+ * enter a commit into the set of commits in flight and take every claim of it, in one order shared
+ * by every commit, or none of them. a write claim is refused by another owner's read claim on the
+ * key, and, when this commit promises first-committer-wins, by another owner's write claim on it or
+ * an interval another owner holds over it; a read claim is never refused. a refusal leaves nothing
+ * behind. the claims are taken before the commit draws its sequence, which is what lets a validator
+ * with a lower sequence be sure of seeing them. a commit with no claims still enters the set, so
+ * the intervals it holds alone can be checked against
  * @param m the clock
- * @param key_hash the same key hash passed to reserve
- * @param commit_seq this committer's sequence number
- * @param observed the CHECK_KEY ticket; the caller must have proved no newer actual-key version
- *                 above read_base after receiving it, before calling this function
- * @return 1 if claimed, 0 if another writer changed the slot or the ticket is invalid
+ * @param commit the armed record, whose claims are sorted in place
+ * @param first_committer_wins non-zero for snapshot and serializable, zero for repeatable read
+ * @return 1 when every claim holds, 0 when one was refused
  */
-int tidesdb_mvcc_reserve_checked(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq,
-                                 uint64_t observed);
+int tidesdb_mvcc_claim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit, int first_committer_wins);
 
 /**
- * tidesdb_mvcc_prepared_hold
- * hold seq in flight past the ring's eviction rule until the batch that drew it is decided
+ * tidesdb_mvcc_claim_range
+ * hold an interval a commit deletes against every other commit in flight, once its keys are claimed
+ * and before its sequence is drawn. under first-committer-wins the interval is refused when another
+ * owner holds an interval meeting it or a claim of any kind on a key inside it -- a writer in
+ * flight it would overwrite, or a prepared reader it would invalidate; without that promise it is
+ * entered and refuses nothing, as a repeatable-read write claim is, so the writers that meet it
+ * decide. a bound longer than the table stores or a full table refuses it either way. the hold is
+ * entered before the check, so a point writer claiming a key inside it in the same instant finds
+ * it, and one of the two yields whichever way they interleave
  * @param m the clock
- * @param seq the sequence the prepare drew and reserves its keys with, which must not be zero
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, or TDB_ERR_CONFLICT when every hold slot is taken
+ * @param commit the record, already entered by tidesdb_mvcc_claim
+ * @param cf_index the family the interval belongs to
+ * @param lo the inclusive lower bound
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound, or NULL with hi_size 0 for open above
+ * @param hi_size length of hi, 0 for open above
+ * @param first_committer_wins non-zero for snapshot and serializable, zero for repeatable read and
+ *                             for a batch adopted after a restart, which is registered rather than
+ *                             contested
+ * @return 1 when the interval is held, 0 when it was refused
  */
-int tidesdb_mvcc_prepared_hold(tidesdb_mvcc_t *m, uint64_t seq);
+int tidesdb_mvcc_claim_range(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit, uint32_t cf_index,
+                             const uint8_t *lo, size_t lo_size, const uint8_t *hi, size_t hi_size,
+                             int first_committer_wins);
 
 /**
- * tidesdb_mvcc_prepared_release
- * let go of seq once phase two has decided the batch, so the eviction rule governs it again
+ * tidesdb_mvcc_draw
+ * draw and mark in progress the commit's sequence, publishing it on the record. the record reads as
+ * drawing between the two, so a validator that meets it waits the few instructions out rather than
+ * mistaking an undrawn sequence for a higher one
  * @param m the clock
- * @param seq the sequence handed to tidesdb_mvcc_prepared_hold; one never held is ignored
+ * @param commit the record, or NULL to draw a sequence that no claim is ordered by
+ * @return the drawn sequence
  */
-void tidesdb_mvcc_prepared_release(tidesdb_mvcc_t *m, uint64_t seq);
+uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit);
 
 /**
- * tidesdb_mvcc_release
- * release a write key's reservation, wherever in its run it sits, if it still holds commit_seq; a
- * slot now owned by a newer committer is left alone
- * @param m the clock
- * @param key_hash the 64-bit hash of the write key
- * @param commit_seq the sequence this committer claimed the slot with
+ * tidesdb_mvcc_commit_prepared
+ * mark a commit's claims and intervals as belonging to a prepared batch, whose commit will come at
+ * a sequence above everything current. a reader of one of its keys is serialized before it and its
+ * read stands; a writer of one still meets its write claims, and a writer of a key it read meets
+ * its read claims
+ * @param commit the record of the prepared batch
  */
-void tidesdb_mvcc_release(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t commit_seq);
+void tidesdb_mvcc_commit_prepared(tidesdb_mvcc_commit_t *commit);
 
 /**
- * tidesdb_mvcc_reassign
- * move a write key's reservation from the sequence that claimed it to the one that finally
- * committed it, keeping the hold unbroken across the change. two-phase commit needs this because a
- * prepare claims the slot with the sequence it drew then, while the batch commits at a fresh
- * sequence decided in phase two -- a slot left naming the prepare's sequence names one that is
- * never resolved, and every later writer of that key reads it as an in-flight committer and takes a
- * conflict that has no writer behind it
+ * tidesdb_mvcc_read_stale
+ * whether another commit in flight, under a sequence lower than this commit's, holds a write claim
+ * on a key this commit read or an interval covering it -- the writer whose version this commit read
+ * before it existed, or the delete that took what it read. asked after this commit's draw, for each
+ * key of its read set, beside the store's own answer
  * @param m the clock
- * @param key_hash the 64-bit hash of the write key
- * @param from_seq the sequence currently holding the slot
- * @param to_seq the sequence to hand it to
+ * @param commit this commit, with its sequence drawn
+ * @param cf_index the family the key belongs to
+ * @param key the key bytes
+ * @param key_size length of key
+ * @param hash the key's hash, as given to the claims
+ * @return 1 when such a commit holds the key, 0 otherwise
  */
-void tidesdb_mvcc_reassign(tidesdb_mvcc_t *m, uint64_t key_hash, uint64_t from_seq,
-                           uint64_t to_seq);
+int tidesdb_mvcc_read_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
+                            uint32_t cf_index, const uint8_t *key, uint32_t key_size,
+                            uint64_t hash);
+
+/**
+ * tidesdb_mvcc_range_stale
+ * whether another commit in flight, under a sequence lower than this commit's, holds a write claim
+ * on a key inside an interval this commit scanned or deletes, or an interval meeting it -- a
+ * version that will exist inside the interval below this commit's position, which the store cannot
+ * show yet. for an interval this commit deletes, another owner's read claim inside it refuses it at
+ * any sequence, since a prepared reader cannot be the one to yield. asked after this commit's draw
+ * @param m the clock
+ * @param commit this commit, with its sequence drawn
+ * @param cf_index the family the interval belongs to
+ * @param lo the inclusive lower bound
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound, or NULL with hi_size 0 for open above
+ * @param hi_size length of hi
+ * @param writing non-zero for an interval this commit deletes, zero for one it scanned
+ * @return 1 when such a commit holds something inside the interval, 0 otherwise
+ */
+int tidesdb_mvcc_range_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
+                             uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                             const uint8_t *hi, size_t hi_size, int writing);
+
+/**
+ * tidesdb_mvcc_write_blocked
+ * whether a key this commit writes is held against it -- by another owner's read claim on it, a
+ * prepared batch that read it and cannot yield, at any level; or, when this commit promises
+ * first-committer-wins, by an interval another commit in flight holds over it under a sequence
+ * lower than this commit's. asked after this commit's draw, for each key of its write set
+ * @param m the clock
+ * @param commit this commit, with its sequence drawn
+ * @param cf_index the family the key belongs to
+ * @param key the key bytes
+ * @param key_size length of key
+ * @param hash the key's hash, as given to the claims
+ * @param first_committer_wins non-zero for snapshot and serializable, zero for repeatable read
+ * @return 1 when the key is held against this commit, 0 otherwise
+ */
+int tidesdb_mvcc_write_blocked(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
+                               uint32_t cf_index, const uint8_t *key, uint32_t key_size,
+                               uint64_t hash, int first_committer_wins);
+
+/**
+ * tidesdb_mvcc_unclaim
+ * drop every claim and interval of a commit and take it out of the set in flight, once its sequence
+ * is decided or its batch rolled back; the claims array is the caller's to free afterwards
+ * @param m the clock
+ * @param commit the record; one that never entered the set is a no-op
+ */
+void tidesdb_mvcc_unclaim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit);
+
+/**
+ * tidesdb_mvcc_holds
+ * whether a commit is in flight -- entered by tidesdb_mvcc_claim and not yet released -- and so has
+ * something for tidesdb_mvcc_unclaim or tidesdb_mvcc_orphan_claims to do
+ * @param commit the record, or NULL for zero
+ * @return 1 when in flight, 0 otherwise
+ */
+int tidesdb_mvcc_holds(const tidesdb_mvcc_commit_t *commit);
+
+/**
+ * tidesdb_mvcc_orphan_claims
+ * keep a prepared batch's claims and intervals held after the handle holding them is freed
+ * undecided. the batch is durable and a later open may still commit it, so a write landing under
+ * one of its keys now would be overwritten by a decision made afterwards; the clock takes copies of
+ * the claims, keys included, re-owns the intervals, and holds them for its own life in the handle's
+ * place. the caller's claims are unlinked and may be freed
+ * @param m the clock
+ * @param commit the prepared batch's record, whose claims are given up either way
+ * @return 1 when the copies hold, 0 when they could not be made and the keys are left unheld
+ */
+int tidesdb_mvcc_orphan_claims(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit);
 
 #endif /* __TIDESDB_TXN_MVCC_H__ */

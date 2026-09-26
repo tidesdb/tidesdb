@@ -182,6 +182,24 @@ int tdb_txn_get_notrack(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
                         size_t *value_size);
 
 /**
+ * tdb_txn_record_scan
+ * record the interval a scan covered into the conflict footprint, at the transaction's snapshot, so
+ * the commit refuses a key another commit put inside it -- a phantom. kept only by the levels that
+ * validate their reads; at every other level the call is a no-op
+ * @param txn the transaction the scan belonged to
+ * @param cf_index the scanned column family's prefix index
+ * @param lo the inclusive lower bound of what was covered; a bound below every key is one zero byte
+ * @param lo_size length of lo, greater than zero
+ * @param hi the exclusive upper bound, or NULL with hi_size 0 when the scan ran to the end
+ * @param hi_size length of hi
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL txn or an empty lower bound, or
+ *         TDB_ERR_MEMORY when the footprint could not be kept and isolation can no longer be
+ * promised
+ */
+int tdb_txn_record_scan(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                        const uint8_t *hi, size_t hi_size);
+
+/**
  * tdb_txn_contains
  * whether a key is present (a non-tracking existence probe that frees any value internally)
  * @param txn the transaction
@@ -317,8 +335,9 @@ int tdb_txn_rollback_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend);
  * tdb_txn_adopt_prepared
  * rebuild a transaction recovery found durably prepared but undecided, so the coordinator resolves
  * it through the same phase-two calls a live prepared transaction uses. it holds no snapshot and
- * joins no registry, since the process that took them is gone; only the batch and its sequence
- * survive
+ * joins no registry, since the process that took them is gone, but it holds its keys, intervals
+ * and reads again exactly as a live prepare does, so a writer of one of them is refused until the
+ * coordinator decides
  * @param clock the borrowed MVCC clock, marked when phase two commits
  * @param xid the transaction id from the PREPARE record, copied here
  * @param xid_size length of xid, must be greater than zero
@@ -326,11 +345,15 @@ int tdb_txn_rollback_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend);
  *                owned by the caller, which must outlive the returned transaction
  * @param count number of entries
  * @param commit_seq the sequence the batch commits at, taken when it originally prepared
+ * @param reads the keys the batch read, from the record written ahead of its PREPARE, whose bytes
+ *              the caller keeps alive as it does the entries'; NULL when the record carried none
+ * @param read_count number of read keys
  * @return the prepared transaction, or NULL on bad args or allocation failure
  */
 tdb_txn_t *tdb_txn_adopt_prepared(tidesdb_mvcc_t *clock, const uint8_t *xid, size_t xid_size,
                                   const tidesdb_wal_entry_t *entries, int count,
-                                  uint64_t commit_seq);
+                                  uint64_t commit_seq, const tidesdb_wal_entry_t *reads,
+                                  int read_count);
 
 /**
  * tdb_txn_commit_seq

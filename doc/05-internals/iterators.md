@@ -151,10 +151,19 @@ Which snapshot depends on the isolation level, and it is the same one a point re
 transaction resolves against — `txn_read_snapshot`, not the begin sequence unconditionally.
 Repeatable-read, snapshot and serializable transactions carry a snapshot drawn at begin and the
 iterator reads at that, so every scan in the transaction sees one instant. A read-committed
-transaction holds no such snapshot, so the iterator draws the current sequence when it is created:
-it sees everything committed before it started, and successive scans in one transaction can
-legitimately differ. Read-uncommitted reads at the maximum sequence, which is what makes another
+transaction holds no such snapshot, so the iterator takes the watermark when it is created: it
+sees everything committed and published before it started, and successive scans in one
+transaction can legitimately differ. Read-uncommitted reads at the maximum sequence, which is what makes another
 transaction's uncommitted versions visible to it.
+
+At repeatable read and serializable the public iterator also keeps its **footprint**: the interval
+of keys it has covered, widened by every positioning call — a seek covers from its target, a step
+covers the key it lands on, and a step off either end covers to the range bound or to the end of the
+family. When the iterator is freed the interval goes into the transaction's read set, and the
+commit validates it as it validates a key read: against the store for a version inside it above the
+snapshot, and against the commits in flight for a write claim inside it sequenced below. A footprint
+that cannot be kept, for want of memory, makes the transaction fail rather than commit unchecked.
+The other levels keep none, and the per-cf iterator underneath knows nothing of it.
 
 Reaching for the begin sequence directly would be wrong rather than merely coarse: a
 read-committed transaction has none, and filtering a scan against it would hide every live row.

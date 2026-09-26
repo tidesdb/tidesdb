@@ -13,13 +13,13 @@
 #include "base/keycmp.h"                 /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
 #include "txn_internal.h"
-#include "xxhash.h" /* XXH3 for the reservation slot and fingerprint hash */
+#include "xxhash.h" /* XXH3 for the key hash the claims and the dedup are bucketed by */
 
 /* the commit half of a transaction -- everything between a caller saying commit and the batch
- * becoming visible. it decides whether the commit may proceed at all (the conflict scan, the
- * reservations, the serializable structure check), turns the buffered write set into WAL entries,
- * gets those durable, and draws and marks the sequence that makes them visible. the buffering, the
- * reads, the savepoints and the lifecycle it works on top of live in txn.c. */
+ * becoming visible. it turns the buffered write set into WAL entries, claims the keys, draws the
+ * sequence, decides whether the commit may proceed at all (the validation against the store and the
+ * claims in flight), gets the entries durable, and marks the sequence that makes them visible. the
+ * buffering, the reads, the savepoints and the lifecycle it works on top of live in txn.c. */
 
 uint64_t txn_key_hash(uint32_t cf_index, const uint8_t *key, size_t key_size)
 {
@@ -276,17 +276,11 @@ static int txn_separate_values(const tdb_txn_backend_t *backend, tidesdb_wal_ent
     return TDB_SUCCESS;
 }
 
-/* release every reservation this commit may have claimed; a slot now owned by a newer committer is
- * left alone by tidesdb_mvcc_release */
-void txn_release_reservations(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count,
-                              uint64_t seq)
+void txn_release_claims(tdb_txn_t *txn)
 {
-    for (int i = 0; i < count; i++)
-        tidesdb_mvcc_release(txn->clock,
-                             txn_key_hash(entries[i].cf_index, entries[i].key, entries[i].key_size),
-                             seq);
-    /* and the intervals, which are keyed by the holder rather than by anything in the entries */
-    tidesdb_mvcc_release_range(txn->clock, seq);
+    tidesdb_mvcc_unclaim(txn->clock, &txn->commit);
+    free(txn->claims);
+    txn->claims = NULL;
 }
 
 /* ask the sources whether a version of a key exists above seq_floor, retrying a transient busy
@@ -342,203 +336,208 @@ static int txn_probe_range_newer(const tidesdb_source_t *sources, int num_source
     return TDB_ERR_IO;
 }
 
-/* what the peer walk accumulates; the pivot test needs both edges, so the walk stops as soon as it
- * has them */
-typedef struct
+/* whether the level validates what it read at commit -- repeatable read and serializable. snapshot
+ * keeps a read set for the version its writes are validated against, and validates no read */
+static int txn_validates_reads(const tdb_txn_t *txn)
 {
-    tdb_txn_t *txn;
-    int nreads;
-    int nwrites;
-    int rw_out;
-    int rw_in;
-} txn_ssi_scan_t;
-
-/* examine one live peer for the two edges; returns non-zero once both are found so the registry
- * walk stops early, exactly as the original loop condition did */
-static int txn_ssi_visit(tdb_txn_t *peer, void *ctx)
-{
-    txn_ssi_scan_t *scan = (txn_ssi_scan_t *)ctx;
-    if (peer == scan->txn || peer->isolation != TDB_ISOLATION_SERIALIZABLE) return 0;
-
-    /* outgoing edge, a key this txn read that the peer writes */
-    for (int r = 0; r < scan->nreads && !scan->rw_out; r++)
-    {
-        tidesdb_readset_entry_t rd;
-        if (!tidesdb_readset_at(scan->txn->readset, r, &rd)) continue;
-        if (tidesdb_writeset_contains(peer->writeset, rd.cf_index, rd.key, rd.key_size))
-            scan->rw_out = 1;
-    }
-    /* incoming edge, a key this txn writes that the peer read */
-    for (int w = 0; w < scan->nwrites && !scan->rw_in; w++)
-    {
-        tidesdb_writeset_op_t op;
-        if (!tidesdb_writeset_op_at(scan->txn->writeset, w, &op)) continue;
-        if (peer->readset &&
-            tidesdb_readset_contains(peer->readset, op.cf_index, op.key, op.key_size))
-            scan->rw_in = 1;
-    }
-    return scan->rw_in && scan->rw_out;
-}
-
-/* serializable-snapshot-isolation dangerous-structure check. this txn is the pivot of a dangerous
- * read-write dependency structure when it has both an outgoing rw-edge (it read a key an active
- * serializable peer writes) and an incoming rw-edge (an active serializable peer read a key it
- * writes). a pivot is aborted -- the conservative Cahill rule, always safe. the edges are computed
- * locally against currently-active peers without mutating them, so exactly one of a write-skew pair
- * aborts and the other makes progress. returns TDB_ERR_CONFLICT if a pivot, else TDB_SUCCESS */
-static int txn_check_ssi(tdb_txn_t *txn)
-{
-    if (txn->isolation != TDB_ISOLATION_SERIALIZABLE || !txn->registry) return TDB_SUCCESS;
-
-    txn_ssi_scan_t scan = {.txn = txn,
-                           .nreads = txn->readset ? tidesdb_readset_count(txn->readset) : 0,
-                           .nwrites = tidesdb_writeset_count(txn->writeset),
-                           .rw_out = 0,
-                           .rw_in = 0};
-
-    /* the walk holds the whole registry, so the peer set cannot shift between shards mid-decision
-     */
-    (void)tidesdb_txn_registry_for_each(txn->registry, txn_ssi_visit, &scan);
-
-    return (scan.rw_in && scan.rw_out) ? TDB_ERR_CONFLICT : TDB_SUCCESS;
-}
-
-/* commit-time conflict detection against current data. repeatable-read and serializable validate
- * that no key they read has a newer committed version (non-repeatable/phantom prevention); snapshot
- * and serializable scan their write keys for a version newer than the snapshot -- an
- * already-applied writer the reservation cannot see; serializable also runs the dangerous-structure
- * check for write skew. returns TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error */
-static int txn_check_conflicts(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources)
-{
-    /* read-set validation runs for repeatable-read and serializable, but not snapshot (which uses
-     * the first-committer-wins reservation instead) */
-    const int validate_reads = txn->isolation == TDB_ISOLATION_REPEATABLE_READ ||
-                               txn->isolation == TDB_ISOLATION_SERIALIZABLE;
-    if (validate_reads && txn->readset)
-    {
-        const int n = tidesdb_readset_count(txn->readset);
-        for (int i = 0; i < n; i++)
-        {
-            tidesdb_readset_entry_t rd;
-            if (!tidesdb_readset_at(txn->readset, i, &rd)) continue;
-            int newer = 0;
-            const int rc = txn_probe_newer(sources, num_sources, rd.cf_index, rd.key, rd.key_size,
-                                           rd.seq, &newer);
-            if (rc != TDB_SUCCESS) return rc;
-            if (newer) return TDB_ERR_CONFLICT;
-        }
-    }
-
-    /* write-conflict scan for snapshot and serializable */
-    if (txn->isolation >= TDB_ISOLATION_SNAPSHOT)
-    {
-        const int n = tidesdb_writeset_count(txn->writeset);
-        for (int i = 0; i < n; i++)
-        {
-            tidesdb_writeset_op_t op;
-            if (!tidesdb_writeset_op_at(txn->writeset, i, &op)) continue;
-            int newer = 0;
-            int rc;
-            if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE)
-            {
-                /* an interval delete conflicts with a write to any key inside it, not with a write
-                 * to the one key whose bytes spell its lower bound. probing it as a key would clear
-                 * a commit that is about to delete somebody else's just-written data */
-                rc = txn_probe_range_newer(
-                    sources, num_sources, op.cf_index, op.key, op.key_size, op.value, op.value_size,
-                    atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire), &newer);
-            }
-            else
-                rc = txn_probe_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
-                                     atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire),
-                                     &newer);
-            if (rc != TDB_SUCCESS) return rc;
-            if (newer) return TDB_ERR_CONFLICT;
-        }
-    }
-
-    /* serializable dangerous-structure detection (write-skew prevention) */
-    return txn_check_ssi(txn);
+    return txn->isolation == TDB_ISOLATION_REPEATABLE_READ ||
+           txn->isolation == TDB_ISOLATION_SERIALIZABLE;
 }
 
 /**
- * txn_reserve_writes
- * take the first-committer-wins reservation on every key this transaction writes. each key is
- * validated against the version this transaction actually read for it, falling back to the snapshot
- * for a blind write, so a writer that landed after the read is caught
- * @param txn the committing transaction
- * @param entries the encoded write set
- * @param count the number of entries
- * @param seq the commit sequence being reserved at
- * @param sources the current source stack for resolving fingerprint aliases
- * @param num_sources number of sources
- * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or an actual-key probe error
+ * txn_validate_reads
+ * refuse the commit if any key it read has a newer version -- committed into the store above the
+ * version read, or held by a commit in flight whose sequence is below this one's, the writer whose
+ * version this commit read before it existed -- or if any interval it scanned holds one, a phantom.
+ * runs after the draw, so every writer that drew before this commit is either in the store or in
+ * the claim set
+ * @param txn the committing transaction, its sequence drawn
+ * @param sources the source stack
+ * @param num_sources how many
+ * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error
  */
-static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count,
-                              uint64_t seq, const tidesdb_source_t *sources, int num_sources)
+static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources)
 {
-    /* read once for the whole write set rather than per key. this is the bound below which a
-     * committed occupant of a slot cannot still be depended on, and it is what lets the slot's
-     * fingerprint rule out a same-key writer on a mismatch; without it every collision
-     * aborts a commit that had no real conflict. the published value is a scan the compaction
-     * scheduler already runs, read here as one relaxed load -- running the scan on this path would
-     * mean every registry shard, once per written key. it is only ever stale low, and low is the
-     * conservative direction */
-    uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
-    int refreshed_min_snapshot = 0;
-
-    /* the intervals this batch writes are claimed first, so a point write that arrives afterwards
-     * meets them. an interval cannot be claimed as a key hash -- there is no one key to hash -- so
-     * this is the only thing standing between a range delete and a concurrent write inside it once
-     * the commit gate is gone, which for a two-phase transaction is the whole in-doubt window */
-    for (int i = 0; i < count; i++)
+    if (!txn->readset) return TDB_SUCCESS;
+    const int n = tidesdb_readset_count(txn->readset);
+    for (int i = 0; i < n; i++)
     {
-        if (!(entries[i].flags & TDB_WAL_ENTRY_RANGE_DELETE)) continue;
-        if (!tidesdb_mvcc_reserve_range(txn->clock, entries[i].cf_index, entries[i].key,
-                                        entries[i].key_size, entries[i].value,
-                                        entries[i].value_size, seq))
+        tidesdb_readset_entry_t rd;
+        if (!tidesdb_readset_at(txn->readset, i, &rd)) continue;
+        int newer = 0;
+        const int rc =
+            txn_probe_newer(sources, num_sources, rd.cf_index, rd.key, rd.key_size, rd.seq, &newer);
+        if (rc != TDB_SUCCESS) return rc;
+        if (newer) return TDB_ERR_CONFLICT;
+        if (tidesdb_mvcc_read_stale(txn->clock, &txn->commit, rd.cf_index, rd.key,
+                                    (uint32_t)rd.key_size,
+                                    txn_key_hash(rd.cf_index, rd.key, rd.key_size)))
             return TDB_ERR_CONFLICT;
     }
-
-    for (int i = 0; i < count; i++)
+    const int ranges = tidesdb_readset_range_count(txn->readset);
+    for (int i = 0; i < ranges; i++)
     {
-        if (entries[i].flags & TDB_WAL_ENTRY_RANGE_DELETE) continue; /* claimed above */
-
-        /* an interval another transaction is committing, or holds in doubt, covers this key */
-        if (tidesdb_mvcc_range_blocks(txn->clock, entries[i].cf_index, entries[i].key,
-                                      entries[i].key_size, seq))
-            return TDB_ERR_CONFLICT;
-
-        const uint64_t h = txn_key_hash(entries[i].cf_index, entries[i].key, entries[i].key_size);
-        uint64_t read_base = atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
-        uint64_t rseq = 0;
-        if (txn->readset && tidesdb_readset_seq(txn->readset, entries[i].cf_index, entries[i].key,
-                                                entries[i].key_size, &rseq))
-            read_base = rseq;
-        uint64_t observed = 0;
-        tidesdb_mvcc_reservation_result_t result =
-            tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot, &observed);
-        if (result != TDB_MVCC_RES_WON && !refreshed_min_snapshot && txn->registry)
-        {
-            /* refresh once per transaction, retaining the global oldest live snapshot */
-            tidesdb_txn_registry_publish_min_snapshot(txn->registry);
-            min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
-            refreshed_min_snapshot = 1;
-            result = tidesdb_mvcc_reserve(txn->clock, h, seq, read_base, min_snapshot, &observed);
-        }
-        if (result == TDB_MVCC_RES_CHECK_KEY)
-        {
-            int newer = 0;
-            const int rc = txn_probe_newer(sources, num_sources, entries[i].cf_index,
-                                           entries[i].key, entries[i].key_size, read_base, &newer);
-            if (rc != TDB_SUCCESS) return rc;
-            if (newer || !tidesdb_mvcc_reserve_checked(txn->clock, h, seq, observed))
-                return TDB_ERR_CONFLICT;
-        }
-        else if (result != TDB_MVCC_RES_WON)
+        tidesdb_readset_range_t sc;
+        if (!tidesdb_readset_range_at(txn->readset, i, &sc)) continue;
+        int newer = 0;
+        const int rc = txn_probe_range_newer(sources, num_sources, sc.cf_index, sc.lo, sc.lo_size,
+                                             sc.hi, sc.hi_size, sc.seq, &newer);
+        if (rc != TDB_SUCCESS) return rc;
+        if (newer) return TDB_ERR_CONFLICT;
+        if (tidesdb_mvcc_range_stale(txn->clock, &txn->commit, sc.cf_index, sc.lo, sc.lo_size,
+                                     sc.hi, sc.hi_size, 0))
             return TDB_ERR_CONFLICT;
     }
     return TDB_SUCCESS;
+}
+
+/**
+ * txn_validate_writes
+ * refuse the commit if any key it writes is read by a prepared batch that cannot yield, and, where
+ * the level promises first-committer-wins, if the key has a version above the snapshot -- a
+ * committer that finished between the snapshot and now -- or a commit in flight sequenced below
+ * this one holds an interval covering it. an interval this commit deletes is probed over its bounds
+ * rather than as a key, since a write to the one key spelling its lower bound is not a write inside
+ * it, and against the claims in flight below this commit inside it
+ * @param txn the committing transaction, its sequence drawn
+ * @param sources the source stack
+ * @param num_sources how many
+ * @param first_committer_wins non-zero at snapshot and above
+ * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error
+ */
+static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources,
+                               int first_committer_wins)
+{
+    const uint64_t snapshot = atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
+    const int n = tidesdb_writeset_count(txn->writeset);
+    for (int i = 0; i < n; i++)
+    {
+        tidesdb_writeset_op_t op;
+        if (!tidesdb_writeset_op_at(txn->writeset, i, &op)) continue;
+        int newer = 0;
+        int rc = TDB_SUCCESS;
+        if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE)
+        {
+            if (first_committer_wins)
+                rc = txn_probe_range_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
+                                           op.value, op.value_size, snapshot, &newer);
+            if (rc == TDB_SUCCESS && !newer && first_committer_wins &&
+                tidesdb_mvcc_range_stale(txn->clock, &txn->commit, op.cf_index, op.key, op.key_size,
+                                         op.value, op.value_size, 1))
+                newer = 1;
+        }
+        else
+        {
+            if (first_committer_wins)
+                rc = txn_probe_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
+                                     snapshot, &newer);
+            if (rc == TDB_SUCCESS && !newer &&
+                tidesdb_mvcc_write_blocked(
+                    txn->clock, &txn->commit, op.cf_index, op.key, (uint32_t)op.key_size,
+                    txn_key_hash(op.cf_index, op.key, op.key_size), first_committer_wins))
+                newer = 1;
+        }
+        if (rc != TDB_SUCCESS) return rc;
+        if (newer) return TDB_ERR_CONFLICT;
+    }
+    return TDB_SUCCESS;
+}
+
+/**
+ * txn_validate
+ * commit-time validation against the store and the claims in flight, after the sequence is drawn.
+ * repeatable read and serializable validate what they read; snapshot and serializable validate what
+ * they write on a first-committer-wins basis; every level here refuses to write a key a prepared
+ * batch read. snapshot deliberately does not validate reads, since first-committer-wins is how it
+ * prevents lost updates and validating reads on top would refuse what the level is defined to allow
+ * @param txn the committing transaction, its sequence drawn
+ * @param sources the source stack
+ * @param num_sources how many
+ * @return TDB_SUCCESS, TDB_ERR_CONFLICT, or a probe error
+ */
+static int txn_validate(tdb_txn_t *txn, const tidesdb_source_t *sources, int num_sources)
+{
+    int rc = TDB_SUCCESS;
+    if (txn_validates_reads(txn)) rc = txn_validate_reads(txn, sources, num_sources);
+    if (rc == TDB_SUCCESS)
+        rc = txn_validate_writes(txn, sources, num_sources,
+                                 txn->isolation >= TDB_ISOLATION_SNAPSHOT);
+    return rc;
+}
+
+/**
+ * txn_claim_intervals
+ * hold every interval this commit deletes, once its keys are claimed and before its sequence is
+ * drawn -- refusing what it meets under first-committer-wins, recorded beside it at repeatable read
+ * as the key claims are. an interval cannot be claimed as a key, there being no one key to hash, so
+ * the clock's interval table is what stands between a range delete and a concurrent write inside
+ * it, which for a two-phase transaction is the whole in-doubt window
+ * @param txn the committing transaction, its keys claimed
+ * @param entries the encoded write set
+ * @param count the number of entries
+ * @return TDB_SUCCESS, or TDB_ERR_CONFLICT when an interval meets a claim or interval in flight
+ */
+static int txn_claim_intervals(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count)
+{
+    const int first_committer_wins = txn->isolation >= TDB_ISOLATION_SNAPSHOT;
+    for (int i = 0; i < count; i++)
+    {
+        if (!(entries[i].flags & TDB_WAL_ENTRY_RANGE_DELETE)) continue;
+        if (!tidesdb_mvcc_claim_range(txn->clock, &txn->commit, entries[i].cf_index, entries[i].key,
+                                      entries[i].key_size, entries[i].value, entries[i].value_size,
+                                      first_committer_wins))
+            return TDB_ERR_CONFLICT;
+    }
+    return TDB_SUCCESS;
+}
+
+/**
+ * txn_claim_writes
+ * claim every key this commit writes and, for a prepare at repeatable read or above, every key it
+ * read, then hold every interval it deletes, all before the sequence is drawn. the claims borrow
+ * the entries' and the read set's key bytes, both of which outlive them
+ * @param txn the committing transaction
+ * @param entries the encoded write set
+ * @param count the number of entries
+ * @param prepare non-zero for a prepare, whose reads are claimed too at the levels that validate
+ *                them
+ * @return TDB_SUCCESS, TDB_ERR_CONFLICT when another commit in flight holds a key or an interval
+ *         this one meets, or TDB_ERR_MEMORY
+ */
+static int txn_claim_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count,
+                            int prepare)
+{
+    const int reads = prepare && txn_validates_reads(txn) ? tidesdb_readset_count(txn->readset) : 0;
+    const int cap = count + reads;
+    tidesdb_mvcc_claim_t *claims = cap > 0 ? malloc((size_t)cap * sizeof(*claims)) : NULL;
+    if (cap > 0 && !claims) return TDB_ERR_MEMORY;
+
+    int n = 0;
+    for (int i = 0; i < count; i++)
+    {
+        if (entries[i].flags & TDB_WAL_ENTRY_RANGE_DELETE) continue;
+        tidesdb_mvcc_claim_init(
+            &claims[n++], entries[i].cf_index, entries[i].key, (uint32_t)entries[i].key_size,
+            TDB_MVCC_CLAIM_WRITE,
+            txn_key_hash(entries[i].cf_index, entries[i].key, entries[i].key_size));
+    }
+    for (int i = 0; i < reads; i++)
+    {
+        tidesdb_readset_entry_t rd;
+        if (!tidesdb_readset_at(txn->readset, i, &rd)) continue;
+        tidesdb_mvcc_claim_init(&claims[n++], rd.cf_index, rd.key, (uint32_t)rd.key_size,
+                                TDB_MVCC_CLAIM_READ,
+                                txn_key_hash(rd.cf_index, rd.key, rd.key_size));
+    }
+
+    tidesdb_mvcc_commit_init(&txn->commit, claims, n);
+    txn->claims = claims;
+    if (tidesdb_mvcc_claim(txn->clock, &txn->commit, txn->isolation >= TDB_ISOLATION_SNAPSHOT) &&
+        txn_claim_intervals(txn, entries, count) == TDB_SUCCESS)
+        return TDB_SUCCESS;
+    txn_release_claims(txn);
+    tidesdb_mvcc_commit_init(&txn->commit, NULL, 0);
+    return TDB_ERR_CONFLICT;
 }
 
 /* preserve the allocation-free path for a single entry and when the family set cannot be allocated
@@ -643,6 +642,44 @@ static int txn_append_batch(const tdb_txn_backend_t *backend, uint8_t kind, cons
     return rc;
 }
 
+/**
+ * txn_append_reads
+ * make the keys a prepare read durable ahead of its PREPARE record, as a record of their own under
+ * the same xid, so a batch adopted in doubt after a restart holds its read claims again. written
+ * first, so a durable PREPARE always has its reads; a record no PREPARE followed is dropped by
+ * recovery
+ * @param backend the commit backend
+ * @param txn the preparing transaction, whose read set is the source
+ * @param xid the transaction id
+ * @param xid_size length of xid
+ * @param seq the prepare's sequence, carried so the record is shaped like every other
+ * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_IO when the append failed
+ */
+static int txn_append_reads(const tdb_txn_backend_t *backend, const tdb_txn_t *txn,
+                            const uint8_t *xid, size_t xid_size, uint64_t seq)
+{
+    const int n = tidesdb_readset_count(txn->readset);
+    if (n == 0) return TDB_SUCCESS;
+    tidesdb_wal_entry_t *keys = calloc((size_t)n, sizeof(*keys));
+    if (!keys) return TDB_ERR_MEMORY;
+    int count = 0;
+    for (int i = 0; i < n; i++)
+    {
+        tidesdb_readset_entry_t rd;
+        if (!tidesdb_readset_at(txn->readset, i, &rd)) continue;
+        keys[count].cf_index = rd.cf_index;
+        keys[count].seq = seq;
+        keys[count].ttl = -1;
+        keys[count].key = rd.key;
+        keys[count].key_size = rd.key_size;
+        count++;
+    }
+    const int rc =
+        txn_append_batch(backend, TDB_WAL_KIND_PREPARE_READS, xid, xid_size, keys, count);
+    free(keys);
+    return rc;
+}
+
 /* record that a durable batch must not be replayed. best effort by construction -- if this append
  * fails there is nothing further to try, and the transaction is already being reported as failed --
  * so the failure is logged rather than returned, and the batch would come back on the next open */
@@ -656,12 +693,13 @@ static void txn_append_abort(const tdb_txn_backend_t *backend, uint64_t seq)
                       (unsigned long long)seq);
 }
 
-/* the shared first phase of committing -- conflict-check, draw and mark-in-progress a commit seq,
- * build the deduplicated entries, reserve the write set, pace on backpressure, and durably append
- * the WAL record of the given kind (with an optional xid). on success returns TDB_SUCCESS with the
- * entries, count, and seq for the caller to apply and mark committed; on failure it releases the
- * reservation, aborts the txn, leaves the registry, frees the entries, and returns the error. the
- * caller must have handled the empty write set and the require-active check first */
+/* the shared first phase of committing -- build the deduplicated entries, pace on backpressure,
+ * claim the write set and hold its intervals, draw and mark-in-progress a commit seq, validate
+ * against the store and the claims in flight, and durably append the WAL record of the given kind
+ * (with an optional xid). on success returns TDB_SUCCESS with the entries, count, and seq for the
+ * caller to apply and mark committed; on failure it drops the claims, marks a drawn seq aborted,
+ * aborts the txn, leaves the registry, frees the entries, and returns the error. the caller must
+ * have handled the empty write set and the require-active check first */
 int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
                     const tidesdb_source_t *sources, int num_sources, uint8_t kind,
                     const uint8_t *xid, size_t xid_size, tidesdb_wal_entry_t **out_entries,
@@ -671,24 +709,8 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     *out_count = 0;
     *out_seq = 0;
 
-    /* conflict detection against current data for everything above read-committed */
-    if (txn->isolation > TDB_ISOLATION_READ_COMMITTED)
-    {
-        const int cc = txn_check_conflicts(txn, sources, num_sources);
-        if (cc != TDB_SUCCESS)
-        {
-            txn->state = TDB_TXN_ABORTED;
-            txn_leave_registry(txn);
-            return cc;
-        }
-    }
-
-    /* draw the commit sequence and mark it in-progress -- invisible until marked committed */
-    const uint64_t seq = tidesdb_mvcc_next_seq(txn->clock);
-    tidesdb_mvcc_mark(txn->clock, seq, 0);
-
     int count = 0;
-    tidesdb_wal_entry_t *entries = txn_build_entries(txn->writeset, seq, &count);
+    tidesdb_wal_entry_t *entries = txn_build_entries(txn->writeset, 0, &count);
     if (!entries)
     {
         txn->state = TDB_TXN_ABORTED;
@@ -696,36 +718,47 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
         return TDB_ERR_MEMORY;
     }
 
-    int rc = TDB_SUCCESS;
+    /* admission comes first, while nothing is held and no sequence is drawn, so a park here neither
+     * keeps a claim from other committers nor holds the watermark down for every reader */
+    int rc = txn_pace_families(backend, entries, count);
 
-    /* first-committer-wins reservation for snapshot and serializable, before the WAL write */
-    const int reserve = txn->isolation >= TDB_ISOLATION_SNAPSHOT;
+    /* the claims come next, ahead of the sequence, so that any committer drawing after this one
+     * finds them when it validates; a refused claim leaves nothing held and no sequence spent */
+    const int claims = txn->isolation >= TDB_ISOLATION_REPEATABLE_READ;
+    if (rc == TDB_SUCCESS && claims)
+        rc = txn_claim_writes(txn, entries, count, kind == TDB_WAL_KIND_PREPARE);
+    if (rc != TDB_SUCCESS)
+    {
+        txn->state = TDB_TXN_ABORTED;
+        txn_leave_registry(txn);
+        free(entries);
+        return rc;
+    }
 
-    /* a prepare keeps its sequence in flight until phase two decides it, which outlasts the commit
-     * ring -- so the sequence is held before the reservation names it. taking it here rather than
-     * after the record is durable means a table with no room refuses a prepare that has changed
-     * nothing yet, the way a full interval table refuses a commit */
-    const int prepared = reserve && kind == TDB_WAL_KIND_PREPARE;
-    if (prepared) rc = tidesdb_mvcc_prepared_hold(txn->clock, seq);
-    if (rc == TDB_SUCCESS && reserve)
-        rc = txn_reserve_writes(txn, entries, count, seq, sources, num_sources);
-
-    /* pace each distinct column family before the durable write */
-    if (rc == TDB_SUCCESS) rc = txn_pace_families(backend, entries, count);
+    /* draw the commit sequence and mark it in progress -- invisible until marked committed. the
+     * validation follows, since it orders this commit against the claims it meets by that sequence
+     */
+    const uint64_t seq = tidesdb_mvcc_draw(txn->clock, claims ? &txn->commit : NULL);
+    for (int i = 0; i < count; i++) entries[i].seq = seq;
+    if (txn->isolation > TDB_ISOLATION_READ_COMMITTED) rc = txn_validate(txn, sources, num_sources);
 
     /* the values the database separates go to the value log here, before the record that names
      * them */
     if (rc == TDB_SUCCESS) rc = txn_separate_values(backend, entries, count);
+
+    /* a prepare's read keys go ahead of its record, so a PREPARE that is durable always has them */
+    if (rc == TDB_SUCCESS && kind == TDB_WAL_KIND_PREPARE && txn_validates_reads(txn))
+        rc = txn_append_reads(backend, txn, xid, xid_size, seq);
 
     /* encode and durably append the WAL record */
     if (rc == TDB_SUCCESS) rc = txn_append_batch(backend, kind, xid, xid_size, entries, count);
 
     if (rc != TDB_SUCCESS)
     {
-        /* release the reservation and abort. the wasted in-progress seq is never made visible and
-         * ages out of the ring */
-        if (reserve) txn_release_reservations(txn, entries, count, seq);
-        if (prepared) tidesdb_mvcc_prepared_release(txn->clock, seq);
+        /* drop the claims and abort. the drawn sequence is never made visible, and marking it
+         * aborted is what lets the watermark pass it */
+        txn_release_claims(txn);
+        tidesdb_mvcc_mark_aborted(txn->clock, seq);
         txn->state = TDB_TXN_ABORTED;
         txn_leave_registry(txn);
         free(entries);
@@ -736,18 +769,6 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     *out_count = count;
     *out_seq = seq;
     return TDB_SUCCESS;
-}
-
-int txn_writes_an_interval(const tidesdb_writeset_t *ws)
-{
-    const int n = tidesdb_writeset_count(ws);
-    for (int i = 0; i < n; i++)
-    {
-        tidesdb_writeset_op_t op;
-        if (!tidesdb_writeset_op_at(ws, i, &op)) continue;
-        if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE) return 1;
-    }
-    return 0;
 }
 
 int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
@@ -765,22 +786,12 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
         return TDB_SUCCESS;
     }
 
-    /* the gate spans the whole commit, not just the reservation, because what a range delete has
-     * to be sure of is that no write it did not see becomes visible behind it. a batch that has
-     * reserved but not yet marked its sequence visible is exactly such a write */
-    const int gated = txn->isolation >= TDB_ISOLATION_SNAPSHOT;
-    if (gated) tidesdb_mvcc_commit_gate_lock(txn->clock, txn_writes_an_interval(txn->writeset));
-
     tidesdb_wal_entry_t *entries = NULL;
     int count = 0;
     uint64_t seq = 0;
     const int rc = txn_write_phase(txn, backend, sources, num_sources, TDB_WAL_KIND_WRITE_BATCH,
                                    NULL, 0, &entries, &count, &seq);
-    if (rc != TDB_SUCCESS)
-    {
-        if (gated) tidesdb_mvcc_commit_gate_unlock(txn->clock);
-        return rc; /* already aborted and left the registry */
-    }
+    if (rc != TDB_SUCCESS) return rc; /* already aborted and left the registry */
 
     /* apply to L0 at the commit sequence, then mark committed and visible */
     if (backend->apply(backend->ctx, entries, count) != 0)
@@ -794,30 +805,24 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
          * failed apply already landed out of reads and out of the flush before then */
         if (backend->abandon) backend->abandon(backend->ctx, seq);
 
-        if (txn->isolation >= TDB_ISOLATION_SNAPSHOT)
-            txn_release_reservations(txn, entries, count, seq);
+        txn_release_claims(txn);
+        tidesdb_mvcc_mark_aborted(txn->clock, seq);
         txn->state = TDB_TXN_ABORTED;
         txn_leave_registry(txn);
         free(entries);
-        if (gated) tidesdb_mvcc_commit_gate_unlock(txn->clock);
         return TDB_ERR_IO;
     }
 
     tidesdb_mvcc_mark(txn->clock, seq, 1);
+    tidesdb_mvcc_wait_visible(txn->clock, seq);
     txn->commit_seq = seq;
 
-    /* the intervals go once the batch is visible, and not before. a key reservation is renamed
-     * rather than dropped because the slot is what a later writer of that key reads; an interval
-     * has no slot of its own to read, so what replaces it here is the committed delete itself,
-     * which a later writer's conflict scan finds. holding it past this point would leave the
-     * table's slots to the first few range deletes a database commits, and refuse the rest */
-    if (txn->isolation >= TDB_ISOLATION_SNAPSHOT) tidesdb_mvcc_release_range(txn->clock, seq);
+    /* the claims and the intervals go once the batch is visible, and not before: from here the
+     * store holds the versions a later writer's validation finds, and until the mark it did not */
+    txn_release_claims(txn);
 
     txn->state = TDB_TXN_COMMITTED;
     txn_leave_registry(txn);
     free(entries);
-    /* released only here -- the batch is visible now, so a range delete waiting on the gate will
-     * see it in the scan it runs once it has the gate */
-    if (gated) tidesdb_mvcc_commit_gate_unlock(txn->clock);
     return TDB_SUCCESS;
 }

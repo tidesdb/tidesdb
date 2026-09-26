@@ -70,20 +70,15 @@ tdb_txn_t *tdb_txn_begin(tidesdb_mvcc_t *clock, tidesdb_isolation_level_t isolat
         txn->deadline = atomic_load_explicit(now, memory_order_relaxed) + timeout_seconds;
 
     /* draw the snapshot. read-uncommitted sees everything, read-committed refreshes per read (0
-     * here), and repeatable-read and stronger freeze the highest already-assigned seq at begin */
+     * here), and repeatable-read and stronger freeze the watermark at begin -- the highest sequence
+     * below which everything is decided, so nothing in flight can land inside the snapshot later */
     if (isolation == TDB_ISOLATION_READ_UNCOMMITTED)
-    {
         atomic_store_explicit(&txn->snapshot_seq, UINT64_MAX, memory_order_relaxed);
-    }
     else if (isolation == TDB_ISOLATION_READ_COMMITTED)
-    {
         atomic_store_explicit(&txn->snapshot_seq, 0, memory_order_relaxed);
-    }
     else
-    {
-        const uint64_t cur = tidesdb_mvcc_current_seq(clock);
-        atomic_store_explicit(&txn->snapshot_seq, cur > 0 ? cur - 1 : 0, memory_order_relaxed);
-    }
+        atomic_store_explicit(&txn->snapshot_seq, tidesdb_mvcc_visible_seq(clock),
+                              memory_order_relaxed);
 
     /* join the live-transaction registry, done last so the snapshot is already set before a peer's
      * gc-floor scan can observe this txn. only repeatable-read and stronger join. a failed join is
@@ -130,12 +125,19 @@ void tdb_txn_free(tdb_txn_t *txn)
     txn_leave_registry(txn); /* never leave a freed pointer in the registry */
 
     /* an in-doubt transaction freed without a decision is abandoned -- nothing in this process can
-     * resolve it any more, and its key reservations are left to age out of the ring the way any
-     * unresolved claim is. the sequence hold has to go with them, or it would keep a sequence no
-     * one can decide in flight for the life of the database, holding those keys against every
-     * later writer and taking a slot from a prepare that could still be decided */
-    if (txn->state == TDB_TXN_PREPARED && txn->isolation >= TDB_ISOLATION_SNAPSHOT)
-        tidesdb_mvcc_prepared_release(txn->clock, txn->commit_seq);
+     * resolve it any more, but its record is durable and a later open may still commit it, so its
+     * keys and intervals stay held: the clock takes over its claims. a claim chained from the set
+     * cannot outlive the memory that holds it, which is why they are copied rather than left */
+    if (txn->state == TDB_TXN_PREPARED && tidesdb_mvcc_holds(&txn->commit))
+    {
+        if (!tidesdb_mvcc_orphan_claims(txn->clock, &txn->commit))
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "abandoned prepare seq %llu could not keep its keys held",
+                          (unsigned long long)txn->commit_seq);
+        free(txn->claims);
+        txn->claims = NULL;
+    }
+    else if (tidesdb_mvcc_holds(&txn->commit))
+        txn_release_claims(txn);
 
     free(txn->prepared_entries); /* an abandoned in-doubt txn still owns these */
     free(txn->xid);
@@ -286,12 +288,12 @@ int tdb_txn_delete_prefix(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *pref
     return buffered;
 }
 
-/* the snapshot a read filters at -- read-uncommitted sees everything, read-committed draws a fresh
- * current-seq per read, and repeatable-read and stronger use the snapshot frozen at begin */
+/* the snapshot a read filters at -- read-uncommitted sees everything, read-committed reads the
+ * watermark afresh per read, and repeatable-read and stronger use the snapshot frozen at begin */
 static uint64_t txn_read_snapshot(const tdb_txn_t *txn)
 {
     if (txn->isolation == TDB_ISOLATION_READ_UNCOMMITTED) return UINT64_MAX;
-    if (txn->isolation == TDB_ISOLATION_READ_COMMITTED) return tidesdb_mvcc_current_seq(txn->clock);
+    if (txn->isolation == TDB_ISOLATION_READ_COMMITTED) return tidesdb_mvcc_visible_seq(txn->clock);
     return atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
 }
 
@@ -373,6 +375,23 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
                 size_t *value_size)
 {
     return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, value, value_size, 1);
+}
+
+int tdb_txn_record_scan(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                        const uint8_t *hi, size_t hi_size)
+{
+    if (!txn || !lo || lo_size == 0) return TDB_ERR_INVALID_ARGS;
+    /* only the levels that validate their reads keep a footprint; snapshot isolation keeps a read
+     * set for the version its writes are validated against and validates no read, so a scan of its
+     * is not recorded. a transaction no longer active commits nothing, so nothing is recorded for
+     * it
+     */
+    const int validates = txn->isolation == TDB_ISOLATION_REPEATABLE_READ ||
+                          txn->isolation == TDB_ISOLATION_SERIALIZABLE;
+    if (!validates || !txn->readset || txn->state != TDB_TXN_ACTIVE) return TDB_SUCCESS;
+    return tidesdb_readset_record_range(
+        txn->readset, cf_index, lo, lo_size, hi, hi_size,
+        atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire));
 }
 
 int tdb_txn_get_notrack(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,

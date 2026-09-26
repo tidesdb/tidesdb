@@ -28,13 +28,13 @@
  * is no cross-worker conflict, so the oracle needs no linearization.
  *
  * that same disjointness is an oracle for the commit path. the workers run at every isolation
- * level, and at snapshot and above a commit reserves its keys and checks them against concurrent
- * committers, so any commit refused with TDB_ERR_CONFLICT is a conflict between keys nobody shares
+ * level, and at repeatable read and above a commit claims its keys and checks them against
+ * concurrent committers, so any commit refused with TDB_ERR_CONFLICT is a conflict between keys
+ * nobody shares
  * -- a refusal the engine invented. a wide batch puts hundreds of keys from a key space of the
  * worker's own and commits them at once, the shape of a bulk load, so two such commits in flight
- * together carry enough keys that a hash collision between them is the ordinary case rather than
- * the rare one; a prefix delete inside a worker's own slice reserves an interval the same way. both
- * must always commit */
+ * together carry enough keys that a table of hashed slots refused most of them; a prefix delete
+ * inside a worker's own slice holds an interval the same way. both must always commit */
 
 #define FC_WORKERS        4    /* worker threads, one disjoint key prefix each; at most 26 */
 #define FC_OPS_PER_WORKER 6000 /* operations each worker runs per iteration */
@@ -45,9 +45,8 @@
 #define FC_WRITE_BUFFER   8192 /* a small memtable so flushes fire often and race the writers */
 #define FC_CF             "c0"
 /* the wide key space: the worker's prefix byte, a marker no ordinary key carries, then
- * FC_WIDE_SUFFIX characters from a wider alphabet, so a batch can hold hundreds of distinct keys. a
- * batch of a few hundred keys against another in flight shares a reservation slot about one time in
- * ten, and a wide commit is in flight for as long as its keys take to apply */
+ * FC_WIDE_SUFFIX characters from a wider alphabet, so a batch can hold hundreds of distinct keys,
+ * and a wide commit is in flight for as long as its keys take to apply */
 #define FC_WIDE_MARK      'z'
 #define FC_WIDE_ALPHABET  16
 #define FC_WIDE_SUFFIX    3
@@ -55,16 +54,15 @@
 #define FC_WIDE_KEY_SPACE (FC_WIDE_ALPHABET * FC_WIDE_ALPHABET * FC_WIDE_ALPHABET)
 #define FC_WIDE_MIN_KEYS  128
 #define FC_WIDE_MAX_KEYS  512
-/* a wide batch's values stay this small: its keys are what the reservations are about, and a batch
- * of hundreds of spilled values would span several memtables and sit in admission for each */
+/* a wide batch's values stay this small: its keys are what the claims are about, and a batch of
+ * hundreds of spilled values would span several memtables and sit in admission for each */
 #define FC_WIDE_VALUE_MAX 8
 /* one wide batch in this many op-14 turns, enough to keep two in flight together now and then
  * without the batches outweighing the rest of the stream */
 #define FC_WIDE_ONE_IN 16
-/* one prefix delete in this many op-15 turns. a commit carrying an interval holds the commit gate
- * exclusively, so it waits out every commit in flight and every later one waits on it; issued on
- * every turn, the deletes serialised the whole commit path and the harness measured exclusion
- * rather than reservations. rare, they still drive the interval path under concurrency */
+/* one prefix delete in this many op-15 turns. a commit carrying an interval is checked against
+ * every claim in flight rather than against one chain; rare, the deletes still drive that path
+ * under concurrency without it outweighing the rest of the stream */
 #define FC_PREFIX_DELETE_ONE_IN 4
 #define FC_STANDALONE_ITERS     30
 #define FC_BUSY_RETRIES         1000 /* a busy fd reservation is retryable, never a definitive result */
@@ -303,7 +301,7 @@ static void fc_do_wide_put(fc_worker_t *w, tidesdb_txn_t *txn)
 }
 
 /* delete every key under the worker's prefix plus one character, in the transaction and the model;
- * at snapshot isolation and above this reserves an interval rather than keys */
+ * at snapshot isolation and above this holds an interval rather than keys */
 static void fc_do_delete_prefix(fc_worker_t *w, tidesdb_txn_t *txn)
 {
     uint8_t prefix[2];
@@ -371,7 +369,7 @@ static void *fc_worker(void *arg)
                 fc_commit(w, &txn);
             }
         }
-        else if (op == 15 && txn) /* now and then, an interval reservation inside the own slice */
+        else if (op == 15 && txn) /* now and then, an interval delete inside the own slice */
         {
             if (fc_rng(&w->rng) % FC_PREFIX_DELETE_ONE_IN == 0) fc_do_delete_prefix(w, txn);
         }

@@ -65,8 +65,9 @@ void tidesdb_memtable_free(tidesdb_memtable_t *mt);
 #define TDB_L0_MAX_TRACKED_CFS 1024
 
 /* abandoned commit sequences remembered at once. one entry costs a failed apply of an already
- * durable batch, which needs an allocation failure or a lost pin retried a hundred times, so a
- * database that fills this has problems this table is not the answer to */
+ * durable batch, which needs an allocation failure or a lost pin retried a hundred times, and an
+ * entry is forgotten once every memtable that could hold the batch has retired, so filling this
+ * takes that many failures between two flushes */
 #define TDB_L0_MAX_ABORTED_SEQS 64
 
 /**
@@ -136,10 +137,13 @@ int tidesdb_wal_flushed_filename(uint64_t generation, char *out, size_t out_size
  * @param aborted_seqs commit sequences whose batch was applied in part and then abandoned, because
  * the apply failed after the log write had already made the batch durable. a read and a flush both
  * skip a version carrying one of these, so entries the failed commit left behind are never visible
- * and never reach L1
- * @param aborted_count how many are held
- * @param aborted_lock guards additions; readers take the count with an acquire load and walk
- * without it, which is safe because entries are only ever appended
+ * and never reach L1. a zero is a slot whose sequence has been forgotten and may be reused
+ * @param aborted_gens beside each sequence, the generation of the memtable that was active when it
+ * was abandoned; the batch's entries can be in no younger memtable, so once that generation retires
+ * the sequence is forgotten
+ * @param aborted_count how many slots have ever been taken, the length readers walk
+ * @param aborted_lock guards additions and forgetting; readers take the count with an acquire load
+ * and walk without it, which is safe because a slot only ever changes between a sequence and zero
  * @param pending_reclaim immutables whose readers had not left when the flush finished with them,
  * held here for a later sweep rather than waited on inline
  * @param admit_mtx guards the admission wait, so a writer cannot be between its check and its wait
@@ -174,7 +178,8 @@ typedef struct
     tdb_wait_stat_t wal_wait;
     vlog_t *vlog;
     _Atomic(_Atomic(int64_t) *) cf_unflushed[TDB_L0_MAX_TRACKED_CFS];
-    uint64_t aborted_seqs[TDB_L0_MAX_ABORTED_SEQS];
+    _Atomic(uint64_t) aborted_seqs[TDB_L0_MAX_ABORTED_SEQS];
+    uint64_t aborted_gens[TDB_L0_MAX_ABORTED_SEQS];
     _Atomic(int) aborted_count;
     pthread_mutex_t aborted_lock;
     _Atomic(void *) pending_reclaim;
@@ -549,7 +554,9 @@ tidesdb_memtable_t *tidesdb_l0_claim_immutable(tidesdb_l0_t *l0);
 /**
  * tidesdb_l0_retire_immutable
  * remove a claimed immutable from the queue and reclaim it, once its data is durable in L1; a no-op
- * on the queue when the immutable was taken with tidesdb_l0_dequeue_immutable instead of claimed
+ * on the queue when the immutable was taken with tidesdb_l0_dequeue_immutable instead of claimed.
+ * every abandoned sequence recorded at or before this memtable's generation is forgotten here,
+ * because no memtable that could still hold its entries remains
  * @param l0 the subsystem
  * @param mt the immutable to retire, may be NULL
  */
@@ -589,10 +596,11 @@ size_t tidesdb_l0_active_bytes(tidesdb_l0_t *l0);
  * tidesdb_l0_mark_aborted
  * record that a commit sequence was abandoned after its batch was already durable, so the entries
  * it managed to apply are hidden from reads and dropped by the flush that would otherwise carry
- * them to L1
+ * them to L1. the record lives until the memtable active now has retired, since no younger one can
+ * hold the batch
  * @param l0 the subsystem
  * @param seq the abandoned commit sequence
- * @return TDB_SUCCESS, or TDB_ERR_MEMORY_LIMIT when the table is full
+ * @return TDB_SUCCESS, or TDB_ERR_MEMORY_LIMIT when every slot names a sequence still in a memtable
  */
 int tidesdb_l0_mark_aborted(tidesdb_l0_t *l0, uint64_t seq);
 

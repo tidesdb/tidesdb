@@ -719,6 +719,136 @@ void test_wal_replay_skips_a_commit_batch_already_in_l1(void)
     (void)remove(wal_path);
 }
 
+/* the keys a prepare at repeatable read or above read are replayed with it. the record written
+ * ahead of its PREPARE is held for it and staged beside its entries, so an adopted batch can hold
+ * its read claims again; read keys whose PREPARE never followed are dropped rather than listed */
+void test_wal_replay_stages_a_prepares_read_keys(void)
+{
+    const char *wal_path = "./l0_adapter_prepare_reads.log";
+    (void)remove(wal_path);
+
+    block_manager_t *wal1 = NULL;
+    ASSERT_EQ(block_manager_open(&wal1, wal_path, BLOCK_MANAGER_SYNC_NONE), 0);
+    tidesdb_l0_t *l0a = tidesdb_l0_create(ADP_BUFFER_SIZE, ADP_QUEUE_SIZE, ADP_MAX_LEVEL,
+                                          ADP_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0a != NULL);
+    tidesdb_l0_set_active(
+        l0a, tidesdb_memtable_create(wal1, 0, 0, ADP_MAX_LEVEL, ADP_PROBABILITY, NULL, NULL));
+    tidesdb_l0_txn_ctx_t ctxa;
+    ASSERT_EQ(tidesdb_l0_adapter_init(&ctxa, l0a, NULL), 0);
+    tdb_txn_backend_t bea;
+    tidesdb_l0_backend(&ctxa, &bea);
+    tidesdb_source_t srca;
+    tidesdb_l0_source(&ctxa, &srca);
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+
+    /* a serializable prepare that read x, absent, and wrote y, left in doubt */
+    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, NULL);
+    uint8_t *v = NULL;
+    size_t vs = 0;
+    ASSERT_EQ(tdb_txn_get(t, 0, (const uint8_t *)"x", 1, &srca, 1, &v, &vs), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(tdb_txn_put(t, 0, (const uint8_t *)"y", 1, (const uint8_t *)"p", 1, -1), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_prepare(t, &bea, &srca, 1, (const uint8_t *)"xid-reads", 9), TDB_SUCCESS);
+
+    /* and a record of read keys whose prepare never followed */
+    const tidesdb_wal_entry_t orphan = {
+        .cf_index = 0, .seq = 1, .ttl = -1, .key = (const uint8_t *)"z", .key_size = 1};
+    const uint8_t orphan_xid[] = "xid-orphan";
+    const size_t size = tidesdb_wal_batch_size(TDB_WAL_KIND_PREPARE_READS, orphan_xid,
+                                               sizeof(orphan_xid) - 1, &orphan, 1);
+    uint8_t *buf = malloc(size);
+    ASSERT_TRUE(buf != NULL);
+    ASSERT_EQ(tidesdb_wal_batch_encode(TDB_WAL_KIND_PREPARE_READS, orphan_xid,
+                                       sizeof(orphan_xid) - 1, &orphan, 1, buf, size),
+              size);
+    ASSERT_EQ(bea.wal_append(bea.ctx, buf, size), 0);
+    free(buf);
+
+    tdb_txn_free(t);
+    tidesdb_l0_destroy(l0a);
+    block_manager_close(wal1);
+
+    block_manager_t *wal2 = NULL;
+    ASSERT_EQ(block_manager_open(&wal2, wal_path, BLOCK_MANAGER_SYNC_NONE), 0);
+    tidesdb_l0_t *l0b = tidesdb_l0_create(ADP_BUFFER_SIZE, ADP_QUEUE_SIZE, ADP_MAX_LEVEL,
+                                          ADP_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0b != NULL);
+    tidesdb_l0_set_active(
+        l0b, tidesdb_memtable_create(wal2, 0, 0, ADP_MAX_LEVEL, ADP_PROBABILITY, NULL, NULL));
+    tdb_prepare_stage_t *stage = tdb_prepare_stage_create();
+    ASSERT_TRUE(stage != NULL);
+    uint64_t replayed_max_seq = 0;
+    ASSERT_EQ(tidesdb_l0_replay_wal(l0b, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &replayed_max_seq,
+                                    stage, NULL, 0),
+              TDB_SUCCESS);
+
+    /* one batch in doubt, its write and its read beside each other; the orphan is not listed */
+    ASSERT_EQ(tdb_prepare_stage_count(stage), 1);
+    const tdb_prepared_record_t *rec = tdb_prepare_stage_at(stage, 0);
+    ASSERT_TRUE(rec != NULL);
+    ASSERT_EQ(rec->resolution, TDB_PREPARE_IN_DOUBT);
+    ASSERT_EQ(rec->count, 1);
+    ASSERT_EQ(rec->read_count, 1);
+    ASSERT_TRUE(rec->reads[0].key_size == 1 && rec->reads[0].key[0] == 'x');
+    ASSERT_TRUE(rec->first_generation == L0_ADAPTER_TEST_GENERATION);
+
+    tdb_prepare_stage_free(stage);
+    tidesdb_l0_destroy(l0b);
+    block_manager_close(wal2);
+    tidesdb_mvcc_destroy(clock);
+    (void)remove(wal_path);
+}
+
+/* a record kind this binary does not know fails the replay rather than being left out of it, so a
+ * log written by a newer binary is refused loudly instead of coming back with a record missing */
+void test_wal_replay_refuses_a_record_kind_it_does_not_know(void)
+{
+    const char *wal_path = "./l0_adapter_unknown_kind.log";
+    (void)remove(wal_path);
+
+    block_manager_t *wal1 = NULL;
+    ASSERT_EQ(block_manager_open(&wal1, wal_path, BLOCK_MANAGER_SYNC_NONE), 0);
+    tidesdb_l0_t *l0a = tidesdb_l0_create(ADP_BUFFER_SIZE, ADP_QUEUE_SIZE, ADP_MAX_LEVEL,
+                                          ADP_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0a != NULL);
+    tidesdb_l0_set_active(
+        l0a, tidesdb_memtable_create(wal1, 0, 0, ADP_MAX_LEVEL, ADP_PROBABILITY, NULL, NULL));
+    tidesdb_l0_txn_ctx_t ctxa;
+    ASSERT_EQ(tidesdb_l0_adapter_init(&ctxa, l0a, NULL), 0);
+    tdb_txn_backend_t bea;
+    tidesdb_l0_backend(&ctxa, &bea);
+
+    const uint8_t unknown = TDB_WAL_KIND_PREPARE_READS + 1;
+    const uint8_t xid[] = "xid-newer";
+    const size_t size = tidesdb_wal_batch_size(unknown, xid, sizeof(xid) - 1, NULL, 0);
+    uint8_t *buf = malloc(size);
+    ASSERT_TRUE(buf != NULL);
+    ASSERT_EQ(tidesdb_wal_batch_encode(unknown, xid, sizeof(xid) - 1, NULL, 0, buf, size), size);
+    ASSERT_EQ(bea.wal_append(bea.ctx, buf, size), 0);
+    free(buf);
+    tidesdb_l0_destroy(l0a);
+    block_manager_close(wal1);
+
+    block_manager_t *wal2 = NULL;
+    ASSERT_EQ(block_manager_open(&wal2, wal_path, BLOCK_MANAGER_SYNC_NONE), 0);
+    tidesdb_l0_t *l0b = tidesdb_l0_create(ADP_BUFFER_SIZE, ADP_QUEUE_SIZE, ADP_MAX_LEVEL,
+                                          ADP_PROBABILITY, NULL, NULL);
+    ASSERT_TRUE(l0b != NULL);
+    tidesdb_l0_set_active(
+        l0b, tidesdb_memtable_create(wal2, 0, 0, ADP_MAX_LEVEL, ADP_PROBABILITY, NULL, NULL));
+    tdb_prepare_stage_t *stage = tdb_prepare_stage_create();
+    ASSERT_TRUE(stage != NULL);
+    uint64_t replayed_max_seq = 0;
+    ASSERT_EQ(tidesdb_l0_replay_wal(l0b, wal2, L0_ADAPTER_TEST_GENERATION, NULL, &replayed_max_seq,
+                                    stage, NULL, 0),
+              TDB_ERR_INVALID_ARGS);
+
+    tdb_prepare_stage_free(stage);
+    tidesdb_l0_destroy(l0b);
+    block_manager_close(wal2);
+    (void)remove(wal_path);
+}
+
 void test_wal_replay_recovers_commits(void)
 {
     const char *wal_path = "./l0_adapter_recover.log";
@@ -802,6 +932,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_concurrent_commits, tests_passed);
     RUN_TEST(test_wal_replay_restores_a_value_log_reference, tests_passed);
     RUN_TEST(test_wal_replay_skips_a_commit_batch_already_in_l1, tests_passed);
+    RUN_TEST(test_wal_replay_stages_a_prepares_read_keys, tests_passed);
+    RUN_TEST(test_wal_replay_refuses_a_record_kind_it_does_not_know, tests_passed);
     RUN_TEST(test_wal_replay_recovers_commits, tests_passed);
     RUN_TEST(test_wal_replay_recovers_a_prefix_delete, tests_passed);
     RUN_TEST(test_prefix_delete_against_a_write_in_the_same_batch, tests_passed);

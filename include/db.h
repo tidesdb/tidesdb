@@ -51,12 +51,13 @@ typedef enum
     /* the newest committed version, with the ceiling re-read on every operation */
     TDB_ISOLATION_READ_COMMITTED = 1,
     /* the ceiling is frozen when the transaction begins, and a commit validates that every key it
-       read still holds the version it read */
+       read still holds the version it read and that no key appeared inside a range it scanned,
+       against commits still in flight as well as committed ones */
     TDB_ISOLATION_REPEATABLE_READ = 2,
-    /* frozen ceiling, and a commit reserves each key it writes on a first-committer-wins basis
-       rather than validating what it read */
+    /* frozen ceiling, and a commit claims each key it writes on a first-committer-wins basis rather
+       than validating what it read */
     TDB_ISOLATION_SNAPSHOT = 3,
-    /* both of the checks above, plus the one that catches write skew */
+    /* both of the checks above */
     TDB_ISOLATION_SERIALIZABLE = 4
 } tidesdb_isolation_level_t;
 
@@ -1272,7 +1273,12 @@ int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name);
  * a scan reaches the same sstables a point read does, so every call here can report TDB_ERR_LOCKED
  * for the same reason and with the same remedy -- the position did not move, nothing is wrong with
  * the iterator, and the step should be retried. it is not the end of the range; that is what
- * tidesdb_iter_valid reports. */
+ * tidesdb_iter_valid reports.
+ *
+ * at repeatable read and serializable an iterator records the interval it covered into its
+ * transaction's read footprint when it is freed, so the commit is refused if another transaction
+ * put a key inside it meanwhile. free an iterator before committing; the other levels record
+ * nothing */
 
 /**
  * tidesdb_iter_new

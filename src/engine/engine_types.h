@@ -268,16 +268,48 @@ struct tidesdb_snapshot_t
 /**
  * tidesdb_iter_t
  * the public range-iterator handle over one column family at a transaction's snapshot -- a per-cf
- * merge iterator plus the cf (for resolving a spilled value through its vlog) and the engine
+ * merge iterator plus the cf (for resolving a spilled value through its vlog), the engine, and the
+ * footprint the scan has covered so far, which a transaction that validates its reads records into
+ * its read set when the iterator is freed
  * @param inner the per-cf merge iterator over L0 and the cf's sstable levels
  * @param cf the iterated column family, borrowed
  * @param db the owning engine, borrowed
+ * @param txn the transaction the scan belongs to, borrowed, whose read set takes the footprint
+ * @param tracked non-zero when the transaction validates its reads, so the footprint is kept at all
+ * @param covered non-zero once a positioning call has run, so there is a footprint to record
+ * @param lo the inclusive lower bound of what the scan covered so far, owned
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound of what the scan covered so far, owned; meaningful only while
+ *           hi_open is zero
+ * @param hi_size length of hi
+ * @param hi_open non-zero once the scan ran past the last key, so the footprint is open above
+ * @param bound_lo the range lower bound the iterator was created with, owned, NULL for none; a scan
+ *                 that runs off the front covered from here rather than from the first key there is
+ * @param bound_lo_size length of bound_lo
+ * @param bound_hi the range upper bound the iterator was created with, owned, NULL for none; a scan
+ *                 that runs off the end covered up to and including it rather than to the end
+ * @param bound_hi_size length of bound_hi
+ * @param footprint_lost non-zero when a bound could not be copied, so the whole family is recorded
+ *                       rather than an interval too narrow
  */
 struct tidesdb_iter_t
 {
     cf_iter_t *inner;
     cf_t *cf;
     tidesdb_t *db;
+    tidesdb_txn_t *txn;
+    int tracked;
+    int covered;
+    uint8_t *lo;
+    size_t lo_size;
+    uint8_t *hi;
+    size_t hi_size;
+    int hi_open;
+    uint8_t *bound_lo;
+    size_t bound_lo_size;
+    uint8_t *bound_hi;
+    size_t bound_hi_size;
+    int footprint_lost;
 };
 
 /**

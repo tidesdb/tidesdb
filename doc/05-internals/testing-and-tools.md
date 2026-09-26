@@ -100,12 +100,12 @@ the transaction buffer to be an ordered log rather than a map: an interval hides
 before it and leaves what was buffered after, so position in the buffer is what decides which of the
 two is newer, and a read resolves a key by finding the last entry that either names it or covers it.
 
-The conflict oracle for an interval is **deliberately not symmetric**, because the engine's is not.
-An interval is claimed against the other intervals only — there is no one key to hash it under — while
-a point write is checked against both the intervals and the point reservations. So a point meeting
-either kind must lose, and an interval meeting another interval must lose, but an interval meeting a
-held point is allowed through. Mirroring that asymmetry is the difference between an oracle and a
-source of false failures.
+The conflict oracle for an interval is **symmetric**, because the engine's is. A point write meets a
+held point on the same key or a held interval covering it; an interval meets a held point inside it
+or a held interval intersecting it. Either way the committing side must lose. The engine used to
+check only the point side, running interval commits alone under an exclusive gate instead, and the
+oracle mirrored that asymmetry; a test oracle that disagrees with the engine on which side yields is
+a source of false failures, so the two moved together.
 
 Alongside the value comparison it carries a **structural** oracle that owes nothing to the model. A
 closed database owns no sstables and no level-set layouts, so both counts have to come back to what
@@ -172,15 +172,14 @@ precisely what it wrote, so any disagreement is a real engine fault rather than 
 checker.
 
 The same partitioning is an oracle for the commit path. The workers cycle through every isolation
-level, and at snapshot and above a commit reserves its keys against every other committer in
+level, and at repeatable read and above a commit claims its keys against every other committer in
 flight, so a commit refused with `TDB_ERR_CONFLICT` is a conflict between keys that nobody shares:
 one the engine invented. To make such refusals likely rather than rare, a worker periodically
 commits a batch of hundreds of keys from a key space of its own in one go, the shape of a bulk
-load, so two such commits in flight at once carry write sets wide enough for their reservations to
-share slots, and deletes prefixes inside its own slice, which reserves an interval the same way.
-Every such commit must succeed. This is the check that would have caught the
-one-slot reservation refusing commits of disjoint keys, which a benchmark can only report as a
-higher retry rate.
+load, so two such commits in flight at once carry write sets wide enough that a table of hashed
+slots refused most of them, and deletes prefixes inside its own slice, which holds an interval the
+same way. Every such commit must succeed. This is the check that would have caught a hashed slot
+refusing commits of disjoint keys, which a benchmark can only report as a higher retry rate.
 
 ### `fuzz_decode` — untrusted input
 

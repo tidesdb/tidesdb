@@ -61,26 +61,6 @@ void tidesdb_txn_registry_remove(tidesdb_txn_registry_t *reg, tdb_txn_t *txn);
 uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg);
 
 /**
- * tidesdb_txn_registry_publish_min_snapshot
- * run the scan once and publish its answer for readers that cannot afford to run it themselves.
- * an empty registry publishes zero rather than the UINT64_MAX sentinel the scan returns, so a
- * transaction beginning afterwards can never hold a snapshot below what was published
- * @param reg the registry
- */
-void tidesdb_txn_registry_publish_min_snapshot(tidesdb_txn_registry_t *reg);
-
-/**
- * tidesdb_txn_registry_published_min_snapshot
- * the last published minimum, as one relaxed load rather than a scan of every shard. the answer is
- * only ever stale low, never high -- a snapshot is drawn from a monotonic clock, so a transaction
- * beginning after a publish holds one at or above it, and one leaving only raises the true minimum
- * -- which is the direction a conservative reader needs
- * @param reg the registry
- * @return the last published minimum, or 0 when none has been published or reg is NULL
- */
-uint64_t tidesdb_txn_registry_published_min_snapshot(const tidesdb_txn_registry_t *reg);
-
-/**
  * tidesdb_txn_visit_fn
  * called for each live transaction during a walk
  * @param txn the live transaction (borrowed, valid only for the call)

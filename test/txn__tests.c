@@ -6,8 +6,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include <pthread.h>
 #include <string.h>
 
+#include "../src/base/keycmp.h"
 #include "../src/txn/registry.h"
 #include "../src/txn/txn.h"
 #include "../src/txn/txn_internal.h"
@@ -21,9 +23,11 @@ static int put(tdb_txn_t *t, uint32_t cf, const char *k, const char *v)
     return tdb_txn_put(t, cf, (const uint8_t *)k, strlen(k), (const uint8_t *)v, strlen(v), -1);
 }
 
-static int put_bytes(tdb_txn_t *t, uint32_t cf, const uint8_t *k, size_t ks, const char *v)
+/* draw and commit n sequences, so the watermark, and with it every snapshot taken afterwards,
+ * stands at n */
+static void advance_clock(tidesdb_mvcc_t *clock, int n)
 {
-    return tdb_txn_put(t, cf, k, ks, (const uint8_t *)v, strlen(v), -1);
+    for (int i = 0; i < n; i++) tidesdb_mvcc_mark(clock, tidesdb_mvcc_draw(clock, NULL), 1);
 }
 
 /* a mock external source holding at most one key at a seq (NULL value = tombstone); busy_remaining
@@ -69,41 +73,31 @@ static tidesdb_source_result_t tsrc_get(void *ctx, uint32_t cf_index, const uint
     return TDB_SOURCE_FOUND;
 }
 
-static tidesdb_source_t tsource(tsrc *m)
-{
-    tidesdb_source_t s = {.name = "mock", .get = tsrc_get, .has_newer = NULL, .ctx = m};
-    return s;
-}
-
-/* The reservation-alias regression uses fixed 16-byte benchmark keys containing zero bytes. */
-typedef struct
-{
-    const uint8_t *key;
-    size_t key_size;
-    uint64_t seq;
-    const char *value;
-} bsrc;
-
-static tidesdb_source_result_t bsrc_get(void *ctx, uint32_t cf_index, const uint8_t *key,
-                                        size_t key_size, uint64_t snapshot,
-                                        tidesdb_source_version_t *out)
+/* whether the one key the source holds falls inside [lo, hi) above the floor, which is what a
+ * commit asks about an interval it scanned or deletes */
+static tidesdb_source_result_t tsrc_range_has_newer(void *ctx, uint32_t cf_index, const uint8_t *lo,
+                                                    size_t lo_size, const uint8_t *hi,
+                                                    size_t hi_size, uint64_t seq_floor, int *newer)
 {
     (void)cf_index;
-    bsrc *m = (bsrc *)ctx;
-    if (key_size != m->key_size || memcmp(key, m->key, key_size) != 0 || m->seq > snapshot)
-        return TDB_SOURCE_NOT_FOUND;
-    out->seq = m->seq;
-    out->ttl = -1;
-    out->deleted = 0;
-    out->value_size = strlen(m->value);
-    out->value = malloc(out->value_size);
-    memcpy(out->value, m->value, out->value_size);
+    tsrc *m = (tsrc *)ctx;
+    *newer = 0;
+    if (!m->has) return TDB_SOURCE_NOT_FOUND;
+    const uint8_t *key = (const uint8_t *)m->key;
+    const size_t key_size = strlen(m->key);
+    if (tdb_key_cmp(lo, lo_size, key, key_size) > 0) return TDB_SOURCE_NOT_FOUND;
+    if (hi_size > 0 && tdb_key_cmp(key, key_size, hi, hi_size) >= 0) return TDB_SOURCE_NOT_FOUND;
+    *newer = m->seq > seq_floor;
     return TDB_SOURCE_FOUND;
 }
 
-static tidesdb_source_t bsource(bsrc *m)
+static tidesdb_source_t tsource(tsrc *m)
 {
-    tidesdb_source_t s = {.name = "bytes", .get = bsrc_get, .has_newer = NULL, .ctx = m};
+    tidesdb_source_t s = {.name = "mock",
+                          .get = tsrc_get,
+                          .has_newer = NULL,
+                          .range_has_newer = tsrc_range_has_newer,
+                          .ctx = m};
     return s;
 }
 
@@ -119,26 +113,13 @@ static int get_is(tdb_txn_t *t, uint32_t cf, const char *k, const tidesdb_source
     return ok;
 }
 
-static int get_bytes_is(tdb_txn_t *t, uint32_t cf, const uint8_t *k, size_t ks,
-                        const tidesdb_source_t *srcs, int ns, const char *expect)
-{
-    uint8_t *v = NULL;
-    size_t vs = 0;
-    if (tdb_txn_get(t, cf, k, ks, srcs, ns, &v, &vs) != TDB_SUCCESS) return 0;
-    const int ok = vs == strlen(expect) && memcmp(v, expect, vs) == 0;
-    free(v);
-    return ok;
-}
-
 /* the snapshot is drawn per isolation level: read-uncommitted sees all, read-committed refreshes
- * per read (0 at begin), and repeatable-read and stronger freeze the highest assigned seq */
+ * per read (0 at begin), and repeatable-read and stronger freeze the watermark */
 void test_txn_begin_snapshot(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
     ASSERT_TRUE(clock != NULL);
-    (void)tidesdb_mvcc_next_seq(clock);
-    (void)tidesdb_mvcc_next_seq(clock);
-    (void)tidesdb_mvcc_next_seq(clock); /* current_seq now 4, highest assigned 3 */
+    advance_clock(clock, 3); /* current_seq now 4, watermark 3 */
 
     tdb_txn_t *ru = tdb_txn_begin(clock, TDB_ISOLATION_READ_UNCOMMITTED, NULL, 0, NULL);
     ASSERT_TRUE(tdb_txn_snapshot(ru) == UINT64_MAX);
@@ -368,6 +349,7 @@ void test_txn_read_ryow(void)
 void test_txn_read_external(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    advance_clock(clock, 1); /* the version at sequence 1 is decided, so it is readable */
     tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
 
     tsrc m = {0, 1, "k", 1, "value"};
@@ -389,9 +371,7 @@ void test_txn_read_external(void)
 void test_txn_read_snapshot(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    (void)tidesdb_mvcc_next_seq(clock);
-    (void)tidesdb_mvcc_next_seq(clock);
-    (void)tidesdb_mvcc_next_seq(clock); /* current 4, so RR snapshot = 3 */
+    advance_clock(clock, 3); /* watermark 3, so RR snapshot = 3 */
     tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
     ASSERT_TRUE(tdb_txn_snapshot(t) == 3);
 
@@ -413,6 +393,7 @@ void test_txn_read_snapshot(void)
 void test_txn_read_busy_absorbed(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    advance_clock(clock, 1);
     tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
 
     tsrc m = {3, 1, "k", 1, "resolved"}; /* busy 3 times, then answers */
@@ -451,6 +432,9 @@ void test_txn_read_expired(void)
     tidesdb_mvcc_destroy(clock);
 }
 
+/* how many sources a mock backend's apply lands entries in */
+#define MB_MAX_APPLIED 2
+
 /* a mock commit backend recording the calls it received and able to fail any stage */
 typedef struct
 {
@@ -464,6 +448,12 @@ typedef struct
     int last_wal_kind;
     uint32_t paced_families[8];
     int fail_bp_call;
+    tsrc *applied[MB_MAX_APPLIED]; /* stand in for the memtable: an applied entry lands in the
+                                    * source holding its key, at the entry's sequence */
+    int n_applied;
+    tidesdb_mvcc_t
+        *peer_clock; /* when set, the apply begins a snapshot transaction on this clock */
+    tdb_txn_t *peer; /* the transaction the apply began, for the test to read through */
 } mockbe;
 
 static int mb_bp(void *ctx, uint32_t cf_index)
@@ -483,10 +473,23 @@ static int mb_wal(void *ctx, const uint8_t *batch, size_t size)
 }
 static int mb_apply(void *ctx, const tidesdb_wal_entry_t *entries, int count)
 {
-    (void)entries;
     mockbe *m = (mockbe *)ctx;
     m->apply_calls++;
     m->last_apply_count = count;
+    /* the version becomes readable at its sequence the moment it is applied, as in the memtable,
+     * and a peer begun now stands exactly where a reader racing the apply would */
+    for (int i = 0; i < count; i++)
+        for (int s = 0; s < m->n_applied; s++)
+        {
+            tsrc *src = m->applied[s];
+            if (entries[i].key_size != strlen(src->key) ||
+                memcmp(entries[i].key, src->key, entries[i].key_size) != 0)
+                continue;
+            src->has = 1;
+            src->seq = entries[i].seq;
+        }
+    if (m->peer_clock && !m->peer)
+        m->peer = tdb_txn_begin(m->peer_clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
     return m->fail_apply ? -1 : 0;
 }
 static tdb_txn_backend_t mkbackend(mockbe *m)
@@ -495,6 +498,97 @@ static tdb_txn_backend_t mkbackend(mockbe *m)
     tdb_txn_backend_t b = {
         .backpressure = mb_bp, .wal_append = mb_wal, .apply = mb_apply, .ctx = m};
     return b;
+}
+
+/* a transaction that begins while another commit is applying sees nothing of that commit. its
+ * snapshot is the watermark, below the sequence in flight, so neither the entries already applied
+ * nor the ones still to come are inside it, and the commit is visible whole once it has marked */
+void test_txn_begun_during_an_apply_sees_nothing_of_it(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    tsrc applied = {0, 0, "k", 0, "v"};
+    tidesdb_source_t src = tsource(&applied);
+    mockbe be_m = {0};
+    be_m.applied[0] = &applied;
+    be_m.n_applied = 1;
+    be_m.peer_clock = clock;
+    tdb_txn_backend_t be = mkbackend(&be_m);
+
+    tdb_txn_t *c = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    put(c, 0, "k", "v");
+    ASSERT_EQ(tdb_txn_commit(c, &be, &src, 1), TDB_SUCCESS);
+    const uint64_t seq = tdb_txn_commit_seq(c);
+
+    tdb_txn_t *peer = be_m.peer;
+    ASSERT_TRUE(peer != NULL);
+    ASSERT_TRUE(tdb_txn_snapshot(peer) < seq);
+    uint8_t *v = NULL;
+    size_t vs = 0;
+    ASSERT_EQ(tdb_txn_get(peer, 0, (const uint8_t *)"k", 1, &src, 1, &v, &vs), TDB_ERR_NOT_FOUND);
+
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) == seq);
+    tdb_txn_t *after = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    ASSERT_TRUE(get_is(after, 0, "k", &src, 1, "v"));
+
+    tdb_txn_free(after);
+    tdb_txn_free(peer);
+    tdb_txn_free(c);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* a commit that fails after drawing its sequence still decides it, so the watermark passes it and
+ * the next commit is visible the moment it marks */
+void test_txn_failed_commit_leaves_the_watermark_advancing(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe be_m = {0};
+    be_m.fail_wal = 1;
+    tdb_txn_backend_t be = mkbackend(&be_m);
+
+    tdb_txn_t *failed = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    put(failed, 0, "k", "v");
+    ASSERT_EQ(tdb_txn_commit(failed, &be, NULL, 0), TDB_ERR_IO);
+    ASSERT_EQ(tdb_txn_state(failed), TDB_TXN_ABORTED);
+
+    be_m.fail_wal = 0;
+    tdb_txn_t *next = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    put(next, 0, "k", "v");
+    ASSERT_EQ(tdb_txn_commit(next, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_TRUE(tdb_txn_commit_seq(next) == 2); /* the failed commit spent sequence 1 */
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) == 2);
+
+    tdb_txn_free(failed);
+    tdb_txn_free(next);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* a prepare's sequence never carries a version, so it does not hold the watermark down for the
+ * in-doubt window; the commits around it become visible as they mark, and phase two's own
+ * sequence is what the batch finally appears at */
+void test_txn_prepared_sequence_does_not_hold_the_watermark(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe be_m = {0};
+    tdb_txn_backend_t be = mkbackend(&be_m);
+    const uint8_t xid[] = {9, 9};
+
+    tdb_txn_t *p = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    put(p, 0, "k", "v");
+    ASSERT_EQ(tdb_txn_prepare(p, &be, NULL, 0, xid, sizeof(xid)), TDB_SUCCESS);
+    const uint64_t prepared = tdb_txn_commit_seq(p);
+
+    tdb_txn_t *other = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    put(other, 0, "j", "w");
+    ASSERT_EQ(tdb_txn_commit(other, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_TRUE(tdb_txn_commit_seq(other) > prepared);
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) == tdb_txn_commit_seq(other));
+
+    ASSERT_EQ(tdb_txn_commit_prepared(p, &be), TDB_SUCCESS);
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) == tdb_txn_commit_seq(p));
+
+    tdb_txn_free(other);
+    tdb_txn_free(p);
+    tidesdb_mvcc_destroy(clock);
 }
 
 /* a commit draws a seq, appends the WAL, applies the entries, and marks the seq committed; the txn
@@ -515,8 +609,8 @@ void test_txn_commit(void)
     ASSERT_EQ(m.last_apply_count, 2);
     ASSERT_EQ(tdb_txn_state(t), TDB_TXN_COMMITTED);
     ASSERT_TRUE(tdb_txn_commit_seq(t) > 0);
-    ASSERT_EQ(tidesdb_mvcc_committed(clock, tdb_txn_commit_seq(t)), 1);
-    ASSERT_EQ(put(t, 0, "c", "3"), TDB_ERR_INVALID_ARGS); /* finished */
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) >= tdb_txn_commit_seq(t)); /* published */
+    ASSERT_EQ(put(t, 0, "c", "3"), TDB_ERR_INVALID_ARGS);                  /* finished */
 
     tdb_txn_free(t);
     tidesdb_mvcc_destroy(clock);
@@ -778,20 +872,25 @@ void test_txn_commit_dedup_matches_brute_force(void)
     }
 }
 
-/* two snapshot transactions racing the same key -- the second to commit loses first-committer-wins
- */
+/* two snapshot transactions racing the same key -- the second to commit loses first-committer-wins.
+ * the first commit has left the claim set by the time the second validates, so what refuses the
+ * second is the version the first landed in the store, above the second's snapshot */
 void test_txn_commit_write_conflict(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    tsrc applied = {0, 0, "k", 0, "v"};
+    tidesdb_source_t src = tsource(&applied);
     mockbe m = {0};
+    m.applied[0] = &applied;
+    m.n_applied = 1;
     tdb_txn_backend_t be = mkbackend(&m);
 
     tdb_txn_t *t1 = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
     tdb_txn_t *t2 = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
     put(t1, 0, "k", "one");
     put(t2, 0, "k", "two");
-    ASSERT_EQ(tdb_txn_commit(t1, &be, NULL, 0), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(t2, &be, NULL, 0), TDB_ERR_CONFLICT);
+    ASSERT_EQ(tdb_txn_commit(t1, &be, &src, 1), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(t2, &be, &src, 1), TDB_ERR_CONFLICT);
     ASSERT_EQ(tdb_txn_state(t2), TDB_TXN_ABORTED);
     tdb_txn_free(t1);
     tdb_txn_free(t2);
@@ -800,7 +899,7 @@ void test_txn_commit_write_conflict(void)
      */
     tdb_txn_t *t3 = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
     put(t3, 0, "k", "three");
-    ASSERT_EQ(tdb_txn_commit(t3, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(t3, &be, &src, 1), TDB_SUCCESS);
     tdb_txn_free(t3);
 
     tidesdb_mvcc_destroy(clock);
@@ -811,7 +910,7 @@ void test_txn_commit_write_conflict(void)
 void test_txn_read_conflict(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    for (int i = 0; i < 6; i++) (void)tidesdb_mvcc_next_seq(clock); /* current 7 */
+    advance_clock(clock, 6); /* watermark 6 */
     mockbe be_m = {0};
     tdb_txn_backend_t be = mkbackend(&be_m);
     tsrc m = {0, 1, "k", 5, "vk"};
@@ -833,7 +932,7 @@ void test_txn_read_conflict(void)
 void test_txn_read_conflict_none(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    for (int i = 0; i < 6; i++) (void)tidesdb_mvcc_next_seq(clock);
+    advance_clock(clock, 6);
     mockbe be_m = {0};
     tdb_txn_backend_t be = mkbackend(&be_m);
     tsrc m = {0, 1, "k", 5, "vk"};
@@ -874,12 +973,15 @@ static int run_write_skew(tidesdb_isolation_level_t iso)
     tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
     mockbe be_m = {0};
     tdb_txn_backend_t be = mkbackend(&be_m);
-    (void)tidesdb_mvcc_next_seq(clock);
-    (void)tidesdb_mvcc_next_seq(clock); /* current 3 -> snapshot 2, above the data seqs */
+    advance_clock(clock, 2); /* watermark 2, above the data seqs */
 
     tsrc md1 = {0, 1, "d1", 1, "oncall"};
     tsrc md2 = {0, 1, "d2", 1, "oncall"};
     tidesdb_source_t sources[2] = {tsource(&md1), tsource(&md2)};
+    /* the first commit's write lands in the store, where the second one's validation finds it */
+    be_m.applied[0] = &md1;
+    be_m.applied[1] = &md2;
+    be_m.n_applied = 2;
 
     tdb_txn_t *t1 = tdb_txn_begin(clock, iso, NULL, 0, reg);
     tdb_txn_t *t2 = tdb_txn_begin(clock, iso, NULL, 0, reg);
@@ -904,7 +1006,7 @@ static int run_write_skew(tidesdb_isolation_level_t iso)
 }
 
 /* serializable prevents write skew: exactly one of the pair commits */
-void test_txn_ssi_write_skew(void)
+void test_txn_serializable_prevents_write_skew(void)
 {
     ASSERT_EQ(run_write_skew(TDB_ISOLATION_SERIALIZABLE), 1);
 }
@@ -934,7 +1036,7 @@ void test_txn_2pc_commit(void)
     ASSERT_EQ(m.apply_calls, 0); /* not applied yet */
     const uint64_t seq = tdb_txn_commit_seq(t);
     ASSERT_TRUE(seq > 0);
-    ASSERT_EQ(tidesdb_mvcc_committed(clock, seq), 0); /* in-progress, invisible */
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) >= seq); /* spent, so the watermark passes it */
 
     /* phase two draws its own sequence and carries the write set in the COMMIT record, so the
      * decision and the batch are one durable record and the prepare-time sequence is left behind */
@@ -943,8 +1045,8 @@ void test_txn_2pc_commit(void)
     ASSERT_EQ(m.last_wal_kind, TDB_WAL_KIND_COMMIT);
     ASSERT_EQ(m.apply_calls, 1);
     const uint64_t decided = tdb_txn_commit_seq(t);
-    ASSERT_TRUE(decided > seq);                           /* decided later than it prepared */
-    ASSERT_EQ(tidesdb_mvcc_committed(clock, decided), 1); /* now committed */
+    ASSERT_TRUE(decided > seq);                              /* decided later than it prepared */
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) >= decided); /* now committed and published */
     ASSERT_EQ(tdb_txn_state(t), TDB_TXN_COMMITTED);
 
     tdb_txn_free(t);
@@ -968,7 +1070,7 @@ void test_txn_2pc_rollback(void)
     ASSERT_EQ(m.wal_calls, 2);
     ASSERT_EQ(m.last_wal_kind, TDB_WAL_KIND_ROLLBACK);
     ASSERT_EQ(m.apply_calls, 0);
-    ASSERT_EQ(tidesdb_mvcc_committed(clock, seq), 0);
+    ASSERT_TRUE(tidesdb_mvcc_visible_seq(clock) >= seq); /* spent, nothing carries it */
     ASSERT_EQ(tdb_txn_state(t), TDB_TXN_ABORTED);
 
     tdb_txn_free(t);
@@ -1034,167 +1136,200 @@ void test_txn_2pc_conflict(void)
     tidesdb_mvcc_destroy(clock);
 }
 
-/* Find distinct keys that share the reservation slot but not its stored fingerprint. */
-static int find_reservation_collision(char a[32], char b[32])
+/* a scan's footprint is validated like a read. the transaction covered [a, z) and found nothing;
+ * a commit then puts m inside it, above the snapshot, and the first transaction commits a write of
+ * its own. reports what that commit returned */
+static int run_phantom(tidesdb_isolation_level_t iso)
 {
-    uint32_t *first = calloc((size_t)TDB_MVCC_RESERVATION_SLOTS, sizeof(*first));
-    if (!first) return 0;
-    for (uint32_t i = 1; i != 100000; i++)
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    tsrc inserted = {0, 0, "m", 0, "v"};
+    tidesdb_source_t src = tsource(&inserted);
+    mockbe be_m = {0};
+    be_m.applied[0] = &inserted;
+    be_m.n_applied = 1;
+    tdb_txn_backend_t be = mkbackend(&be_m);
+    advance_clock(clock, 1);
+
+    tdb_txn_t *t1 = tdb_txn_begin(clock, iso, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_record_scan(t1, 0, (const uint8_t *)"a", 1, (const uint8_t *)"z", 1),
+              TDB_SUCCESS);
+    put(t1, 0, "marker", "x");
+
+    tdb_txn_t *t2 = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    put(t2, 0, "m", "v");
+    ASSERT_EQ(tdb_txn_commit(t2, &be, &src, 1), TDB_SUCCESS);
+
+    const int rc = tdb_txn_commit(t1, &be, &src, 1);
+    tdb_txn_free(t1);
+    tdb_txn_free(t2);
+    tidesdb_mvcc_destroy(clock);
+    return rc;
+}
+
+/* a key another commit put inside a scanned interval, above the snapshot, is a phantom: the levels
+ * that validate their reads refuse the commit */
+void test_txn_scan_footprint_refuses_a_phantom(void)
+{
+    ASSERT_EQ(run_phantom(TDB_ISOLATION_REPEATABLE_READ), TDB_ERR_CONFLICT);
+    ASSERT_EQ(run_phantom(TDB_ISOLATION_SERIALIZABLE), TDB_ERR_CONFLICT);
+}
+
+/* snapshot isolation validates no read, so it keeps no footprint and commits over the phantom */
+void test_txn_snapshot_commits_over_a_phantom(void)
+{
+    ASSERT_EQ(run_phantom(TDB_ISOLATION_SNAPSHOT), TDB_SUCCESS);
+}
+
+/* a batch adopted in doubt after a restart holds what it read as well as what it wrote, from the
+ * read keys recovery staged beside its entries: a writer of a read key is refused until the
+ * coordinator decides, a writer of an unrelated key is not, and the decision lets the refused one
+ * through */
+void test_txn_adopted_prepare_holds_its_reads(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe m = {0};
+    tdb_txn_backend_t be = mkbackend(&m);
+    const uint8_t xid[] = {4, 2};
+    const uint64_t prepared_at = 7;
+    tidesdb_mvcc_reseed(clock, prepared_at);
+    const tidesdb_wal_entry_t wrote = {.cf_index = 0,
+                                       .seq = prepared_at,
+                                       .ttl = -1,
+                                       .key = (const uint8_t *)"y",
+                                       .key_size = 1,
+                                       .value = (const uint8_t *)"p",
+                                       .value_size = 1};
+    const tidesdb_wal_entry_t read = {
+        .cf_index = 0, .seq = prepared_at, .ttl = -1, .key = (const uint8_t *)"x", .key_size = 1};
+
+    tdb_txn_t *p =
+        tdb_txn_adopt_prepared(clock, xid, sizeof(xid), &wrote, 1, prepared_at, &read, 1);
+    ASSERT_TRUE(p != NULL);
+    ASSERT_EQ(tdb_txn_state(p), TDB_TXN_PREPARED);
+
+    tdb_txn_t *w = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(w, 0, "x", "w");
+    ASSERT_EQ(tdb_txn_commit(w, &be, NULL, 0), TDB_ERR_CONFLICT);
+    tdb_txn_free(w);
+
+    tdb_txn_t *elsewhere = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(elsewhere, 0, "z", "w");
+    ASSERT_EQ(tdb_txn_commit(elsewhere, &be, NULL, 0), TDB_SUCCESS);
+    tdb_txn_free(elsewhere);
+
+    ASSERT_EQ(tdb_txn_commit_prepared(p, &be), TDB_SUCCESS);
+    tdb_txn_free(p);
+    w = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(w, 0, "x", "w");
+    ASSERT_EQ(tdb_txn_commit(w, &be, NULL, 0), TDB_SUCCESS);
+    tdb_txn_free(w);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/**
+ * skew_src_t
+ * the source of key x for the interleaved write-skew test. the first time a validation asks it
+ * about x it commits the peer transaction, which read y and writes x, on a thread of its own before
+ * answering -- so the peer lands exactly between the asking commit's probe and its decision
+ * @param base the version of x the source holds
+ * @param peer the transaction to commit from inside the probe, or NULL
+ * @param be the backend the peer commits through
+ * @param sources the source stack the peer validates against
+ * @param nsources how many
+ * @param fired set once the peer has been committed
+ * @param peer_rc what the peer's commit returned
+ */
+typedef struct
+{
+    tsrc base;
+    tdb_txn_t *peer;
+    const tdb_txn_backend_t *be;
+    const tidesdb_source_t *sources;
+    int nsources;
+    int fired;
+    int peer_rc;
+} skew_src_t;
+
+/* commit the peer on a thread of its own, as a rival committer would be; the asking commit holds
+ * the gate shared while it validates, and so does this one, so neither waits on the other */
+static void *skew_commit_peer(void *arg)
+{
+    skew_src_t *s = (skew_src_t *)arg;
+    s->peer_rc = tdb_txn_commit(s->peer, s->be, s->sources, s->nsources);
+    return NULL;
+}
+
+static tidesdb_source_result_t skew_get(void *ctx, uint32_t cf_index, const uint8_t *key,
+                                        size_t key_size, uint64_t snapshot,
+                                        tidesdb_source_version_t *out)
+{
+    skew_src_t *s = (skew_src_t *)ctx;
+    if (!s->fired && s->peer && key_size == 1 && key[0] == 'x')
     {
-        char candidate[32];
-        const int n = snprintf(candidate, sizeof(candidate), "reserve-%u", i);
-        const uint64_t h = txn_key_hash(0, (const uint8_t *)candidate, (size_t)n);
-        const uint32_t slot = (uint32_t)h & TDB_MVCC_RESERVATION_MASK;
-        const uint32_t prior = first[slot];
-        if (prior)
-        {
-            char prior_key[32];
-            const int pn = snprintf(prior_key, sizeof(prior_key), "reserve-%u", prior);
-            const uint64_t ph = txn_key_hash(0, (const uint8_t *)prior_key, (size_t)pn);
-            if ((uint16_t)(ph >> TDB_MVCC_RES_SEQ_BITS) != (uint16_t)(h >> TDB_MVCC_RES_SEQ_BITS))
-            {
-                snprintf(a, 32, "%s", prior_key);
-                snprintf(b, 32, "%s", candidate);
-                free(first);
-                return 1;
-            }
-        }
-        else
-            first[slot] = i;
+        s->fired = 1;
+        pthread_t peer;
+        if (pthread_create(&peer, NULL, skew_commit_peer, s) == 0) pthread_join(peer, NULL);
     }
-    free(first);
-    return 0;
+    return tsrc_get(&s->base, cf_index, key, key_size, snapshot, out);
 }
 
-/* Two distinct 16-byte benchmark keys with the same XXH3 slot and stored 16-bit fingerprint.
- * They were found once with a bounded birthday scan and kept literal so this regression is O(1). */
-void test_txn_reservation_matching_fingerprint_alias(void)
+/* the doctors-on-call pair with the peer's whole commit landing inside the other's validation of
+ * the key it read. run at the given isolation, reporting how many of the two committed */
+static int run_write_skew_inside_probe(tidesdb_isolation_level_t iso)
 {
-    static const uint8_t a[16] = {0, 0, 0, 0, 0, 2, 0xde, 0xce, 0, 0, 0, 0, 0, 0, 0, 0};
-    static const uint8_t b[16] = {0, 0, 0, 0, 0, 3, 0xec, 0xb0, 0, 0, 0, 0, 0, 0, 0, 0};
-    const uint64_t ah = txn_key_hash(0, a, sizeof(a));
-    const uint64_t bh = txn_key_hash(0, b, sizeof(b));
-    ASSERT_TRUE(memcmp(a, b, sizeof(a)) != 0);
-    ASSERT_EQ((uint32_t)ah & TDB_MVCC_RESERVATION_MASK, (uint32_t)bh & TDB_MVCC_RESERVATION_MASK);
-    ASSERT_EQ((uint16_t)(ah >> TDB_MVCC_RES_SEQ_BITS), (uint16_t)(bh >> TDB_MVCC_RES_SEQ_BITS));
-
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
     mockbe be_m = {0};
     tdb_txn_backend_t be = mkbackend(&be_m);
-    ASSERT_TRUE(clock && reg);
+    advance_clock(clock, 2); /* watermark 2, above the data at 1 */
 
-    /* Seed both keys in one transaction, then leave A as the committed slot occupant. */
-    tdb_txn_t *seed = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, reg);
-    ASSERT_EQ(put_bytes(seed, 0, a, sizeof(a), "seed-a"), TDB_SUCCESS);
-    ASSERT_EQ(put_bytes(seed, 0, b, sizeof(b), "seed-b"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(seed, &be, NULL, 0), TDB_SUCCESS);
-    const uint64_t seed_seq = tdb_txn_commit_seq(seed);
-    tdb_txn_free(seed);
+    skew_src_t sx = {.base = {0, 1, "x", 1, "oncall"}};
+    tsrc sy = {0, 1, "y", 1, "oncall"};
+    tidesdb_source_t sources[2] = {{.name = "skew", .get = skew_get, .has_newer = NULL, .ctx = &sx},
+                                   tsource(&sy)};
 
-    bsrc a_source = {a, sizeof(a), seed_seq, "seed-a"};
-    bsrc b_source = {b, sizeof(b), seed_seq, "seed-b"};
-    tidesdb_source_t sources[] = {bsource(&a_source), bsource(&b_source)};
+    tdb_txn_t *t1 = tdb_txn_begin(clock, iso, NULL, 0, NULL);
+    tdb_txn_t *t2 = tdb_txn_begin(clock, iso, NULL, 0, NULL);
+    get_is(t1, 0, "x", sources, 2, "oncall");
+    put(t1, 0, "y", "off");
+    get_is(t2, 0, "y", sources, 2, "oncall");
+    put(t2, 0, "x", "off");
 
-    tdb_txn_t *update_a = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, reg);
-    ASSERT_TRUE(get_bytes_is(update_a, 0, a, sizeof(a), sources, 2, "seed-a"));
-    ASSERT_EQ(put_bytes(update_a, 0, a, sizeof(a), "updated-a"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(update_a, &be, sources, 2), TDB_SUCCESS);
-    a_source.seq = tdb_txn_commit_seq(update_a);
-    a_source.value = "updated-a";
-    tdb_txn_free(update_a);
+    sx.peer = t2;
+    sx.be = &be;
+    sx.sources = sources;
+    sx.nsources = 2;
+    const int rc1 = tdb_txn_commit(t1, &be, sources, 2);
+    /* a level that validates no reads never asks the source about x, so the peer commits after --
+     * disarmed first, since its own write validation asks about x and must not commit it again
+     * from inside itself */
+    if (!sx.fired)
+    {
+        sx.peer = NULL;
+        sx.peer_rc = tdb_txn_commit(t2, &be, sources, 2);
+    }
+    const int committed = (rc1 == TDB_SUCCESS) + (sx.peer_rc == TDB_SUCCESS);
 
-    /* B read-modify-write is disjoint from A. Its stale matching fingerprint must not imply A == B.
-     */
-    tdb_txn_t *update_b = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, reg);
-    ASSERT_TRUE(get_bytes_is(update_b, 0, b, sizeof(b), sources, 2, "seed-b"));
-    ASSERT_EQ(put_bytes(update_b, 0, b, sizeof(b), "updated-b"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(update_b, &be, sources, 2), TDB_SUCCESS);
-    b_source.seq = tdb_txn_commit_seq(update_b);
-    b_source.value = "updated-b";
-    tdb_txn_free(update_b);
-
-    tdb_txn_t *verify = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, reg);
-    ASSERT_TRUE(get_bytes_is(verify, 0, a, sizeof(a), sources, 2, "updated-a"));
-    ASSERT_TRUE(get_bytes_is(verify, 0, b, sizeof(b), sources, 2, "updated-b"));
-    ASSERT_EQ(tdb_txn_rollback(verify), TDB_SUCCESS);
-    tdb_txn_free(verify);
-    tidesdb_txn_registry_destroy(reg);
+    tdb_txn_free(t1);
+    tdb_txn_free(t2);
     tidesdb_mvcc_destroy(clock);
+    return committed;
 }
 
-/* A stale published floor must not turn an old, different-fingerprint slot into a conflict. */
-void test_txn_reservation_refreshes_stale_floor_once(void)
+/* a write-skew pair whose second commit lands inside the first's validation still yields exactly
+ * one commit at serializable and at repeatable read: the second finds the first's write claim below
+ * its own sequence on the key it read. the probe alone would have cleared both, since the second
+ * had not committed when the first looked */
+void test_txn_write_skew_inside_the_probe_yields_one(void)
 {
-    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
-    mockbe be_m = {0};
-    tdb_txn_backend_t be = mkbackend(&be_m);
-    char a[32], b[32];
-    ASSERT_TRUE(clock && reg && find_reservation_collision(a, b));
-
-    (void)tidesdb_mvcc_next_seq(clock);
-    tidesdb_mvcc_mark(clock, 1, 1);
-    tsrc old_a = {0, 1, a, 1, "old"};
-    tidesdb_source_t source = tsource(&old_a);
-
-    tdb_txn_t *prior = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
-    ASSERT_EQ(put(prior, 0, b, "other"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(prior, &be, &source, 1), TDB_SUCCESS);
-    tdb_txn_free(prior);
-    ASSERT_EQ(tidesdb_txn_registry_published_min_snapshot(reg), 0);
-
-    tdb_txn_t *current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
-    ASSERT_EQ(tdb_txn_snapshot(current), 2);
-    ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
-    ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_SUCCESS);
-    tdb_txn_free(current);
-    tidesdb_txn_registry_destroy(reg);
-    tidesdb_mvcc_destroy(clock);
+    ASSERT_EQ(run_write_skew_inside_probe(TDB_ISOLATION_SERIALIZABLE), 1);
+    ASSERT_EQ(run_write_skew_inside_probe(TDB_ISOLATION_REPEATABLE_READ), 1);
 }
 
-/* A live older snapshot's collision guard is preserved: the committed occupant it may still need
- * to meet keeps its slot, while an unrelated key colliding into that slot records itself beside it
- * and commits. One slot per key refused the unrelated commit to keep the guard. */
-void test_txn_reservation_refresh_keeps_live_old_snapshot(void)
+/* snapshot isolation validates no reads, so the same pair commits twice -- the write skew the level
+ * is defined to allow */
+void test_txn_snapshot_allows_write_skew_inside_the_probe(void)
 {
-    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
-    tidesdb_txn_registry_t *reg = tidesdb_txn_registry_create();
-    mockbe be_m = {0};
-    tdb_txn_backend_t be = mkbackend(&be_m);
-    char a[32], b[32];
-    ASSERT_TRUE(clock && reg && find_reservation_collision(a, b));
-
-    (void)tidesdb_mvcc_next_seq(clock);
-    tidesdb_mvcc_mark(clock, 1, 1);
-    tsrc old_a = {0, 1, a, 1, "old"};
-    tidesdb_source_t source = tsource(&old_a);
-    tdb_txn_t *old = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
-    tdb_txn_t *prior = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
-    ASSERT_EQ(put(prior, 0, b, "other"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(prior, &be, &source, 1), TDB_SUCCESS);
-    tdb_txn_free(prior);
-
-    tdb_txn_t *current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
-    ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
-    ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_SUCCESS);
-    tdb_txn_free(current);
-
-    /* the guard itself: the old snapshot writing the key committed above it still meets that
-     * commit's occupant, which the unrelated claim left in place */
-    ASSERT_EQ(put(old, 0, b, "late"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(old, &be, &source, 1), TDB_ERR_CONFLICT);
-    tdb_txn_free(old);
-
-    current = tdb_txn_begin(clock, TDB_ISOLATION_SERIALIZABLE, NULL, 0, reg);
-    ASSERT_TRUE(get_is(current, 0, a, &source, 1, "old"));
-    ASSERT_EQ(put(current, 0, a, "new"), TDB_SUCCESS);
-    ASSERT_EQ(tdb_txn_commit(current, &be, &source, 1), TDB_SUCCESS);
-    tdb_txn_free(current);
-    tidesdb_txn_registry_destroy(reg);
-    tidesdb_mvcc_destroy(clock);
+    ASSERT_EQ(run_write_skew_inside_probe(TDB_ISOLATION_SNAPSHOT), 2);
 }
 
 int main(int argc, char **argv)
@@ -1206,12 +1341,18 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_2pc_readonly, tests_passed);
     RUN_TEST(test_txn_2pc_prepared_is_frozen, tests_passed);
     RUN_TEST(test_txn_2pc_conflict, tests_passed);
-    RUN_TEST(test_txn_ssi_write_skew, tests_passed);
+    RUN_TEST(test_txn_adopted_prepare_holds_its_reads, tests_passed);
+    RUN_TEST(test_txn_scan_footprint_refuses_a_phantom, tests_passed);
+    RUN_TEST(test_txn_snapshot_commits_over_a_phantom, tests_passed);
+    RUN_TEST(test_txn_serializable_prevents_write_skew, tests_passed);
     RUN_TEST(test_txn_snapshot_allows_write_skew, tests_passed);
     RUN_TEST(test_txn_read_conflict, tests_passed);
     RUN_TEST(test_txn_read_conflict_none, tests_passed);
     RUN_TEST(test_txn_write_scan_conflict, tests_passed);
     RUN_TEST(test_txn_commit, tests_passed);
+    RUN_TEST(test_txn_begun_during_an_apply_sees_nothing_of_it, tests_passed);
+    RUN_TEST(test_txn_failed_commit_leaves_the_watermark_advancing, tests_passed);
+    RUN_TEST(test_txn_prepared_sequence_does_not_hold_the_watermark, tests_passed);
     RUN_TEST(test_txn_commit_paces_first_seen_families, tests_passed);
     RUN_TEST(test_txn_commit_paces_large_grouped_families, tests_passed);
     RUN_TEST(test_txn_commit_backpressure_failure, tests_passed);
@@ -1234,9 +1375,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_savepoints, tests_passed);
     RUN_TEST(test_txn_savepoint_remark, tests_passed);
     RUN_TEST(test_txn_null_safe, tests_passed);
-    RUN_TEST(test_txn_reservation_matching_fingerprint_alias, tests_passed);
-    RUN_TEST(test_txn_reservation_refreshes_stale_floor_once, tests_passed);
-    RUN_TEST(test_txn_reservation_refresh_keeps_live_old_snapshot, tests_passed);
+    RUN_TEST(test_txn_write_skew_inside_the_probe_yields_one, tests_passed);
+    RUN_TEST(test_txn_snapshot_allows_write_skew_inside_the_probe, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

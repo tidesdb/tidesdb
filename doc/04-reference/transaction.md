@@ -34,7 +34,7 @@ commit fail.
 | --- | --- | --- | --- |
 | `TDB_ISOLATION_READ_UNCOMMITTED` | 0 | Everything, including uncommitted writes | No |
 | `TDB_ISOLATION_READ_COMMITTED` | 1 | The latest committed version, re-read per operation | No |
-| `TDB_ISOLATION_REPEATABLE_READ` | 2 | A sequence frozen at begin | **Yes**, if a key it read changed |
+| `TDB_ISOLATION_REPEATABLE_READ` | 2 | A sequence frozen at begin | **Yes**, if a key it read changed or a key appeared in a range it scanned |
 | `TDB_ISOLATION_SNAPSHOT` | 3 | A sequence frozen at begin | **Yes**, if a key it wrote was written first |
 | `TDB_ISOLATION_SERIALIZABLE` | 4 | A sequence frozen at begin | **Yes**, on either |
 
@@ -44,12 +44,12 @@ like an unchecked overwrite, so a lost update is the expected outcome of a race 
 a defect.
 
 The three above it each check something different. Repeatable read validates its **read set**: a
-commit fails if any key it recorded a read for has a newer committed version. Snapshot instead
-takes a first-committer-wins reservation on every key it **writes**, validated against the version
-the transaction actually read, so a write-write race loses at commit rather than silently
-overwriting — but it does not check reads. Serializable does both and adds the check for write
-skew. **Any code using a level above read-committed must handle `TDB_ERR_CONFLICT` by retrying the
-whole transaction.**
+commit fails if any key it recorded a read for has a newer version, committed or in flight below
+it, or if a key appeared inside a range one of its iterators covered. Snapshot instead claims every
+key it **writes** on a first-committer-wins basis, validated against the version the transaction
+actually read, so a write-write race loses at commit rather than silently overwriting — but it does
+not check reads. Serializable does both. **Any code using a level above read-committed must handle
+`TDB_ERR_CONFLICT` by retrying the whole transaction.**
 
 ## tidesdb_txn_begin
 
@@ -141,7 +141,8 @@ int tidesdb_snapshot_create(tidesdb_t *db, tidesdb_snapshot_t **snapshot);
 
 ### Description
 
-Captures the current sequence and **holds the reclamation floor at it**. That hold is the feature:
+Captures the watermark — the newest sequence below which every commit is decided and published —
+and **holds the reclamation floor at it**. That hold is the feature:
 compaction may not discard versions above the floor, and a flush carries them into L1 for the same
 reason, so the state the snapshot names stays readable for as long as it lives.
 
@@ -524,8 +525,8 @@ committed versions are and are not visible. Diagnostic; nothing in the API consu
 | Level | Value returned |
 | --- | --- |
 | `TDB_ISOLATION_READ_UNCOMMITTED` | `UINT64_MAX` |
-| `TDB_ISOLATION_READ_COMMITTED` | The current sequence, moving with each read |
-| Repeatable read and stronger | The sequence frozen at begin |
+| `TDB_ISOLATION_READ_COMMITTED` | The watermark, moving with each read |
+| Repeatable read and stronger | The watermark frozen at begin |
 
 Returns 0 for a `NULL` transaction, which is otherwise not a valid snapshot.
 
@@ -778,8 +779,8 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn);
 
 ### Description
 
-Validates conflicts if the isolation level requires it, draws a commit sequence, reserves
-the written keys, writes the batch to the write-ahead log, and applies it to the memtable.
+Claims the written keys if the isolation level requires it, draws a commit sequence, validates
+conflicts, writes the batch to the write-ahead log, and applies it to the memtable.
 The log write happens before the memtable apply, so a crash in between recovers the batch
 rather than losing it.
 
@@ -867,8 +868,8 @@ int tidesdb_txn_set_timeout(tidesdb_txn_t *txn, int64_t seconds);
 Sets a deadline `seconds` from now, overriding the database's `txn_timeout_seconds` for this
 transaction alone. Pass `0` or less to clear any bound.
 
-**Why this exists.** An active transaction holds its snapshot, and at snapshot and serializable
-isolation its write reservations too. That keeps the reclamation floor down, so compaction cannot
+**Why this exists.** An active transaction holds its snapshot, and once prepared its claims too.
+That keeps the reclamation floor down, so compaction cannot
 drop the old versions below it and the value log cannot reclaim their bytes. A transaction that is
 never resolved therefore costs disk for as long as the database stays open. A timeout is what
 bounds that for a caller that might leak one.
@@ -975,12 +976,12 @@ Runs the same conflict checks as commit and durably logs the write batch under `
 leaves the writes **invisible and unapplied** so a coordinator can collect votes from every
 participant before deciding.
 
-On success the transaction is `TDB_TXN_STATE_PREPARED` and holds its snapshot and its key
-reservations until resolved with
-[`tidesdb_txn_commit_prepared`](#tidesdb_txn_commit_prepared) or
-[`tidesdb_txn_rollback_prepared`](#tidesdb_txn_rollback_prepared). Holding reservations
-blocks conflicting commits, so an undecided prepared transaction applies backpressure to
-everything contending for its keys — decide promptly.
+On success the transaction is `TDB_TXN_STATE_PREPARED` and holds its snapshot and its claims —
+on the keys it wrote, and at repeatable read or above on the keys it read too — until resolved
+with [`tidesdb_txn_commit_prepared`](#tidesdb_txn_commit_prepared) or
+[`tidesdb_txn_rollback_prepared`](#tidesdb_txn_rollback_prepared). A held claim refuses
+conflicting commits, so an undecided prepared transaction applies backpressure to everything
+contending for its keys — decide promptly.
 
 A read-only transaction prepares with nothing durable and needs no phase two.
 
@@ -1046,7 +1047,7 @@ int tidesdb_txn_rollback_prepared(tidesdb_txn_t *txn);
 
 ### Description
 
-Durably logs the decision to abandon the prepared transaction and releases its reservations.
+Durably logs the decision to abandon the prepared transaction and releases its claims.
 Nothing had been applied, so nothing is undone. The decision is logged rather than merely
 dropped so that a restart does not resurrect the transaction as in-doubt.
 

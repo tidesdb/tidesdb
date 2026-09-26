@@ -14,7 +14,7 @@
 
 #include "db.h" /* TDB_SUCCESS / TDB_ERR_* result codes */
 
-/* initial entry-array capacity, grown by doubling */
+/* initial array capacity for the keys and for the intervals, grown by doubling */
 #define TDB_READSET_INITIAL_CAP 16
 
 /**
@@ -34,20 +34,46 @@ typedef struct
 } readset_entry;
 
 /**
+ * readset_range
+ * one interval a scan covered; the bounds are their own allocations
+ * @param cf_index target column family prefix index
+ * @param lo allocated inclusive lower bound
+ * @param lo_size length of lo
+ * @param hi allocated exclusive upper bound, NULL when the scan ran to the end of the family
+ * @param hi_size length of hi, 0 when open above
+ * @param seq the snapshot the scan read at
+ */
+typedef struct
+{
+    uint32_t cf_index;
+    uint8_t *lo;
+    size_t lo_size;
+    uint8_t *hi;
+    size_t hi_size;
+    uint64_t seq;
+} readset_range;
+
+/**
  * tidesdb_readset
- * the read set with its scan lock and memory accounting
+ * the read set with its lock and memory accounting
  * @param entries recorded reads, one per distinct key
  * @param count number of entries
  * @param capacity allocated length of entries
- * @param lock guards entry-array mutation against a cross-txn peer scan
- * @param mem_bytes approximate heap held by the entries and their keys. atomic for the same reason
- *                  the write set's is -- the stats sweep reads it from another thread
+ * @param ranges the intervals scans covered, one per freed iterator
+ * @param range_count number of ranges
+ * @param range_capacity allocated length of ranges
+ * @param lock guards array mutation
+ * @param mem_bytes approximate heap held by the entries, the ranges and their bytes. atomic for the
+ *                  same reason the write set's is -- the stats sweep reads it from another thread
  */
 struct tidesdb_readset
 {
     readset_entry *entries;
     int count;
     int capacity;
+    readset_range *ranges;
+    int range_count;
+    int range_capacity;
     pthread_rwlock_t lock;
     _Atomic(int64_t) mem_bytes;
 };
@@ -64,11 +90,17 @@ tidesdb_readset_t *tidesdb_readset_create(void)
     return rs;
 }
 
-/* free every entry's key and reset the count; the caller holds the write lock or owns the set */
+/* free every entry's key and every range's bounds and reset the counts; the caller owns the set */
 static void readset_drop_all(tidesdb_readset_t *rs)
 {
     for (int i = 0; i < rs->count; i++) free(rs->entries[i].key);
     rs->count = 0;
+    for (int i = 0; i < rs->range_count; i++)
+    {
+        free(rs->ranges[i].lo);
+        free(rs->ranges[i].hi);
+    }
+    rs->range_count = 0;
     atomic_store_explicit(&rs->mem_bytes, 0, memory_order_relaxed);
 }
 
@@ -77,6 +109,7 @@ void tidesdb_readset_free(tidesdb_readset_t *rs)
     if (!rs) return;
     readset_drop_all(rs);
     free(rs->entries);
+    free(rs->ranges);
     pthread_rwlock_destroy(&rs->lock);
     free(rs);
 }
@@ -93,6 +126,20 @@ static int readset_index(const tidesdb_readset_t *rs, uint32_t cf_index, const u
             return i;
     }
     return -1;
+}
+
+/* copy a bound, or NULL when it is empty or cannot be copied; *ok is cleared on a failed copy */
+static uint8_t *readset_copy_bytes(const uint8_t *src, size_t size, int *ok)
+{
+    if (size == 0) return NULL;
+    uint8_t *copy = malloc(size);
+    if (!copy)
+    {
+        *ok = 0;
+        return NULL;
+    }
+    memcpy(copy, src, size);
+    return copy;
 }
 
 int tidesdb_readset_record(tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
@@ -140,6 +187,45 @@ int tidesdb_readset_record(tidesdb_readset_t *rs, uint32_t cf_index, const uint8
     return TDB_SUCCESS;
 }
 
+int tidesdb_readset_record_range(tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *lo,
+                                 size_t lo_size, const uint8_t *hi, size_t hi_size, uint64_t seq)
+{
+    if (!rs || !lo || lo_size == 0 || (hi_size > 0 && !hi)) return TDB_ERR_INVALID_ARGS;
+
+    int ok = 1;
+    uint8_t *lo_copy = readset_copy_bytes(lo, lo_size, &ok);
+    uint8_t *hi_copy = readset_copy_bytes(hi, hi_size, &ok);
+    if (!ok)
+    {
+        free(lo_copy);
+        free(hi_copy);
+        return TDB_ERR_MEMORY;
+    }
+
+    pthread_rwlock_wrlock(&rs->lock);
+    if (rs->range_count == rs->range_capacity)
+    {
+        const int new_cap = rs->range_capacity ? rs->range_capacity * 2 : TDB_READSET_INITIAL_CAP;
+        readset_range *grown = realloc(rs->ranges, (size_t)new_cap * sizeof(*grown));
+        if (!grown)
+        {
+            pthread_rwlock_unlock(&rs->lock);
+            free(lo_copy);
+            free(hi_copy);
+            return TDB_ERR_MEMORY;
+        }
+        rs->ranges = grown;
+        rs->range_capacity = new_cap;
+    }
+    rs->ranges[rs->range_count] =
+        (readset_range){cf_index, lo_copy, lo_size, hi_copy, hi_size, seq};
+    rs->range_count++;
+    atomic_fetch_add_explicit(&rs->mem_bytes, (int64_t)(sizeof(readset_range) + lo_size + hi_size),
+                              memory_order_relaxed);
+    pthread_rwlock_unlock(&rs->lock);
+    return TDB_SUCCESS;
+}
+
 int tidesdb_readset_count(const tidesdb_readset_t *rs)
 {
     return rs ? rs->count : 0;
@@ -156,32 +242,22 @@ int tidesdb_readset_at(const tidesdb_readset_t *rs, int index, tidesdb_readset_e
     return 1;
 }
 
-int tidesdb_readset_seq(const tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
-                        size_t key_size, uint64_t *out_seq)
+int tidesdb_readset_range_count(const tidesdb_readset_t *rs)
 {
-    if (!rs || !key) return 0;
-    const int idx = readset_index(rs, cf_index, key, key_size);
-    if (idx < 0) return 0;
-    if (out_seq) *out_seq = rs->entries[idx].seq;
+    return rs ? rs->range_count : 0;
+}
+
+int tidesdb_readset_range_at(const tidesdb_readset_t *rs, int index, tidesdb_readset_range_t *out)
+{
+    if (!rs || !out || index < 0 || index >= rs->range_count) return 0;
+    const readset_range *r = &rs->ranges[index];
+    out->cf_index = r->cf_index;
+    out->lo = r->lo;
+    out->lo_size = r->lo_size;
+    out->hi = r->hi;
+    out->hi_size = r->hi_size;
+    out->seq = r->seq;
     return 1;
-}
-
-int tidesdb_readset_contains(tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
-                             size_t key_size)
-{
-    if (!rs || !key) return 0;
-    pthread_rwlock_rdlock(&rs->lock);
-    const int found = readset_index(rs, cf_index, key, key_size) >= 0;
-    pthread_rwlock_unlock(&rs->lock);
-    return found;
-}
-
-void tidesdb_readset_clear(tidesdb_readset_t *rs)
-{
-    if (!rs) return;
-    pthread_rwlock_wrlock(&rs->lock);
-    readset_drop_all(rs);
-    pthread_rwlock_unlock(&rs->lock);
 }
 
 int64_t tidesdb_readset_mem_bytes(const tidesdb_readset_t *rs)

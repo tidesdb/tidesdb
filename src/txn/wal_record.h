@@ -37,6 +37,13 @@
  * ROLLBACK so it can never be mistaken for a two-phase rollback, which is keyed by a caller's
  * transaction id and could legitimately be eight bytes long */
 #define TDB_WAL_KIND_ABORT_SEQ 4
+/* the keys a prepare at repeatable read or above had read, written immediately ahead of its PREPARE
+ * under the same xid so a durable PREPARE always has them. its entries carry a key and no value,
+ * and recovery holds them for the PREPARE that follows; a batch adopted in doubt after a restart
+ * then refuses a writer of a key it read, as the live prepare did. a distinct kind rather than
+ * entries inside the PREPARE, so a binary that does not know it refuses the log rather than
+ * applying the keys as writes */
+#define TDB_WAL_KIND_PREPARE_READS 5
 
 /* the encoded width of the sequence an abort record carries */
 #define TDB_WAL_ABORT_SEQ_SIZE 8

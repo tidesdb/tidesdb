@@ -49,13 +49,10 @@ typedef struct
  * tidesdb_txn_registry
  * the live-transaction set, split across independent shards selected by joining thread
  * @param shards the shard array
- * @param published_min the last minimum a scan published, for readers that cannot afford the scan
- *                      itself; starts at zero, which reads as "assume nothing"
  */
 struct tidesdb_txn_registry
 {
     tidesdb_txn_registry_shard_t shards[TDB_TXN_REGISTRY_SHARDS];
-    _Atomic(uint64_t) published_min;
 };
 
 /* the shard a joining transaction takes, claimed once per thread from a global counter.
@@ -185,24 +182,6 @@ uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg)
         pthread_rwlock_unlock(&shard->lock);
     }
     return min;
-}
-
-void tidesdb_txn_registry_publish_min_snapshot(tidesdb_txn_registry_t *reg)
-{
-    if (!reg) return;
-
-    /* an empty registry answers UINT64_MAX, which is a sentinel for "nothing constrains you"
-     * rather than a real minimum -- publishing it would let a transaction that begins afterwards
-     * hold a snapshot below the published value, which is the one direction a reader of this may
-     * not tolerate. zero is the honest answer for an empty set: it constrains nothing wrongly */
-    const uint64_t exact = tidesdb_txn_registry_min_snapshot(reg);
-    atomic_store_explicit(&reg->published_min, exact == UINT64_MAX ? 0 : exact,
-                          memory_order_relaxed);
-}
-
-uint64_t tidesdb_txn_registry_published_min_snapshot(const tidesdb_txn_registry_t *reg)
-{
-    return reg ? atomic_load_explicit(&reg->published_min, memory_order_relaxed) : 0;
 }
 
 int tidesdb_txn_registry_for_each(tidesdb_txn_registry_t *reg, tidesdb_txn_visit_fn visit,

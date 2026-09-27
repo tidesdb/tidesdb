@@ -209,8 +209,8 @@ void engine_flush_worker(void *item, void *ctx)
     tidesdb_t *db = (tidesdb_t *)ctx;
 
     /* the next rotation's log is prepared here, on a flush worker, rather than by the committer
-     * whose commit rotated. under full sync the preparation fills the log with zeros, which is
-     * device work no commit should wait on. a rotation that arrives first opens its own log */
+     * whose commit rotated, so creating the file is device work no commit waits on. a rotation that
+     * arrives first opens its own log */
     engine_prepare_spare_wal(db);
 
     pthread_mutex_lock(&db->flush_lock);
@@ -292,8 +292,6 @@ void engine_prepare_spare_wal(tidesdb_t *db)
         atomic_store_explicit(&db->spare_wal_preparing, 0, memory_order_release);
         return;
     }
-    /* filled before it is published, while nothing can append to it */
-    engine_prefill_wal(db, wal);
 
     /* the generation is written before the pointer is published, so a rotation that takes the log
      * also sees the generation it was named for */

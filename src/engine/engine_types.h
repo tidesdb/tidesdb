@@ -115,7 +115,7 @@ typedef struct
  * @param active_wal_gen the generation of the log the active memtable appends to, written at open
  * and under rotate_lock, and read without it by a prepare pinning the log its record lands in and
  * by the statistics. a rotation that finds the spare named at or below it discards the spare, since
- * a rotation that opened its own log while the spare was being filled has already moved past it,
+ * a rotation that opened its own log while the spare was being prepared has already moved past it,
  * and installing the lower generation after the higher one would have recovery replay the newer
  * commits as the older
  * @param spare_wal_preparing whether a thread is already opening a spare, so a rotation burst

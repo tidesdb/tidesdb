@@ -152,9 +152,9 @@ is cheap, and the first write into each one converts it. That conversion is itse
 metadata operation, and a synchronous write cannot return until the journal has committed it. For
 files written in bulk and synced once that is noise. For a log synced on every commit it is not: it
 put a journal commit behind every durable append and made each one cost several times the device's
-own sync. `block_manager_prefill` writes zeros over the range instead, through a descriptor of its
-own with one sync at the end, so the appends that follow land in written extents; the engine uses it
-for write-ahead logs under full sync only.
+own sync. `block_manager_set_fill_ahead` has a buffered log's flush thread write zeros over the
+range just past its end instead, through a descriptor of its own, while the log is idle and its
+writes are small; the engine turns it on for write-ahead logs under full sync only.
 :::
 
 ## The buffered append ring

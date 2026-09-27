@@ -94,6 +94,14 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
 #define BM_BUF_FLUSH_PARK_MAX_US 250000 /* idle ceiling, a quarter second */
 #define BM_BUF_FLUSH_PARK_GROWTH 2      /* multiplier applied per consecutive empty park */
 
+/* the running average of a flush-thread write's size past which a log is not filled ahead, and the
+ * weight a new write carries in that average. the journal cost a fill saves is paid once per sync,
+ * while the zeros it writes cost per byte, so a log whose syncs carry large writes -- a bulk load
+ * -- gains little from filling and pays for every zero, where one whose syncs carry a few small
+ * commits gains the most */
+#define BM_FILL_RUN_AVG_MAX (64 * 1024)
+#define BM_RUN_AVG_WEIGHT   8
+
 /* a rotating WAL opens a fresh buffered handle every generation; without pooling that mallocs and
  * first-touches (page-faults) a new ring plus done-ring each time, on the rotation critical path. a
  * small free-list hands a retired, already-resident buffer pair to the next open instead. a
@@ -281,6 +289,9 @@ static int bm_flush_drain(block_manager_t *bm)
     }
     if (p <= fl) return 0;
 
+    /* weighted so a burst of large writes turns filling off within a few syncs, and a quiet spell
+     * of small ones turns it back on */
+    bm->run_avg = (bm->run_avg * (BM_RUN_AVG_WEIGHT - 1) + (p - fl)) / BM_RUN_AVG_WEIGHT;
     if (bm_flush_write_run(bm, fl, p - fl) != 0)
     {
         bm_note_write_failure(bm);
@@ -335,6 +346,73 @@ static void bm_flush_park(block_manager_t *bm, long *park_us)
     pthread_mutex_unlock(&bm->buf_mtx);
 }
 
+/* how much one idle fill writes before the flush thread looks for work again, small enough that an
+ * append arriving mid-fill waits about as long as one more sync, and the page of zeros every fill
+ * write points its vectors at, so a fill allocates nothing */
+#define BM_FILL_CHUNK   (256 * 1024)
+#define BM_FILL_PAGE    (64 * 1024)
+#define BM_FILL_VECTORS (BM_FILL_CHUNK / BM_FILL_PAGE)
+static const unsigned char bm_fill_zeros[BM_FILL_PAGE];
+
+void block_manager_set_fill_ahead(block_manager_t *bm, const uint64_t bytes)
+{
+    if (!bm || !bm->buffered) return;
+    atomic_store_explicit(&bm->fill_ahead, bytes, memory_order_release);
+}
+
+/* write zeros over [start, end) of the fill descriptor, at most one chunk */
+static int bm_fill_write(const block_manager_t *bm, const uint64_t start, const uint64_t end)
+{
+    struct iovec iov[BM_FILL_VECTORS];
+    const uint64_t want = end - start;
+    const int vectors = (int)((want + BM_FILL_PAGE - 1) / BM_FILL_PAGE);
+    for (int i = 0; i < vectors; i++)
+    {
+        iov[i].iov_base = (void *)(uintptr_t)bm_fill_zeros;
+        iov[i].iov_len = BM_FILL_PAGE;
+    }
+    iov[vectors - 1].iov_len = (size_t)(want - (uint64_t)(vectors - 1) * BM_FILL_PAGE);
+    if (tdb_pwritev_safe(bm->fill_fd, iov, vectors, (off_t)start) != (ssize_t)want) return -1;
+    return fdatasync(bm->fill_fd) == 0 ? 0 : -1;
+}
+
+/**
+ * bm_fill_ahead_step
+ * write one chunk of zeros past the reserved end when the log is idle and the window is short. the
+ * chunk starts at or past every offset reserved when the log was found idle, and this thread writes
+ * every record reserved after that, so no zero lands on a record. an oversized record, which its
+ * appender writes itself, waits for this thread to reach it and so writes after the chunk, and no
+ * chunk starts while it is reserved and unwritten, since the log is then not idle
+ * @param bm the buffered block manager
+ * @return 1 when a chunk was written, 0 otherwise; a failed fill turns filling off for this log
+ */
+static int bm_fill_ahead_step(block_manager_t *bm)
+{
+    const uint64_t ahead = atomic_load_explicit(&bm->fill_ahead, memory_order_acquire);
+    if (ahead == 0 || bm->run_avg > BM_FILL_RUN_AVG_MAX) return 0;
+    const uint64_t reserved = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+    if (atomic_load_explicit(&bm->buf_flushed, memory_order_acquire) != reserved ||
+        atomic_load_explicit(&bm->durable_waiters, memory_order_acquire) != 0)
+        return 0;
+
+    const uint64_t filled = atomic_load_explicit(&bm->filled_to, memory_order_relaxed);
+    const uint64_t start = filled > reserved ? filled : reserved;
+    const uint64_t target = reserved + ahead;
+    if (start >= target) return 0;
+    const uint64_t end = target - start > BM_FILL_CHUNK ? start + BM_FILL_CHUNK : target;
+
+    /* a descriptor of its own without synchronous writes, so a chunk costs the device one flush */
+    if (bm->fill_fd < 0) bm->fill_fd = open(bm->file_path, O_WRONLY, BLOCK_MANAGER_FILE_MODE);
+    if (bm->fill_fd < 0 || bm_fill_write(bm, start, end) != 0)
+    {
+        atomic_store_explicit(&bm->fill_ahead, 0, memory_order_release);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "fill ahead stopped on %s, %s", bm->file_path, strerror(errno));
+        return 0;
+    }
+    atomic_store_explicit(&bm->filled_to, end, memory_order_release);
+    return 1;
+}
+
 /* the single writer for a buffered block manager, draining completed runs from the ring to the fd
  * and parking when idle; appenders never wait on each other, they just set their done flag, so
  * there is no in-order release convoy under thread oversubscription and only this thread touches
@@ -366,6 +444,10 @@ void *bm_flush_thread(void *arg)
         const uint64_t reserved =
             atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
         if (atomic_load_explicit(&bm->flush_stop, memory_order_acquire) && fl == reserved) break;
+
+        /* idle, so the window past the reserved end is topped up a chunk at a time, looking for
+         * work between chunks rather than parking */
+        if (bm_fill_ahead_step(bm)) continue;
         bm_flush_park(bm, &park_us);
     }
 

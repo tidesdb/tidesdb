@@ -527,9 +527,6 @@ static int engine_install_generation(tidesdb_t *db, uint64_t gen, int is_first, 
     const int orc =
         sealed ? engine_open_wal_sealed(db, wal_path, &wal) : engine_open_wal(db, wal_path, &wal);
     if (orc != 0) return TDB_ERR_IO;
-    /* the generation that will take appends is filled before its memtable is installed, so no
-     * commit ever lands in its unwritten reservation */
-    if (!sealed) engine_prefill_wal(db, wal);
     tidesdb_memtable_t *mt = tidesdb_memtable_create(
         wal, gen, gen, db->config.memtable_skip_list_max_level,
         db->config.memtable_skip_list_probability, &db->now_seconds, db->arena);

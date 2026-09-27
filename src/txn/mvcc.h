@@ -265,7 +265,8 @@ int tidesdb_mvcc_claim_range(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit, u
  * tidesdb_mvcc_draw
  * draw and mark in progress the commit's sequence, publishing it on the record. the record reads as
  * drawing between the two, so a validator that meets it waits the few instructions out rather than
- * mistaking an undrawn sequence for a higher one
+ * mistaking an undrawn sequence for a higher one. a full ring is waited out before the record says
+ * drawing, since the validator it would keep waiting may be the one whose decision makes the room
  * @param m the clock
  * @param commit the record, or NULL to draw a sequence that no claim is ordered by
  * @return the drawn sequence

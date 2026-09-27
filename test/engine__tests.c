@@ -6951,6 +6951,78 @@ void test_engine_create_cf_refuses_an_id_past_the_key_prefix(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* an iterator may be freed after the transaction it was opened under is freed or reset. the free
+ * then records no footprint, releases no hold and touches nothing of the transaction, an iterator
+ * left behind answers nothing but its free, and a transaction reset under one carries no footprint
+ * of the old scan into the transaction it becomes */
+void test_engine_iterator_outlives_its_transaction(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    ryow_commit(db, cf, "a", "A");
+    ryow_commit(db, cf, "b", "B");
+
+    /* a read committed scan holds its ceiling through the iterator; the transaction goes first */
+    tidesdb_txn_t *rc = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &rc), TDB_SUCCESS);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(rc, cf, &it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_SUCCESS);
+    tidesdb_txn_free(rc);
+    tidesdb_iter_free(it);
+
+    /* a repeatable read scan that covered the family would hand its footprint to the read set */
+    tidesdb_txn_t *rr = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &rr),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_new(rr, cf, &it), TDB_SUCCESS);
+    int rc_step = tidesdb_iter_seek_to_first(it);
+    while (rc_step == TDB_SUCCESS && tidesdb_iter_valid(it)) rc_step = tidesdb_iter_next(it);
+    tidesdb_txn_free(rr);
+    tidesdb_iter_free(it);
+
+    /* an iterator left behind by its transaction's free answers nothing but its free */
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &rc), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_new(rc, cf, &it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_valid(it), 1);
+    tidesdb_txn_free(rc);
+    ASSERT_EQ(tidesdb_iter_valid(it), 0);
+    ASSERT_EQ(tidesdb_iter_next(it), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_ERR_INVALID_ARGS);
+    uint8_t *k = NULL;
+    size_t ks = 0;
+    ASSERT_EQ(tidesdb_iter_key(it, &k, &ks), TDB_ERR_INVALID_ARGS);
+    tidesdb_iter_free(it);
+
+    /* the same scan left behind by a reset. another transaction then puts a key inside the old
+     * scan's range, and the reset transaction commits a write beside it, which the old footprint
+     * would have refused as a phantom had it been carried across */
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &rr),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_new(rr, cf, &it), TDB_SUCCESS);
+    rc_step = tidesdb_iter_seek_to_first(it);
+    while (rc_step == TDB_SUCCESS && tidesdb_iter_valid(it)) rc_step = tidesdb_iter_next(it);
+    ASSERT_EQ(tidesdb_txn_reset(rr, TDB_ISOLATION_REPEATABLE_READ), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_valid(it), 0);
+    tidesdb_iter_free(it);
+    ryow_commit(db, cf, "c", "C");
+    ASSERT_EQ(tidesdb_txn_put(rr, cf, (const uint8_t *)"q", 1, (const uint8_t *)"Q", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(rr), TDB_SUCCESS);
+    tidesdb_txn_free(rr);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -6982,6 +7054,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_compaction_converges_an_interleaved_store, tests_passed);
     RUN_TEST(test_engine_scan_reads_own_writes, tests_passed);
     RUN_TEST(test_engine_scan_honours_own_prefix_delete, tests_passed);
+    RUN_TEST(test_engine_iterator_outlives_its_transaction, tests_passed);
     RUN_TEST(test_engine_cf_stats, tests_passed);
     RUN_TEST(test_engine_cf_estimate_cardinality, tests_passed);
     RUN_TEST(test_engine_cf_unflushed_keys, tests_passed);

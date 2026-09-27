@@ -57,9 +57,15 @@ writes visible to the caller's very next transaction — the watermark publishes
 
 The ring is bounded, and the bound is enforced rather than assumed: the clock will not draw a
 sequence a ring's width above the watermark, so a slot the watermark has yet to read is never
-recycled underneath it, and a slot always describes the sequence it is asked about. Nothing reads
-the ring below the watermark — a reader's question is answered by the watermark alone — so there is
-no rule for sequences that have aged out of it.
+recycled underneath it, and a slot always describes the sequence it is asked about. The room is
+checked and the sequence taken in one compare-and-swap. Checked apart, every committer that saw the
+last free slot took a sequence, the ones past the ring recycled the slot of a sequence the watermark
+had yet to read, its decision was lost, and the watermark stopped for good: every later commit
+waited out its spin budget and a read-committed reader never saw another commit. A draw that has
+to wait for room does so before it announces itself to validators, for the reason given under
+[Claims](#claims-what-a-commit-in-flight-holds). Nothing reads the ring below the watermark — a
+reader's question is answered by the watermark alone — so there is no rule for sequences that have
+aged out of it.
 
 The sequence a two-phase transaction drew at its prepare is spent the moment its record is durable:
 phase two commits at a fresh one, so no version ever carries it, and it is decided as aborted so the
@@ -185,7 +191,10 @@ What a claim meets when it joins its chain decides it:
   a prepare needs one is in [Two-phase commit](#two-phase-commit).
 
 A claim carries its owner's sequence once drawn; until then it reads as *drawing*, and a validator
-that meets one spins for the store, which is a few instructions away. Validation at repeatable read
+that meets one spins for the store, which is a few instructions away. It is a few instructions
+away because a draw that finds the ring full waits for room *before* it says drawing: the validator
+it would otherwise keep spinning may hold the lowest undecided sequence, whose decision is what
+makes the room, and announced first the two waited on each other for the length of the spin budget. Validation at repeatable read
 and serializable asks the set, for every key the transaction read, whether another owner's write
 claim sits **below my sequence**: that writer lands before me, my read of the key is stale at my
 position, and I am refused. For every interval a scan of the transaction covered it asks the same of

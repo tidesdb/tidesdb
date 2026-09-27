@@ -239,6 +239,9 @@ struct tidesdb_t
  * actually landed in is not knowable from one read, since a rotation may race the append, so both
  * ends are pinned and the inclusive range is released together -- keeping a log that turns out
  * unnecessary costs disk, where dropping the one holding an undecided batch loses it
+ * @param iters the iterators still open under this transaction, newest first, so freeing or
+ * resetting it detaches them rather than leaving each one a pointer into freed memory. a handle
+ * and its iterators are used from one thread, so the list takes no lock
  */
 struct tidesdb_txn_t
 {
@@ -246,6 +249,7 @@ struct tidesdb_txn_t
     tidesdb_t *db;
     uint64_t prepare_generation;
     uint64_t prepare_generation_last;
+    tidesdb_iter_t *iters;
 };
 
 /**
@@ -273,7 +277,12 @@ struct tidesdb_snapshot_t
  * @param inner the per-cf merge iterator over L0 and the cf's sstable levels
  * @param cf the iterated column family, borrowed
  * @param db the owning engine, borrowed
- * @param txn the transaction the scan belongs to, borrowed, whose read set takes the footprint
+ * @param txn the transaction the scan belongs to, borrowed, whose read set takes the footprint;
+ *            NULL once that transaction was freed or reset, after which only the free is answered
+ * @param txn_prev the iterator opened under the same transaction after this one, NULL for the
+ * newest
+ * @param txn_next the iterator opened under the same transaction before this one, NULL for the
+ *                 oldest
  * @param tracked non-zero when the transaction validates its reads, so the footprint is kept at all
  * @param covered non-zero once a positioning call has run, so there is a footprint to record
  * @param lo the inclusive lower bound of what the scan covered so far, owned
@@ -297,6 +306,8 @@ struct tidesdb_iter_t
     cf_t *cf;
     tidesdb_t *db;
     tidesdb_txn_t *txn;
+    tidesdb_iter_t *txn_prev;
+    tidesdb_iter_t *txn_next;
     int tracked;
     int covered;
     uint8_t *lo;

@@ -1233,7 +1233,8 @@ int tidesdb_txn_state(const tidesdb_txn_t *txn, tidesdb_txn_state_t *out_state);
 
 /**
  * tidesdb_txn_reset
- * reset a transaction for reuse at a new isolation level, discarding its buffered state
+ * reset a transaction for reuse at a new isolation level, discarding its buffered state and
+ * detaching the iterators still open under it
  * @param txn transaction
  * @param isolation isolation level for the reset transaction
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL txn, or TDB_ERR_MEMORY
@@ -1242,7 +1243,8 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, tidesdb_isolation_level_t isolation);
 
 /**
  * tidesdb_txn_free
- * free a transaction handle, rolling it back if still open
+ * free a transaction handle, rolling it back if still open and detaching the iterators still open
+ * under it
  * @param txn transaction, may be NULL
  */
 void tidesdb_txn_free(tidesdb_txn_t *txn);
@@ -1289,7 +1291,11 @@ int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name);
  * at repeatable read and serializable an iterator records the interval it covered into its
  * transaction's read footprint when it is freed, so the commit is refused if another transaction
  * put a key inside it meanwhile. free an iterator before committing; the other levels record
- * nothing */
+ * nothing.
+ *
+ * an iterator may outlive its transaction. freeing or resetting the transaction detaches every
+ * iterator still open under it, after which tidesdb_iter_valid reports 0, every other call reports
+ * TDB_ERR_INVALID_ARGS, and tidesdb_iter_free is all that is left to do with it */
 
 /**
  * tidesdb_iter_new

@@ -821,10 +821,20 @@ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, si
 
 /**
  * engine_iter_free
- * free an iterator and release its L0 pins and sstable references
+ * free an iterator and release its L0 pins and sstable references. one whose transaction was freed
+ * or reset before it records no footprint and releases no hold, having been detached then
  * @param it the iterator, may be NULL
  */
 void engine_iter_free(tidesdb_iter_t *it);
+
+/**
+ * engine_iter_detach
+ * cut every iterator still open under a transaction loose from it, ahead of the transaction being
+ * freed or reset. a detached iterator answers nothing but its free, and its free touches nothing of
+ * the transaction
+ * @param txn the transaction, may be NULL
+ */
+void engine_iter_detach(tidesdb_txn_t *txn);
 
 /**
  * engine_iter_seek_first / engine_iter_seek_last / engine_iter_seek / engine_iter_seek_for_prev /

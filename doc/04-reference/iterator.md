@@ -26,8 +26,13 @@ in the same transaction would see:
 | `TDB_ISOLATION_READ_COMMITTED` | The watermark, taken when the iterator is created — everything committed and published before that moment, so two scans in one transaction may legitimately differ |
 | `TDB_ISOLATION_READ_UNCOMMITTED` | Everything, including versions other transactions have written but not committed |
 
-Iterators are **not thread-safe**. One iterator belongs to one thread, and it must be freed
-before the transaction it was created from is freed.
+Iterators are **not thread-safe**. One iterator belongs to one thread, the thread of the
+transaction it was created from. It may outlive that transaction: freeing or resetting the
+transaction detaches every iterator still open under it, after which
+[`tidesdb_iter_valid`](#tidesdb_iter_valid) reports 0, every other call reports
+`TDB_ERR_INVALID_ARGS`, and [`tidesdb_iter_free`](#tidesdb_iter_free) is all that is left to do
+with it. A handler that caches an iterator across statements can free it whenever it next finds it
+stale, without holding the transaction open for it.
 
 At `TDB_ISOLATION_REPEATABLE_READ` and `TDB_ISOLATION_SERIALIZABLE` an iterator also records what
 it covered: the interval from the key it sought, or the start of its range, to the last key it stood

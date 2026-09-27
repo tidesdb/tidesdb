@@ -181,20 +181,43 @@ void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m)
 
 /* ===== the clock ===== */
 
-/* consume the next sequence. the ring is what decides the watermark, so no sequence is drawn a
- * ring's width or more above it, where its slot would recycle one the watermark has yet to read; a
- * draw that far ahead waits for the commits below it to decide, which bounds the sequences in
- * flight by the ring rather than assuming it */
-static uint64_t mvcc_next_seq(tidesdb_mvcc_t *m)
+/* wait for room to draw. the ring is what decides the watermark, so no sequence is drawn a ring's
+ * width or more above it, where its slot would recycle one the watermark has yet to read; a draw
+ * that far ahead waits for the commits below it to decide, which bounds the sequences in flight by
+ * the ring rather than assuming it */
+static void mvcc_wait_ring_room(tidesdb_mvcc_t *m)
 {
     for (uint64_t spin = 0; spin < TDB_MVCC_VISIBLE_WAIT_MAX; spin++)
     {
         const uint64_t ahead = atomic_load_explicit(&m->global_seq, memory_order_acquire) -
                                atomic_load_explicit(&m->visible_seq, memory_order_acquire);
-        if (ahead < (uint64_t)m->ring_capacity - 1) break;
+        if (ahead < (uint64_t)m->ring_capacity - 1) return;
         cpu_yield();
     }
-    return atomic_fetch_add_explicit(&m->global_seq, 1, memory_order_acq_rel);
+}
+
+/**
+ * mvcc_take_seq
+ * take the next sequence only while the ring has room for it, in one compare-and-swap with the
+ * room check. a check apart from the take let every committer that saw the last free slot take a
+ * sequence, and those past the ring recycled the slot of one the watermark had yet to read, losing
+ * its decision and stopping the watermark for good
+ * @param m the clock
+ * @return the sequence taken, or 0 when the ring filled before this committer could take one
+ */
+static uint64_t mvcc_take_seq(tidesdb_mvcc_t *m)
+{
+    uint64_t seq = atomic_load_explicit(&m->global_seq, memory_order_acquire);
+    for (uint64_t spin = 0; spin < TDB_MVCC_VISIBLE_WAIT_MAX; spin++)
+    {
+        if (seq - atomic_load_explicit(&m->visible_seq, memory_order_acquire) >=
+            (uint64_t)m->ring_capacity - 1)
+            return 0;
+        if (atomic_compare_exchange_weak_explicit(&m->global_seq, &seq, seq + 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+            return seq;
+    }
+    return 0;
 }
 
 uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m)
@@ -693,13 +716,36 @@ int tidesdb_mvcc_claim_range(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
 uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
 {
     if (!m) return 0;
-    /* announced before the draw, so a validator that reads the announcement knows a sequence that
-     * may be lower than its own is a few instructions from being published, and one that reads
-     * nothing knows the draw has not happened and the sequence will be higher than its own. the
-     * fence orders the claims taken before this against the draw itself */
-    if (commit) atomic_store_explicit(&commit->seq, TDB_MVCC_SEQ_DRAWING, memory_order_release);
-    atomic_thread_fence(memory_order_seq_cst);
-    const uint64_t seq = mvcc_next_seq(m);
+    /* room in the ring is waited for before anything is announced. the committer holding the
+     * lowest undecided sequence is the one whose decision makes the room, and it may be validating
+     * against this commit's claims, spinning on the announcement to learn where this commit lands.
+     * announced first, this commit would wait on that one while that one waited on this, for the
+     * length of the spin budget.
+     *
+     * the draw is announced before the sequence is taken, so a validator that reads the
+     * announcement knows a sequence that may be lower than its own is a few instructions from being
+     * published, and one that reads nothing knows the draw has not happened and the sequence will
+     * be higher than its own. the fence orders the claims taken before this against the draw
+     * itself. a committer that lost the room between the wait and the take withdraws the
+     * announcement, which is true to a validator, since it has taken nothing and will take a
+     * sequence above the validator's own, and waits for room again */
+    uint64_t seq = 0;
+    for (uint64_t attempt = 0; seq == 0 && attempt < TDB_MVCC_VISIBLE_WAIT_MAX; attempt++)
+    {
+        mvcc_wait_ring_room(m);
+        if (commit) atomic_store_explicit(&commit->seq, TDB_MVCC_SEQ_DRAWING, memory_order_release);
+        atomic_thread_fence(memory_order_seq_cst);
+        seq = mvcc_take_seq(m);
+        if (seq == 0 && commit) atomic_store_explicit(&commit->seq, 0, memory_order_release);
+    }
+    /* a ring that never made room is a stall below every committer, not a lost decision; the draw
+     * goes ahead rather than refuse a commit its caller cannot retry past */
+    if (seq == 0)
+    {
+        if (commit) atomic_store_explicit(&commit->seq, TDB_MVCC_SEQ_DRAWING, memory_order_release);
+        atomic_thread_fence(memory_order_seq_cst);
+        seq = atomic_fetch_add_explicit(&m->global_seq, 1, memory_order_acq_rel);
+    }
     tidesdb_mvcc_mark(m, seq, 0);
     if (commit) atomic_store_explicit(&commit->seq, seq, memory_order_release);
     return seq;

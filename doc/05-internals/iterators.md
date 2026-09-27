@@ -183,6 +183,14 @@ The cost is that a long-lived iterator holds back reclamation — sstables it pi
 and the transaction behind it holds `min_snapshot_seq` down. A scan left open across a long
 operation is a real source of space that will not reclaim.
 
+The transaction is the one thing an iterator does not pin. It keeps a pointer to it, for the read
+hold it releases and the footprint it records when freed, and the transaction keeps a list of the
+iterators open under it. Freeing or resetting the transaction walks that list and detaches each
+iterator, which from then on answers nothing but its free, and the free touches nothing of the
+transaction. A caller that caches an iterator across statements, as a table handler does to save
+rebuilding the merge heap, therefore cannot reach freed memory through it, and a footprint from
+before a reset is never carried into the transaction the reset produces.
+
 A transaction timeout bounds the second half of that but not the first. Expiry is lazy, so it
 resolves the transaction at its next operation and releases the snapshot; the iterator's own pins
 last until it is freed, whatever the transaction behind it did.

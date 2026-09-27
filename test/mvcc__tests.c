@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../src/base/waitstat.h" /* tdb_monotonic_us, to bound a validator's wait */
 #include "../src/txn/mvcc.h"
 #include "test_utils.h"
 
@@ -662,6 +663,127 @@ void test_mvcc_null_safe(void)
     ASSERT_TRUE(1);
 }
 
+/* how long a validator may take to learn where a claimant that has not drawn will land; the spin
+ * budget it would otherwise burn through runs to tens of seconds */
+#define ROOM_WAIT_ANSWER_MAX_US (2 * 1000 * 1000)
+/* long enough for the drawing thread to reach its wait for room */
+#define ROOM_WAIT_SETTLE_US (50 * 1000)
+
+typedef struct
+{
+    tidesdb_mvcc_t *m;
+    tidesdb_mvcc_commit_t *commit;
+    uint64_t seq;
+} room_draw_t;
+
+static void *room_draw_worker(void *arg)
+{
+    room_draw_t *a = (room_draw_t *)arg;
+    a->seq = tidesdb_mvcc_draw(a->m, a->commit);
+    return NULL;
+}
+
+/* a commit that has claimed and finds the ring full waits for room before it announces its draw. a
+ * validator holding the lowest undecided sequence spins on that announcement to learn where the
+ * claimant lands, and its decision is what makes the room, so announcing first left each waiting
+ * on the other for the length of the spin budget */
+void test_mvcc_draw_waits_for_room_before_it_announces(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    tidesdb_mvcc_claim_t ca[1], cb[1];
+    tidesdb_mvcc_commit_t a, b;
+    claim(&ca[0], "k", TDB_MVCC_CLAIM_WRITE);
+    claim(&cb[0], "k", TDB_MVCC_CLAIM_WRITE);
+    tidesdb_mvcc_commit_init(&a, ca, 1);
+    tidesdb_mvcc_commit_init(&b, cb, 1);
+
+    /* b claims and draws and stays undecided, so the watermark stands below it while the ring
+     * fills behind it with sequences the watermark cannot pass */
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &b, 0), 1);
+    const uint64_t seq_b = tidesdb_mvcc_draw(m, &b);
+    while (tidesdb_mvcc_current_seq(m) - tidesdb_mvcc_visible_seq(m) <
+           TDB_MVCC_COMMIT_RING_SIZE - 1)
+        tidesdb_mvcc_mark(m, tidesdb_mvcc_draw(m, NULL), 1);
+
+    /* a claims beside b and goes to draw, which has to wait for room */
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &a, 0), 1);
+    room_draw_t arg = {.m = m, .commit = &a, .seq = 0};
+    pthread_t t;
+    ASSERT_EQ(pthread_create(&t, NULL, room_draw_worker, &arg), 0);
+    usleep(ROOM_WAIT_SETTLE_US);
+
+    /* b validates its read of k against a's claim. a has not drawn, so it lands above b, and the
+     * answer comes at once */
+    const uint64_t started = tdb_monotonic_us();
+    ASSERT_EQ(tidesdb_mvcc_read_stale(m, &b, CLAIM_CF, (const uint8_t *)"k", 1, claim_hash("k")),
+              0);
+    ASSERT_TRUE(tdb_monotonic_us() - started < ROOM_WAIT_ANSWER_MAX_US);
+
+    /* b decides, the watermark moves, and a draws above b */
+    tidesdb_mvcc_mark(m, seq_b, 1);
+    tidesdb_mvcc_unclaim(m, &b);
+    pthread_join(t, NULL);
+    ASSERT_TRUE(arg.seq > seq_b);
+    tidesdb_mvcc_mark(m, arg.seq, 1);
+    tidesdb_mvcc_unclaim(m, &a);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* drawers released together onto the last free slot of the ring, and rounds of them */
+#define ROOM_RACE_THREADS 8
+#define ROOM_RACE_ROUNDS  4
+
+typedef struct
+{
+    tidesdb_mvcc_t *m;
+    _Atomic int *gate;
+} room_race_t;
+
+static void *room_race_worker(void *arg)
+{
+    room_race_t *a = (room_race_t *)arg;
+    while (!atomic_load_explicit(a->gate, memory_order_acquire)) cpu_pause();
+    const uint64_t seq = tidesdb_mvcc_draw(a->m, NULL);
+    tidesdb_mvcc_mark(a->m, seq, 1);
+    return NULL;
+}
+
+/* many committers finding one free slot in the ring take it one at a time. drawn together past the
+ * room check they overshot the ring, a slot the watermark had yet to read was recycled under a
+ * sequence a ring above it, and the decision it held was lost, so the watermark stood still for
+ * good and every later commit waited out its spin budget */
+void test_mvcc_draws_racing_for_the_last_slot_never_overshoot_the_ring(void)
+{
+    for (int round = 0; round < ROOM_RACE_ROUNDS; round++)
+    {
+        tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+        ASSERT_TRUE(m != NULL);
+        const uint64_t held = tidesdb_mvcc_draw(m, NULL);
+        while (tidesdb_mvcc_current_seq(m) - tidesdb_mvcc_visible_seq(m) <
+               TDB_MVCC_COMMIT_RING_SIZE - 2)
+            tidesdb_mvcc_mark(m, tidesdb_mvcc_draw(m, NULL), 1);
+
+        _Atomic int gate = 0;
+        room_race_t arg = {.m = m, .gate = &gate};
+        pthread_t t[ROOM_RACE_THREADS];
+        for (int i = 0; i < ROOM_RACE_THREADS; i++)
+            ASSERT_EQ(pthread_create(&t[i], NULL, room_race_worker, &arg), 0);
+        atomic_store_explicit(&gate, 1, memory_order_release);
+        usleep(ROOM_WAIT_SETTLE_US);
+
+        /* one drawer took the last slot and the rest wait for room */
+        ASSERT_TRUE(tidesdb_mvcc_current_seq(m) - tidesdb_mvcc_visible_seq(m) <=
+                    TDB_MVCC_COMMIT_RING_SIZE - 1);
+
+        /* the held sequence decides, and the watermark carries every drawer's decision */
+        tidesdb_mvcc_mark(m, held, 1);
+        for (int i = 0; i < ROOM_RACE_THREADS; i++) pthread_join(t[i], NULL);
+        ASSERT_TRUE(tidesdb_mvcc_visible_seq(m) == tidesdb_mvcc_current_seq(m) - 1);
+        tidesdb_mvcc_destroy(m);
+    }
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -680,6 +802,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_seq_concurrent_unique, tests_passed);
     RUN_TEST(test_mvcc_two_neighbours_publish_each_other, tests_passed);
     RUN_TEST(test_mvcc_claim_single_winner, tests_passed);
+    RUN_TEST(test_mvcc_draw_waits_for_room_before_it_announces, tests_passed);
+    RUN_TEST(test_mvcc_draws_racing_for_the_last_slot_never_overshoot_the_ring, tests_passed);
     RUN_TEST(test_mvcc_null_safe, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -28,6 +28,7 @@ int engine_txn_begin(tidesdb_t *db, tidesdb_isolation_level_t isolation, tidesdb
     tidesdb_txn_t *h = malloc(sizeof(*h));
     if (!h) return TDB_ERR_MEMORY;
     h->db = db;
+    h->iters = NULL;
     /* the configured timeout applies to every transaction; a caller bounds a single one through
      * tidesdb_txn_set_timeout. the registry is joined only at repeatable-read and stronger */
     h->inner = tdb_txn_begin(db->clock, isolation, &db->now_seconds, db->config.txn_timeout_seconds,
@@ -361,6 +362,9 @@ int engine_txn_set_timeout(tidesdb_txn_t *txn, int64_t seconds)
 void engine_txn_free(tidesdb_txn_t *txn)
 {
     if (!txn) return;
+    /* an iterator a caller keeps past this point, as one cached across statements is, must find
+     * nothing of the transaction to touch when it is freed */
+    engine_iter_detach(txn);
     tdb_txn_free(txn->inner);
     free(txn);
 }
@@ -508,7 +512,10 @@ int engine_txn_release_savepoint(tidesdb_txn_t *txn, const char *name)
 int engine_txn_reset(tidesdb_txn_t *txn, tidesdb_isolation_level_t isolation)
 {
     if (!txn) return TDB_ERR_INVALID_ARGS;
-    /* the txn core has no in-place reset, so discard it and begin a fresh one at a new snapshot */
+    /* the txn core has no in-place reset, so discard it and begin a fresh one at a new snapshot.
+     * the iterators open under the old one are detached first, so a scan's footprint from before
+     * the reset is not recorded into the transaction this becomes and refused there as a phantom */
+    engine_iter_detach(txn);
     tdb_txn_free(txn->inner);
     txn->inner = tdb_txn_begin(txn->db->clock, isolation, &txn->db->now_seconds,
                                txn->db->config.txn_timeout_seconds, txn->db->txn_registry);

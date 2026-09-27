@@ -161,8 +161,27 @@ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, si
         free(it);
         return rc;
     }
+    /* at the head of the transaction's list, so a free or a reset of the transaction can detach
+     * every iterator still open under it */
+    it->txn_next = txn->iters;
+    if (txn->iters) txn->iters->txn_prev = it;
+    txn->iters = it;
     *out = it;
     return TDB_SUCCESS;
+}
+
+void engine_iter_detach(tidesdb_txn_t *txn)
+{
+    if (!txn) return;
+    for (tidesdb_iter_t *it = txn->iters; it;)
+    {
+        tidesdb_iter_t *next = it->txn_next;
+        it->txn = NULL;
+        it->txn_prev = NULL;
+        it->txn_next = NULL;
+        it = next;
+    }
+    txn->iters = NULL;
 }
 
 /* hand the footprint to the transaction's read set, the whole family when a bound was lost. a read
@@ -193,9 +212,19 @@ static void engine_iter_record(tidesdb_iter_t *it)
 void engine_iter_free(tidesdb_iter_t *it)
 {
     if (!it) return;
-    engine_iter_record(it);
+    /* an iterator whose transaction was freed or reset was detached then, and has nothing left to
+     * record, release or leave the list of */
+    if (it->txn)
+    {
+        engine_iter_record(it);
+        tdb_txn_read_release(it->txn->inner);
+        if (it->txn_prev)
+            it->txn_prev->txn_next = it->txn_next;
+        else
+            it->txn->iters = it->txn_next;
+        if (it->txn_next) it->txn_next->txn_prev = it->txn_prev;
+    }
     cf_iter_free(it->inner);
-    tdb_txn_read_release(it->txn->inner);
     free(it->lo);
     free(it->hi);
     free(it->bound_lo);
@@ -205,7 +234,7 @@ void engine_iter_free(tidesdb_iter_t *it)
 
 int engine_iter_seek_first(tidesdb_iter_t *it)
 {
-    if (!it) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn) return TDB_ERR_INVALID_ARGS;
     const int rc = cf_iter_seek_first(it->inner);
     if (it->tracked) engine_iter_cover_front(it);
     engine_iter_cover_current(it, 1);
@@ -214,7 +243,7 @@ int engine_iter_seek_first(tidesdb_iter_t *it)
 
 int engine_iter_seek_last(tidesdb_iter_t *it)
 {
-    if (!it) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn) return TDB_ERR_INVALID_ARGS;
     const int rc = cf_iter_seek_last(it->inner);
     if (it->tracked) engine_iter_cover_end(it);
     engine_iter_cover_current(it, 0);
@@ -223,7 +252,7 @@ int engine_iter_seek_last(tidesdb_iter_t *it)
 
 int engine_iter_seek(tidesdb_iter_t *it, const uint8_t *key, size_t key_size)
 {
-    if (!it) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn) return TDB_ERR_INVALID_ARGS;
     const int rc = cf_iter_seek(it->inner, key, key_size);
     /* the target is covered whether or not a key sits there; an insert at it is a phantom too */
     if (it->tracked) engine_iter_cover_low(it, key, key_size);
@@ -233,7 +262,7 @@ int engine_iter_seek(tidesdb_iter_t *it, const uint8_t *key, size_t key_size)
 
 int engine_iter_seek_for_prev(tidesdb_iter_t *it, const uint8_t *key, size_t key_size)
 {
-    if (!it) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn) return TDB_ERR_INVALID_ARGS;
     const int rc = cf_iter_seek_for_prev(it->inner, key, key_size);
     if (it->tracked) engine_iter_cover_high(it, key, key_size);
     engine_iter_cover_current(it, 0);
@@ -242,7 +271,7 @@ int engine_iter_seek_for_prev(tidesdb_iter_t *it, const uint8_t *key, size_t key
 
 int engine_iter_next(tidesdb_iter_t *it)
 {
-    if (!it) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn) return TDB_ERR_INVALID_ARGS;
     const int rc = cf_iter_next(it->inner);
     engine_iter_cover_current(it, 1);
     return rc;
@@ -250,7 +279,7 @@ int engine_iter_next(tidesdb_iter_t *it)
 
 int engine_iter_prev(tidesdb_iter_t *it)
 {
-    if (!it) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn) return TDB_ERR_INVALID_ARGS;
     const int rc = cf_iter_prev(it->inner);
     engine_iter_cover_current(it, 0);
     return rc;
@@ -258,7 +287,7 @@ int engine_iter_prev(tidesdb_iter_t *it)
 
 int engine_iter_valid(const tidesdb_iter_t *it)
 {
-    return it ? cf_iter_valid(it->inner) : 0;
+    return it && it->txn ? cf_iter_valid(it->inner) : 0;
 }
 
 /* read the iterator's current entry, borrowing its key and value pointers */
@@ -308,7 +337,7 @@ static int engine_iter_dup_value(tidesdb_iter_t *it, const uint8_t *value, size_
 
 int engine_iter_key(tidesdb_iter_t *it, uint8_t **key, size_t *key_size)
 {
-    if (!it || !key || !key_size) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn || !key || !key_size) return TDB_ERR_INVALID_ARGS;
     const uint8_t *k = NULL, *v = NULL;
     size_t ks = 0, vs = 0;
     uint64_t voff = 0;
@@ -318,7 +347,7 @@ int engine_iter_key(tidesdb_iter_t *it, uint8_t **key, size_t *key_size)
 
 int engine_iter_value(tidesdb_iter_t *it, uint8_t **value, size_t *value_size)
 {
-    if (!it || !value || !value_size) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn || !value || !value_size) return TDB_ERR_INVALID_ARGS;
     const uint8_t *k = NULL, *v = NULL;
     size_t ks = 0, vs = 0;
     uint64_t voff = 0;
@@ -329,7 +358,7 @@ int engine_iter_value(tidesdb_iter_t *it, uint8_t **value, size_t *value_size)
 int engine_iter_key_value(tidesdb_iter_t *it, uint8_t **key, size_t *key_size, uint8_t **value,
                           size_t *value_size)
 {
-    if (!it || !key || !key_size || !value || !value_size) return TDB_ERR_INVALID_ARGS;
+    if (!it || !it->txn || !key || !key_size || !value || !value_size) return TDB_ERR_INVALID_ARGS;
     const uint8_t *k = NULL, *v = NULL;
     size_t ks = 0, vs = 0;
     uint64_t voff = 0;

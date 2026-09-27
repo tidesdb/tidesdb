@@ -951,6 +951,59 @@ void test_retire_refuses_the_segment_taking_appends(void)
     vlog_close(v);
 }
 
+/* how long the roll in the next test holds its segment open and unpublished, long enough for a
+ * reclaim pass to reach it */
+#define V_ROLL_PUBLISH_DELAY_US (50 * 1000)
+
+typedef struct
+{
+    vlog_t *v;
+    _Atomic(int) opened;
+} roll_in_flight_t;
+
+/* a roll as it runs, with the pause widened: the successor is opened under the roll lock and only
+ * published as the active segment a moment later */
+static void *roll_in_flight(void *arg)
+{
+    roll_in_flight_t *r = (roll_in_flight_t *)arg;
+    pthread_mutex_lock(&r->v->roll_mu);
+    uint32_t slot = 0;
+    const int rc = vlog_segment_open(r->v, atomic_load(&r->v->next_number), &slot);
+    atomic_store(&r->opened, rc == VLOG_OK ? 1 : -1);
+    usleep(V_ROLL_PUBLISH_DELAY_US);
+    if (rc == VLOG_OK) atomic_store(&r->v->active_slot, slot);
+    pthread_mutex_unlock(&r->v->roll_mu);
+    return NULL;
+}
+
+/* a segment a roll has opened but not yet published looks sealed and empty to a reclaim pass, the
+ * one state it is always allowed to drop. retired there, its file is unlinked and its slot freed,
+ * the roll then publishes the dead slot as the active one, and every later append fails to take it
+ * and reports the store full, with nothing left to roll it forward */
+void test_reclaim_never_retires_a_segment_a_roll_is_publishing(void)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
+
+    roll_in_flight_t r = {.v = v};
+    atomic_init(&r.opened, 0);
+    pthread_t t;
+    ASSERT_EQ(pthread_create(&t, NULL, roll_in_flight, &r), 0);
+    while (atomic_load(&r.opened) == 0) usleep(100);
+    ASSERT_EQ(atomic_load(&r.opened), 1);
+
+    ASSERT_EQ(vlog_reclaim(v), VLOG_OK);
+    pthread_join(t, NULL);
+
+    const uint32_t active = atomic_load(&v->active_slot);
+    ASSERT_EQ((int)atomic_load(&v->segments[active].state), (int)VLOG_SEG_OPEN);
+    uint8_t *val = pattern(V_MEDIUM, 93);
+    uint64_t id = 0;
+    ASSERT_EQ(vlog_write(v, val, V_MEDIUM, NULL, 0, &id, NULL), VLOG_OK);
+    free(val);
+    vlog_close(v);
+}
+
 void test_list_segments_reports_each(void)
 {
     fresh_dir();
@@ -1282,6 +1335,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_many_values_stress, tests_passed);
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);
     RUN_TEST(test_concurrent_reads_writes_and_reclaim, tests_passed);
+    RUN_TEST(test_reclaim_never_retires_a_segment_a_roll_is_publishing, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

@@ -5419,8 +5419,11 @@ void test_engine_wal_descriptor_accounting_balances(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
     ASSERT_TRUE(cf != NULL);
 
-    /* a freshly opened database holds its active log and nothing else */
-    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_WAL_LOG), ENGINE_TEST_WAL_RESIDENT_MIN);
+    /* a freshly opened database holds its active log, and the spare a flush worker prepares for
+     * the first rotation once it has run -- which it may or may not have by this line */
+    const int wal_at_open = fd_manager_open_count(&db->fdm, FD_LABEL_WAL_LOG);
+    ASSERT_TRUE(wal_at_open >= ENGINE_TEST_WAL_RESIDENT_MIN &&
+                wal_at_open <= ENGINE_TEST_WAL_RESIDENT_MAX);
 
     for (int i = 0; i < ENGINE_TEST_WAL_ROTATE_KEYS; i++)
     {

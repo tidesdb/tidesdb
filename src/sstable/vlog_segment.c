@@ -219,13 +219,18 @@ int vlog_segment_retire(vlog_t *v, uint32_t slot)
     }
 
     /* the caller decided this slot was reclaimable against a reading of active_slot that a roll may
-     * have overtaken since, so confirm it here, where the answer can no longer change. a slot only
-     * becomes the active one by being claimed out of the table, and the claim takes slots reading
-     * absent -- this one still reads open until the store at the end of this function -- so no roll
-     * can select it from here on, and the reading below is final. retiring the active segment would
-     * unlink the file taking appends and leave every appender spinning on a slot that never reopens
-     */
-    if (slot == atomic_load_explicit(&v->active_slot, memory_order_acquire))
+     * have overtaken since, so confirm it here, where the answer can no longer change. a roll opens
+     * its successor, which then reads open and empty, and only afterwards publishes it as active,
+     * all under roll_mu -- so read without the lock, a successor in that window looks sealed and
+     * reclaimable, and retiring it had the roll publish a dead slot that every append then failed
+     * to take. under the lock no roll is between the two, and a roll that starts later claims only
+     * a slot reading absent, which this one does not until the store at the end of this function.
+     * retiring the active segment would unlink the file taking appends and leave every appender
+     * spinning on a slot that never reopens */
+    pthread_mutex_lock(&v->roll_mu);
+    const int active = slot == atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    pthread_mutex_unlock(&v->roll_mu);
+    if (active)
     {
         /* nothing could have counted through the window, as above, so the baseline is restored
          * exactly and the segment goes back to resting */

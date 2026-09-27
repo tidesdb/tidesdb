@@ -572,7 +572,7 @@ int block_manager_prefill(block_manager_t *bm, const uint64_t bytes)
     /* written through a descriptor of its own, opened without synchronous writes, so the fill is
      * buffered and costs the device one flush at the end. through the log's own descriptor every
      * write would be a flush, and the fill's flushes would queue ahead of the commits' */
-    const int fd = open(bm->file_path, O_WRONLY);
+    const int fd = open(bm->file_path, O_WRONLY, BLOCK_MANAGER_FILE_MODE);
     if (fd < 0) return -1;
     int rc = bm_prefill_zeros_range(fd, start, end);
     if (rc == 0 && fdatasync(fd) != 0) rc = -1;

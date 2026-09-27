@@ -89,6 +89,10 @@ static int engine_wal_sync_mode(int sync_mode)
 #define ENGINE_WAL_RING_MIN   (1ull * 1024 * 1024)
 #define ENGINE_WAL_RING_MAX   (16ull * 1024 * 1024)
 
+/* the most a log is filled with zeros ahead of its appends, whatever the write buffer. a log that
+ * outgrows its fill reserves the rest the ordinary way */
+#define ENGINE_WAL_PREFILL_MAX (256ull * 1024 * 1024)
+
 /**
  * engine_wal_ring_size
  * the staging ring a WAL is opened with. the WAL runs in buffered append mode, where committing
@@ -131,6 +135,17 @@ int engine_open_wal(tidesdb_t *db, const char *wal_path, block_manager_t **out_b
      * close pairs with this -- engine_close_wal and the flush path are the only two that may */
     if (rc == 0) fd_manager_note_open(&db->fdm, FD_LABEL_WAL_LOG);
     return rc;
+}
+
+void engine_prefill_wal(tidesdb_t *db, block_manager_t *wal)
+{
+    /* only a commit that waits for the device pays for unwritten extents, so the other modes keep
+     * the cheaper reservation */
+    if (!db || !wal || db->config.memtable_sync_mode != TDB_SYNC_FULL) return;
+    uint64_t bytes = (uint64_t)db->config.memtable_write_buffer_size;
+    if (bytes > ENGINE_WAL_PREFILL_MAX) bytes = ENGINE_WAL_PREFILL_MAX;
+    if (block_manager_prefill(wal, bytes) != 0)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "wal prefill failed, appends reserve their extents instead");
 }
 
 int engine_open_wal_sealed(tidesdb_t *db, const char *wal_path, block_manager_t **out_bm)
@@ -648,8 +663,9 @@ int engine_open(const tidesdb_config_t *config, tidesdb_t **out)
         return rc;
     }
 
-    /* wake the pool once per recovered immutable so the recovered generations flush to L1 */
-    for (int i = 0; i < recovered; i++) (void)queue_enqueue(db->flush_queue, db);
+    /* wake the pool once per recovered immutable so the recovered generations flush to L1, and once
+     * more so a worker prepares the log the first rotation will take */
+    for (int i = 0; i <= recovered; i++) (void)queue_enqueue(db->flush_queue, db);
 
     db->opened = 1;
     TDB_DEBUG_LOG(TDB_LOG_INFO, "opened %s with %d recovered generations to flush",

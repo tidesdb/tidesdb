@@ -584,6 +584,20 @@ uint64_t block_manager_framed_size(uint32_t payload_size);
 int block_manager_buffered_lag(block_manager_t *bm, uint64_t *out_lag, uint64_t *out_capacity);
 
 /**
+ * block_manager_prefill
+ * write zeros over the given length past the file's end before anything is appended there, so the
+ * appends land in extents the filesystem already holds as written. an extent reserved with
+ * fallocate is held as unwritten, and the first write into it is a metadata change a synchronous
+ * write must journal before it returns, which on ext4 put a journal commit behind every durable
+ * append and cost several times the device's own sync. the zeros read back exactly as a fallocated
+ * tail does, so replay is unchanged. called only on a file nothing is appending to yet
+ * @param bm the block manager
+ * @param bytes how far past the current end to write
+ * @return 0 on success, -1 on an io error, leaving whatever was written as a harmless zero tail
+ */
+int block_manager_prefill(block_manager_t *bm, uint64_t bytes);
+
+/**
  * block_manager_escalate_fsync
  * escalates an fsync syscall to the underlying block manager file
  * @param bm the block manager to fsync

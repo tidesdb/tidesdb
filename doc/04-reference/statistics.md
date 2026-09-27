@@ -274,8 +274,9 @@ family averages across settings that no longer apply. A key log is attributed by
 recorded in its own footer; a value is attributed by the chain recorded in its own block header. A
 family mid-migration shows two rows, which is the truth, rather than one number that is not.
 
-**Durability.** `wal_generation` is the current write-ahead log generation, incremented on
-each rotation. `flush_count` and `compaction_count` are cumulative, alongside the same
+**Durability.** `wal_generation` is the generation of the write-ahead log the active memtable
+appends to, which moves forward at each rotation. A log prepared ahead for the next rotation
+already has its generation, and it is not counted here until a rotation installs it. `flush_count` and `compaction_count` are cumulative, alongside the same
 byte counters as the per-family stats.
 
 ### Errors

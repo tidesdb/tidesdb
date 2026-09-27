@@ -172,10 +172,27 @@ creation, a staging ring and a flush thread. Paid inline, that is orders of magn
 slot swap it accompanies — and every committer in the database is stopped for the whole of it, since
 the rotation holds the lock while it works. How much more depends entirely on the filesystem and the
 device: it has been measured from tens of milliseconds on a local SSD to well over a hundred on a
-virtualised runner with no working preallocation. A log is therefore prepared after each rotation,
-outside the lock, and the next rotation
-takes the prepared one and becomes a memtable allocation and two pointer swaps. The preparing thread
-still pays the cost; the other fifteen no longer do.
+virtualised runner with no working preallocation. A log is therefore prepared ahead of the rotation
+that will need it, outside the lock, by a flush worker: once at open and again each time a rotation
+wakes one. The next rotation takes the prepared log and becomes a memtable allocation and two
+pointer swaps, and no committer pays for the preparation at all.
+
+Under full sync the preparation also **fills the log with zeros** up to the write buffer, through a
+descriptor of its own with one sync at the end, and the first log is filled the same way at open.
+A synchronous append into an extent `fallocate` reserved converts that extent from unwritten to
+written, a metadata change ext4 journals before the write returns, so every durable commit carried
+a journal commit and paid several times the device's own sync. Into a written extent the append is
+the sync alone. Measured on a SATA SSD whose durable 4 KiB write costs about 450 µs, the median
+commit fell from about 1,000 µs to 460 µs with one committer and from about 2,000 µs to 930 µs with
+four. The zeros read back exactly as a fallocated tail does, so replay is unchanged. The cost is
+writing each log's bytes twice, the second time off every commit's path, and a log that outgrows
+its fill reserves the rest the ordinary way. At a commit rate high enough to roll the log every few
+seconds the fill competes with the commits for the device, which is where it stops paying.
+
+A rotation that finds the preparer still busy opens its own log, and that log's generation is above
+the one being prepared. The prepared log is then **discarded rather than installed** when a later
+rotation finds it: its generation is at or below the active log's, and installed after it, recovery,
+which replays logs in generation order, would take its newer commits for older ones.
 
 Preparing is claimed, not merely checked. Every committer that rotated arrives at the same moment
 and the empty-slot check is only a hint, so without a claim each one creates a log for a slot that

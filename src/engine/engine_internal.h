@@ -63,6 +63,16 @@ int engine_durable_sync_mode(int sync_mode);
 int engine_open_wal(tidesdb_t *db, const char *wal_path, block_manager_t **out_bm);
 
 /**
+ * engine_prefill_wal
+ * fill a fresh log with zeros up to its write buffer, under full sync only, so its durable appends
+ * land in written extents and a synchronous write is the device's sync alone. called on a log
+ * nothing appends to yet -- the first active log at open, and the spare before it is published
+ * @param db the database, for the sync mode and the write buffer size
+ * @param wal the fresh log
+ */
+void engine_prefill_wal(tidesdb_t *db, block_manager_t *wal);
+
+/**
  * engine_open_wal_sealed
  * open a recovered generation's WAL for replay only, without the buffered-append machinery
  * nothing appends to a sealed generation, so its staging ring and flush thread would never be used

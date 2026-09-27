@@ -149,10 +149,12 @@ otherwise invisible, the first such failure in the process is logged once.
 `fallocate` advances the logical end of file, which is what takes writes off the extending path.
 It does not initialize the blocks — the extents come back marked unwritten, which is why the call
 is cheap, and the first write into each one converts it. That conversion is itself a journalled
-metadata operation. Preallocation therefore exchanges one metadata cost for another rather than
-removing metadata work from the write path, and measured on ext4 it changes neither throughput nor
-tail latency for the log. It still earns its place on filesystems that behave differently, and it
-keeps the two write paths consistent.
+metadata operation, and a synchronous write cannot return until the journal has committed it. For
+files written in bulk and synced once that is noise. For a log synced on every commit it is not: it
+put a journal commit behind every durable append and made each one cost several times the device's
+own sync. `block_manager_prefill` writes zeros over the range instead, through a descriptor of its
+own with one sync at the end, so the appends that follow land in written extents; the engine uses it
+for write-ahead logs under full sync only.
 :::
 
 ## The buffered append ring

@@ -396,7 +396,7 @@ int engine_get_db_stats(tidesdb_t *db, tidesdb_db_stats_t *out)
     out->global_seq = tidesdb_mvcc_current_seq(db->clock);
     out->min_snapshot_seq = tidesdb_txn_registry_min_snapshot(db->txn_registry);
     out->next_cf_index = (uint32_t)cf_registry_next_cf_id(db->cfs);
-    out->wal_generation = atomic_load_explicit(&db->wal_generation, memory_order_relaxed);
+    out->wal_generation = atomic_load_explicit(&db->active_wal_gen, memory_order_relaxed);
 
     tidesdb_l0_admission_t admission = {0};
     tidesdb_l0_admission_stats(db->l0, &admission);

@@ -102,7 +102,9 @@ typedef struct
  * @param retained_wals_lock guards retained_wals against concurrent flushes and resolutions
  * @param flush_queue the flush pool's work queue; a rotation enqueues one wake signal per sealed
  * immutable
- * @param wal_generation the current active memtable's WAL generation, bumped on every rotation
+ * @param wal_generation the highest generation drawn, for the active log or for a spare prepared
+ * ahead of it, so it runs ahead of the active log whenever a spare exists. which log a commit lands
+ * in is active_wal_gen, never this
  * @param spare_wal a log opened ahead of the rotation that will need it, or NULL. opening one costs
  * a file creation, a staging ring and a flush thread, and on a loaded device that is long enough to
  * matter -- paid under rotate_lock it would stop every committer in the database for the whole of
@@ -110,6 +112,12 @@ typedef struct
  * @param spare_wal_gen the generation spare_wal was named for. written and read under
  * spare_wal_preparing rather than beside the pointer, because taking the spare empties the slot and
  * lets the next preparer overwrite this field before the taker has read it
+ * @param active_wal_gen the generation of the log the active memtable appends to, written at open
+ * and under rotate_lock, and read without it by a prepare pinning the log its record lands in and
+ * by the statistics. a rotation that finds the spare named at or below it discards the spare, since
+ * a rotation that opened its own log while the spare was being filled has already moved past it,
+ * and installing the lower generation after the higher one would have recovery replay the newer
+ * commits as the older
  * @param spare_wal_preparing whether a thread is already opening a spare, so a rotation burst
  * prepares one log rather than one per committer. without it every committer that rotated created a
  * file and all but one abandoned it
@@ -195,6 +203,7 @@ struct tidesdb_t
     _Atomic(uint64_t) wal_generation;
     _Atomic(block_manager_t *) spare_wal;
     uint64_t spare_wal_gen;
+    _Atomic(uint64_t) active_wal_gen;
     _Atomic(int) spare_wal_preparing;
     pthread_mutex_t rotate_lock;
     int rotate_lock_inited;

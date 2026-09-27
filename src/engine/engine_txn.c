@@ -219,12 +219,15 @@ int engine_txn_prepare(tidesdb_txn_t *txn, const uint8_t *xid, size_t xid_size)
     /* the record's generation is not knowable from here with one read: a rotation may land it in a
      * later log than the one current before the append. so both ends are taken and both pinned --
      * they are the same generation unless a rotation raced, and keeping one log that turns out
-     * unnecessary costs disk where dropping the one holding an undecided batch loses it */
-    const uint64_t first = atomic_load_explicit(&db->wal_generation, memory_order_acquire);
+     * unnecessary costs disk where dropping the one holding an undecided batch loses it. the active
+     * log's generation, not the generation counter, which a spare prepared ahead has already moved
+     * past the log the record goes to -- pinning that one left the real log unpinned, and a flush
+     * unlinked it with the undecided prepare inside */
+    const uint64_t first = atomic_load_explicit(&db->active_wal_gen, memory_order_acquire);
 
     const int rc =
         tdb_txn_prepare(txn->inner, &db->backend, db->sources, ENGINE_NUM_SOURCES, xid, xid_size);
-    const uint64_t last = atomic_load_explicit(&db->wal_generation, memory_order_acquire);
+    const uint64_t last = atomic_load_explicit(&db->active_wal_gen, memory_order_acquire);
     /* a prepare that is refused is a conflict like any other; one that holds is not yet a commit */
     if (rc == TDB_ERR_CONFLICT) engine_count_commit(db, rc);
     /* only a write transaction leaves anything durable to protect; a read-only prepare finishes

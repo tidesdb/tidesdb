@@ -3301,10 +3301,91 @@ void test_block_manager_buffered_oversized_record(void)
     (void)remove(path);
 }
 
+/* how far a prefill test fills, past every record it writes */
+#define BM_TEST_PREFILL_BYTES (1024 * 1024)
+
+#ifdef __linux__
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+
+/* extents a fiemap query of the prefilled range can report */
+#define BM_TEST_FIEMAP_EXTENTS 64
+
+/* whether any extent over [start, start + len) is held as unwritten, -1 when the filesystem cannot
+ * say. an unwritten extent is what makes a synchronous append journal a metadata change */
+static int bm_test_range_has_unwritten(const int fd, const uint64_t start, const uint64_t len)
+{
+    const size_t size =
+        sizeof(struct fiemap) + BM_TEST_FIEMAP_EXTENTS * sizeof(struct fiemap_extent);
+    struct fiemap *fm = calloc(1, size);
+    if (!fm) return -1;
+    fm->fm_start = start;
+    fm->fm_length = len;
+    fm->fm_flags = FIEMAP_FLAG_SYNC;
+    fm->fm_extent_count = BM_TEST_FIEMAP_EXTENTS;
+    int unwritten = -1;
+    if (ioctl(fd, FS_IOC_FIEMAP, fm) == 0)
+    {
+        unwritten = 0;
+        for (uint32_t i = 0; i < fm->fm_mapped_extents; i++)
+            if (fm->fm_extents[i].fe_flags & FIEMAP_EXTENT_UNWRITTEN) unwritten = 1;
+    }
+    free(fm);
+    return unwritten;
+}
+#endif
+
+/* a prefill writes zeros past the file's end without moving where appends go, the records appended
+ * after it read back and replay stops at the zeros exactly as it does at a fallocated tail, and the
+ * filled range is held as written rather than unwritten where the filesystem can say */
+void test_block_manager_prefill_leaves_appends_and_replay_unchanged(void)
+{
+    (void)remove("test_prefill.db");
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, "test_prefill.db", BLOCK_MANAGER_SYNC_FULL), 0);
+    uint64_t start = 0;
+    ASSERT_EQ(block_manager_get_size(bm, &start), 0);
+    ASSERT_EQ(block_manager_prefill(bm, BM_TEST_PREFILL_BYTES), 0);
+
+    char first[] = "first-record";
+    char second[] = "second-record";
+    block_manager_block_t *b1 = block_manager_block_create(sizeof(first), first);
+    block_manager_block_t *b2 = block_manager_block_create(sizeof(second), second);
+    ASSERT_TRUE(b1 && b2);
+    ASSERT_EQ(block_manager_block_write(bm, b1), (int64_t)start);
+    ASSERT_TRUE(block_manager_block_write(bm, b2) > (int64_t)start);
+    (void)block_manager_block_free(b1);
+    (void)block_manager_block_free(b2);
+
+#ifdef __linux__
+    const int unwritten = bm_test_range_has_unwritten(bm->fd, start, BM_TEST_PREFILL_BYTES);
+    if (unwritten >= 0) ASSERT_EQ(unwritten, 0);
+#endif
+    ASSERT_EQ(block_manager_close(bm), 0);
+
+    ASSERT_EQ(block_manager_open(&bm, "test_prefill.db", BLOCK_MANAGER_SYNC_FULL), 0);
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_EQ(block_manager_cursor_init(&cursor, bm), 0);
+    block_manager_block_t *r = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(r != NULL && r->size == sizeof(first) && memcmp(r->data, first, r->size) == 0);
+    (void)block_manager_block_free(r);
+    ASSERT_EQ(block_manager_cursor_next(cursor), 0);
+    r = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(r != NULL && r->size == sizeof(second) && memcmp(r->data, second, r->size) == 0);
+    (void)block_manager_block_free(r);
+    ASSERT_TRUE(block_manager_cursor_next(cursor) != 0 ||
+                block_manager_cursor_read(cursor) == NULL);
+    (void)block_manager_cursor_free(cursor);
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove("test_prefill.db");
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_block_manager_open, tests_passed);
+    RUN_TEST(test_block_manager_prefill_leaves_appends_and_replay_unchanged, tests_passed);
     RUN_TEST(test_block_manager_block_create, tests_passed);
     RUN_TEST(test_block_manager_block_write, tests_passed);
     RUN_TEST(test_block_manager_block_write_batch, tests_passed);

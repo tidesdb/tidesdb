@@ -546,7 +546,7 @@ typedef struct
  * bytes
  * @param is_flushing 1 while an immutable is queued or flushing
  * @param next_cf_index next column family id to be assigned
- * @param wal_generation current write-ahead-log generation counter
+ * @param wal_generation the generation of the write-ahead log the active memtable appends to
  * @param flush_count sstables flushed across every cf
  * @param compaction_count compactions run across every cf
  * @param flush_bytes_written flush output bytes summed across every cf

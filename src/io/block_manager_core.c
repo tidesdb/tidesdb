@@ -533,6 +533,60 @@ int block_manager_escalate_fsync(block_manager_t *bm)
     return 0;
 }
 
+/* one page of zeros every prefill write points all of its vectors at, and how many vectors one
+ * write carries, so a prefill allocates nothing and issues a few large writes */
+#define BM_PREFILL_PAGE    (64 * 1024)
+#define BM_PREFILL_VECTORS 64
+static const unsigned char bm_prefill_zeros[BM_PREFILL_PAGE];
+
+/* write zeros over [start, end) of a descriptor in writes of one vector array each */
+static int bm_prefill_zeros_range(const int fd, const uint64_t start, const uint64_t end)
+{
+    struct iovec iov[BM_PREFILL_VECTORS];
+    for (int i = 0; i < BM_PREFILL_VECTORS; i++)
+    {
+        iov[i].iov_base = (void *)(uintptr_t)bm_prefill_zeros;
+        iov[i].iov_len = BM_PREFILL_PAGE;
+    }
+    const uint64_t per_write = (uint64_t)BM_PREFILL_PAGE * BM_PREFILL_VECTORS;
+    uint64_t at = start;
+    while (at < end)
+    {
+        const uint64_t want = end - at < per_write ? end - at : per_write;
+        const int vectors = (int)((want + BM_PREFILL_PAGE - 1) / BM_PREFILL_PAGE);
+        iov[vectors - 1].iov_len = (size_t)(want - (uint64_t)(vectors - 1) * BM_PREFILL_PAGE);
+        const ssize_t wrote = tdb_pwritev_safe(fd, iov, vectors, (off_t)at);
+        iov[vectors - 1].iov_len = BM_PREFILL_PAGE;
+        if (wrote <= 0) return -1;
+        at += (uint64_t)wrote;
+    }
+    return 0;
+}
+
+int block_manager_prefill(block_manager_t *bm, const uint64_t bytes)
+{
+    if (!bm || bytes == 0) return -1;
+    const uint64_t start = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+    const uint64_t end = start + bytes;
+
+    /* written through a descriptor of its own, opened without synchronous writes, so the fill is
+     * buffered and costs the device one flush at the end. through the log's own descriptor every
+     * write would be a flush, and the fill's flushes would queue ahead of the commits' */
+    const int fd = open(bm->file_path, O_WRONLY);
+    if (fd < 0) return -1;
+    int rc = bm_prefill_zeros_range(fd, start, end);
+    if (rc == 0 && fdatasync(fd) != 0) rc = -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc != 0) return -1;
+
+    /* the filled range is already allocated and written, so the append path's extension starts
+     * past it rather than reserving it again as unwritten extents. nothing appends before a
+     * prefill, so no extension races this store */
+    if (atomic_load_explicit(&bm->preallocated_size, memory_order_acquire) < end)
+        atomic_store_explicit(&bm->preallocated_size, end, memory_order_release);
+    return 0;
+}
+
 time_t block_manager_last_modified(block_manager_t *bm)
 {
     if (!bm) return -1;

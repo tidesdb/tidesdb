@@ -7023,6 +7023,117 @@ void test_engine_iterator_outlives_its_transaction(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* polls for the spare log a flush worker prepares after open, each a millisecond apart */
+#define ENGINE_TEST_SPARE_WAIT_POLLS 10000
+#define ENGINE_TEST_SPARE_POLL_US    1000
+
+/* a rotation that opened its own log while the spare was still being prepared has moved past the
+ * spare's generation, and the next rotation must not install the spare after it. a log with a lower
+ * generation holding newer commits would be replayed as older, since recovery replays in generation
+ * order. the spare is discarded, its file with it, and every commit reads back after a reopen */
+void test_engine_rotation_never_installs_an_overtaken_spare(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    engine_prepare_spare_wal(db);
+    for (int i = 0; i < ENGINE_TEST_SPARE_WAIT_POLLS &&
+                    !atomic_load_explicit(&db->spare_wal, memory_order_acquire);
+         i++)
+        usleep(ENGINE_TEST_SPARE_POLL_US);
+    ASSERT_TRUE(atomic_load_explicit(&db->spare_wal, memory_order_acquire) != NULL);
+    const uint64_t spare_gen = db->spare_wal_gen;
+
+    /* a preparer is in flight, so the rotation opens a log of its own above the spare */
+    atomic_store_explicit(&db->spare_wal_preparing, 1, memory_order_release);
+    ryow_commit(db, cf, "a", "A");
+    ASSERT_EQ(engine_force_rotate(db), TDB_SUCCESS);
+    const uint64_t overtaking_gen = atomic_load(&db->active_wal_gen);
+    ASSERT_TRUE(overtaking_gen > spare_gen);
+    atomic_store_explicit(&db->spare_wal_preparing, 0, memory_order_release);
+
+    /* the next rotation finds the overtaken spare and discards it */
+    ryow_commit(db, cf, "b", "B");
+    ASSERT_EQ(engine_force_rotate(db), TDB_SUCCESS);
+    ASSERT_TRUE(atomic_load(&db->active_wal_gen) > overtaking_gen);
+    char name[ENGINE_WAL_NAME_MAX], path[ENGINE_PATH_BUF_SIZE];
+    ASSERT_EQ(tidesdb_wal_filename(spare_gen, name, sizeof(name)), TDB_SUCCESS);
+    snprintf(path, sizeof(path), "%s%s%s", db_path, PATH_SEPARATOR, name);
+    ASSERT_TRUE(access(path, F_OK) != 0);
+
+    ryow_commit(db, cf, "c", "C");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    const char *keys[] = {"a", "b", "c"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+    {
+        tidesdb_txn_t *t = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
+        uint8_t *v = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(t, cf, (const uint8_t *)keys[i], 1, &v, &vs), TDB_SUCCESS);
+        free(v);
+        tidesdb_txn_free(t);
+    }
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a prepare pins the log its record lands in even while a spare log waits for the next rotation.
+ * the spare's generation is already drawn, so a prepare that pinned the newest generation drawn
+ * pinned the spare, left the active log unpinned, and a flush of the active generation unlinked
+ * the log holding the undecided prepare, which a reopen then did not find */
+void test_engine_prepare_pins_the_active_log_while_a_spare_waits(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    engine_prepare_spare_wal(db);
+    for (int i = 0; i < ENGINE_TEST_SPARE_WAIT_POLLS &&
+                    !atomic_load_explicit(&db->spare_wal, memory_order_acquire);
+         i++)
+        usleep(ENGINE_TEST_SPARE_POLL_US);
+    ASSERT_TRUE(atomic_load_explicit(&db->spare_wal, memory_order_acquire) != NULL);
+
+    const uint8_t xid[] = "xid-beside-a-spare";
+    tidesdb_txn_t *pending = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &pending), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(pending, cf, (const uint8_t *)"p", 1, (const uint8_t *)"P", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(pending, xid, sizeof(xid) - 1), TDB_SUCCESS);
+    ryow_commit(db, cf, "q", "Q");
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    tidesdb_txn_free(pending);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    int count = -1;
+    tidesdb_prepared_txn_t found[4];
+    ASSERT_EQ(tidesdb_recover_prepared(db, found, 4, &count), TDB_SUCCESS);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(memcmp(found[0].xid, xid, sizeof(xid) - 1) == 0);
+    ASSERT_EQ(tidesdb_txn_rollback_prepared(found[0].txn), TDB_SUCCESS);
+    tidesdb_txn_free(found[0].txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -7055,6 +7166,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_scan_reads_own_writes, tests_passed);
     RUN_TEST(test_engine_scan_honours_own_prefix_delete, tests_passed);
     RUN_TEST(test_engine_iterator_outlives_its_transaction, tests_passed);
+    RUN_TEST(test_engine_rotation_never_installs_an_overtaken_spare, tests_passed);
+    RUN_TEST(test_engine_prepare_pins_the_active_log_while_a_spare_waits, tests_passed);
     RUN_TEST(test_engine_cf_stats, tests_passed);
     RUN_TEST(test_engine_cf_estimate_cardinality, tests_passed);
     RUN_TEST(test_engine_cf_unflushed_keys, tests_passed);

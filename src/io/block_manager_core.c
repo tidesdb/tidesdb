@@ -247,10 +247,6 @@ static void bm_init_fields(block_manager_t *m, const block_manager_sync_mode_t s
     atomic_init(&m->flush_error, 0);
     atomic_init(&m->flush_sleeping, 0);
     atomic_init(&m->durable_waiters, 0);
-    atomic_init(&m->fill_ahead, 0);
-    atomic_init(&m->filled_to, 0);
-    m->run_avg = 0;
-    m->fill_fd = -1;
 
     m->sync_mode = sync_mode;
     atomic_init(&m->sync_full_cached, sync_mode == BLOCK_MANAGER_SYNC_FULL);
@@ -410,8 +406,6 @@ int block_manager_close(block_manager_t *bm)
         pthread_cond_signal(&bm->buf_work_cv);
         pthread_mutex_unlock(&bm->buf_mtx);
         tdb_thread_finish(&bm->flush_thread);
-        if (bm->fill_fd >= 0) (void)close(bm->fill_fd);
-        bm->fill_fd = -1;
         /* a clean drain left every done-ring flag cleared, so return the warm buffer pair to the
          * pool for the next WAL. a flush error may have left flags set, so free that pair instead.
          */
@@ -621,7 +615,6 @@ int block_manager_open_buffered(block_manager_t **bm, const char *file_path, con
      * continue from there and the flush thread only ever writes newly-appended bytes. */
     const uint64_t fsz = atomic_load(&b->current_file_size);
     atomic_store(&b->buf_flushed, fsz);
-    atomic_store(&b->filled_to, fsz);
 
     pthread_mutex_init(&b->buf_mtx, NULL);
     /* both on the clock their deadlines are built from, so a wall clock step cannot hold the

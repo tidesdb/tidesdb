@@ -115,14 +115,6 @@ typedef enum
  * @param buf_mtx guards the buffered condition variables
  * @param buf_work_cv the flush thread parks here when the ring has no released work
  * @param buf_durable_cv appenders park here waiting for buf_flushed to advance
- * @param fill_ahead how far past the reserved end the flush thread keeps the file written with
- *                   zeros while it is idle, 0 for never
- * @param filled_to the file offset the flush thread has written zeros up to, written by the flush
- *                  thread alone
- * @param run_avg a running average of the bytes each flush-thread write carries, kept by the flush
- *                thread alone, so it fills only for a log whose writes are small
- * @param fill_fd the descriptor the zeros are written through, opened without synchronous writes by
- *                the flush thread on its first fill, -1 before that; the flush thread alone uses it
  */
 typedef struct
 {
@@ -159,10 +151,6 @@ typedef struct
     pthread_mutex_t buf_mtx;
     pthread_cond_t buf_work_cv;
     pthread_cond_t buf_durable_cv;
-    ATOMIC_ALIGN(8) _Atomic uint64_t fill_ahead;
-    ATOMIC_ALIGN(8) _Atomic uint64_t filled_to;
-    uint64_t run_avg;
-    int fill_fd;
 } block_manager_t;
 
 /**
@@ -594,21 +582,6 @@ uint64_t block_manager_framed_size(uint32_t payload_size);
  * @return 0 on success, -1 on a bad argument
  */
 int block_manager_buffered_lag(block_manager_t *bm, uint64_t *out_lag, uint64_t *out_capacity);
-
-/**
- * block_manager_set_fill_ahead
- * have a buffered log's flush thread keep the file written with zeros a given distance past its
- * reserved end, a chunk at a time, only while it is idle -- nothing reserved is left unwritten and
- * no appender waits on it. an extent reserved with fallocate is held as unwritten, and the first
- * write into one is a metadata change a synchronous write must journal before it returns, which on
- * ext4 put a journal commit behind every small durable append. filled while idle, a lightly loaded
- * log's appends land in written extents and cost the device's sync alone; a busy log is never idle,
- * so its flush thread never spends the device on zeros its large appends gain nothing from. the
- * zeros read back exactly as a fallocated tail does, so replay is unchanged
- * @param bm a block manager opened in buffered mode
- * @param bytes the distance to keep filled past the reserved end, 0 to stop
- */
-void block_manager_set_fill_ahead(block_manager_t *bm, uint64_t bytes);
 
 /**
  * block_manager_escalate_fsync

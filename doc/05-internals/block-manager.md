@@ -149,12 +149,10 @@ otherwise invisible, the first such failure in the process is logged once.
 `fallocate` advances the logical end of file, which is what takes writes off the extending path.
 It does not initialize the blocks — the extents come back marked unwritten, which is why the call
 is cheap, and the first write into each one converts it. That conversion is itself a journalled
-metadata operation, and a synchronous write cannot return until the journal has committed it. For
-files written in bulk and synced once that is noise. For a log synced on every commit it is not: it
-put a journal commit behind every durable append and made each one cost several times the device's
-own sync. `block_manager_set_fill_ahead` has a buffered log's flush thread write zeros over the
-range just past its end instead, through a descriptor of its own, while the log is idle and its
-writes are small; the engine turns it on for write-ahead logs under full sync only.
+metadata operation, and a synchronous write cannot return until the journal has committed it, so
+a log synced on every commit pays a journal commit per sync either way: a file grown by its own
+writes journals its new size instead. Writing zeros ahead of the appends would avoid it, at the
+cost of writing the log's bytes twice, which is not worth it.
 :::
 
 ## The buffered append ring

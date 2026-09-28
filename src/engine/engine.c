@@ -89,11 +89,6 @@ static int engine_wal_sync_mode(int sync_mode)
 #define ENGINE_WAL_RING_MIN   (1ull * 1024 * 1024)
 #define ENGINE_WAL_RING_MAX   (16ull * 1024 * 1024)
 
-/* how far past its end a log's flush thread keeps it written with zeros while idle, under full
- * sync. a few megabytes covers the small commits of a lightly loaded database between idle moments,
- * and a busy log is never idle and fills nothing */
-#define ENGINE_WAL_FILL_AHEAD (4ull * 1024 * 1024)
-
 /**
  * engine_wal_ring_size
  * the staging ring a WAL is opened with. the WAL runs in buffered append mode, where committing
@@ -135,10 +130,6 @@ int engine_open_wal(tidesdb_t *db, const char *wal_path, block_manager_t **out_b
     /* the labelled count is what the reaper and the open budget read, and it only balances if every
      * close pairs with this -- engine_close_wal and the flush path are the only two that may */
     if (rc == 0) fd_manager_note_open(&db->fdm, FD_LABEL_WAL_LOG);
-    /* only a commit that waits for the device pays for an unwritten extent, so only full sync
-     * keeps the log filled ahead */
-    if (rc == 0 && db->config.memtable_sync_mode == TDB_SYNC_FULL)
-        block_manager_set_fill_ahead(*out_bm, ENGINE_WAL_FILL_AHEAD);
     return rc;
 }
 

@@ -177,20 +177,6 @@ that will need it, outside the lock, by a flush worker: once at open and again e
 wakes one. The next rotation takes the prepared log and becomes a memtable allocation and two
 pointer swaps, and no committer pays for the preparation at all.
 
-Under full sync a log that takes appends is also **kept written with zeros a few megabytes past its
-end**, by its own flush thread, a chunk at a time. A synchronous append into an extent `fallocate`
-reserved converts that extent from unwritten to written, a metadata change ext4 journals before the
-write returns, so every durable commit carried a journal commit and paid several times the device's
-own sync. Into a written extent the append is the sync alone. The flush thread fills only while the
-log is idle — nothing reserved is left unwritten and no committer waits on it — and only while its
-recent writes are small, because the journal cost a fill saves is paid once per sync while the zeros
-cost per byte. Measured on a SATA SSD whose durable 4 KiB write costs about 450 µs, the median commit
-of one committer fell from about 1,000 µs to 580 µs and four committers' p99 from 22 ms to 4 ms,
-while a bulk load, whose syncs each carry a quarter of a megabyte, fills nothing and runs exactly as
-fast as without it. Filling the whole log up front at its creation cost that load 40%: it wrote more
-zeros than the log ever reached, and they were written back while the commits synced. The zeros
-read back exactly as a fallocated tail does, so replay is unchanged.
-
 A rotation that finds the preparer still busy opens its own log, and that log's generation is above
 the one being prepared. The prepared log is then **discarded rather than installed** when a later
 rotation finds it: its generation is at or below the active log's, and installed after it, recovery,

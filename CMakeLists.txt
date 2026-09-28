@@ -721,6 +721,7 @@ if(TIDESDB_BUILD_TESTS)
         ttl_tests
         txn_api_tests
         iter_api_tests
+        isolation_history_tests
     )
 
     # the crash-recovery tests start a child from this same binary rather than forking, so they

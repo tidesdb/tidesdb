@@ -305,29 +305,34 @@ static int txn_validate_reads(tdb_txn_t *txn, const tidesdb_source_t *sources, i
     {
         tidesdb_readset_entry_t rd;
         if (!tidesdb_readset_at(txn->readset, i, &rd)) continue;
+        /* the claims before the store. a writer lets go of its claims only once its version is in
+         * the store, so a claim found gone here means the probe below sees the version; asked the
+         * other way round, a writer could apply after the probe and let go before the claim check,
+         * missed by both */
+        if (tidesdb_mvcc_read_stale(txn->clock, &txn->commit, rd.cf_index, rd.key,
+                                    (uint32_t)rd.key_size,
+                                    txn_key_hash(rd.cf_index, rd.key, rd.key_size)))
+            return TDB_ERR_CONFLICT;
         int newer = 0;
         const int rc = txn_probe_newer(sources, num_sources, rd.cf_index, rd.key, rd.key_size,
                                        rd.seq, below, &newer);
         if (rc != TDB_SUCCESS) return rc;
         if (newer) return TDB_ERR_CONFLICT;
-        if (tidesdb_mvcc_read_stale(txn->clock, &txn->commit, rd.cf_index, rd.key,
-                                    (uint32_t)rd.key_size,
-                                    txn_key_hash(rd.cf_index, rd.key, rd.key_size)))
-            return TDB_ERR_CONFLICT;
     }
     const int ranges = tidesdb_readset_range_count(txn->readset);
     for (int i = 0; i < ranges; i++)
     {
         tidesdb_readset_range_t sc;
         if (!tidesdb_readset_range_at(txn->readset, i, &sc)) continue;
+        /* the claims before the store, for the reason the point reads above give */
+        if (tidesdb_mvcc_range_stale(txn->clock, &txn->commit, sc.cf_index, sc.lo, sc.lo_size,
+                                     sc.hi, sc.hi_size, 0))
+            return TDB_ERR_CONFLICT;
         int newer = 0;
         const int rc = txn_probe_range_newer(sources, num_sources, sc.cf_index, sc.lo, sc.lo_size,
                                              sc.hi, sc.hi_size, sc.seq, below, &newer);
         if (rc != TDB_SUCCESS) return rc;
         if (newer) return TDB_ERR_CONFLICT;
-        if (tidesdb_mvcc_range_stale(txn->clock, &txn->commit, sc.cf_index, sc.lo, sc.lo_size,
-                                     sc.hi, sc.hi_size, 0))
-            return TDB_ERR_CONFLICT;
     }
     return TDB_SUCCESS;
 }
@@ -358,26 +363,26 @@ static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, 
         if (!tidesdb_writeset_op_at(txn->writeset, i, &op)) continue;
         int newer = 0;
         int rc = TDB_SUCCESS;
+        /* the claims before the store in both branches, for the reason txn_validate_reads gives */
         if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE)
         {
-            if (first_committer_wins)
-                rc = txn_probe_range_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
-                                           op.value, op.value_size, snapshot, below, &newer);
-            if (rc == TDB_SUCCESS && !newer && first_committer_wins &&
+            if (first_committer_wins &&
                 tidesdb_mvcc_range_stale(txn->clock, &txn->commit, op.cf_index, op.key, op.key_size,
                                          op.value, op.value_size, 1))
                 newer = 1;
+            if (!newer && first_committer_wins)
+                rc = txn_probe_range_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
+                                           op.value, op.value_size, snapshot, below, &newer);
         }
         else
         {
-            if (first_committer_wins)
-                rc = txn_probe_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
-                                     snapshot, below, &newer);
-            if (rc == TDB_SUCCESS && !newer &&
-                tidesdb_mvcc_write_blocked(
+            if (tidesdb_mvcc_write_blocked(
                     txn->clock, &txn->commit, op.cf_index, op.key, (uint32_t)op.key_size,
                     txn_key_hash(op.cf_index, op.key, op.key_size), first_committer_wins))
                 newer = 1;
+            if (!newer && first_committer_wins)
+                rc = txn_probe_newer(sources, num_sources, op.cf_index, op.key, op.key_size,
+                                     snapshot, below, &newer);
         }
         if (rc != TDB_SUCCESS) return rc;
         if (newer) return TDB_ERR_CONFLICT;

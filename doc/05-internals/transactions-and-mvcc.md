@@ -210,6 +210,14 @@ them all, and a successful one drops them once the watermark has passed its sequ
 validating against the data finds what the claims were standing in for. Nothing is renamed, aged out
 or handed over.
 
+That hand-over fixes the order validation asks its two questions in: **the claims first, then the
+store**. A writer drops its claims only once its version is in the store, so a claim a validator finds
+gone is a version the store check after it will see. Asked the other way round, a writer sequenced
+just below could apply after the store check and drop its claims before the claim check, and neither
+would see it. Snapshot and serializable refuse a second writer at its claim, which hid the gap for
+them; repeatable read refuses nothing at the claim and relied on validation alone, and two
+read-modify-writes of one key both committed.
+
 Losing a claim is `TDB_ERR_CONFLICT`, raised before anything durable has been written.
 
 The subtlety is what each write is validated *against*. Not the transaction's snapshot, but **the

@@ -231,7 +231,7 @@ void test_isolation_history_read_committed_reads_only_committed_states(void)
     hist_record(TDB_ISOLATION_READ_COMMITTED, &g_point_mix);
     const hist_found_t f = hist_check();
     hist_report("read committed", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a, 0);
     ASSERT_EQ(f.g1b, 0);
 }
@@ -242,7 +242,7 @@ void test_isolation_history_snapshot_forbids_g_single(void)
     hist_record(TDB_ISOLATION_SNAPSHOT, &g_point_mix);
     const hist_found_t f = hist_check();
     hist_report("snapshot", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.g0_g1c, 0);
     ASSERT_EQ(f.g_single, 0);
@@ -255,7 +255,7 @@ void test_isolation_history_repeatable_read_is_acyclic_over_point_access(void)
     hist_record(TDB_ISOLATION_REPEATABLE_READ, &g_point_mix);
     const hist_found_t f = hist_check();
     hist_report("repeatable read", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.cycles, 0);
 }
@@ -266,7 +266,7 @@ void test_isolation_history_serializable_is_acyclic(void)
     hist_record(TDB_ISOLATION_SERIALIZABLE, &g_point_mix);
     const hist_found_t f = hist_check();
     hist_report("serializable", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.cycles, 0);
 }

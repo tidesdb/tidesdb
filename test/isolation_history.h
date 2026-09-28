@@ -44,6 +44,13 @@
 #define HIST_XID_FORMAT    "x%d"
 #define HIST_IN_DOUBT_MAX  8
 
+/* the fewest commits a history must hold to be checked. the workers stop at the target, but how
+ * many attempts reach it depends on the scheduler rather than the engine -- eight threads on two
+ * cores are preempted inside their transactions, see many commits land meanwhile, and are refused
+ * by validation as they should be, committing a few in a hundred -- so the attempt budget can run
+ * out first, and a history of this size still exercises every check */
+#define HIST_COMMIT_FLOOR (HIST_COMMIT_TARGET / 4)
+
 /* the fixed capacity every history is recorded into; nothing is allocated while a run records */
 #define HIST_OPS_MAX     (HIST_ACTIONS + HIST_SPAN * 2)
 #define HIST_ATTEMPT_MAX (HIST_COMMIT_TARGET * 24)
@@ -728,6 +735,8 @@ static int hist_two_phase(tidesdb_txn_t *txn, hist_txn_t *t, const int slot, uin
  * @param seed the thread's generator seed
  * @param mix the actions the attempts draw
  * @param target the committed count at which the thread stops
+ * @param slot_limit the slot at which the thread stops, whatever has committed, so one run leaves
+ *                   the rest of the budget to the runs after it
  * @param leave_in_doubt non-zero to leave prepared attempts undecided, up to HIST_IN_DOUBT_MAX
  */
 typedef struct
@@ -738,6 +747,7 @@ typedef struct
     uint64_t seed;
     hist_mix_t mix;
     int target;
+    int slot_limit;
     int leave_in_doubt;
 } hist_worker_t;
 
@@ -776,7 +786,7 @@ static void *hist_worker(void *arg)
     {
         if (atomic_load(&g_hist.committed) >= w->target) break;
         const int slot = atomic_fetch_add(&g_hist.next_slot, 1);
-        if (slot >= HIST_ATTEMPT_MAX) break;
+        if (slot >= w->slot_limit || slot >= HIST_ATTEMPT_MAX) break;
         hist_run_attempt(w, &rng, slot);
     }
     return NULL;
@@ -801,9 +811,11 @@ static void hist_open(const int fresh, tidesdb_t **db, tidesdb_column_family_t *
     ASSERT_TRUE(*cf != NULL);
 }
 
-/* run the workers against an open database until the committed count reaches target */
+/* run the workers against an open database until the committed count reaches target or the slots
+ * reach slot_limit */
 static void hist_run(tidesdb_t *db, tidesdb_column_family_t *cf, const int iso,
-                     const hist_mix_t *mix, const int target, const int leave_in_doubt)
+                     const hist_mix_t *mix, const int target, const int slot_limit,
+                     const int leave_in_doubt)
 {
     pthread_t th[HIST_THREADS];
     hist_worker_t w[HIST_THREADS];
@@ -815,6 +827,7 @@ static void hist_run(tidesdb_t *db, tidesdb_column_family_t *cf, const int iso,
                             .iso = iso,
                             .mix = *mix,
                             .target = target,
+                            .slot_limit = slot_limit,
                             .seed = HIST_RNG_SEED + (uint64_t)(i + atomic_load(&g_hist.next_slot)),
                             .leave_in_doubt = leave_in_doubt};
         ASSERT_EQ(pthread_create(&th[i], NULL, hist_worker, &w[i]), 0);
@@ -840,7 +853,7 @@ static void hist_record(const int iso, const hist_mix_t *mix)
     tidesdb_t *db = NULL;
     tidesdb_column_family_t *cf = NULL;
     hist_open(1, &db, &cf);
-    hist_run(db, cf, iso, mix, HIST_COMMIT_TARGET, 0);
+    hist_run(db, cf, iso, mix, HIST_COMMIT_TARGET, HIST_ATTEMPT_MAX, 0);
     hist_read_final(db, cf);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(HIST_DB_DIR);

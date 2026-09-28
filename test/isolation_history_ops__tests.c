@@ -26,6 +26,9 @@ static int tests_failed = 0;
 #define HIST_RECOVERY_ALWAYS_PREPARE 100
 #define HIST_RECOVERY_TRIES          (HIST_IN_DOUBT_MAX * 8)
 #define HIST_RECOVERY_SEED           0xD1B54A32D192ED03ULL
+/* the share of the attempt budget the run before the restart may use, so the prepares left in doubt
+ * and the run after it always have slots */
+#define HIST_RECOVERY_FIRST_SLOTS (HIST_ATTEMPT_MAX / 3)
 
 static const hist_mix_t g_ops_mix = {.read = HIST_OPS_READ_PERCENT,
                                      .scan = HIST_OPS_SCAN_PERCENT,
@@ -39,7 +42,7 @@ void test_isolation_history_ops_read_committed_reads_only_committed_states(void)
     hist_record(TDB_ISOLATION_READ_COMMITTED, &g_ops_mix);
     const hist_found_t f = hist_check();
     hist_report("read committed", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a, 0);
     ASSERT_EQ(f.g1b, 0);
 }
@@ -51,7 +54,7 @@ void test_isolation_history_ops_snapshot_forbids_g_single(void)
     hist_record(TDB_ISOLATION_SNAPSHOT, &g_ops_mix);
     const hist_found_t f = hist_check();
     hist_report("snapshot", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.g0_g1c, 0);
     ASSERT_EQ(f.g_single, 0);
@@ -64,7 +67,7 @@ void test_isolation_history_ops_repeatable_read_is_acyclic(void)
     hist_record(TDB_ISOLATION_REPEATABLE_READ, &g_ops_mix);
     const hist_found_t f = hist_check();
     hist_report("repeatable read", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.cycles, 0);
 }
@@ -75,7 +78,7 @@ void test_isolation_history_ops_serializable_is_acyclic(void)
     hist_record(TDB_ISOLATION_SERIALIZABLE, &g_ops_mix);
     const hist_found_t f = hist_check();
     hist_report("serializable", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.cycles, 0);
 }
@@ -143,7 +146,8 @@ void test_isolation_history_ops_serializable_across_a_restart_with_prepares_in_d
     tidesdb_t *db = NULL;
     tidesdb_column_family_t *cf = NULL;
     hist_open(1, &db, &cf);
-    hist_run(db, cf, iso, &g_ops_mix, HIST_COMMIT_TARGET / HIST_RECOVERY_PHASES, 0);
+    hist_run(db, cf, iso, &g_ops_mix, HIST_COMMIT_TARGET / HIST_RECOVERY_PHASES,
+             HIST_RECOVERY_FIRST_SLOTS, 0);
     hist_leave_prepares_in_doubt(db, cf, iso);
     const int left = hist_count_in_doubt();
     ASSERT_TRUE(left > 0);
@@ -153,7 +157,7 @@ void test_isolation_history_ops_serializable_across_a_restart_with_prepares_in_d
     uint64_t rng = HIST_RECOVERY_SEED;
     hist_resolve_in_doubt(db, &rng);
     ASSERT_EQ(hist_count_in_doubt(), 0);
-    hist_run(db, cf, iso, &g_ops_mix, HIST_COMMIT_TARGET, 0);
+    hist_run(db, cf, iso, &g_ops_mix, HIST_COMMIT_TARGET, HIST_ATTEMPT_MAX, 0);
     hist_read_final(db, cf);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(HIST_DB_DIR);
@@ -161,7 +165,7 @@ void test_isolation_history_ops_serializable_across_a_restart_with_prepares_in_d
     const hist_found_t f = hist_check();
     printf("  %d prepares left in doubt across the restart\n", left);
     hist_report("serializable across a restart", &f);
-    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_TARGET);
+    ASSERT_TRUE(atomic_load(&g_hist.committed) >= HIST_COMMIT_FLOOR);
     ASSERT_EQ(f.g1a + f.g1b + f.lost + f.incompatible, 0);
     ASSERT_EQ(f.cycles, 0);
 }

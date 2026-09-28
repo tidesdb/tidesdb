@@ -305,9 +305,9 @@ granularity ladder would also reach.
 
 **Durable read claims across a restart.** None of the surveyed systems carries a prepared
 transaction's read set through a crash; the ones that keep SIREAD locks keep them in memory.
-TidesDB records the keys as their own log record ahead of the PREPARE, since a two-phase
-participant that recovers with its writes held but its reads unprotected would let a concurrent
-writer invalidate a vote it already cast.
+TidesDB records the keys and the scanned intervals as their own log record ahead of the PREPARE,
+since a two-phase participant that recovers with its writes held but its reads unprotected would
+let a concurrent writer invalidate a vote it already cast.
 
 ## What is novel here
 

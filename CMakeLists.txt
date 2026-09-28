@@ -192,7 +192,7 @@ set(TIDESDB_SOURCES
     src/sstable/vlog.c src/sstable/vlog_reclaim.c src/sstable/vlog_segment.c src/sstable/sstable.c
     src/sstable/sstable_footer.c
     src/sstable/sstable_read.c src/sstable/sstable_builder.c
-    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/wal_record.c src/txn/source.c src/txn/key_index.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
+    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/mvcc_orphan.c src/txn/wal_record.c src/txn/source.c src/txn/key_index.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
     external/xxhash.c)
 
 # vendored sources are compiled as-is; their diagnostics belong upstream, and letting them into this
@@ -722,6 +722,7 @@ if(TIDESDB_BUILD_TESTS)
         txn_api_tests
         iter_api_tests
         isolation_history_tests
+        isolation_history_ops_tests
     )
 
     # the crash-recovery tests start a child from this same binary rather than forking, so they

@@ -68,10 +68,29 @@ typedef struct tidesdb_mvcc_claim tidesdb_mvcc_claim_t;
 typedef struct tidesdb_mvcc_commit tidesdb_mvcc_commit_t;
 
 /**
+ * tidesdb_mvcc_range_t
+ * an interval a prepare scanned, held against every writer inside it until the prepare is decided
+ * @param cf_index the family the interval belongs to
+ * @param lo the inclusive lower bound, borrowed
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound, borrowed, or NULL with hi_size 0 for open above
+ * @param hi_size length of hi
+ */
+typedef struct
+{
+    uint32_t cf_index;
+    const uint8_t *lo;
+    size_t lo_size;
+    const uint8_t *hi;
+    size_t hi_size;
+} tidesdb_mvcc_range_t;
+
+/**
  * tidesdb_mvcc_commit
  * one commit's claims and the sequence they are ordered by, in flight from the claim to the release
- * @param seq 0 until the draw, TDB_MVCC_SEQ_DRAWING during it, the drawn sequence after, and
- *            TDB_MVCC_SEQ_FUTURE once the batch is prepared
+ * @param seq 0 until the draw, TDB_MVCC_SEQ_DRAWING during it, the drawn sequence after,
+ *            TDB_MVCC_SEQ_FUTURE once the batch is prepared, and the sequence its phase two draws
+ *            once that draw is announced
  * @param claims the claims, an array the owner keeps in place until tidesdb_mvcc_unclaim returns;
  *               sorted by family and key by the claim call
  * @param n_claims how many
@@ -79,6 +98,10 @@ typedef struct tidesdb_mvcc_commit tidesdb_mvcc_commit_t;
  *                      interval is checked against
  * @param held non-zero while the commit is in flight -- from the claim call to the release --
  *             whether or not it holds any key, since it may hold intervals alone
+ * @param scans the intervals a prepare scanned, borrowed and kept in place until the release, or
+ *              NULL; a writer inside one is refused for as long as the commit is in flight, since
+ *              the prepare's position is not decided until its phase two
+ * @param n_scans how many
  */
 struct tidesdb_mvcc_commit
 {
@@ -87,6 +110,8 @@ struct tidesdb_mvcc_commit
     int n_claims;
     tidesdb_mvcc_commit_t *next_inflight;
     int held;
+    const tidesdb_mvcc_range_t *scans;
+    int n_scans;
 };
 
 /**
@@ -207,6 +232,17 @@ void tidesdb_mvcc_commit_init(tidesdb_mvcc_commit_t *commit, tidesdb_mvcc_claim_
                               int n_claims);
 
 /**
+ * tidesdb_mvcc_commit_scans
+ * attach the intervals a prepare scanned to its record, before the claim call makes the record
+ * visible, so that no writer finds the prepare in flight without them
+ * @param commit the record
+ * @param scans the intervals, borrowed and kept in place until tidesdb_mvcc_unclaim returns
+ * @param n_scans how many
+ */
+void tidesdb_mvcc_commit_scans(tidesdb_mvcc_commit_t *commit, const tidesdb_mvcc_range_t *scans,
+                               int n_scans);
+
+/**
  * tidesdb_mvcc_claim_init
  * fill one claim; the key bytes are borrowed and must outlive the claim
  * @param claim the claim to fill
@@ -278,7 +314,8 @@ uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit);
  * mark a commit's claims and intervals as belonging to a prepared batch, whose commit will come at
  * a sequence above everything current. a reader of one of its keys is serialized before it and its
  * read stands; a writer of one still meets its write claims, and a writer of a key it read meets
- * its read claims
+ * its read claims. phase two draws through the same record, which places the batch at the sequence
+ * drawn, and a phase two that fails marks it prepared again
  * @param commit the record of the prepared batch
  */
 void tidesdb_mvcc_commit_prepared(tidesdb_mvcc_commit_t *commit);
@@ -323,11 +360,31 @@ int tidesdb_mvcc_range_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *com
                              const uint8_t *hi, size_t hi_size, int writing);
 
 /**
+ * tidesdb_mvcc_range_read_held
+ * whether an interval this commit deletes meets what a prepare in flight read -- a key it read or
+ * an interval it scanned. a prepared reader cannot be the one to yield, so this refuses the delete
+ * at every level that validates and whatever the two sequences, as a read claim refuses a point
+ * write
+ * @param m the clock
+ * @param commit this commit
+ * @param cf_index the family the interval belongs to
+ * @param lo the inclusive lower bound
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound, or NULL with hi_size 0 for open above
+ * @param hi_size length of hi
+ * @return 1 when a prepare's reads meet the interval, 0 otherwise
+ */
+int tidesdb_mvcc_range_read_held(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
+                                 uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                                 const uint8_t *hi, size_t hi_size);
+
+/**
  * tidesdb_mvcc_write_blocked
- * whether a key this commit writes is held against it -- by another owner's read claim on it, a
- * prepared batch that read it and cannot yield, at any level; or, when this commit promises
- * first-committer-wins, by an interval another commit in flight holds over it under a sequence
- * lower than this commit's. asked after this commit's draw, for each key of its write set
+ * whether a key this commit writes is held against it -- by another owner's read claim on it or an
+ * interval another owner scanned around it, a prepared batch that read it and cannot yield, at any
+ * level that validates; or, when this commit promises first-committer-wins, by an interval another
+ * commit in flight holds over it under a sequence lower than this commit's. asked after this
+ * commit's draw, for each key of its write set
  * @param m the clock
  * @param commit this commit, with its sequence drawn
  * @param cf_index the family the key belongs to

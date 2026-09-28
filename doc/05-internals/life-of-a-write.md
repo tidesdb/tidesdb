@@ -83,7 +83,8 @@ What a claim meets decides it:
   commit's validation in stage 5.
 - A **read claim** — which a prepare at repeatable read or above takes on every key it read —
   refuses every later writer of that key at repeatable read or above for as long as the prepare is
-  undecided.
+  undecided. The intervals the prepare's scans covered are held the same way, on its record in the
+  list of commits in flight, against a writer inside any of them.
 - An **interval** a [range delete](/reference/transaction#tidesdb_txn_delete_range) writes has no
   key to claim, so it is held in a second, small table, entered first and then, under
   first-committer-wins, checked against every claim in flight. A point write inside it is refused

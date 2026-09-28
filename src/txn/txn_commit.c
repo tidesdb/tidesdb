@@ -214,6 +214,8 @@ void txn_release_claims(tdb_txn_t *txn)
     tidesdb_mvcc_unclaim(txn->clock, &txn->commit);
     free(txn->claims);
     txn->claims = NULL;
+    free(txn->scans);
+    txn->scans = NULL;
 }
 
 /* ask the sources whether a version of a key exists above seq_floor and at or below seq_ceiling,
@@ -366,7 +368,12 @@ static int txn_validate_writes(tdb_txn_t *txn, const tidesdb_source_t *sources, 
         /* the claims before the store in both branches, for the reason txn_validate_reads gives */
         if (op.flags & TDB_WAL_ENTRY_RANGE_DELETE)
         {
-            if (first_committer_wins &&
+            /* a prepare's reads refuse the interval at every level that validates, as they refuse a
+             * point write */
+            if (tidesdb_mvcc_range_read_held(txn->clock, &txn->commit, op.cf_index, op.key,
+                                             op.key_size, op.value, op.value_size))
+                newer = 1;
+            if (!newer && first_committer_wins &&
                 tidesdb_mvcc_range_stale(txn->clock, &txn->commit, op.cf_index, op.key, op.key_size,
                                          op.value, op.value_size, 1))
                 newer = 1;
@@ -442,10 +449,38 @@ static int txn_claim_intervals(tdb_txn_t *txn, const tidesdb_wal_entry_t *entrie
 }
 
 /**
+ * txn_prepare_scans
+ * attach the intervals a prepare scanned to its record before the claim, borrowing the read set's
+ * bounds, which outlive the record
+ * @param txn the preparing transaction
+ * @return TDB_SUCCESS or TDB_ERR_MEMORY
+ */
+static int txn_prepare_scans(tdb_txn_t *txn)
+{
+    const int n = tidesdb_readset_range_count(txn->readset);
+    if (n == 0) return TDB_SUCCESS;
+    txn->scans = malloc((size_t)n * sizeof(*txn->scans));
+    if (!txn->scans) return TDB_ERR_MEMORY;
+    int count = 0;
+    for (int i = 0; i < n; i++)
+    {
+        tidesdb_readset_range_t sc;
+        if (!tidesdb_readset_range_at(txn->readset, i, &sc)) continue;
+        txn->scans[count++] = (tidesdb_mvcc_range_t){.cf_index = sc.cf_index,
+                                                     .lo = sc.lo,
+                                                     .lo_size = sc.lo_size,
+                                                     .hi = sc.hi,
+                                                     .hi_size = sc.hi_size};
+    }
+    tidesdb_mvcc_commit_scans(&txn->commit, txn->scans, count);
+    return TDB_SUCCESS;
+}
+
+/**
  * txn_claim_writes
  * claim every key this commit writes and, for a prepare at repeatable read or above, every key it
- * read, then hold every interval it deletes, all before the sequence is drawn. the claims borrow
- * the entries' and the read set's key bytes, both of which outlive them
+ * read and every interval it scanned, then hold every interval it deletes, all before the sequence
+ * is drawn. the claims borrow the entries' and the read set's key bytes, both of which outlive them
  * @param txn the committing transaction
  * @param entries the encoded write set
  * @param count the number of entries
@@ -457,7 +492,8 @@ static int txn_claim_intervals(tdb_txn_t *txn, const tidesdb_wal_entry_t *entrie
 static int txn_claim_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, int count,
                             int prepare)
 {
-    const int reads = prepare && txn_validates_reads(txn) ? tidesdb_readset_count(txn->readset) : 0;
+    const int reads_validated = prepare && txn_validates_reads(txn);
+    const int reads = reads_validated ? tidesdb_readset_count(txn->readset) : 0;
     const int cap = count + reads;
     tidesdb_mvcc_claim_t *claims = cap > 0 ? malloc((size_t)cap * sizeof(*claims)) : NULL;
     if (cap > 0 && !claims) return TDB_ERR_MEMORY;
@@ -482,6 +518,12 @@ static int txn_claim_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries, 
 
     tidesdb_mvcc_commit_init(&txn->commit, claims, n);
     txn->claims = claims;
+    if (reads_validated && txn_prepare_scans(txn) != TDB_SUCCESS)
+    {
+        txn_release_claims(txn);
+        tidesdb_mvcc_commit_init(&txn->commit, NULL, 0);
+        return TDB_ERR_MEMORY;
+    }
     if (tidesdb_mvcc_claim(txn->clock, &txn->commit, txn->isolation >= TDB_ISOLATION_SNAPSHOT) &&
         txn_claim_intervals(txn, entries, count) == TDB_SUCCESS)
         return TDB_SUCCESS;
@@ -594,8 +636,9 @@ static int txn_append_batch(const tdb_txn_backend_t *backend, uint8_t kind, cons
 
 /**
  * txn_append_reads
- * make the keys a prepare read durable ahead of its PREPARE record, as a record of their own under
- * the same xid, so a batch adopted in doubt after a restart holds its read claims again. written
+ * make the keys a prepare read and the intervals it scanned durable ahead of its PREPARE record, as
+ * a record of their own under the same xid, so a batch adopted in doubt after a restart holds its
+ * read claims and its scans again. written
  * first, so a durable PREPARE always has its reads; a record no PREPARE followed is dropped by
  * recovery
  * @param backend the commit backend
@@ -609,8 +652,9 @@ static int txn_append_reads(const tdb_txn_backend_t *backend, const tdb_txn_t *t
                             const uint8_t *xid, size_t xid_size, uint64_t seq)
 {
     const int n = tidesdb_readset_count(txn->readset);
-    if (n == 0) return TDB_SUCCESS;
-    tidesdb_wal_entry_t *keys = calloc((size_t)n, sizeof(*keys));
+    const int ranges = tidesdb_readset_range_count(txn->readset);
+    if (n + ranges == 0) return TDB_SUCCESS;
+    tidesdb_wal_entry_t *keys = calloc((size_t)(n + ranges), sizeof(*keys));
     if (!keys) return TDB_ERR_MEMORY;
     int count = 0;
     for (int i = 0; i < n; i++)
@@ -622,6 +666,22 @@ static int txn_append_reads(const tdb_txn_backend_t *backend, const tdb_txn_t *t
         keys[count].ttl = -1;
         keys[count].key = rd.key;
         keys[count].key_size = rd.key_size;
+        count++;
+    }
+    /* a scanned interval is shaped as an interval delete is, lower bound as the key and upper as
+     * the value, and flagged the same way, which is what recovery tells the two kinds apart by */
+    for (int i = 0; i < ranges; i++)
+    {
+        tidesdb_readset_range_t sc;
+        if (!tidesdb_readset_range_at(txn->readset, i, &sc)) continue;
+        keys[count].cf_index = sc.cf_index;
+        keys[count].seq = seq;
+        keys[count].ttl = -1;
+        keys[count].flags = TDB_WAL_ENTRY_TOMBSTONE | TDB_WAL_ENTRY_RANGE_DELETE;
+        keys[count].key = sc.lo;
+        keys[count].key_size = sc.lo_size;
+        keys[count].value = sc.hi;
+        keys[count].value_size = sc.hi_size;
         count++;
     }
     const int rc =

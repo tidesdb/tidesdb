@@ -347,6 +347,44 @@ static int l0_mt_range_has_newer(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt,
     return TDB_SUCCESS;
 }
 
+/**
+ * l0_mt_tombstones_newer
+ * whether a range delete in one memtable overlaps a prefixed interval with a sequence in the
+ * window, stepping over an abandoned commit's as the point walk does. a range delete writes no key
+ * inside the interval, so the point walk alone never sees one
+ * @param l0 the subsystem, for the abandoned-commit set
+ * @param mt the memtable
+ * @param plo inclusive prefixed lower bound
+ * @param plo_size length of plo
+ * @param phi exclusive prefixed upper bound, NULL for unbounded above
+ * @param phi_size length of phi
+ * @param seq_floor the sequence a tombstone must exceed
+ * @param seq_ceiling the sequence a tombstone must not exceed to count at all
+ * @return 1 when one is found, 0 otherwise
+ */
+static int l0_mt_tombstones_newer(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt,
+                                  const uint8_t *plo, const size_t plo_size, const uint8_t *phi,
+                                  const size_t phi_size, const uint64_t seq_floor,
+                                  const uint64_t seq_ceiling)
+{
+    if (!tidesdb_memtable_has_range_tombstones(mt)) return 0;
+    int found = 0;
+    tdb_wprwlock_rdlock(&mt->range_tombstone_lock);
+    const size_t n = range_tombstone_set_count(mt->range_tombstones);
+    for (size_t i = 0; i < n && !found; i++)
+    {
+        const rt_fragment_t *frag = NULL;
+        if (range_tombstone_set_fragment_at(mt->range_tombstones, i, &frag) != TDB_SUCCESS ||
+            !range_tombstone_fragment_overlaps(frag, plo, plo_size, phi, phi_size))
+            continue;
+        for (size_t s = 0; s < frag->seq_count && !found; s++)
+            found = frag->seqs[s] > seq_floor && frag->seqs[s] <= seq_ceiling &&
+                    !tidesdb_l0_seq_aborted(l0, frag->seqs[s]);
+    }
+    tdb_wprwlock_unlock(&mt->range_tombstone_lock);
+    return found;
+}
+
 int tidesdb_l0_range_has_newer(tidesdb_l0_t *l0, const uint32_t cf_index, const uint8_t *lo,
                                const size_t lo_size, const uint8_t *hi, const size_t hi_size,
                                const uint64_t seq_floor, const uint64_t seq_ceiling, int *newer)
@@ -390,8 +428,13 @@ int tidesdb_l0_range_has_newer(tidesdb_l0_t *l0, const uint32_t cf_index, const 
     {
         rc = TDB_SUCCESS;
         for (int i = 0; i < n && rc == TDB_SUCCESS && !*newer; i++)
+        {
             rc = l0_mt_range_has_newer(l0, mts[i], plo, plo_size, phi, phi_size, seq_floor,
                                        seq_ceiling, newer);
+            if (rc == TDB_SUCCESS && !*newer)
+                *newer = l0_mt_tombstones_newer(l0, mts[i], plo, plo_size, phi, phi_size, seq_floor,
+                                                seq_ceiling);
+        }
         tidesdb_l0_unpin_memtables(mts, n);
     }
 

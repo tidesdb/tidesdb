@@ -142,6 +142,7 @@ void tdb_txn_free(tdb_txn_t *txn)
     }
     else if (tidesdb_mvcc_holds(&txn->commit))
         txn_release_claims(txn);
+    free(txn->scans); /* the orphan copied them, and a release has already set this NULL */
 
     free(txn->prepared_entries); /* an abandoned in-doubt txn still owns these */
     free(txn->xid);

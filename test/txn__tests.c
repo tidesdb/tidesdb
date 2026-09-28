@@ -452,9 +452,14 @@ typedef struct
                                     * source holding its key, at the entry's sequence */
     int n_applied;
     tidesdb_mvcc_t
-        *peer_clock; /* when set, the apply begins a snapshot transaction on this clock */
-    tdb_txn_t *peer; /* the transaction the apply began, for the test to read through */
+        *peer_clock;  /* when set, the apply begins a snapshot transaction on this clock */
+    tdb_txn_t *peer;  /* the transaction the apply began, for the test to read through */
+    tdb_txn_t *racer; /* prepared from inside the next COMMIT record's append, when set */
+    const tidesdb_source_t *racer_src; /* the source the racer validates against */
+    int racer_rc;                      /* what the racer's prepare returned */
 } mockbe;
+
+static tdb_txn_backend_t mkbackend(mockbe *m);
 
 static int mb_bp(void *ctx, uint32_t cf_index)
 {
@@ -469,6 +474,18 @@ static int mb_wal(void *ctx, const uint8_t *batch, size_t size)
     mockbe *m = (mockbe *)ctx;
     m->wal_calls++;
     if (size >= 2) m->last_wal_kind = batch[1]; /* version byte then the record kind */
+    /* a phase two has drawn its sequence and not yet applied, so a committer validating now finds
+     * the batch in the claims and nowhere in the store */
+    if (m->racer && m->last_wal_kind == TDB_WAL_KIND_COMMIT)
+    {
+        tdb_txn_t *racer = m->racer;
+        m->racer = NULL;
+        mockbe racer_m = {0};
+        tdb_txn_backend_t racer_be = mkbackend(&racer_m);
+        const uint8_t xid[] = {'r'};
+        m->racer_rc = tdb_txn_prepare(racer, &racer_be, m->racer_src, 1, xid, sizeof(xid));
+        if (m->racer_rc == TDB_SUCCESS) (void)tdb_txn_rollback_prepared(racer, &racer_be);
+    }
     return m->fail_wal ? -1 : 0;
 }
 static int mb_apply(void *ctx, const tidesdb_wal_entry_t *entries, int count)
@@ -1183,6 +1200,168 @@ void test_txn_snapshot_commits_over_a_phantom(void)
     ASSERT_EQ(run_phantom(TDB_ISOLATION_SNAPSHOT), TDB_SUCCESS);
 }
 
+/* a prepare holds the interval it scanned until it is decided, at repeatable read as at
+ * serializable. a writer inserting inside it would commit below the batch's phase two, where the
+ * scan should have found the insert, so a writer at any level that validates is refused, a writer
+ * outside it is not, and the decision lets the refused one through */
+void test_txn_prepared_scan_refuses_an_insert_inside_it(void)
+{
+    const int levels[] = {TDB_ISOLATION_REPEATABLE_READ, TDB_ISOLATION_SERIALIZABLE};
+    for (size_t l = 0; l < sizeof(levels) / sizeof(levels[0]); l++)
+    {
+        tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+        tsrc empty = {0, 0, "q", 0, NULL};
+        tidesdb_source_t src = tsource(&empty);
+        mockbe m = {0};
+        tdb_txn_backend_t be = mkbackend(&m);
+        tdb_txn_t *p = tdb_txn_begin(clock, levels[l], NULL, 0, NULL);
+        ASSERT_EQ(tdb_txn_record_scan(p, 0, (const uint8_t *)"a", 1, (const uint8_t *)"m", 1),
+                  TDB_SUCCESS);
+        put(p, 0, "z", "p");
+        const uint8_t xid[] = {'s'};
+        ASSERT_EQ(tdb_txn_prepare(p, &be, &src, 1, xid, sizeof(xid)), TDB_SUCCESS);
+
+        for (int wl = 0; wl < 2; wl++)
+        {
+            tdb_txn_t *w = tdb_txn_begin(
+                clock, wl == 0 ? TDB_ISOLATION_REPEATABLE_READ : TDB_ISOLATION_SNAPSHOT, NULL, 0,
+                NULL);
+            put(w, 0, "k", "w");
+            ASSERT_EQ(tdb_txn_commit(w, &be, &src, 1), TDB_ERR_CONFLICT);
+            tdb_txn_free(w);
+        }
+
+        tdb_txn_t *outside = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+        put(outside, 0, "n", "w");
+        ASSERT_EQ(tdb_txn_commit(outside, &be, &src, 1), TDB_SUCCESS);
+        tdb_txn_free(outside);
+
+        ASSERT_EQ(tdb_txn_commit_prepared(p, &be), TDB_SUCCESS);
+        tdb_txn_free(p);
+        tdb_txn_t *after = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+        put(after, 0, "k", "w");
+        ASSERT_EQ(tdb_txn_commit(after, &be, &src, 1), TDB_SUCCESS);
+        tdb_txn_free(after);
+        tidesdb_mvcc_destroy(clock);
+    }
+}
+
+/* a range delete over a key a prepare read is refused until the prepare is decided, at repeatable
+ * read too, where the delete holds its interval without first-committer-wins and would otherwise
+ * ask nothing of the prepare */
+void test_txn_prepared_read_refuses_a_range_delete_over_it(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    advance_clock(clock, 2);
+    tsrc k = {0, 1, "k", 2, "old"};
+    tidesdb_source_t src = tsource(&k);
+    mockbe m = {0};
+    tdb_txn_backend_t be = mkbackend(&m);
+
+    tdb_txn_t *p = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
+    ASSERT_TRUE(get_is(p, 0, "k", &src, 1, "old"));
+    put(p, 0, "z", "p");
+    const uint8_t xid[] = {'d'};
+    ASSERT_EQ(tdb_txn_prepare(p, &be, &src, 1, xid, sizeof(xid)), TDB_SUCCESS);
+
+    tdb_txn_t *d = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_delete_range(d, 0, (const uint8_t *)"a", 1, (const uint8_t *)"m", 1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(d, &be, &src, 1), TDB_ERR_CONFLICT);
+    tdb_txn_free(d);
+
+    ASSERT_EQ(tdb_txn_commit_prepared(p, &be), TDB_SUCCESS);
+    tdb_txn_free(p);
+    d = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_delete_range(d, 0, (const uint8_t *)"a", 1, (const uint8_t *)"m", 1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(d, &be, &src, 1), TDB_SUCCESS);
+    tdb_txn_free(d);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* a batch adopted in doubt after a restart holds the intervals it scanned, from the entries
+ * recovery staged beside its writes, flagged and bounded as an interval delete is */
+void test_txn_adopted_prepare_holds_its_scans(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    mockbe m = {0};
+    tdb_txn_backend_t be = mkbackend(&m);
+    const uint8_t xid[] = {4, 3};
+    const uint64_t prepared_at = 7;
+    tidesdb_mvcc_reseed(clock, prepared_at);
+    const tidesdb_wal_entry_t wrote = {.cf_index = 0,
+                                       .seq = prepared_at,
+                                       .ttl = -1,
+                                       .key = (const uint8_t *)"z",
+                                       .key_size = 1,
+                                       .value = (const uint8_t *)"p",
+                                       .value_size = 1};
+    const tidesdb_wal_entry_t scanned = {
+        .cf_index = 0,
+        .seq = prepared_at,
+        .ttl = -1,
+        .flags = TDB_WAL_ENTRY_TOMBSTONE | TDB_WAL_ENTRY_RANGE_DELETE,
+        .key = (const uint8_t *)"a",
+        .key_size = 1,
+        .value = (const uint8_t *)"m",
+        .value_size = 1};
+    tdb_txn_t *p =
+        tdb_txn_adopt_prepared(clock, xid, sizeof(xid), &wrote, 1, prepared_at, &scanned, 1);
+    ASSERT_TRUE(p != NULL);
+
+    tdb_txn_t *w = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(w, 0, "k", "w");
+    ASSERT_EQ(tdb_txn_commit(w, &be, NULL, 0), TDB_ERR_CONFLICT);
+    tdb_txn_free(w);
+    tdb_txn_t *outside = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(outside, 0, "n", "w");
+    ASSERT_EQ(tdb_txn_commit(outside, &be, NULL, 0), TDB_SUCCESS);
+    tdb_txn_free(outside);
+
+    ASSERT_EQ(tdb_txn_rollback_prepared(p, &be), TDB_SUCCESS);
+    tdb_txn_free(p);
+    w = tdb_txn_begin(clock, TDB_ISOLATION_SNAPSHOT, NULL, 0, NULL);
+    put(w, 0, "k", "w");
+    ASSERT_EQ(tdb_txn_commit(w, &be, NULL, 0), TDB_SUCCESS);
+    tdb_txn_free(w);
+    tidesdb_mvcc_destroy(clock);
+}
+
+/* phase two places a prepared batch at the sequence it draws, so a commit drawn after it that read
+ * a key the batch writes is stale, although the batch is not yet in the store. the prepare's record
+ * has to carry that sequence from the draw on; left reading as prepared, the batch looks above
+ * every committer and the read is validated against a store that does not hold the batch yet */
+void test_txn_2pc_decided_batch_orders_a_later_draw_after_it(void)
+{
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    advance_clock(clock, 2);
+    tsrc k = {0, 1, "k", 2, "old"};
+    tidesdb_source_t src = tsource(&k);
+    mockbe m = {0};
+    m.applied[0] = &k;
+    m.n_applied = 1;
+    tdb_txn_backend_t be = mkbackend(&m);
+
+    tdb_txn_t *p = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
+    ASSERT_TRUE(get_is(p, 0, "k", &src, 1, "old"));
+    put(p, 0, "k", "p");
+    const uint8_t xid[] = {'p'};
+    ASSERT_EQ(tdb_txn_prepare(p, &be, &src, 1, xid, sizeof(xid)), TDB_SUCCESS);
+
+    tdb_txn_t *r = tdb_txn_begin(clock, TDB_ISOLATION_REPEATABLE_READ, NULL, 0, NULL);
+    ASSERT_TRUE(get_is(r, 0, "k", &src, 1, "old"));
+    put(r, 0, "y", "r");
+    m.racer = r;
+    m.racer_src = &src;
+    ASSERT_EQ(tdb_txn_commit_prepared(p, &be), TDB_SUCCESS);
+    ASSERT_EQ(m.racer_rc, TDB_ERR_CONFLICT);
+
+    tdb_txn_free(r);
+    tdb_txn_free(p);
+    tidesdb_mvcc_destroy(clock);
+}
+
 /* a batch adopted in doubt after a restart holds what it read as well as what it wrote, from the
  * read keys recovery staged beside its entries: a writer of a read key is refused until the
  * coordinator decides, a writer of an unrelated key is not, and the decision lets the refused one
@@ -1457,6 +1636,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_2pc_readonly, tests_passed);
     RUN_TEST(test_txn_2pc_prepared_is_frozen, tests_passed);
     RUN_TEST(test_txn_2pc_conflict, tests_passed);
+    RUN_TEST(test_txn_2pc_decided_batch_orders_a_later_draw_after_it, tests_passed);
+    RUN_TEST(test_txn_prepared_scan_refuses_an_insert_inside_it, tests_passed);
+    RUN_TEST(test_txn_adopted_prepare_holds_its_scans, tests_passed);
+    RUN_TEST(test_txn_prepared_read_refuses_a_range_delete_over_it, tests_passed);
     RUN_TEST(test_txn_adopted_prepare_holds_its_reads, tests_passed);
     RUN_TEST(test_txn_scan_footprint_refuses_a_phantom, tests_passed);
     RUN_TEST(test_txn_snapshot_commits_over_a_phantom, tests_passed);

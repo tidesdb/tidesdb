@@ -4021,6 +4021,70 @@ void test_engine_recovered_prepare_keeps_its_read_claims(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* commit one put at snapshot and return what the commit returned */
+static int engine_put_one(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
+{
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &w), TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_txn_put(w, cf, (const uint8_t *)key, strlen(key), (const uint8_t *)"w", 1, -1),
+        TDB_SUCCESS);
+    const int rc = tidesdb_txn_commit(w);
+    tidesdb_txn_free(w);
+    return rc;
+}
+
+/* what a prepare scanned is held across a restart too. the interval is durable beside the read
+ * keys, so a batch adopted in doubt after a reopen refuses an insert inside the range its scan
+ * found empty, lets a write outside it through, and releases it once the coordinator decides */
+void test_engine_recovered_prepare_keeps_its_scanned_range(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    const uint8_t xid[] = "xid-scan-across-restart";
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    /* the prepare scans [a, m), finds it empty, and writes y */
+    tidesdb_txn_t *p = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &p), TDB_SUCCESS);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new_range(p, cf, (const uint8_t *)"a", 1, (const uint8_t *)"m", 1, &it),
+              TDB_SUCCESS);
+    (void)tidesdb_iter_seek(it, (const uint8_t *)"a", 1);
+    ASSERT_TRUE(!tidesdb_iter_valid(it));
+    tidesdb_iter_free(it);
+    ASSERT_EQ(tidesdb_txn_put(p, cf, (const uint8_t *)"y", 1, (const uint8_t *)"p", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(p, xid, sizeof(xid) - 1), TDB_SUCCESS);
+    tidesdb_txn_free(p);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    tidesdb_prepared_txn_t found[1];
+    int count = -1;
+    ASSERT_EQ(tidesdb_recover_prepared(db, found, 1, &count), TDB_SUCCESS);
+    ASSERT_EQ(count, 1);
+
+    ASSERT_EQ(engine_put_one(db, cf, "k"), TDB_ERR_CONFLICT);
+    ASSERT_EQ(engine_put_one(db, cf, "n"), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_rollback_prepared(found[0].txn), TDB_SUCCESS);
+    tidesdb_txn_free(found[0].txn);
+    ASSERT_EQ(engine_put_one(db, cf, "k"), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 /**
  * engine_scan_then_insert
  * one transaction scans forward from a key, stopping at a key when one is given and running to the
@@ -6954,6 +7018,179 @@ void test_engine_create_cf_refuses_an_id_past_the_key_prefix(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+#define ENGINE_TEST_RT_LO       "r1"
+#define ENGINE_TEST_RT_HI       "r4"
+#define ENGINE_TEST_RT_ROWS_MAX 8
+
+static void engine_test_rt_fill(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    ryow_commit(db, cf, "r1", "a");
+    ryow_commit(db, cf, "r2", "b");
+    ryow_commit(db, cf, "r3", "c");
+}
+
+static int engine_test_rt_delete(tidesdb_txn_t *t, tidesdb_column_family_t *cf)
+{
+    return tidesdb_txn_delete_range(t, cf, (const uint8_t *)ENGINE_TEST_RT_LO,
+                                    strlen(ENGINE_TEST_RT_LO), (const uint8_t *)ENGINE_TEST_RT_HI,
+                                    strlen(ENGINE_TEST_RT_HI));
+}
+
+/* collect what a scan of the whole family returns into "k,k," form */
+static void engine_test_scan_keys(tidesdb_txn_t *t, tidesdb_column_family_t *cf, char *out,
+                                  const size_t cap)
+{
+    out[0] = '\0';
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(t, cf, &it), TDB_SUCCESS);
+    int rc = tidesdb_iter_seek_to_first(it);
+    for (int i = 0; i < ENGINE_TEST_RT_ROWS_MAX && rc == TDB_SUCCESS && tidesdb_iter_valid(it); i++)
+    {
+        uint8_t *k = NULL, *v = NULL;
+        size_t ks = 0, vs = 0;
+        ASSERT_EQ(tidesdb_iter_key_value(it, &k, &ks, &v, &vs), TDB_SUCCESS);
+        strncat(out, (const char *)k, ks < cap - strlen(out) - 2 ? ks : 0);
+        strncat(out, ",", cap - strlen(out) - 1);
+        free(k);
+        free(v);
+        rc = tidesdb_iter_next(it);
+    }
+    tidesdb_iter_free(it);
+}
+
+/* a transaction's scan hides the committed rows its own interval delete covers even when those rows
+ * committed at the very sequence its snapshot stands on, the last commit before it began, and shows
+ * a key it wrote under the interval afterwards */
+void test_engine_scan_honours_own_interval_delete_at_the_snapshot_sequence(void)
+{
+    for (int prefix = 0; prefix <= 1; prefix++)
+    {
+        (void)remove_directory(ENGINE_TEST_DB_DIR);
+        char db_path[] = ENGINE_TEST_DB_DIR;
+        tidesdb_config_t cfg = engine_test_config(db_path);
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+        tidesdb_txn_t *w = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &w), TDB_SUCCESS);
+        const char *rows[] = {"r1", "r2", "r3"};
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++)
+            ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)rows[i], strlen(rows[i]),
+                                      (const uint8_t *)"v", 1, -1),
+                      TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(w), TDB_SUCCESS);
+        tidesdb_txn_free(w);
+
+        tidesdb_txn_t *t = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t), TDB_SUCCESS);
+        if (prefix)
+            ASSERT_EQ(tidesdb_txn_delete_prefix(t, cf, (const uint8_t *)"r", 1), TDB_SUCCESS);
+        else
+            ASSERT_EQ(engine_test_rt_delete(t, cf), TDB_SUCCESS);
+        char seen[64];
+        engine_test_scan_keys(t, cf, seen, sizeof(seen));
+        ASSERT_EQ(strcmp(seen, ""), 0);
+        ASSERT_EQ(tidesdb_txn_put(t, cf, (const uint8_t *)"r2", 2, (const uint8_t *)"w", 1, -1),
+                  TDB_SUCCESS);
+        engine_test_scan_keys(t, cf, seen, sizeof(seen));
+        ASSERT_EQ(strcmp(seen, "r2,"), 0);
+        ASSERT_EQ(tidesdb_txn_rollback(t), TDB_SUCCESS);
+        tidesdb_txn_free(t);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a range delete whose interval an overlapping range delete wrote into after its snapshot is
+ * refused under first-committer-wins, with the committed tombstone in a memtable or flushed to a
+ * table, since both deleted the same versions and only one may */
+void test_engine_range_delete_conflicts_with_a_committed_overlapping_range_delete(void)
+{
+    const int levels[] = {TDB_ISOLATION_SNAPSHOT, TDB_ISOLATION_SERIALIZABLE};
+    for (size_t l = 0; l < sizeof(levels) / sizeof(levels[0]); l++)
+        for (int flushed = 0; flushed <= 1; flushed++)
+        {
+            (void)remove_directory(ENGINE_TEST_DB_DIR);
+            char db_path[] = ENGINE_TEST_DB_DIR;
+            tidesdb_config_t cfg = engine_test_config(db_path);
+            tidesdb_t *db = NULL;
+            ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+            tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+            ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+            engine_test_rt_fill(db, cf);
+
+            tidesdb_txn_t *older = NULL, *newer = NULL;
+            ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, levels[l], &older), TDB_SUCCESS);
+            ASSERT_EQ(engine_test_rt_delete(older, cf), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, levels[l], &newer), TDB_SUCCESS);
+            ASSERT_EQ(engine_test_rt_delete(newer, cf), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(newer), TDB_SUCCESS);
+            if (flushed) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(older), TDB_ERR_CONFLICT);
+            tidesdb_txn_free(older);
+            tidesdb_txn_free(newer);
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+        }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a serializable scan over rows a range delete removed after its snapshot is a read that no longer
+ * holds, so the scanning transaction is refused, with the tombstone in a memtable or a table */
+void test_engine_serializable_scan_conflicts_with_a_range_delete_under_it(void)
+{
+    for (int flushed = 0; flushed <= 1; flushed++)
+    {
+        (void)remove_directory(ENGINE_TEST_DB_DIR);
+        char db_path[] = ENGINE_TEST_DB_DIR;
+        tidesdb_config_t cfg = engine_test_config(db_path);
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+        engine_test_rt_fill(db, cf);
+
+        tidesdb_txn_t *scanner = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &scanner),
+                  TDB_SUCCESS);
+        tidesdb_iter_t *it = NULL;
+        ASSERT_EQ(tidesdb_iter_new_range(
+                      scanner, cf, (const uint8_t *)ENGINE_TEST_RT_LO, strlen(ENGINE_TEST_RT_LO),
+                      (const uint8_t *)ENGINE_TEST_RT_HI, strlen(ENGINE_TEST_RT_HI), &it),
+                  TDB_SUCCESS);
+        ASSERT_EQ(
+            tidesdb_iter_seek(it, (const uint8_t *)ENGINE_TEST_RT_LO, strlen(ENGINE_TEST_RT_LO)),
+            TDB_SUCCESS);
+        int rows = 0;
+        for (int i = 0; i < ENGINE_TEST_RT_ROWS_MAX && tidesdb_iter_valid(it); i++)
+        {
+            rows++;
+            if (tidesdb_iter_next(it) != TDB_SUCCESS) break;
+        }
+        tidesdb_iter_free(it);
+        ASSERT_TRUE(rows >= 1);
+
+        tidesdb_txn_t *deleter = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &deleter),
+                  TDB_SUCCESS);
+        ASSERT_EQ(engine_test_rt_delete(deleter, cf), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(deleter), TDB_SUCCESS);
+        tidesdb_txn_free(deleter);
+        if (flushed) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(scanner, cf, (const uint8_t *)"z", 1, (const uint8_t *)"z", 1, -1),
+            TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(scanner), TDB_ERR_CONFLICT);
+        tidesdb_txn_free(scanner);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 /* an iterator may be freed after the transaction it was opened under is freed or reset. the free
  * then records no footprint, releases no hold and touches nothing of the transaction, an iterator
  * left behind answers nothing but its free, and a transaction reset under one carries no footprint
@@ -7171,6 +7408,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_iterator_outlives_its_transaction, tests_passed);
     RUN_TEST(test_engine_rotation_never_installs_an_overtaken_spare, tests_passed);
     RUN_TEST(test_engine_prepare_pins_the_active_log_while_a_spare_waits, tests_passed);
+    RUN_TEST(test_engine_range_delete_conflicts_with_a_committed_overlapping_range_delete,
+             tests_passed);
+    RUN_TEST(test_engine_serializable_scan_conflicts_with_a_range_delete_under_it, tests_passed);
+    RUN_TEST(test_engine_scan_honours_own_interval_delete_at_the_snapshot_sequence, tests_passed);
     RUN_TEST(test_engine_cf_stats, tests_passed);
     RUN_TEST(test_engine_cf_estimate_cardinality, tests_passed);
     RUN_TEST(test_engine_cf_unflushed_keys, tests_passed);
@@ -7255,6 +7496,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_prepared_batch_holds_its_key_past_the_commit_ring, tests_passed);
     RUN_TEST(test_engine_prepared_read_refuses_a_writer_until_decided, tests_passed);
     RUN_TEST(test_engine_recovered_prepare_keeps_its_read_claims, tests_passed);
+    RUN_TEST(test_engine_recovered_prepare_keeps_its_scanned_range, tests_passed);
     RUN_TEST(test_engine_scan_footprint_refuses_a_phantom, tests_passed);
     RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);

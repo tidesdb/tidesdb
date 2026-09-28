@@ -440,6 +440,107 @@ void test_mvcc_range_stale_orders_by_sequence(void)
     tidesdb_mvcc_destroy(m);
 }
 
+/* a prepare's scanned intervals refuse every writer inside them while it is in flight, at any level
+ * and whatever the writer's sequence, as its read claims refuse a writer of a key it read; a writer
+ * outside them and every reader pass, a range delete meeting one is refused, and none of it
+ * outlasts the release */
+void test_mvcc_prepared_scans_refuse_writers_inside_them(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    const uint8_t *k = (const uint8_t *)"k", *z = (const uint8_t *)"z";
+    const tidesdb_mvcc_range_t scans[] = {
+        {.cf_index = CLAIM_CF,
+         .lo = (const uint8_t *)"b",
+         .lo_size = 1,
+         .hi = (const uint8_t *)"y",
+         .hi_size = 1},
+    };
+    tidesdb_mvcc_commit_t p, w;
+    tidesdb_mvcc_commit_init(&p, NULL, 0);
+    tidesdb_mvcc_commit_scans(&p, scans, 1);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &p, 0), 1);
+    tidesdb_mvcc_commit_prepared(&p);
+
+    tidesdb_mvcc_commit_init(&w, NULL, 0);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &w, 0), 1);
+    (void)tidesdb_mvcc_draw(m, &w);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, k, 1, claim_hash("k"), 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, k, 1, claim_hash("k"), 1), 1);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, z, 1, claim_hash("z"), 1), 0);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF + 1, k, 1, claim_hash("k"), 1), 0);
+    ASSERT_EQ(tidesdb_mvcc_read_stale(m, &w, CLAIM_CF, k, 1, claim_hash("k")), 0);
+    ASSERT_EQ(tidesdb_mvcc_range_read_held(m, &w, CLAIM_CF, (const uint8_t *)"a", 1, k, 1), 1);
+    ASSERT_EQ(tidesdb_mvcc_range_read_held(m, &w, CLAIM_CF, (const uint8_t *)"y", 1, z, 1), 0);
+    ASSERT_EQ(tidesdb_mvcc_range_read_held(m, &w, CLAIM_CF, (const uint8_t *)"a", 1, NULL, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_range_stale(m, &w, CLAIM_CF, (const uint8_t *)"a", 1, z, 1, 0), 0);
+
+    tidesdb_mvcc_unclaim(m, &p);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, k, 1, claim_hash("k"), 0), 0);
+    ASSERT_EQ(tidesdb_mvcc_range_read_held(m, &w, CLAIM_CF, (const uint8_t *)"a", 1, z, 1), 0);
+    tidesdb_mvcc_unclaim(m, &w);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* a range delete at every level is refused by a key a prepare read inside it, the interval
+ * counterpart of a read claim refusing a point write */
+void test_mvcc_prepared_read_claim_refuses_a_range_delete_over_it(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    tidesdb_mvcc_claim_t cp[1];
+    tidesdb_mvcc_commit_t p, d;
+    claim(&cp[0], "k", TDB_MVCC_CLAIM_READ);
+    tidesdb_mvcc_commit_init(&p, cp, 1);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &p, 0), 1);
+    tidesdb_mvcc_commit_prepared(&p);
+    tidesdb_mvcc_commit_init(&d, NULL, 0);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &d, 0), 1);
+    ASSERT_EQ(tidesdb_mvcc_range_read_held(m, &d, CLAIM_CF, (const uint8_t *)"a", 1,
+                                           (const uint8_t *)"z", 1),
+              1);
+    ASSERT_EQ(tidesdb_mvcc_range_read_held(m, &d, CLAIM_CF, (const uint8_t *)"l", 1,
+                                           (const uint8_t *)"z", 1),
+              0);
+    tidesdb_mvcc_unclaim(m, &p);
+    tidesdb_mvcc_unclaim(m, &d);
+    tidesdb_mvcc_destroy(m);
+}
+
+/* a prepare's scans are copied with its claims when its handle is freed undecided, so a writer
+ * inside one is still refused by the clock */
+void test_mvcc_orphaned_scans_keep_holding(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    uint8_t lo[] = {'b'}, hi[] = {'y'};
+    tidesdb_mvcc_range_t scans[] = {
+        {.cf_index = CLAIM_CF, .lo = lo, .lo_size = 1, .hi = hi, .hi_size = 1},
+    };
+    tidesdb_mvcc_commit_t *p = calloc(1, sizeof(*p));
+    ASSERT_TRUE(p != NULL);
+    tidesdb_mvcc_commit_init(p, NULL, 0);
+    tidesdb_mvcc_commit_scans(p, scans, 1);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, p, 0), 1);
+    tidesdb_mvcc_commit_prepared(p);
+    ASSERT_EQ(tidesdb_mvcc_orphan_claims(m, p), 1);
+    free(p);
+    lo[0] = 'x'; /* the owner's bounds are gone, and the clock's copy is what holds */
+    scans[0].lo_size = 0;
+
+    tidesdb_mvcc_commit_t w;
+    tidesdb_mvcc_commit_init(&w, NULL, 0);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &w, 0), 1);
+    ASSERT_EQ(
+        tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, (const uint8_t *)"k", 1, claim_hash("k"), 0),
+        1);
+    ASSERT_EQ(
+        tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, (const uint8_t *)"z", 1, claim_hash("z"), 0),
+        0);
+    tidesdb_mvcc_unclaim(m, &w);
+    tidesdb_mvcc_destroy(m);
+}
+
 /* a prepared batch's intervals outlive the handle that held them as its claims do: the clock owns
  * them in its place, and a writer inside one is still refused */
 void test_mvcc_orphaned_intervals_keep_holding(void)
@@ -799,6 +900,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_interval_claims_meet_point_claims_both_ways, tests_passed);
     RUN_TEST(test_mvcc_range_stale_orders_by_sequence, tests_passed);
     RUN_TEST(test_mvcc_orphaned_intervals_keep_holding, tests_passed);
+    RUN_TEST(test_mvcc_prepared_scans_refuse_writers_inside_them, tests_passed);
+    RUN_TEST(test_mvcc_prepared_read_claim_refuses_a_range_delete_over_it, tests_passed);
+    RUN_TEST(test_mvcc_orphaned_scans_keep_holding, tests_passed);
     RUN_TEST(test_mvcc_seq_concurrent_unique, tests_passed);
     RUN_TEST(test_mvcc_two_neighbours_publish_each_other, tests_passed);
     RUN_TEST(test_mvcc_claim_single_winner, tests_passed);

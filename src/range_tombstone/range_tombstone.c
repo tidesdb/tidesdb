@@ -428,6 +428,15 @@ size_t range_tombstone_set_bytes(const range_tombstone_set_t *set)
     return total;
 }
 
+int range_tombstone_fragment_overlaps(const rt_fragment_t *frag, const uint8_t *lo,
+                                      const size_t lo_size, const uint8_t *hi, const size_t hi_size)
+{
+    if (!frag || !lo) return 0;
+    if (hi && tdb_key_cmp(frag->lo, frag->lo_size, hi, hi_size) >= 0) return 0;
+    if (frag->hi && tdb_key_cmp(lo, lo_size, frag->hi, frag->hi_size) >= 0) return 0;
+    return 1;
+}
+
 int range_tombstone_set_fragment_at(const range_tombstone_set_t *set, const size_t i,
                                     const rt_fragment_t **out)
 {

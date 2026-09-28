@@ -524,16 +524,19 @@ static void wss_get(void *ctx, const uint8_t **key, size_t *key_size, uint64_t *
     *deleted = s->deleted;
 }
 
-/* an interval the transaction itself has buffered covers the key, at the overlay's own sequence --
- * so it deletes every committed version below and yields to a write of the key the transaction
- * buffered after it, which the resolve above already reports live at that same sequence */
+/* an interval the transaction buffered after its own newest write of the key covers it, one above
+ * the overlay's own sequence. every committed version a scan can see sits at or below the snapshot,
+ * which is the overlay's sequence, and the merge lets an interval delete only a strictly older
+ * version, so a row committed at the snapshot itself would otherwise survive the delete. a key the
+ * transaction wrote after its interval is not covered and stays live */
 static int writeset_source_covers(void *ctx, const uint8_t *key, size_t key_size, uint64_t snapshot,
                                   uint64_t *out_seq)
 {
     (void)snapshot;
     writeset_merge_source_t *s = (writeset_merge_source_t *)ctx;
-    if (tidesdb_writeset_covering(s->ws, s->cf_index, key, key_size, -1) < 0) return 0;
-    *out_seq = s->seq;
+    const int own = tidesdb_writeset_newest(s->ws, s->cf_index, key, key_size);
+    if (tidesdb_writeset_covering(s->ws, s->cf_index, key, key_size, own) < 0) return 0;
+    *out_seq = s->seq == UINT64_MAX ? UINT64_MAX : s->seq + 1;
     return 1;
 }
 

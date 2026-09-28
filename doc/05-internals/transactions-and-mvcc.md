@@ -189,6 +189,11 @@ What a claim meets when it joins its chain decides it:
 - A **read claim** — taken by a prepare at repeatable read or above on every key it read — is never
   refused, and refuses every later write claim on its key for as long as its owner is undecided. Why
   a prepare needs one is in [Two-phase commit](#two-phase-commit).
+- A **scanned interval** is the read claim of a scan. A prepare at repeatable read or above attaches
+  every interval its scans covered to its record in the list of commits in flight, and a writer
+  inside one — a point write or a range delete meeting it — is refused for as long as the prepare is
+  undecided. The intervals live on the record rather than in the table of held intervals, so a
+  prepare with many scans takes no slot a range delete needs.
 
 A claim carries its owner's sequence once drawn; until then it reads as *drawing*, and a validator
 that meets one spins for the store, which is a few instructions away. It is a few instructions
@@ -248,6 +253,14 @@ write claim at that level is; what it is for is being met by the writers at snap
 by the readers validating under it. After the draw a range delete under first-committer-wins
 validates like a write: the store for a version inside the interval above its snapshot, and the
 commits in flight for a write claim inside it sequenced below it.
+
+A version inside an interval is not only a key written there. A range delete writes no key at all,
+only a tombstone over its bounds, so the store's answer for an interval also asks every memtable's
+range tombstones and every table's interval block whether one overlapping it carries a sequence in
+the window. Walking the keys alone, two overlapping range deletes both committed, and a serializable
+scan whose rows a range delete removed after its snapshot committed on rows that no longer existed.
+A table's newest sequence and key range are those of its keys, so its intervals are asked before
+either is used to rule it out.
 
 The table is almost always empty, so a point write's check is one relaxed load; only when a range
 delete is actually in flight does a write compare its key against a handful of bounds. That is also
@@ -481,21 +494,31 @@ and phase two lands the batch above everything that committed while it was in do
 that wrote a key the prepare read, committing inside that window, would leave the batch with a
 stale read at its final position — the shape every anomaly needs — and the prepared side can no
 longer be the one to yield, since a participant that voted yes must be able to commit. So the
-writer is refused: at repeatable read and above the prepare takes a read claim on every key it read,
-and a writer of such a key is refused for as long as the batch is undecided.
+writer is refused: at repeatable read and above the prepare takes a read claim on every key it read
+and holds every interval it scanned, and a writer of such a key, or inside such an interval, is
+refused for as long as the batch is undecided. A range delete meeting either is refused the same
+way at every level that validates, repeatable read included, where the delete otherwise asks
+nothing of the claims in flight. Read committed validates nothing and claims nothing, so a writer
+there is not stopped by a prepare's reads.
 
 Its write claims read as *future* to every validator while it is in doubt. A reader of a key it
 writes is not refused — it is serialized before the batch, and its read is consistent — while a
-writer of that key at snapshot or above is, first-committer-wins. The claims are dropped once phase
-two has applied and marked the batch, or rolled it back. Nothing is handed over between the
-prepare's sequence and the one phase two commits at, because a claim is held by presence, not by
-the sequence it names.
+writer of that key at snapshot or above is, first-committer-wins. Phase two then draws through the
+same record, so from that draw the claims carry the sequence the batch commits at. A commit drawn
+above it validates before the batch is applied and finds it below itself in the claims, since the
+store cannot show it yet. Left reading as future, the batch looked above that commit, its read of a
+key the batch writes passed against a store that did not hold the batch, and the two committed a
+write skew. A phase two that fails marks the record future again before it spends the sequence it
+drew. The claims are dropped once phase two has applied and marked the batch, or rolled it back.
+Nothing is handed over between the prepare's sequence and the one phase two commits at, because a
+claim is held by presence and the record it belongs to is the same one throughout.
 
 An in-doubt batch adopted after a restart claims its keys again, and holds its intervals again, from
 the entries its PREPARE record carries, and its reads again from the record written immediately
-ahead of it: at repeatable read and above the prepare appends its read keys as a record of their own
-under the same xid before the PREPARE, so a PREPARE that is durable always has its reads, and
-recovery holds the keys for the PREPARE that follows. Read keys no PREPARE ever followed — the
+ahead of it: at repeatable read and above the prepare appends its read keys and its scanned
+intervals as a record of their own under the same xid before the PREPARE, so a PREPARE that is
+durable always has its reads, and recovery holds them for the PREPARE that follows. An interval is
+an entry flagged and bounded as a range delete is, which is how recovery tells it from a read key. Read keys no PREPARE ever followed — the
 prepare failed between the two appends — are dropped with the staging map. A prepared handle freed
 without a decision — abandoned, which the engine allows — leaves its claims with the clock in its
 place, since the record is durable and a later open may still commit it.
@@ -543,6 +566,8 @@ for a ring's worth of commits refuses exactly what it refused when it was young.
 | A claim is compared by its key's bytes, never by its hash alone | Two keys in one chain are two claims; a hash collision refused a commit that had no conflict |
 | Claims are taken before the sequence is drawn | A commit sequenced below mine finished claiming before I drew, so my validation sees it; the other order lets two rivals miss each other |
 | A prepare at repeatable read or above holds what it read | Phase two lands it above everything that committed in doubt; a writer of a key it read committing inside that window would leave it a stale read at its final position, and the prepared side cannot yield |
+| A prepare holds the intervals it scanned as well as the keys | An insert inside a range its scan found empty is a phantom at the batch's final position just as a changed key is a stale read |
+| Phase two draws through the prepare's own record | A commit drawn above the batch validates before the batch is applied, so only the claims can show it the batch below; a record still reading as prepared hides it |
 | An interval is held before the draw and checked both ways | A point writer meets it in the table, and it meets the point writer in the list of commits in flight, so the two find each other whichever was first; without that a range delete and a write inside it could each validate against a set that did not yet hold the other |
 | A scan's footprint is validated like a read | A key another commit put inside the interval a scan covered is a phantom, whether it is in the store above the snapshot or still a claim in flight below this commit; refusing it is what makes serializable hold over predicates and not only over the keys it read |
 | Compaction may not drop above `min_snapshot_seq` | A live snapshot must still see what it could see |

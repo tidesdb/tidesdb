@@ -105,8 +105,13 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
      * was in doubt, yet it materializes above them -- and the read path resolves a key by source
      * order rather than by sequence, so the older batch would shadow the newer writes. deciding the
      * sequence now keeps a batch's position and its age in agreement, the invariant the read path,
-     * tombstone collection, and the generation layout all rest on */
-    const uint64_t seq = tidesdb_mvcc_draw(txn->clock, NULL);
+     * tombstone collection, and the generation layout all rest on.
+     *
+     * the draw goes through the batch's own record, so its claims carry the sequence from here on.
+     * a commit drawn above it validates before the batch is applied and must find the batch below
+     * itself in the claims, since the store cannot show it yet; a record still reading as prepared
+     * would place the batch above that commit, and a read of a key the batch writes would pass */
+    const uint64_t seq = tidesdb_mvcc_draw(txn->clock, &txn->commit);
     for (int i = 0; i < txn->prepared_count; i++) txn->prepared_entries[i].seq = seq;
 
     /* the COMMIT record carries the write set, so it is both the decision and the only durable copy
@@ -117,7 +122,9 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
     if (wr != TDB_SUCCESS)
     {
         /* stays prepared -- the coordinator retries, and the retry draws another sequence, so the
-         * one drawn here is spent for the watermark */
+         * one drawn here is spent for the watermark, and the record reads as prepared again before
+         * it is */
+        tidesdb_mvcc_commit_prepared(&txn->commit);
         tidesdb_mvcc_mark_aborted(txn->clock, seq);
         return wr;
     }
@@ -150,7 +157,8 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
  * so a writer of one of them is refused for as long as the coordinator leaves the batch in doubt.
  * every batch here prepared before the crash, so the keys are registered rather than contested
  * @param txn the adopted transaction, its prepared entries and sequence in place
- * @param reads the keys the batch read, from the record written ahead of its PREPARE, or NULL
+ * @param reads the keys the batch read and the intervals it scanned, from the record written ahead
+ *              of its PREPARE, or NULL
  * @param read_count how many
  * @return TDB_SUCCESS, TDB_ERR_MEMORY, or TDB_ERR_CONFLICT when an interval could not be held
  */
@@ -168,14 +176,37 @@ static int txn_adopt_claims(tdb_txn_t *txn, const tidesdb_wal_entry_t *reads, co
                                 TDB_MVCC_CLAIM_WRITE,
                                 txn_key_hash(e->cf_index, e->key, e->key_size));
     }
+    int scans = 0;
+    for (int i = 0; i < read_count; i++)
+        scans += (reads[i].flags & TDB_WAL_ENTRY_RANGE_DELETE) != 0;
+    if (scans > 0)
+    {
+        txn->scans = malloc((size_t)scans * sizeof(*txn->scans));
+        if (!txn->scans)
+        {
+            free(claims);
+            return TDB_ERR_MEMORY;
+        }
+    }
+    int s = 0;
     for (int i = 0; i < read_count; i++)
     {
         const tidesdb_wal_entry_t *r = &reads[i];
+        if (r->flags & TDB_WAL_ENTRY_RANGE_DELETE)
+        {
+            txn->scans[s++] = (tidesdb_mvcc_range_t){.cf_index = r->cf_index,
+                                                     .lo = r->key,
+                                                     .lo_size = r->key_size,
+                                                     .hi = r->value_size > 0 ? r->value : NULL,
+                                                     .hi_size = r->value_size};
+            continue;
+        }
         tidesdb_mvcc_claim_init(&claims[n++], r->cf_index, r->key, (uint32_t)r->key_size,
                                 TDB_MVCC_CLAIM_READ,
                                 txn_key_hash(r->cf_index, r->key, r->key_size));
     }
     tidesdb_mvcc_commit_init(&txn->commit, claims, n);
+    tidesdb_mvcc_commit_scans(&txn->commit, txn->scans, s);
     txn->claims = claims;
     int held = tidesdb_mvcc_claim(txn->clock, &txn->commit, 0);
     for (int i = 0; held && i < txn->prepared_count; i++)

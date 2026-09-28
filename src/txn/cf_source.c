@@ -372,6 +372,38 @@ static int cf_source_table_range_has_newer(sstable_t *sst, const uint8_t *lo, co
     return rc;
 }
 
+/**
+ * cf_source_table_intervals_newer
+ * whether an interval a table carries overlaps [lo, hi) with a sequence in the window. a range
+ * delete writes no key inside the interval, and a table's newest sequence and key range are those
+ * of its keys alone, so a table holding only intervals is ruled in here before either is consulted
+ * @param sst the table
+ * @param lo inclusive lower bound
+ * @param lo_size length of lo
+ * @param hi exclusive upper bound
+ * @param hi_size length of hi, 0 for unbounded above
+ * @param seq_floor the sequence an interval must exceed
+ * @param seq_ceiling the sequence an interval must not exceed to count at all
+ * @return 1 when one is found, 0 otherwise
+ */
+static int cf_source_table_intervals_newer(const sstable_t *sst, const uint8_t *lo,
+                                           const size_t lo_size, const uint8_t *hi,
+                                           const size_t hi_size, const uint64_t seq_floor,
+                                           const uint64_t seq_ceiling)
+{
+    const size_t n = range_tombstone_set_count(sst->range_tombstones);
+    for (size_t i = 0; i < n; i++)
+    {
+        const rt_fragment_t *frag = NULL;
+        if (range_tombstone_set_fragment_at(sst->range_tombstones, i, &frag) != TDB_SUCCESS ||
+            !range_tombstone_fragment_overlaps(frag, lo, lo_size, hi_size > 0 ? hi : NULL, hi_size))
+            continue;
+        for (size_t s = 0; s < frag->seq_count; s++)
+            if (frag->seqs[s] > seq_floor && frag->seqs[s] <= seq_ceiling) return 1;
+    }
+    return 0;
+}
+
 /* the interval probe a commit runs for a range delete. a table whose newest sequence is at or
  * below the floor cannot hold anything newer wherever its keys fall, so it is ruled out on cached
  * metadata alone -- which is what keeps this off the cost of the delete it is checking */
@@ -403,6 +435,13 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
     for (int i = 0; i < n; i++)
     {
         if (*newer || failed) continue;
+        if (cf_source_table_intervals_newer(tables[i], lo, lo_size, hi, hi_size, seq_floor,
+                                            seq_ceiling))
+        {
+            held = 1;
+            *newer = 1;
+            continue;
+        }
         if (tables[i]->max_seq <= seq_floor) continue; /* nothing in it can be newer */
         if (!cf_source_table_in_range(tables[i], lo, lo_size, hi, hi_size)) continue;
 

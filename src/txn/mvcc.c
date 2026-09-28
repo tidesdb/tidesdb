@@ -13,6 +13,7 @@
 
 #include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
+#include "mvcc_internal.h"
 
 /* commit-ring slot states, in the low bits of a slot; the sequence the slot describes sits above
  * them, so a slot recycled by a later sequence never reads as a decision about an earlier one */
@@ -31,89 +32,6 @@
  * stall elsewhere is logged or refused rather than waited on forever */
 #define TDB_MVCC_VISIBLE_WAIT_SPINS 1024
 #define TDB_MVCC_VISIBLE_WAIT_MAX   100000000ULL
-
-/**
- * mvcc_range_hold_t
- * one interval held against concurrent point writes and other intervals while its commit is in
- * flight or its batch in doubt
- * @param lo the inclusive lower bound
- * @param hi the exclusive upper bound, meaningful only when hi_size is non-zero
- * @param lo_size length of lo
- * @param hi_size length of hi, zero when the interval is open above
- * @param cf_index the family the interval belongs to
- * @param owner the commit holding it, whose sequence orders it against a validator
- * @param in_use non-zero while the slot holds an interval, which is stated rather than inferred
- *        from a length so an open bound is not mistaken for a free slot
- */
-typedef struct
-{
-    uint8_t lo[TDB_MVCC_MAX_RANGE_BYTES];
-    uint8_t hi[TDB_MVCC_MAX_RANGE_BYTES];
-    size_t lo_size;
-    size_t hi_size;
-    uint32_t cf_index;
-    const tidesdb_mvcc_commit_t *owner;
-    int in_use;
-} mvcc_range_hold_t;
-
-/**
- * mvcc_orphan_t
- * the claims of one prepared batch whose handle was freed undecided, copied so they outlive it
- * @param commit the record the copied claims chain under and the batch's intervals are owned by,
- *               a prepared batch's for good
- * @param claims the copied claims
- * @param keys the copied key bytes, one per claim
- * @param n how many
- * @param next the next orphan
- */
-typedef struct mvcc_orphan
-{
-    tidesdb_mvcc_commit_t commit;
-    tidesdb_mvcc_claim_t *claims;
-    uint8_t **keys;
-    int n;
-    struct mvcc_orphan *next;
-} mvcc_orphan_t;
-
-/**
- * tidesdb_mvcc
- * the MVCC clock state. the locks nest in one order wherever two are held -- a stripe, then the
- * interval table, then the in-flight list -- so no two committers can wait on each other
- * @param global_seq monotonic sequence counter; the next seq to assign
- * @param ring commit-status ring indexed by seq modulo capacity, each slot the packed sequence it
- *             describes and its state
- * @param ring_capacity length of ring, the most sequences that can be in flight above the watermark
- * @param visible_seq the watermark, the highest sequence below which every sequence is decided;
- *                    what every reader's ceiling is taken from
- * @param claim_heads the in-flight claim set, one chain head per bucket of a key's hash
- * @param claim_stripes the mutexes guarding the chains, one per stripe of buckets
- * @param inflight every commit between its claim and its release, which is what an interval is
- *                 checked against, since an interval has no one chain to look in
- * @param inflight_lock guards the in-flight list
- * @param range_holds the intervals held by commits in flight and prepares undecided
- * @param range_count how many slots are taken, so a database that never deletes a range reads one
- *                    counter
- * @param range_lock guards the interval table
- * @param orphans the claims of prepared batches whose handles were freed undecided, held for the
- *                clock's life in the handles' place
- * @param orphan_lock guards the orphan list
- */
-struct tidesdb_mvcc
-{
-    _Atomic(uint64_t) global_seq;
-    _Atomic(uint64_t) *ring;
-    size_t ring_capacity;
-    _Atomic(uint64_t) visible_seq;
-    tidesdb_mvcc_claim_t **claim_heads;
-    pthread_mutex_t *claim_stripes;
-    tidesdb_mvcc_commit_t *inflight;
-    pthread_mutex_t inflight_lock;
-    mvcc_range_hold_t range_holds[TDB_MVCC_MAX_RANGE_RESERVATIONS];
-    _Atomic(int) range_count;
-    pthread_mutex_t range_lock;
-    mvcc_orphan_t *orphans;
-    pthread_mutex_t orphan_lock;
-};
 
 tidesdb_mvcc_t *tidesdb_mvcc_create(void)
 {
@@ -139,6 +57,7 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     pthread_mutex_init(&m->inflight_lock, NULL);
     memset(m->range_holds, 0, sizeof(m->range_holds));
     atomic_init(&m->range_count, 0);
+    atomic_init(&m->scan_holders, 0);
     pthread_mutex_init(&m->range_lock, NULL);
     m->orphans = NULL;
     pthread_mutex_init(&m->orphan_lock, NULL);
@@ -147,16 +66,6 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     atomic_init(&m->visible_seq, 0);
     m->ring_capacity = TDB_MVCC_COMMIT_RING_SIZE;
     return m;
-}
-
-/* free one orphan's copies; its claims are already off the chains or the chains are going with it
- */
-static void mvcc_orphan_free(mvcc_orphan_t *o)
-{
-    for (int i = 0; i < o->n; i++) free(o->keys[i]);
-    free(o->keys);
-    free(o->claims);
-    free(o);
 }
 
 void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m)
@@ -334,6 +243,16 @@ void tidesdb_mvcc_commit_init(tidesdb_mvcc_commit_t *commit, tidesdb_mvcc_claim_
     commit->n_claims = n_claims;
     commit->next_inflight = NULL;
     commit->held = 0;
+    commit->scans = NULL;
+    commit->n_scans = 0;
+}
+
+void tidesdb_mvcc_commit_scans(tidesdb_mvcc_commit_t *commit, const tidesdb_mvcc_range_t *scans,
+                               const int n_scans)
+{
+    if (!commit || n_scans < 0 || (n_scans > 0 && !scans)) return;
+    commit->scans = scans;
+    commit->n_scans = n_scans;
 }
 
 void tidesdb_mvcc_claim_init(tidesdb_mvcc_claim_t *claim, const uint32_t cf_index,
@@ -356,12 +275,12 @@ int tidesdb_mvcc_holds(const tidesdb_mvcc_commit_t *commit)
 }
 
 /* the bucket a key's claims chain from, and the lock guarding that chain */
-static uint32_t mvcc_claim_bucket(const uint64_t hash)
+uint32_t mvcc_claim_bucket(const uint64_t hash)
 {
     return (uint32_t)hash & (TDB_MVCC_CLAIM_BUCKETS - 1);
 }
 
-static pthread_mutex_t *mvcc_claim_stripe(tidesdb_mvcc_t *m, const uint32_t bucket)
+pthread_mutex_t *mvcc_claim_stripe(tidesdb_mvcc_t *m, const uint32_t bucket)
 {
     return &m->claim_stripes[bucket & (TDB_MVCC_CLAIM_STRIPES - 1)];
 }
@@ -440,6 +359,7 @@ static void mvcc_inflight_push(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
     commit->next_inflight = m->inflight;
     m->inflight = commit;
     commit->held = 1;
+    if (commit->n_scans > 0) atomic_fetch_add_explicit(&m->scan_holders, 1, memory_order_release);
     pthread_mutex_unlock(&m->inflight_lock);
 }
 
@@ -450,6 +370,8 @@ static void mvcc_inflight_pop(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
         if (*link == commit)
         {
             *link = commit->next_inflight;
+            if (commit->n_scans > 0)
+                atomic_fetch_sub_explicit(&m->scan_holders, 1, memory_order_release);
             break;
         }
     commit->next_inflight = NULL;
@@ -515,7 +437,7 @@ static int mvcc_claim_refused(const tidesdb_mvcc_claim_t *head, const tidesdb_mv
 }
 
 /* unlink one claim from its chain, under the stripe lock the caller holds */
-static void mvcc_claim_unlink(tidesdb_mvcc_t *m, const uint32_t bucket, tidesdb_mvcc_claim_t *claim)
+void mvcc_claim_unlink(tidesdb_mvcc_t *m, const uint32_t bucket, tidesdb_mvcc_claim_t *claim)
 {
     tidesdb_mvcc_claim_t **link = &m->claim_heads[bucket];
     for (uint32_t walked = 0; *link && walked < TDB_MVCC_CLAIM_WALK_MAX; walked++)
@@ -784,6 +706,72 @@ int tidesdb_mvcc_read_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *comm
     return stale || walked >= TDB_MVCC_CLAIM_WALK_MAX;
 }
 
+/* whether one of an in-flight commit's scanned intervals meets the interval given, or holds the key
+ * given when point is set */
+static int mvcc_scans_meet_one(const tidesdb_mvcc_commit_t *c, const uint32_t cf_index,
+                               const uint8_t *lo, const size_t lo_size, const uint8_t *hi,
+                               const size_t hi_size, const int point)
+{
+    for (int i = 0; i < c->n_scans; i++)
+    {
+        const tidesdb_mvcc_range_t *r = &c->scans[i];
+        if (r->cf_index != cf_index) continue;
+        if (point ? mvcc_key_in_range(lo, lo_size, r->lo, r->lo_size, r->hi, r->hi_size)
+                  : (hi_size == 0 || tdb_key_cmp(hi, hi_size, r->lo, r->lo_size) > 0) &&
+                        (r->hi_size == 0 || tdb_key_cmp(r->hi, r->hi_size, lo, lo_size) > 0))
+            return 1;
+    }
+    return 0;
+}
+
+/* whether one of an in-flight commit's read claims falls inside the interval given */
+static int mvcc_reads_inside(const tidesdb_mvcc_commit_t *c, const uint32_t cf_index,
+                             const uint8_t *lo, const size_t lo_size, const uint8_t *hi,
+                             const size_t hi_size)
+{
+    for (int i = 0; i < c->n_claims; i++)
+    {
+        const tidesdb_mvcc_claim_t *k = &c->claims[i];
+        if (k->kind == TDB_MVCC_CLAIM_READ && k->cf_index == cf_index &&
+            mvcc_key_in_range(k->key, k->key_size, lo, lo_size, hi, hi_size))
+            return 1;
+    }
+    return 0;
+}
+
+/* whether a commit in flight other than this one read what a write would change -- scanned an
+ * interval holding the key given, when point is set, or read a key or scanned an interval meeting
+ * the interval given otherwise. only a prepare reads under a claim, and it is held against every
+ * writer whatever its sequence, since it validated at prepare and is placed only when its phase two
+ * draws. a point write has asked the chains for read claims already, so the walk is skipped when no
+ * commit holds scans; an interval cannot ask the chains and always walks */
+static int mvcc_reads_meet(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
+                           const uint32_t cf_index, const uint8_t *lo, const size_t lo_size,
+                           const uint8_t *hi, const size_t hi_size, const int point)
+{
+    if (point && atomic_load_explicit(&m->scan_holders, memory_order_acquire) == 0) return 0;
+    pthread_mutex_lock(&m->inflight_lock);
+    int met = 0;
+    uint32_t walked = 0;
+    for (const tidesdb_mvcc_commit_t *c = m->inflight;
+         c && !met && walked < TDB_MVCC_INFLIGHT_WALK_MAX; c = c->next_inflight, walked++)
+    {
+        if (c == commit) continue;
+        met = mvcc_scans_meet_one(c, cf_index, lo, lo_size, hi, hi_size, point) ||
+              (!point && mvcc_reads_inside(c, cf_index, lo, lo_size, hi, hi_size));
+    }
+    pthread_mutex_unlock(&m->inflight_lock);
+    return met || walked >= TDB_MVCC_INFLIGHT_WALK_MAX;
+}
+
+int tidesdb_mvcc_range_read_held(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
+                                 const uint32_t cf_index, const uint8_t *lo, const size_t lo_size,
+                                 const uint8_t *hi, const size_t hi_size)
+{
+    if (!m || !commit || !lo) return 0;
+    return mvcc_reads_meet(m, commit, cf_index, lo, lo_size, hi, hi_size, 0);
+}
+
 int tidesdb_mvcc_range_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
                              const uint32_t cf_index, const uint8_t *lo, const size_t lo_size,
                              const uint8_t *hi, const size_t hi_size, const int writing)
@@ -817,6 +805,7 @@ int tidesdb_mvcc_write_blocked(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *c
     if (!blocked && first_committer_wins)
         blocked = mvcc_interval_held_over(m, commit, cf_index, key, key_size, 1);
     pthread_mutex_unlock(lock);
+    if (!blocked) blocked = mvcc_reads_meet(m, commit, cf_index, key, key_size, NULL, 0, 1);
     return blocked || walked >= TDB_MVCC_CLAIM_WALK_MAX;
 }
 
@@ -828,97 +817,6 @@ void tidesdb_mvcc_unclaim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
     mvcc_inflight_pop(m, commit);
     commit->claims = NULL;
     commit->n_claims = 0;
-}
-
-/* copy a commit's claims, key bytes included, into an orphan, or NULL when the copies could not
- * all be made */
-static mvcc_orphan_t *mvcc_orphan_copy(const tidesdb_mvcc_commit_t *commit)
-{
-    mvcc_orphan_t *o = calloc(1, sizeof(*o));
-    if (!o) return NULL;
-    tidesdb_mvcc_commit_init(&o->commit, NULL, 0);
-    if (commit->n_claims > 0)
-    {
-        o->claims = calloc((size_t)commit->n_claims, sizeof(*o->claims));
-        o->keys = calloc((size_t)commit->n_claims, sizeof(*o->keys));
-        if (!o->claims || !o->keys)
-        {
-            mvcc_orphan_free(o);
-            return NULL;
-        }
-    }
-    for (int i = 0; i < commit->n_claims; i++)
-    {
-        const tidesdb_mvcc_claim_t *c = &commit->claims[i];
-        o->keys[i] = malloc(c->key_size ? c->key_size : 1);
-        if (!o->keys[i])
-        {
-            mvcc_orphan_free(o);
-            return NULL;
-        }
-        memcpy(o->keys[i], c->key, c->key_size);
-        tidesdb_mvcc_claim_init(&o->claims[i], c->cf_index, o->keys[i], c->key_size, c->kind,
-                                c->hash);
-        o->claims[i].owner = &o->commit;
-        o->n = i + 1;
-    }
-    o->commit.claims = o->claims;
-    o->commit.n_claims = o->n;
-    atomic_store_explicit(&o->commit.seq, TDB_MVCC_SEQ_FUTURE, memory_order_release);
-    return o;
-}
-
-/* put the orphan in the freed commit's place in the in-flight list, so an interval checked against
- * the list goes on meeting the batch's keys */
-static void mvcc_inflight_replace(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
-                                  tidesdb_mvcc_commit_t *with)
-{
-    pthread_mutex_lock(&m->inflight_lock);
-    for (tidesdb_mvcc_commit_t **link = &m->inflight; *link; link = &(*link)->next_inflight)
-        if (*link == commit)
-        {
-            with->next_inflight = commit->next_inflight;
-            *link = with;
-            break;
-        }
-    commit->next_inflight = NULL;
-    commit->held = 0;
-    with->held = 1;
-    pthread_mutex_unlock(&m->inflight_lock);
-}
-
-int tidesdb_mvcc_orphan_claims(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
-{
-    if (!m || !commit || !commit->held) return 1;
-    mvcc_orphan_t *o = mvcc_orphan_copy(commit);
-    if (!o)
-    {
-        tidesdb_mvcc_unclaim(m, commit);
-        return 0;
-    }
-    /* each copy takes its original's place in the chain under the same stripe lock, so no writer
-     * of the key ever finds the key unheld between the two; the intervals change owner in place */
-    for (int i = 0; i < commit->n_claims; i++)
-    {
-        const uint32_t bucket = mvcc_claim_bucket(commit->claims[i].hash);
-        pthread_mutex_t *lock = mvcc_claim_stripe(m, bucket);
-        pthread_mutex_lock(lock);
-        mvcc_claim_unlink(m, bucket, &commit->claims[i]);
-        o->claims[i].next = m->claim_heads[bucket];
-        m->claim_heads[bucket] = &o->claims[i];
-        pthread_mutex_unlock(lock);
-    }
-    pthread_mutex_lock(&m->range_lock);
-    for (int i = 0; i < TDB_MVCC_MAX_RANGE_RESERVATIONS; i++)
-        if (m->range_holds[i].in_use && m->range_holds[i].owner == commit)
-            m->range_holds[i].owner = &o->commit;
-    pthread_mutex_unlock(&m->range_lock);
-    mvcc_inflight_replace(m, commit, &o->commit);
-    commit->claims = NULL;
-    commit->n_claims = 0;
-    pthread_mutex_lock(&m->orphan_lock);
-    o->next = m->orphans;
-    m->orphans = o;
-    pthread_mutex_unlock(&m->orphan_lock);
-    return 1;
+    commit->scans = NULL;
+    commit->n_scans = 0;
 }

@@ -60,6 +60,8 @@
  *               in flight -- the keys it holds and the sequence they are ordered by
  * @param claims the claims that record chains, one per written key and, for a prepare at
  *               repeatable read or above, one per read key; NULL when nothing is held
+ * @param scans the intervals a prepare at repeatable read or above scanned, attached to its record
+ *              in the claim set; NULL when it scanned none
  */
 struct tdb_txn
 {
@@ -90,6 +92,7 @@ struct tdb_txn
     _Atomic(int) abort_requested;
     tidesdb_mvcc_commit_t commit;
     tidesdb_mvcc_claim_t *claims;
+    tidesdb_mvcc_range_t *scans;
 };
 
 /* bounded internal retries for a transient source BUSY before giving up; the engine absorbs BUSY so

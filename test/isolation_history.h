@@ -793,7 +793,7 @@ static int hist_two_phase(tidesdb_txn_t *txn, hist_txn_t *t, const int slot, uin
         t->status = HIST_IN_DOUBT;
         return TDB_ERR_TXN_ABORTED;
     }
-    if (linger_us > 0) (void)usleep((useconds_t)linger_us);
+    if (linger_us > 0) (void)usleep((unsigned int)linger_us);
     if (hist_rng(rng) % 2 == 0)
     {
         (void)tidesdb_txn_rollback_prepared(txn);

@@ -433,9 +433,21 @@ void test_txn_read_expired(void)
 }
 
 /* how often a held append looks at its gate, and how long a test gives a validation that should be
- * waiting to show that it is not */
+ * waiting to show that it is not. the window is measured on the clock rather than counted in polls,
+ * since a sleep rounds up to the scheduler's tick and on some systems a hundred polls take seconds,
+ * long enough to outlast the bounded wait the test is watching */
 #define TXN_TEST_HOLD_POLL_US   100
 #define TXN_TEST_WAIT_WINDOW_US 200000
+#define TXN_TEST_US_PER_S       1000000LL
+#define TXN_TEST_NS_PER_US      1000LL
+
+/* microseconds on the monotonic clock */
+static long long txn_test_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * TXN_TEST_US_PER_S + (long long)ts.tv_nsec / TXN_TEST_NS_PER_US;
+}
 
 /* how many sources a mock backend's apply lands entries in */
 #define MB_MAX_APPLIED 2
@@ -1479,8 +1491,8 @@ void test_txn_validation_waits_for_a_claimless_writer_below_it(void)
     while (!atomic_load(&wm.entered)) (void)usleep(TXN_TEST_HOLD_POLL_US);
 
     ASSERT_EQ(pthread_create(&tr, NULL, held_commit_run, &hr), 0);
-    for (int waited = 0; waited < TXN_TEST_WAIT_WINDOW_US && !atomic_load(&hr.done);
-         waited += TXN_TEST_HOLD_POLL_US)
+    const long long window_end = txn_test_now_us() + TXN_TEST_WAIT_WINDOW_US;
+    while (txn_test_now_us() < window_end && !atomic_load(&hr.done))
         (void)usleep(TXN_TEST_HOLD_POLL_US);
     const int finished_early = atomic_load(&hr.done);
     atomic_store(&gate, 0);

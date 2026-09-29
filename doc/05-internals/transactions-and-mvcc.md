@@ -208,7 +208,20 @@ exist — which is what the list of commits in flight is for, since an interval 
 look in. A write claim above my sequence is not my problem — that commit is sequenced after me and
 validates against mine. A prepared owner's write claims read as **future**, since its final sequence
 will exceed every current one, so a reader of a key it writes is serialized before the batch and not
-refused, while a writer of that key at snapshot or above is.
+refused, while a writer of that key at snapshot or above is. A reader that is itself a prepare is
+the exception, covered in [Two-phase commit](#two-phase-commit).
+
+Read committed and below write **without claims**, which keeps their commits off the claim set
+entirely, and that leaves one case the order above does not cover. Validation asks the claims
+before the store because a claimed writer lets go only once its version is in the store, so a writer
+below me is in one or the other. A writer without claims is in neither between its draw and its
+apply. So such a writer counts itself in the clock before it draws and uncounts once its sequence is
+decided, and a validating commit that finds the count raised after its own draw waits for every
+sequence below it to be decided before it asks the store. The count is split over counters on lines
+of their own, since every read-committed commit moves one twice; a workload with no read-committed
+writers pays one load per validation, and one with no validating commits pays nothing but the count.
+Without the wait a repeatable-read commit drawn just above a read-committed writer of a key it read
+validated before that writer applied and committed on a read it had already invalidated.
 
 The claims go with the commit. A refused claim drops the ones already taken, a failed commit drops
 them all, and a successful one drops them once the watermark has passed its sequence, so a rival
@@ -497,9 +510,23 @@ longer be the one to yield, since a participant that voted yes must be able to c
 writer is refused: at repeatable read and above the prepare takes a read claim on every key it read
 and holds every interval it scanned, and a writer of such a key, or inside such an interval, is
 refused for as long as the batch is undecided. A range delete meeting either is refused the same
-way at every level that validates, repeatable read included, where the delete otherwise asks
-nothing of the claims in flight. Read committed validates nothing and claims nothing, so a writer
-there is not stopped by a prepare's reads.
+way, repeatable read included, where the delete otherwise asks nothing of the claims in flight.
+Read committed validates nothing of its own and takes no claims, yet it is held to this too: a
+prepare counts itself in the clock before it draws, so a read-committed commit drawn above it finds
+the count raised and checks its writes against the prepares' reads, and one drawn below it is found
+by the prepare's own validation, which waits for it as any validation waits for a writer without
+claims. With no prepare holding reads the check is one load.
+
+A prepare that validates its reads also yields to another prepare that writes what it read,
+whatever the two drew. A plain reader of such a key is serialized before the batch, which holds
+because it commits now, below any phase two to come. A prepare's position is not decided now: both
+are placed by their phase twos, and the batch that voted first may be decided first and land below
+the reader, which then read a version older than one beneath it. So a prepare meeting another
+prepare's write claim, or its interval, on something it read or scanned is refused, and a prepare at
+read committed claims what it writes for this reason, since the reader has nothing else to find the
+pending write by. Before this a serializable prepare validated past a batch already prepared, the
+batch was decided first, and a reader that saw the batch but not the prepare closed a cycle through
+two serializable reads.
 
 Its write claims read as *future* to every validator while it is in doubt. A reader of a key it
 writes is not refused — it is serialized before the batch, and its read is consistent — while a
@@ -568,6 +595,9 @@ for a ring's worth of commits refuses exactly what it refused when it was young.
 | A prepare at repeatable read or above holds what it read | Phase two lands it above everything that committed in doubt; a writer of a key it read committing inside that window would leave it a stale read at its final position, and the prepared side cannot yield |
 | A prepare holds the intervals it scanned as well as the keys | An insert inside a range its scan found empty is a phantom at the batch's final position just as a changed key is a stale read |
 | Phase two draws through the prepare's own record | A commit drawn above the batch validates before the batch is applied, so only the claims can show it the batch below; a record still reading as prepared hides it |
+| A validating commit waits out writers without claims below it | A read-committed writer is in neither the claims nor the store between its draw and its apply |
+| A read-committed write is checked against undecided prepares' reads | It lands below their phase twos, where what they read would be stale |
+| A prepare yields to another prepare's write on what it read | Both are placed by their phase twos, so the batch that voted first may land below the reader |
 | An interval is held before the draw and checked both ways | A point writer meets it in the table, and it meets the point writer in the list of commits in flight, so the two find each other whichever was first; without that a range delete and a write inside it could each validate against a set that did not yet hold the other |
 | A scan's footprint is validated like a read | A key another commit put inside the interval a scan covered is a phantom, whether it is in the store above the snapshot or still a claim in flight below this commit; refusing it is what makes serializable hold over predicates and not only over the keys it read |
 | Compaction may not drop above `min_snapshot_seq` | A live snapshot must still see what it could see |

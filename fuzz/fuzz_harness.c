@@ -185,12 +185,13 @@ static void fx_ensure_txn(fx_state_t *s)
 /* whether a commit of the open transaction must be refused, and whether it may be, derived from
  * what the engine actually runs at each level.
  *
- * read-uncommitted and read-committed run no commit-time conflict detection at all --
- * txn_write_phase gates it on isolation above read-committed -- so a refusal at those levels is
- * always a fault. every level above runs detection and may legitimately refuse, and the oracle
- * cannot predict when: read validation refuses on a version that merely moved and on a key that
- * appeared inside a scanned interval, and a prepared batch's read claims refuse a writer of a key
- * it read, which the model does not follow. so a refusal is permitted, never predicted.
+ * read-uncommitted and read-committed run no validation of their own, so at those levels a refusal
+ * is a fault unless a prepared batch that may hold reads is live: its read claims and scanned
+ * intervals refuse a writer at every level, since that writer would land below the batch's phase
+ * two. every level above runs detection and may legitimately refuse, and the oracle cannot predict
+ * when: read validation refuses on a version that merely moved and on a key that appeared inside a
+ * scanned interval, and a prepared batch's read claims refuse a writer of a key it read, which the
+ * model does not follow. so a refusal is permitted, never predicted.
  *
  * one refusal is required rather than permitted: a prepared batch holds its keys and intervals
  * until phase two decides it, whether it prepared in this process at repeatable read or above or
@@ -201,7 +202,7 @@ void fx_conflict_expectation(const fx_state_t *s, int *required, int *allowed)
     const int reserves = s->txn_iso >= FX_ISO_RESERVES;
     const int held =
         s->prepared && (s->prepared_recovered || s->prepared_iso >= TDB_ISOLATION_REPEATABLE_READ);
-    *allowed = s->txn_iso > TDB_ISOLATION_READ_COMMITTED;
+    *allowed = s->txn_iso > TDB_ISOLATION_READ_COMMITTED || held;
     *required = reserves && held && fuzz_model_txn_hits_prepared(s->model);
 }
 
@@ -214,7 +215,9 @@ void fx_commit_txn(fx_state_t *s)
 
     if (rc == TDB_ERR_CONFLICT)
     {
-        FUZZ_CHECK(allowed, "commit refused at isolation %d, which runs no conflict detection",
+        FUZZ_CHECK(allowed,
+                   "commit refused at isolation %d, with no conflict detection and no prepared "
+                   "reads to meet",
                    (int)s->txn_iso);
         /* the transaction aborted, so the model discards its buffer rather than applying it */
         tidesdb_txn_free(s->txn);

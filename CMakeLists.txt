@@ -723,6 +723,7 @@ if(TIDESDB_BUILD_TESTS)
         iter_api_tests
         isolation_history_tests
         isolation_history_ops_tests
+        isolation_history_mixed_tests
     )
 
     # the crash-recovery tests start a child from this same binary rather than forking, so they

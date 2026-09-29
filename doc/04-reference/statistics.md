@@ -207,8 +207,8 @@ read committed and above.
 
 **Conflicts.** `txn_commits` counts the transactions committed since the database opened,
 single-phase and phase two together, and `txn_conflicts` the commits and prepares refused with
-`TDB_ERR_CONFLICT`. Only the levels above read committed can be refused, so the ratio is the retry
-rate those levels are paying. A rate that climbs under a workload that did not change is contention
+`TDB_ERR_CONFLICT`. Apart from a write meeting what an undecided prepare read, only the levels
+above read committed can be refused, so the ratio is the retry rate those levels are paying. A rate that climbs under a workload that did not change is contention
 between transactions — the same keys, the same ranges, or a scan wide enough to meet every insert —
 and a rate that is high from the start usually means a transaction is holding a snapshot far longer
 than its work needs.

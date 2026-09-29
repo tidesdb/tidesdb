@@ -32,16 +32,22 @@ commit fail.
 
 | Level | Value | Reads see | Commit can return `TDB_ERR_CONFLICT` |
 | --- | --- | --- | --- |
-| `TDB_ISOLATION_READ_UNCOMMITTED` | 0 | Everything, including uncommitted writes | No |
-| `TDB_ISOLATION_READ_COMMITTED` | 1 | The latest committed version, re-read per operation | No |
+| `TDB_ISOLATION_READ_UNCOMMITTED` | 0 | Everything, including uncommitted writes | Only on a key an undecided prepare read |
+| `TDB_ISOLATION_READ_COMMITTED` | 1 | The latest committed version, re-read per operation | Only on a key an undecided prepare read |
 | `TDB_ISOLATION_REPEATABLE_READ` | 2 | A sequence frozen at begin | **Yes**, if a key it read changed or a key appeared in a range it scanned |
 | `TDB_ISOLATION_SNAPSHOT` | 3 | A sequence frozen at begin | **Yes**, if a key it wrote was written first |
 | `TDB_ISOLATION_SERIALIZABLE` | 4 | A sequence frozen at begin | **Yes**, on either |
 
-`TDB_ISOLATION_READ_COMMITTED` is the default, so **conflict detection is opt-in**. Only the lower
-two never conflict, and a blind write at `TDB_ISOLATION_READ_COMMITTED` — the default — behaves
-like an unchecked overwrite, so a lost update is the expected outcome of a race there rather than
-a defect.
+`TDB_ISOLATION_READ_COMMITTED` is the default, so **conflict detection is opt-in**. The lower two
+check nothing of their own, and a blind write at `TDB_ISOLATION_READ_COMMITTED` — the default —
+behaves like an unchecked overwrite, so a lost update is the expected outcome of a race there
+rather than a defect.
+
+The one exception is [two-phase commit](#tidesdb_txn_prepare). A transaction prepared at repeatable
+read or above has validated what it read and cannot give way once it has voted, so until its phase
+two decides it, a write to a key it read or inside a range it scanned is refused with
+`TDB_ERR_CONFLICT` at **every** level. A workload that never prepares never sees this at the lower
+two levels; one that does should retry a refused commit there as it would at any other level.
 
 The three above it each check something different. Repeatable read validates its **read set**: a
 commit fails if any key it recorded a read for has a newer version, committed or in flight below
@@ -63,7 +69,7 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn);
 
 ### Description
 
-Begins at `TDB_ISOLATION_READ_COMMITTED`, which does not detect conflicts. This is a fixed
+Begins at `TDB_ISOLATION_READ_COMMITTED`, which does not detect conflicts of its own. This is a fixed
 library default, not a configurable one — the database configuration has no isolation field.
 To choose a level use
 [`tidesdb_txn_begin_with_isolation`](#tidesdb_txn_begin_with_isolation), or
@@ -803,7 +809,7 @@ successful commit.
 
 | Code | Cause |
 | --- | --- |
-| `TDB_ERR_CONFLICT` | Another transaction committed a conflicting write first. Only at snapshot and serializable. **Retry the whole transaction.** |
+| `TDB_ERR_CONFLICT` | A key it read changed or a range it scanned gained a key (repeatable read and serializable), a key it wrote was written first (snapshot and serializable), or it wrote what an undecided prepared transaction read (any level). **Retry the whole transaction.** |
 | `TDB_ERR_INVALID_ARGS` | `txn` is `NULL` or not active |
 | `TDB_ERR_TXN_EXPIRED` | The transaction is no longer active |
 | `TDB_ERR_TXN_ABORTED` | Another thread called `tidesdb_txn_request_abort` on the transaction |

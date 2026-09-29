@@ -57,7 +57,8 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     pthread_mutex_init(&m->inflight_lock, NULL);
     memset(m->range_holds, 0, sizeof(m->range_holds));
     atomic_init(&m->range_count, 0);
-    atomic_init(&m->scan_holders, 0);
+    atomic_init(&m->read_holders, 0);
+    for (int i = 0; i < MVCC_UNCLAIMED_SHARDS; i++) atomic_init(&m->unclaimed[i].n, 0);
     pthread_mutex_init(&m->range_lock, NULL);
     m->orphans = NULL;
     pthread_mutex_init(&m->orphan_lock, NULL);
@@ -243,6 +244,8 @@ void tidesdb_mvcc_commit_init(tidesdb_mvcc_commit_t *commit, tidesdb_mvcc_claim_
     commit->n_claims = n_claims;
     commit->next_inflight = NULL;
     commit->held = 0;
+    commit->reads_held = 0;
+    atomic_store_explicit(&commit->prepared, 0, memory_order_relaxed);
     commit->scans = NULL;
     commit->n_scans = 0;
 }
@@ -352,6 +355,25 @@ static int mvcc_owner_below(const tidesdb_mvcc_commit_t *owner, const uint64_t m
     return theirs != 0 && theirs < mine;
 }
 
+/* which owners a check counts. a prepare that validates its reads counts a prepared owner as well
+ * as one below it: the two are placed by their phase twos, not by what they drew, so a prepare
+ * cannot serialize itself before a batch that voted first and may be decided first, landing below
+ * it */
+#define MVCC_ORDER_ANY    0
+#define MVCC_ORDER_BELOW  1
+#define MVCC_ORDER_READER 2
+
+/* whether an owner counts against the asking commit under an order */
+static int mvcc_owner_counts(const tidesdb_mvcc_commit_t *owner, const tidesdb_mvcc_commit_t *asker,
+                             const uint64_t mine, const int order)
+{
+    if (order == MVCC_ORDER_ANY) return 1;
+    if (order == MVCC_ORDER_READER && asker->reads_held &&
+        atomic_load_explicit(&owner->prepared, memory_order_acquire))
+        return 1;
+    return mvcc_owner_below(owner, mine);
+}
+
 /* the in-flight list, entered before a commit's first claim and left after its last release */
 static void mvcc_inflight_push(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
 {
@@ -359,7 +381,10 @@ static void mvcc_inflight_push(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
     commit->next_inflight = m->inflight;
     m->inflight = commit;
     commit->held = 1;
-    if (commit->n_scans > 0) atomic_fetch_add_explicit(&m->scan_holders, 1, memory_order_release);
+    commit->reads_held = commit->n_scans > 0;
+    for (int i = 0; i < commit->n_claims && !commit->reads_held; i++)
+        commit->reads_held = commit->claims[i].kind == TDB_MVCC_CLAIM_READ;
+    if (commit->reads_held) atomic_fetch_add_explicit(&m->read_holders, 1, memory_order_release);
     pthread_mutex_unlock(&m->inflight_lock);
 }
 
@@ -370,12 +395,13 @@ static void mvcc_inflight_pop(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
         if (*link == commit)
         {
             *link = commit->next_inflight;
-            if (commit->n_scans > 0)
-                atomic_fetch_sub_explicit(&m->scan_holders, 1, memory_order_release);
+            if (commit->reads_held)
+                atomic_fetch_sub_explicit(&m->read_holders, 1, memory_order_release);
             break;
         }
     commit->next_inflight = NULL;
     commit->held = 0;
+    commit->reads_held = 0;
     pthread_mutex_unlock(&m->inflight_lock);
 }
 
@@ -387,13 +413,12 @@ static void mvcc_inflight_pop(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
  * @param cf_index the family the key belongs to
  * @param key the key bytes
  * @param key_size length of key
- * @param below_only non-zero to count only owners sequenced below the asking commit, zero to count
- *                   every other owner
+ * @param order which owners count, one of the MVCC_ORDER_ values
  * @return 1 when such an interval covers the key, 0 otherwise
  */
 static int mvcc_interval_held_over(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
                                    const uint32_t cf_index, const uint8_t *key,
-                                   const size_t key_size, const int below_only)
+                                   const size_t key_size, const int order)
 {
     if (atomic_load_explicit(&m->range_count, memory_order_acquire) == 0) return 0;
     const uint64_t mine = atomic_load_explicit(&commit->seq, memory_order_acquire);
@@ -404,7 +429,7 @@ static int mvcc_interval_held_over(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_
         const mvcc_range_hold_t *r = &m->range_holds[i];
         if (!r->in_use || r->owner == commit || r->cf_index != cf_index) continue;
         if (!mvcc_key_in_range(key, key_size, r->lo, r->lo_size, r->hi, r->hi_size)) continue;
-        held = !below_only || mvcc_owner_below(r->owner, mine);
+        held = mvcc_owner_counts(r->owner, commit, mine, order);
     }
     pthread_mutex_unlock(&m->range_lock);
     return held;
@@ -499,7 +524,8 @@ int tidesdb_mvcc_claim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
         const int refused =
             mvcc_claim_refused(m->claim_heads[bucket], claim, first_committer_wins) ||
             (first_committer_wins && claim->kind == TDB_MVCC_CLAIM_WRITE &&
-             mvcc_interval_held_over(m, commit, claim->cf_index, claim->key, claim->key_size, 0));
+             mvcc_interval_held_over(m, commit, claim->cf_index, claim->key, claim->key_size,
+                                     MVCC_ORDER_ANY));
         if (refused)
         {
             pthread_mutex_unlock(lock);
@@ -517,9 +543,9 @@ int tidesdb_mvcc_claim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
 /**
  * mvcc_inflight_meets
  * whether a commit in flight other than the asking one holds a claim on a key inside an interval,
- * under the in-flight list's lock. a write claim counts when its owner is sequenced below the
- * asking commit, or at any sequence when below_only is zero; a read claim counts at any sequence
- * when reads_block is set, since a prepared reader cannot be the one to yield
+ * under the in-flight list's lock. a write claim counts when its owner counts under the order; a
+ * read claim counts at any sequence when reads_block is set, since a prepared reader cannot be the
+ * one to yield
  * @param m the clock
  * @param commit the asking commit
  * @param cf_index the family the interval belongs to
@@ -527,13 +553,13 @@ int tidesdb_mvcc_claim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
  * @param lo_size length of lo
  * @param hi the exclusive upper bound, or NULL with hi_size 0 for open above
  * @param hi_size length of hi
- * @param below_only non-zero to count only write claims of owners sequenced below the asking commit
+ * @param order which owners' write claims count, one of the MVCC_ORDER_ values
  * @param reads_block non-zero when another owner's read claim inside the interval counts
  * @return 1 when such a claim exists, 0 otherwise
  */
 static int mvcc_inflight_meets(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
                                const uint32_t cf_index, const uint8_t *lo, const size_t lo_size,
-                               const uint8_t *hi, const size_t hi_size, const int below_only,
+                               const uint8_t *hi, const size_t hi_size, const int order,
                                const int reads_block)
 {
     const uint64_t mine = atomic_load_explicit(&commit->seq, memory_order_acquire);
@@ -554,7 +580,7 @@ static int mvcc_inflight_meets(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *c
             if (k->kind == TDB_MVCC_CLAIM_READ)
                 inside = reads_block;
             else
-                inside = !below_only || mvcc_owner_below(c, mine);
+                inside = mvcc_owner_counts(c, commit, mine, order);
         }
         met = inside;
     }
@@ -573,13 +599,13 @@ static int mvcc_inflight_meets(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *c
  * @param lo_size length of lo
  * @param hi the exclusive upper bound, or NULL with hi_size 0 for open above
  * @param hi_size length of hi
- * @param below_only non-zero to count only owners sequenced below the asking commit
+ * @param order which owners count, one of the MVCC_ORDER_ values
  * @return 1 when such an interval exists, 0 otherwise
  */
 static int mvcc_interval_meets_holds(const tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
                                      const uint32_t cf_index, const uint8_t *lo,
                                      const size_t lo_size, const uint8_t *hi, const size_t hi_size,
-                                     const int below_only)
+                                     const int order)
 {
     const uint64_t mine = atomic_load_explicit(&commit->seq, memory_order_acquire);
     for (int i = 0; i < TDB_MVCC_MAX_RANGE_RESERVATIONS; i++)
@@ -587,7 +613,7 @@ static int mvcc_interval_meets_holds(const tidesdb_mvcc_t *m, const tidesdb_mvcc
         const mvcc_range_hold_t *r = &m->range_holds[i];
         if (!r->in_use || r->owner == commit || r->cf_index != cf_index) continue;
         if (!mvcc_hold_overlaps(r, lo, lo_size, hi, hi_size)) continue;
-        if (!below_only || mvcc_owner_below(r->owner, mine)) return 1;
+        if (mvcc_owner_counts(r->owner, commit, mine, order)) return 1;
     }
     return 0;
 }
@@ -607,9 +633,9 @@ int tidesdb_mvcc_claim_range(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
     for (int i = 0; i < TDB_MVCC_MAX_RANGE_RESERVATIONS && slot < 0; i++)
         if (!m->range_holds[i].in_use) slot = i;
     /* a full table conflicts rather than letting the commit past unchecked */
-    int held =
-        slot >= 0 && (!first_committer_wins ||
-                      !mvcc_interval_meets_holds(m, commit, cf_index, lo, lo_size, hi, hi_size, 0));
+    int held = slot >= 0 && (!first_committer_wins ||
+                             !mvcc_interval_meets_holds(m, commit, cf_index, lo, lo_size, hi,
+                                                        hi_size, MVCC_ORDER_ANY));
     if (held)
     {
         mvcc_range_hold_t *r = &m->range_holds[slot];
@@ -624,7 +650,7 @@ int tidesdb_mvcc_claim_range(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit,
         /* held first, checked second: a point writer meeting the hold in the same instant is
          * refused, and one that claimed just before it is found here, so one of the two yields */
         if (first_committer_wins &&
-            mvcc_inflight_meets(m, commit, cf_index, lo, lo_size, hi, hi_size, 0, 1))
+            mvcc_inflight_meets(m, commit, cf_index, lo, lo_size, hi, hi_size, MVCC_ORDER_ANY, 1))
         {
             r->in_use = 0;
             atomic_fetch_sub_explicit(&m->range_count, 1, memory_order_release);
@@ -675,7 +701,9 @@ uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
 
 void tidesdb_mvcc_commit_prepared(tidesdb_mvcc_commit_t *commit)
 {
-    if (commit) atomic_store_explicit(&commit->seq, TDB_MVCC_SEQ_FUTURE, memory_order_release);
+    if (!commit) return;
+    atomic_store_explicit(&commit->prepared, 1, memory_order_release);
+    atomic_store_explicit(&commit->seq, TDB_MVCC_SEQ_FUTURE, memory_order_release);
 }
 
 int tidesdb_mvcc_read_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
@@ -699,9 +727,10 @@ int tidesdb_mvcc_read_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *comm
             !mvcc_claim_same_key(o, &probe))
             continue;
         /* one already drawn below this commit is the writer whose version it missed */
-        stale = mvcc_owner_below(o->owner, mine);
+        stale = mvcc_owner_counts(o->owner, commit, mine, MVCC_ORDER_READER);
     }
-    if (!stale) stale = mvcc_interval_held_over(m, commit, cf_index, key, key_size, 1);
+    if (!stale)
+        stale = mvcc_interval_held_over(m, commit, cf_index, key, key_size, MVCC_ORDER_READER);
     pthread_mutex_unlock(lock);
     return stale || walked >= TDB_MVCC_CLAIM_WALK_MAX;
 }
@@ -749,7 +778,7 @@ static int mvcc_reads_meet(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commi
                            const uint32_t cf_index, const uint8_t *lo, const size_t lo_size,
                            const uint8_t *hi, const size_t hi_size, const int point)
 {
-    if (point && atomic_load_explicit(&m->scan_holders, memory_order_acquire) == 0) return 0;
+    if (point && atomic_load_explicit(&m->read_holders, memory_order_acquire) == 0) return 0;
     pthread_mutex_lock(&m->inflight_lock);
     int met = 0;
     uint32_t walked = 0;
@@ -762,6 +791,33 @@ static int mvcc_reads_meet(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commi
     }
     pthread_mutex_unlock(&m->inflight_lock);
     return met || walked >= TDB_MVCC_INFLIGHT_WALK_MAX;
+}
+
+int tidesdb_mvcc_unclaimed_enter(tidesdb_mvcc_t *m, const uint64_t hint)
+{
+    if (!m) return 0;
+    const int shard = (int)(hint % MVCC_UNCLAIMED_SHARDS);
+    atomic_fetch_add_explicit(&m->unclaimed[shard].n, 1, memory_order_seq_cst);
+    return shard;
+}
+
+void tidesdb_mvcc_unclaimed_exit(tidesdb_mvcc_t *m, const int shard)
+{
+    if (m && shard >= 0 && shard < MVCC_UNCLAIMED_SHARDS)
+        atomic_fetch_sub_explicit(&m->unclaimed[shard].n, 1, memory_order_release);
+}
+
+int tidesdb_mvcc_unclaimed_writers(const tidesdb_mvcc_t *m)
+{
+    if (!m) return 0;
+    for (int i = 0; i < MVCC_UNCLAIMED_SHARDS; i++)
+        if (atomic_load_explicit(&m->unclaimed[i].n, memory_order_seq_cst) > 0) return 1;
+    return 0;
+}
+
+int tidesdb_mvcc_reads_held(const tidesdb_mvcc_t *m)
+{
+    return m && atomic_load_explicit(&m->read_holders, memory_order_acquire) > 0;
 }
 
 int tidesdb_mvcc_range_read_held(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
@@ -778,9 +834,10 @@ int tidesdb_mvcc_range_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *com
 {
     if (!m || !commit || !lo) return 0;
     pthread_mutex_lock(&m->range_lock);
-    int stale = mvcc_interval_meets_holds(m, commit, cf_index, lo, lo_size, hi, hi_size, 1);
+    const int order = writing ? MVCC_ORDER_BELOW : MVCC_ORDER_READER;
+    int stale = mvcc_interval_meets_holds(m, commit, cf_index, lo, lo_size, hi, hi_size, order);
     if (!stale)
-        stale = mvcc_inflight_meets(m, commit, cf_index, lo, lo_size, hi, hi_size, 1, writing);
+        stale = mvcc_inflight_meets(m, commit, cf_index, lo, lo_size, hi, hi_size, order, writing);
     pthread_mutex_unlock(&m->range_lock);
     return stale;
 }
@@ -803,7 +860,7 @@ int tidesdb_mvcc_write_blocked(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *c
         if (o->owner != commit && o->kind == TDB_MVCC_CLAIM_READ && mvcc_claim_same_key(o, &probe))
             blocked = 1;
     if (!blocked && first_committer_wins)
-        blocked = mvcc_interval_held_over(m, commit, cf_index, key, key_size, 1);
+        blocked = mvcc_interval_held_over(m, commit, cf_index, key, key_size, MVCC_ORDER_BELOW);
     pthread_mutex_unlock(lock);
     if (!blocked) blocked = mvcc_reads_meet(m, commit, cf_index, key, key_size, NULL, 0, 1);
     return blocked || walked >= TDB_MVCC_CLAIM_WALK_MAX;
@@ -819,4 +876,5 @@ void tidesdb_mvcc_unclaim(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
     commit->n_claims = 0;
     commit->scans = NULL;
     commit->n_scans = 0;
+    atomic_store_explicit(&commit->prepared, 0, memory_order_release);
 }

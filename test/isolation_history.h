@@ -25,6 +25,7 @@
 
 #define HIST_DB_DIR "." PATH_SEPARATOR "test_isolation_history_db"
 #define HIST_CF     "lists"
+#define HIST_CF_B   "lists_b"
 
 /* the key space, the upper part of which range deletes may clear */
 #define HIST_KEYS         12
@@ -43,6 +44,17 @@
 #define HIST_XID_BYTES     16
 #define HIST_XID_FORMAT    "x%d"
 #define HIST_IN_DOUBT_MAX  8
+
+/* a buffer this small rotates the memtable every few commits, so flushes and compactions run
+ * through the whole history and validation reads tables as well as memtables */
+#define HIST_WRITE_BUFFER_SMALL (8u * 1024u)
+
+/* the families a history may spread its keys over, the lower half of the keys in the first and the
+ * upper half, which holds every deletable key, in the second */
+#define HIST_FAMILIES_MAX 2
+
+/* the levels a mixed history draws each attempt's from */
+#define HIST_MIXED_LEVELS 3
 
 /* the fewest commits a history must hold to be checked. the workers stop at the target, but how
  * many attempts reach it depends on the scheduler rather than the engine -- eight threads on two
@@ -93,6 +105,14 @@ enum
  * @param del range deletes of HIST_SPAN deletable keys, each scanning its range first
  * @param two_phase attempts that prepare and then commit or roll back the prepared transaction
  * @param keys how many keys the workload draws from
+ * @param families how many families the keys are spread over, 0 or 1 for one
+ * @param mixed non-zero to begin each attempt at read committed, repeatable read or serializable
+ *              drawn at random, in place of the level the run names
+ * @param small_buffer non-zero for HIST_WRITE_BUFFER_SMALL, so flushes and compactions run
+ *                     through the history
+ * @param linger_us how long a prepared attempt waits before its decision, in microseconds, the time
+ *                  a coordinator takes to collect its other votes; while it waits the prepare holds
+ *                  what it read against every writer
  */
 typedef struct
 {
@@ -101,6 +121,10 @@ typedef struct
     int del;
     int two_phase;
     int keys;
+    int families;
+    int mixed;
+    int small_buffer;
+    int linger_us;
 } hist_mix_t;
 
 /**
@@ -129,12 +153,16 @@ typedef struct
  * hist_txn_t
  * one recorded attempt
  * @param status HIST_COMMITTED, HIST_ABORTED, or HIST_IN_DOUBT until a recovery decides it
+ * @param weak non-zero for an attempt at read committed, whose level permits a read another
+ *             attempt overwrites before it commits, so no read-write edge leaves it and a lost
+ *             update it takes part in is not counted against it
  * @param n how many operations it recorded
  * @param ops the operations in the order it issued them
  */
 typedef struct
 {
     int status;
+    int weak;
     int n;
     hist_op_t ops[HIST_OPS_MAX];
 } hist_txn_t;
@@ -188,8 +216,10 @@ static uint32_t g_elem_pred[HIST_ELEM_MAX];
 static uint32_t g_elem_pos[HIST_ELEM_MAX];
 static uint32_t g_elem_succ[HIST_ELEM_MAX];
 static int g_elem_deleter[HIST_ELEM_MAX];
+static int g_elem_deleter_slot[HIST_ELEM_MAX];
 static uint32_t g_first[HIST_KEYS];
 static int g_generations[HIST_KEYS];
+static int g_strict_starts[HIST_KEYS];
 static int g_deleted[HIST_KEYS];
 static uint32_t g_path[HIST_LIST_MAX];
 static uint64_t g_edge_w[HIST_NODE_MAX][HIST_WORDS];
@@ -236,6 +266,12 @@ static int hist_committed_elem(const uint32_t elem)
            g_hist.txns[hist_slot_of_elem(elem)].status == HIST_COMMITTED;
 }
 
+/* whether the attempt that appended elem ran at a level that permits a lost update */
+static int hist_weak_elem(const uint32_t elem)
+{
+    return elem > 0 && elem < HIST_ELEM_MAX && g_hist.txns[hist_slot_of_elem(elem)].weak;
+}
+
 /* the node of the attempt that appended elem, HIST_NONE when it did not commit */
 static int hist_writer_node(const uint32_t elem)
 {
@@ -264,9 +300,11 @@ static int hist_index(void)
         if (g_hist.txns[s].status == HIST_COMMITTED && nodes < HIST_NODE_MAX)
             g_node_of_slot[s] = nodes++;
     memset(g_elem_succ, 0, sizeof(g_elem_succ));
-    for (int e = 0; e < HIST_ELEM_MAX; e++) g_elem_key[e] = g_elem_deleter[e] = HIST_NONE;
+    for (int e = 0; e < HIST_ELEM_MAX; e++)
+        g_elem_key[e] = g_elem_deleter[e] = g_elem_deleter_slot[e] = HIST_NONE;
     memset(g_first, 0, sizeof(g_first));
     memset(g_generations, 0, sizeof(g_generations));
+    memset(g_strict_starts, 0, sizeof(g_strict_starts));
     memset(g_deleted, 0, sizeof(g_deleted));
     for (int s = 0; s < slots; s++)
     {
@@ -285,7 +323,11 @@ static int hist_index(void)
     return nodes;
 }
 
-/* link each committed append to its predecessor, counting forks as lost updates */
+/* link each committed append to its predecessor, counting forks as lost updates. two appends that
+ * extended the same version each read it, and whichever committed second read it after the first
+ * overwrote it, so a fork between two attempts at levels forbidding a lost update is one whatever
+ * else ran between them; a fork a read-committed attempt took part in may be its own, which its
+ * level permits, and is not counted */
 static void hist_chain(hist_found_t *f)
 {
     for (uint32_t e = 1; e < HIST_ELEM_MAX; e++)
@@ -296,6 +338,7 @@ static void hist_chain(hist_found_t *f)
         if (p == 0)
         {
             if (g_generations[k]++ == 0) g_first[k] = e;
+            g_strict_starts[k] += !hist_weak_elem(e);
             continue;
         }
         if (!hist_committed_elem(p))
@@ -303,13 +346,13 @@ static void hist_chain(hist_found_t *f)
         else if (g_elem_key[p] != k || g_elem_pos[p] + 1 != g_elem_pos[e])
             f->incompatible++;
         else if (g_elem_succ[p] != 0)
-            f->lost++;
+            f->lost += !hist_weak_elem(g_elem_succ[p]) && !hist_weak_elem(e);
         else
             g_elem_succ[p] = e;
     }
     /* a second start of a list no delete ever cleared is an append that missed the first */
     for (int k = 0; k < HIST_KEYS; k++)
-        if (g_generations[k] > 1 && !g_deleted[k]) f->lost += g_generations[k] - 1;
+        if (g_strict_starts[k] > 1 && !g_deleted[k]) f->lost += g_strict_starts[k] - 1;
 }
 
 /* the list ending at elem, collected back through the predecessors; its length, 0 if unplaceable */
@@ -380,12 +423,17 @@ static void hist_edges_from_writes(hist_found_t *f)
             {
                 const hist_op_t *seen = hist_deleted_version(t, i, k);
                 if (!seen || seen->len == 0 || !hist_committed_elem(seen->last)) continue;
-                if (g_elem_succ[seen->last] != 0 || g_elem_deleter[seen->last] != HIST_NONE)
+                const uint32_t v = seen->last;
+                if (g_elem_succ[v] != 0 || g_elem_deleter[v] != HIST_NONE)
                 {
-                    f->lost++;
+                    const int other_weak = g_elem_succ[v] != 0
+                                               ? hist_weak_elem(g_elem_succ[v])
+                                               : g_hist.txns[g_elem_deleter_slot[v]].weak;
+                    f->lost += !t->weak && !other_weak;
                     continue;
                 }
-                g_elem_deleter[seen->last] = g_node_of_slot[s];
+                g_elem_deleter[v] = g_node_of_slot[s];
+                g_elem_deleter_slot[v] = s;
                 hist_set(g_edge_w, hist_writer_node(seen->last), g_node_of_slot[s]);
             }
         }
@@ -397,11 +445,14 @@ static void hist_edges_from_read(hist_found_t *f, const int node, const int slot
 {
     const hist_op_t *op = &g_hist.txns[slot].ops[i];
     const int k = op->key;
+    /* a read committed attempt may read what another overwrites before it commits, so no read-write
+     * edge leaves it; its write and write-read edges still count, since its level forbids g1c */
+    const int rw = !g_hist.txns[slot].weak;
     if (!hist_observation_placed(f, k, op)) return;
     if (op->len == 0)
     {
         /* an empty list read before a key's only start, when no delete could have emptied it */
-        if (!g_deleted[k] && g_generations[k] == 1)
+        if (rw && !g_deleted[k] && g_generations[k] == 1)
             hist_set(g_edge_rw, node, hist_writer_node(g_first[k]));
         return;
     }
@@ -409,6 +460,7 @@ static void hist_edges_from_read(hist_found_t *f, const int node, const int slot
     if (w != node && hist_appends_later(hist_slot_of_elem(op->last), hist_op_of_elem(op->last), k))
         f->g1b++;
     hist_set(g_edge_w, w, node);
+    if (!rw) return;
     const uint32_t next = g_elem_succ[op->last];
     if (next != 0) hist_set(g_edge_rw, node, hist_writer_node(next));
     if (g_elem_deleter[op->last] != HIST_NONE) hist_set(g_edge_rw, node, g_elem_deleter[op->last]);
@@ -431,20 +483,27 @@ static void hist_build_graph(hist_found_t *f)
     }
 }
 
-/* no final list holds an aborted element, and every key no delete touched ends in the list its
- * version order builds */
+/* no final list holds an aborted element, and every key no delete touched ends in a list its
+ * version order builds, ending at a version nothing extended. the list is followed back from its
+ * end rather than forward from its start, since a read-committed attempt may fork a list, which its
+ * level permits, and the final list may then be either branch */
 static void hist_check_final(hist_found_t *f)
 {
     for (int k = 0; k < HIST_KEYS; k++)
     {
-        for (uint32_t i = 0; i < g_hist.final_len[k] && i < HIST_LIST_MAX; i++)
+        const uint32_t len = g_hist.final_len[k];
+        for (uint32_t i = 0; i < len && i < HIST_LIST_MAX; i++)
             if (!hist_committed_elem(g_hist.final[k][i])) f->g1a++;
         if (g_deleted[k]) continue;
-        uint32_t len = 0;
-        for (uint32_t e = g_first[k]; e != 0 && len < HIST_LIST_MAX; e = g_elem_succ[e])
-            g_path[len++] = e;
-        if (len != g_hist.final_len[k] ||
-            hist_digest(g_path, len) != hist_digest(g_hist.final[k], len))
+        if (len == 0)
+        {
+            f->incompatible += g_generations[k] > 0;
+            continue;
+        }
+        const uint32_t last = g_hist.final[k][len - 1];
+        if (!hist_committed_elem(last)) continue;
+        if (g_elem_key[last] != k || g_elem_pos[last] + 1 != len || hist_path_to(last) != len ||
+            hist_digest(g_path, len) != hist_digest(g_hist.final[k], len) || g_elem_succ[last] != 0)
             f->incompatible++;
     }
 }
@@ -678,23 +737,39 @@ static int hist_do_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, hist_
     return rc;
 }
 
-/* one drawn action; a scan or a delete that no longer fits in the attempt's record is a read */
-static int hist_do_action(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, hist_txn_t *t,
+/* how many families a mix spreads its keys over */
+static int hist_families(const hist_mix_t *mix)
+{
+    return mix->families > 1 ? HIST_FAMILIES_MAX : 1;
+}
+
+/* the family a key lives in, the lower half of the keys in the first when there are two */
+static int hist_family_of(const hist_mix_t *mix, const int key)
+{
+    return hist_families(mix) > 1 && key >= mix->keys / HIST_FAMILIES_MAX ? 1 : 0;
+}
+
+/* one drawn action; a scan or a delete that no longer fits in the attempt's record is a read. a
+ * scan stays inside one family, and the deletable keys all lie in the last */
+static int hist_do_action(tidesdb_txn_t *txn, tidesdb_column_family_t *const *cfs, hist_txn_t *t,
                           const int slot, const hist_mix_t *mix, uint64_t *rng)
 {
     const int roll = (int)(hist_rng(rng) % HIST_PERCENT);
     const int key = (int)(hist_rng(rng) % (uint64_t)mix->keys);
     const int room = t->n + HIST_SPAN + 1 <= HIST_OPS_MAX;
     const int del_keys = mix->keys - HIST_DELETE_FIRST - HIST_SPAN + 1;
+    tidesdb_column_family_t *cf = cfs[hist_family_of(mix, key)];
     if (roll < mix->scan && room)
     {
-        const int lo = (int)(hist_rng(rng) % (uint64_t)(mix->keys - HIST_SPAN + 1));
+        const int span = mix->keys / hist_families(mix);
+        const int base = hist_family_of(mix, key) * span;
+        const int lo = base + (int)(hist_rng(rng) % (uint64_t)(span - HIST_SPAN + 1));
         return hist_do_scan(txn, cf, t, lo, lo + HIST_SPAN);
     }
     if (roll < mix->scan + mix->del && room && del_keys > 0)
     {
         const int lo = HIST_DELETE_FIRST + (int)(hist_rng(rng) % (uint64_t)del_keys);
-        return hist_do_delete(txn, cf, t, lo, lo + HIST_SPAN);
+        return hist_do_delete(txn, cfs[hist_family_of(mix, lo)], t, lo, lo + HIST_SPAN);
     }
     if (roll < mix->scan + mix->del + mix->read || t->n + 1 > HIST_OPS_MAX)
         return t->n + 1 <= HIST_OPS_MAX ? hist_do_read(txn, cf, t, key) : TDB_SUCCESS;
@@ -703,7 +778,7 @@ static int hist_do_action(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, hist_
 
 /* decide an attempt in two phases, or leave it prepared for a recovery when that is still wanted */
 static int hist_two_phase(tidesdb_txn_t *txn, hist_txn_t *t, const int slot, uint64_t *rng,
-                          const int leave_in_doubt)
+                          const int leave_in_doubt, const int linger_us)
 {
     char xid[HIST_XID_BYTES];
     snprintf(xid, sizeof(xid), HIST_XID_FORMAT, slot);
@@ -718,6 +793,7 @@ static int hist_two_phase(tidesdb_txn_t *txn, hist_txn_t *t, const int slot, uin
         t->status = HIST_IN_DOUBT;
         return TDB_ERR_TXN_ABORTED;
     }
+    if (linger_us > 0) (void)usleep((useconds_t)linger_us);
     if (hist_rng(rng) % 2 == 0)
     {
         (void)tidesdb_txn_rollback_prepared(txn);
@@ -730,8 +806,8 @@ static int hist_two_phase(tidesdb_txn_t *txn, hist_txn_t *t, const int slot, uin
  * hist_worker_t
  * what one recording thread runs against
  * @param db the database
- * @param cf the family the lists live in
- * @param iso the isolation level every attempt begins at
+ * @param cfs the families the lists live in
+ * @param iso the isolation level every attempt begins at, unless the mix draws one per attempt
  * @param seed the thread's generator seed
  * @param mix the actions the attempts draw
  * @param target the committed count at which the thread stops
@@ -742,7 +818,7 @@ static int hist_two_phase(tidesdb_txn_t *txn, hist_txn_t *t, const int slot, uin
 typedef struct
 {
     tidesdb_t *db;
-    tidesdb_column_family_t *cf;
+    tidesdb_column_family_t *cfs[HIST_FAMILIES_MAX];
     int iso;
     uint64_t seed;
     hist_mix_t mix;
@@ -754,19 +830,23 @@ typedef struct
 /* one attempt recorded into its slot; an attempt the store refuses or fails is recorded aborted */
 static void hist_run_attempt(const hist_worker_t *w, uint64_t *rng, const int slot)
 {
+    static const int levels[HIST_MIXED_LEVELS] = {
+        TDB_ISOLATION_READ_COMMITTED, TDB_ISOLATION_REPEATABLE_READ, TDB_ISOLATION_SERIALIZABLE};
+    const int iso = w->mix.mixed ? levels[hist_rng(rng) % HIST_MIXED_LEVELS] : w->iso;
     hist_txn_t *t = &g_hist.txns[slot];
     t->status = HIST_ABORTED;
+    t->weak = iso <= TDB_ISOLATION_READ_COMMITTED;
     t->n = 0;
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin_with_isolation(w->db, (tidesdb_isolation_level_t)w->iso, &txn) !=
+    if (tidesdb_txn_begin_with_isolation(w->db, (tidesdb_isolation_level_t)iso, &txn) !=
         TDB_SUCCESS)
         return;
     int rc = TDB_SUCCESS;
     for (int i = 0; i < HIST_ACTIONS && rc == TDB_SUCCESS; i++)
-        rc = hist_do_action(txn, w->cf, t, slot, &w->mix, rng);
+        rc = hist_do_action(txn, w->cfs, t, slot, &w->mix, rng);
     if (rc == TDB_SUCCESS)
         rc = (int)(hist_rng(rng) % HIST_PERCENT) < w->mix.two_phase
-                 ? hist_two_phase(txn, t, slot, rng, w->leave_in_doubt)
+                 ? hist_two_phase(txn, t, slot, rng, w->leave_in_doubt, w->mix.linger_us)
                  : tidesdb_txn_commit(txn);
     if (rc == TDB_SUCCESS)
     {
@@ -792,28 +872,34 @@ static void *hist_worker(void *arg)
     return NULL;
 }
 
-/* open the database of a history, fresh when asked, and its family */
-static void hist_open(const int fresh, tidesdb_t **db, tidesdb_column_family_t **cf)
+/* open the database of a history, fresh when asked, and the families its mix spreads keys over */
+static void hist_open(const int fresh, const hist_mix_t *mix, tidesdb_t **db,
+                      tidesdb_column_family_t **cfs)
 {
+    static const char *names[HIST_FAMILIES_MAX] = {HIST_CF, HIST_CF_B};
     if (fresh) (void)remove_directory(HIST_DB_DIR);
     static char path[] = HIST_DB_DIR;
     tidesdb_config_t cfg = tidesdb_default_config();
     cfg.db_path = path;
-    cfg.memtable_write_buffer_size = HIST_WRITE_BUFFER;
+    cfg.memtable_write_buffer_size =
+        mix->small_buffer ? HIST_WRITE_BUFFER_SMALL : HIST_WRITE_BUFFER;
     cfg.log_level = TDB_LOG_WARN;
     ASSERT_EQ(tidesdb_open(&cfg, db), TDB_SUCCESS);
-    if (fresh)
+    for (int i = 0; i < hist_families(mix); i++)
     {
-        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
-        ASSERT_EQ(tidesdb_create_column_family(*db, HIST_CF, &cc), TDB_SUCCESS);
+        if (fresh)
+        {
+            tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+            ASSERT_EQ(tidesdb_create_column_family(*db, names[i], &cc), TDB_SUCCESS);
+        }
+        cfs[i] = tidesdb_get_column_family(*db, names[i]);
+        ASSERT_TRUE(cfs[i] != NULL);
     }
-    *cf = tidesdb_get_column_family(*db, HIST_CF);
-    ASSERT_TRUE(*cf != NULL);
 }
 
 /* run the workers against an open database until the committed count reaches target or the slots
  * reach slot_limit */
-static void hist_run(tidesdb_t *db, tidesdb_column_family_t *cf, const int iso,
+static void hist_run(tidesdb_t *db, tidesdb_column_family_t *const *cfs, const int iso,
                      const hist_mix_t *mix, const int target, const int slot_limit,
                      const int leave_in_doubt)
 {
@@ -823,7 +909,7 @@ static void hist_run(tidesdb_t *db, tidesdb_column_family_t *cf, const int iso,
     {
         w[i] =
             (hist_worker_t){.db = db,
-                            .cf = cf,
+                            .cfs = {cfs[0], cfs[hist_families(mix) - 1]},
                             .iso = iso,
                             .mix = *mix,
                             .target = target,
@@ -836,12 +922,15 @@ static void hist_run(tidesdb_t *db, tidesdb_column_family_t *cf, const int iso,
 }
 
 /* read every key's final list once every attempt has finished */
-static void hist_read_final(tidesdb_t *db, tidesdb_column_family_t *cf)
+static void hist_read_final(tidesdb_t *db, tidesdb_column_family_t *const *cfs,
+                            const hist_mix_t *mix)
 {
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn), TDB_SUCCESS);
     for (int k = 0; k < HIST_KEYS; k++)
-        ASSERT_EQ(hist_read_list(txn, cf, k, g_hist.final[k], &g_hist.final_len[k]), TDB_SUCCESS);
+        ASSERT_EQ(hist_read_list(txn, cfs[hist_family_of(mix, k)], k, g_hist.final[k],
+                                 &g_hist.final_len[k]),
+                  TDB_SUCCESS);
     ASSERT_EQ(tidesdb_txn_rollback(txn), TDB_SUCCESS);
     tidesdb_txn_free(txn);
 }
@@ -851,10 +940,10 @@ static void hist_record(const int iso, const hist_mix_t *mix)
 {
     memset(&g_hist, 0, sizeof(g_hist));
     tidesdb_t *db = NULL;
-    tidesdb_column_family_t *cf = NULL;
-    hist_open(1, &db, &cf);
-    hist_run(db, cf, iso, mix, HIST_COMMIT_TARGET, HIST_ATTEMPT_MAX, 0);
-    hist_read_final(db, cf);
+    tidesdb_column_family_t *cfs[HIST_FAMILIES_MAX] = {NULL};
+    hist_open(1, mix, &db, cfs);
+    hist_run(db, cfs, iso, mix, HIST_COMMIT_TARGET, HIST_ATTEMPT_MAX, 0);
+    hist_read_final(db, cfs, mix);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(HIST_DB_DIR);
 }

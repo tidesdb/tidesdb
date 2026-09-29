@@ -14,6 +14,12 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+/* the keys the mixed-level histories below use */
+#define HIST_SYN_READ_KEY  0
+#define HIST_SYN_WRITE_KEY 1
+#define HIST_SYN_FORK_KEY  2
+#define HIST_SYN_START_KEY 3
+
 /* the point workload, half reads and half appends over a few keys so that transactions contend */
 #define HIST_POINT_READ_PERCENT 50
 
@@ -41,6 +47,14 @@ static uint32_t hist_add_append(const int slot, const int key, const uint32_t *r
     op->elem = (uint32_t)(slot * HIST_OPS_MAX + t->n + 1);
     t->n++;
     return op->elem;
+}
+
+/* add a committed attempt at read committed and return its slot */
+static int hist_add_weak_txn(void)
+{
+    const int slot = hist_add_txn(HIST_COMMITTED);
+    g_hist.txns[slot].weak = 1;
+    return slot;
 }
 
 static void hist_add_read(const int slot, const int key, const uint32_t *list, const uint32_t len)
@@ -207,6 +221,64 @@ void test_isolation_history_checker_accepts_a_list_started_again(void)
 }
 
 /* a history with no anomaly reports none */
+/* a strict attempt that read a key a read-committed attempt then overwrote, and wrote after that
+ * attempt on another key, is on a cycle through its own read-write edge -- the shape a prepare at
+ * serializable takes when a read-committed writer changes what it read while it is in doubt */
+void test_isolation_history_checker_counts_a_strict_read_overtaken_by_a_weak_writer(void)
+{
+    hist_synthetic_reset();
+    const int base = hist_add_txn(HIST_COMMITTED);
+    const uint32_t a = hist_add_append(base, HIST_SYN_READ_KEY, NULL, 0);
+    const uint32_t c = hist_add_append(base, HIST_SYN_WRITE_KEY, NULL, 0);
+    const int weak = hist_add_weak_txn();
+    const uint32_t w0 = hist_add_append(weak, HIST_SYN_READ_KEY, &a, 1);
+    const uint32_t w1 = hist_add_append(weak, HIST_SYN_WRITE_KEY, &c, 1);
+    const int strict = hist_add_txn(HIST_COMMITTED);
+    hist_add_read(strict, HIST_SYN_READ_KEY, &a, 1);
+    const uint32_t cw[] = {c, w1};
+    const uint32_t s1 = hist_add_append(strict, HIST_SYN_WRITE_KEY, cw, 2);
+    const uint32_t k0[] = {a, w0}, k1[] = {c, w1, s1};
+    hist_set_final(HIST_SYN_READ_KEY, k0, 2);
+    hist_set_final(HIST_SYN_WRITE_KEY, k1, 3);
+    const hist_found_t f = hist_check();
+    ASSERT_TRUE(f.cycles >= 1);
+}
+
+/* what read committed permits is not counted against it: a stale read of its own closes no cycle,
+ * and a fork or a second start of a list one of its appends took part in is its own lost update.
+ * the same fork between two strict attempts still counts */
+void test_isolation_history_checker_permits_what_read_committed_permits(void)
+{
+    hist_synthetic_reset();
+    const int base = hist_add_txn(HIST_COMMITTED);
+    const uint32_t a = hist_add_append(base, HIST_SYN_READ_KEY, NULL, 0);
+    const uint32_t c = hist_add_append(base, HIST_SYN_WRITE_KEY, NULL, 0);
+    const uint32_t q = hist_add_append(base, HIST_SYN_FORK_KEY, NULL, 0);
+    const int strict = hist_add_txn(HIST_COMMITTED);
+    const uint32_t s0 = hist_add_append(strict, HIST_SYN_READ_KEY, &a, 1);
+    const uint32_t s1 = hist_add_append(strict, HIST_SYN_WRITE_KEY, &c, 1);
+    const uint32_t y = hist_add_append(strict, HIST_SYN_FORK_KEY, &q, 1);
+    const uint32_t r2 = hist_add_append(strict, HIST_SYN_START_KEY, NULL, 0);
+    const int weak = hist_add_weak_txn();
+    hist_add_read(weak, HIST_SYN_READ_KEY, &a, 1);
+    const uint32_t cs[] = {c, s1};
+    const uint32_t w1 = hist_add_append(weak, HIST_SYN_WRITE_KEY, cs, 2);
+    (void)hist_add_append(weak, HIST_SYN_FORK_KEY, &q, 1);
+    (void)hist_add_append(weak, HIST_SYN_START_KEY, NULL, 0);
+    const uint32_t k0[] = {a, s0}, k1[] = {c, s1, w1}, k2[] = {q, y}, k3[] = {r2};
+    hist_set_final(HIST_SYN_READ_KEY, k0, 2);
+    hist_set_final(HIST_SYN_WRITE_KEY, k1, 3);
+    hist_set_final(HIST_SYN_FORK_KEY, k2, 2);
+    hist_set_final(HIST_SYN_START_KEY, k3, 1);
+    hist_found_t f = hist_check();
+    ASSERT_EQ(hist_total(&f), 0);
+
+    g_hist.txns[weak].weak = 0;
+    f = hist_check();
+    ASSERT_TRUE(f.lost >= 2);
+    ASSERT_TRUE(f.cycles >= 1);
+}
+
 void test_isolation_history_checker_accepts_a_serial_history(void)
 {
     hist_synthetic_reset();
@@ -282,6 +354,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_isolation_history_checker_finds_lost_updates, tests_passed);
     RUN_TEST(test_isolation_history_checker_orders_range_deletes, tests_passed);
     RUN_TEST(test_isolation_history_checker_accepts_a_list_started_again, tests_passed);
+    RUN_TEST(test_isolation_history_checker_counts_a_strict_read_overtaken_by_a_weak_writer,
+             tests_passed);
+    RUN_TEST(test_isolation_history_checker_permits_what_read_committed_permits, tests_passed);
     RUN_TEST(test_isolation_history_checker_accepts_a_serial_history, tests_passed);
     RUN_TEST(test_isolation_history_read_committed_reads_only_committed_states, tests_passed);
     RUN_TEST(test_isolation_history_snapshot_forbids_g_single, tests_passed);

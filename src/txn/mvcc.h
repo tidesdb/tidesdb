@@ -26,11 +26,12 @@
  * asked about */
 #define TDB_MVCC_COMMIT_RING_SIZE 65536
 
-/* the in-flight claim set. every commit at repeatable read and above claims the keys it writes
- * before it draws its sequence and validates after, and a prepare keeps its claims until phase two
- * decides it. a claim is a node the committer owns, chained from the bucket its key hashes to and
- * compared by bytes, so the set has no capacity of its own and never mistakes one key for another.
- * the chains are guarded by striped locks; a stripe is a set of buckets sharing one */
+/* the in-flight claim set. every commit at repeatable read and above, and every prepare, claims
+ * the keys it writes before it draws its sequence and validates after, and a prepare keeps its
+ * claims until phase two decides it. a claim is a node the committer owns, chained from the bucket
+ * its key hashes to and compared by bytes, so the set has no capacity of its own and never mistakes
+ * one key for another. the chains are guarded by striped locks; a stripe is a set of buckets
+ * sharing one */
 #define TDB_MVCC_CLAIM_BUCKETS ((uint32_t)1 << 18)
 #define TDB_MVCC_CLAIM_STRIPES ((uint32_t)1 << 12)
 
@@ -98,6 +99,11 @@ typedef struct
  *                      interval is checked against
  * @param held non-zero while the commit is in flight -- from the claim call to the release --
  *             whether or not it holds any key, since it may hold intervals alone
+ * @param prepared non-zero from the prepare until the release, through phase two; a prepare that
+ *                 validates its reads counts a prepared owner's write claim against itself whatever
+ *                 sequence that owner has drawn
+ * @param reads_held non-zero while the commit is in flight holding a read claim or a scanned
+ *                   interval, which the clock counts so a writer that finds none checks nothing
  * @param scans the intervals a prepare scanned, borrowed and kept in place until the release, or
  *              NULL; a writer inside one is refused for as long as the commit is in flight, since
  *              the prepare's position is not decided until its phase two
@@ -110,6 +116,8 @@ struct tidesdb_mvcc_commit
     int n_claims;
     tidesdb_mvcc_commit_t *next_inflight;
     int held;
+    _Atomic(int) prepared;
+    int reads_held;
     const tidesdb_mvcc_range_t *scans;
     int n_scans;
 };
@@ -314,8 +322,10 @@ uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit);
  * mark a commit's claims and intervals as belonging to a prepared batch, whose commit will come at
  * a sequence above everything current. a reader of one of its keys is serialized before it and its
  * read stands; a writer of one still meets its write claims, and a writer of a key it read meets
- * its read claims. phase two draws through the same record, which places the batch at the sequence
- * drawn, and a phase two that fails marks it prepared again
+ * its read claims, and another prepare that read one of its keys meets its write claims whatever
+ * the two draw, since phase two decides which of them lands first. phase two draws through the same
+ * record, which places the batch at the sequence drawn, and a phase two that fails marks it
+ * prepared again
  * @param commit the record of the prepared batch
  */
 void tidesdb_mvcc_commit_prepared(tidesdb_mvcc_commit_t *commit);
@@ -358,6 +368,46 @@ int tidesdb_mvcc_read_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *comm
 int tidesdb_mvcc_range_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commit,
                              uint32_t cf_index, const uint8_t *lo, size_t lo_size,
                              const uint8_t *hi, size_t hi_size, int writing);
+
+/**
+ * tidesdb_mvcc_unclaimed_enter
+ * count a commit that writes without claims, before it draws its sequence. validation asks the
+ * claims before the store because a claimed writer releases only once its version is in the store;
+ * one without claims is in neither while it applies, so a validating commit drawn above it waits
+ * for its sequence to be decided, and finds it through this count
+ * @param m the clock
+ * @param hint any value that differs between concurrent committers, which spreads them over the
+ *             count's shards
+ * @return the shard counted, to hand back to tidesdb_mvcc_unclaimed_exit
+ */
+int tidesdb_mvcc_unclaimed_enter(tidesdb_mvcc_t *m, uint64_t hint);
+
+/**
+ * tidesdb_mvcc_unclaimed_exit
+ * uncount a commit tidesdb_mvcc_unclaimed_enter counted, once its sequence is marked
+ * @param m the clock
+ * @param shard the shard the enter returned
+ */
+void tidesdb_mvcc_unclaimed_exit(tidesdb_mvcc_t *m, int shard);
+
+/**
+ * tidesdb_mvcc_unclaimed_writers
+ * whether a commit writing without claims is between its draw and its decision, asked by a
+ * validating commit after its own draw; one counted before a draw below this commit's is found
+ * @param m the clock
+ * @return 1 when one is, 0 otherwise
+ */
+int tidesdb_mvcc_unclaimed_writers(const tidesdb_mvcc_t *m);
+
+/**
+ * tidesdb_mvcc_reads_held
+ * whether any commit in flight holds a read claim or a scanned interval, asked by a commit that
+ * takes no claims after its draw, so that one finding none has nothing a prepare read to check. a
+ * prepare counts itself before its draw, so a commit drawn above it finds the count raised
+ * @param m the clock
+ * @return 1 when one does, 0 otherwise
+ */
+int tidesdb_mvcc_reads_held(const tidesdb_mvcc_t *m);
 
 /**
  * tidesdb_mvcc_range_read_held

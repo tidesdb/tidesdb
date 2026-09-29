@@ -114,7 +114,8 @@ static void hist_resolve_in_doubt(tidesdb_t *db, uint64_t *rng)
  * claims into the restart without stalling a concurrent workload behind them */
 static void hist_leave_prepares_in_doubt(tidesdb_t *db, tidesdb_column_family_t *cf, const int iso)
 {
-    hist_worker_t w = {.db = db, .cf = cf, .iso = iso, .mix = g_ops_mix, .leave_in_doubt = 1};
+    hist_worker_t w = {
+        .db = db, .cfs = {cf, cf}, .iso = iso, .mix = g_ops_mix, .leave_in_doubt = 1};
     w.mix.two_phase = HIST_RECOVERY_ALWAYS_PREPARE;
     w.mix.del = 0;
     uint64_t rng = HIST_RECOVERY_SEED;
@@ -144,21 +145,23 @@ void test_isolation_history_ops_serializable_across_a_restart_with_prepares_in_d
     const int iso = TDB_ISOLATION_SERIALIZABLE;
     memset(&g_hist, 0, sizeof(g_hist));
     tidesdb_t *db = NULL;
-    tidesdb_column_family_t *cf = NULL;
-    hist_open(1, &db, &cf);
-    hist_run(db, cf, iso, &g_ops_mix, HIST_COMMIT_TARGET / HIST_RECOVERY_PHASES,
+    tidesdb_column_family_t *cfs[HIST_FAMILIES_MAX] = {NULL};
+    hist_open(1, &g_ops_mix, &db, cfs);
+    tidesdb_column_family_t *cf = cfs[0];
+    hist_run(db, cfs, iso, &g_ops_mix, HIST_COMMIT_TARGET / HIST_RECOVERY_PHASES,
              HIST_RECOVERY_FIRST_SLOTS, 0);
     hist_leave_prepares_in_doubt(db, cf, iso);
     const int left = hist_count_in_doubt();
     ASSERT_TRUE(left > 0);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
-    hist_open(0, &db, &cf);
+    hist_open(0, &g_ops_mix, &db, cfs);
+    cf = cfs[0];
     uint64_t rng = HIST_RECOVERY_SEED;
     hist_resolve_in_doubt(db, &rng);
     ASSERT_EQ(hist_count_in_doubt(), 0);
-    hist_run(db, cf, iso, &g_ops_mix, HIST_COMMIT_TARGET, HIST_ATTEMPT_MAX, 0);
-    hist_read_final(db, cf);
+    hist_run(db, cfs, iso, &g_ops_mix, HIST_COMMIT_TARGET, HIST_ATTEMPT_MAX, 0);
+    hist_read_final(db, cfs, &g_ops_mix);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(HIST_DB_DIR);
 

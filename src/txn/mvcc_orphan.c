@@ -92,7 +92,7 @@ static mvcc_orphan_t *mvcc_orphan_copy(const tidesdb_mvcc_commit_t *commit)
     o->commit.n_claims = o->n;
     o->commit.scans = o->scans;
     o->commit.n_scans = o->n_scans;
-    atomic_store_explicit(&o->commit.seq, TDB_MVCC_SEQ_FUTURE, memory_order_release);
+    tidesdb_mvcc_commit_prepared(&o->commit);
     return o;
 }
 
@@ -112,6 +112,8 @@ static void mvcc_inflight_replace(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *comm
     commit->next_inflight = NULL;
     commit->held = 0;
     with->held = 1;
+    with->reads_held = commit->reads_held;
+    commit->reads_held = 0;
     pthread_mutex_unlock(&m->inflight_lock);
 }
 

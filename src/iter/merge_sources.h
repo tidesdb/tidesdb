@@ -32,6 +32,40 @@
  */
 void sstable_merge_source(sstable_iter_t *it, merge_source_t *out);
 
+/**
+ * level_merge_source_t
+ * one level below L1 read as a single source, a run of sstables sorted by key that never overlap,
+ * with one of its cursors positioned at a time
+ * @param ssts the run's sstables in key order, borrowed
+ * @param iters one cursor per sstable, parallel to ssts, borrowed
+ * @param n how many
+ * @param cur the positioned table, -1 before the first and n past the last
+ * @param failed non-zero when a read in the run failed since the last seek, so the merge learns of
+ * it however the walk moved on
+ */
+typedef struct
+{
+    sstable_t *const *ssts;
+    sstable_iter_t *const *iters;
+    int n;
+    int cur;
+    int failed;
+} level_merge_source_t;
+
+/**
+ * level_merge_source
+ * fill a merge source that reads a whole level below L1 as one, descending only the table that can
+ * hold a sought key and stepping from table to table across their boundaries; the tables must be
+ * sorted by key and must not overlap, which every level below L1 guarantees
+ * @param s the state to keep, owned by the caller and kept in place for the source's life
+ * @param ssts the level's sstables in key order
+ * @param iters one cursor per sstable, parallel to ssts
+ * @param n how many, at least one
+ * @param out the source to fill
+ */
+void level_merge_source(level_merge_source_t *s, sstable_t *const *ssts,
+                        sstable_iter_t *const *iters, int n, merge_source_t *out);
+
 /* stack room for the prefixed form of a key while a memtable view is asked about its intervals */
 #define MERGE_SOURCE_PREFIXED_KEY_STACK 128
 

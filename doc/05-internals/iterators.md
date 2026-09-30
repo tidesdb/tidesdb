@@ -121,6 +121,17 @@ level — deeper levels are binary-searched — the cost is that it is paid once
 along with the epoch enter and exit that make the layout safe to read.
 :::
 
+A level below L1 is also read as **one source**, not one per table. Its tables are sorted by key and
+never overlap, so a key can live in at most one of them. The level's source binary-searches the run
+for that table and descends it alone on a seek, and a step that runs off the end of one table
+carries on into its neighbour in either direction. With a source per table, a seek positioned every
+table in every level, and an equality lookup through a long-lived iterator, the shape a table
+handler uses for a secondary index, paid one tree descent per table on every lookup. On a family of
+42 tables across two levels that was the difference between 152,000 and 446,000 seeks a second on
+one thread. A level's source still asks every table it holds about range deletes, since an interval
+a table carries is not bounded by that table's own keys. L1 tables may overlap, so each stays a
+source of its own.
+
 The bound is a **contract, not a fence**: the iterator's results are defined only inside the range
 it was given, because the sources that could answer outside it were never opened. A caller that
 seeks past its own bound is asking a question the iterator was not built to answer.
@@ -217,6 +228,7 @@ that always returns both.
 | A read resolves against its snapshot; a compaction reads raw | A compaction decides retention across the whole version chain, which a resolved stream has already discarded |
 | A compaction writes tombstones to its output | They shadow older versions in levels the merge did not include; dropping one resurrects the deleted key |
 | A direction change re-seeks every source | Exhausted sources hold entries behind the position |
+| A level below L1 is one source | Its tables never overlap, so a seek descends the one table that can hold the key; a source per table descended all of them |
 | Sources stay pinned for the iterator's life | A compaction may replace a layout mid-scan |
 | A bounded iterator answers only inside its bounds | Sources outside the range were never opened, so a key beyond it may have no source that holds it |
 | The snapshot is fixed for the iterator's life | Stability is the guarantee an iterator makes; which snapshot it is comes from the isolation level, but it does not move once chosen |

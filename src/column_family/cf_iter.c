@@ -37,11 +37,14 @@ struct cf_iter
     int n_mts;
     skip_list_cursor_t **cursors;   /* one per memtable */
     memtable_merge_source_t *views; /* one per memtable */
-    sstable_t **ssts;               /* referenced sstables */
+    sstable_t **ssts; /* referenced sstables, level by level, deep levels in key order */
+    int *levels;      /* the level of each sstable, parallel to ssts */
     int n_ssts;
     sstable_iter_t **iters;          /* one per sstable */
+    level_merge_source_t *runs;      /* one per level below L1 read as a single source */
     writeset_merge_source_t *ws_src; /* optional read-your-own-writes overlay, owned, freed here */
-    merge_source_t *sources;         /* ws overlay, then n_mts memtables, then n_ssts sstables */
+    merge_source_t
+        *sources; /* ws overlay, then n_mts memtables, then L1 sstables and deeper levels */
     merge_iter_t *merge;
 };
 
@@ -111,7 +114,13 @@ static int cf_iter_collect_ssts_in_range(cf_iter_t *it, cf_t *cf, const cf_iter_
             return TDB_SUCCESS;
         }
         sstable_t **arr = malloc((size_t)cap * sizeof(*arr));
-        if (!arr) return TDB_ERR_MEMORY;
+        int *levels = malloc((size_t)cap * sizeof(*levels));
+        if (!arr || !levels)
+        {
+            free(arr);
+            free(levels);
+            return TDB_ERR_MEMORY;
+        }
 
         it->ssts = arr;
         int n = 0, rc = TDB_SUCCESS;
@@ -122,10 +131,11 @@ static int cf_iter_collect_ssts_in_range(cf_iter_t *it, cf_t *cf, const cf_iter_
             if (got < 0)
                 rc = got;
             else
-                n += got;
+                for (int i = 0; i < got; i++) levels[n++] = level;
         }
         if (rc == TDB_SUCCESS)
         {
+            it->levels = levels;
             it->n_ssts = n;
             return TDB_SUCCESS;
         }
@@ -133,6 +143,7 @@ static int cf_iter_collect_ssts_in_range(cf_iter_t *it, cf_t *cf, const cf_iter_
         for (int i = 0; i < n; i++)
             if (sstable_unref(it->ssts[i])) sstable_close(it->ssts[i]);
         free(arr);
+        free(levels);
         it->ssts = NULL;
         it->n_ssts = 0;
         if (rc != TDB_ERR_BUSY) return rc;
@@ -140,11 +151,11 @@ static int cf_iter_collect_ssts_in_range(cf_iter_t *it, cf_t *cf, const cf_iter_
     return TDB_ERR_BUSY;
 }
 
-/* reference the column family's sstables into the iterator, growing the array if a compaction raced
- */
+/* reference the column family's sstables into the iterator with the level of each, from one layout,
+ * growing the arrays if a compaction raced the sizing */
 static int cf_iter_collect_ssts(cf_iter_t *it, cf_t *cf)
 {
-    int total = level_set_collect_all(cf->levels, NULL, 0);
+    int total = level_set_snapshot(cf->levels, NULL, 0);
     for (int tries = 0; tries < CF_ITER_MAX_RETRY; tries++)
     {
         if (total <= 0)
@@ -153,19 +164,64 @@ static int cf_iter_collect_ssts(cf_iter_t *it, cf_t *cf)
             it->n_ssts = 0;
             return TDB_SUCCESS;
         }
-        sstable_t **arr = malloc((size_t)total * sizeof(*arr));
-        if (!arr) return TDB_ERR_MEMORY;
-        const int got = level_set_collect_all(cf->levels, arr, total);
-        if (got <= total)
+        level_set_snapshot_entry_t *entries = calloc((size_t)total, sizeof(*entries));
+        if (!entries) return TDB_ERR_MEMORY;
+        const int got = level_set_snapshot(cf->levels, entries, total);
+        if (got > total)
         {
-            it->ssts = arr;
-            it->n_ssts = got;
-            return TDB_SUCCESS;
+            free(entries); /* the set grew and nothing was referenced; size up and retry */
+            total = got;
+            continue;
         }
-        free(arr); /* the set grew and nothing was referenced; size up and retry */
-        total = got;
+        sstable_t **arr = malloc((size_t)(got > 0 ? got : 1) * sizeof(*arr));
+        int *levels = malloc((size_t)(got > 0 ? got : 1) * sizeof(*levels));
+        if (!arr || !levels)
+        {
+            for (int i = 0; i < got; i++)
+                if (sstable_unref(entries[i].sst)) sstable_close(entries[i].sst);
+            free(entries);
+            free(arr);
+            free(levels);
+            return TDB_ERR_MEMORY;
+        }
+        for (int i = 0; i < got; i++)
+        {
+            arr[i] = entries[i].sst;
+            levels[i] = entries[i].level;
+        }
+        free(entries);
+        it->ssts = arr;
+        it->levels = levels;
+        it->n_ssts = got;
+        return TDB_SUCCESS;
     }
     return TDB_ERR_BUSY;
+}
+
+/* the sources the sstables make: each L1 table one of its own, since L1 tables overlap, and each
+ * deeper level one for its whole run when it holds more than one table, so a seek descends only the
+ * table that can hold the key. returns the number of sources written, or -1 on allocation failure
+ */
+static int cf_iter_table_sources(cf_iter_t *it, merge_source_t *out)
+{
+    if (it->n_ssts > 0)
+    {
+        it->runs = calloc((size_t)it->n_ssts, sizeof(*it->runs));
+        if (!it->runs) return -1;
+    }
+    int n = 0, runs = 0;
+    for (int i = 0; i < it->n_ssts;)
+    {
+        int end = i + 1;
+        if (it->levels[i] > LEVEL_SET_L1)
+            while (end < it->n_ssts && it->levels[end] == it->levels[i]) end++;
+        if (end - i > 1)
+            level_merge_source(&it->runs[runs++], &it->ssts[i], &it->iters[i], end - i, &out[n++]);
+        else
+            sstable_merge_source(it->iters[i], &out[n++]);
+        i = end;
+    }
+    return n;
 }
 
 static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
@@ -197,7 +253,6 @@ static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
                                    (uint32_t)cf->cf_id, snapshot);
         memtable_merge_source(&it->views[i], &it->sources[ws_off + i]);
     }
-    int n_src = ws_off + it->n_mts;
     for (int i = 0; i < it->n_ssts; i++)
     {
         /* carry the sstable's own result out rather than calling every failure an i/o error. it
@@ -206,9 +261,11 @@ static int cf_iter_build(cf_iter_t *it, cf_t *cf, uint64_t snapshot)
          */
         const int rc = sstable_iter_new(it->ssts[i], CF_ITER_USE_CACHE, &it->iters[i]);
         if (rc != TDB_SUCCESS) return rc;
-        sstable_merge_source(it->iters[i], &it->sources[n_src++]);
     }
-    return merge_iter_new(it->sources, n_src, snapshot, MERGE_ITER_RESOLVE, &it->merge);
+    const int tables = cf_iter_table_sources(it, &it->sources[ws_off + it->n_mts]);
+    if (tables < 0) return TDB_ERR_MEMORY;
+    return merge_iter_new(it->sources, ws_off + it->n_mts + tables, snapshot, MERGE_ITER_RESOLVE,
+                          &it->merge);
 }
 
 int cf_iter_new(cf_t *cf, tidesdb_l0_t *l0, uint64_t snapshot, writeset_merge_source_t *ws_src,
@@ -271,8 +328,10 @@ void cf_iter_free(cf_iter_t *it)
     free(it->views);
     free(it->cursors);
     free(it->iters);
+    free(it->runs);
     free(it->mts);
     free(it->ssts);
+    free(it->levels);
     free(it);
 }
 

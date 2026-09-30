@@ -276,6 +276,257 @@ void test_cf_iter_full_scan_spans_every_sstable(void)
     cfi_db_close(&db);
 }
 
+/* the key the iterator stands on, as a string */
+static void cfi_key_at(cf_iter_t *it, char *out, size_t out_cap)
+{
+    const uint8_t *key = NULL, *value = NULL;
+    size_t key_size = 0, value_size = 0;
+    uint64_t seq = 0, vlog_offset = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(
+        cf_iter_get(it, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl, &deleted),
+        TDB_SUCCESS);
+    ASSERT_TRUE(key_size < out_cap);
+    memcpy(out, key, key_size);
+    out[key_size] = '\0';
+}
+
+/* the bands a range delete carried in another band's table covers, and the band carrying it, for
+ * the test that a level read as one source still asks every table of it about intervals */
+#define CFI_COVERED_FIRST 10
+#define CFI_COVERED_END   12
+#define CFI_COVERING_BAND 20
+#define CFI_COVER_SEQ     100000
+
+/* the most cache entries one seek into a level read as a single source may touch, a descent of one
+ * table's tree, well under the one per table a source per table pays */
+#define CFI_LEVEL_SEEK_TOUCH_MAX (CFI_BANDS / 4)
+
+/* lay down the bands as L1 tables, then move every one to L2 in place, so the family holds one
+ * sorted level of disjoint tables; with cover set, the covering band's table also carries a range
+ * delete over the covered bands */
+static tidesdb_l0_t *cfi_build_banded_level(cfi_db_t *db, cf_t *cf, _Atomic(uint64_t) *next_id,
+                                            flush_ctx_t *fx, cf_t **cfs, const int cover)
+{
+    tidesdb_l0_t *l0 =
+        tidesdb_l0_create(CFI_BUFFER, CFI_QDEPTH, CFI_MAX_LEVEL, CFI_PROB, NULL, NULL);
+    tidesdb_l0_set_active(l0,
+                          tidesdb_memtable_create(NULL, 0, 0, CFI_MAX_LEVEL, CFI_PROB, NULL, NULL));
+    cfs[0] = cf;
+    atomic_init(next_id, 100);
+    fx->l0 = l0;
+    fx->cfs = cfs;
+    fx->n_cfs = 1;
+    fx->manifest = db->manifest;
+    fx->manifest_path = db->manifest_path;
+    fx->next_sstable_id = next_id;
+    fx->fdm = &db->fdm;
+    fx->sync_mode = BLOCK_MANAGER_SYNC_NONE;
+    fx->value_threshold = db->value_threshold;
+    for (int band = 0; band < CFI_BANDS; band++)
+    {
+        if (cover && band == CFI_COVERING_BAND)
+        {
+            char lo[CFI_BAND_KEY_LEN], hi[CFI_BAND_KEY_LEN];
+            snprintf(lo, sizeof(lo), "b%03d", CFI_COVERED_FIRST);
+            snprintf(hi, sizeof(hi), "b%03d", CFI_COVERED_END);
+            ASSERT_EQ(
+                tidesdb_l0_apply_range_tombstone(l0, 0, (const uint8_t *)lo, strlen(lo),
+                                                 (const uint8_t *)hi, strlen(hi), CFI_COVER_SEQ),
+                TDB_SUCCESS);
+        }
+        cfi_flush_band(l0, fx, band);
+    }
+    level_set_snapshot_entry_t entries[CFI_BANDS];
+    ASSERT_EQ(level_set_snapshot(cf->levels, entries, CFI_BANDS), CFI_BANDS);
+    for (int i = 0; i < CFI_BANDS; i++)
+    {
+        const int to[1] = {LEVEL_SET_L1 + 1};
+        const uint64_t size[1] = {entries[i].size_bytes};
+        sstable_t *const one[1] = {entries[i].sst};
+        ASSERT_EQ(level_set_swap(cf->levels, one, 1, one, to, size, 1), 0);
+        if (sstable_unref(entries[i].sst)) sstable_close(entries[i].sst);
+    }
+    ASSERT_EQ(level_set_count(cf->levels, LEVEL_SET_L1), 0);
+    ASSERT_EQ(level_set_count(cf->levels, LEVEL_SET_L1 + 1), CFI_BANDS);
+    return l0;
+}
+
+/* what a scan of the banded level returns in one direction, leaving out the covered bands when a
+ * range delete hides them */
+static void cfi_expected_bands(const int dir, const int cover, char *out, const size_t out_cap)
+{
+    out[0] = '\0';
+    for (int i = 0; i < CFI_BANDS; i++)
+    {
+        const int band = dir > 0 ? i : CFI_BANDS - 1 - i;
+        if (cover && band >= CFI_COVERED_FIRST && band < CFI_COVERED_END) continue;
+        for (int j = 0; j < CFI_KEYS_PER_BAND; j++)
+        {
+            const int k = dir > 0 ? j : CFI_KEYS_PER_BAND - 1 - j;
+            char item[CFI_BAND_KEY_LEN + 4];
+            snprintf(item, sizeof(item), "b%03d_k%03d:v,", band, k);
+            strncat(out, item, out_cap - strlen(out) - 1);
+        }
+    }
+}
+
+/* a level below L1 is read as one source over its sorted run of tables, carrying a scan from each
+ * table into the next in both directions, and returning exactly what a source per table did */
+void test_cf_iter_level_reads_as_one_source_in_both_directions(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_level(&db, cf, &next_id, &fx, cfs, 0);
+
+    static char got[CFI_BANDS * CFI_KEYS_PER_BAND * (CFI_BAND_KEY_LEN + 4)];
+    static char want[sizeof(got)];
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new(cf, l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
+    collect(it, 1, got, sizeof(got));
+    cfi_expected_bands(1, 0, want, sizeof(want));
+    ASSERT_EQ(strcmp(got, want), 0);
+    collect(it, -1, got, sizeof(got));
+    cfi_expected_bands(-1, 0, want, sizeof(want));
+    ASSERT_EQ(strcmp(got, want), 0);
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
+/* seek the iterator and report the key it stands on, or an empty string when it stands nowhere */
+static void cfi_seek_to(cf_iter_t *it, const char *target, const int for_prev, char *out,
+                        const size_t out_cap)
+{
+    if (for_prev)
+        (void)cf_iter_seek_for_prev(it, (const uint8_t *)target, strlen(target));
+    else
+        (void)cf_iter_seek(it, (const uint8_t *)target, strlen(target));
+    out[0] = '\0';
+    if (cf_iter_valid(it)) cfi_key_at(it, out, out_cap);
+}
+
+/* a seek lands in the one table that can hold the key, a key in the gap between two tables finds
+ * the next table's first or the previous table's last, a seek past either end finds nothing, and a
+ * turn at a table boundary steps back into the table it just left */
+void test_cf_iter_level_seeks_land_in_the_right_table(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_level(&db, cf, &next_id, &fx, cfs, 0);
+
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new(cf, l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
+    char at[CFI_BAND_KEY_LEN];
+    cfi_seek_to(it, "b016_k002", 0, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b016_k002"), 0);
+    cfi_seek_to(it, "b016_k999", 0, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b017_k000"), 0);
+    cfi_seek_to(it, "a", 0, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b000_k000"), 0);
+    cfi_seek_to(it, "z", 0, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, ""), 0);
+    cfi_seek_to(it, "b016_k999", 1, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b016_k003"), 0);
+    cfi_seek_to(it, "a", 1, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, ""), 0);
+    cfi_seek_to(it, "z", 1, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b031_k003"), 0);
+
+    cfi_seek_to(it, "b016_k003", 0, at, sizeof(at));
+    ASSERT_EQ(cf_iter_next(it), TDB_SUCCESS);
+    cfi_key_at(it, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b017_k000"), 0);
+    ASSERT_EQ(cf_iter_prev(it), TDB_SUCCESS);
+    cfi_key_at(it, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b016_k003"), 0);
+    ASSERT_EQ(cf_iter_prev(it), TDB_SUCCESS);
+    cfi_key_at(it, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b016_k002"), 0);
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
+/* a seek through a long-lived iterator over the whole family descends one table of a level rather
+ * than every table in it, the cost an equality lookup through a reused iterator pays per level */
+void test_cf_iter_level_seek_descends_one_table(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_level(&db, cf, &next_id, &fx, cfs, 0);
+
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new(cf, l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
+    char at[CFI_BAND_KEY_LEN];
+    const uint64_t before = cfi_cache_touches(db.cache);
+    cfi_seek_to(it, "b016_k001", 0, at, sizeof(at));
+    const uint64_t touched = cfi_cache_touches(db.cache) - before;
+    ASSERT_EQ(strcmp(at, "b016_k001"), 0);
+    ASSERT_TRUE(touched <= (uint64_t)CFI_LEVEL_SEEK_TOUCH_MAX);
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
+/* an interval one table of a level carries hides keys another table of the same level holds, so a
+ * level read as one source asks every table of it about intervals, not only the one a seek picked
+ */
+void test_cf_iter_level_interval_in_one_table_hides_keys_in_another(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_level(&db, cf, &next_id, &fx, cfs, 1);
+
+    static char got[CFI_BANDS * CFI_KEYS_PER_BAND * (CFI_BAND_KEY_LEN + 4)];
+    static char want[sizeof(got)];
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new(cf, l0, UINT64_MAX, NULL, &it), TDB_SUCCESS);
+    collect(it, 1, got, sizeof(got));
+    cfi_expected_bands(1, 1, want, sizeof(want));
+    ASSERT_EQ(strcmp(got, want), 0);
+    collect(it, -1, got, sizeof(got));
+    cfi_expected_bands(-1, 1, want, sizeof(want));
+    ASSERT_EQ(strcmp(got, want), 0);
+    char at[CFI_BAND_KEY_LEN];
+    cfi_seek_to(it, "b010_k000", 0, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b012_k000"), 0);
+    cfi_seek_to(it, "b011_k003", 1, at, sizeof(at));
+    ASSERT_EQ(strcmp(at, "b009_k003"), 0);
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
 /* a cf iterator folds a flushed sstable and the live memtable into one snapshot stream, the newest
  * version across the two winning per key */
 void test_cf_iter_memtable_over_sstable(void)
@@ -388,20 +639,6 @@ void test_cf_iter_seek_hides_tombstones(void)
 }
 
 /* read the key the iterator sits on into a nul-terminated buffer */
-static void cfi_key_at(cf_iter_t *it, char *out, size_t out_cap)
-{
-    const uint8_t *key = NULL, *value = NULL;
-    size_t key_size = 0, value_size = 0;
-    uint64_t seq = 0, vlog_offset = 0;
-    int64_t ttl = 0;
-    uint8_t deleted = 0;
-    ASSERT_EQ(
-        cf_iter_get(it, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl, &deleted),
-        TDB_SUCCESS);
-    ASSERT_TRUE(key_size < out_cap);
-    memcpy(out, key, key_size);
-    out[key_size] = '\0';
-}
 
 /* the scans above run one direction to exhaustion, which never makes the merge turn around
  * mid-stream. a flip has to re-seek every source around the current key, and the sstable and the
@@ -687,6 +924,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_cf_iter_narrow_range_scan_does_not_open_every_sstable, tests_passed);
     RUN_TEST(test_cf_iter_seek_hides_tombstones, tests_passed);
     RUN_TEST(test_cf_iter_direction_flip_across_sources, tests_passed);
+    RUN_TEST(test_cf_iter_level_reads_as_one_source_in_both_directions, tests_passed);
+    RUN_TEST(test_cf_iter_level_seeks_land_in_the_right_table, tests_passed);
+    RUN_TEST(test_cf_iter_level_seek_descends_one_table, tests_passed);
+    RUN_TEST(test_cf_iter_level_interval_in_one_table_hides_keys_in_another, tests_passed);
     RUN_TEST(test_cf_iter_spilled_value_reports_offset_not_stale_bytes, tests_passed);
     RUN_TEST(test_cf_iter_scan_resolves_by_sequence_where_a_point_get_resolves_by_position,
              tests_passed);

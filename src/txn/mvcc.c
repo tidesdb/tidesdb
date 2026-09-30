@@ -13,6 +13,7 @@
 
 #include "base/keycmp.h" /* tdb_key_cmp, the one byte-wise key order */
 #include "base/log.h"
+#include "base/waitstat.h" /* tdb_wait_deadline, tdb_cond_init_monotonic */
 #include "mvcc_internal.h"
 
 /* commit-ring slot states, in the low bits of a slot; the sequence the slot describes sits above
@@ -32,6 +33,12 @@
  * stall elsewhere is logged or refused rather than waited on forever */
 #define TDB_MVCC_VISIBLE_WAIT_SPINS 1024
 #define TDB_MVCC_VISIBLE_WAIT_MAX   100000000ULL
+
+/* a commit waiting for the watermark sleeps once its spin is spent, for this long at a time as a
+ * net under a wakeup it missed, and gives up after this many sleeps -- about as long as the spin
+ * it replaced, since only a commit below that stalled keeps the watermark down that long */
+#define TDB_MVCC_VISIBLE_PARK_US  1000
+#define TDB_MVCC_VISIBLE_PARK_MAX 100000
 
 tidesdb_mvcc_t *tidesdb_mvcc_create(void)
 {
@@ -58,7 +65,9 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     memset(m->range_holds, 0, sizeof(m->range_holds));
     atomic_init(&m->range_count, 0);
     atomic_init(&m->read_holders, 0);
-    for (int i = 0; i < MVCC_UNCLAIMED_SHARDS; i++) atomic_init(&m->unclaimed[i].n, 0);
+    pthread_mutex_init(&m->visible_lock, NULL);
+    (void)tdb_cond_init_monotonic(&m->visible_cv);
+    atomic_init(&m->visible_waiters, 0);
     pthread_mutex_init(&m->range_lock, NULL);
     m->orphans = NULL;
     pthread_mutex_init(&m->orphan_lock, NULL);
@@ -75,6 +84,8 @@ void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m)
     pthread_mutex_destroy(&m->range_lock);
     pthread_mutex_destroy(&m->inflight_lock);
     pthread_mutex_destroy(&m->orphan_lock);
+    pthread_cond_destroy(&m->visible_cv);
+    pthread_mutex_destroy(&m->visible_lock);
     mvcc_orphan_t *o = m->orphans;
     while (o)
     {
@@ -169,15 +180,29 @@ static void mvcc_advance_watermark(tidesdb_mvcc_t *m)
      * on both sides, so at least one of them sees the other's decision and carries it */
     atomic_thread_fence(memory_order_seq_cst);
     uint64_t visible = atomic_load_explicit(&m->visible_seq, memory_order_acquire);
+    int moved = 0;
     for (size_t step = 0; step < m->ring_capacity; step++)
     {
         const uint64_t next = visible + 1;
-        if (next >= atomic_load_explicit(&m->global_seq, memory_order_acquire)) return;
-        if (!mvcc_decided(m, next)) return;
+        if (next >= atomic_load_explicit(&m->global_seq, memory_order_acquire)) break;
+        if (!mvcc_decided(m, next)) break;
         if (atomic_compare_exchange_weak_explicit(&m->visible_seq, &visible, next,
                                                   memory_order_acq_rel, memory_order_acquire))
+        {
             visible = next;
+            moved = 1;
+        }
     }
+    if (!moved) return;
+
+    /* wake the commits sleeping on the watermark, when there are any. the fence orders the move
+     * above ahead of the count's load, as a sleeper's count increment is ordered ahead of its
+     * recheck of the watermark, so either this sees the sleeper or the sleeper sees the move */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&m->visible_waiters, memory_order_relaxed) == 0) return;
+    pthread_mutex_lock(&m->visible_lock);
+    pthread_cond_broadcast(&m->visible_cv);
+    pthread_mutex_unlock(&m->visible_lock);
 }
 
 void tidesdb_mvcc_mark(tidesdb_mvcc_t *m, uint64_t seq, int committed)
@@ -207,17 +232,35 @@ const _Atomic(uint64_t) *tidesdb_mvcc_watermark_ref(const tidesdb_mvcc_t *m)
     return m ? &m->visible_seq : NULL;
 }
 
-void tidesdb_mvcc_wait_visible(const tidesdb_mvcc_t *m, uint64_t seq)
+void tidesdb_mvcc_wait_visible(tidesdb_mvcc_t *m, uint64_t seq)
 {
     if (!m) return;
-    for (uint64_t spin = 0; spin < TDB_MVCC_VISIBLE_WAIT_MAX; spin++)
+    for (int spin = 0; spin < TDB_MVCC_VISIBLE_WAIT_SPINS; spin++)
     {
         if (atomic_load_explicit(&m->visible_seq, memory_order_acquire) >= seq) return;
-        if (spin < TDB_MVCC_VISIBLE_WAIT_SPINS)
-            cpu_pause();
-        else
-            cpu_yield();
+        cpu_pause();
     }
+
+    /* sleep rather than yield. the watermark waits on commits below this one that are syncing or
+     * applying, and a committer yielding in a loop keeps a core busy that one of them needs --
+     * sixteen loaders doing it spent five cores in the kernel on a load bound by its log */
+    pthread_mutex_lock(&m->visible_lock);
+    atomic_fetch_add_explicit(&m->visible_waiters, 1, memory_order_seq_cst);
+    int reached = 0;
+    for (int park = 0; park < TDB_MVCC_VISIBLE_PARK_MAX; park++)
+    {
+        if (atomic_load_explicit(&m->visible_seq, memory_order_acquire) >= seq)
+        {
+            reached = 1;
+            break;
+        }
+        struct timespec ts;
+        tdb_wait_deadline(&ts, TDB_MVCC_VISIBLE_PARK_US);
+        pthread_cond_timedwait(&m->visible_cv, &m->visible_lock, &ts);
+    }
+    atomic_fetch_sub_explicit(&m->visible_waiters, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&m->visible_lock);
+    if (reached) return;
     /* every drawn sequence is decided on every path, so this is a stall in a commit below seq, not
      * a lost decision; the batch is durable and applied, only its publication is late */
     TDB_DEBUG_LOG(TDB_LOG_WARN, "commit seq %llu returned before the watermark reached it",
@@ -793,28 +836,6 @@ static int mvcc_reads_meet(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *commi
     return met || walked >= TDB_MVCC_INFLIGHT_WALK_MAX;
 }
 
-int tidesdb_mvcc_unclaimed_enter(tidesdb_mvcc_t *m, const uint64_t hint)
-{
-    if (!m) return 0;
-    const int shard = (int)(hint % MVCC_UNCLAIMED_SHARDS);
-    atomic_fetch_add_explicit(&m->unclaimed[shard].n, 1, memory_order_seq_cst);
-    return shard;
-}
-
-void tidesdb_mvcc_unclaimed_exit(tidesdb_mvcc_t *m, const int shard)
-{
-    if (m && shard >= 0 && shard < MVCC_UNCLAIMED_SHARDS)
-        atomic_fetch_sub_explicit(&m->unclaimed[shard].n, 1, memory_order_release);
-}
-
-int tidesdb_mvcc_unclaimed_writers(const tidesdb_mvcc_t *m)
-{
-    if (!m) return 0;
-    for (int i = 0; i < MVCC_UNCLAIMED_SHARDS; i++)
-        if (atomic_load_explicit(&m->unclaimed[i].n, memory_order_seq_cst) > 0) return 1;
-    return 0;
-}
-
 int tidesdb_mvcc_reads_held(const tidesdb_mvcc_t *m)
 {
     return m && atomic_load_explicit(&m->read_holders, memory_order_acquire) > 0;
@@ -852,13 +873,20 @@ int tidesdb_mvcc_write_blocked(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *c
 
     const uint32_t bucket = mvcc_claim_bucket(hash);
     pthread_mutex_t *lock = mvcc_claim_stripe(m, bucket);
+    const uint64_t mine = atomic_load_explicit(&commit->seq, memory_order_acquire);
     pthread_mutex_lock(lock);
     int blocked = 0;
     uint32_t walked = 0;
     for (const tidesdb_mvcc_claim_t *o = m->claim_heads[bucket];
          o && !blocked && walked < TDB_MVCC_CLAIM_WALK_MAX; o = o->next, walked++)
-        if (o->owner != commit && o->kind == TDB_MVCC_CLAIM_READ && mvcc_claim_same_key(o, &probe))
-            blocked = 1;
+    {
+        if (o->owner == commit || !mvcc_claim_same_key(o, &probe)) continue;
+        /* a writer without the first-committer promise may join a claim this commit took first,
+         * and one that drew below lands before it, in a version this commit never saw; the claim
+         * shows it until its version is in the store, which the probe after this reads */
+        blocked = o->kind == TDB_MVCC_CLAIM_READ ||
+                  (first_committer_wins && mvcc_owner_below(o->owner, mine));
+    }
     if (!blocked && first_committer_wins)
         blocked = mvcc_interval_held_over(m, commit, cf_index, key, key_size, MVCC_ORDER_BELOW);
     pthread_mutex_unlock(lock);

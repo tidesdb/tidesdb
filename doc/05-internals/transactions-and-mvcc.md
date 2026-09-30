@@ -211,17 +211,15 @@ will exceed every current one, so a reader of a key it writes is serialized befo
 refused, while a writer of that key at snapshot or above is. A reader that is itself a prepare is
 the exception, covered in [Two-phase commit](#two-phase-commit).
 
-Read committed and below write **without claims**, which keeps their commits off the claim set
-entirely, and that leaves one case the order above does not cover. Validation asks the claims
-before the store because a claimed writer lets go only once its version is in the store, so a writer
-below me is in one or the other. A writer without claims is in neither between its draw and its
-apply. So such a writer counts itself in the clock before it draws and uncounts once its sequence is
-decided, and a validating commit that finds the count raised after its own draw waits for every
-sequence below it to be decided before it asks the store. The count is split over counters on lines
-of their own, since every read-committed commit moves one twice; a workload with no read-committed
-writers pays one load per validation, and one with no validating commits pays nothing but the count.
-Without the wait a repeatable-read commit drawn just above a read-committed writer of a key it read
-validated before that writer applied and committed on a read it had already invalidated.
+Every writing commit claims, read committed and below included; those levels only drop the
+first-committer promise, so their claims refuse nothing at the claim. The claim is what lets the
+order above hold: validation asks the claims before the store because a claimed writer lets go only
+once its version is in the store, so a writer below me is in one or the other. When read committed
+wrote without claims, such a writer was in neither between its draw and its apply, and a
+repeatable-read commit drawn just above one that wrote a key it read validated past it and committed
+on a read it had already invalidated. Covering that by making validating commits wait for every
+sequence below them to settle cost a mixed load about a sixth of its time; the claim covers it at no
+cost the load could measure.
 
 The claims go with the commit. A refused claim drops the ones already taken, a failed commit drops
 them all, and a successful one drops them once the watermark has passed its sequence, so a rival
@@ -511,11 +509,10 @@ writer is refused: at repeatable read and above the prepare takes a read claim o
 and holds every interval it scanned, and a writer of such a key, or inside such an interval, is
 refused for as long as the batch is undecided. A range delete meeting either is refused the same
 way, repeatable read included, where the delete otherwise asks nothing of the claims in flight.
-Read committed validates nothing of its own and takes no claims, yet it is held to this too: a
-prepare counts itself in the clock before it draws, so a read-committed commit drawn above it finds
-the count raised and checks its writes against the prepares' reads, and one drawn below it is found
-by the prepare's own validation, which waits for it as any validation waits for a writer without
-claims. With no prepare holding reads the check is one load.
+Read committed validates nothing of its own, yet it is held to this too: a prepare counts itself in
+the clock before it draws, so a read-committed commit drawn above it finds the count raised and
+checks its writes against the prepares' reads, and one drawn below it is found in the claims by the
+prepare's own validation. With no prepare holding reads the check is one load.
 
 A prepare that validates its reads also yields to another prepare that writes what it read,
 whatever the two drew. A plain reader of such a key is serialized before the batch, which holds
@@ -595,7 +592,8 @@ for a ring's worth of commits refuses exactly what it refused when it was young.
 | A prepare at repeatable read or above holds what it read | Phase two lands it above everything that committed in doubt; a writer of a key it read committing inside that window would leave it a stale read at its final position, and the prepared side cannot yield |
 | A prepare holds the intervals it scanned as well as the keys | An insert inside a range its scan found empty is a phantom at the batch's final position just as a changed key is a stale read |
 | Phase two draws through the prepare's own record | A commit drawn above the batch validates before the batch is applied, so only the claims can show it the batch below; a record still reading as prepared hides it |
-| A validating commit waits out writers without claims below it | A read-committed writer is in neither the claims nor the store between its draw and its apply |
+| Every writing commit claims, at every level | A validating commit finds a writer below it in the claims until its version is in the store; a writer without claims was in neither between its draw and its apply |
+| First-committer-wins counts a write claim below it | A writer without the promise may join a claim taken first and draw below it, landing a version the first-committer never saw |
 | A read-committed write is checked against undecided prepares' reads | It lands below their phase twos, where what they read would be stale |
 | A prepare yields to another prepare's write on what it read | Both are placed by their phase twos, so the batch that voted first may land below the reader |
 | An interval is held before the draw and checked both ways | A point writer meets it in the table, and it meets the point writer in the list of commits in flight, so the two find each other whichever was first; without that a range delete and a write inside it could each validate against a set that did not yet hold the other |

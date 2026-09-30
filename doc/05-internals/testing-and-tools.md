@@ -172,8 +172,7 @@ precisely what it wrote, so any disagreement is a real engine fault rather than 
 checker.
 
 The same partitioning is an oracle for the commit path. The workers cycle through every isolation
-level, and at repeatable read and above, and at every level when it prepares, a commit claims its
-keys against every other committer in
+level, and every writing commit claims its keys against every other committer in
 flight, so a commit refused with `TDB_ERR_CONFLICT` is a conflict between keys that nobody shares:
 one the engine invented. To make such refusals likely rather than rare, a worker periodically
 commits a batch of hundreds of keys from a key space of its own in one go, the shape of a bulk

@@ -1457,10 +1457,10 @@ static void *held_commit_run(void *arg)
     return NULL;
 }
 
-/* a read-committed writer holds no claims, so between its draw and its apply it is in neither the
- * claims nor the store. a repeatable-read commit drawn above it that read the old version of its
- * key waits for it to be decided, then finds its version and is refused */
-void test_txn_validation_waits_for_a_claimless_writer_below_it(void)
+/* a read-committed writer claims what it writes, so between its draw and its apply it is in the
+ * claims though not yet in the store. a repeatable-read commit drawn above it that read the old
+ * version of its key finds it there and is refused at once, without waiting for it to apply */
+void test_txn_validation_finds_a_read_committed_writer_below_it_in_the_claims(void)
 {
     tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
     advance_clock(clock, 2);
@@ -1500,7 +1500,7 @@ void test_txn_validation_waits_for_a_claimless_writer_below_it(void)
     ASSERT_EQ(pthread_join(tr, NULL), 0);
 
     ASSERT_EQ(hw.rc, TDB_SUCCESS);
-    ASSERT_EQ(finished_early, 0);
+    ASSERT_EQ(finished_early, 1);
     ASSERT_EQ(hr.rc, TDB_ERR_CONFLICT);
     tdb_txn_free(w);
     tdb_txn_free(r);
@@ -1818,7 +1818,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_2pc_decided_batch_orders_a_later_draw_after_it, tests_passed);
     RUN_TEST(test_txn_read_committed_writer_refused_by_a_prepared_read, tests_passed);
     RUN_TEST(test_txn_prepare_refused_by_a_prepared_write_to_what_it_read, tests_passed);
-    RUN_TEST(test_txn_validation_waits_for_a_claimless_writer_below_it, tests_passed);
+    RUN_TEST(test_txn_validation_finds_a_read_committed_writer_below_it_in_the_claims,
+             tests_passed);
     RUN_TEST(test_txn_prepared_scan_refuses_an_insert_inside_it, tests_passed);
     RUN_TEST(test_txn_adopted_prepare_holds_its_scans, tests_passed);
     RUN_TEST(test_txn_prepared_read_refuses_a_range_delete_over_it, tests_passed);

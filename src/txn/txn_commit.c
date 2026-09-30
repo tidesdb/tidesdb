@@ -209,14 +209,6 @@ static int txn_separate_values(const tdb_txn_backend_t *backend, tidesdb_wal_ent
     return TDB_SUCCESS;
 }
 
-/* uncount a commit that wrote without claims, once its sequence is marked */
-static void txn_unclaimed_exit(tdb_txn_t *txn)
-{
-    if (!txn->unclaimed) return;
-    tidesdb_mvcc_unclaimed_exit(txn->clock, txn->unclaimed - 1);
-    txn->unclaimed = 0;
-}
-
 void txn_release_claims(tdb_txn_t *txn)
 {
     tidesdb_mvcc_unclaim(txn->clock, &txn->commit);
@@ -742,13 +734,12 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     int rc = txn_pace_families(backend, entries, count);
 
     /* the claims come next, ahead of the sequence, so that any committer drawing after this one
-     * finds them when it validates; a refused claim leaves nothing held and no sequence spent. a
-     * prepare claims what it writes at every level, since another prepare that read one of its keys
-     * can learn of the pending write only from the claim */
-    const int claims =
-        txn->isolation >= TDB_ISOLATION_REPEATABLE_READ || kind == TDB_WAL_KIND_PREPARE;
-    if (rc == TDB_SUCCESS && claims)
-        rc = txn_claim_writes(txn, entries, count, kind == TDB_WAL_KIND_PREPARE);
+     * finds them when it validates; a refused claim leaves nothing held and no sequence spent.
+     * every writing commit claims, whatever its level: a validating commit drawn above one learns
+     * of its version from the claim until the version is in the store, and a prepare that read one
+     * of its keys has no other way to learn of it at all. only the promise of first-committer-wins
+     * at the claim is kept to the levels that make it */
+    if (rc == TDB_SUCCESS) rc = txn_claim_writes(txn, entries, count, kind == TDB_WAL_KIND_PREPARE);
     if (rc != TDB_SUCCESS)
     {
         txn->state = TDB_TXN_ABORTED;
@@ -760,22 +751,9 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     /* draw the commit sequence and mark it in progress -- invisible until marked committed. the
      * validation follows, since it orders this commit against the claims it meets by that sequence
      */
-    if (!claims)
-    {
-        /* the transaction's address spreads concurrent committers over the count's shards */
-        txn->unclaimed =
-            tidesdb_mvcc_unclaimed_enter(txn->clock, (uint64_t)(uintptr_t)txn / sizeof(*txn)) + 1;
-    }
-    const uint64_t seq = tidesdb_mvcc_draw(txn->clock, claims ? &txn->commit : NULL);
+    const uint64_t seq = tidesdb_mvcc_draw(txn->clock, &txn->commit);
     for (int i = 0; i < count; i++) entries[i].seq = seq;
 
-    /* a commit that validates against the store waits for every commit below it to be decided
-     * while one writing without claims is in flight. such a writer is found only in the store, and
-     * it is there once it has applied, which is before its sequence is decided; it was counted
-     * before it drew, so one below this commit is in the count. every commit below is independent
-     * of this one, so the wait ends */
-    if (txn->isolation > TDB_ISOLATION_READ_COMMITTED && tidesdb_mvcc_unclaimed_writers(txn->clock))
-        tidesdb_mvcc_wait_visible(txn->clock, seq - 1);
     if (txn->isolation > TDB_ISOLATION_READ_COMMITTED)
         rc = txn_validate(txn, sources, num_sources, seq);
     /* a commit that validates nothing of its own still may not write what an undecided prepare
@@ -802,7 +780,6 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
          * aborted is what lets the watermark pass it */
         txn_release_claims(txn);
         tidesdb_mvcc_mark_aborted(txn->clock, seq);
-        txn_unclaimed_exit(txn);
         txn->state = TDB_TXN_ABORTED;
         txn_leave_registry(txn);
         free(entries);
@@ -851,7 +828,6 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
 
         txn_release_claims(txn);
         tidesdb_mvcc_mark_aborted(txn->clock, seq);
-        txn_unclaimed_exit(txn);
         txn->state = TDB_TXN_ABORTED;
         txn_leave_registry(txn);
         free(entries);
@@ -859,7 +835,6 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     }
 
     tidesdb_mvcc_mark(txn->clock, seq, 1);
-    txn_unclaimed_exit(txn);
     tidesdb_mvcc_wait_visible(txn->clock, seq);
     txn->commit_seq = seq;
 

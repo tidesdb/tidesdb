@@ -61,24 +61,6 @@ typedef struct mvcc_orphan
     struct mvcc_orphan *next;
 } mvcc_orphan_t;
 
-/* the count of commits writing without claims is split over this many counters, each on a line of
- * its own, since every such commit moves one twice and a single counter would be one line every
- * core fights for; a validating commit, which asks far less often, reads them all */
-#define MVCC_UNCLAIMED_SHARDS 16
-#define MVCC_LINE_BYTES       64
-
-/**
- * mvcc_shard_t
- * one counter alone on its line
- * @param n the count
- * @param pad the rest of the line
- */
-typedef struct
-{
-    _Atomic(int) n;
-    char pad[MVCC_LINE_BYTES - sizeof(_Atomic(int))];
-} mvcc_shard_t;
-
 /**
  * tidesdb_mvcc
  * the MVCC clock state. the locks nest in one order wherever two are held -- a stripe, then the
@@ -101,9 +83,10 @@ typedef struct
  * @param orphans the claims of prepared batches whose handles were freed undecided, held for the
  *                clock's life in the handles' place
  * @param orphan_lock guards the orphan list
- * @param unclaimed how many commits are between drawing and deciding a sequence without claims,
- *                  which read committed and below write without, split over shards; a validating
- *                  commit cannot see one below it in the claims, only in the store once applied
+ * @param visible_lock guards the sleep of a commit waiting for the watermark
+ * @param visible_cv signalled when the watermark moves while a commit sleeps on it
+ * @param visible_waiters how many commits sleep on the watermark, so one that moves it wakes
+ *                        nobody when none do
  * @param read_holders how many commits in flight hold a read claim or a scanned interval, which
  * only a prepare at repeatable read or above does, so a writer finds none to check with one load
  */
@@ -122,8 +105,10 @@ struct tidesdb_mvcc
     pthread_mutex_t range_lock;
     mvcc_orphan_t *orphans;
     pthread_mutex_t orphan_lock;
+    pthread_mutex_t visible_lock;
+    pthread_cond_t visible_cv;
+    _Atomic(int) visible_waiters;
     _Atomic(int) read_holders;
-    mvcc_shard_t unclaimed[MVCC_UNCLAIMED_SHARDS];
 };
 
 /**

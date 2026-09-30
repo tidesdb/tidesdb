@@ -26,12 +26,11 @@
  * asked about */
 #define TDB_MVCC_COMMIT_RING_SIZE 65536
 
-/* the in-flight claim set. every commit at repeatable read and above, and every prepare, claims
- * the keys it writes before it draws its sequence and validates after, and a prepare keeps its
- * claims until phase two decides it. a claim is a node the committer owns, chained from the bucket
- * its key hashes to and compared by bytes, so the set has no capacity of its own and never mistakes
- * one key for another. the chains are guarded by striped locks; a stripe is a set of buckets
- * sharing one */
+/* the in-flight claim set. every writing commit claims the keys it writes before it draws its
+ * sequence and validates after, and a prepare keeps its claims until phase two decides it. a claim
+ * is a node the committer owns, chained from the bucket its key hashes to and compared by bytes, so
+ * the set has no capacity of its own and never mistakes one key for another. the chains are guarded
+ * by striped locks; a stripe is a set of buckets sharing one */
 #define TDB_MVCC_CLAIM_BUCKETS ((uint32_t)1 << 18)
 #define TDB_MVCC_CLAIM_STRIPES ((uint32_t)1 << 12)
 
@@ -208,7 +207,7 @@ const _Atomic(uint64_t) *tidesdb_mvcc_watermark_ref(const tidesdb_mvcc_t *m);
  * @param m the clock
  * @param seq the sequence this caller marked committed
  */
-void tidesdb_mvcc_wait_visible(const tidesdb_mvcc_t *m, uint64_t seq);
+void tidesdb_mvcc_wait_visible(tidesdb_mvcc_t *m, uint64_t seq);
 
 /**
  * tidesdb_mvcc_mark_aborted
@@ -370,40 +369,11 @@ int tidesdb_mvcc_range_stale(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t *com
                              const uint8_t *hi, size_t hi_size, int writing);
 
 /**
- * tidesdb_mvcc_unclaimed_enter
- * count a commit that writes without claims, before it draws its sequence. validation asks the
- * claims before the store because a claimed writer releases only once its version is in the store;
- * one without claims is in neither while it applies, so a validating commit drawn above it waits
- * for its sequence to be decided, and finds it through this count
- * @param m the clock
- * @param hint any value that differs between concurrent committers, which spreads them over the
- *             count's shards
- * @return the shard counted, to hand back to tidesdb_mvcc_unclaimed_exit
- */
-int tidesdb_mvcc_unclaimed_enter(tidesdb_mvcc_t *m, uint64_t hint);
-
-/**
- * tidesdb_mvcc_unclaimed_exit
- * uncount a commit tidesdb_mvcc_unclaimed_enter counted, once its sequence is marked
- * @param m the clock
- * @param shard the shard the enter returned
- */
-void tidesdb_mvcc_unclaimed_exit(tidesdb_mvcc_t *m, int shard);
-
-/**
- * tidesdb_mvcc_unclaimed_writers
- * whether a commit writing without claims is between its draw and its decision, asked by a
- * validating commit after its own draw; one counted before a draw below this commit's is found
- * @param m the clock
- * @return 1 when one is, 0 otherwise
- */
-int tidesdb_mvcc_unclaimed_writers(const tidesdb_mvcc_t *m);
-
-/**
  * tidesdb_mvcc_reads_held
  * whether any commit in flight holds a read claim or a scanned interval, asked by a commit that
- * takes no claims after its draw, so that one finding none has nothing a prepare read to check. a
- * prepare counts itself before its draw, so a commit drawn above it finds the count raised
+ * validates nothing of its own after its draw, so that one finding none has nothing a prepare read
+ * to check. a prepare counts itself before its draw, so a commit drawn above it finds the count
+ * raised
  * @param m the clock
  * @return 1 when one does, 0 otherwise
  */
@@ -432,9 +402,9 @@ int tidesdb_mvcc_range_read_held(tidesdb_mvcc_t *m, const tidesdb_mvcc_commit_t 
  * tidesdb_mvcc_write_blocked
  * whether a key this commit writes is held against it -- by another owner's read claim on it or an
  * interval another owner scanned around it, a prepared batch that read it and cannot yield, at any
- * level that validates; or, when this commit promises first-committer-wins, by an interval another
- * commit in flight holds over it under a sequence lower than this commit's. asked after this
- * commit's draw, for each key of its write set
+ * level; or, when this commit promises first-committer-wins, by another owner's write claim on it
+ * or an interval another commit in flight holds over it, under a sequence lower than this commit's.
+ * asked after this commit's draw, for each key of its write set
  * @param m the clock
  * @param commit this commit, with its sequence drawn
  * @param cf_index the family the key belongs to

@@ -205,6 +205,33 @@ void test_mvcc_read_claim_refuses_writers(void)
     tidesdb_mvcc_destroy(m);
 }
 
+/* a first-committer-wins writer that claimed a key first is blocked by a writer that joined it
+ * without that promise and drew below it, since that version lands first and was never in the
+ * snapshot; one that drew above it does not block, and neither blocks a writer without the promise
+ */
+void test_mvcc_write_claim_below_blocks_a_first_committer(void)
+{
+    tidesdb_mvcc_t *m = tidesdb_mvcc_create();
+    ASSERT_TRUE(m != NULL);
+    tidesdb_mvcc_claim_t cv[1], cw[1];
+    tidesdb_mvcc_commit_t v, w;
+    claim(&cv[0], "k", TDB_MVCC_CLAIM_WRITE);
+    claim(&cw[0], "k", TDB_MVCC_CLAIM_WRITE);
+    tidesdb_mvcc_commit_init(&v, cv, 1);
+    tidesdb_mvcc_commit_init(&w, cw, 1);
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &v, 1), 1); /* first-committer-wins, first */
+    ASSERT_EQ(tidesdb_mvcc_claim(m, &w, 0), 1); /* joins without the promise */
+    (void)tidesdb_mvcc_draw(m, &w);
+    (void)tidesdb_mvcc_draw(m, &v);
+    const uint8_t *k = (const uint8_t *)"k";
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &v, CLAIM_CF, k, 1, claim_hash("k"), 1), 1);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &v, CLAIM_CF, k, 1, claim_hash("k"), 0), 0);
+    ASSERT_EQ(tidesdb_mvcc_write_blocked(m, &w, CLAIM_CF, k, 1, claim_hash("k"), 1), 0);
+    tidesdb_mvcc_unclaim(m, &w);
+    tidesdb_mvcc_unclaim(m, &v);
+    tidesdb_mvcc_destroy(m);
+}
+
 /* a read is stale when a write claim on the key belongs to a commit drawn below the reader; one
  * drawn above it, one not yet drawn, and one prepared all leave the read standing */
 void test_mvcc_read_stale_orders_by_sequence(void)
@@ -895,6 +922,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_mvcc_repeatable_read_registers_without_refusing, tests_passed);
     RUN_TEST(test_mvcc_read_claim_refuses_writers, tests_passed);
     RUN_TEST(test_mvcc_read_stale_orders_by_sequence, tests_passed);
+    RUN_TEST(test_mvcc_write_claim_below_blocks_a_first_committer, tests_passed);
     RUN_TEST(test_mvcc_claims_are_sorted, tests_passed);
     RUN_TEST(test_mvcc_orphaned_claims_keep_holding, tests_passed);
     RUN_TEST(test_mvcc_interval_claims_meet_point_claims_both_ways, tests_passed);

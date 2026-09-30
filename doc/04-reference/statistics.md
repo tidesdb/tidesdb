@@ -198,10 +198,20 @@ staging ring. That is worth knowing when reading them, because the two look diff
 `write_stall_us` with a flat `writes_blocked` is the ring band doing its job, applying many small
 dwells rather than one long stop.
 
-**MVCC.** `global_seq` is the current sequence; `min_snapshot_seq` is the oldest snapshot any
-live transaction holds, and it is what gates tombstone reclamation — a long-running
-transaction holds it back and keeps garbage alive. `active_txn_count` and
-`txn_memory_bytes` cover the live transactions themselves.
+**MVCC.** `global_seq` is the current sequence; `min_snapshot_seq` is the oldest frozen snapshot
+any live transaction holds, at repeatable read and stronger, and it is what gates tombstone
+reclamation — a long-running transaction holds it back and keeps garbage alive. A read-committed
+read holds the floor too, at its own ceiling, but only for as long as the read lasts, so it does not
+show here. `active_txn_count` and `txn_memory_bytes` cover the live transactions themselves, at
+read committed and above.
+
+**Conflicts.** `txn_commits` counts the transactions committed since the database opened,
+single-phase and phase two together, and `txn_conflicts` the commits and prepares refused with
+`TDB_ERR_CONFLICT`. Apart from a write meeting what an undecided prepare read, only the levels
+above read committed can be refused, so the ratio is the retry rate those levels are paying. A rate that climbs under a workload that did not change is contention
+between transactions — the same keys, the same ranges, or a scan wide enough to meet every insert —
+and a rate that is high from the start usually means a transaction is holding a snapshot far longer
+than its work needs.
 
 **Value log.** `vlog_file_size`, `vlog_value_count` and `vlog_used_bytes` describe the contents;
 `vlog_segment_count` is how many files they are spread across, one of which is taking appends.
@@ -264,8 +274,9 @@ family averages across settings that no longer apply. A key log is attributed by
 recorded in its own footer; a value is attributed by the chain recorded in its own block header. A
 family mid-migration shows two rows, which is the truth, rather than one number that is not.
 
-**Durability.** `wal_generation` is the current write-ahead log generation, incremented on
-each rotation. `flush_count` and `compaction_count` are cumulative, alongside the same
+**Durability.** `wal_generation` is the generation of the write-ahead log the active memtable
+appends to, which moves forward at each rotation. A log prepared ahead for the next rotation
+already has its generation, and it is not counted here until a rotation installs it. `flush_count` and `compaction_count` are cumulative, alongside the same
 byte counters as the per-family stats.
 
 ### Errors

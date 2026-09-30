@@ -547,6 +547,7 @@ static int engine_install_generation(tidesdb_t *db, uint64_t gen, int is_first, 
         return TDB_ERR_MEMORY;
     }
     db->wal_bm = wal; /* the previous active's WAL now belongs to the sealed immutable */
+    atomic_store_explicit(&db->active_wal_gen, gen, memory_order_release);
     atomic_store_explicit(&db->wal_generation, gen, memory_order_relaxed);
     return TDB_SUCCESS;
 }

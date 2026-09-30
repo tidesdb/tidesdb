@@ -319,6 +319,43 @@ void test_level_set_swap(void)
     level_set_free(ls);
 }
 
+/* a publish changes the layout, the occupancy mask and the interval count, three words a reader
+ * loads one at a time, and the generation is what tells the reader it mixed them. it is a sequence
+ * lock, so it has to be odd only inside a publish and to advance by exactly two per publish -- a
+ * reader that finds it odd retries, and one that finds it even and unchanged trusts what it read.
+ * a bump that went missing on either side would leave a reader trusting a mixed shape */
+void test_level_set_publish_brackets_the_generation(void)
+{
+    const uint64_t bumps_per_publish = 2; /* one to odd ahead of the stores, one to even after */
+    level_set_t *ls = NULL;
+    ASSERT_EQ(level_set_create(&ls), 0);
+    ASSERT_EQ(level_set_generation(ls), 0u);
+
+    sstable_t *a = make_stub(1, "a", "c");
+    install_stub(ls, a, 1, 100);
+    const uint64_t after_install = level_set_generation(ls);
+    ASSERT_EQ(after_install, bumps_per_publish);
+    ASSERT_EQ(after_install & LEVEL_SET_PUBLISHING, 0u);
+
+    /* a swap is one publish whatever it moves, so one more pair */
+    sstable_t *merged = make_stub(2, "a", "c");
+    sstable_t *inputs[1] = {a};
+    sstable_t *outputs[1] = {merged};
+    int out_levels[1] = {2};
+    uint64_t out_sizes[1] = {100};
+    ASSERT_EQ(level_set_swap(ls, inputs, 1, outputs, out_levels, out_sizes, 1), 0);
+    sstable_unref(merged);
+    const uint64_t after_swap = level_set_generation(ls);
+    ASSERT_EQ(after_swap, after_install + bumps_per_publish);
+    ASSERT_EQ(after_swap & LEVEL_SET_PUBLISHING, 0u);
+
+    /* reads publish nothing */
+    ASSERT_EQ(level_set_count(ls, 2), 1);
+    ASSERT_EQ(level_set_generation(ls), after_swap);
+
+    level_set_free(ls);
+}
+
 /* ===== concurrent RCU: readers query while a writer churns the layout ===== */
 #define LEVEL_CONCURRENT_ITERS   4000
 #define LEVEL_CONCURRENT_READERS 3
@@ -382,6 +419,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_level_set_overlapping, tests_passed);
     RUN_TEST(test_level_set_l2_sorted, tests_passed);
     RUN_TEST(test_level_set_swap, tests_passed);
+    RUN_TEST(test_level_set_publish_brackets_the_generation, tests_passed);
     RUN_TEST(test_level_set_concurrent_readers, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

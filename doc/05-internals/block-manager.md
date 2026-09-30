@@ -149,10 +149,10 @@ otherwise invisible, the first such failure in the process is logged once.
 `fallocate` advances the logical end of file, which is what takes writes off the extending path.
 It does not initialize the blocks — the extents come back marked unwritten, which is why the call
 is cheap, and the first write into each one converts it. That conversion is itself a journalled
-metadata operation. Preallocation therefore exchanges one metadata cost for another rather than
-removing metadata work from the write path, and measured on ext4 it changes neither throughput nor
-tail latency for the log. It still earns its place on filesystems that behave differently, and it
-keeps the two write paths consistent.
+metadata operation, and a synchronous write cannot return until the journal has committed it, so
+a log synced on every commit pays a journal commit per sync either way: a file grown by its own
+writes journals its new size instead. Writing zeros ahead of the appends would avoid it, at the
+cost of writing the log's bytes twice, which is not worth it.
 :::
 
 ## The buffered append ring

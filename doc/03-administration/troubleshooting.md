@@ -172,7 +172,8 @@ If the rate is high enough to hurt:
   `tidesdb_txn_contains`.
 - **Are transactions too long?** A longer transaction has a wider window to lose a race.
 - **Do you need the guarantee?** Append-only workloads are usually correct at
-  `TDB_ISOLATION_READ_COMMITTED`, which never conflicts.
+  `TDB_ISOLATION_READ_COMMITTED`, which conflicts only with a prepared transaction that read what
+  it writes.
 
 ## The database will not open
 

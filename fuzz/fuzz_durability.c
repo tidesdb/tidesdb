@@ -42,7 +42,9 @@ void fx_op_prepare(fx_state_t *s)
     const int rc = tidesdb_txn_prepare(s->txn, xid, sizeof(xid));
     if (rc == TDB_ERR_CONFLICT)
     {
-        FUZZ_CHECK(allowed, "prepare refused at isolation %d, which runs no conflict detection",
+        FUZZ_CHECK(allowed,
+                   "prepare refused at isolation %d, with no conflict detection and no prepared "
+                   "reads to meet",
                    (int)s->txn_iso);
         tidesdb_txn_free(s->txn);
         s->txn = NULL;

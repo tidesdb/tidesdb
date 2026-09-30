@@ -7,7 +7,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "../src/base/errors.h"
+#include "../src/base/thread.h" /* a flush driven from a thread while the test decides sequences */
 #include "../src/flush/flush.h"
+#include "../src/txn/mvcc.h" /* the clock whose watermark a flush waits on */
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -393,6 +395,125 @@ void test_flush_output_carries_its_memtable_intervals(void)
     flush_db_close(&db);
 }
 
+/* how long the test gives a flush that should be waiting before it checks that it still is */
+#define FLUSH_WAIT_PROBE_US 100000
+
+/**
+ * flush_wait_arg_t
+ * a flush run on its own thread, so the test can decide sequences while it waits
+ * @param fx the flush context, whose watermark the flush waits on
+ * @param immutable the memtable to flush
+ * @param done set once the flush has returned
+ * @param rc what the flush returned
+ */
+typedef struct
+{
+    const flush_ctx_t *fx;
+    tidesdb_memtable_t *immutable;
+    _Atomic(int) done;
+    int rc;
+} flush_wait_arg_t;
+
+static void *flush_wait_thread(void *arg)
+{
+    flush_wait_arg_t *a = arg;
+    a->rc = flush_immutable(a->fx, a->immutable);
+    atomic_store(&a->done, 1);
+    return NULL;
+}
+
+/* whether L1 holds a live version of key in any table overlapping it */
+static int flush_l1_has(cf_t *cf, const char *key)
+{
+    sstable_t *out[8];
+    const int n = level_set_overlapping(cf->levels, LEVEL_SET_L1, (const uint8_t *)key, strlen(key),
+                                        (const uint8_t *)key, strlen(key), out, 8);
+    int found = 0;
+    for (int i = 0; i < n; i++)
+    {
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint64_t vlog_offset = 0, seq = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        if (sstable_get(out[i], (const uint8_t *)key, strlen(key), &value, &value_size,
+                        &vlog_offset, &seq, &ttl, &deleted) == TDB_SUCCESS &&
+            !deleted)
+            found = 1;
+        free(value);
+        if (sstable_unref(out[i])) sstable_close(out[i]);
+    }
+    return found;
+}
+
+/* a flush builds only once every sequence in the memtable is decided. a batch still in flight when
+ * the memtable rotated is not written until its commit or abort is known, and one that is then
+ * abandoned never reaches an sstable, where the abandoned table could no longer hide it */
+void test_flush_waits_for_the_watermark_and_drops_an_abandoned_batch(void)
+{
+    flush_db_t db;
+    flush_db_open(&db);
+    cf_t *cf0 = flush_make_cf(&db, 0, "cf0");
+    tidesdb_l0_t *l0 =
+        tidesdb_l0_create(FLUSH_BUFFER, FLUSH_QDEPTH, FLUSH_MAX_LEVEL, FLUSH_PROB, NULL, NULL);
+    ASSERT_TRUE(l0 != NULL);
+    tidesdb_l0_set_active(
+        l0, tidesdb_memtable_create(NULL, 0, 0, FLUSH_MAX_LEVEL, FLUSH_PROB, NULL, NULL));
+
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
+    ASSERT_TRUE(clock != NULL);
+    const uint64_t decided = tidesdb_mvcc_draw(clock, NULL);
+    const uint64_t doomed = tidesdb_mvcc_draw(clock, NULL);
+    tidesdb_mvcc_mark(clock, decided, 1);
+    ASSERT_EQ(
+        tidesdb_l0_apply(l0, 0, (const uint8_t *)"aa", 2, (const uint8_t *)"v", 1, -1, decided, 0),
+        TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_l0_apply(l0, 0, (const uint8_t *)"bb", 2, (const uint8_t *)"w", 1, -1, doomed, 0),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(
+                  l0, tidesdb_memtable_create(NULL, 1, 1, FLUSH_MAX_LEVEL, FLUSH_PROB, NULL, NULL)),
+              TDB_SUCCESS);
+    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(l0);
+    ASSERT_TRUE(immutable != NULL);
+
+    _Atomic(uint64_t) next_id;
+    atomic_init(&next_id, FLUSH_FIRST_ID);
+    cf_t *cfs[1] = {cf0};
+    flush_ctx_t fx = {.l0 = l0,
+                      .cfs = cfs,
+                      .n_cfs = 1,
+                      .manifest = db.manifest,
+                      .manifest_path = db.manifest_path,
+                      .next_sstable_id = &next_id,
+                      .fdm = &db.fdm,
+                      .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                      .value_threshold = FLUSH_NO_SPILL,
+                      .visible_seq = tidesdb_mvcc_watermark_ref(clock)};
+    flush_wait_arg_t arg = {.fx = &fx, .immutable = immutable, .rc = -1};
+    atomic_init(&arg.done, 0);
+    tdb_thread_t thread;
+    ASSERT_EQ(tdb_thread_start(&thread, flush_wait_thread, &arg), 0);
+
+    /* the doomed sequence is undecided, so the flush is still waiting */
+    usleep(FLUSH_WAIT_PROBE_US);
+    ASSERT_EQ(atomic_load(&arg.done), 0);
+
+    /* the batch is abandoned the way a failed apply abandons one, then its sequence decided */
+    ASSERT_EQ(tidesdb_l0_mark_aborted(l0, doomed), TDB_SUCCESS);
+    tidesdb_mvcc_mark_aborted(clock, doomed);
+    tdb_thread_finish(&thread);
+    ASSERT_EQ(arg.rc, TDB_SUCCESS);
+
+    ASSERT_TRUE(flush_l1_has(cf0, "aa"));
+    ASSERT_TRUE(!flush_l1_has(cf0, "bb"));
+
+    tidesdb_mvcc_destroy(clock);
+    tidesdb_l0_destroy(l0);
+    cf_free(cf0);
+    flush_db_close(&db);
+}
+
 void test_flush_carries_a_prefix_delete_that_wrote_no_keys(void)
 {
     flush_db_t db;
@@ -565,6 +686,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_flush_empty_immutable, tests_passed);
     RUN_TEST(test_flush_output_carries_its_memtable_intervals, tests_passed);
     RUN_TEST(test_flush_carries_a_prefix_delete_that_wrote_no_keys, tests_passed);
+    RUN_TEST(test_flush_waits_for_the_watermark_and_drops_an_abandoned_batch, tests_passed);
     RUN_TEST(test_flush_concurrent_same_cf, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

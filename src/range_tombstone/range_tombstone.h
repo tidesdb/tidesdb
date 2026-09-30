@@ -143,6 +143,20 @@ int range_tombstone_max_covering(const range_tombstone_set_t *set, const uint8_t
                                  size_t key_size, uint64_t snapshot_seq, uint64_t *out_seq);
 
 /**
+ * range_tombstone_fragment_overlaps
+ * whether a fragment shares any key with a half-open interval, for a probe asking whether a range
+ * delete wrote inside an interval rather than over one key
+ * @param frag the fragment
+ * @param lo inclusive lower bound of the interval
+ * @param lo_size length of lo in bytes
+ * @param hi exclusive upper bound of the interval, or NULL for unbounded above
+ * @param hi_size length of hi in bytes, ignored when hi is NULL
+ * @return 1 when they overlap, 0 when they do not or frag or lo is NULL
+ */
+int range_tombstone_fragment_overlaps(const rt_fragment_t *frag, const uint8_t *lo, size_t lo_size,
+                                      const uint8_t *hi, size_t hi_size);
+
+/**
  * range_tombstone_covering_fragment
  * borrow the fragment covering a key, with every sequence it carries -- for a reader that has to
  * filter those sequences itself rather than simply take the newest below a ceiling, which is what

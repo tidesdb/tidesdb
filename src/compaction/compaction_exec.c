@@ -289,6 +289,15 @@ static int ce_sink_add(ce_sink_t *s, const uint8_t *key, size_t key_size, const 
     return TDB_SUCCESS;
 }
 
+/* a merge that dropped every version still hands on the intervals it has not finished, and an
+ * interval lives only in a table, so where there would be no output one is written to carry them */
+static int ce_sink_carry_alone(ce_sink_t *s)
+{
+    if (s->n_outputs > 0 || s->cur_open || !s->carried) return TDB_SUCCESS;
+    const int rc = ce_sink_open(s);
+    return rc == TDB_SUCCESS ? ce_sink_seal(s) : rc;
+}
+
 /* discard the sink on failure: close any open output and drop the finished ones */
 static void ce_sink_discard(ce_sink_t *s)
 {
@@ -954,6 +963,7 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     if (rc == TDB_SUCCESS)
         rc = k > 1 ? ce_merge_subdivided(cx, job, inputs, n_inputs, k, &sink)
                    : ce_merge_inputs(cx, job, inputs, n_inputs, &sink, NULL, 0, NULL, 0);
+    if (rc == TDB_SUCCESS) rc = ce_sink_carry_alone(&sink);
     if (rc == TDB_SUCCESS) rc = ce_commit(cx, job, inputs, in_sizes, n_inputs, &sink);
 
     if (rc == TDB_SUCCESS)

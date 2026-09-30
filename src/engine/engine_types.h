@@ -102,7 +102,9 @@ typedef struct
  * @param retained_wals_lock guards retained_wals against concurrent flushes and resolutions
  * @param flush_queue the flush pool's work queue; a rotation enqueues one wake signal per sealed
  * immutable
- * @param wal_generation the current active memtable's WAL generation, bumped on every rotation
+ * @param wal_generation the highest generation drawn, for the active log or for a spare prepared
+ * ahead of it, so it runs ahead of the active log whenever a spare exists. which log a commit lands
+ * in is active_wal_gen, never this
  * @param spare_wal a log opened ahead of the rotation that will need it, or NULL. opening one costs
  * a file creation, a staging ring and a flush thread, and on a loaded device that is long enough to
  * matter -- paid under rotate_lock it would stop every committer in the database for the whole of
@@ -110,6 +112,12 @@ typedef struct
  * @param spare_wal_gen the generation spare_wal was named for. written and read under
  * spare_wal_preparing rather than beside the pointer, because taking the spare empties the slot and
  * lets the next preparer overwrite this field before the taker has read it
+ * @param active_wal_gen the generation of the log the active memtable appends to, written at open
+ * and under rotate_lock, and read without it by a prepare pinning the log its record lands in and
+ * by the statistics. a rotation that finds the spare named at or below it discards the spare, since
+ * a rotation that opened its own log while the spare was being prepared has already moved past it,
+ * and installing the lower generation after the higher one would have recovery replay the newer
+ * commits as the older
  * @param spare_wal_preparing whether a thread is already opening a spare, so a rotation burst
  * prepares one log rather than one per committer. without it every committer that rotated created a
  * file and all but one abandoned it
@@ -134,14 +142,12 @@ typedef struct
  * @param fd_reaper the descriptor-eviction ticker, borrowed from the threadmanager that owns it, so
  * a caller held at the descriptor budget can make it sweep rather than wait out its tick
  * @param next_sstable_id the db-level monotonic sstable id sequence flush and compaction draw from
- * @param gc_floor_high_water the highest reclamation floor any collection has ever taken.
- * everything at or above it has never been eligible for collection, so a read there resolves to
- * exactly what was true; below it a merge has already kept one version per key and dropped the
- * rest, which is what makes an older point in time unanswerable rather than merely stale. raised
- * where a floor is taken rather than where the work finishes, so a job already collecting is
- * accounted for before a reader can conclude its sequence is safe
  * @param commit_hook_count the number of column families with a live commit hook, so the commit
  * path skips the post-commit hook pass entirely when it is zero
+ * @param txn_commits transactions committed since this handle opened, single-phase and phase two
+ * together, read-only ones included
+ * @param txn_conflicts commits and prepares refused with a conflict since this handle opened; read
+ * against txn_commits it is the retry rate the levels above read committed are paying
  * @param vlog_gc_active set while a value-log reclaim job is queued or running, so at most one runs
  * at a time
  * @param opened set once open fully succeeds, so close persists the clock only for a built engine
@@ -197,6 +203,7 @@ struct tidesdb_t
     _Atomic(uint64_t) wal_generation;
     _Atomic(block_manager_t *) spare_wal;
     uint64_t spare_wal_gen;
+    _Atomic(uint64_t) active_wal_gen;
     _Atomic(int) spare_wal_preparing;
     pthread_mutex_t rotate_lock;
     int rotate_lock_inited;
@@ -213,8 +220,9 @@ struct tidesdb_t
     bg_ticker_t *fd_reaper;
 
     _Atomic(uint64_t) next_sstable_id;
-    _Atomic(uint64_t) gc_floor_high_water;
     _Atomic(int) commit_hook_count;
+    _Atomic(uint64_t) txn_commits;
+    _Atomic(uint64_t) txn_conflicts;
     _Atomic(int) vlog_gc_active;
     int lock_fd;
     int opened;
@@ -240,6 +248,9 @@ struct tidesdb_t
  * actually landed in is not knowable from one read, since a rotation may race the append, so both
  * ends are pinned and the inclusive range is released together -- keeping a log that turns out
  * unnecessary costs disk, where dropping the one holding an undecided batch loses it
+ * @param iters the iterators still open under this transaction, newest first, so freeing or
+ * resetting it detaches them rather than leaving each one a pointer into freed memory. a handle
+ * and its iterators are used from one thread, so the list takes no lock
  */
 struct tidesdb_txn_t
 {
@@ -247,6 +258,7 @@ struct tidesdb_txn_t
     tidesdb_t *db;
     uint64_t prepare_generation;
     uint64_t prepare_generation_last;
+    tidesdb_iter_t *iters;
 };
 
 /**
@@ -268,16 +280,55 @@ struct tidesdb_snapshot_t
 /**
  * tidesdb_iter_t
  * the public range-iterator handle over one column family at a transaction's snapshot -- a per-cf
- * merge iterator plus the cf (for resolving a spilled value through its vlog) and the engine
+ * merge iterator plus the cf (for resolving a spilled value through its vlog), the engine, and the
+ * footprint the scan has covered so far, which a transaction that validates its reads records into
+ * its read set when the iterator is freed
  * @param inner the per-cf merge iterator over L0 and the cf's sstable levels
  * @param cf the iterated column family, borrowed
  * @param db the owning engine, borrowed
+ * @param txn the transaction the scan belongs to, borrowed, whose read set takes the footprint;
+ *            NULL once that transaction was freed or reset, after which only the free is answered
+ * @param txn_prev the iterator opened under the same transaction after this one, NULL for the
+ * newest
+ * @param txn_next the iterator opened under the same transaction before this one, NULL for the
+ *                 oldest
+ * @param tracked non-zero when the transaction validates its reads, so the footprint is kept at all
+ * @param covered non-zero once a positioning call has run, so there is a footprint to record
+ * @param lo the inclusive lower bound of what the scan covered so far, owned
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound of what the scan covered so far, owned; meaningful only while
+ *           hi_open is zero
+ * @param hi_size length of hi
+ * @param hi_open non-zero once the scan ran past the last key, so the footprint is open above
+ * @param bound_lo the range lower bound the iterator was created with, owned, NULL for none; a scan
+ *                 that runs off the front covered from here rather than from the first key there is
+ * @param bound_lo_size length of bound_lo
+ * @param bound_hi the range upper bound the iterator was created with, owned, NULL for none; a scan
+ *                 that runs off the end covered up to and including it rather than to the end
+ * @param bound_hi_size length of bound_hi
+ * @param footprint_lost non-zero when a bound could not be copied, so the whole family is recorded
+ *                       rather than an interval too narrow
  */
 struct tidesdb_iter_t
 {
     cf_iter_t *inner;
     cf_t *cf;
     tidesdb_t *db;
+    tidesdb_txn_t *txn;
+    tidesdb_iter_t *txn_prev;
+    tidesdb_iter_t *txn_next;
+    int tracked;
+    int covered;
+    uint8_t *lo;
+    size_t lo_size;
+    uint8_t *hi;
+    size_t hi_size;
+    int hi_open;
+    uint8_t *bound_lo;
+    size_t bound_lo_size;
+    uint8_t *bound_hi;
+    size_t bound_hi_size;
+    int footprint_lost;
 };
 
 /**

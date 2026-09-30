@@ -83,13 +83,17 @@ typedef tidesdb_source_result_t (*tidesdb_source_get_fn)(void *ctx, uint32_t cf_
  * @param key the key bytes (unprefixed)
  * @param key_size length of key
  * @param seq_floor the sequence a version must exceed to count as newer
+ * @param seq_ceiling the sequence a version must not exceed to count at all -- a commit asks about
+ *        the writers sequenced below it, and a version above its own sequence belongs to one
+ * ordered after it
  * @param newer out, set non-zero when the found version is above seq_floor
- * @return TDB_SOURCE_FOUND with newer set when this source holds the key, TDB_SOURCE_NOT_FOUND when
- *         it does not, or TDB_SOURCE_BUSY when transiently unavailable
+ * @return TDB_SOURCE_FOUND with newer set when this source holds the key at or below the ceiling,
+ *         TDB_SOURCE_NOT_FOUND when it does not, or TDB_SOURCE_BUSY when transiently unavailable
  */
 typedef tidesdb_source_result_t (*tidesdb_source_has_newer_fn)(void *ctx, uint32_t cf_index,
                                                                const uint8_t *key, size_t key_size,
-                                                               uint64_t seq_floor, int *newer);
+                                                               uint64_t seq_floor,
+                                                               uint64_t seq_ceiling, int *newer);
 
 /**
  * tidesdb_source_range_has_newer_fn
@@ -106,13 +110,14 @@ typedef tidesdb_source_result_t (*tidesdb_source_has_newer_fn)(void *ctx, uint32
  * @param hi exclusive upper bound (unprefixed), or NULL with hi_size 0 for unbounded above
  * @param hi_size length of hi, 0 for unbounded above
  * @param seq_floor the sequence a version must exceed to count as newer
+ * @param seq_ceiling the sequence a version must not exceed to count at all
  * @param newer out, set non-zero as soon as one is found
  * @return TDB_SOURCE_FOUND with newer set, TDB_SOURCE_NOT_FOUND when the source holds nothing in
  *         the range, or TDB_SOURCE_BUSY when transiently unavailable
  */
 typedef tidesdb_source_result_t (*tidesdb_source_range_has_newer_fn)(
     void *ctx, uint32_t cf_index, const uint8_t *lo, size_t lo_size, const uint8_t *hi,
-    size_t hi_size, uint64_t seq_floor, int *newer);
+    size_t hi_size, uint64_t seq_floor, uint64_t seq_ceiling, int *newer);
 
 /**
  * tidesdb_source_t
@@ -144,13 +149,14 @@ typedef struct
  * @param key the key bytes (unprefixed)
  * @param key_size length of key
  * @param seq_floor the sequence a version must exceed to count as newer
+ * @param seq_ceiling the sequence a version must not exceed to count at all
  * @param newer out, set non-zero when a newer version exists
  * @return TDB_SOURCE_FOUND or TDB_SOURCE_NOT_FOUND with newer set, or TDB_SOURCE_BUSY
  */
 tidesdb_source_result_t tidesdb_source_stack_has_newer(const tidesdb_source_t *sources, int count,
                                                        uint32_t cf_index, const uint8_t *key,
                                                        size_t key_size, uint64_t seq_floor,
-                                                       int *newer);
+                                                       uint64_t seq_ceiling, int *newer);
 
 /**
  * tidesdb_source_stack_range_has_newer
@@ -165,6 +171,7 @@ tidesdb_source_result_t tidesdb_source_stack_has_newer(const tidesdb_source_t *s
  * @param hi exclusive upper bound (unprefixed), or NULL with hi_size 0 for unbounded above
  * @param hi_size length of hi, 0 for unbounded above
  * @param seq_floor the sequence a version must exceed to count as newer
+ * @param seq_ceiling the sequence a version must not exceed to count at all
  * @param newer out, set non-zero when any source holds one
  * @return TDB_SOURCE_FOUND or TDB_SOURCE_NOT_FOUND with newer set, or TDB_SOURCE_BUSY when a source
  *         could not answer -- including one that implements no interval probe at all
@@ -173,7 +180,8 @@ tidesdb_source_result_t tidesdb_source_stack_range_has_newer(const tidesdb_sourc
                                                              int count, uint32_t cf_index,
                                                              const uint8_t *lo, size_t lo_size,
                                                              const uint8_t *hi, size_t hi_size,
-                                                             uint64_t seq_floor, int *newer);
+                                                             uint64_t seq_floor,
+                                                             uint64_t seq_ceiling, int *newer);
 
 /**
  * tidesdb_source_stack_get

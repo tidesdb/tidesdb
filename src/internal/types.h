@@ -62,6 +62,9 @@
  * shared, and neither reaches it at all while the fragment count reads zero. writer-preferring,
  * because on a family that deletes ranges every read takes it and a commit waiting behind an
  * unbroken run of them would never get in
+ * @param high_seq the highest sequence applied into this memtable, keys and intervals alike. a
+ * flush waits for the clock's watermark to pass it before building, so every version it writes is
+ * decided and the abandoned ones can be dropped rather than made permanent
  */
 typedef struct tidesdb_memtable_t
 {
@@ -77,6 +80,7 @@ typedef struct tidesdb_memtable_t
     range_tombstone_set_t *range_tombstones;
     _Atomic(size_t) range_tombstone_frags;
     tdb_wprwlock_t range_tombstone_lock;
+    _Atomic(uint64_t) high_seq;
 } tidesdb_memtable_t;
 
 #endif /* __TIDESDB_INTERNAL_TYPES_H__ */

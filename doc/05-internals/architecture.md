@@ -64,7 +64,7 @@ API can be read as a list of intentions and the engine as a list of mechanisms.
 | Directory | Responsibility |
 | --- | --- |
 | `src/engine/` | The composition root. Owns `tidesdb_t`, open and close, recovery, the worker pools, and the orchestration of flush and compaction. |
-| `src/txn/` | Transactions, MVCC sequences and snapshots, write and read sets, conflict reservations, two-phase commit, WAL record encoding, and the L0 adapter binding the txn core to the memtable. |
+| `src/txn/` | Transactions, MVCC sequences and snapshots, write and read sets, the in-flight claim set, two-phase commit, WAL record encoding, and the L0 adapter binding the txn core to the memtable. |
 | `src/memtable/` | The one shared in-memory write buffer and its write-ahead log, rotation, the immutable queue, and reader-pinned reclamation. |
 | `src/sstable/` | The on-disk sorted table: a btree key log, the shared value log, the partition range filter, and a self-describing footer. |
 | `src/column_family/` | Family configuration, the registry, and the level set that organises a family's open sstables into tiers. |

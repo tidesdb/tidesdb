@@ -206,8 +206,10 @@ int engine_snapshot_create(tidesdb_t *db, tidesdb_snapshot_t **out);
 /**
  * engine_take_gc_floor
  * read the reclamation floor for a collection and record it as the oldest point any collection has
- * run against. raised here, where the floor is taken, rather than where the work completes -- a job
- * already collecting has to be visible to a reader deciding whether its sequence is still safe
+ * run against -- the smallest sequence any live transaction still reads at, a frozen snapshot or
+ * the ceiling of a read committed read in flight, and never above the watermark. raised here, where
+ * the floor is taken, rather than where the work completes -- a job already collecting has to be
+ * visible to a reader deciding whether its sequence is still safe
  * @param db the engine
  * @return the floor to retain against
  */
@@ -819,10 +821,20 @@ int engine_iter_new_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *lower, si
 
 /**
  * engine_iter_free
- * free an iterator and release its L0 pins and sstable references
+ * free an iterator and release its L0 pins and sstable references. one whose transaction was freed
+ * or reset before it records no footprint and releases no hold, having been detached then
  * @param it the iterator, may be NULL
  */
 void engine_iter_free(tidesdb_iter_t *it);
+
+/**
+ * engine_iter_detach
+ * cut every iterator still open under a transaction loose from it, ahead of the transaction being
+ * freed or reset. a detached iterator answers nothing but its free, and its free touches nothing of
+ * the transaction
+ * @param txn the transaction, may be NULL
+ */
+void engine_iter_detach(tidesdb_txn_t *txn);
 
 /**
  * engine_iter_seek_first / engine_iter_seek_last / engine_iter_seek / engine_iter_seek_for_prev /

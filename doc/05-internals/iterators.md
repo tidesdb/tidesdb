@@ -121,6 +121,17 @@ level — deeper levels are binary-searched — the cost is that it is paid once
 along with the epoch enter and exit that make the layout safe to read.
 :::
 
+A level below L1 is also read as **one source**, not one per table. Its tables are sorted by key and
+never overlap, so a key can live in at most one of them. The level's source binary-searches the run
+for that table and descends it alone on a seek, and a step that runs off the end of one table
+carries on into its neighbour in either direction. With a source per table, a seek positioned every
+table in every level, and an equality lookup through a long-lived iterator, the shape a table
+handler uses for a secondary index, paid one tree descent per table on every lookup. On a family of
+42 tables across two levels that was the difference between 152,000 and 446,000 seeks a second on
+one thread. A level's source still asks every table it holds about range deletes, since an interval
+a table carries is not bounded by that table's own keys. L1 tables may overlap, so each stays a
+source of its own.
+
 The bound is a **contract, not a fence**: the iterator's results are defined only inside the range
 it was given, because the sources that could answer outside it were never opened. A caller that
 seeks past its own bound is asking a question the iterator was not built to answer.
@@ -151,17 +162,30 @@ Which snapshot depends on the isolation level, and it is the same one a point re
 transaction resolves against — `txn_read_snapshot`, not the begin sequence unconditionally.
 Repeatable-read, snapshot and serializable transactions carry a snapshot drawn at begin and the
 iterator reads at that, so every scan in the transaction sees one instant. A read-committed
-transaction holds no such snapshot, so the iterator draws the current sequence when it is created:
-it sees everything committed before it started, and successive scans in one transaction can
-legitimately differ. Read-uncommitted reads at the maximum sequence, which is what makes another
+transaction holds no such snapshot, so the iterator takes the watermark when it is created: it
+sees everything committed and published before it started, and successive scans in one
+transaction can legitimately differ. Read-uncommitted reads at the maximum sequence, which is what makes another
 transaction's uncommitted versions visible to it.
+
+At repeatable read and serializable the public iterator also keeps its **footprint**: the interval
+of keys it has covered, widened by every positioning call — a seek covers from its target, a step
+covers the key it lands on, and a step off either end covers to the range bound or to the end of the
+family. When the iterator is freed the interval goes into the transaction's read set, and the
+commit validates it as it validates a key read: against the store for a version inside it above the
+snapshot, and against the commits in flight for a write claim inside it sequenced below. A footprint
+that cannot be kept, for want of memory, makes the transaction fail rather than commit unchecked.
+The other levels keep none, and the per-cf iterator underneath knows nothing of it.
 
 Reaching for the begin sequence directly would be wrong rather than merely coarse: a
 read-committed transaction has none, and filtering a scan against it would hide every live row.
 
 Over that committed view the scan folds the transaction's **own buffered writes**: its uncommitted
-puts appear, and its deletes hide the rows beneath them, exactly as point reads resolve them
-through the write set.
+puts appear, its deletes hide the rows beneath them, and its interval deletes hide every committed
+key under them while a key it wrote under one afterwards shows, exactly as point reads resolve them
+through the write set. The overlay is a cursor over the write set's own key list, so opening an
+iterator costs nothing that grows with the transaction. An interval delete reports itself one sequence above the overlay's own, since
+the merge lets an interval delete only a strictly older version and a row committed at the snapshot
+itself, the last commit before the transaction began, would otherwise tie and survive it.
 
 Making that true requires holding things alive. An iterator's sources pin what they read: memtables
 by epoch or reference count, sstables by the reference their level-set layout holds. A compaction
@@ -171,6 +195,14 @@ when it lets go.
 The cost is that a long-lived iterator holds back reclamation — sstables it pins cannot be deleted,
 and the transaction behind it holds `min_snapshot_seq` down. A scan left open across a long
 operation is a real source of space that will not reclaim.
+
+The transaction is the one thing an iterator does not pin. It keeps a pointer to it, for the read
+hold it releases and the footprint it records when freed, and the transaction keeps a list of the
+iterators open under it. Freeing or resetting the transaction walks that list and detaches each
+iterator, which from then on answers nothing but its free, and the free touches nothing of the
+transaction. A caller that caches an iterator across statements, as a table handler does to save
+rebuilding the merge heap, therefore cannot reach freed memory through it, and a footprint from
+before a reset is never carried into the transaction the reset produces.
 
 A transaction timeout bounds the second half of that but not the first. Expiry is lazy, so it
 resolves the transaction at its next operation and releases the snapshot; the iterator's own pins
@@ -196,6 +228,7 @@ that always returns both.
 | A read resolves against its snapshot; a compaction reads raw | A compaction decides retention across the whole version chain, which a resolved stream has already discarded |
 | A compaction writes tombstones to its output | They shadow older versions in levels the merge did not include; dropping one resurrects the deleted key |
 | A direction change re-seeks every source | Exhausted sources hold entries behind the position |
+| A level below L1 is one source | Its tables never overlap, so a seek descends the one table that can hold the key; a source per table descended all of them |
 | Sources stay pinned for the iterator's life | A compaction may replace a layout mid-scan |
 | A bounded iterator answers only inside its bounds | Sources outside the range were never opened, so a key beyond it may have no source that holds it |
 | The snapshot is fixed for the iterator's life | Stability is the guarantee an iterator makes; which snapshot it is comes from the isolation level, but it does not move once chosen |

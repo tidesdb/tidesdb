@@ -84,6 +84,7 @@ static flush_ctx_t engine_flush_ctx(tidesdb_t *db, cf_t *const *cfs, int n_cfs)
 {
     return (flush_ctx_t){.l0 = db->l0,
                          .cfs = cfs,
+                         .visible_seq = tidesdb_mvcc_watermark_ref(db->clock),
                          .wal_generation_pinned = engine_wal_generation_pinned,
                          .on_wal_retained = engine_note_retained_wal,
                          .on_wal_retained_ctx = db,
@@ -206,6 +207,12 @@ void engine_flush_worker(void *item, void *ctx)
 {
     (void)item; /* a wake signal; the immutable comes from the shared L0 queue */
     tidesdb_t *db = (tidesdb_t *)ctx;
+
+    /* the next rotation's log is prepared here, on a flush worker, rather than by the committer
+     * whose commit rotated, so creating the file is device work no commit waits on. a rotation that
+     * arrives first opens its own log */
+    engine_prepare_spare_wal(db);
+
     pthread_mutex_lock(&db->flush_lock);
     tidesdb_memtable_t *imm = tidesdb_l0_claim_immutable(db->l0);
     const uint64_t ticket =
@@ -324,6 +331,16 @@ static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
         atomic_store_explicit(&db->spare_wal_preparing, 0, memory_order_release);
     }
 
+    /* a spare named at or below the active log was overtaken by a rotation that opened its own
+     * while the spare was being prepared. installed now it would put a lower generation after a
+     * higher one, and recovery, which replays in generation order, would take its newer commits
+     * for older ones */
+    if (new_wal && gen <= atomic_load_explicit(&db->active_wal_gen, memory_order_relaxed))
+    {
+        engine_unlink_wal(db, new_wal);
+        new_wal = NULL;
+    }
+
     /* a preparer holding the claim leaves this rotation to open its own log rather than wait on it,
      * which costs the creation this exists to avoid but only for the rotation that collides */
     if (!new_wal)
@@ -350,6 +367,7 @@ static int engine_rotate_locked(tidesdb_t *db, engine_rotate_cost_t *cost)
     if (published)
     {
         db->wal_bm = new_wal; /* the old active's WAL now belongs to the sealed immutable */
+        atomic_store_explicit(&db->active_wal_gen, gen, memory_order_release);
 
         const uint64_t enq_from = engine_monotonic_us();
         (void)queue_enqueue(db->flush_queue, db); /* wake a worker to flush the sealed immutable */
@@ -402,17 +420,6 @@ void engine_maybe_rotate(tidesdb_t *db)
                       (unsigned long long)(acquired_us - started_us), (unsigned long long)cost.gen,
                       (unsigned long long)cost.open_us, (unsigned long long)cost.create_us,
                       (unsigned long long)cost.publish_us, (unsigned long long)cost.enqueue_us);
-
-    /* prepared outside the lock on purpose: this is the file creation, ring allocation and flush
-     * thread the next rotation would otherwise do while every committer waits behind it. it is
-     * still this caller's latency, so it is worth its own line -- but it is one thread's cost now
-     * rather than every committer's */
-    const uint64_t prepare_from = engine_monotonic_us();
-    engine_prepare_spare_wal(db);
-    const uint64_t prepared_us = engine_monotonic_us();
-    if (prepared_us - prepare_from >= ENGINE_SLOW_ROTATE_WARN_US)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "slow next-wal prepare %llu us, off the rotation lock",
-                      (unsigned long long)(prepared_us - prepare_from));
 }
 
 int engine_force_rotate(tidesdb_t *db)

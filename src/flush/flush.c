@@ -24,6 +24,12 @@
  * as a right shift; 2 adds a quarter, so a klog rarely has to extend mid-build */
 #define FLUSH_KLOG_PREALLOC_SLACK_SHIFT 2
 
+/* how a flush waits for the watermark to pass the memtable's highest sequence: a short spin for a
+ * commit finishing its mark, then yields, with a bound far past any commit window so a stall
+ * elsewhere is logged rather than waited on forever */
+#define FLUSH_WATERMARK_WAIT_SPINS 1024
+#define FLUSH_WATERMARK_WAIT_MAX   100000000ULL
+
 /* one built L1 sstable awaiting its manifest commit and level-set install */
 typedef struct
 {
@@ -571,6 +577,32 @@ static int flush_build_cf_intervals_only(const flush_ctx_t *fx, cf_t *cf, const 
     return TDB_SUCCESS;
 }
 
+/**
+ * flush_wait_decided
+ * wait until the clock's watermark has passed every sequence applied into the immutable, so the
+ * build reads only decided versions and the abandoned table names every one it has to drop. the
+ * wait is on the commits still in flight below that sequence, each inside its own commit window,
+ * and nothing inside such a window waits on a flush, so it cannot deadlock. the bound is far beyond
+ * any commit window and exists so a stall elsewhere is logged rather than waited on forever
+ * @param fx the flush context, whose watermark may be NULL to skip the wait
+ * @param immutable the memtable about to be built
+ */
+static void flush_wait_decided(const flush_ctx_t *fx, const tidesdb_memtable_t *immutable)
+{
+    if (!fx->visible_seq) return;
+    const uint64_t high = atomic_load_explicit(&immutable->high_seq, memory_order_acquire);
+    for (uint64_t spin = 0; spin < FLUSH_WATERMARK_WAIT_MAX; spin++)
+    {
+        if (atomic_load_explicit(fx->visible_seq, memory_order_acquire) >= high) return;
+        if (spin < FLUSH_WATERMARK_WAIT_SPINS)
+            cpu_pause();
+        else
+            cpu_yield();
+    }
+    TDB_DEBUG_LOG(TDB_LOG_WARN, "flush of generation %llu built before the watermark reached %llu",
+                  (unsigned long long)immutable->generation, (unsigned long long)high);
+}
+
 int flush_build(const flush_ctx_t *fx, tidesdb_memtable_t *immutable, flush_job_t **out_job)
 {
     if (!fx || !immutable || !immutable->skip_list || !out_job) return TDB_ERR_INVALID_ARGS;
@@ -581,6 +613,7 @@ int flush_build(const flush_ctx_t *fx, tidesdb_memtable_t *immutable, flush_job_
      * cursor can pass a key's position before that late insert lands and the built sstable would
      * omit a committed key, losing it once the immutable is retired from L0 */
     tdb_epoch_wait_drained(&immutable->writers);
+    flush_wait_decided(fx, immutable);
 
     skip_list_cursor_t *cur = NULL;
     if (skip_list_cursor_init(&cur, immutable->skip_list) != 0) return TDB_ERR_IO;

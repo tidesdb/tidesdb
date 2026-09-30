@@ -191,10 +191,18 @@ typedef struct
  */
 int level_set_snapshot(level_set_t *ls, level_set_snapshot_entry_t *out, int max);
 
+/* the generation bit that is set while a publish is between its two bumps. a reader that finds it
+ * set entered mid-publish and may see the old mask with the new layout, or the reverse, so it must
+ * not trust what it reads */
+#define LEVEL_SET_PUBLISHING ((uint64_t)1)
+
 /**
  * level_set_generation
- * a counter bumped every time a new layout is published, so a caller that plans against the level
- * set can tell whether anything changed since it last looked without walking it
+ * a counter bumped twice by every publish, once to odd before the layout, the occupancy mask and
+ * the interval count change and once to even after. a caller that plans against the level set can
+ * tell whether anything changed since it last looked without walking it, and a reader that records
+ * the generation, walks the shape and reads it again may trust the walk only if the value it
+ * started with was even and is unchanged
  * @param ls the level set
  * @return the current generation, or 0 for a null set
  */

@@ -23,11 +23,23 @@ in the same transaction would see:
 | Isolation | The iterator reads at |
 | --- | --- |
 | `TDB_ISOLATION_REPEATABLE_READ`, `TDB_ISOLATION_SNAPSHOT`, `TDB_ISOLATION_SERIALIZABLE` | The transaction's snapshot, taken at begin — every scan in the transaction sees one instant |
-| `TDB_ISOLATION_READ_COMMITTED` | The current sequence, taken when the iterator is created — everything committed before that moment, so two scans in one transaction may legitimately differ |
+| `TDB_ISOLATION_READ_COMMITTED` | The watermark, taken when the iterator is created — everything committed and published before that moment, so two scans in one transaction may legitimately differ |
 | `TDB_ISOLATION_READ_UNCOMMITTED` | Everything, including versions other transactions have written but not committed |
 
-Iterators are **not thread-safe**. One iterator belongs to one thread, and it must be freed
-before the transaction it was created from is freed.
+Iterators are **not thread-safe**. One iterator belongs to one thread, the thread of the
+transaction it was created from. It may outlive that transaction: freeing or resetting the
+transaction detaches every iterator still open under it, after which
+[`tidesdb_iter_valid`](#tidesdb_iter_valid) reports 0, every other call reports
+`TDB_ERR_INVALID_ARGS`, and [`tidesdb_iter_free`](#tidesdb_iter_free) is all that is left to do
+with it. A handler that caches an iterator across statements can free it whenever it next finds it
+stale, without holding the transaction open for it.
+
+At `TDB_ISOLATION_REPEATABLE_READ` and `TDB_ISOLATION_SERIALIZABLE` an iterator also records what
+it covered: the interval from the key it sought, or the start of its range, to the last key it stood
+on, or to the end when it ran off it. The interval joins the transaction's read footprint when the
+iterator is freed, so the commit is refused if another transaction put a key inside it meanwhile — a
+phantom — exactly as it is refused when a key it read changed. Free an iterator before committing,
+since a footprint recorded afterwards protects nothing. The other levels record nothing.
 
 ## Direction changes are supported but not free
 

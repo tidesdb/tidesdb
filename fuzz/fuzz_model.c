@@ -547,11 +547,10 @@ static int fm_op_survives(const fm_op_t *ops, size_t count, size_t at)
     return fm_ops_decide(ops, count, ops[at].cf_id, ops[at].key, ops[at].klen) == &ops[at];
 }
 
-/* whether a committing entry is one the engine must refuse against a held one. the engine claims an
- * interval against the other intervals only, and checks a point write against both the intervals
- * and the point reservations -- an interval cannot be claimed as a key hash, there being no one key
- * to hash. so a committing interval meeting a held point is not refused, and this is deliberately
- * not symmetric */
+/* whether a committing entry is one the engine must refuse against a held one. a point write meets
+ * a held point on the same key or a held interval covering it; an interval meets a held point
+ * inside it or a held interval intersecting it. the engine checks both directions, so a committing
+ * interval meeting a held point is refused as a point meeting a held interval is */
 static int fm_op_refused_against(const fm_op_t *committing, const fm_op_t *held)
 {
     if (committing->cf_id == 0 || committing->cf_id != held->cf_id) return 0;
@@ -563,7 +562,7 @@ static int fm_op_refused_against(const fm_op_t *committing, const fm_op_t *held)
         return fuzz_key_cmp(committing->key, committing->klen, held->key, held->klen) == 0;
     }
 
-    if (!held_range) return 0;
+    if (!held_range) return fm_op_covers(committing, held->key, held->klen);
 
     /* two half-open intervals intersect unless one ends at or below where the other starts; an open
      * upper bound is above every bound that can be spelled, so it never separates them */

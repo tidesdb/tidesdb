@@ -209,7 +209,7 @@ int engine_note_prepared_in_doubt(tidesdb_t *db)
         /* pinned here rather than where a caller adopts the transaction, because a database that
          * never asks for its in-doubt list still must not unlink the log holding the only copy of
          * one. the pin is released when the batch is finally decided */
-        (void)engine_note_prepare_generation(db, rec->generation, rec->generation, NULL, 0);
+        (void)engine_note_prepare_generation(db, rec->first_generation, rec->generation, NULL, 0);
     }
     if (in_doubt > 0)
         TDB_DEBUG_LOG(TDB_LOG_TRACE, "recovered %d prepared transactions still in doubt", in_doubt);

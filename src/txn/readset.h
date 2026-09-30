@@ -11,12 +11,13 @@
 
 #include "../compat.h"
 
-/* a transaction's read set -- the cf-namespaced keys it has read and the highest sequence it
- * observed for each. repeatable-read and serializable record their reads here so commit can
- * validate that none changed under them, and a serializable peer scans this set for read-write
- * antidependencies. like the write set, mutation goes through one guarded api: the owner records
- * behind a write lock and a peer scans behind the read lock. a repeated read of the same key keeps
- * the higher observed sequence rather than appending, so the set stays bounded by distinct keys. */
+/* a transaction's read footprint -- the cf-namespaced keys it has read, each with the highest
+ * sequence it observed, and the intervals its scans covered, each with the snapshot it scanned at.
+ * repeatable-read and serializable record their reads here so commit can validate that none changed
+ * under them, against the store and against the commits in flight, and a prepare at those levels
+ * claims the keys. a repeated read of the same key keeps the higher observed sequence rather than
+ * appending, so the keys stay bounded by distinct keys; a scan appends its interval once, when the
+ * iterator that made it is freed. */
 
 typedef struct tidesdb_readset tidesdb_readset_t;
 
@@ -37,6 +38,26 @@ typedef struct
 } tidesdb_readset_entry_t;
 
 /**
+ * tidesdb_readset_range_t
+ * a read-only view of one interval a scan covered, bounds pointing into the read set
+ * @param cf_index the column family's prefix index
+ * @param lo the inclusive lower bound
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound, NULL when the scan ran to the end of the family
+ * @param hi_size length of hi, 0 when open above
+ * @param seq the snapshot the scan read at; a version inside the interval above it is a phantom
+ */
+typedef struct
+{
+    uint32_t cf_index;
+    const uint8_t *lo;
+    size_t lo_size;
+    const uint8_t *hi;
+    size_t hi_size;
+    uint64_t seq;
+} tidesdb_readset_range_t;
+
+/**
  * tidesdb_readset_create
  * create an empty read set
  * @return the read set, or NULL on allocation failure
@@ -45,7 +66,7 @@ tidesdb_readset_t *tidesdb_readset_create(void);
 
 /**
  * tidesdb_readset_free
- * free the read set and its recorded keys
+ * free the read set and its recorded keys and intervals
  * @param rs the read set, may be NULL
  */
 void tidesdb_readset_free(tidesdb_readset_t *rs);
@@ -63,6 +84,21 @@ void tidesdb_readset_free(tidesdb_readset_t *rs);
  */
 int tidesdb_readset_record(tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
                            size_t key_size, uint64_t seq);
+
+/**
+ * tidesdb_readset_record_range
+ * record the interval a scan covered, at the snapshot it scanned at; the bounds are copied
+ * @param rs the read set
+ * @param cf_index the column family's prefix index
+ * @param lo the inclusive lower bound (must be non-empty; a bound below every key is one zero byte)
+ * @param lo_size length of lo
+ * @param hi the exclusive upper bound, or NULL with hi_size 0 for a scan that ran to the end
+ * @param hi_size length of hi
+ * @param seq the snapshot the scan read at
+ * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS / TDB_ERR_MEMORY
+ */
+int tidesdb_readset_record_range(tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *lo,
+                                 size_t lo_size, const uint8_t *hi, size_t hi_size, uint64_t seq);
 
 /**
  * tidesdb_readset_count
@@ -83,37 +119,22 @@ int tidesdb_readset_count(const tidesdb_readset_t *rs);
 int tidesdb_readset_at(const tidesdb_readset_t *rs, int index, tidesdb_readset_entry_t *out);
 
 /**
- * tidesdb_readset_seq
- * the highest sequence observed for a key, for the reservation read base; an owner-side read
+ * tidesdb_readset_range_count
+ * the number of recorded scan intervals; an owner-side read
  * @param rs the read set
- * @param cf_index the column family's prefix index
- * @param key the key bytes
- * @param key_size length of key
- * @param out_seq receives the observed sequence on a hit
- * @return 1 if the key was read, 0 otherwise
+ * @return the count, or 0 if rs is NULL
  */
-int tidesdb_readset_seq(const tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
-                        size_t key_size, uint64_t *out_seq);
+int tidesdb_readset_range_count(const tidesdb_readset_t *rs);
 
 /**
- * tidesdb_readset_contains
- * whether a key was read, under the read lock so a serializable peer can scan a running txn's read
- * set safely for read-write antidependency detection
+ * tidesdb_readset_range_at
+ * borrow the recorded scan interval at an index for commit-time validation; an owner-side read
  * @param rs the read set
- * @param cf_index the column family's prefix index
- * @param key the key bytes
- * @param key_size length of key
- * @return 1 if the key was read, 0 otherwise
+ * @param index 0-based index
+ * @param out receives the interval view
+ * @return 1 if the index was in range, 0 otherwise
  */
-int tidesdb_readset_contains(tidesdb_readset_t *rs, uint32_t cf_index, const uint8_t *key,
-                             size_t key_size);
-
-/**
- * tidesdb_readset_clear
- * drop every recorded read, freeing the keys, for reuse of the transaction
- * @param rs the read set
- */
-void tidesdb_readset_clear(tidesdb_readset_t *rs);
+int tidesdb_readset_range_at(const tidesdb_readset_t *rs, int index, tidesdb_readset_range_t *out);
 
 /**
  * tidesdb_readset_mem_bytes

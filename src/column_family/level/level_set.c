@@ -60,8 +60,8 @@ typedef struct
  * @param epoch in-flight-reader counter guarding the layout
  * @param retire deferred reclamation of superseded layouts
  * @param write_lock serializes install and swap; reads are lock-free
- * @param generation bumped on every published layout, so a caller can tell whether the shape it
- * last looked at is still the current one without walking it
+ * @param generation bumped to odd ahead of a publish and to even after it, so a caller can tell
+ * whether the shape it looked at was settled and is still the current one without walking it
  * @param interval_tables how many of the listed sstables carry range tombstones, republished with
  * the layout, so a family that has never deleted a range answers a covering query from one load
  * @param occupancy bit i set when level i+1 holds at least one sstable, republished with the
@@ -266,28 +266,19 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
                 carrying++;
     }
 
+    /* the layout, the mask and the interval count are three words a reader loads one at a time, and
+     * a publish changes all three. a reader that mixes them -- the old mask with the new layout, or
+     * the reverse -- walks levels the tables have left and skips the ones they moved to, and
+     * answers with an absence or an older version that was never true. the generation brackets the
+     * three stores as a sequence lock, odd while they are in progress and even once they are done.
+     * a reader records it, walks, and reads it again, and trusts the walk only if it started even
+     * and did not change. seeing any of the three new words means seeing the bump ahead of them,
+     * which every one of them was released after, so a reader that started before this publish and
+     * met any part of it finds the generation moved, and one that started inside it finds it odd */
+    atomic_fetch_add_explicit(&ls->generation, 1, memory_order_release);
     level_layout_t *old = atomic_exchange_explicit(&ls->layout, fresh, memory_order_acq_rel);
-    /* published after the layout, so a reader that sees a level occupied and then reads the layout
-     * sees at least that layout.
-     *
-     * the other direction is the one that needs an argument: a reader can load the mask just before
-     * this store and skip a level that has this instant gained its first sstable. that is safe
-     * because of where the data also is. a flush installs its sstables and only then retires the
-     * immutable memtable they came from, so through that whole window the same keys are still in
-     * L0 -- and L0 is the first source every read and every conflict probe consults, ahead of any
-     * sstable level. so a skipped brand-new level cannot hide a version from either; it is found in
-     * L0 instead. shortening that window, or retiring the immutable before the install, would break
-     * this */
     atomic_store_explicit(&ls->occupancy, occ, memory_order_release);
-    /* the interval count rests on that same argument. a reader can load it as zero just before a
-     * flush publishes the first table carrying an interval, and skip a walk that would have found
-     * it -- but the memtable that flush is installing for has not been retired yet and holds the
-     * same intervals, and it is asked ahead of any sstable. the count only ever drops to zero when
-     * the last interval is really gone, and a reader holding a stale non-zero simply walks and
-     * finds nothing */
     atomic_store_explicit(&ls->interval_tables, carrying, memory_order_release);
-    /* bumped after the swap so an observer that reads the generation and then the layout cannot see
-     * a new generation against the old shape */
     atomic_fetch_add_explicit(&ls->generation, 1, memory_order_release);
     tdb_retire(&ls->retire, old, &ls->epoch, level_layout_reclaim, NULL);
 }

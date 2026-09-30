@@ -127,8 +127,9 @@ void test_source_stack_has_newer_takes_the_first_source_holding_the_key(void)
     tidesdb_source_t stack[2] = {src("l0", &l0), src("sst", &sst)};
 
     int newer = -1;
-    ASSERT_EQ(tidesdb_source_stack_has_newer(stack, 2, 0, (const uint8_t *)"k", 1, 7, &newer),
-              TDB_SOURCE_FOUND);
+    ASSERT_EQ(
+        tidesdb_source_stack_has_newer(stack, 2, 0, (const uint8_t *)"k", 1, 7, UINT64_MAX, &newer),
+        TDB_SOURCE_FOUND);
     ASSERT_EQ(newer, 0); /* sst holds 10, above the floor of 7, and is never asked */
 }
 

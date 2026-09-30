@@ -172,10 +172,15 @@ creation, a staging ring and a flush thread. Paid inline, that is orders of magn
 slot swap it accompanies — and every committer in the database is stopped for the whole of it, since
 the rotation holds the lock while it works. How much more depends entirely on the filesystem and the
 device: it has been measured from tens of milliseconds on a local SSD to well over a hundred on a
-virtualised runner with no working preallocation. A log is therefore prepared after each rotation,
-outside the lock, and the next rotation
-takes the prepared one and becomes a memtable allocation and two pointer swaps. The preparing thread
-still pays the cost; the other fifteen no longer do.
+virtualised runner with no working preallocation. A log is therefore prepared ahead of the rotation
+that will need it, outside the lock, by a flush worker: once at open and again each time a rotation
+wakes one. The next rotation takes the prepared log and becomes a memtable allocation and two
+pointer swaps, and no committer pays for the preparation at all.
+
+A rotation that finds the preparer still busy opens its own log, and that log's generation is above
+the one being prepared. The prepared log is then **discarded rather than installed** when a later
+rotation finds it: its generation is at or below the active log's, and installed after it, recovery,
+which replays logs in generation order, would take its newer commits for older ones.
 
 Preparing is claimed, not merely checked. Every committer that rotated arrives at the same moment
 and the empty-slot check is only a hint, so without a claim each one creates a log for a slot that

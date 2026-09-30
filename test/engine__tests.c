@@ -46,15 +46,15 @@ static int tests_failed = 0;
  * boundary rather than sitting on it */
 #define ENGINE_TEST_RING_OVERRUN 64
 
-/* in-doubt transactions abandoned in a row, past the hold table so a leak would exhaust it */
-#define ENGINE_TEST_ABANDONED_PREPARES (TDB_MVCC_MAX_PREPARED_HOLDS * 2)
+/* in-doubt transactions abandoned in a row, enough that a claim left behind by any one of them
+ * would be met by the writer that follows */
+#define ENGINE_TEST_ABANDONED_PREPARES 128
 /* the transaction that prepares and then decides, so its batch is durable as a COMMIT record */
 #define ENGINE_TEST_DECIDED_XID "decided-in-two-phases"
 
 /* a value log entry planted straight into a memtable, standing in for a commit that separated its
  * value, since nothing on the commit path produces one yet */
 #define ENGINE_TEST_PLANTED_VALUE_SIZE 4096
-#define ENGINE_TEST_PLANTED_SEQ        1
 
 /* a separation threshold and a value comfortably above it, for the family that opts out of
  * separation and the one that does not */
@@ -977,6 +977,51 @@ static void ryow_scan(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, int forwa
 /* a scan inside a transaction reads the transaction's own buffered writes: new puts appear,
  * overwrites win over committed values, deletes hide the underlying rows, a put-then-delete
  * vanishes, and none of it leaks to a concurrent transaction until commit */
+/* a transaction's own buffered prefix delete hides the committed keys under it from its own scan,
+ * exactly as it hides them from its own point reads, and a key it writes under the prefix after the
+ * delete comes back while one it wrote before the delete does not */
+void test_engine_scan_honours_own_prefix_delete(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    ryow_commit(db, cf, "user:1", "A");
+    ryow_commit(db, cf, "user:2", "B");
+    ryow_commit(db, cf, "zz", "Z");
+
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &w), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"user:4", 6, (const uint8_t *)"D", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_delete_prefix(w, cf, (const uint8_t *)"user:", 5), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"user:3", 6, (const uint8_t *)"C", 1, -1),
+              TDB_SUCCESS);
+
+    /* the point read already answers this way; the scan has to agree with it */
+    uint8_t *v = NULL;
+    size_t vl = 0;
+    ASSERT_EQ(tidesdb_txn_get(w, cf, (const uint8_t *)"user:1", 6, &v, &vl), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(tidesdb_txn_get(w, cf, (const uint8_t *)"user:4", 6, &v, &vl), TDB_ERR_NOT_FOUND);
+
+    char buf[256];
+    ryow_scan(w, cf, 1, buf, sizeof(buf));
+    ASSERT_TRUE(strcmp(buf, "user:3:C,zz:Z,") == 0);
+    ryow_scan(w, cf, 0, buf, sizeof(buf));
+    ASSERT_TRUE(strcmp(buf, "zz:Z,user:3:C,") == 0);
+
+    ASSERT_EQ(tidesdb_txn_rollback(w), TDB_SUCCESS);
+    tidesdb_txn_free(w);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 void test_engine_scan_reads_own_writes(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -3789,12 +3834,12 @@ void test_engine_prepared_prefix_delete_blocks_a_write_under_it(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
-/* a prepared batch holds a reservation on every key it wrote until phase two decides it, and the
- * sequences a busy database draws in the meantime do not make that hold any less live. the commit
- * ring only distinguishes the last TDB_MVCC_COMMIT_RING_SIZE sequences and reads anything older as
- * committed, which is true of every sequence a commit drew and false of one a prepare is still
- * sitting on. so this walks the ring clear past the prepare and asks the hold to still refuse the
- * write it refused when it was young */
+/* a prepared batch holds a claim on every key it wrote until phase two decides it, and the
+ * sequences a busy database draws in the meantime do not make that claim any less live. the commit
+ * ring only distinguishes the last TDB_MVCC_COMMIT_RING_SIZE sequences, and the prepare's is spent
+ * the moment it prepares, so nothing about the ring can be what holds the key. this walks the ring
+ * clear past the prepare and asks the claim to still refuse the write it refused when it was young
+ */
 void test_engine_prepared_batch_holds_its_key_past_the_commit_ring(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -3847,11 +3892,289 @@ void test_engine_prepared_batch_holds_its_key_past_the_commit_ring(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
-/* freeing an in-doubt transaction without deciding it abandons it, which the engine supports -- so
- * the sequence hold the prepare took has to go with it. a hold left behind would keep a sequence
- * nothing can decide in flight for the life of the database, holding its keys against every later
- * writer, and the fixed table would fill and refuse every prepare after it */
-void test_engine_abandoned_prepares_do_not_exhaust_the_hold_table(void)
+/* a prepare at repeatable read or above holds what it read as well as what it wrote. its reads were
+ * validated when it prepared, and phase two lands it above everything that commits while it is in
+ * doubt, so a writer of a key it read committing inside that window would leave the batch with a
+ * stale read at its final position -- and the prepared side can no longer be the one to yield. so
+ * the writer is refused until the batch is decided, and goes through once it is */
+static void engine_prepared_read_holds_off_a_writer(tidesdb_isolation_level_t iso)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    tidesdb_txn_t *seed = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &seed), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(seed, cf, (const uint8_t *)"x", 1, (const uint8_t *)"0", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(seed), TDB_SUCCESS);
+    tidesdb_txn_free(seed);
+
+    /* the prepare reads x and writes y */
+    tidesdb_txn_t *p = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, iso, &p), TDB_SUCCESS);
+    uint8_t *got = NULL;
+    size_t got_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(p, cf, (const uint8_t *)"x", 1, &got, &got_size), TDB_SUCCESS);
+    free(got);
+    ASSERT_EQ(tidesdb_txn_put(p, cf, (const uint8_t *)"y", 1, (const uint8_t *)"p", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(p, (const uint8_t *)"xid-read", 8), TDB_SUCCESS);
+
+    /* a writer of x is refused while the batch is in doubt */
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &w), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"x", 1, (const uint8_t *)"w", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(w), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(w);
+
+    /* and goes through once phase two has decided it */
+    ASSERT_EQ(tidesdb_txn_commit_prepared(p), TDB_SUCCESS);
+    tidesdb_txn_free(p);
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &w), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"x", 1, (const uint8_t *)"w", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(w), TDB_SUCCESS);
+    tidesdb_txn_free(w);
+    engine_assert_committed(db, cf, "x", "w");
+    engine_assert_committed(db, cf, "y", "p");
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+void test_engine_prepared_read_refuses_a_writer_until_decided(void)
+{
+    engine_prepared_read_holds_off_a_writer(TDB_ISOLATION_SERIALIZABLE);
+    engine_prepared_read_holds_off_a_writer(TDB_ISOLATION_REPEATABLE_READ);
+}
+
+/* what a prepare read is held across a restart as well. the read keys are durable beside the
+ * PREPARE record, so a batch adopted in doubt after a reopen refuses a writer of a key it read
+ * exactly as the live prepare did, and lets it through once the coordinator has decided */
+void test_engine_recovered_prepare_keeps_its_read_claims(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    const uint8_t xid[] = "xid-read-across-restart";
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *seed = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &seed), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(seed, cf, (const uint8_t *)"x", 1, (const uint8_t *)"0", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(seed), TDB_SUCCESS);
+    tidesdb_txn_free(seed);
+
+    /* the prepare reads x and writes y, then the process goes away with it in doubt */
+    tidesdb_txn_t *p = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &p), TDB_SUCCESS);
+    uint8_t *got = NULL;
+    size_t got_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(p, cf, (const uint8_t *)"x", 1, &got, &got_size), TDB_SUCCESS);
+    free(got);
+    ASSERT_EQ(tidesdb_txn_put(p, cf, (const uint8_t *)"y", 1, (const uint8_t *)"p", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(p, xid, sizeof(xid) - 1), TDB_SUCCESS);
+    tidesdb_txn_free(p);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    tidesdb_prepared_txn_t found[1];
+    int count = -1;
+    ASSERT_EQ(tidesdb_recover_prepared(db, found, 1, &count), TDB_SUCCESS);
+    ASSERT_EQ(count, 1);
+
+    /* a writer of x is refused while the recovered batch is in doubt */
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &w), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"x", 1, (const uint8_t *)"w", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(w), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(w);
+
+    /* and goes through once it is decided, with the batch's own write standing */
+    ASSERT_EQ(tidesdb_txn_commit_prepared(found[0].txn), TDB_SUCCESS);
+    tidesdb_txn_free(found[0].txn);
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &w), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)"x", 1, (const uint8_t *)"w", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(w), TDB_SUCCESS);
+    tidesdb_txn_free(w);
+    engine_assert_committed(db, cf, "x", "w");
+    engine_assert_committed(db, cf, "y", "p");
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* commit one put at snapshot and return what the commit returned */
+static int engine_put_one(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
+{
+    tidesdb_txn_t *w = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &w), TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_txn_put(w, cf, (const uint8_t *)key, strlen(key), (const uint8_t *)"w", 1, -1),
+        TDB_SUCCESS);
+    const int rc = tidesdb_txn_commit(w);
+    tidesdb_txn_free(w);
+    return rc;
+}
+
+/* what a prepare scanned is held across a restart too. the interval is durable beside the read
+ * keys, so a batch adopted in doubt after a reopen refuses an insert inside the range its scan
+ * found empty, lets a write outside it through, and releases it once the coordinator decides */
+void test_engine_recovered_prepare_keeps_its_scanned_range(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    const uint8_t xid[] = "xid-scan-across-restart";
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    /* the prepare scans [a, m), finds it empty, and writes y */
+    tidesdb_txn_t *p = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &p), TDB_SUCCESS);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new_range(p, cf, (const uint8_t *)"a", 1, (const uint8_t *)"m", 1, &it),
+              TDB_SUCCESS);
+    (void)tidesdb_iter_seek(it, (const uint8_t *)"a", 1);
+    ASSERT_TRUE(!tidesdb_iter_valid(it));
+    tidesdb_iter_free(it);
+    ASSERT_EQ(tidesdb_txn_put(p, cf, (const uint8_t *)"y", 1, (const uint8_t *)"p", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(p, xid, sizeof(xid) - 1), TDB_SUCCESS);
+    tidesdb_txn_free(p);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    tidesdb_prepared_txn_t found[1];
+    int count = -1;
+    ASSERT_EQ(tidesdb_recover_prepared(db, found, 1, &count), TDB_SUCCESS);
+    ASSERT_EQ(count, 1);
+
+    ASSERT_EQ(engine_put_one(db, cf, "k"), TDB_ERR_CONFLICT);
+    ASSERT_EQ(engine_put_one(db, cf, "n"), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_rollback_prepared(found[0].txn), TDB_SUCCESS);
+    tidesdb_txn_free(found[0].txn);
+    ASSERT_EQ(engine_put_one(db, cf, "k"), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/**
+ * engine_scan_then_insert
+ * one transaction scans forward from a key, stopping at a key when one is given and running to the
+ * end otherwise, and frees the iterator; another commits a key; the first commits a write of its
+ * own
+ * @param db the open database
+ * @param cf the family, holding b and d
+ * @param iso the scanning transaction's isolation level
+ * @param seek the key the scan seeks to
+ * @param stop the key the scan stops at, or NULL to run to the end
+ * @param inserted the key the other transaction commits meanwhile
+ * @param rc receives what the scanning transaction's commit returned
+ */
+static void engine_scan_then_insert(tidesdb_t *db, tidesdb_column_family_t *cf,
+                                    tidesdb_isolation_level_t iso, const char *seek,
+                                    const char *stop, const char *inserted, int *rc)
+{
+    tidesdb_txn_t *scanner = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, iso, &scanner), TDB_SUCCESS);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(scanner, cf, &it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek(it, (const uint8_t *)seek, strlen(seek)), TDB_SUCCESS);
+    while (tidesdb_iter_valid(it))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(it, &key, &key_size), TDB_SUCCESS);
+        const int past = stop && key_size == strlen(stop) && memcmp(key, stop, key_size) >= 0;
+        free(key);
+        if (past) break;
+        (void)tidesdb_iter_next(it);
+    }
+    tidesdb_iter_free(it);
+
+    tidesdb_txn_t *other = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &other), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(other, cf, (const uint8_t *)inserted, strlen(inserted),
+                              (const uint8_t *)"v", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(other), TDB_SUCCESS);
+    tidesdb_txn_free(other);
+
+    ASSERT_EQ(
+        tidesdb_txn_put(scanner, cf, (const uint8_t *)"marker", 6, (const uint8_t *)"s", 1, -1),
+        TDB_SUCCESS);
+    *rc = tidesdb_txn_commit(scanner);
+    tidesdb_txn_free(scanner);
+}
+
+/* a scan's footprint is the interval it covered, the keys it did not find included. at the levels
+ * that validate their reads a key another commit puts inside it before this one commits is a
+ * phantom and refuses the commit; a key outside it is not, and snapshot isolation, which validates
+ * no read, commits over it as the level is defined to allow */
+void test_engine_scan_footprint_refuses_a_phantom(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+    tidesdb_txn_t *seed = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &seed), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(seed, cf, (const uint8_t *)"b", 1, (const uint8_t *)"v", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(seed, cf, (const uint8_t *)"d", 1, (const uint8_t *)"v", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(seed), TDB_SUCCESS);
+    tidesdb_txn_free(seed);
+
+    int rc = TDB_SUCCESS;
+    /* the scan ran to the end, so an insert anywhere above a is a phantom */
+    engine_scan_then_insert(db, cf, TDB_ISOLATION_REPEATABLE_READ, "a", NULL, "c", &rc);
+    ASSERT_EQ(rc, TDB_ERR_CONFLICT);
+    engine_scan_then_insert(db, cf, TDB_ISOLATION_SERIALIZABLE, "a", NULL, "e", &rc);
+    ASSERT_EQ(rc, TDB_ERR_CONFLICT);
+    /* the scan stopped at d, so an insert above d is outside what it covered */
+    engine_scan_then_insert(db, cf, TDB_ISOLATION_SERIALIZABLE, "a", "d", "f", &rc);
+    ASSERT_EQ(rc, TDB_SUCCESS);
+    /* and snapshot isolation keeps no footprint at all */
+    engine_scan_then_insert(db, cf, TDB_ISOLATION_SNAPSHOT, "a", NULL, "g", &rc);
+    ASSERT_EQ(rc, TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* freeing an in-doubt transaction without deciding it abandons it, which the engine supports. the
+ * batch is durable and a later open may still commit it, so its keys stay held for the life of the
+ * process -- and nothing about that holds any later prepare or commit of other keys back */
+void test_engine_abandoned_prepares_keep_their_keys_held(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
     char db_path[] = ENGINE_TEST_DB_DIR;
@@ -3885,8 +4208,7 @@ void test_engine_abandoned_prepares_do_not_exhaust_the_hold_table(void)
 
     /* the abandoned batch keeps refusing writes to its keys. its PREPARE record is durable, so a
      * later open can still adopt and decide it, and dropping the claim here would let a write land
-     * under a batch decided afterwards. the claim is left to age out of the ring the way any
-     * unresolved one is, which is the behaviour releasing the sequence hold restores */
+     * under a batch decided afterwards */
     tidesdb_txn_t *writer = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &writer), TDB_SUCCESS);
     ASSERT_EQ(tidesdb_txn_put(writer, cf, (const uint8_t *)"abandon00000", 12, (const uint8_t *)"w",
@@ -4611,9 +4933,13 @@ void test_engine_memtable_reference_resolves_on_every_path(void)
     vlog_stats_t before;
     vlog_get_stats(db->vlog, &before);
 
-    ASSERT_EQ(tidesdb_l0_apply_reference(
-                  db->l0, (uint32_t)((cf_t *)cf)->cf_id, (const uint8_t *)"planted", 7, id,
-                  ENGINE_TEST_PLANTED_VALUE_SIZE, -1, ENGINE_TEST_PLANTED_SEQ, 0),
+    /* planted at a sequence the clock has decided, since a reader's ceiling is the watermark and a
+     * sequence nothing ever committed sits above it */
+    const uint64_t planted = tidesdb_mvcc_draw(db->clock, NULL);
+    tidesdb_mvcc_mark(db->clock, planted, 1);
+    ASSERT_EQ(tidesdb_l0_apply_reference(db->l0, (uint32_t)((cf_t *)cf)->cf_id,
+                                         (const uint8_t *)"planted", 7, id,
+                                         ENGINE_TEST_PLANTED_VALUE_SIZE, -1, planted, 0),
               TDB_SUCCESS);
 
     /* from the memtable */
@@ -5157,8 +5483,11 @@ void test_engine_wal_descriptor_accounting_balances(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
     ASSERT_TRUE(cf != NULL);
 
-    /* a freshly opened database holds its active log and nothing else */
-    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_WAL_LOG), ENGINE_TEST_WAL_RESIDENT_MIN);
+    /* a freshly opened database holds its active log, and the spare a flush worker prepares for
+     * the first rotation once it has run -- which it may or may not have by this line */
+    const int wal_at_open = fd_manager_open_count(&db->fdm, FD_LABEL_WAL_LOG);
+    ASSERT_TRUE(wal_at_open >= ENGINE_TEST_WAL_RESIDENT_MIN &&
+                wal_at_open <= ENGINE_TEST_WAL_RESIDENT_MAX);
 
     for (int i = 0; i < ENGINE_TEST_WAL_ROTATE_KEYS; i++)
     {
@@ -6217,16 +6546,19 @@ void test_engine_recover_prepared(void)
     ASSERT_EQ(tidesdb_txn_commit(rt), TDB_SUCCESS);
     tidesdb_txn_free(rt);
 
+    /* and its key came back held: a writer of it is refused until the batch is decided, since phase
+     * two lands at a fresh sequence and would otherwise land over the write */
+    tidesdb_txn_t *writer = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &writer), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(writer, cf, k1, sizeof(k1) - 1, v2, sizeof(v2) - 1, -1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(writer), TDB_ERR_CONFLICT);
+    tidesdb_txn_free(writer);
+
     /* deciding it now makes its write visible, exactly as phase two would have before the restart
      */
     ASSERT_EQ(tidesdb_txn_commit_prepared(found[0].txn), TDB_SUCCESS);
     tidesdb_txn_free(found[0].txn);
-
-    ASSERT_EQ(tidesdb_txn_begin(db, &rt), TDB_SUCCESS);
-    ASSERT_EQ(tidesdb_txn_get(rt, cf, k1, sizeof(k1) - 1, &got, &got_size), TDB_SUCCESS);
-    free(got);
-    ASSERT_EQ(tidesdb_txn_commit(rt), TDB_SUCCESS);
-    tidesdb_txn_free(rt);
+    engine_assert_committed(db, cf, "pk1", "pv1");
 
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -6260,7 +6592,7 @@ void test_engine_recovered_phase_two_durable_and_ordered(void)
     ASSERT_EQ(tidesdb_txn_commit(seed), TDB_SUCCESS);
     tidesdb_txn_free(seed);
 
-    /* prepare below snapshot isolation, which takes no reservation, then abandon the handle */
+    /* prepare below repeatable read, which claims no key, then abandon the handle */
     tidesdb_txn_t *p = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_UNCOMMITTED, &p),
               TDB_SUCCESS);
@@ -6334,16 +6666,12 @@ void test_engine_recovered_phase_two_durable_and_ordered(void)
  * prepared and lands above anything that committed while it was in doubt. that keeps a batch's
  * position and its age in agreement, which is what the read path, tombstone collection, and the
  * generation layout all rest on, and a reopen must reach the same answer. the prepare is taken
- * below snapshot isolation, which claims no write reservation and so lets the competing delete
- * commit at all */
+ * below repeatable read, which claims no key and so lets the competing delete commit at all */
 /* a key written by a two-phase transaction has to stay writable once that transaction has finished.
- * the prepare claims the key's reservation with the sequence it drew then, and phase two commits at
- * a fresh one -- so unless the slot is handed over, it goes on naming a sequence that is never
- * marked committed, and the next writer of that key reads it as a committer still in flight and
- * loses to a transaction that ended. no concurrency is needed to see it: one connection, one key,
- * everything already committed. it heals itself only after the commit ring wraps past the
- * abandoned sequence, which is what makes it look intermittent on a busy database and permanent on
- * a quiet one */
+ * the prepare claims the key and phase two commits at a fresh sequence, so the claim has to go with
+ * the decision; one left behind would name a batch that ended, and the next writer of that key
+ * would lose to it. no concurrency is needed to see it: one connection, one key, everything already
+ * committed */
 void test_engine_key_stays_writable_after_a_two_phase_commit(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -6390,8 +6718,7 @@ void test_engine_key_stays_writable_after_a_two_phase_commit(void)
     ASSERT_EQ(tidesdb_txn_commit_prepared(p2), TDB_SUCCESS);
     tidesdb_txn_free(p2);
 
-    /* and a rolled-back prepare must leave the key writable too, which is the path that always
-     * released its reservation */
+    /* and a rolled-back prepare must leave the key writable too */
     tidesdb_txn_t *p3 = NULL;
     const uint8_t xid3[] = "xid-rolled-back";
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &p3), TDB_SUCCESS);
@@ -6691,6 +7018,362 @@ void test_engine_create_cf_refuses_an_id_past_the_key_prefix(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+#define ENGINE_TEST_RT_LO       "r1"
+#define ENGINE_TEST_RT_HI       "r4"
+#define ENGINE_TEST_RT_ROWS_MAX 8
+
+static void engine_test_rt_fill(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    ryow_commit(db, cf, "r1", "a");
+    ryow_commit(db, cf, "r2", "b");
+    ryow_commit(db, cf, "r3", "c");
+}
+
+static int engine_test_rt_delete(tidesdb_txn_t *t, tidesdb_column_family_t *cf)
+{
+    return tidesdb_txn_delete_range(t, cf, (const uint8_t *)ENGINE_TEST_RT_LO,
+                                    strlen(ENGINE_TEST_RT_LO), (const uint8_t *)ENGINE_TEST_RT_HI,
+                                    strlen(ENGINE_TEST_RT_HI));
+}
+
+/* collect what a scan of the whole family returns into "k,k," form */
+static void engine_test_scan_keys(tidesdb_txn_t *t, tidesdb_column_family_t *cf, char *out,
+                                  const size_t cap)
+{
+    out[0] = '\0';
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(t, cf, &it), TDB_SUCCESS);
+    int rc = tidesdb_iter_seek_to_first(it);
+    for (int i = 0; i < ENGINE_TEST_RT_ROWS_MAX && rc == TDB_SUCCESS && tidesdb_iter_valid(it); i++)
+    {
+        uint8_t *k = NULL, *v = NULL;
+        size_t ks = 0, vs = 0;
+        ASSERT_EQ(tidesdb_iter_key_value(it, &k, &ks, &v, &vs), TDB_SUCCESS);
+        strncat(out, (const char *)k, ks < cap - strlen(out) - 2 ? ks : 0);
+        strncat(out, ",", cap - strlen(out) - 1);
+        free(k);
+        free(v);
+        rc = tidesdb_iter_next(it);
+    }
+    tidesdb_iter_free(it);
+}
+
+/* a transaction's scan hides the committed rows its own interval delete covers even when those rows
+ * committed at the very sequence its snapshot stands on, the last commit before it began, and shows
+ * a key it wrote under the interval afterwards */
+void test_engine_scan_honours_own_interval_delete_at_the_snapshot_sequence(void)
+{
+    for (int prefix = 0; prefix <= 1; prefix++)
+    {
+        (void)remove_directory(ENGINE_TEST_DB_DIR);
+        char db_path[] = ENGINE_TEST_DB_DIR;
+        tidesdb_config_t cfg = engine_test_config(db_path);
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+        tidesdb_txn_t *w = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &w), TDB_SUCCESS);
+        const char *rows[] = {"r1", "r2", "r3"};
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++)
+            ASSERT_EQ(tidesdb_txn_put(w, cf, (const uint8_t *)rows[i], strlen(rows[i]),
+                                      (const uint8_t *)"v", 1, -1),
+                      TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(w), TDB_SUCCESS);
+        tidesdb_txn_free(w);
+
+        tidesdb_txn_t *t = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &t), TDB_SUCCESS);
+        if (prefix)
+            ASSERT_EQ(tidesdb_txn_delete_prefix(t, cf, (const uint8_t *)"r", 1), TDB_SUCCESS);
+        else
+            ASSERT_EQ(engine_test_rt_delete(t, cf), TDB_SUCCESS);
+        char seen[64];
+        engine_test_scan_keys(t, cf, seen, sizeof(seen));
+        ASSERT_EQ(strcmp(seen, ""), 0);
+        ASSERT_EQ(tidesdb_txn_put(t, cf, (const uint8_t *)"r2", 2, (const uint8_t *)"w", 1, -1),
+                  TDB_SUCCESS);
+        engine_test_scan_keys(t, cf, seen, sizeof(seen));
+        ASSERT_EQ(strcmp(seen, "r2,"), 0);
+        ASSERT_EQ(tidesdb_txn_rollback(t), TDB_SUCCESS);
+        tidesdb_txn_free(t);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a range delete whose interval an overlapping range delete wrote into after its snapshot is
+ * refused under first-committer-wins, with the committed tombstone in a memtable or flushed to a
+ * table, since both deleted the same versions and only one may */
+void test_engine_range_delete_conflicts_with_a_committed_overlapping_range_delete(void)
+{
+    const int levels[] = {TDB_ISOLATION_SNAPSHOT, TDB_ISOLATION_SERIALIZABLE};
+    for (size_t l = 0; l < sizeof(levels) / sizeof(levels[0]); l++)
+        for (int flushed = 0; flushed <= 1; flushed++)
+        {
+            (void)remove_directory(ENGINE_TEST_DB_DIR);
+            char db_path[] = ENGINE_TEST_DB_DIR;
+            tidesdb_config_t cfg = engine_test_config(db_path);
+            tidesdb_t *db = NULL;
+            ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+            tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+            ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+            engine_test_rt_fill(db, cf);
+
+            tidesdb_txn_t *older = NULL, *newer = NULL;
+            ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, levels[l], &older), TDB_SUCCESS);
+            ASSERT_EQ(engine_test_rt_delete(older, cf), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, levels[l], &newer), TDB_SUCCESS);
+            ASSERT_EQ(engine_test_rt_delete(newer, cf), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(newer), TDB_SUCCESS);
+            if (flushed) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(older), TDB_ERR_CONFLICT);
+            tidesdb_txn_free(older);
+            tidesdb_txn_free(newer);
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+        }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a serializable scan over rows a range delete removed after its snapshot is a read that no longer
+ * holds, so the scanning transaction is refused, with the tombstone in a memtable or a table */
+void test_engine_serializable_scan_conflicts_with_a_range_delete_under_it(void)
+{
+    for (int flushed = 0; flushed <= 1; flushed++)
+    {
+        (void)remove_directory(ENGINE_TEST_DB_DIR);
+        char db_path[] = ENGINE_TEST_DB_DIR;
+        tidesdb_config_t cfg = engine_test_config(db_path);
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+        ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+        engine_test_rt_fill(db, cf);
+
+        tidesdb_txn_t *scanner = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &scanner),
+                  TDB_SUCCESS);
+        tidesdb_iter_t *it = NULL;
+        ASSERT_EQ(tidesdb_iter_new_range(
+                      scanner, cf, (const uint8_t *)ENGINE_TEST_RT_LO, strlen(ENGINE_TEST_RT_LO),
+                      (const uint8_t *)ENGINE_TEST_RT_HI, strlen(ENGINE_TEST_RT_HI), &it),
+                  TDB_SUCCESS);
+        ASSERT_EQ(
+            tidesdb_iter_seek(it, (const uint8_t *)ENGINE_TEST_RT_LO, strlen(ENGINE_TEST_RT_LO)),
+            TDB_SUCCESS);
+        int rows = 0;
+        for (int i = 0; i < ENGINE_TEST_RT_ROWS_MAX && tidesdb_iter_valid(it); i++)
+        {
+            rows++;
+            if (tidesdb_iter_next(it) != TDB_SUCCESS) break;
+        }
+        tidesdb_iter_free(it);
+        ASSERT_TRUE(rows >= 1);
+
+        tidesdb_txn_t *deleter = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &deleter),
+                  TDB_SUCCESS);
+        ASSERT_EQ(engine_test_rt_delete(deleter, cf), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(deleter), TDB_SUCCESS);
+        tidesdb_txn_free(deleter);
+        if (flushed) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(scanner, cf, (const uint8_t *)"z", 1, (const uint8_t *)"z", 1, -1),
+            TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(scanner), TDB_ERR_CONFLICT);
+        tidesdb_txn_free(scanner);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* an iterator may be freed after the transaction it was opened under is freed or reset. the free
+ * then records no footprint, releases no hold and touches nothing of the transaction, an iterator
+ * left behind answers nothing but its free, and a transaction reset under one carries no footprint
+ * of the old scan into the transaction it becomes */
+void test_engine_iterator_outlives_its_transaction(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    ryow_commit(db, cf, "a", "A");
+    ryow_commit(db, cf, "b", "B");
+
+    /* a read committed scan holds its ceiling through the iterator; the transaction goes first */
+    tidesdb_txn_t *rc = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &rc), TDB_SUCCESS);
+    tidesdb_iter_t *it = NULL;
+    ASSERT_EQ(tidesdb_iter_new(rc, cf, &it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_SUCCESS);
+    tidesdb_txn_free(rc);
+    tidesdb_iter_free(it);
+
+    /* a repeatable read scan that covered the family would hand its footprint to the read set */
+    tidesdb_txn_t *rr = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &rr),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_new(rr, cf, &it), TDB_SUCCESS);
+    int rc_step = tidesdb_iter_seek_to_first(it);
+    while (rc_step == TDB_SUCCESS && tidesdb_iter_valid(it)) rc_step = tidesdb_iter_next(it);
+    tidesdb_txn_free(rr);
+    tidesdb_iter_free(it);
+
+    /* an iterator left behind by its transaction's free answers nothing but its free */
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &rc), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_new(rc, cf, &it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_valid(it), 1);
+    tidesdb_txn_free(rc);
+    ASSERT_EQ(tidesdb_iter_valid(it), 0);
+    ASSERT_EQ(tidesdb_iter_next(it), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(it), TDB_ERR_INVALID_ARGS);
+    uint8_t *k = NULL;
+    size_t ks = 0;
+    ASSERT_EQ(tidesdb_iter_key(it, &k, &ks), TDB_ERR_INVALID_ARGS);
+    tidesdb_iter_free(it);
+
+    /* the same scan left behind by a reset. another transaction then puts a key inside the old
+     * scan's range, and the reset transaction commits a write beside it, which the old footprint
+     * would have refused as a phantom had it been carried across */
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &rr),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_new(rr, cf, &it), TDB_SUCCESS);
+    rc_step = tidesdb_iter_seek_to_first(it);
+    while (rc_step == TDB_SUCCESS && tidesdb_iter_valid(it)) rc_step = tidesdb_iter_next(it);
+    ASSERT_EQ(tidesdb_txn_reset(rr, TDB_ISOLATION_REPEATABLE_READ), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_valid(it), 0);
+    tidesdb_iter_free(it);
+    ryow_commit(db, cf, "c", "C");
+    ASSERT_EQ(tidesdb_txn_put(rr, cf, (const uint8_t *)"q", 1, (const uint8_t *)"Q", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(rr), TDB_SUCCESS);
+    tidesdb_txn_free(rr);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* polls for the spare log a flush worker prepares after open, each a millisecond apart */
+#define ENGINE_TEST_SPARE_WAIT_POLLS 10000
+#define ENGINE_TEST_SPARE_POLL_US    1000
+
+/* a rotation that opened its own log while the spare was still being prepared has moved past the
+ * spare's generation, and the next rotation must not install the spare after it. a log with a lower
+ * generation holding newer commits would be replayed as older, since recovery replays in generation
+ * order. the spare is discarded, its file with it, and every commit reads back after a reopen */
+void test_engine_rotation_never_installs_an_overtaken_spare(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    engine_prepare_spare_wal(db);
+    for (int i = 0; i < ENGINE_TEST_SPARE_WAIT_POLLS &&
+                    !atomic_load_explicit(&db->spare_wal, memory_order_acquire);
+         i++)
+        usleep(ENGINE_TEST_SPARE_POLL_US);
+    ASSERT_TRUE(atomic_load_explicit(&db->spare_wal, memory_order_acquire) != NULL);
+    const uint64_t spare_gen = db->spare_wal_gen;
+
+    /* a preparer is in flight, so the rotation opens a log of its own above the spare */
+    atomic_store_explicit(&db->spare_wal_preparing, 1, memory_order_release);
+    ryow_commit(db, cf, "a", "A");
+    ASSERT_EQ(engine_force_rotate(db), TDB_SUCCESS);
+    const uint64_t overtaking_gen = atomic_load(&db->active_wal_gen);
+    ASSERT_TRUE(overtaking_gen > spare_gen);
+    atomic_store_explicit(&db->spare_wal_preparing, 0, memory_order_release);
+
+    /* the next rotation finds the overtaken spare and discards it */
+    ryow_commit(db, cf, "b", "B");
+    ASSERT_EQ(engine_force_rotate(db), TDB_SUCCESS);
+    ASSERT_TRUE(atomic_load(&db->active_wal_gen) > overtaking_gen);
+    char name[ENGINE_WAL_NAME_MAX], path[ENGINE_PATH_BUF_SIZE];
+    ASSERT_EQ(tidesdb_wal_filename(spare_gen, name, sizeof(name)), TDB_SUCCESS);
+    snprintf(path, sizeof(path), "%s%s%s", db_path, PATH_SEPARATOR, name);
+    ASSERT_TRUE(access(path, F_OK) != 0);
+
+    ryow_commit(db, cf, "c", "C");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    const char *keys[] = {"a", "b", "c"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+    {
+        tidesdb_txn_t *t = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &t), TDB_SUCCESS);
+        uint8_t *v = NULL;
+        size_t vs = 0;
+        ASSERT_EQ(tidesdb_txn_get(t, cf, (const uint8_t *)keys[i], 1, &v, &vs), TDB_SUCCESS);
+        free(v);
+        tidesdb_txn_free(t);
+    }
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a prepare pins the log its record lands in even while a spare log waits for the next rotation.
+ * the spare's generation is already drawn, so a prepare that pinned the newest generation drawn
+ * pinned the spare, left the active log unpinned, and a flush of the active generation unlinked
+ * the log holding the undecided prepare, which a reopen then did not find */
+void test_engine_prepare_pins_the_active_log_while_a_spare_waits(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    engine_prepare_spare_wal(db);
+    for (int i = 0; i < ENGINE_TEST_SPARE_WAIT_POLLS &&
+                    !atomic_load_explicit(&db->spare_wal, memory_order_acquire);
+         i++)
+        usleep(ENGINE_TEST_SPARE_POLL_US);
+    ASSERT_TRUE(atomic_load_explicit(&db->spare_wal, memory_order_acquire) != NULL);
+
+    const uint8_t xid[] = "xid-beside-a-spare";
+    tidesdb_txn_t *pending = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &pending), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(pending, cf, (const uint8_t *)"p", 1, (const uint8_t *)"P", 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_prepare(pending, xid, sizeof(xid) - 1), TDB_SUCCESS);
+    ryow_commit(db, cf, "q", "Q");
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    tidesdb_txn_free(pending);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    int count = -1;
+    tidesdb_prepared_txn_t found[4];
+    ASSERT_EQ(tidesdb_recover_prepared(db, found, 4, &count), TDB_SUCCESS);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(memcmp(found[0].xid, xid, sizeof(xid) - 1) == 0);
+    ASSERT_EQ(tidesdb_txn_rollback_prepared(found[0].txn), TDB_SUCCESS);
+    tidesdb_txn_free(found[0].txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -6721,6 +7404,14 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_bounded_iterator_returns_the_whole_range_and_nothing_else, tests_passed);
     RUN_TEST(test_engine_compaction_converges_an_interleaved_store, tests_passed);
     RUN_TEST(test_engine_scan_reads_own_writes, tests_passed);
+    RUN_TEST(test_engine_scan_honours_own_prefix_delete, tests_passed);
+    RUN_TEST(test_engine_iterator_outlives_its_transaction, tests_passed);
+    RUN_TEST(test_engine_rotation_never_installs_an_overtaken_spare, tests_passed);
+    RUN_TEST(test_engine_prepare_pins_the_active_log_while_a_spare_waits, tests_passed);
+    RUN_TEST(test_engine_range_delete_conflicts_with_a_committed_overlapping_range_delete,
+             tests_passed);
+    RUN_TEST(test_engine_serializable_scan_conflicts_with_a_range_delete_under_it, tests_passed);
+    RUN_TEST(test_engine_scan_honours_own_interval_delete_at_the_snapshot_sequence, tests_passed);
     RUN_TEST(test_engine_cf_stats, tests_passed);
     RUN_TEST(test_engine_cf_estimate_cardinality, tests_passed);
     RUN_TEST(test_engine_cf_unflushed_keys, tests_passed);
@@ -6803,7 +7494,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_txn_timeout_config_default, tests_passed);
     RUN_TEST(test_engine_cf_id_not_reused_after_drop_reopen, tests_passed);
     RUN_TEST(test_engine_prepared_batch_holds_its_key_past_the_commit_ring, tests_passed);
-    RUN_TEST(test_engine_abandoned_prepares_do_not_exhaust_the_hold_table, tests_passed);
+    RUN_TEST(test_engine_prepared_read_refuses_a_writer_until_decided, tests_passed);
+    RUN_TEST(test_engine_recovered_prepare_keeps_its_read_claims, tests_passed);
+    RUN_TEST(test_engine_recovered_prepare_keeps_its_scanned_range, tests_passed);
+    RUN_TEST(test_engine_scan_footprint_refuses_a_phantom, tests_passed);
+    RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

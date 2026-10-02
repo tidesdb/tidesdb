@@ -75,7 +75,10 @@ static int cf_load_entries(cf_t *cf, tidesdb_manifest_t *manifest, const int syn
     tidesdb_manifest_entry_t *entries = malloc((size_t)count * sizeof(*entries));
     if (!entries) return -1;
 
-    const int got = tidesdb_manifest_copy_entries(manifest, cf->cf_id, entries, count);
+    /* a table landing between the count and the copy is reported but not copied, so only what fit
+     * in the array is read */
+    const int matched = tidesdb_manifest_copy_entries(manifest, cf->cf_id, entries, count);
+    const int got = matched < count ? matched : count;
     int result = 0;
     for (int i = 0; i < got && result == 0; i++)
     {

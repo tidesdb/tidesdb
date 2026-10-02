@@ -370,7 +370,12 @@ static void fx_op_delete(fx_state_t *s)
     const char *cf = fx_pick_cf(s);
     uint8_t key[FX_MAX_KLEN];
     const size_t klen = fx_gen_key(s, key);
-    const int rc = tidesdb_txn_delete(s->txn, fx_cf_handle(s->db, cf), key, klen);
+    /* the fuzzer rewrites keys freely, so a single-delete here mostly breaks its promise of one
+     * put, and the model holding it to a plain delete is what proves a broken promise never brings
+     * an older put back */
+    const int single = fx_byte(s) & 1;
+    const int rc = single ? tidesdb_txn_single_delete(s->txn, fx_cf_handle(s->db, cf), key, klen)
+                          : tidesdb_txn_delete(s->txn, fx_cf_handle(s->db, cf), key, klen);
     FUZZ_CHECK(rc == TDB_SUCCESS || rc == TDB_ERR_NOT_FOUND, "delete rc %d", rc);
     FUZZ_CHECK(fuzz_model_delete(s->model, cf, key, klen), "model delete");
 }

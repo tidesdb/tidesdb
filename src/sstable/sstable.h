@@ -487,7 +487,8 @@ int sstable_iter_read_failed(const sstable_iter_t *it);
  * @param vlog_offset out -- the vlog offset to resolve, or 0 when the value is inline
  * @param seq out -- the entry's sequence number
  * @param ttl out -- the entry's expiry, or 0 for none
- * @param deleted out -- non-zero when the entry is a tombstone
+ * @param deleted out -- non-zero when the entry is a tombstone, as TDB_KV_FLAG_TOMBSTONE with
+ * TDB_KV_FLAG_SINGLE_DELETE on top for a single-delete
  * @return TDB_SUCCESS on success, TDB_ERR_NOT_FOUND when the cursor is not positioned,
  * TDB_ERR_INVALID_ARGS
  */

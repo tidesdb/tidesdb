@@ -359,9 +359,15 @@ so that case refuses the drop rather than concluding from what it did see. A lev
 read at all refuses too. The tombstone surviving a merge it could have left costs one entry; the
 opposite mistake costs a resurrected key.
 
-A **single-delete** is the exception: the caller has promised the key was written at most once,
-so the tombstone and that one put annihilate as soon as a merge sees them together. That
-promise is unverifiable by the engine, which is why breaking it resurrects data.
+A **single-delete** is the exception: the caller has promised the key was written at most once
+since its last delete, so the tombstone and that one put drop together as soon as a merge sees
+them together, at any level. The merge holds a single-delete back when it is the key's newest
+version at or below the floor, and looks at the next version. If that is a live put and no
+table outside the merge holds the key, both go. The engine cannot check the promise, so the
+second condition is the same proof a base tombstone at the largest level needs. A put in a
+table the merge did not read keeps the single-delete, and that covers a key written twice.
+A kept single-delete is written back with its subtype, so the merge that later meets the put
+can still drop the pair. Breaking the promise therefore costs space, never a resurrected key.
 
 ### A lapsed entry arrives as a tombstone
 

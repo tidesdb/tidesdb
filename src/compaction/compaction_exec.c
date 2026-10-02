@@ -354,6 +354,134 @@ static int ce_safe_to_drop_tomb(cf_t *cf, const uint8_t *key, size_t klen, const
     return safe;
 }
 
+/**
+ * ce_key_state_t
+ * what the write loop carries from one version of a key to the next
+ * @param key the key being merged, copied since the merge moves under it
+ * @param key_size the copy's length
+ * @param key_cap the copy's allocated size
+ * @param kept_base whether the key's base version has been seen
+ * @param sd_held whether a single-delete base is held back until the version beneath it is seen
+ * @param sd_seq the held single-delete's sequence number
+ */
+typedef struct
+{
+    uint8_t *key;
+    size_t key_size;
+    size_t key_cap;
+    int kept_base;
+    int sd_held;
+    uint64_t sd_seq;
+} ce_key_state_t;
+
+/* write one retained version. a tombstone carries no deadline of its own, including one that lapsed
+ * and became a tombstone on the way in here, which is how the flush writes one too, and a
+ * single-delete keeps its subtype so a later merge that meets its put can still drop the pair */
+static int ce_add_version(ce_sink_t *sink, const uint8_t *key, size_t key_size,
+                          const uint8_t *value, size_t value_size, uint64_t vlog_offset,
+                          uint64_t seq, int64_t ttl, uint8_t deleted)
+{
+    const uint8_t flags =
+        deleted ? (uint8_t)(TDB_KV_FLAG_TOMBSTONE | (deleted & TDB_KV_FLAG_SINGLE_DELETE)) : 0;
+    const int64_t entry_ttl = deleted ? TDB_TTL_NONE : ttl;
+    return ce_sink_add(sink, key, key_size, value, value_size, vlog_offset, seq, entry_ttl, flags);
+}
+
+/* settle a held single-delete. it goes with the put beneath it at any level, or alone at the
+ * largest level as any base tombstone does, and in both only when no sstable outside the merge
+ * holds the key. the promise of a single put is the caller's, and a second put in a table the merge
+ * did not see would come back if it were trusted. kept, it is written back still a single-delete */
+static int ce_release_single_delete(const compaction_ctx_t *cx, const compaction_job_t *job,
+                                    ce_sink_t *sink, ce_key_state_t *st, int met_put)
+{
+    if (!st->sd_held) return TDB_SUCCESS;
+    st->sd_held = 0;
+    if ((met_put || job->is_largest_level) &&
+        ce_safe_to_drop_tomb(cx->cf, st->key, st->key_size, job->input_ids, job->n_inputs))
+    {
+        TDB_DEBUG_LOG(TDB_LOG_TRACE, "dropping single-delete cf %s key %.*s seq %llu", cx->cf->name,
+                      (int)st->key_size, (const char *)st->key, (unsigned long long)st->sd_seq);
+        return TDB_SUCCESS;
+    }
+    return ce_add_version(sink, st->key, st->key_size, NULL, 0, 0, st->sd_seq, TDB_TTL_NONE,
+                          TDB_KV_FLAG_TOMBSTONE | TDB_KV_FLAG_SINGLE_DELETE);
+}
+
+/* on the first version of a new key, settle what the previous key left held, roll the output at a
+ * boundary, and copy the key */
+static int ce_enter_key(const compaction_ctx_t *cx, const compaction_job_t *job, ce_sink_t *sink,
+                        ce_key_state_t *st, const uint8_t *key, size_t key_size)
+{
+    if (st->key && tdb_key_cmp(key, key_size, st->key, st->key_size) == 0) return TDB_SUCCESS;
+    const int rc = ce_release_single_delete(cx, job, sink, st, 0);
+    if (rc != TDB_SUCCESS) return rc;
+    st->kept_base = 0;
+    if (ce_sink_maybe_roll(sink, job, key, key_size) != TDB_SUCCESS) return TDB_ERR_IO;
+    if (key_size > st->key_cap)
+    {
+        uint8_t *grown = realloc(st->key, key_size);
+        if (!grown) return TDB_ERR_MEMORY;
+        st->key = grown;
+        st->key_cap = key_size;
+    }
+    memcpy(st->key, key, key_size);
+    st->key_size = key_size;
+    return TDB_SUCCESS;
+}
+
+/* apply retention to one version of the current key and write it when it stays */
+static int ce_place_version(const compaction_ctx_t *cx, const compaction_job_t *job,
+                            ce_sink_t *sink, ce_key_state_t *st, const uint8_t *value,
+                            size_t value_size, uint64_t vlog_offset, uint64_t seq, int64_t ttl,
+                            uint8_t deleted)
+{
+    const uint8_t *key = st->key;
+    const size_t key_size = st->key_size;
+    /* the version beneath a held single-delete settles it, a live put being the one it pairs with.
+     * everything beneath the base is dropped below, so nothing of this key is written after it */
+    if (st->sd_held)
+    {
+        const int rc = ce_release_single_delete(cx, job, sink, st, !deleted);
+        if (rc != TDB_SUCCESS) return rc;
+    }
+
+    const int was_base = st->kept_base;
+    int keep = ce_retain(cx, job->is_largest_level, seq, deleted, &st->kept_base);
+    const int is_base = !was_base && st->kept_base;
+
+    /* a range tombstone at or below the reclamation floor deletes this version for every reader
+     * there can still be, so the version goes -- the base ce_retain kept included, since
+     * nothing can resolve to it any more. the tombstone itself stays until it is provably
+     * spent, so the data it shadows in a sibling this merge did not touch is still covered */
+    uint64_t range_tomb_seq = 0;
+    if (keep && cf_range_tombstone_covering(cx->cf, key, key_size, cx->gc_floor, &range_tomb_seq) &&
+        range_tomb_seq > seq)
+        keep = 0;
+
+    /* a single-delete base waits for the version beneath it, which is where its put would be */
+    if (is_base && (deleted & TDB_KV_FLAG_SINGLE_DELETE) && (keep || job->is_largest_level))
+    {
+        st->sd_held = 1;
+        st->sd_seq = seq;
+        return TDB_SUCCESS;
+    }
+    /* a base tombstone is only GC'd when no sstable outside the merge still holds the key; a
+     * sibling in the tiered largest level or L1 that the merge did not include would otherwise
+     * resurrect the older version once the shadowing tombstone is dropped */
+    if (!keep && deleted && job->is_largest_level && is_base)
+    {
+        if (ce_safe_to_drop_tomb(cx->cf, key, key_size, job->input_ids, job->n_inputs))
+            /* the point of no return for a delete -- once this tombstone is gone any older
+             * version a sibling still holds becomes visible again */
+            TDB_DEBUG_LOG(TDB_LOG_TRACE, "dropping base tombstone cf %s key %.*s seq %llu",
+                          cx->cf->name, (int)key_size, (const char *)key, (unsigned long long)seq);
+        else
+            keep = 1;
+    }
+    if (!keep) return TDB_SUCCESS;
+    return ce_add_version(sink, key, key_size, value, value_size, vlog_offset, seq, ttl, deleted);
+}
+
 /* iterate the raw merge over [begin, end), applying retention and the split policy, into the sink.
  * a NULL begin starts at the first key and a NULL end runs to the last, which is the whole range
  * and what an undivided job passes */
@@ -361,11 +489,11 @@ static int ce_write_merged(const compaction_ctx_t *cx, const compaction_job_t *j
                            merge_iter_t *merge, ce_sink_t *sink, const uint8_t *begin,
                            size_t begin_size, const uint8_t *end, size_t end_size)
 {
-    uint8_t *prev_key = NULL;
-    size_t prev_key_size = 0, prev_key_cap = 0;
-    int kept_base = 0;
+    ce_key_state_t st;
+    memset(&st, 0, sizeof(st));
+    int wr = TDB_SUCCESS;
     int rc = begin ? merge_iter_seek(merge, begin, begin_size) : merge_iter_seek_first(merge);
-    while (rc == TDB_SUCCESS)
+    while (rc == TDB_SUCCESS && wr == TDB_SUCCESS)
     {
         const uint8_t *key = NULL, *value = NULL;
         size_t key_size = 0, value_size = 0;
@@ -380,72 +508,16 @@ static int ce_write_merged(const compaction_ctx_t *cx, const compaction_job_t *j
          * starts here begins with that key's own versions rather than the tail of this one's */
         if (end && tdb_key_cmp(key, key_size, end, end_size) >= 0) break;
 
-        if (!prev_key || tdb_key_cmp(key, key_size, prev_key, prev_key_size) != 0)
-        {
-            kept_base = 0;
-            if (ce_sink_maybe_roll(sink, job, key, key_size) != TDB_SUCCESS)
-            {
-                free(prev_key);
-                return TDB_ERR_IO;
-            }
-            if (key_size > prev_key_cap)
-            {
-                uint8_t *grown = realloc(prev_key, key_size);
-                if (!grown)
-                {
-                    free(prev_key);
-                    return TDB_ERR_MEMORY;
-                }
-                prev_key = grown;
-                prev_key_cap = key_size;
-            }
-            memcpy(prev_key, key, key_size);
-            prev_key_size = key_size;
-        }
-
-        const int was_base = kept_base;
-        int keep = ce_retain(cx, job->is_largest_level, seq, deleted, &kept_base);
-
-        /* a range tombstone at or below the reclamation floor deletes this version for every reader
-         * there can still be, so the version goes -- the base ce_retain kept included, since
-         * nothing can resolve to it any more. the tombstone itself stays until it is provably
-         * spent, so the data it shadows in a sibling this merge did not touch is still covered */
-        uint64_t range_tomb_seq = 0;
-        if (keep &&
-            cf_range_tombstone_covering(cx->cf, key, key_size, cx->gc_floor, &range_tomb_seq) &&
-            range_tomb_seq > seq)
-            keep = 0;
-        /* a base tombstone is only GC'd when no sstable outside the merge still holds the key; a
-         * sibling in the tiered largest level or L1 that the merge did not include would otherwise
-         * resurrect the older version once the shadowing tombstone is dropped */
-        if (!keep && deleted && job->is_largest_level && !was_base && kept_base)
-        {
-            if (ce_safe_to_drop_tomb(cx->cf, key, key_size, job->input_ids, job->n_inputs))
-                /* the point of no return for a delete -- once this tombstone is gone any older
-                 * version a sibling still holds becomes visible again */
-                TDB_DEBUG_LOG(TDB_LOG_TRACE, "dropping base tombstone cf %s key %.*s seq %llu",
-                              cx->cf->name, (int)key_size, (const char *)key,
-                              (unsigned long long)seq);
-            else
-                keep = 1;
-        }
-        if (keep)
-        {
-            const uint8_t flags = deleted ? TDB_KV_FLAG_TOMBSTONE : 0;
-            /* a tombstone carries no deadline of its own, including one that lapsed and became a
-             * tombstone on the way in here, which is how the flush writes one too */
-            const int64_t entry_ttl = deleted ? TDB_TTL_NONE : ttl;
-            const int wr = ce_sink_add(sink, key, key_size, value, value_size, vlog_offset, seq,
-                                       entry_ttl, flags);
-            if (wr != TDB_SUCCESS)
-            {
-                free(prev_key);
-                return wr;
-            }
-        }
-        rc = merge_iter_next(merge);
+        wr = ce_enter_key(cx, job, sink, &st, key, key_size);
+        if (wr == TDB_SUCCESS)
+            wr = ce_place_version(cx, job, sink, &st, value, value_size, vlog_offset, seq, ttl,
+                                  deleted);
+        if (wr == TDB_SUCCESS) rc = merge_iter_next(merge);
     }
-    free(prev_key);
+    /* the last key's single-delete has no version beneath it in this range */
+    if (wr == TDB_SUCCESS) wr = ce_release_single_delete(cx, job, sink, &st, 0);
+    free(st.key);
+    if (wr != TDB_SUCCESS) return wr;
     /* two ways out are both a finished range: the merge ran out (not found), or the loop stopped at
      * the upper bound while it still had entries (success). only a real error skips the seal */
     if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND) return rc;

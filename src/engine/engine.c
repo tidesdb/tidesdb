@@ -906,7 +906,12 @@ int engine_drop_cf_locked(tidesdb_t *db, const char *name)
         if (!files)
             n_files = 0;
         else
-            n_files = tidesdb_manifest_copy_entries(db->manifest, cf_id, files, n_files);
+        {
+            /* a flush or a merge can land a table between the count and the copy, and the copy
+             * reports every match, so only what fit in the array is read */
+            const int matched = tidesdb_manifest_copy_entries(db->manifest, cf_id, files, n_files);
+            if (matched < n_files) n_files = matched;
+        }
     }
 
     int result = TDB_SUCCESS;

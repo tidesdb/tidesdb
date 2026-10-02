@@ -335,8 +335,8 @@ visible as `min_snapshot_seq`.
 A tombstone is the hard case. It can only be dropped when the merge can prove no older
 version of that key survives beneath it. Drop it too early and the older version is
 resurrected. This is why deletes cost space until a merge deep enough to prove it happens,
-and why a single-delete — where the caller promises the key was written at most once — can
-annihilate immediately.
+and why a single-delete — where the caller promises the key was written at most once — drops
+with its put at the first merge that reads both, at any level.
 
 ## The whole path
 

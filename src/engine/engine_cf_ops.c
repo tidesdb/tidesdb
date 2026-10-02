@@ -206,7 +206,10 @@ static int engine_clone_copy_sstables(tidesdb_t *db, const cf_t *src, cf_t *dst)
 
     tidesdb_manifest_entry_t *entries = malloc((size_t)count * sizeof(*entries));
     if (!entries) return TDB_ERR_MEMORY;
-    const int got = tidesdb_manifest_copy_entries(db->manifest, src->cf_id, entries, count);
+    /* a table landing between the count and the copy is reported but not copied, so only what fit
+     * in the array is read */
+    const int matched = tidesdb_manifest_copy_entries(db->manifest, src->cf_id, entries, count);
+    const int got = matched < count ? matched : count;
 
     int rc = TDB_SUCCESS;
     for (int i = 0; i < got && rc == TDB_SUCCESS; i++)

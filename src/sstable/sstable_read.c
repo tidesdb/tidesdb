@@ -11,6 +11,7 @@
 
 #include "base/errors.h" /* TDB_SUCCESS and the TDB_ERR_* result codes */
 #include "base/log.h"
+#include "internal/types.h" /* TDB_KV_FLAG_* the iterator reports a tombstone in */
 #include "sstable.h"
 
 /* fraction of the recorded node size added as read slack, as a right shift; 2 adds a quarter. a
@@ -430,6 +431,13 @@ int sstable_iter_get(sstable_iter_t *it, uint8_t **key, size_t *key_size, uint8_
     if (btree_cursor_get(it->cursor, key, key_size, value, value_size, vlog_offset, seq, ttl,
                          deleted) != 0)
         return TDB_ERR_NOT_FOUND;
+
+    /* the cursor answers with the on-disk flag byte, and everything above the table speaks the
+     * in-memory set, so a single-delete is spelled again here for the compaction that acts on it */
+    const uint8_t on_disk = *deleted;
+    *deleted = 0;
+    if (on_disk & BTREE_ENTRY_FLAG_TOMBSTONE) *deleted |= TDB_KV_FLAG_TOMBSTONE;
+    if (on_disk & BTREE_ENTRY_FLAG_SINGLE_DELETE) *deleted |= TDB_KV_FLAG_SINGLE_DELETE;
 
     /* scans and the compaction merge read through here, so a lapsed entry becomes a tombstone for
      * both -- hidden from an iterator, and carried into the merge as the tombstone whose collection

@@ -195,6 +195,8 @@ if the rule were broken. The enforcement column distinguishes three cases:
 | Replay applies at the record's own sequence, not its file position | [Recovery](/internals/recovery) | `test_engine_overwrite_across_recovery` |
 | The prepared-transaction staging map spans generations | [Recovery](/internals/recovery) | `test_engine_prepared_survives_flush` |
 | Families are rebuilt before log records naming them are applied | [Recovery](/internals/recovery) | `test_engine_cf_recovery` |
+| One create of a name wins, and the rest are refused as existing | [Recovery](/internals/recovery) | `test_engine_concurrent_create_of_one_name_admits_one_and_reopens` -- sixteen threads create one name at once, five rounds, and the store reopens each time. Without the ddl lock every creator found the name free, each persisted a record of its own, the losers reported out of memory, and the next open refused the whole store |
+| A duplicate name in the manifest keeps the record holding data | [Recovery](/internals/recovery) | `test_engine_open_keeps_the_duplicate_name_that_holds_data` -- the winner's data in the log, in a table, and nowhere, with the duplicate at the lower id. Keeping the lowest id fails it, and so does skipping the log scan |
 | A damaged manifest is rebuilt from the sstables on disk | [Manifest](/internals/manifest) | `manifest` tests cover discarding the log; `test_engine_rebuilds_catalogue_from_sstables` covers the readopt, and asserts the data reads back rather than only that the open succeeded |
 | A torn sstable is truncated to its last valid block | [Recovery](/internals/recovery) | `test_crash_recovery_torn_flush` |
 

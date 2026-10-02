@@ -204,8 +204,15 @@ field was rejected.
 
 ### Thread Safety
 
-Safe to call concurrently with other operations on the same database, including creates of
-differently named families.
+Safe to call concurrently with other operations on the same database. Creates, drops, renames and
+clones of families run one at a time, from the check of the name to the family's publication, so
+several threads creating the same name at once get exactly one `TDB_SUCCESS` and `TDB_ERR_EXISTS`
+for the rest. "Look it up, and create it if missing" from many threads is therefore safe: treat
+`TDB_ERR_EXISTS` as someone else having created it, and look it up again.
+
+Releases through 10.1.0 did not serialize this, and a create that lost such a race could leave a
+second record of the name in the manifest. Opening a store that carries one keeps the record that
+holds data, drops the other with a warning in the log, and opens normally.
 
 ### Examples
 

@@ -49,4 +49,16 @@ tidesdb_memtable_t *l0_pin_active_read(tidesdb_l0_t *l0);
  */
 void l0_unpin_read(tidesdb_memtable_t *mt);
 
+/**
+ * l0_pending_node_t
+ * one immutable awaiting a quiet moment to be freed
+ * @param mt the memtable, dequeued and unreachable by any new reader
+ * @param next the next node in the pending list
+ */
+typedef struct l0_pending_node
+{
+    tidesdb_memtable_t *mt;
+    struct l0_pending_node *next;
+} l0_pending_node_t;
+
 #endif /* __TIDESDB_L0_INTERNAL_H__ */

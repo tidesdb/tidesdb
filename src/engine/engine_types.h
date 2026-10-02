@@ -128,6 +128,10 @@ typedef struct
  * so the costly build runs off it and many immutables build at once
  * @param flush_lock_inited whether flush_lock was initialized, so close only destroys an
  * initialized lock
+ * @param ddl_lock serializes create, drop, rename and clone of families, from the check of a name
+ * to the publication of the result, so two of them cannot both find a name free and both persist it
+ * @param ddl_lock_inited whether ddl_lock was initialized, so close only destroys an initialized
+ * lock
  * @param install_lock orders the install phase by flush ticket so immutables install oldest-first
  * even though they build concurrently, preserving the invariant that no sstable is newer than what
  * remains in L0
@@ -209,6 +213,8 @@ struct tidesdb_t
     int rotate_lock_inited;
     pthread_mutex_t flush_lock;
     int flush_lock_inited;
+    pthread_mutex_t ddl_lock;
+    int ddl_lock_inited;
     pthread_mutex_t install_lock;
     pthread_cond_t install_cv;
     int install_lock_inited;

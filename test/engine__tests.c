@@ -10,6 +10,7 @@
 #include "../src/base/encoding/serialization.h" /* TDB_CF_INDEX_MAX */
 #include "../src/base/thread.h"                 /* threads retired without a join */
 #include "../src/base/waitstat.h" /* tdb_monotonic_us, for a duration the wall clock cannot give */
+#include "../src/column_family/cf_config.h"     /* cf_config_serialize, for a seeded record */
 #include "../src/column_family/column_family.h" /* cf_t, for level inspection */
 #include "../src/column_family/level/level_set.h"
 #include "../src/engine/engine.h"          /* engine_vlog_gc, for a direct value-log reclaim */
@@ -377,6 +378,145 @@ static void engine_assert_committed(tidesdb_t *db, tidesdb_column_family_t *cf, 
     }
     ASSERT_EQ(tidesdb_txn_commit(t), TDB_SUCCESS);
     tidesdb_txn_free(t);
+}
+
+/* threads that create one family name at once, rounds of them on fresh stores, and where a seeded
+ * duplicate keeps its winner's data */
+#define ENGINE_TEST_CREATE_RACERS 16
+#define ENGINE_TEST_CREATE_ROUNDS 5
+#define ENGINE_TEST_DUP_IN_LOG    0
+#define ENGINE_TEST_DUP_IN_TABLE  1
+#define ENGINE_TEST_DUP_EMPTY     2
+
+/**
+ * engine_create_racer_t
+ * one thread creating the raced name
+ * @param db the store
+ * @param go set once every racer is ready, so the creates overlap
+ * @param rc what the create returned
+ */
+typedef struct
+{
+    tidesdb_t *db;
+    _Atomic(int) *go;
+    int rc;
+} engine_create_racer_t;
+
+static void *engine_create_racer(void *arg)
+{
+    engine_create_racer_t *r = (engine_create_racer_t *)arg;
+    tidesdb_column_family_config_t cfc = tidesdb_default_column_family_config();
+    while (!atomic_load(r->go))
+        ;
+    r->rc = tidesdb_create_column_family(r->db, "same_name", &cfc);
+    return NULL;
+}
+
+/* creates of one name at once admit exactly one, refuse the rest as existing, and leave a store
+ * that opens again. losers used to persist a record of their own under the same name before finding
+ * the name taken, report it as out of memory, and the next open refused the whole store */
+void test_engine_concurrent_create_of_one_name_admits_one_and_reopens(void)
+{
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    for (int round = 0; round < ENGINE_TEST_CREATE_ROUNDS; round++)
+    {
+        (void)remove_directory(ENGINE_TEST_DB_DIR);
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        _Atomic(int) go;
+        atomic_init(&go, 0);
+        pthread_t th[ENGINE_TEST_CREATE_RACERS];
+        engine_create_racer_t racers[ENGINE_TEST_CREATE_RACERS];
+        for (int i = 0; i < ENGINE_TEST_CREATE_RACERS; i++)
+        {
+            racers[i] = (engine_create_racer_t){.db = db, .go = &go, .rc = TDB_ERR_UNKNOWN};
+            ASSERT_EQ(pthread_create(&th[i], NULL, engine_create_racer, &racers[i]), 0);
+        }
+        atomic_store(&go, 1);
+        int created = 0, existed = 0;
+        for (int i = 0; i < ENGINE_TEST_CREATE_RACERS; i++)
+        {
+            ASSERT_EQ(pthread_join(th[i], NULL), 0);
+            created += racers[i].rc == TDB_SUCCESS;
+            existed += racers[i].rc == TDB_ERR_EXISTS;
+        }
+        ASSERT_EQ(created, 1);
+        ASSERT_EQ(existed, ENGINE_TEST_CREATE_RACERS - 1);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+        db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        ASSERT_TRUE(tidesdb_get_column_family(db, "same_name") != NULL);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a store an earlier release left with two records of one name, the second written by a create that
+ * lost a race, holding its winner's data in the log, in a table, or nowhere. the loser's id is the
+ * lower of the two, so keeping the lowest id would keep the empty one and lose the data */
+static void engine_open_duplicate_name(const int where)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    tidesdb_column_family_config_t cfc = tidesdb_default_column_family_config();
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+
+    /* an id below the winner's that no live family holds, the place a losing create's id lands */
+    ASSERT_EQ(tidesdb_create_column_family(db, "spare", &cfc), TDB_SUCCESS);
+    const uint64_t loser_id = engine_get_cf(db, "spare")->cf_id;
+    ASSERT_EQ(tidesdb_drop_column_family(db, "spare"), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_column_family(db, "dup", &cfc), TDB_SUCCESS);
+    const uint64_t winner_id = engine_get_cf(db, "dup")->cf_id;
+    ASSERT_TRUE(loser_id < winner_id);
+
+    if (where != ENGINE_TEST_DUP_EMPTY)
+    {
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dup");
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)"k", 1, (const uint8_t *)"v", 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+        if (where == ENGINE_TEST_DUP_IN_TABLE) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    }
+
+    /* the record a losing create persisted, the same name under its own id */
+    tidesdb_column_family_config_t named = cfc;
+    snprintf(named.name, sizeof(named.name), "%s", "dup");
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+    ASSERT_EQ(cf_config_serialize(&named, &blob, &blob_len), 0);
+    ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, loser_id, "dup", blob, blob_len), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(db->manifest, db->manifest->path, 1), 0);
+    free(blob);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    for (int reopen = 0; reopen < 2; reopen++)
+    {
+        db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        if (where != ENGINE_TEST_DUP_EMPTY)
+        {
+            ASSERT_EQ(engine_get_cf(db, "dup")->cf_id, winner_id);
+            engine_assert_committed(db, tidesdb_get_column_family(db, "dup"), "k", "v");
+        }
+        else
+            ASSERT_TRUE(engine_get_cf(db, "dup") != NULL);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+void test_engine_open_keeps_the_duplicate_name_that_holds_data(void)
+{
+    engine_open_duplicate_name(ENGINE_TEST_DUP_IN_LOG);
+    engine_open_duplicate_name(ENGINE_TEST_DUP_IN_TABLE);
+    engine_open_duplicate_name(ENGINE_TEST_DUP_EMPTY);
 }
 
 /* a committed put reads back within its own transaction and from a later one */
@@ -7493,6 +7633,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_txn_timeout_expires, tests_passed);
     RUN_TEST(test_engine_txn_timeout_config_default, tests_passed);
     RUN_TEST(test_engine_cf_id_not_reused_after_drop_reopen, tests_passed);
+    RUN_TEST(test_engine_concurrent_create_of_one_name_admits_one_and_reopens, tests_passed);
+    RUN_TEST(test_engine_open_keeps_the_duplicate_name_that_holds_data, tests_passed);
     RUN_TEST(test_engine_prepared_batch_holds_its_key_past_the_commit_ring, tests_passed);
     RUN_TEST(test_engine_prepared_read_refuses_a_writer_until_decided, tests_passed);
     RUN_TEST(test_engine_recovered_prepare_keeps_its_read_claims, tests_passed);

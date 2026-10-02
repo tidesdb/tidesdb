@@ -17,6 +17,7 @@
 #include "compat.h" /* PATH_SEPARATOR, opendir, readdir */
 #include "engine_internal.h"
 #include "io/block_manager.h"
+#include "txn/wal_record.h" /* the log entries a duplicate family is looked for in */
 
 /* rebuilding the write side from what is on disk -- the column family registry the manifest
  * records, and every surviving WAL generation replayed back into L0 behind a fresh active memtable.
@@ -334,6 +335,9 @@ static int engine_rebuild_from_sstables(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
+static int engine_resolve_duplicate_names(tidesdb_t *db, const tidesdb_manifest_cf_t *cfs, int n,
+                                          int *skip);
+
 /* rebuild the cf registry from the manifest -- open every persisted cf from its recorded config
  * blob and sstable entries, seed the cf-id allocator past the highest recovered id, and seed the
  * sstable-id sequence past the highest recovered entry id. an empty manifest yields an empty
@@ -379,11 +383,18 @@ int engine_recover_cfs(tidesdb_t *db)
     }
 
     const int bm_sync = engine_durable_sync_mode(db->config.memtable_sync_mode);
-    int rc = TDB_SUCCESS;
+    int *skip = n > 0 ? calloc((size_t)n, sizeof(*skip)) : NULL;
+    if (n > 0 && !skip)
+    {
+        free(cfs);
+        return TDB_ERR_MEMORY;
+    }
+    int rc = engine_resolve_duplicate_names(db, cfs, n, skip);
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
         /* keep the l0 cf-index allocator past every recovered index so it never reuses one */
         tidesdb_l0_cf_index_observe(db->l0, (uint32_t)cfs[i].id);
+        if (skip[i]) continue;
         if (cfs[i].config_blob_len == 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "cf %s has no persisted config, skipping recovery",
@@ -398,15 +409,16 @@ int engine_recover_cfs(tidesdb_t *db)
             rc = TDB_ERR_IO;
             break;
         }
-        if (cf_registry_add(db->cfs, cf) != TDB_SUCCESS)
+        rc = cf_registry_add(db->cfs, cf);
+        if (rc != TDB_SUCCESS)
         {
             cf_free(cf);
-            rc = TDB_ERR_MEMORY;
             break;
         }
         /* bind before the wal replay below so replayed keys rebuild the unflushed count */
         tidesdb_l0_bind_cf_counter(db->l0, (uint32_t)cf->cf_id, &cf->unflushed_key_count);
     }
+    free(skip);
     free(cfs);
     if (rc != TDB_SUCCESS) return rc;
 
@@ -507,6 +519,121 @@ static int engine_scan_wal_generations(const char *db_dir, engine_wal_gen_t **ou
     }
     *out_gens = gens;
     return count;
+}
+
+/* mark which of ids any record in any surviving log names, for the duplicate names below. only a
+ * store that already holds a duplicate pays for it, and a log is read only to look */
+static int engine_wal_mentions(tidesdb_t *db, const uint64_t *ids, const int n_ids, int *mentioned)
+{
+    engine_wal_gen_t *gens = NULL;
+    const int n = engine_scan_wal_generations(db->db_path, &gens);
+    if (n < 0) return TDB_ERR_IO;
+    int rc = TDB_SUCCESS;
+    for (int g = 0; g < n && rc == TDB_SUCCESS; g++)
+    {
+        char name[ENGINE_WAL_NAME_MAX], path[ENGINE_PATH_BUF_SIZE];
+        block_manager_t *wal = NULL;
+        if (engine_wal_gen_name(&gens[g], name, sizeof(name)) != TDB_SUCCESS ||
+            engine_build_path(db->db_path, name, path, sizeof(path)) != TDB_SUCCESS ||
+            engine_open_wal_sealed(db, path, &wal) != 0)
+        {
+            rc = TDB_ERR_IO;
+            break;
+        }
+        block_manager_cursor_t cursor;
+        if (block_manager_cursor_init_stack(&cursor, wal) != 0) rc = TDB_ERR_IO;
+        block_manager_block_t *block = NULL;
+        while (rc == TDB_SUCCESS &&
+               (block = block_manager_cursor_read_and_advance(&cursor)) != NULL)
+        {
+            tidesdb_wal_cursor_t wc;
+            tidesdb_wal_entry_t e;
+            if (tidesdb_wal_cursor_init(&wc, block->data, block->size) == 0)
+                while (tidesdb_wal_cursor_next(&wc, &e) == 1)
+                    for (int i = 0; i < n_ids; i++) mentioned[i] |= (uint64_t)e.cf_index == ids[i];
+            block_manager_block_free(block);
+        }
+        engine_close_wal(db, wal);
+    }
+    free(gens);
+    return rc;
+}
+
+/* the index of the first record sharing cfs[i]'s name, i itself when it is the first */
+static int engine_first_of_name(const tidesdb_manifest_cf_t *cfs, const int i)
+{
+    for (int j = 0; j < i; j++)
+        if (strcmp(cfs[j].name, cfs[i].name) == 0) return j;
+    return i;
+}
+
+/* reconcile records naming the same family, which a create that lost a race to another create of
+ * the same name could persist before the ddl lock serialized them. the loser's handle was freed
+ * before it was ever published, so nothing was ever written under its id -- every table and every
+ * log record of the name belongs to the winner. the record holding data is kept and the others are
+ * dropped from the manifest for good; with no data anywhere either is the same family, and the
+ * lowest id is kept. two records holding data is no state a create could leave, and the open is
+ * refused rather than guessing. skip receives which records the registration must pass over */
+static int engine_resolve_duplicate_names(tidesdb_t *db, const tidesdb_manifest_cf_t *cfs,
+                                          const int n, int *skip)
+{
+    int dups = 0;
+    for (int i = 0; i < n; i++) dups += engine_first_of_name(cfs, i) != i;
+    if (dups == 0) return TDB_SUCCESS;
+
+    uint64_t *ids = malloc((size_t)n * sizeof(*ids));
+    int *mentioned = calloc((size_t)n, sizeof(*mentioned));
+    if (!ids || !mentioned)
+    {
+        free(ids);
+        free(mentioned);
+        return TDB_ERR_MEMORY;
+    }
+    for (int i = 0; i < n; i++) ids[i] = cfs[i].id;
+    int rc = engine_wal_mentions(db, ids, n, mentioned);
+
+    for (int first = 0; first < n && rc == TDB_SUCCESS; first++)
+    {
+        if (engine_first_of_name(cfs, first) != first) continue;
+        int keep = -1, holders = 0, members = 0;
+        for (int i = first; i < n; i++)
+        {
+            if (strcmp(cfs[i].name, cfs[first].name) != 0) continue;
+            members++;
+            const int tables = tidesdb_manifest_copy_entries(db->manifest, cfs[i].id, NULL, 0) > 0;
+            if (tables || mentioned[i])
+            {
+                holders++;
+                keep = i;
+            }
+            else if (holders == 0 && (keep < 0 || cfs[i].id < cfs[keep].id))
+                keep = i;
+        }
+        if (members < 2) continue;
+        if (holders > 1)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "cf %s is recorded %d times and %d of them hold data, refusing to choose",
+                          cfs[first].name, members, holders);
+            rc = TDB_ERR_CORRUPTION;
+            break;
+        }
+        for (int i = first; i < n; i++)
+        {
+            if (i == keep || strcmp(cfs[i].name, cfs[first].name) != 0) continue;
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "cf %s was recorded again under id %llu, keeping id %llu",
+                          cfs[i].name, (unsigned long long)cfs[i].id,
+                          (unsigned long long)cfs[keep].id);
+            skip[i] = 1;
+            if (tidesdb_manifest_drop_cf(db->manifest, cfs[i].id) != 0) rc = TDB_ERR_IO;
+        }
+    }
+    if (rc == TDB_SUCCESS &&
+        tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) != 0)
+        rc = TDB_ERR_IO;
+    free(ids);
+    free(mentioned);
+    return rc;
 }
 
 /* mint the WAL for a generation and install its memtable -- as the active one when is_first, else

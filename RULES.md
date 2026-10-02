@@ -1,26 +1,25 @@
 # Code Rules
 
 1. **Simple control flow.** No `goto`, `setjmp`/`longjmp`, or recursion.
-2. **Fixed loop bounds.** Every loop must have a statically verifiable upper bound.
-3. **No dynamic allocation after init.** All memory is allocated up front; no `malloc`/`free` in steady-state operation.
+2. **Bounded loops.** Every loop terminates by a stated bound or invariant -- a count, the size of the data it walks, or the progress a compare-and-swap retry makes. Wait and retry loops carry an explicit maximum and a defined outcome when they reach it.
+3. **Allocate deliberately.** Every allocation's failure is handled, hot paths reuse arenas or pools, and nothing allocates without bound.
 4. **Smallest possible scope.** Declare data objects at the tightest scope that works.
-5. **Check every return value.** Validate all function parameters; never ignore a non-void return.
-6. **Minimal preprocessor use.** Macros limited to file inclusion and simple constants - no token pasting, no conditional compilation that hides code from the compiler.
-7. **Restricted pointer use.** At most one level of dereference; no function pointers.
+5. **Check every return value.** Validate all function parameters; never ignore a non-void return. A result deliberately discarded is cast to `(void)` with the reason beside it.
+6. **Minimal preprocessor use.** Macros limited to file inclusion and simple constants, no token pasting. Conditional compilation only for platform differences, optional dependencies and named test switches, kept in the compat and platform headers where possible.
+7. **Restricted pointer use.** Function pointers only for interfaces and callbacks; pointer-to-pointer only for out-parameters and arrays of handles.
 8. **Zero-warning compilation.** All warnings enabled, all warnings fixed, and the code passes static analysis clean before release.
 9. **No magic numbers or strings.** Every literal with meaning gets a named constant or macro instead of a bare number or string appearing inline.
-10. **Functions should be unit and integration testable** 
+10. **Functions should be unit and integration testable.** A system module is unit and integration tested in the style of what is under `/test`.
 11. Comments are primarily **lowercase**.
-12. Before commiting code be sure to test it thoroughly locally and prove it, if on linux with ASAN, UBSAN and TSAN, all possible flags on your running platform.
-13. Attempt to keep source and header files under **1000** lines of code. A small number of files are
+12. Before committing code be sure to test it thoroughly locally and prove it, if on linux with ASAN, UBSAN and TSAN, all possible flags on your running platform.
+13. Attempt to keep source and header files under `src/` and `include/` under **1000** lines of code. Test files are not held to this. A small number of files are
     graced from this and are listed below; a graced file still has a hard ceiling, and nothing else
     may exceed 1000 lines without being added to the list.
 
     | File | Ceiling | Why |
     | --- | --- | --- |
     | `include/db.h` | 10000 | The public header is deliberately self-contained: one include gives a consumer or an FFI binding the whole API, with every type, error code and doc comment in one place. Splitting it would trade that for a header set callers have to assemble. |
-14. Functions should be attempted to be no greater than **100** lines.
-15. When writing system modules, be sure your code it unit and integration tested, similar style as to whats under /test
+14. Functions under `src/` should be attempted to be no greater than **100** lines.
 
 ## Documentation Style
 

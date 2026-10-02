@@ -43,6 +43,27 @@
 int engine_build_path(const char *dir, const char *name, char *out, size_t out_size);
 
 /**
+ * engine_create_cf_locked
+ * engine_create_cf for a caller already holding the ddl lock, the clone that creates its
+ * destination
+ * @param db the engine
+ * @param name the cf name, non-empty
+ * @param config the cf configuration, borrowed
+ * @return as engine_create_cf
+ */
+int engine_create_cf_locked(tidesdb_t *db, const char *name,
+                            const tidesdb_column_family_config_t *config);
+
+/**
+ * engine_drop_cf_locked
+ * engine_drop_cf for a caller already holding the ddl lock, the clone that undoes a partial copy
+ * @param db the engine
+ * @param name the cf name
+ * @return as engine_drop_cf
+ */
+int engine_drop_cf_locked(tidesdb_t *db, const char *name);
+
+/**
  * engine_durable_sync_mode
  * the block-manager sync mode for the durable base -- the value log, the flush and compaction
  * sstables, and the manifest. both full and interval keep the base fsynced, since interval only

@@ -598,6 +598,8 @@ static int engine_open_threads(tidesdb_t *db)
     db->prepare_vlog_token = VLOG_BUILD_TOKEN_NONE;
     if (pthread_mutex_init(&db->flush_lock, NULL) != 0) return TDB_ERR_MEMORY;
     db->flush_lock_inited = 1;
+    if (pthread_mutex_init(&db->ddl_lock, NULL) != 0) return TDB_ERR_MEMORY;
+    db->ddl_lock_inited = 1;
     if (pthread_mutex_init(&db->install_lock, NULL) != 0) return TDB_ERR_MEMORY;
     if (pthread_cond_init(&db->install_cv, NULL) != 0)
     {
@@ -743,6 +745,7 @@ void engine_close(tidesdb_t *db)
     free(db->retained_wals);
     free(db->prepare_gens);
     if (db->flush_lock_inited) pthread_mutex_destroy(&db->flush_lock);
+    if (db->ddl_lock_inited) pthread_mutex_destroy(&db->ddl_lock);
     if (db->install_lock_inited)
     {
         pthread_mutex_destroy(&db->install_lock);
@@ -757,7 +760,8 @@ void engine_close(tidesdb_t *db)
     if (owned_log_sink) tidesdb_log_close_sink();
 }
 
-int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_family_config_t *config)
+int engine_create_cf_locked(tidesdb_t *db, const char *name,
+                            const tidesdb_column_family_config_t *config)
 {
     if (!db || !name || name[0] == '\0' || !config) return TDB_ERR_INVALID_ARGS;
     if (atomic_load_explicit(&db->closing, memory_order_acquire)) return TDB_ERR_INVALID_DB;
@@ -808,11 +812,13 @@ int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_famil
         return rc;
     }
 
-    if (cf_registry_add(db->cfs, cf) != TDB_SUCCESS)
+    rc = cf_registry_add(db->cfs, cf);
+    if (rc != TDB_SUCCESS)
     {
-        /* the cf is durable and will recover on reopen; drop the in-memory handle */
+        /* the cf is durable and will recover on reopen; drop the in-memory handle. the name was
+         * checked under the ddl lock, so the registry cannot report it taken here */
         cf_free(cf);
-        return TDB_ERR_MEMORY;
+        return rc;
     }
     tidesdb_l0_bind_cf_counter(db->l0, (uint32_t)cf->cf_id, &cf->unflushed_key_count);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "cf %s created with id %llu", name, (unsigned long long)cf_id);
@@ -823,6 +829,18 @@ int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_famil
     return TDB_SUCCESS;
 }
 
+int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_family_config_t *config)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+    /* held from the name check to the registry publish. without it every creator of one name
+     * found it free, each persisted a manifest record of its own under a fresh id, and all but one
+     * then found the registry taken -- leaving records the next open could not reconcile */
+    pthread_mutex_lock(&db->ddl_lock);
+    const int rc = engine_create_cf_locked(db, name, config);
+    pthread_mutex_unlock(&db->ddl_lock);
+    return rc;
+}
+
 /* free a dropped family, once the registry says no borrow can still name it */
 static void engine_cf_reclaim(void *item, void *ctx)
 {
@@ -831,6 +849,15 @@ static void engine_cf_reclaim(void *item, void *ctx)
 }
 
 int engine_drop_cf(tidesdb_t *db, const char *name)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+    pthread_mutex_lock(&db->ddl_lock);
+    const int rc = engine_drop_cf_locked(db, name);
+    pthread_mutex_unlock(&db->ddl_lock);
+    return rc;
+}
+
+int engine_drop_cf_locked(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return TDB_ERR_INVALID_ARGS;
 

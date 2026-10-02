@@ -48,6 +48,13 @@ no compiler until the job runs it, and can stop compiling against the API while 
 reporting success. They are also denied the internal include path, so they prove the public header
 alone is sufficient to use the database.
 
+`library_unload_tests` does what a plugin host does at shutdown. It loads the shared library with
+`dlopen` rather than linking it, reads a flushed key from a second thread, closes the database,
+unloads the library, and only then lets that thread exit. The read leaves the block manager's
+per-thread read buffer behind, and its destructor runs at the thread's exit, so a library that the
+unload had unmapped takes the process down there. It is built only for shared builds on ELF
+platforms, the ones linked with `-z nodelete`.
+
 :::caution[Assert on the contract, not on success]
 The administrative calls — manual compaction, manual flush, backup, and the column-family
 rename, drop and reconfigure paths — take an exclusive claim on a family, and answer

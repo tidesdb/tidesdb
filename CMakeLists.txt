@@ -211,6 +211,14 @@ set_target_properties(tidesdb PROPERTIES
 
 target_include_directories(tidesdb PRIVATE src)
 
+# the block manager's per-thread read buffer is freed by a thread-specific destructor that lives in
+# this library, and a host that unloads it (a plugin server at shutdown) still has threads that ran
+# a read. their exit would call into unmapped code, so the shared library is marked never to be
+# unmapped. ELF linkers take the flag; Mach-O and PE have no equivalent
+if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+    target_link_options(tidesdb PRIVATE "LINKER:-z,nodelete")
+endif()
+
 # the test and fuzz sources declare their cases as bare
 # test_x(), which trips the prototype and shadow flags in bulk without indicating a defect there.
 # each flag is probed before use so an older GCC, a Clang, or a BSD toolchain that lacks one still
@@ -775,6 +783,24 @@ if(TIDESDB_BUILD_TESTS)
     set_tests_properties(portability_verify PROPERTIES FIXTURES_REQUIRED portable_db)
     set_tests_properties(portability_create portability_verify PROPERTIES
                          ENVIRONMENT TIDESDB_PORTABLE_DIR=${PORTABLE_DB_DIR})
+
+    # loads the built shared library, unloads it, and then exits a thread that read through it,
+    # which is what a plugin host does at shutdown. it does not link the library, it opens it
+    if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+        add_executable(library_unload_tests test/library_unload__tests.c)
+        add_dependencies(library_unload_tests tidesdb)
+        target_include_directories(library_unload_tests PRIVATE
+                                   include ${CMAKE_CURRENT_BINARY_DIR}/include)
+        target_link_libraries(library_unload_tests PRIVATE ${CMAKE_DL_LIBS} pthread)
+        set(LIBRARY_UNLOAD_DB ${CMAKE_CURRENT_BINARY_DIR}/library_unload_tests_library_unload_db)
+        add_test(NAME library_unload_reset COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIBRARY_UNLOAD_DB})
+        add_test(NAME library_unload_tests
+                 COMMAND library_unload_tests $<TARGET_FILE:tidesdb>)
+        add_test(NAME library_unload_cleanup COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIBRARY_UNLOAD_DB})
+        set_tests_properties(library_unload_reset PROPERTIES FIXTURES_SETUP library_unload_db)
+        set_tests_properties(library_unload_cleanup PROPERTIES FIXTURES_CLEANUP library_unload_db)
+        set_tests_properties(library_unload_tests PROPERTIES FIXTURES_REQUIRED library_unload_db)
+    endif()
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)

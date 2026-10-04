@@ -168,6 +168,19 @@ static int l0_backend_apply(void *ctx, const tidesdb_wal_entry_t *entries, int c
 
 /* the interval probe over L0, for a commit checking a prefix delete against what the memtables hold
  */
+static tidesdb_source_result_t l0_source_has_newer(void *ctx, uint32_t cf_index, const uint8_t *key,
+                                                   size_t key_size, uint64_t seq_floor,
+                                                   uint64_t seq_ceiling, int *newer)
+{
+    tidesdb_l0_txn_ctx_t *actx = (tidesdb_l0_txn_ctx_t *)ctx;
+    const int rc =
+        tidesdb_l0_has_newer(actx->l0, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
+    if (rc == TDB_SUCCESS) return TDB_SOURCE_FOUND;
+    if (rc == TDB_ERR_NOT_FOUND) return TDB_SOURCE_NOT_FOUND;
+    /* a busy slot or any transient error is retryable, never a definitive miss */
+    return TDB_SOURCE_BUSY;
+}
+
 static tidesdb_source_result_t l0_source_range_has_newer(void *ctx, uint32_t cf_index,
                                                          const uint8_t *lo, size_t lo_size,
                                                          const uint8_t *hi, size_t hi_size,
@@ -194,9 +207,7 @@ void tidesdb_l0_source(tidesdb_l0_txn_ctx_t *ctx, tidesdb_source_t *out)
     if (!ctx || !out) return;
     out->name = "l0";
     out->get = l0_source_get;
-    /* no single-key probe -- the stack falls back to a full get, which for a memtable is already
-     * the cheapest answer there is. the interval probe has no such fallback and is set */
-    out->has_newer = NULL;
+    out->has_newer = l0_source_has_newer;
     out->range_has_newer = l0_source_range_has_newer;
     out->ctx = ctx;
 }

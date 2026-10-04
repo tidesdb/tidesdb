@@ -1831,6 +1831,28 @@ void test_block_manager_runtime_full_syncs_buffered_descriptor(void)
 }
 #endif
 
+/* a read of a file written since its last access would otherwise dirty the inode and wait on the
+ * journal, so the descriptor carries the platform's no-access-time flag from the first open and
+ * from a reopen alike. a platform without the flag opens with nothing extra */
+void test_block_manager_opens_without_access_time(void)
+{
+    const char *path = "test_open_noatime.db";
+    (void)remove(path);
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+#ifndef _WIN32
+    const int flags = fcntl(bm->fd, F_GETFL);
+    ASSERT_TRUE(flags >= 0);
+    ASSERT_EQ(flags & TDB_O_NOATIME, TDB_O_NOATIME);
+    ASSERT_EQ(block_manager_truncate(bm), 0);
+    const int reopened_flags = fcntl(bm->fd, F_GETFL);
+    ASSERT_TRUE(reopened_flags >= 0);
+    ASSERT_EQ(reopened_flags & TDB_O_NOATIME, TDB_O_NOATIME);
+#endif
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
 void test_block_manager_full_open_tracks_descriptor_sync(void)
 {
     const char *path = "test_full_open_odsync.db";
@@ -3333,6 +3355,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_runtime_full_syncs_direct_descriptor, tests_passed);
     RUN_TEST(test_block_manager_runtime_full_syncs_buffered_descriptor, tests_passed);
 #endif
+    RUN_TEST(test_block_manager_opens_without_access_time, tests_passed);
     RUN_TEST(test_block_manager_full_open_tracks_descriptor_sync, tests_passed);
     RUN_TEST(test_block_manager_runtime_full_reopen_tracks_descriptor_sync, tests_passed);
     RUN_TEST(test_block_manager_get_block_size_at_offset, tests_passed);

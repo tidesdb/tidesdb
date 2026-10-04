@@ -299,6 +299,16 @@ static int l0_wal_append_kv(block_manager_t *wal, const uint8_t *pkey, size_t pk
 
 static void l0_hold_vlog_floor(tidesdb_l0_t *l0, tidesdb_memtable_t *mt);
 
+/* raise the memtable's high sequence to seq if it is higher; a concurrent raise past it ends the
+ * loop just as a successful swap does */
+static void l0_note_seq(tidesdb_memtable_t *mt, const uint64_t seq)
+{
+    uint64_t cur = atomic_load_explicit(&mt->high_seq, memory_order_relaxed);
+    while (seq > cur && !atomic_compare_exchange_weak_explicit(
+                            &mt->high_seq, &cur, seq, memory_order_release, memory_order_relaxed))
+        ;
+}
+
 tidesdb_memtable_t *tidesdb_l0_set_active(tidesdb_l0_t *l0, tidesdb_memtable_t *mt)
 {
     if (!l0 || !mt) return NULL;
@@ -334,6 +344,7 @@ int tidesdb_l0_put(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size
                                        flags, &created) != 0)
         rc = TDB_ERR_MEMORY;
     if (rc == TDB_SUCCESS && created) l0_count_new_key(l0, cf_index);
+    if (rc == TDB_SUCCESS) l0_note_seq(mt, seq);
 
     if (pkey != stack_key) free(pkey);
     l0_unpin_write(mt);
@@ -371,16 +382,6 @@ static void l0_protect_reference(tidesdb_l0_t *l0, tidesdb_memtable_t *mt, uint6
     uint64_t segment = 0;
     if (vlog_id_segment(l0->vlog, vlog_id, &segment) == VLOG_OK)
         vlog_build_lower(l0->vlog, token, segment);
-}
-
-/* raise the memtable's high sequence to seq if it is higher; a concurrent raise past it ends the
- * loop just as a successful swap does */
-static void l0_note_seq(tidesdb_memtable_t *mt, const uint64_t seq)
-{
-    uint64_t cur = atomic_load_explicit(&mt->high_seq, memory_order_relaxed);
-    while (seq > cur && !atomic_compare_exchange_weak_explicit(
-                            &mt->high_seq, &cur, seq, memory_order_release, memory_order_relaxed))
-        ;
 }
 
 /* the shared body behind both applies -- pin the active memtable, prefix the key, put, and count a

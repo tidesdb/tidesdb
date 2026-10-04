@@ -414,6 +414,87 @@ void test_l0_a_later_immutable_shadows_a_newer_earlier_one(void)
     tidesdb_l0_destroy(l0);
 }
 
+/* the conflict probe passes over a memtable holding nothing above its floor, so the version that
+ * decides is the one in the first memtable that could hold a newer write */
+static int l0_probe(tidesdb_l0_t *l0, const char *key, uint64_t floor, uint64_t ceiling, int *newer)
+{
+    return tidesdb_l0_has_newer(l0, 0, (const uint8_t *)key, strlen(key) + 1, floor, ceiling,
+                                newer);
+}
+
+/* a version one past the floor in an immutable is newer, and the same immutable at the floor holds
+ * nothing that could be */
+void test_l0_has_newer_finds_a_version_above_the_floor_in_an_immutable(void)
+{
+    tidesdb_l0_t *l0 = l0_in_memory(L0_BUFFER_SIZE);
+    ASSERT_TRUE(l0 != NULL);
+    ASSERT_EQ(mt_put(l0, "K", "v", 11), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(1)), TDB_SUCCESS);
+    ASSERT_EQ(mt_put(l0, "other", "v", 20), TDB_SUCCESS);
+
+    int newer = 0;
+    ASSERT_EQ(l0_probe(l0, "K", 10, UINT64_MAX, &newer), TDB_SUCCESS);
+    ASSERT_TRUE(newer);
+    ASSERT_EQ(l0_probe(l0, "K", 11, UINT64_MAX, &newer), TDB_ERR_NOT_FOUND);
+    ASSERT_TRUE(!newer);
+
+    tidesdb_l0_destroy(l0);
+}
+
+/* a version above the ceiling is not the probe's concern, whatever the floor */
+void test_l0_has_newer_ignores_a_version_above_the_ceiling(void)
+{
+    tidesdb_l0_t *l0 = l0_in_memory(L0_BUFFER_SIZE);
+    ASSERT_TRUE(l0 != NULL);
+    ASSERT_EQ(mt_put(l0, "K", "v", 20), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(1)), TDB_SUCCESS);
+
+    int newer = 1;
+    const int rc = l0_probe(l0, "K", 10, 15, &newer);
+    ASSERT_TRUE(rc == TDB_ERR_NOT_FOUND || rc == TDB_SUCCESS);
+    ASSERT_TRUE(!newer);
+
+    tidesdb_l0_destroy(l0);
+}
+
+/* a range delete above the floor raises its memtable's high sequence as a point write does, so the
+ * memtable is searched and the delete counts as a newer write of every key it covers */
+void test_l0_has_newer_counts_a_range_delete_above_the_floor(void)
+{
+    tidesdb_l0_t *l0 = l0_in_memory(L0_BUFFER_SIZE);
+    ASSERT_TRUE(l0 != NULL);
+    ASSERT_EQ(mt_put(l0, "K", "v", 3), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(l0, 0, (const uint8_t *)"J", 1, (const uint8_t *)"L",
+                                               1, 15),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(1)), TDB_SUCCESS);
+
+    int newer = 0;
+    ASSERT_EQ(l0_probe(l0, "K", 10, UINT64_MAX, &newer), TDB_SUCCESS);
+    ASSERT_TRUE(newer);
+
+    tidesdb_l0_destroy(l0);
+}
+
+/* a commit drawn before a rotation and applied after it leaves the older version in the active
+ * memtable and the newer one behind it. a read takes the first hit, but the active memtable holds
+ * nothing above the floor, so the probe passes it and finds the newer version it would have missed
+ */
+void test_l0_has_newer_passes_an_active_memtable_below_the_floor(void)
+{
+    tidesdb_l0_t *l0 = l0_in_memory(L0_BUFFER_SIZE);
+    ASSERT_TRUE(l0 != NULL);
+    ASSERT_EQ(mt_put(l0, "K", "newer", 10), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, fresh_mt(1)), TDB_SUCCESS);
+    ASSERT_EQ(mt_put(l0, "K", "stale", 5), TDB_SUCCESS);
+
+    int newer = 0;
+    ASSERT_EQ(l0_probe(l0, "K", 7, UINT64_MAX, &newer), TDB_SUCCESS);
+    ASSERT_TRUE(newer);
+
+    tidesdb_l0_destroy(l0);
+}
+
 /* immutables dequeue oldest first, and reclaiming a dequeued one frees it and shrinks the queue */
 void test_l0_dequeue_fifo_and_reclaim(void)
 {
@@ -1234,6 +1315,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_l0_newest_version_wins, tests_passed);
     RUN_TEST(test_l0_active_shadows_a_newer_immutable, tests_passed);
     RUN_TEST(test_l0_a_later_immutable_shadows_a_newer_earlier_one, tests_passed);
+    RUN_TEST(test_l0_has_newer_finds_a_version_above_the_floor_in_an_immutable, tests_passed);
+    RUN_TEST(test_l0_has_newer_ignores_a_version_above_the_ceiling, tests_passed);
+    RUN_TEST(test_l0_has_newer_counts_a_range_delete_above_the_floor, tests_passed);
+    RUN_TEST(test_l0_has_newer_passes_an_active_memtable_below_the_floor, tests_passed);
     RUN_TEST(test_l0_dequeue_fifo_and_reclaim, tests_passed);
     RUN_TEST(test_l0_retire_is_observable_to_a_bracketed_read, tests_passed);
     RUN_TEST(test_l0_reclaim_defers_rather_than_blocking, tests_passed);

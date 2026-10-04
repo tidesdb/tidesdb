@@ -390,6 +390,26 @@ int tidesdb_memtable_range_tombstone_covering(const tidesdb_l0_t *l0, tidesdb_me
                                               uint64_t snapshot, uint64_t *out_seq);
 
 /**
+ * tidesdb_l0_has_newer
+ * whether the newest version of a key L0 holds at or below seq_ceiling sits above seq_floor, which
+ * is what a commit asks of every key it writes under first-committer-wins. a memtable holding
+ * nothing above the floor is passed over without a search, so a probe reads only the memtables
+ * written since the snapshot, and a value held as a value log id is never fetched
+ * @param l0 the subsystem
+ * @param cf_index the column family's prefix index
+ * @param key the caller's key bytes (unprefixed)
+ * @param key_size length of key
+ * @param seq_floor the sequence a version must exceed to be newer
+ * @param seq_ceiling the sequence a version must not exceed to count at all
+ * @param newer out, set non-zero when the version found is above the floor
+ * @return TDB_SUCCESS when a version was found, TDB_ERR_NOT_FOUND when no memtable that could hold
+ * a newer one has the key, TDB_ERR_BUSY when a rotation kept racing the read, TDB_ERR_MEMORY, or
+ * TDB_ERR_INVALID_ARGS
+ */
+int tidesdb_l0_has_newer(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         uint64_t seq_floor, uint64_t seq_ceiling, int *newer);
+
+/**
  * tidesdb_l0_range_has_newer
  * whether L0 holds any key in [lo, hi) at a sequence above seq_floor -- what a commit asks on
  * behalf of a prefix delete, which writes an interval and so has no one key to probe. the walk

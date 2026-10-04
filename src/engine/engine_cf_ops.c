@@ -17,6 +17,7 @@
 #include "column_family/cf_config.h"
 #include "compat.h" /* rename, PATH_SEPARATOR, usleep */
 #include "engine.h"
+#include "engine_internal.h" /* the create and drop a clone runs under the ddl lock it holds */
 #include "io/block_manager.h"
 #include "manifest/manifest.h"
 #include "sstable/sstable.h" /* sstable_klog_filename */
@@ -135,7 +136,7 @@ static int engine_cf_claim(cf_t *cf)
     return TDB_ERR_LOCKED;
 }
 
-int engine_rename_cf(tidesdb_t *db, const char *old_name, const char *new_name)
+static int engine_rename_cf_locked(tidesdb_t *db, const char *old_name, const char *new_name)
 {
     if (!db || !old_name || !new_name) return TDB_ERR_INVALID_ARGS;
     const size_t nl = strlen(new_name);
@@ -205,7 +206,10 @@ static int engine_clone_copy_sstables(tidesdb_t *db, const cf_t *src, cf_t *dst)
 
     tidesdb_manifest_entry_t *entries = malloc((size_t)count * sizeof(*entries));
     if (!entries) return TDB_ERR_MEMORY;
-    const int got = tidesdb_manifest_copy_entries(db->manifest, src->cf_id, entries, count);
+    /* a table landing between the count and the copy is reported but not copied, so only what fit
+     * in the array is read */
+    const int matched = tidesdb_manifest_copy_entries(db->manifest, src->cf_id, entries, count);
+    const int got = matched < count ? matched : count;
 
     int rc = TDB_SUCCESS;
     for (int i = 0; i < got && rc == TDB_SUCCESS; i++)
@@ -244,7 +248,7 @@ static void engine_level_set_reclaim(void *item, void *ctx)
     level_set_free((level_set_t *)item);
 }
 
-int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
+static int engine_clone_cf_locked(tidesdb_t *db, const char *src_name, const char *dst_name)
 {
     if (!db || !src_name || !dst_name) return TDB_ERR_INVALID_ARGS;
 
@@ -270,7 +274,7 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
     snprintf(dst_cfg.name, sizeof(dst_cfg.name), "%s", dst_name);
     dst_cfg.commit_hook_fn = NULL;
     dst_cfg.commit_hook_ctx = NULL;
-    rc = engine_create_cf(db, dst_name, &dst_cfg);
+    rc = engine_create_cf_locked(db, dst_name, &dst_cfg);
 
     if (rc == TDB_SUCCESS)
     {
@@ -301,8 +305,8 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
                  * no live view names the family, which is the same rule a dropped handle follows.
                  *
                  * the destination is invisible for that window. it is a half-built clone that no
-                 * caller has been given yet, and the only cost is that a create racing for the same
-                 * name could take it, which fails this clone rather than corrupting either */
+                 * caller has been given yet, and the ddl lock this clone holds keeps any other
+                 * create, rename or clone from taking the name meanwhile */
                 cf_t *detached = NULL;
                 level_set_t *displaced = NULL;
                 if (cf_registry_remove(db->cfs, dst_name, &detached) != TDB_SUCCESS)
@@ -320,7 +324,7 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
             atomic_store_explicit(&dst->compacting, 0, memory_order_release);
         }
 
-        if (rc != TDB_SUCCESS) (void)engine_drop_cf(db, dst_name); /* undo a partial clone */
+        if (rc != TDB_SUCCESS) (void)engine_drop_cf_locked(db, dst_name); /* undo a partial clone */
     }
 
     /* a clone copies every sstable, so it is the one family operation whose cost scales with the
@@ -345,4 +349,22 @@ int engine_cf_set_commit_hook(tidesdb_t *db, cf_t *cf, tidesdb_commit_hook_fn fn
     if ((old == NULL) != (fn == NULL))
         atomic_fetch_add_explicit(&db->commit_hook_count, fn ? 1 : -1, memory_order_relaxed);
     return TDB_SUCCESS;
+}
+
+int engine_rename_cf(tidesdb_t *db, const char *old_name, const char *new_name)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+    pthread_mutex_lock(&db->ddl_lock);
+    const int rc = engine_rename_cf_locked(db, old_name, new_name);
+    pthread_mutex_unlock(&db->ddl_lock);
+    return rc;
+}
+
+int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+    pthread_mutex_lock(&db->ddl_lock);
+    const int rc = engine_clone_cf_locked(db, src_name, dst_name);
+    pthread_mutex_unlock(&db->ddl_lock);
+    return rc;
 }

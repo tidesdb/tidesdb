@@ -51,6 +51,17 @@ log outside the catalogue can never be reached again, so leaving it costs disk a
 The one exception is a self-healed manifest, where the catalogue was derived from the files and
 sweeping against it would destroy what the rebuild could not adopt.
 
+A manifest may name one family twice, two records of one name under different ids. Releases
+through 10.1.0 let a create that lost a race to another create of the same name persist its record
+before finding the name taken. The loser's handle was freed before it was ever published, so
+nothing was ever written under its id; every table and every log record of the name belongs to the
+winner. Recovery keeps the record that holds data, judged by the tables the manifest lists for it
+and by the ids the surviving logs name, and drops the others from the manifest for good with a
+warning. The winner is not necessarily the lower id, so keeping the lowest would lose a winner's
+unflushed writes. With no data anywhere, either is the same empty family and the lowest is kept.
+Two records holding data is no state a create could leave, and the open is refused rather than
+guessing which to keep.
+
 A manifest that will not read back does not fail the open. The discarded catalogue is rebuilt from
 the sstables themselves: the database directory is scanned and every `.klog` whose footer reads back
 is re-registered at L1, its owning family taken from the family id in its filename. The footer is

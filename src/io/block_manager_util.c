@@ -47,6 +47,9 @@ _Static_assert(BLOCK_MANAGER_BLOCK_HEADER_SIZE == 8, "block header must stay siz
 _Static_assert(BLOCK_MANAGER_FOOTER_SIZE == 8, "block footer must stay size plus magic");
 _Static_assert(BLOCK_MANAGER_FOOTER_MAGIC_OFFSET == 4, "footer magic must follow the size field");
 
+/* the destructor behind this key runs at the exit of every thread that read, including a host's
+ * threads that outlive an unload of the library, so the shared build is linked never to be
+ * unmapped (see the nodelete flag in CMakeLists.txt) */
 static pthread_key_t bm_tls_key;
 
 static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;

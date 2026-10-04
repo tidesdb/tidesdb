@@ -66,8 +66,8 @@ outcomes is counted, and `write_stall_ceiling_hits` climbing is the serious one.
 
 ## Stage 3 — Claims
 
-At `TDB_ISOLATION_REPEATABLE_READ` and above, every key the batch writes is entered in the
-database's **in-flight claim set** before the sequence is drawn. A claim names the key itself, byte
+At every isolation level, every key the batch writes is entered in the database's **in-flight
+claim set** before the sequence is drawn. A claim names the key itself, byte
 for byte, under the commit that holds it. It is not a hashed slot, so two commits of different keys
 never collide on one, however wide either is. A commit takes its claims in one fixed order — family,
 then key — so two commits sharing keys meet at the same first key and exactly one of them yields
@@ -78,9 +78,9 @@ What a claim meets decides it:
 - At `TDB_ISOLATION_SNAPSHOT` and `TDB_ISOLATION_SERIALIZABLE`, a write claim that finds another
   commit's write claim on the same key is **refused**. That commit is in flight, one of the two must
   lose, and the later claimant does: first-committer-wins.
-- At `TDB_ISOLATION_REPEATABLE_READ` a write claim is recorded and refuses nothing. Two blind
-  writers of one key both commit at that level; what the claim is for is being *seen* by another
-  commit's validation in stage 5.
+- At `TDB_ISOLATION_REPEATABLE_READ` and below a write claim is recorded and refuses nothing. Two
+  blind writers of one key both commit at those levels; what the claim is for is being *seen* by
+  another commit's validation in stage 5.
 - A **read claim** — which a prepare at repeatable read or above takes on every key it read —
   refuses every later writer of that key at repeatable read or above for as long as the prepare is
   undecided. The intervals the prepare's scans covered are held the same way, on its record in the
@@ -204,7 +204,7 @@ append path has to preserve it.
 
 ## Stage 8 — Apply
 
-Only now does the batch enter the memtable, at the commit sequence drawn in stage 3.
+Only now does the batch enter the memtable, at the commit sequence drawn in stage 4.
 
 The order is the point. The log has the batch before memory does, so a crash between the two
 recovers it. The reverse order would make the write visible before it was recoverable.
@@ -335,8 +335,8 @@ visible as `min_snapshot_seq`.
 A tombstone is the hard case. It can only be dropped when the merge can prove no older
 version of that key survives beneath it. Drop it too early and the older version is
 resurrected. This is why deletes cost space until a merge deep enough to prove it happens,
-and why a single-delete — where the caller promises the key was written at most once — can
-annihilate immediately.
+and why a single-delete — where the caller promises the key was written at most once — drops
+with its put at the first merge that reads both, at any level.
 
 ## The whole path
 
@@ -347,14 +347,14 @@ annihilate immediately.
           |
      admission            paced against the flush queue, holding nothing yet
           |
-     conflict check       repeatable read and above, aborts before anything durable
+     claim keys           every writer; first-committer-wins refuses at snapshot and above
           |
      draw sequence        marked in progress -> above the watermark, invisible
           |
-     reserve keys         first-committer-wins, vs the version actually read
+     conflict check       against the claims, then the store, below this sequence
           |
      separate values      large ones to the value log; the record carries the id
-          |               after the reservation, before the record naming them
+          |               after the validation, before the record naming them
      WAL append           ring reservation -> parallel copy -> ordered drain
           |                                   ^ gap-free, or recovery truncates
      memtable apply       durable before visible

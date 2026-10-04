@@ -149,6 +149,26 @@ static int bm_fd_uses_odsync(const int fd)
 }
 
 /**
+ * bm_open_file
+ * open a block manager's file without access time updates where the platform offers it. the kernel
+ * refuses that flag with EPERM on a file this process does not own, which a store copied in by
+ * another user can hold, so that one case opens again without it
+ * @param path the file to open
+ * @param flags the open flags
+ * @param mode the mode a created file gets
+ * @return the descriptor, or -1 with errno set
+ */
+static int bm_open_file(const char *path, const int flags, const mode_t mode)
+{
+    if (TDB_O_NOATIME != 0)
+    {
+        const int fd = open(path, flags | TDB_O_NOATIME, mode);
+        if (fd != -1 || errno != EPERM) return fd;
+    }
+    return open(path, flags, mode);
+}
+
+/**
  * reopen_fd
  * closes and reopens the block manager file descriptor with the same flags.
  * not safe against concurrent readers, a reader that already captured bm->fd will
@@ -167,7 +187,7 @@ int reopen_fd(block_manager_t *bm)
         flags |= O_DSYNC;
     }
 
-    bm->fd = open(bm->file_path, flags, BLOCK_MANAGER_FILE_MODE);
+    bm->fd = bm_open_file(bm->file_path, flags, BLOCK_MANAGER_FILE_MODE);
     if (bm->fd == -1) return -1;
 
     bm->opened_with_odsync = bm_fd_uses_odsync(bm->fd);
@@ -316,7 +336,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
     const mode_t mode = BLOCK_MANAGER_FILE_MODE;
 
-    new_bm->fd = open(file_path, flags, mode);
+    new_bm->fd = bm_open_file(file_path, flags, mode);
     if (new_bm->fd == -1)
     {
         /* preserve the open() errno across free() so the caller can report the real cause

@@ -90,6 +90,14 @@ re-read whenever the descriptor is reopened.
 Truncation is a special case: `ftruncate` is not covered by `O_DSYNC`, so a truncation always
 syncs explicitly.
 
+Every file is also opened `O_NOATIME` on Linux. Nothing in the engine reads an access time back,
+and keeping one current is not free: a read of a file written since its last access dirties the
+inode, which opens a journal transaction, and on ext4 that waits out any commit the journal is
+running. A value log segment is read while it is still being appended to, so without the flag
+nearly every read of it paid that, and under a heavy write load a point read blocked for hundreds
+of milliseconds behind the device. The kernel refuses the flag on a file the process does not own,
+so that one case opens again without it.
+
 ## Preallocation
 
 An append that extends a file takes the kernel's per-inode write lock, so extending writes

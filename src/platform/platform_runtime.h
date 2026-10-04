@@ -64,6 +64,16 @@ static inline void tdb_set_thread_name(const char *name)
 #endif
 #endif
 
+/* open without updating the access time on read. the engine never reads access times back, and on
+ * linux a read of a file written since its last access dirties the inode, which opens a journal
+ * transaction and waits out any commit the journal is running -- a read that blocks on the
+ * device's write load. linux only; elsewhere the flag is absent and opening asks for nothing */
+#ifdef O_NOATIME
+#define TDB_O_NOATIME O_NOATIME
+#else
+#define TDB_O_NOATIME 0
+#endif
+
 /* cross-platform pwritev for scatter-gather I/O
  * Linux and modern BSDs have native pwritev in <sys/uio.h>
  * macOS added pwritev in 10.16/11.0 (Big Sur)

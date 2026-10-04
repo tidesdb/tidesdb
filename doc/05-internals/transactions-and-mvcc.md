@@ -333,10 +333,17 @@ newer exists, and a skipped sstable's answer is no.
 Since flush and compaction continuously produce sstables while transactions are short, nearly every
 sstable predates any live transaction's snapshot, and nearly the whole scan resolves from metadata.
 
-:::note[The memtable is still read]
-The skip applies to sstables, which carry the sequence range in their footer. A conflicting commit
-has usually not been flushed yet, so the memtable genuinely has to be consulted and is the part of
-the scan that remains.
+Memtables get the same skip from the highest sequence each one has applied. A sealed memtable
+waiting for its flush was usually filled before the snapshot, so its highest sequence is at or
+below it and the scan passes it without a search. The bound is raised as part of the apply, before
+the commit gives up its claims, so a commit the scan no longer finds among the claims has already
+raised it. The scan also asks only for the sequence it finds, so a value held as a value log id is
+never fetched to answer it.
+
+:::note[The active memtable is still read]
+A conflicting commit has usually not been flushed yet, and the active memtable's highest sequence is
+almost always above any live snapshot, so that one memtable genuinely has to be searched and is the
+part of the scan that remains.
 :::
 
 A [range delete](/reference/transaction#tidesdb_txn_delete_range) asks the same question over an
@@ -349,8 +356,8 @@ Two things differ from the point form. Every source is asked rather than the fir
 key, because a newer key in an interval can be in any of them and a shallower source says nothing
 about what a deeper one holds elsewhere in the range. And there is **no fallback**: a source that
 cannot answer an interval reports busy, which the commit retries, rather than being stood in for by
-a full read the way a missing point probe is. A missing implementation must never read as a clear
-run.
+a full read the way a source without a point probe is. A missing implementation must never read as
+a clear run.
 
 Busy has to mean *transient*, though. The retry is bounded, and a source that answers busy for a
 reason that will hold every time — a bound too long for a buffer, say — turns a permanent condition

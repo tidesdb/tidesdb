@@ -11,7 +11,7 @@ if(TIDESDB_WITH_MIMALLOC)
 endif()
 
 project(tidesdb
-	VERSION 10.1.0
+	VERSION 10.1.1
 	LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -188,11 +188,11 @@ include_directories(SYSTEM external)
 set(TIDESDB_SOURCES
     src/db.c src/engine/engine.c src/engine/engine_l0.c src/engine/engine_recovery.c src/engine/engine_txn.c src/engine/engine_compaction.c src/engine/engine_reaper.c src/engine/engine_iter.c src/engine/engine_stats.c src/engine/engine_ops.c src/engine/engine_backup.c src/engine/engine_cf_ops.c src/engine/engine_prepared.c src/io/block_manager_core.c src/io/block_manager_util.c src/io/block_manager_write.c src/io/block_manager_cursor.c src/io/block_manager_recover.c src/io/block_manager_fault.c src/base/alloc_fault.c src/datastructures/skip_list/skip_list_node.c src/datastructures/skip_list/skip_list_core.c src/datastructures/skip_list/skip_list_read.c src/datastructures/skip_list/skip_list_cursor.c src/datastructures/skip_list/skip_list_write.c src/base/encoding/compress.c src/sstable/bloom_filter.c
     src/sstable/pr_filter.c
-    src/manifest/manifest_set.c src/manifest/manifest_record.c src/manifest/manifest_log.c src/manifest/manifest_api.c src/column_family/cf_config.c src/column_family/column_family.c src/column_family/cf_registry.c src/column_family/cf_iter.c src/flush/flush.c src/compaction/compaction_exec.c src/compaction/compaction_planner.c src/iter/merge_iter.c src/iter/merge_sources.c src/iter/merge_level_source.c src/column_family/level/level_set.c src/fdmanager/fdmanager.c src/fdmanager/reaper.c src/datastructures/queue.c src/range_tombstone/range_tombstone.c src/sstable/btree/btree_node.c src/sstable/btree/btree_node_encode.c src/sstable/btree/btree_builder.c src/sstable/btree/btree_read.c src/sstable/btree/btree_cursor.c
+    src/manifest/manifest_set.c src/manifest/manifest_record.c src/manifest/manifest_log.c src/manifest/manifest_api.c src/column_family/cf_config.c src/column_family/column_family.c src/column_family/cf_registry.c src/column_family/cf_iter.c src/flush/flush.c src/compaction/compaction_exec.c src/compaction/compaction_commit.c src/compaction/compaction_planner.c src/iter/merge_iter.c src/iter/merge_sources.c src/iter/merge_level_source.c src/column_family/level/level_set.c src/fdmanager/fdmanager.c src/fdmanager/reaper.c src/datastructures/queue.c src/range_tombstone/range_tombstone.c src/sstable/btree/btree_node.c src/sstable/btree/btree_node_encode.c src/sstable/btree/btree_builder.c src/sstable/btree/btree_read.c src/sstable/btree/btree_cursor.c
     src/sstable/vlog.c src/sstable/vlog_reclaim.c src/sstable/vlog_segment.c src/sstable/sstable.c
     src/sstable/sstable_footer.c
     src/sstable/sstable_read.c src/sstable/sstable_builder.c
-    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/mvcc_orphan.c src/txn/wal_record.c src/txn/source.c src/txn/key_index.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
+    src/base/log.c src/base/errors.c src/base/thread.c src/base/encoding/encoding.c src/base/lockfree.c src/base/arena.c src/cache/cache.c src/base/bg_pool.c src/base/bg_ticker.c src/threadmanager/threadmanager.c src/memtable/memtable.c src/memtable/l0_immutable.c src/memtable/l0_read.c src/memtable/backpressure.c src/memtable/l0_admission.c src/txn/mvcc.c src/txn/mvcc_orphan.c src/txn/wal_record.c src/txn/source.c src/txn/key_index.c src/txn/writeset.c src/txn/readset.c src/txn/registry.c src/txn/txn.c src/txn/txn_commit.c src/txn/txn_two_phase.c src/txn/l0_adapter.c src/txn/cf_source.c src/txn/prepare_stage.c
     external/xxhash.c)
 
 # vendored sources are compiled as-is; their diagnostics belong upstream, and letting them into this
@@ -210,6 +210,14 @@ set_target_properties(tidesdb PROPERTIES
                               SOVERSION "${PROJECT_VERSION_MAJOR}")
 
 target_include_directories(tidesdb PRIVATE src)
+
+# the block manager's per-thread read buffer is freed by a thread-specific destructor that lives in
+# this library, and a host that unloads it (a plugin server at shutdown) still has threads that ran
+# a read. their exit would call into unmapped code, so the shared library is marked never to be
+# unmapped. ELF linkers take the flag; Mach-O and PE have no equivalent
+if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+    target_link_options(tidesdb PRIVATE "LINKER:-z,nodelete")
+endif()
 
 # the test and fuzz sources declare their cases as bare
 # test_x(), which trips the prototype and shadow flags in bulk without indicating a defect there.
@@ -775,6 +783,24 @@ if(TIDESDB_BUILD_TESTS)
     set_tests_properties(portability_verify PROPERTIES FIXTURES_REQUIRED portable_db)
     set_tests_properties(portability_create portability_verify PROPERTIES
                          ENVIRONMENT TIDESDB_PORTABLE_DIR=${PORTABLE_DB_DIR})
+
+    # loads the built shared library, unloads it, and then exits a thread that read through it,
+    # which is what a plugin host does at shutdown. it does not link the library, it opens it
+    if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+        add_executable(library_unload_tests test/library_unload__tests.c)
+        add_dependencies(library_unload_tests tidesdb)
+        target_include_directories(library_unload_tests PRIVATE
+                                   include ${CMAKE_CURRENT_BINARY_DIR}/include)
+        target_link_libraries(library_unload_tests PRIVATE ${CMAKE_DL_LIBS} pthread)
+        set(LIBRARY_UNLOAD_DB ${CMAKE_CURRENT_BINARY_DIR}/library_unload_tests_library_unload_db)
+        add_test(NAME library_unload_reset COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIBRARY_UNLOAD_DB})
+        add_test(NAME library_unload_tests
+                 COMMAND library_unload_tests $<TARGET_FILE:tidesdb>)
+        add_test(NAME library_unload_cleanup COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIBRARY_UNLOAD_DB})
+        set_tests_properties(library_unload_reset PROPERTIES FIXTURES_SETUP library_unload_db)
+        set_tests_properties(library_unload_cleanup PROPERTIES FIXTURES_CLEANUP library_unload_db)
+        set_tests_properties(library_unload_tests PROPERTIES FIXTURES_REQUIRED library_unload_db)
+    endif()
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)

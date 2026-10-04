@@ -64,9 +64,17 @@ int tidesdb_memtable_range_tombstone_covering(const tidesdb_l0_t *l0, tidesdb_me
 }
 
 static int l0_read_mt(const tidesdb_l0_t *l0, tidesdb_memtable_t *mt, const uint8_t *pkey,
-                      size_t pkey_size, uint64_t snapshot, uint8_t **value, size_t *value_size,
-                      uint64_t *vlog_id, int64_t *ttl, uint8_t *deleted, uint64_t *out_seq)
+                      size_t pkey_size, uint64_t seq_floor, uint64_t snapshot, uint8_t **value,
+                      size_t *value_size, uint64_t *vlog_id, int64_t *ttl, uint8_t *deleted,
+                      uint64_t *out_seq)
 {
+    /* a conflict probe asks only whether a version above its floor exists, and a memtable whose
+     * every sequence is at or below the floor cannot hold one. an apply raises the high sequence
+     * before its commit gives up its claims, so a commit the probe no longer finds among the claims
+     * has already raised it */
+    if (seq_floor > 0 && atomic_load_explicit(&mt->high_seq, memory_order_acquire) <= seq_floor)
+        return -1;
+
     uint64_t seq = 0;
     const int rc =
         skip_list_get_with_seq(mt->skip_list, pkey, pkey_size, value, value_size, vlog_id, ttl,
@@ -117,9 +125,9 @@ static int l0_pin_all(void **snap, size_t got)
  * returning the first hit. the epoch is dropped before the skip_list reads, so a reclaimer's drain
  * is held off only for the pinning window and not for a slow read */
 static int l0_get_from_immutables(tidesdb_l0_t *l0, const uint8_t *pkey, size_t pkey_size,
-                                  uint64_t snapshot, uint8_t **value, size_t *value_size,
-                                  uint64_t *vlog_id, int64_t *ttl, uint8_t *deleted,
-                                  uint64_t *out_seq)
+                                  uint64_t seq_floor, uint64_t snapshot, uint8_t **value,
+                                  size_t *value_size, uint64_t *vlog_id, int64_t *ttl,
+                                  uint8_t *deleted, uint64_t *out_seq)
 {
     if (queue_size(l0->queue) == 0) return TDB_ERR_NOT_FOUND;
 
@@ -175,8 +183,8 @@ static int l0_get_from_immutables(tidesdb_l0_t *l0, const uint8_t *pkey, size_t 
     {
         tidesdb_memtable_t *mt = (tidesdb_memtable_t *)snap[i];
         if (mt && rc != TDB_SUCCESS &&
-            l0_read_mt(l0, mt, pkey, pkey_size, snapshot, value, value_size, vlog_id, ttl, deleted,
-                       out_seq) == 0)
+            l0_read_mt(l0, mt, pkey, pkey_size, seq_floor, snapshot, value, value_size, vlog_id,
+                       ttl, deleted, out_seq) == 0)
             rc = TDB_SUCCESS;
     }
     for (size_t i = 0; i < got; i++)
@@ -191,10 +199,11 @@ static int l0_get_from_immutables(tidesdb_l0_t *l0, const uint8_t *pkey, size_t 
 
 /* the shared read core reads the active memtable first, then the immutable queue, at a snapshot
  * ceiling (UINT64_MAX for the latest). out_seq, when non-NULL, receives the winning version's
- * sequence. */
+ * sequence. a non-zero seq_floor passes over every memtable that holds nothing above it, which only
+ * a conflict probe asks for, since a reader needs the newest version wherever it lies */
 static int l0_get_impl(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size_t key_size,
-                       uint64_t snapshot, uint8_t **value, size_t *value_size, uint64_t *vlog_id,
-                       int64_t *ttl, uint8_t *deleted, uint64_t *out_seq)
+                       uint64_t seq_floor, uint64_t snapshot, uint8_t **value, size_t *value_size,
+                       uint64_t *vlog_id, int64_t *ttl, uint8_t *deleted, uint64_t *out_seq)
 {
     if (!l0 || !key) return TDB_ERR_INVALID_ARGS;
 
@@ -231,13 +240,13 @@ static int l0_get_impl(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, 
 
         /* the active memtable holds the newest writes; only when it misses does the search fall
          * through the sealed immutables, newest first */
-        const int found = l0_read_mt(l0, mt, pkey, pkey_size, snapshot, value, value_size, vlog_id,
-                                     ttl, deleted, out_seq);
+        const int found = l0_read_mt(l0, mt, pkey, pkey_size, seq_floor, snapshot, value,
+                                     value_size, vlog_id, ttl, deleted, out_seq);
         l0_unpin_read(mt);
 
         rc = found == 0 ? TDB_SUCCESS
-                        : l0_get_from_immutables(l0, pkey, pkey_size, snapshot, value, value_size,
-                                                 vlog_id, ttl, deleted, out_seq);
+                        : l0_get_from_immutables(l0, pkey, pkey_size, seq_floor, snapshot, value,
+                                                 value_size, vlog_id, ttl, deleted, out_seq);
 
         /* an answer either way stands. only a miss whose boundary moved underneath it is worth
          * asking again, since that is the one outcome the two-step read can get wrong */
@@ -257,8 +266,8 @@ int tidesdb_l0_get(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size
                    uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted)
 {
     uint64_t vlog_id = 0;
-    const int rc = l0_get_impl(l0, cf_index, key, key_size, UINT64_MAX, value, value_size, &vlog_id,
-                               ttl, deleted, NULL);
+    const int rc = l0_get_impl(l0, cf_index, key, key_size, 0, UINT64_MAX, value, value_size,
+                               &vlog_id, ttl, deleted, NULL);
     /* this entry point has nowhere to report an id, so a referenced value would come back as an
      * empty one. a caller that may meet a reference reads through tidesdb_l0_get_at_seq */
     if (rc == TDB_SUCCESS && vlog_id != 0)
@@ -274,8 +283,26 @@ int tidesdb_l0_get_at_seq(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *ke
                           uint64_t snapshot, uint8_t **value, size_t *value_size, uint64_t *vlog_id,
                           int64_t *ttl, uint8_t *deleted, uint64_t *seq)
 {
-    return l0_get_impl(l0, cf_index, key, key_size, snapshot, value, value_size, vlog_id, ttl,
+    return l0_get_impl(l0, cf_index, key, key_size, 0, snapshot, value, value_size, vlog_id, ttl,
                        deleted, seq);
+}
+
+int tidesdb_l0_has_newer(tidesdb_l0_t *l0, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         uint64_t seq_floor, uint64_t seq_ceiling, int *newer)
+{
+    if (!newer) return TDB_ERR_INVALID_ARGS;
+    *newer = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_id = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+    /* a value the commit separated stays an id here, so the probe never reaches the value log */
+    const int rc = l0_get_impl(l0, cf_index, key, key_size, seq_floor, seq_ceiling, &value,
+                               &value_size, &vlog_id, &ttl, &deleted, &seq);
+    free(value);
+    if (rc == TDB_SUCCESS) *newer = seq > seq_floor;
+    return rc;
 }
 
 /* memtables one range probe pins before it gives up; a deeper queue makes the probe report busy,

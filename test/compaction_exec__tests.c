@@ -18,6 +18,9 @@ static int tests_failed = 0;
 #define CE_MAX_LEVEL 12
 #define CE_PROB      0.25f
 
+/* the deleted value of a ce_entry_t that writes a single-delete rather than a plain tombstone */
+#define CE_SINGLE_DELETE 2
+
 typedef struct
 {
     vlog_t *vlog;
@@ -95,7 +98,8 @@ static uint64_t ce_flush(ce_db_t *db, const ce_entry_t *entries, int n, uint64_t
     for (int i = 0; i < n; i++)
     {
         const ce_entry_t *e = &entries[i];
-        const uint8_t flags = e->deleted ? SKIP_LIST_FLAG_DELETED : 0;
+        uint8_t flags = e->deleted ? SKIP_LIST_FLAG_DELETED : 0;
+        if (e->deleted == CE_SINGLE_DELETE) flags |= SKIP_LIST_FLAG_SINGLE_DELETE;
         ASSERT_EQ(tidesdb_l0_apply(db->l0, 0, (const uint8_t *)e->key, strlen(e->key),
                                    e->deleted ? NULL : (const uint8_t *)e->val,
                                    e->deleted ? 0 : strlen(e->val), -1, e->seq, flags),
@@ -590,6 +594,172 @@ void test_compaction_keeps_tombstone_with_sibling(void)
     ce_db_close(&db);
 }
 
+/* every version of key across the cf's sstables, as the merge reads them, counting the entries and
+ * reporting the newest one's deleted flags; returns how many entries hold the key */
+static int ce_key_entries(cf_t *cf, const char *key, uint8_t *newest_deleted)
+{
+    const size_t kl = strlen(key);
+    uint64_t best_seq = 0;
+    int entries = 0;
+    for (int lvl = 1; lvl <= LEVEL_SET_MAX_LEVELS; lvl++)
+    {
+        sstable_t *out[8];
+        const int n = level_set_overlapping(cf->levels, lvl, (const uint8_t *)key, kl,
+                                            (const uint8_t *)key, kl, out, 8);
+        for (int i = 0; i < n; i++)
+        {
+            sstable_iter_t *it = NULL;
+            ASSERT_EQ(sstable_iter_new(out[i], 0, &it), TDB_SUCCESS);
+            for (int rc = sstable_iter_seek_first(it); rc == TDB_SUCCESS && sstable_iter_valid(it);
+                 rc = sstable_iter_next(it))
+            {
+                uint8_t *k = NULL, *v = NULL;
+                size_t ks = 0, vs = 0;
+                uint64_t vo = 0, sq = 0;
+                int64_t tl = 0;
+                uint8_t dl = 0;
+                ASSERT_EQ(sstable_iter_get(it, &k, &ks, &v, &vs, &vo, &sq, &tl, &dl), TDB_SUCCESS);
+                if (ks != kl || memcmp(k, key, kl) != 0) continue;
+                if (entries == 0 || sq > best_seq)
+                {
+                    best_seq = sq;
+                    *newest_deleted = dl;
+                }
+                entries++;
+            }
+            sstable_iter_free(it);
+        }
+        for (int i = 0; i < n; i++)
+            if (sstable_unref(out[i])) sstable_close(out[i]);
+    }
+    return entries;
+}
+
+/* run one compaction of the given tables into target, below the largest level unless largest */
+static void ce_compact(ce_db_t *db, const uint64_t *inputs, int n_inputs, int target, int largest,
+                       uint64_t gc_floor)
+{
+    const compaction_job_t job = {.input_ids = inputs,
+                                  .n_inputs = n_inputs,
+                                  .target_level = target,
+                                  .is_largest_level = largest,
+                                  .split = COMPACTION_SPLIT_NONE,
+                                  .file_max = 0};
+    const compaction_ctx_t cx = {.cf = db->cf,
+                                 .manifest = db->manifest,
+                                 .manifest_path = db->manifest_path,
+                                 .next_sstable_id = &db->next_id,
+                                 .gc_floor = gc_floor,
+                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                                 .value_threshold = db->value_threshold};
+    ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
+}
+
+/* a single-delete that meets its put in a merge drops with it below the largest level, where a
+ * plain tombstone would be carried down, and leaves nothing of the key in any table */
+void test_compaction_single_delete_drops_with_its_put(void)
+{
+    ce_db_t db;
+    ce_db_open(&db);
+
+    const ce_entry_t put[] = {{"k", "v", 1, 0}, {"keep", "v", 2, 0}};
+    const ce_entry_t del[] = {{"k", NULL, 3, CE_SINGLE_DELETE}};
+    const uint64_t id0 = ce_flush(&db, put, 2, 1);
+    const uint64_t id1 = ce_flush(&db, del, 1, 2);
+
+    const uint64_t inputs[2] = {id0, id1};
+    ce_compact(&db, inputs, 2, 2, 0, UINT64_MAX);
+
+    uint8_t dl = 0;
+    ASSERT_EQ(ce_key_entries(db.cf, "k", &dl), 0);
+    ce_assert_read(db.cf, 2, "keep", "v");
+
+    ce_db_close(&db);
+}
+
+/* a single-delete whose put sits in a table outside the merge is kept, still a single-delete, so
+ * the later merge that does meet the put drops the pair */
+void test_compaction_single_delete_kept_apart_from_its_put_stays_single(void)
+{
+    ce_db_t db;
+    ce_db_open(&db);
+
+    const ce_entry_t put[] = {{"k", "v", 1, 0}};
+    const ce_entry_t del[] = {{"k", NULL, 2, CE_SINGLE_DELETE}};
+    const uint64_t id0 = ce_flush(&db, put, 1, 1);
+    const uint64_t id1 = ce_flush(&db, del, 1, 2);
+
+    const uint64_t first[1] = {id1};
+    const uint64_t merged_id = atomic_load(&db.next_id);
+    ce_compact(&db, first, 1, 2, 0, UINT64_MAX);
+
+    uint8_t dl = 0;
+    ASSERT_EQ(ce_key_entries(db.cf, "k", &dl), 2);
+    ASSERT_TRUE((dl & TDB_KV_FLAG_SINGLE_DELETE) != 0);
+    ASSERT_TRUE(!ce_merged_present(db.cf, "k"));
+
+    const uint64_t second[2] = {id0, merged_id};
+    ce_compact(&db, second, 2, 3, 0, UINT64_MAX);
+    ASSERT_EQ(ce_key_entries(db.cf, "k", &dl), 0);
+
+    ce_db_close(&db);
+}
+
+/* a key put twice breaks the single-delete promise. with every version in the merge the key reads
+ * deleted as a plain delete would leave it, and with the first put in a table outside the merge the
+ * single-delete stays, so the older put does not come back */
+void test_compaction_single_delete_after_two_puts_reads_deleted(void)
+{
+    ce_db_t db;
+    ce_db_open(&db);
+
+    const ce_entry_t all[] = {{"a", "a1", 1, 0}};
+    const ce_entry_t again[] = {{"a", "a2", 2, 0}};
+    const ce_entry_t del[] = {{"a", NULL, 3, CE_SINGLE_DELETE}};
+    const uint64_t a0 = ce_flush(&db, all, 1, 1);
+    const uint64_t a1 = ce_flush(&db, again, 1, 2);
+    const uint64_t a2 = ce_flush(&db, del, 1, 3);
+    const uint64_t merged[3] = {a0, a1, a2};
+    ce_compact(&db, merged, 3, 2, 0, UINT64_MAX);
+    uint8_t dl = 0;
+    ASSERT_EQ(ce_key_entries(db.cf, "a", &dl), 0);
+
+    const ce_entry_t first[] = {{"b", "b1", 4, 0}};
+    const ce_entry_t second[] = {{"b", "b2", 5, 0}};
+    const ce_entry_t drop[] = {{"b", NULL, 6, CE_SINGLE_DELETE}};
+    (void)ce_flush(&db, first, 1, 4);
+    const uint64_t b1 = ce_flush(&db, second, 1, 5);
+    const uint64_t b2 = ce_flush(&db, drop, 1, 6);
+    const uint64_t partial[2] = {b1, b2}; /* the single-delete meets b2, b1 stays outside */
+    ce_compact(&db, partial, 2, 3, 0, UINT64_MAX);
+    ASSERT_TRUE(!ce_merged_present(db.cf, "b"));
+    ASSERT_TRUE(ce_key_entries(db.cf, "b", &dl) > 0);
+    ASSERT_TRUE((dl & TDB_KV_FLAG_SINGLE_DELETE) != 0);
+
+    ce_db_close(&db);
+}
+
+/* a single-delete above the reclamation floor is still needed by a reader between it and its put,
+ * so both stay */
+void test_compaction_single_delete_above_floor_keeps_both(void)
+{
+    ce_db_t db;
+    ce_db_open(&db);
+
+    const ce_entry_t put[] = {{"k", "v", 1, 0}};
+    const ce_entry_t del[] = {{"k", NULL, 2, CE_SINGLE_DELETE}};
+    const uint64_t id0 = ce_flush(&db, put, 1, 1);
+    const uint64_t id1 = ce_flush(&db, del, 1, 2);
+    const uint64_t inputs[2] = {id0, id1};
+    ce_compact(&db, inputs, 2, 2, 0, 1); /* a reader at seq 1 still sees the put */
+
+    uint8_t dl = 0;
+    ASSERT_EQ(ce_key_entries(db.cf, "k", &dl), 2);
+    ASSERT_TRUE((dl & TDB_KV_FLAG_SINGLE_DELETE) != 0);
+
+    ce_db_close(&db);
+}
+
 /* a merge that drops every version it read still hands on an interval it has not finished. the
  * interval lives only in a table, so a merge writing none would leave it nowhere, and the key a
  * sibling outside the merge holds under it would come back */
@@ -754,6 +924,12 @@ int main(int argc, char **argv)
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_within_boundaries, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_excludes_spilled_values, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_keeps_tombstone_with_sibling, tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_single_delete_drops_with_its_put, tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_single_delete_kept_apart_from_its_put_stays_single,
+                             tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_single_delete_after_two_puts_reads_deleted,
+                             tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_single_delete_above_floor_keeps_both, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_empty_merge_carries_intervals, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_concurrent_merges_return_every_reference,
                              tests_passed);

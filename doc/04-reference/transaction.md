@@ -609,14 +609,18 @@ int tidesdb_txn_single_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, c
 
 ### Description
 
-A tombstone carrying a **promise from the caller**: this key was written at most once, so
-the tombstone and that single put annihilate as soon as a compaction sees them together,
-instead of the tombstone being retained until every level below has been proven clear.
+A tombstone carrying a **promise from the caller**: this key was written at most once since it
+was last deleted. A compaction that reads the single-delete with its put directly beneath it
+drops both, at whatever level the merge writes, instead of carrying the tombstone down to
+the largest level the way a plain delete is carried. Both go only once no reader can still
+see the put, and only when no table outside the merge holds the key.
 
-**Breaking the promise resurrects data.** If the key was written more than once, the
-tombstone and the newest put cancel, and an older put underneath becomes visible again. Use
-it only for keys written exactly once — insert-once identifiers, for example. When in doubt
-use [`tidesdb_txn_delete`](#tidesdb_txn_delete), which is always safe.
+Reads are the same as after [`tidesdb_txn_delete`](#tidesdb_txn_delete): the key is gone.
+The promise only decides whether the space comes back early. A key written twice still
+reads as deleted. While the older put sits in a table the merge did not read, the
+single-delete is kept, written back as a single-delete, so a later merge that does meet its
+put can still drop the pair. It suits keys written once per lifetime, such as secondary
+index entries.
 
 ### Errors
 

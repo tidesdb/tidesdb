@@ -6600,6 +6600,25 @@ void test_engine_drop_removes_only_that_familys_files(void)
 /* raising the open-file limit reports a positive ceiling, never lowers it, and the report reflects
  * the raise; the exact ceiling depends on the hard limit, so only the monotonic relation is
  * asserted */
+#ifdef __linux__
+#define ENGINE_TEST_COPY_SRC "." PATH_SEPARATOR "test_engine_copy_src"
+
+/* a copy is synced before it is reported done, since a clone's catalogue and a finished backup both
+ * rely on it the moment the call returns. /dev/null takes the bytes and refuses the sync, so a copy
+ * there has to fail rather than report a destination it never made durable */
+void test_engine_copy_file_reports_a_failed_sync(void)
+{
+    FILE *f = fopen(ENGINE_TEST_COPY_SRC, "wb");
+    ASSERT_TRUE(f != NULL);
+    const char bytes[] = "bytes a clone or a backup relies on";
+    ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+    ASSERT_EQ(fclose(f), 0);
+
+    ASSERT_EQ(engine_copy_file(ENGINE_TEST_COPY_SRC, "/dev/null", sizeof(bytes)), TDB_ERR_IO);
+    (void)remove(ENGINE_TEST_COPY_SRC);
+}
+#endif
+
 void test_engine_raise_open_file_limit(void)
 {
     const long current = tidesdb_raise_open_file_limit(0); /* report only */
@@ -7642,6 +7661,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_scan_footprint_refuses_a_phantom, tests_passed);
     RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
+#ifdef __linux__
+    RUN_TEST(test_engine_copy_file_reports_a_failed_sync, tests_passed);
+#endif
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

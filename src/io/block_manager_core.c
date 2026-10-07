@@ -537,6 +537,10 @@ int block_manager_escalate_fsync(block_manager_t *bm)
 {
     if (!bm) return -1;
 
+    /* after a failed write or sync a second fdatasync can return clean for pages the kernel already
+     * dropped, so the first failure is the answer for as long as this descriptor lives */
+    if (atomic_load_explicit(&bm->flush_error, memory_order_acquire)) return -1;
+
     /* in buffered append mode an appender returns once its bytes are in the staging ring, which the
      * flush thread has not necessarily written yet. syncing the descriptor alone would then report
      * as durable a record that is still only in this process's memory, so wait for the frontier to

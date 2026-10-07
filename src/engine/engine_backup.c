@@ -93,9 +93,14 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit)
         if (rc == TDB_SUCCESS && ferror(in)) rc = TDB_ERR_IO;
     }
 
+    /* a copy is relied on the moment this returns, a clone's catalogue names it and a backup is
+     * handed back as finished, so its bytes and then its name reach the device first */
+    if (rc == TDB_SUCCESS && (fflush(out) != 0 || tdb_fsync(tdb_fileno(out)) != 0)) rc = TDB_ERR_IO;
+
     free(buf);
     if (fclose(out) != 0) rc = rc == TDB_SUCCESS ? TDB_ERR_IO : rc;
     fclose(in);
+    if (rc == TDB_SUCCESS && tdb_fsync_parent_dir(dst) != 0) rc = TDB_ERR_IO;
     if (rc != TDB_SUCCESS) TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup copy of %s failed rc=%d", src, rc);
     return rc;
 }

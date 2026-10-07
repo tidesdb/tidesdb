@@ -526,6 +526,11 @@ static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint
 {
     if (bm->buffered) return bm_buffered_append(bm, data, size, 1);
 
+    /* a file whose write or sync has failed stays failed. the kernel may have dropped the pages
+     * that failed and reports the error once, so a later write here could sync clean and report
+     * bytes durable that are not, and the buffered path refuses for the same reason */
+    if (BM_UNLIKELY(atomic_load_explicit(&bm->flush_error, memory_order_acquire))) return -1;
+
     const size_t total_size =
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)size + BLOCK_MANAGER_FOOTER_SIZE;
     const uint32_t checksum = compute_checksum(data, size);

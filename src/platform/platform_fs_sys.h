@@ -392,16 +392,22 @@ static inline int remove_directory(const char *path)
  * used to drop the flush for paths longer than the buffer). best-effort -- a directory that cannot
  * be opened or an allocation failure just skips the flush, which is the pre-existing behavior for
  * an unfsyncable directory.
+ *
+ * on posix a directory that cannot be opened or synced is reported, since a caller that needs a
+ * rename durable cannot claim it was otherwise. windows stays best-effort and reports success,
+ * because opening a directory for a flush is refused there in most configurations and ntfs
+ * journals the rename itself
  * @param path a file path whose parent directory should be flushed
+ * @return 0 when the directory was flushed or there is nothing to flush, -1 when it could not be
  */
-static inline void tdb_fsync_parent_dir(const char *path)
+static inline int tdb_fsync_parent_dir(const char *path)
 {
     const char *last_sep = strrchr(path, '/');
 #ifdef _WIN32
     const char *last_bsep = strrchr(path, '\\');
     if (last_bsep && (!last_sep || last_bsep > last_sep)) last_sep = last_bsep;
 #endif
-    if (!last_sep) return;
+    if (!last_sep) return 0;
 
     const size_t dir_len = (size_t)(last_sep - path);
     char stack_buf[4096];
@@ -410,12 +416,13 @@ static inline void tdb_fsync_parent_dir(const char *path)
     if (dir_len >= sizeof(stack_buf))
     {
         heap_buf = (char *)malloc(dir_len + 1);
-        if (!heap_buf) return;
+        if (!heap_buf) return -1;
         dir_path = heap_buf;
     }
     memcpy(dir_path, path, dir_len);
     dir_path[dir_len] = '\0';
 
+    int rc = 0;
 #ifdef _WIN32
     HANDLE dir_handle = CreateFile(dir_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -426,13 +433,16 @@ static inline void tdb_fsync_parent_dir(const char *path)
     }
 #else
     const int dir_fd = open(dir_path, O_RDONLY);
-    if (dir_fd >= 0)
+    if (dir_fd < 0)
+        rc = -1;
+    else
     {
-        fsync(dir_fd);
+        if (fsync(dir_fd) != 0) rc = -1;
         close(dir_fd);
     }
 #endif
     free(heap_buf);
+    return rc;
 }
 
 /**
@@ -457,8 +467,9 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
         return -1;
     }
 
-    /* flush parent directory to ensure rename is durable */
-    tdb_fsync_parent_dir(new_path);
+    /* flush parent directory to ensure rename is durable. best-effort here, the return says whether
+     * the rename happened, and a caller that needs it durable syncs the directory itself */
+    (void)tdb_fsync_parent_dir(new_path);
 
     return 0;
 #else
@@ -472,8 +483,10 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
      * this is critical for crash safety on non-journaling filesystems
      * https://groups.google.com/g/comp.unix.programmer/c/AM2V83RCOVE?pli=1
      * https://man7.org/linux/man-pages/man2/rename.2.html
+     * best-effort here, the return says whether the rename happened, and a caller that needs it
+     * durable syncs the directory itself and checks the result
      */
-    tdb_fsync_parent_dir(new_path);
+    (void)tdb_fsync_parent_dir(new_path);
 
     return 0;
 #endif

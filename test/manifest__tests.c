@@ -226,6 +226,75 @@ void test_manifest_commit_and_load()
     remove(TEST_MANIFEST_PATH);
 }
 
+#ifdef __linux__
+/* a durable commit whose sync fails leaves the log refusing appends, so the next commit writes the
+ * whole set to a fresh log instead of failing until a restart. /dev/null accepts the write and
+ * refuses the sync, which is the failure this takes */
+void test_manifest_failed_sync_rolls_over_to_a_fresh_log()
+{
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
+    ASSERT_TRUE(manifest != NULL);
+    tidesdb_manifest_add_sstable(manifest, 1, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1), 0);
+
+    const int null_fd = open("/dev/null", O_RDWR);
+    ASSERT_TRUE(null_fd >= 0);
+    ASSERT_TRUE(dup2(null_fd, manifest->bm->fd) >= 0);
+    close(null_fd);
+    tidesdb_manifest_add_sstable(manifest, 1, 1, 101, 1000, 65536, MANIFEST_NO_PARTITION);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1), -1);
+
+    tidesdb_manifest_add_sstable(manifest, 1, 1, 102, 1000, 65536, MANIFEST_NO_PARTITION);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH, 1), 0);
+    tidesdb_manifest_close(manifest);
+
+    tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
+    ASSERT_TRUE(loaded != NULL);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 1, 100));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 1, 101));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 1, 102));
+    tidesdb_manifest_close(loaded);
+    remove(TEST_MANIFEST_PATH);
+}
+#endif
+
+#ifndef _WIN32
+#define TEST_MANIFEST_SYNC_DIR       "." PATH_SEPARATOR "test_manifest_dirsync"
+#define TEST_MANIFEST_SYNC_PATH      TEST_MANIFEST_SYNC_DIR PATH_SEPARATOR "MANIFEST"
+#define TEST_MANIFEST_SYNC_PATH2     TEST_MANIFEST_SYNC_DIR PATH_SEPARATOR "MANIFEST2"
+#define TEST_MANIFEST_DIR_WRITE_ONLY 0300
+
+/* a rollover renames its snapshot into place and then cannot sync the directory -- here because the
+ * directory cannot be opened for reading. the rename may not be on the device, and a later sync of
+ * that directory could report clean while it still is not, so every commit after it fails instead
+ * of building on it */
+void test_manifest_unsynced_rename_fails_later_commits()
+{
+    if (geteuid() == 0) return; /* root opens the directory whatever its mode */
+    (void)remove(TEST_MANIFEST_SYNC_PATH);
+    (void)remove(TEST_MANIFEST_SYNC_PATH2);
+    (void)rmdir(TEST_MANIFEST_SYNC_DIR);
+    ASSERT_EQ(mkdir(TEST_MANIFEST_SYNC_DIR, TEST_MANIFEST_DIR_PERMISSIONS), 0);
+
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_SYNC_PATH);
+    ASSERT_TRUE(manifest != NULL);
+    tidesdb_manifest_add_sstable(manifest, 1, 1, 100, 1000, 65536, MANIFEST_NO_PARTITION);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_SYNC_PATH, 1), 0);
+
+    ASSERT_EQ(chmod(TEST_MANIFEST_SYNC_DIR, TEST_MANIFEST_DIR_WRITE_ONLY), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_SYNC_PATH2, 1), -1);
+    ASSERT_EQ(chmod(TEST_MANIFEST_SYNC_DIR, TEST_MANIFEST_DIR_PERMISSIONS), 0);
+
+    tidesdb_manifest_add_sstable(manifest, 1, 1, 101, 1000, 65536, MANIFEST_NO_PARTITION);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, TEST_MANIFEST_SYNC_PATH2, 1), -1);
+    tidesdb_manifest_close(manifest);
+
+    (void)remove(TEST_MANIFEST_SYNC_PATH);
+    (void)remove(TEST_MANIFEST_SYNC_PATH2);
+    ASSERT_EQ(rmdir(TEST_MANIFEST_SYNC_DIR), 0);
+}
+#endif
+
 void test_manifest_birth_level_persists()
 {
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
@@ -1499,6 +1568,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_manifest_cf_config_blob, tests_passed);
     RUN_TEST(test_manifest_cf_id_high_water_survives_drop, tests_passed);
     RUN_TEST(test_manifest_cf_id_high_water_survives_snapshot, tests_passed);
+#ifdef __linux__
+    RUN_TEST(test_manifest_failed_sync_rolls_over_to_a_fresh_log, tests_passed);
+#endif
+#ifndef _WIN32
+    RUN_TEST(test_manifest_unsynced_rename_fails_later_commits, tests_passed);
+#endif
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

@@ -1808,6 +1808,35 @@ void test_block_manager_runtime_full_syncs_direct_descriptor(void)
     (void)remove(path);
 }
 
+/* a sync that fails leaves the file failed. the descriptor is pointed back at the real file
+ * afterwards, where the kernel would accept both a write and a sync, so only the sticky error can
+ * refuse them -- which is the point, since after a real failure that second sync could report clean
+ * for pages the kernel already dropped */
+void test_block_manager_failed_sync_refuses_later_writes(void)
+{
+    const char *path = "test_failed_sync_sticky.db";
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_FULL), 0);
+    const char payload[] = "before-the-failure";
+    ASSERT_TRUE(block_manager_write_raw(bm, payload, sizeof(payload)) >= 0);
+
+    const int real_fd = dup(bm->fd);
+    ASSERT_TRUE(real_fd >= 0);
+    bm_replace_fd_with_dev_null(bm);
+    ASSERT_EQ(block_manager_escalate_fsync(bm), -1);
+    ASSERT_EQ(block_manager_last_errno(bm), EINVAL);
+
+    ASSERT_TRUE(dup2(real_fd, bm->fd) >= 0);
+    close(real_fd);
+    ASSERT_TRUE(block_manager_write_raw(bm, payload, sizeof(payload)) < 0);
+    ASSERT_EQ(block_manager_escalate_fsync(bm), -1);
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
 void test_block_manager_runtime_full_syncs_buffered_descriptor(void)
 {
     const char *path = "test_runtime_full_buffered.db";
@@ -3354,6 +3383,7 @@ int main(int argc, char **argv)
 #ifdef __linux__
     RUN_TEST(test_block_manager_runtime_full_syncs_direct_descriptor, tests_passed);
     RUN_TEST(test_block_manager_runtime_full_syncs_buffered_descriptor, tests_passed);
+    RUN_TEST(test_block_manager_failed_sync_refuses_later_writes, tests_passed);
 #endif
     RUN_TEST(test_block_manager_opens_without_access_time, tests_passed);
     RUN_TEST(test_block_manager_full_open_tracks_descriptor_sync, tests_passed);

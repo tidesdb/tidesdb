@@ -98,6 +98,21 @@ nearly every read of it paid that, and under a heavy write load a point read blo
 of milliseconds behind the device. The kernel refuses the flag on a file the process does not own,
 so that one case opens again without it.
 
+## A failed write is final for its file
+
+The first write or sync that fails is recorded on the handle, and from then on every append and
+every requested sync on that handle fails without reaching the kernel. That applies to buffered and
+unbuffered files alike. A sync that failed may have cost pages the kernel then marked clean, and the
+kernel reports the error to the descriptor once, so asking again could return clean for bytes that
+never reached the device. The owners of long-lived files step around a failed one rather than wait
+for a restart. The manifest writes its in-memory set, which already holds the batch being committed,
+to a fresh log, and the value log rolls to a fresh segment, which is the same thing a size limit
+does.
+
+A copy made for a clone or a backup is synced, along with its directory entry, before the copy
+reports success, since a clone's catalogue entry and a finished backup both rely on it as soon as the
+call returns.
+
 ## Preallocation
 
 An append that extends a file takes the kernel's per-inode write lock, so extending writes

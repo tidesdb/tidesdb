@@ -6614,7 +6614,9 @@ void test_engine_copy_file_reports_a_failed_sync(void)
     ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
     ASSERT_EQ(fclose(f), 0);
 
-    ASSERT_EQ(engine_copy_file(ENGINE_TEST_COPY_SRC, "/dev/null", sizeof(bytes)), TDB_ERR_IO);
+    ASSERT_EQ(engine_copy_file(ENGINE_TEST_COPY_SRC, "/dev/null", sizeof(bytes), 1), TDB_ERR_IO);
+    /* a copy the caller does not need durable asks for no sync, so the same destination is fine */
+    ASSERT_EQ(engine_copy_file(ENGINE_TEST_COPY_SRC, "/dev/null", sizeof(bytes), 0), TDB_SUCCESS);
     (void)remove(ENGINE_TEST_COPY_SRC);
 }
 #endif

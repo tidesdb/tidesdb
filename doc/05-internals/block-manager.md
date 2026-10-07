@@ -109,9 +109,11 @@ for a restart. The manifest writes its in-memory set, which already holds the ba
 to a fresh log, and the value log rolls to a fresh segment, which is the same thing a size limit
 does.
 
-A copy made for a clone or a backup is synced, along with its directory entry, before the copy
-reports success, since a clone's catalogue entry and a finished backup both rely on it as soon as the
-call returns.
+A copy made for a backup is synced, along with its directory entry, before the copy reports
+success, since a finished backup is relied on as soon as the call returns, whatever the database's
+sync mode. A clone's copies are synced on the same terms as the manifest commit that names them,
+which follows the database's mode, so under `TDB_SYNC_NONE` a clone takes no barrier its commit
+does not take either.
 
 ## Preallocation
 

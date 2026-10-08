@@ -147,6 +147,10 @@ typedef struct
  * @param self_healed set when open discarded a corrupt or unreadable log. the set it carries is
  * then incomplete or empty, which is why recovery readopts the sstables on disk rather than
  * trusting it
+ * @param dir_sync_failed set when a durable rollover renamed its snapshot into place and could not
+ * sync the directory. a later sync of that directory can report clean while the rename is still
+ * not on the device, so every commit after it fails until the database is reopened, where recovery
+ * reads whichever log the directory names and replays the logs nothing was allowed to reap
  * @param lock reader-writer lock for thread safety. writer-preferring, because the readers are the
  * engine's own background work -- a compaction asks it the level of every input file of every
  * merge -- and under sustained flush a plain rwlock never lets a writer in at all. a column family
@@ -176,6 +180,7 @@ typedef struct
     size_t pending_cap;
     int records_since_snapshot;
     int self_healed;
+    int dir_sync_failed;
     tdb_wprwlock_t lock;
     _Atomic(int) active_ops;
     tdb_wait_stat_t commit_wait;

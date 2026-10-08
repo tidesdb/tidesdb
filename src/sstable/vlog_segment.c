@@ -303,8 +303,10 @@ int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len, u
 
         /* roll on the observed size rather than under a lock, so two appenders may both land in a
          * segment already at its target. overshooting by a block is harmless; serializing every
-         * append behind a size check would not be */
-        if (size >= v->segment_target_bytes)
+         * append behind a size check would not be. a segment whose write or sync has failed is
+         * rolled too, since it refuses every append after the failure and the values must go on
+         * landing somewhere */
+        if (size >= v->segment_target_bytes || block_manager_last_errno(bm) != 0)
         {
             vlog_segment_release(v, slot);
             const int rolled = vlog_segment_roll(v, slot);

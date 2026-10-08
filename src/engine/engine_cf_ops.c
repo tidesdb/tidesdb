@@ -224,7 +224,9 @@ static int engine_clone_copy_sstables(tidesdb_t *db, const cf_t *src, cf_t *dst)
             rc = TDB_ERR_IO;
             break;
         }
-        rc = engine_copy_file(src_path, dst_path, entries[i].size_bytes);
+        /* synced on the same terms as the manifest commit naming the copy, which follows the
+         * database's mode, so a clone under no sync pays for no barrier its commit does not take */
+        rc = engine_copy_file(src_path, dst_path, entries[i].size_bytes, engine_durable_writes(db));
         if (rc == TDB_SUCCESS &&
             tidesdb_manifest_add_sstable(db->manifest, dst->cf_id, entries[i].level, new_id,
                                          entries[i].num_entries, entries[i].size_bytes,

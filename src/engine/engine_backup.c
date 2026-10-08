@@ -54,7 +54,7 @@ static int engine_is_wal_name(const char *name)
     return nlen >= elen && strcmp(name + nlen - elen, TDB_WAL_EXT) == 0;
 }
 
-int engine_copy_file(const char *src, const char *dst, uint64_t limit)
+int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int durable)
 {
     FILE *in = fopen(src, "rb");
     if (!in)
@@ -93,9 +93,15 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit)
         if (rc == TDB_SUCCESS && ferror(in)) rc = TDB_ERR_IO;
     }
 
+    /* a durable copy is relied on the moment this returns, a clone's catalogue names it and a
+     * backup is handed back as finished, so its bytes and then its name reach the device first */
+    if (durable && rc == TDB_SUCCESS && (fflush(out) != 0 || tdb_fsync(tdb_fileno(out)) != 0))
+        rc = TDB_ERR_IO;
+
     free(buf);
     if (fclose(out) != 0) rc = rc == TDB_SUCCESS ? TDB_ERR_IO : rc;
     fclose(in);
+    if (durable && rc == TDB_SUCCESS && tdb_fsync_parent_dir(dst) != 0) rc = TDB_ERR_IO;
     if (rc != TDB_SUCCESS) TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup copy of %s failed rc=%d", src, rc);
     return rc;
 }
@@ -135,7 +141,7 @@ static int engine_backup_copy_manifest(tidesdb_t *db, const char *dir)
 
     uint64_t len = 0;
     if (tidesdb_manifest_hold(db->manifest, &len) != 0) return TDB_ERR_IO;
-    const int rc = engine_copy_file(src, dst, len);
+    const int rc = engine_copy_file(src, dst, len, 1);
     tidesdb_manifest_release(db->manifest);
     return rc;
 }
@@ -186,7 +192,7 @@ static int engine_backup_copy_toplevel(tidesdb_t *db, const char *dir)
         /* a segment retired between the listing and this pass is already fully reclaimed, so
          * skipping it copies a store that is consistent rather than one missing live values */
         const uint64_t size = engine_backup_segment_size(segs, n_segs, ent->d_name);
-        if (size > 0) rc = engine_copy_file(src, dst, size);
+        if (size > 0) rc = engine_copy_file(src, dst, size, 1);
     }
     closedir(d);
     free(segs);
@@ -220,7 +226,7 @@ static int engine_backup_copy_cf(tidesdb_t *db, cf_t *cf, const char *dir)
             rc = TDB_ERR_IO;
             break;
         }
-        rc = engine_copy_file(src, dst, entries[i].size_bytes);
+        rc = engine_copy_file(src, dst, entries[i].size_bytes, 1);
     }
     free(entries);
     return rc;

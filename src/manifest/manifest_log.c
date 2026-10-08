@@ -251,7 +251,14 @@ static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int dura
     /* the platform helper rather than a local copy -- it flushes the directory on windows too,
      * takes the last separator of either kind, and heap-allocates for a path longer than its stack
      * buffer instead of truncating and flushing whatever that left */
-    if (durable_sync) tdb_fsync_parent_dir(manifest->path);
+    if (durable_sync && tdb_fsync_parent_dir(manifest->path) != 0)
+    {
+        manifest->dir_sync_failed = 1;
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "manifest %s renamed into place but its directory could not be synced, "
+                      "commits fail until the database is reopened",
+                      manifest->path);
+    }
 
     /* reopen the log on the (possibly new) path so subsequent commits append to the snapshot */
     if (block_manager_open_pre(&manifest->bm, manifest->path, BLOCK_MANAGER_SYNC_NONE,
@@ -262,7 +269,8 @@ static int manifest_rollover_locked(tidesdb_manifest_t *manifest, const int dura
     }
 
     manifest->records_since_snapshot = 0;
-    return manifest_pending_reset(manifest);
+    const int reset = manifest_pending_reset(manifest);
+    return manifest->dir_sync_failed ? -1 : reset;
 }
 
 /**
@@ -363,6 +371,7 @@ static tidesdb_manifest_t *manifest_alloc(const char *path)
     manifest->pending_cap = 0;
     manifest->records_since_snapshot = 0;
     manifest->self_healed = 0;
+    manifest->dir_sync_failed = 0;
     atomic_init(&manifest->active_ops, 0);
     /* the struct is malloc'd, so every field is set here or holds what the allocator left */
     tdb_wait_init(&manifest->commit_wait);
@@ -491,6 +500,15 @@ static int manifest_commit_inner(tidesdb_manifest_t *manifest, const char *path,
 
     int result = 0;
 
+    /* a rename that may not be on the device is not built on; see dir_sync_failed */
+    if (manifest->dir_sync_failed)
+    {
+        (void)manifest_pending_reset(manifest);
+        tdb_wprwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
+        return -1;
+    }
+
     /* a path change re-points the manifest and persists the whole set at the new path via a
      * rollover, which reopens the log there */
     if (strcmp(manifest->path, path) != 0)
@@ -513,6 +531,19 @@ static int manifest_commit_inner(tidesdb_manifest_t *manifest, const char *path,
             atomic_fetch_sub(&manifest->active_ops, 1);
             return -1;
         }
+    }
+
+    /* a log whose write or sync failed refuses every append after it, since the kernel may have
+     * dropped what failed. the set in memory already carries this batch, so it is written whole to
+     * a fresh log instead, which is what a rollover does, and the commit goes on from there */
+    if (block_manager_last_errno(manifest->bm) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "manifest %s failed a write, rolling over to a fresh log",
+                      manifest->path);
+        result = manifest_rollover_locked(manifest, durable_sync);
+        tdb_wprwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
+        return result;
     }
 
     /* close the batch with a SEQ record carrying the current sequence so replay's last SEQ wins,

@@ -71,6 +71,16 @@ error is reported rather than absorbed: a catalogue commit whose sync fails is a
 the flush or compaction behind it withdraws what it had recorded instead of going on as though the
 bytes had landed. Swallowing it would be the worst available outcome — the engine would report the
 write durable, and a compaction would go on to unlink the inputs a crash would then need.
+
+A failure is also final for the file it happened on. After a failed sync the kernel may already
+have dropped the pages that did not reach the device and reports the error only once, so a later
+sync of the same file can return clean for bytes that are gone. The engine therefore never writes
+to or syncs a file again once one of its writes or syncs has failed. The catalogue writes its whole
+state to a fresh log on the next commit, a value log moves to a fresh segment, and the write-ahead
+log takes a fresh file at its next rotation. The one failure it cannot step around is a directory
+that will not sync after the catalogue renamed a fresh log into place, since the rename itself may
+not be on the device; every commit after that fails until the database is reopened, and recovery
+replays the logs nothing was allowed to reap in the meantime.
 :::
 
 :::note[A large value is durable before the record that names it]

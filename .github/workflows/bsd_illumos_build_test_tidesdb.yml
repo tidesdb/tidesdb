@@ -35,6 +35,12 @@ jobs:
             sed -i '' -E 's/signature_type:[[:space:]]*"?fingerprints"?/signature_type: "none"/g' \
               /etc/pkg/FreeBSD.conf
             rm -rf /var/db/pkg/repos/*
+            # the ports repo moves to packages built for the next minor release (15.1)
+            # while the image still runs 15.0, and pkg then stops at an interactive
+            # "wrong OS version" prompt that a CI shell answers no to. packages built
+            # for a later minor release of the same major run on this one, so the
+            # check is waived rather than the job left waiting on the image.
+            export IGNORE_OSVERSION=yes
             pkg update -f
             pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |

@@ -748,9 +748,11 @@ int engine_checkpoint(tidesdb_t *db);
  * @param src the source file path
  * @param dst the destination file path, created or overwritten
  * @param limit the maximum number of bytes to copy
+ * @param durable non-zero to sync the copy and its directory entry before returning, which a backup
+ * always asks for and a clone asks for when the database syncs its own commits
  * @return TDB_SUCCESS, TDB_ERR_IO, or TDB_ERR_MEMORY
  */
-int engine_copy_file(const char *src, const char *dst, uint64_t limit);
+int engine_copy_file(const char *src, const char *dst, uint64_t limit, int durable);
 
 /**
  * engine_clone_cf

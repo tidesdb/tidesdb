@@ -106,6 +106,47 @@ static vlog_t *open_store(tidesdb_compression_algorithm_t comp, uint64_t target)
     return v;
 }
 
+#ifdef __linux__
+/* a segment whose write fails refuses every append after it, so the next value rolls to a fresh
+ * segment rather than every large value failing until a restart. a descriptor opened read-only
+ * refuses the write, which is the failure this takes */
+void test_vlog_failed_write_rolls_to_a_fresh_segment(void)
+{
+    fresh_dir();
+    ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
+    const vlog_config_t cfg = {
+        .encodings = &g_vlog_reg, .sync_mode = BLOCK_MANAGER_SYNC_FULL, .segment_target_bytes = 0};
+    vlog_t *v = NULL;
+    ASSERT_TRUE(vlog_open(VDIR, &cfg, &v) == VLOG_OK);
+
+    const uint8_t first[] = "lands-before-the-failure";
+    vlog_id_t id = 0;
+    ASSERT_TRUE(vlog_write(v, first, sizeof(first), NULL, 0, &id, NULL) == VLOG_OK);
+    const uint32_t failed_slot = atomic_load(&v->active_slot);
+    block_manager_t *bm = atomic_load(&v->segments[failed_slot].bm);
+    const int read_only_fd = open("/dev/null", O_RDONLY);
+    ASSERT_TRUE(read_only_fd >= 0);
+    ASSERT_TRUE(dup2(read_only_fd, bm->fd) >= 0);
+    close(read_only_fd);
+
+    const uint8_t lost[] = "the-write-fails-under-this-one";
+    ASSERT_TRUE(vlog_write(v, lost, sizeof(lost), NULL, 0, &id, NULL) != VLOG_OK);
+
+    const uint8_t after[] = "lands-in-a-fresh-segment";
+    ASSERT_TRUE(vlog_write(v, after, sizeof(after), NULL, 0, &id, NULL) == VLOG_OK);
+    ASSERT_TRUE(atomic_load(&v->active_slot) != failed_slot);
+    uint8_t *got = NULL;
+    size_t glen = 0;
+    ASSERT_TRUE(vlog_read(v, id, &got, &glen) == VLOG_OK);
+    ASSERT_EQ(glen, sizeof(after));
+    ASSERT_EQ(memcmp(got, after, glen), 0);
+    free(got);
+
+    vlog_close(v);
+    (void)remove_directory(VDIR);
+}
+#endif
+
 static void assert_reads(vlog_t *v, vlog_id_t id, const uint8_t *want, size_t wlen)
 {
     uint8_t *got = NULL;
@@ -1336,6 +1377,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);
     RUN_TEST(test_concurrent_reads_writes_and_reclaim, tests_passed);
     RUN_TEST(test_reclaim_never_retires_a_segment_a_roll_is_publishing, tests_passed);
+#ifdef __linux__
+    RUN_TEST(test_vlog_failed_write_rolls_to_a_fresh_segment, tests_passed);
+#endif
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

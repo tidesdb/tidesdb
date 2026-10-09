@@ -173,7 +173,7 @@ If the rate is high enough to hurt:
 - **Are transactions too long?** A longer transaction has a wider window to lose a race.
 - **Do you need the guarantee?** Append-only workloads are usually correct at
   `TDB_ISOLATION_READ_COMMITTED`, which conflicts only with a prepared transaction that read what
-  it writes.
+  it writes, or on a range delete while the table of intervals held by commits in flight is full.
 
 ## The database will not open
 

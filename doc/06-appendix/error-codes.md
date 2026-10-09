@@ -41,13 +41,15 @@ absent key.
 
 ### `TDB_ERR_CONFLICT`
 
-From any level above `TDB_ISOLATION_READ_COMMITTED`, and only from `commit` or `prepare`. Nothing
-durable was written; the transaction is aborted.
+Only from `commit` or `prepare`. Nothing durable was written; the transaction is aborted.
 
-What was violated depends on the level, and the two causes are different events. At
+What was violated depends on the level, and the causes are different events. At
 `TDB_ISOLATION_REPEATABLE_READ` a key **you read** gained a newer committed version. At
 `TDB_ISOLATION_SNAPSHOT` a key **you wrote** was written by someone who committed first.
 `TDB_ISOLATION_SERIALIZABLE` reports either, and additionally the write-skew check.
+`TDB_ISOLATION_READ_COMMITTED` validates nothing of its own and conflicts only in two narrow cases:
+a key you write was read or scanned by a prepared transaction that is still undecided, or a range
+delete found the table of intervals held by commits in flight full.
 
 **Retry the whole transaction** — begin again, redo the reads, redo the writes. Retrying just
 the commit is meaningless, since the reads it was validated against are stale.
@@ -86,7 +88,7 @@ Retry with a short backoff.
 
 | Code | Typically from |
 | --- | --- |
-| `TDB_ERR_CONFLICT` | `tidesdb_txn_commit`, `tidesdb_txn_prepare`, at any level above `TDB_ISOLATION_READ_COMMITTED` |
+| `TDB_ERR_CONFLICT` | `tidesdb_txn_commit`, `tidesdb_txn_prepare`, at any level above `TDB_ISOLATION_READ_COMMITTED`, and at read committed only against an undecided prepare's reads or a full interval table |
 | `TDB_ERR_LOCKED` | `tidesdb_compact`, `tidesdb_compact_range`, `tidesdb_cf_update_runtime_config`, `tidesdb_rename_column_family`, `tidesdb_clone_column_family`, `tidesdb_backup`; `tidesdb_flush_memtable` and `tidesdb_checkpoint` when the immutable queue does not drain in time; `tidesdb_range_stats` when the layout moves mid-scan; rarely, reads, iterator steps and `tidesdb_iter_new` under pressure the engine could not absorb |
 | `TDB_ERR_NOT_FOUND` | `tidesdb_txn_get`, `tidesdb_txn_contains`, family and savepoint lookups |
 | `TDB_ERR_EXISTS` | `tidesdb_create_column_family`, `tidesdb_clone_column_family` |

@@ -70,8 +70,8 @@ nothing below to partition against.
 boundaries, instead of writing one output file.
 
 The reason is the cost of merging into a large level. A merge that produces one enormous file
-must rewrite it in full next time anything overlaps it. By splitting output at the boundaries
-of the level below, each subsequent merge touches only the partitions it actually overlaps.
+must rewrite it in full next time anything overlaps it. By splitting output at the largest
+level's boundaries, each subsequent merge touches only the partitions it actually overlaps.
 `dividing_level_offset` moves that behaviour shallower or deeper — shallower partitions sooner
 and keeps individual merges smaller; deeper defers the bookkeeping.
 

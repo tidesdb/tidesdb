@@ -119,9 +119,10 @@ column family's L1, returning when that is done.
 
 The memtable is **shared by every column family**, so this flushes all of them — there is no
 per-family flush. This is why
-[`tidesdb_rename_column_family`](/reference/column-family#tidesdb_rename_column_family) and
-[`tidesdb_clone_column_family`](/reference/column-family#tidesdb_clone_column_family) are
-database-wide in their cost.
+[`tidesdb_clone_column_family`](/reference/column-family#tidesdb_clone_column_family), which flushes
+before it copies files, is database-wide in its cost. A
+[rename](/reference/column-family#tidesdb_rename_column_family) flushes nothing, since nothing on
+disk is kept in step with a family's name.
 
 Writers are not blocked for the whole call: the rotation installs a new active memtable
 immediately, and writes continue into it while the sealed one is written out.

@@ -12,8 +12,9 @@ sidebar:
 **Block** — One framed record in a file: size, checksum, payload, size again, magic. Every file
 the engine writes is a sequence of these.
 
-**Block cache** — The database-wide bounded pool every on-disk block read passes through. Caches
-parsed objects as well as raw bytes, so a hit skips both the read and the parse.
+**Block cache** — The database-wide bounded pool every sstable block read passes through, key log
+nodes and filter partitions alike; the value log deliberately reads around it. Caches parsed
+objects as well as raw bytes, so a hit skips both the read and the parse.
 
 **Column family** — An independent ordered keyspace within one database. Has its own levels and
 compaction policy; shares the memtable, log, value log, and cache with every other family.
@@ -24,8 +25,8 @@ compaction policy; shares the memtable, log, value log, and cache with every oth
 of how much data the largest level actually holds, so capacities adapt to the data rather than
 being fixed in advance.
 
-**Dividing level** — The shallowest level whose merges partition their output by the level below's
-file boundaries instead of writing one file.
+**Dividing level** — The shallowest level whose merges partition their output by the largest
+level's file boundaries instead of writing one file.
 
 **Output size cap** — The largest a compaction output may grow before the merge rolls to a new
 file, derived as a fraction of the largest level's data. It counts key log bytes, so a separated

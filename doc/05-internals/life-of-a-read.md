@@ -176,7 +176,7 @@ an older source, for the same reason a tombstone does.
 
 Three steps, arranged so the expensive ones are usually skipped.
 
-**The partition range filter first.** A definite miss means the key is not in this table, and
+**The partitioned bloom filter first.** A definite miss means the key is not in this table, and
 the key log is never opened. Membership is version-agnostic — the filter answers about the
 key, not about any particular version — so a miss is conclusive regardless of the snapshot.
 
@@ -271,7 +271,7 @@ The first definitive answer wins:
   |  cf   L1  overlapping            every covering table, newest first          |
   |       L2+ non-overlapping runs   at most one table per level                 |
   |            |                                                                 |
-  |            +-- partition range filter   definite miss -> skip the table      |
+  |            +-- partitioned bloom filter   definite miss -> skip the table      |
   |            +-- descriptor budget        waits out pressure; BUSY if it stays |
   |            +-- btree key log            newest version <= snapshot           |
   |            +-- value log                only if the value was separated      |

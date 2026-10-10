@@ -7,7 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "../src/io/block_manager.h"
-#include "../src/sstable/pr_filter.h"
+#include "../src/sstable/partitioned_bloom_filter.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -109,45 +109,46 @@ static size_t make_key(int v, uint8_t *out)
 
 void test_bbf_builder_new_invalid_args()
 {
-    pr_filter_builder_t *b = NULL;
-    ASSERT_NE(pr_filter_builder_new(NULL, 0.01, 0, store_write, NULL), 0);
-    ASSERT_NE(pr_filter_builder_new(&b, 0.0, 0, store_write, NULL), 0);
-    ASSERT_NE(pr_filter_builder_new(&b, 1.0, 0, store_write, NULL), 0);
-    ASSERT_NE(pr_filter_builder_new(&b, 0.01, 0, NULL, NULL), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_NE(partitioned_bloom_filter_builder_new(NULL, 0.01, 0, store_write, NULL), 0);
+    ASSERT_NE(partitioned_bloom_filter_builder_new(&b, 0.0, 0, store_write, NULL), 0);
+    ASSERT_NE(partitioned_bloom_filter_builder_new(&b, 1.0, 0, store_write, NULL), 0);
+    ASSERT_NE(partitioned_bloom_filter_builder_new(&b, 0.01, 0, NULL, NULL), 0);
 }
 
 /* every added key must report may-present -- a bloom may never report a false negative */
 void test_bbf_no_false_negatives()
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 512, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 512, store_write, &store), 0);
 
     const int n = 20000;
     for (int i = 0; i < n; i++)
     {
         uint8_t key[16];
         size_t klen = make_key(i, key);
-        ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+        ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     }
     uint64_t dir_off = 0, total = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
     ASSERT_EQ(total, (uint64_t)n);
-    pr_filter_builder_free(b);
+    partitioned_bloom_filter_builder_free(b);
 
     /* rollover at 512 keys over 20000 keys means many partitions plus the directory were written */
     ASSERT_TRUE(store.writes > n / 512);
 
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
     for (int i = 0; i < n; i++)
     {
         uint8_t key[16];
         size_t klen = make_key(i, key);
-        ASSERT_EQ(pr_filter_reader_maybe_contains(r, key, klen), 1);
+        ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, key, klen), 1);
     }
-    pr_filter_reader_free(r);
+    partitioned_bloom_filter_reader_free(r);
     store_free(&store);
 }
 
@@ -155,25 +156,26 @@ void test_bbf_no_false_negatives()
 void test_bbf_below_range_is_absent()
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 256, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 256, store_write, &store), 0);
     for (int i = 100; i < 5000; i++)
     {
         uint8_t key[16];
         size_t klen = make_key(i, key);
-        ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+        ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     }
     uint64_t dir_off = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
-    pr_filter_builder_free(b);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
+    partitioned_bloom_filter_builder_free(b);
 
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
     uint8_t key[16];
     size_t klen = make_key(0, key); /* below the smallest inserted key (100) */
-    ASSERT_EQ(pr_filter_reader_maybe_contains(r, key, klen), 0);
-    pr_filter_reader_free(r);
+    ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, key, klen), 0);
+    partitioned_bloom_filter_reader_free(r);
     store_free(&store);
 }
 
@@ -181,33 +183,34 @@ void test_bbf_below_range_is_absent()
 void test_bbf_false_positive_rate()
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 4096, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 4096, store_write, &store), 0);
 
     const int n = 50000;
     for (int i = 0; i < n; i++) /* even keys inserted, ascending */
     {
         uint8_t key[16];
         size_t klen = make_key(i * 2, key);
-        ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+        ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     }
     uint64_t dir_off = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
-    pr_filter_builder_free(b);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
+    partitioned_bloom_filter_builder_free(b);
 
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
     int fp = 0;
     for (int i = 0; i < n; i++) /* odd keys never inserted, interleaved across partitions */
     {
         uint8_t key[16];
         size_t klen = make_key(i * 2 + 1, key);
-        if (pr_filter_reader_maybe_contains(r, key, klen) == 1) fp++;
+        if (partitioned_bloom_filter_reader_maybe_contains(r, key, klen) == 1) fp++;
     }
     /* generous ceiling at 3x the target so the fixed seed cannot flake */
     ASSERT_TRUE(fp < n * 3 / 100);
-    pr_filter_reader_free(r);
+    partitioned_bloom_filter_reader_free(r);
     store_free(&store);
 }
 
@@ -216,21 +219,22 @@ void test_bbf_false_positive_rate()
 void test_bbf_empty_build()
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 256, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 256, store_write, &store), 0);
     uint64_t dir_off = 0, total = 1;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
     ASSERT_EQ(total, 0u);
-    pr_filter_builder_free(b);
+    partitioned_bloom_filter_builder_free(b);
 
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
     uint8_t key[16];
     size_t klen = make_key(42, key);
-    ASSERT_EQ(pr_filter_reader_maybe_contains(r, key, klen), 1);
-    ASSERT_TRUE(pr_filter_reader_resident_bytes(r) > 0);
-    pr_filter_reader_free(r);
+    ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, key, klen), 1);
+    ASSERT_TRUE(partitioned_bloom_filter_reader_resident_bytes(r) > 0);
+    partitioned_bloom_filter_reader_free(r);
     store_free(&store);
 }
 
@@ -238,30 +242,31 @@ void test_bbf_empty_build()
 void test_bbf_single_key()
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
     uint8_t key[16];
     size_t klen = make_key(7, key);
-    ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+    ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     uint64_t dir_off = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
-    pr_filter_builder_free(b);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
+    partitioned_bloom_filter_builder_free(b);
 
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
-    ASSERT_EQ(pr_filter_reader_maybe_contains(r, key, klen), 1);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, key, klen), 1);
     uint8_t other[16];
     size_t olen = make_key(999999, other); /* absent, above range -> routes to the sole partition */
-    ASSERT_EQ(pr_filter_reader_maybe_contains(r, other, olen), 0);
-    pr_filter_reader_free(r);
+    ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, other, olen), 0);
+    partitioned_bloom_filter_reader_free(r);
     store_free(&store);
 }
 
 /* keys in a small table, a full partition, and the one key that spills into a second partition */
 #define TEST_BBF_SMALL_KEYS     1000
-#define TEST_BBF_FULL_PARTITION TDB_PR_FILTER_DEFAULT_PARTITION_ENTRIES
-#define TEST_BBF_SPILL_KEYS     (TDB_PR_FILTER_DEFAULT_PARTITION_ENTRIES + 1)
+#define TEST_BBF_FULL_PARTITION TDB_PARTITIONED_BLOOM_FILTER_DEFAULT_PARTITION_ENTRIES
+#define TEST_BBF_SPILL_KEYS     (TDB_PARTITIONED_BLOOM_FILTER_DEFAULT_PARTITION_ENTRIES + 1)
 /* a full partition holds this many times the keys of the small table, so its filter must hold at
  * least half that many times the bits, which no partition sized for a full table could satisfy */
 #define TEST_BBF_SIZE_RATIO_FLOOR (TEST_BBF_FULL_PARTITION / TEST_BBF_SMALL_KEYS / 2)
@@ -277,18 +282,18 @@ void test_bbf_single_key()
 static size_t partition_bytes(const int n)
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
     for (int i = 0; i < n; i++)
     {
         uint8_t key[16];
         size_t klen = make_key(i, key);
-        ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+        ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     }
     uint64_t dir_off = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
-    pr_filter_builder_free(b);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
+    partitioned_bloom_filter_builder_free(b);
     const size_t bytes = store.len - dir_size;
     store_free(&store);
     return bytes;
@@ -313,36 +318,38 @@ void test_bbf_partition_bits_track_its_keys()
 void test_bbf_implausible_partition_count_is_rejected()
 {
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 0, store_write, &store), 0);
     uint8_t key[16];
     const size_t klen = make_key(7, key);
-    ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+    ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     uint64_t dir_off = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
-    pr_filter_builder_free(b);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, NULL), 0);
+    partitioned_bloom_filter_builder_free(b);
 
     /* the directory reads back before the count is touched */
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
-    pr_filter_reader_free(r);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    partitioned_bloom_filter_reader_free(r);
 
     /* partition_count sits after magic and version, so overwrite the third word in place */
     uint8_t *count_field = store.buf + dir_off + 2 * sizeof(uint32_t);
     for (size_t i = 0; i < sizeof(uint32_t); i++) count_field[i] = 0xFF;
 
     r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), -1);
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), -1);
     ASSERT_TRUE(r == NULL);
     store_free(&store);
 }
 
 void test_bbf_free_null_safe()
 {
-    pr_filter_builder_free(NULL);
-    pr_filter_reader_free(NULL);
-    ASSERT_EQ(pr_filter_reader_resident_bytes(NULL), 0u);
+    partitioned_bloom_filter_builder_free(NULL);
+    partitioned_bloom_filter_reader_free(NULL);
+    ASSERT_EQ(partitioned_bloom_filter_reader_resident_bytes(NULL), 0u);
 }
 
 /* end to end over a real block manager file, exercising the exact write and read path the sstable
@@ -356,39 +363,40 @@ void test_bbf_block_manager_backed()
     block_manager_t *bm = NULL;
     ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
 
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 1024, bm_write, bm), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 1024, bm_write, bm), 0);
     const int n = 30000;
     for (int i = 0; i < n; i++)
     {
         uint8_t key[16];
         size_t klen = make_key(i, key);
-        ASSERT_EQ(pr_filter_builder_add(b, key, klen), 0);
+        ASSERT_EQ(partitioned_bloom_filter_builder_add(b, key, klen), 0);
     }
     uint64_t dir_off = 0, total = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
     ASSERT_EQ(total, (uint64_t)n);
-    pr_filter_builder_free(b);
+    partitioned_bloom_filter_builder_free(b);
     ASSERT_EQ(block_manager_close(bm), 0);
 
     /* reopen from disk so the reader loads its directory through the block manager, not from any
      * builder state left in memory */
     block_manager_t *bm2 = NULL;
     ASSERT_EQ(block_manager_open(&bm2, path, BLOCK_MANAGER_SYNC_NONE), 0);
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, bm_fetch, bm_release, bm2), 0);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, bm_fetch, bm_release, bm2), 0);
     for (int i = 0; i < n; i++)
     {
         uint8_t key[16];
         size_t klen = make_key(i, key);
-        ASSERT_EQ(pr_filter_reader_maybe_contains(r, key, klen), 1);
+        ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, key, klen), 1);
     }
     uint8_t absent[16];
     size_t alen = make_key(-1, absent); /* "k-0000001" sorts before every inserted key */
-    ASSERT_EQ(pr_filter_reader_maybe_contains(r, absent, alen), 0);
+    ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, absent, alen), 0);
 
-    pr_filter_reader_free(r);
+    partitioned_bloom_filter_reader_free(r);
     ASSERT_EQ(block_manager_close(bm2), 0);
     remove(path);
 }
@@ -452,20 +460,22 @@ void test_bbf_stress_correctness()
     }
 
     bbf_store_t store = {0};
-    pr_filter_builder_t *b = NULL;
-    ASSERT_EQ(pr_filter_builder_new(&b, 0.01, 2048, store_write, &store), 0);
-    for (int i = 0; i < m; i++) ASSERT_EQ(pr_filter_builder_add(b, keys[i].k, keys[i].len), 0);
+    partitioned_bloom_filter_builder_t *b = NULL;
+    ASSERT_EQ(partitioned_bloom_filter_builder_new(&b, 0.01, 2048, store_write, &store), 0);
+    for (int i = 0; i < m; i++)
+        ASSERT_EQ(partitioned_bloom_filter_builder_add(b, keys[i].k, keys[i].len), 0);
     uint64_t dir_off = 0, total = 0;
     uint32_t dir_size = 0;
-    ASSERT_EQ(pr_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
+    ASSERT_EQ(partitioned_bloom_filter_builder_finish(b, &dir_off, &dir_size, &total), 0);
     ASSERT_EQ(total, (uint64_t)m);
-    pr_filter_builder_free(b);
+    partitioned_bloom_filter_builder_free(b);
 
-    pr_filter_reader_t *r = NULL;
-    ASSERT_EQ(pr_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
+    partitioned_bloom_filter_reader_t *r = NULL;
+    ASSERT_EQ(
+        partitioned_bloom_filter_reader_open(&r, dir_off, dir_size, store_fetch, NULL, &store), 0);
 
     for (int i = 0; i < m; i++)
-        ASSERT_EQ(pr_filter_reader_maybe_contains(r, keys[i].k, keys[i].len), 1);
+        ASSERT_EQ(partitioned_bloom_filter_reader_maybe_contains(r, keys[i].k, keys[i].len), 1);
 
     int tested = 0, fp = 0;
     for (int t = 0; t < n; t++)
@@ -477,12 +487,12 @@ void test_bbf_stress_correctness()
         if (bsearch(&probe, keys, (size_t)m, sizeof(*keys), bbf_skey_cmp))
             continue; /* skip present */
         tested++;
-        if (pr_filter_reader_maybe_contains(r, q, len) == 1) fp++;
+        if (partitioned_bloom_filter_reader_maybe_contains(r, q, len) == 1) fp++;
     }
     ASSERT_TRUE(tested > 0);
     ASSERT_TRUE(fp < tested * 3 / 100); /* 3x the 0.01 target -- a wide margin against flaking */
 
-    pr_filter_reader_free(r);
+    partitioned_bloom_filter_reader_free(r);
     for (int i = 0; i < m; i++) free(keys[i].k);
     free(keys);
     store_free(&store);

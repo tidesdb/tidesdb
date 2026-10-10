@@ -160,12 +160,19 @@ static void wl_fillrandom(bench_thread_t *t)
 }
 
 /* read one key, offset added to the index so readmissing (offset = num) always misses */
-static void bench_read_once(bench_thread_t *t, uint64_t offset)
+/* the two tail bytes that place a probe strictly between two adjacent written keys. bench_make_key
+ * zeroes everything after the index prefix, so any non-zero tail names a key the fill never writes,
+ * and 1 < 2 keeps a probe range non-empty as a range while holding no keys */
+#define BENCH_EMPTY_PROBE_LO 0x01
+#define BENCH_EMPTY_PROBE_HI 0x02
+
+/* one timed point read of key, which belongs to index idx's family
+ * @param t the worker
+ * @param idx the index the key was made from, which picks the family
+ * @param key the key to read */
+static void bench_read_key(bench_thread_t *t, uint64_t idx, const uint8_t *key)
 {
     const bench_config_t *c = t->cfg;
-    const uint64_t idx = bench_next_index(t) + offset;
-    uint8_t key[BENCH_MAX_KEY];
-    bench_make_key(c, idx, key);
     struct timespec a;
     clock_gettime(CLOCK_MONOTONIC, &a);
     tidesdb_txn_t *txn = NULL;
@@ -184,6 +191,39 @@ static void bench_read_once(bench_thread_t *t, uint64_t offset)
     atomic_fetch_add_explicit(t->ops_done, 1, memory_order_relaxed);
 }
 
+static void bench_read_once(bench_thread_t *t, uint64_t offset)
+{
+    const uint64_t idx = bench_next_index(t) + offset;
+    uint8_t key[BENCH_MAX_KEY];
+    bench_make_key(t->cfg, idx, key);
+    bench_read_key(t, idx, key);
+}
+
+/* one read of a key the fill never wrote, placed between two keys it did.
+ *
+ * the key has to be interior to measure anything. a key past the last one written is excluded by
+ * every sstable's recorded key bounds before a filter is asked, which measures that pruning rather
+ * than a miss -- and every lookup then costs the same nothing however the filters are built. sat in
+ * the gap between two written keys, the bounds of every file spanning that point include it, so
+ * each candidate has to be ruled out by its filter or read, which is the cost a missing key really
+ * has. without a tail past the index prefix there is no gap, and the probe falls back to past the
+ * end
+ * @param t the worker */
+static void bench_read_missing_once(bench_thread_t *t)
+{
+    const bench_config_t *c = t->cfg;
+    if (c->key_size <= BENCH_KEY_PREFIX_BYTES)
+    {
+        bench_read_once(t, c->num);
+        return;
+    }
+    const uint64_t idx = bench_next_index(t);
+    uint8_t key[BENCH_MAX_KEY];
+    bench_make_key(c, idx, key);
+    key[c->key_size - 1] = BENCH_EMPTY_PROBE_LO;
+    bench_read_key(t, idx, key);
+}
+
 /* run a fixed number of reads per thread so read-only benchmarks terminate */
 static void bench_run_reads(bench_thread_t *t, uint64_t offset)
 {
@@ -195,9 +235,11 @@ static void wl_readrandom(bench_thread_t *t)
 {
     bench_run_reads(t, 0);
 }
+
 static void wl_readmissing(bench_thread_t *t)
 {
-    bench_run_reads(t, t->cfg->num);
+    const uint64_t per_thread = t->cfg->num / (uint64_t)t->cfg->threads + 1;
+    for (uint64_t i = 0; bench_more(t, i, per_thread); i++) bench_read_missing_once(t);
 }
 
 /* one delete transaction of n_ops deletes, measured whole */
@@ -335,12 +377,6 @@ static void wl_scanrange(bench_thread_t *t)
     for (uint64_t s = 0; bench_more(t, s, BENCH_SCANS_PER_THREAD); s++) bench_scan_once(t, 1);
 }
 
-/* the two tail bytes that place an empty probe range strictly between two adjacent written keys.
- * bench_make_key zeroes everything after the index prefix, so any non-zero tail names a key the
- * fill never writes, and 1 < 2 keeps the range non-empty as a range while holding no keys */
-#define BENCH_EMPTY_PROBE_LO 0x01
-#define BENCH_EMPTY_PROBE_HI 0x02
-
 /* one bounded scan over a range holding no keys, measuring what it costs to prove a range empty.
  *
  * the range has to be *interior* to be worth measuring. a range past the last key is excluded by
@@ -437,9 +473,14 @@ static uint64_t bench_index_key_pk(const uint8_t *key)
  * those point gets descends its own family's levels, and the two families have independent depths.
  * that is the ref-join shape, and it is the one a secondary-index plan drives per outer row
  *
- * an op is one lookup rather than one row, since the lookup is the unit being measured
- * @param t the worker */
-static void bench_index_lookup_once(bench_thread_t *t)
+ * an op is one lookup rather than one row, since the lookup is the unit being measured.
+ *
+ * with fetch_rows clear only the index half runs -- the bounded scan over one indexed value and
+ * nothing else -- which isolates the part of the lookup a filter on the index family could prune
+ * from the row gets that dominate it otherwise
+ * @param t the worker
+ * @param fetch_rows non-zero to fetch each matching row from the table family as the plugin does */
+static void bench_index_lookup_once(bench_thread_t *t, int fetch_rows)
 {
     const bench_config_t *c = t->cfg;
     const uint64_t fanout = (uint64_t)c->index_fanout;
@@ -482,6 +523,8 @@ static void bench_index_lookup_once(bench_thread_t *t)
             }
             const uint64_t pk = bench_index_key_pk(ik);
             tidesdb_free(ik);
+            seen++;
+            if (!fetch_rows) continue;
 
             uint8_t dk[BENCH_MAX_KEY];
             bench_make_key(c, pk, dk);
@@ -489,7 +532,6 @@ static void bench_index_lookup_once(bench_thread_t *t)
             size_t vl = 0;
             if (tidesdb_txn_get(txn, data_cf, dk, (size_t)c->key_size, &v, &vl) == TDB_SUCCESS)
                 tidesdb_free(v);
-            seen++;
         }
         tidesdb_iter_free(it);
     }
@@ -575,7 +617,7 @@ static void wl_indexmixed(bench_thread_t *t)
     for (uint64_t i = 0; bench_more(t, i, per_thread); i++)
     {
         if ((int)(bench_rng(&t->rng) % 100) < c->read_ratio)
-            bench_index_lookup_once(t);
+            bench_index_lookup_once(t, 1);
         else
             bench_index_fill_once(t, (start + i) % c->num);
     }
@@ -585,7 +627,15 @@ static void wl_indexscan(bench_thread_t *t)
 {
     const bench_config_t *c = t->cfg;
     const uint64_t lookups = c->num / ((uint64_t)c->threads * (uint64_t)c->index_fanout) + 1;
-    for (uint64_t s = 0; bench_more(t, s, lookups); s++) bench_index_lookup_once(t);
+    for (uint64_t s = 0; bench_more(t, s, lookups); s++) bench_index_lookup_once(t, 1);
+}
+
+/* the index half of indexscan alone -- one bounded scan per indexed value, no row fetched */
+static void wl_indexprobe(bench_thread_t *t)
+{
+    const bench_config_t *c = t->cfg;
+    const uint64_t lookups = c->num / ((uint64_t)c->threads * (uint64_t)c->index_fanout) + 1;
+    for (uint64_t s = 0; bench_more(t, s, lookups); s++) bench_index_lookup_once(t, 0);
 }
 
 /* write one entry whose value is large enough to spill into the shared value log, so the write path
@@ -702,6 +752,7 @@ static const bench_workload_t BENCH_WORKLOADS[] = {
     {"scanempty", wl_scanempty},
     {"fillindex", wl_fillindex},
     {"indexscan", wl_indexscan},
+    {"indexprobe", wl_indexprobe},
     {"indexmixed", wl_indexmixed},
     {"mixedlarge", wl_mixedlarge},
     {"deletewhilereadlarge", wl_deletewhilereadlarge},

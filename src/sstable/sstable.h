@@ -20,14 +20,14 @@
 #include "manifest/manifest.h"               /* tidesdb_manifest_entry_t names the file to open */
 #include "range_tombstone/range_tombstone.h" /* the tombstone block a table carries */
 #include "sstable/btree/btree.h"             /* btree_t, btree_builder for the sstable klog */
-#include "sstable/pr_filter.h"
+#include "sstable/partitioned_bloom_filter.h"
 #include "sstable/vlog.h" /* the shared db-global value log, borrowed by the builder */
 
 /* an sstable is one immutable sorted run of a column family, a single .klog file holding a b+tree,
- * a pr_filter directory, and a trailing metadata footer. the btree is the sorted store and the
- * index; this module adds the footer, the bloom front, value-log resolution, and the lock-free
- * lifetime. the shared db-global value log is borrowed per call, so an sstable owns exactly the one
- * klog file. */
+ * a partitioned_bloom_filter directory, and a trailing metadata footer. the btree is the sorted
+ * store and the index; this module adds the footer, the bloom front, value-log resolution, and the
+ * lock-free lifetime. the shared db-global value log is borrowed per call, so an sstable owns
+ * exactly the one klog file. */
 
 /* the refcount an idle installed sstable sits at -- the single reference its level set holds. a
  * caller adds whatever references it holds itself before handing the total to sstable_evict_klog,
@@ -68,8 +68,9 @@ typedef struct
  * @param root_offset btree root node offset, passed to btree_open
  * @param first_leaf_offset first leaf offset, the forward-iteration entry
  * @param last_leaf_offset last leaf offset, the backward-iteration entry
- * @param bloom_dir_offset pr_filter directory offset, 0 when the sstable added no keys
- * @param bloom_dir_size pr_filter directory size in bytes
+ * @param bloom_dir_offset partitioned_bloom_filter directory offset, 0 when the sstable added no
+ * keys
+ * @param bloom_dir_size partitioned_bloom_filter directory size in bytes
  * @param distinct_key_count number of unique keys, a bloom-sizing and cardinality input
  * @param tombstone_count number of tombstone entries, gates tombstone-gc decisions
  * @param max_seq the sstable's newest sequence number
@@ -209,7 +210,7 @@ typedef struct
     int codec_count;
 
     _Atomic(block_manager_t *) klog_bm;
-    _Atomic(pr_filter_reader_t *) bloom;
+    _Atomic(partitioned_bloom_filter_reader_t *) bloom;
     _Atomic(btree_node_t *) root_node;
     cache_entry_t *root_pin;
 
@@ -542,7 +543,8 @@ void sstable_close(sstable_t *sst);
  * @param range_tombstones the tombstones this table is to carry, borrowed and written into a block
  * of its own, or NULL to carry none. a flush passes what its memtable held and a merge passes what
  * its inputs carried, so an interval lives exactly as long as a table holding it
- * @param enable_bloom build a partition-range filter (pr_filter) for point-get pruning
+ * @param enable_bloom build a partitioned bloom filter (partitioned_bloom_filter) for point-get
+ * pruning
  * @param bloom_fpr target bloom false-positive rate when enable_bloom is set
  * @param sync_mode block-manager sync mode, drives the durability barrier at finish
  * @param id sstable id for the produced sstable and its manifest row

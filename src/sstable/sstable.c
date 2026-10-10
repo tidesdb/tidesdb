@@ -326,7 +326,7 @@ void sstable_close(sstable_t *sst)
         (void)block_manager_close(bm);
         if (sst->fdm) fd_manager_note_close(sst->fdm, FD_LABEL_SSTABLE_KLOG);
     }
-    pr_filter_reader_free(atomic_load_explicit(&sst->bloom, memory_order_acquire));
+    partitioned_bloom_filter_reader_free(atomic_load_explicit(&sst->bloom, memory_order_acquire));
     cache_release(sst->root_pin);
 
     /* a superseded sstable's bytes stay charged to the filesystem until the file is unlinked, and

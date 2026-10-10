@@ -848,7 +848,7 @@ int main(int argc, char **argv)
             "  [--rate=N] hold total throughput to N ops/sec, so two runs can be compared at\n"
             "             matched ingest rather than at whatever each can reach\n"
             "  [--compression=none|snappy|lz4|lz4fast|zstd] klog encoding pipeline\n"
-            "  [--index_fanout=N] rows sharing one indexed value, for fillindex and indexscan\n"
+            "  [--index_fanout=N] rows sharing one indexed value, for the index workloads\n"
             "  [--large_value_size=B] [--large_ratio=PCT] the size of a large value and the\n"
             "    share of ops that write one, for the mixedlarge and deletewhilereadlarge runs\n"
             "  [--sample_interval_ms=N] [--sync=0|1|2] [--memtable_size=B] [--cache_size=B]\n"
@@ -864,8 +864,8 @@ int main(int argc, char **argv)
             "  [--idle_flush_seconds=N] [--skip_list_max_level=N] [--skip_list_probability=F]\n"
             "  [--log_level=0..4] [--log_file=PATH]\n"
             "workloads: fillseq fillrandom readrandom readmissing readwrite deleterandom\n"
-            "           deletewhileread scan scanrange scanempty indexscan mixedlarge\n"
-            "           deletewhilereadlarge\n"
+            "           deletewhileread scan scanrange scanempty fillindex indexscan\n"
+            "           indexprobe indexmixed mixedlarge deletewhilereadlarge\n"
             "  value-log workloads: [--large_value_size=N] [--large_ratio=PCT]\n",
             argv[0]);
         return 2;
@@ -907,7 +907,7 @@ int main(int argc, char **argv)
         }
         /* the index workloads address a table family and an index family separately, so refuse the
          * run rather than read past a single-family array */
-        if ((!strcmp(tok, "fillindex") || !strcmp(tok, "indexscan") ||
+        if ((!strcmp(tok, "fillindex") || !strcmp(tok, "indexscan") || !strcmp(tok, "indexprobe") ||
              !strcmp(tok, "indexmixed")) &&
             cfg.n_cfs < 2)
         {

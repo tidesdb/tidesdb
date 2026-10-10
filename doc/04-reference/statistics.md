@@ -97,7 +97,7 @@ underlying count can dip below it for an instant when a flush's decrement is obs
 matching apply increment, and that dip is an artefact of reading two independent updates rather
 than a real figure.
 
-**Filter memory.** `filter_resident_bytes` is what this family's partition range filters hold
+**Filter memory.** `filter_resident_bytes` is what this family's partitioned bloom filters hold
 **outside the block cache**. Each open sstable keeps one routing directory — every partition's
 offset and its whole first key — and that directory is ordinary heap memory, not charged against
 `block_cache_size`. The filter bit arrays are not counted: those are fetched one partition at a time

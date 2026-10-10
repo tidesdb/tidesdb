@@ -24,7 +24,7 @@ by the call that takes them and may be freed immediately after.
 | `log_level` | `TDB_LOG_INFO` | Engine log verbosity |
 | `log_to_file` | 0 | Write the log to `LOG` in the database directory rather than stderr |
 | `log_truncation_at` | 0 | Truncate that file once it passes this size; 0 never truncates |
-| `block_cache_size` | 64 MiB | The database-wide block cache budget. It bounds the cache, not the process: an open sstable also holds its partition range filter's routing directory as ordinary heap memory outside this figure, reported per family as `filter_resident_bytes` in [statistics](/reference/statistics#tidesdb_get_cf_stats) |
+| `block_cache_size` | 64 MiB | The database-wide block cache budget. It bounds the cache, not the process: an open sstable also holds its partitioned bloom filter's routing directory as ordinary heap memory outside this figure, reported per family as `filter_resident_bytes` in [statistics](/reference/statistics#tidesdb_get_cf_stats) |
 | `max_open_sstables` | 1024 | Ceiling on resident descriptors for sstable key logs and value-log segments together. The reaper reclaims toward a slightly lower figure — a reserve of an eighth, at least 16 and at most half, is held back so a reader can still open a file while it works, leaving 896 at the default. **Cut at open to fit the process open-file ceiling**, which at the defaults it does not: 1024 against the usual 1024 `ulimit -n` leaves nothing for the manifest, so it comes down to 960 and says so at warn. Raise the ceiling with [`tidesdb_raise_open_file_limit`](/reference/database#tidesdb_raise_open_file_limit) to keep the larger figure. See [the descriptor manager](/internals/fd-manager) |
 | `memtable_write_buffer_size` | 64 MiB | Memory the active memtable may occupy before it rotates. A memory budget, not a promise about flush size — see below |
 | `memtable_skip_list_max_level` | 12 | Skip list height |
@@ -80,7 +80,7 @@ sizes a byte-counting engine would give you, raise this figure accordingly — t
 being used, it simply was not being counted.
 
 **`block_cache_size`** is the main read-performance knob. It also bounds the resident cost of
-partition range filters, so a cache too small to hold the working set of filter partitions makes
+partitioned bloom filters, so a cache too small to hold the working set of filter partitions makes
 every point lookup re-read its filter.
 
 Resident memory tracks this figure, but the *number of nodes* it holds is fewer than the budget
@@ -116,7 +116,7 @@ one thread's worth of drain. See [Compaction](/internals/compaction).
 | `btree_klog_block_size` | 4096 | Target btree node size |
 | `encoding_pipeline` | empty | Encodings applied in order to btree klog nodes and to separated values; see the note below |
 | `encoding_count` | 0 | Entries in the pipeline, up to `TDB_ENCODING_PIPELINE_MAX` |
-| `enable_bloom_filter` | 1 | Build a partition range filter per sstable |
+| `enable_bloom_filter` | 1 | Build a partitioned bloom filter per sstable |
 | `bloom_fpr` | 0.01 | Target false positive rate |
 | `default_isolation_level` | `TDB_ISOLATION_READ_COMMITTED` | Level used by `tidesdb_txn_begin_cf` |
 | `l1_file_count_trigger` | 4 | L1 file count that triggers compaction |

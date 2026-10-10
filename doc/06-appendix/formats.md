@@ -15,7 +15,7 @@ Five structures carry that version and validate it on read: the block-manager fi
 write-ahead log record, the sstable footer, the manifest record, and a column family's stored
 configuration. Two carry no version of their own and are governed by whichever of those encloses
 them — a btree node by its sstable's footer, a value-log block by its segment's file header. The
-partition range filter directory is the exception: it versions independently, as noted where it is
+partitioned bloom filter directory is the exception: it versions independently, as noted where it is
 described below.
 
 :::caution[Descriptive, not a contract]
@@ -208,7 +208,7 @@ footer is rejected rather than read past.
 Recording the **btree node size** here rather than reading it from configuration is what lets a
 file be read with the geometry it was written with, after the configuration has changed.
 
-## Partition range filter directory
+## Partitioned bloom filter directory
 
 The resident half of an sstable's filter, written into the key log's aux region and pointed at by
 the footer's *filter directory offset* and *size*. Little-endian throughout:

@@ -52,7 +52,7 @@ takes the name separately, and the separate argument wins. See
 | `btree_klog_block_size` | 4096 | Target btree node size in the key log |
 | `encoding_pipeline` | empty | Encodings applied in order to btree klog nodes and separated values — see [Configuration](/appendix/configuration#what-the-encoding-pipeline-currently-does) |
 | `encoding_count` | 0 | Entries in the pipeline |
-| `enable_bloom_filter` | 1 | Build a partition range filter per sstable |
+| `enable_bloom_filter` | 1 | Build a partitioned bloom filter per sstable |
 | `bloom_fpr` | 0.01 | Target false positive rate |
 | `default_isolation_level` | `TDB_ISOLATION_READ_COMMITTED` | Level used by `tidesdb_txn_begin_cf` |
 | `l1_file_count_trigger` | 4 | L1 file count that triggers compaction |

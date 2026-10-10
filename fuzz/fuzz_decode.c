@@ -15,7 +15,7 @@
 #include "manifest/manifest.h"
 #include "manifest/manifest_internal.h"
 #include "sstable/btree/btree_internal.h"
-#include "sstable/pr_filter.h"
+#include "sstable/partitioned_bloom_filter.h"
 #include "sstable/sstable.h"
 #include "txn/wal_record.h"
 
@@ -85,7 +85,7 @@ static void fzd_wal(const uint8_t *data, size_t size)
     }
 }
 
-static void fzd_pr_filter(const uint8_t *data, size_t size)
+static void fzd_partitioned_bloom_filter(const uint8_t *data, size_t size)
 {
     /* the leading bytes carry the directory offset and length the reader would have read from a
      * footer, so the fuzzer controls where in its own buffer the directory is claimed to live */
@@ -94,14 +94,15 @@ static void fzd_pr_filter(const uint8_t *data, size_t size)
     const uint32_t dir_size = (uint32_t)data[1] | ((uint32_t)data[2] << 8);
 
     fzd_blob_t blob = {data, size};
-    pr_filter_reader_t *r = NULL;
-    if (pr_filter_reader_open(&r, dir_offset, dir_size, fzd_fetch, NULL, &blob) != 0) return;
+    partitioned_bloom_filter_reader_t *r = NULL;
+    if (partitioned_bloom_filter_reader_open(&r, dir_offset, dir_size, fzd_fetch, NULL, &blob) != 0)
+        return;
 
     /* a directory that parsed is then probed, so routing and the per-partition blob read run too */
     const uint8_t key[] = {'k'};
-    (void)pr_filter_reader_maybe_contains(r, key, sizeof(key));
-    (void)pr_filter_reader_resident_bytes(r);
-    pr_filter_reader_free(r);
+    (void)partitioned_bloom_filter_reader_maybe_contains(r, key, sizeof(key));
+    (void)partitioned_bloom_filter_reader_resident_bytes(r);
+    partitioned_bloom_filter_reader_free(r);
 }
 
 static void fzd_btree_node(const uint8_t *data, size_t size)
@@ -147,7 +148,7 @@ static void fzd_manifest(const uint8_t *data, size_t size)
 
 /* the decoders this target rotates through, selected by the first input byte */
 static void (*const fzd_targets[])(const uint8_t *, size_t) = {
-    fzd_footer, fzd_cf_config, fzd_wal, fzd_pr_filter, fzd_btree_node, fzd_manifest,
+    fzd_footer, fzd_cf_config, fzd_wal, fzd_partitioned_bloom_filter, fzd_btree_node, fzd_manifest,
 };
 
 #define FZD_TARGET_COUNT (sizeof(fzd_targets) / sizeof(fzd_targets[0]))

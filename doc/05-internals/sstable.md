@@ -1,6 +1,6 @@
 ---
 title: SSTable
-description: The immutable sorted run on disk -- btree key log, partition range filter, self-describing footer, and the shared value log.
+description: The immutable sorted run on disk -- btree key log, partitioned bloom filter, self-describing footer, and the shared value log.
 slug: internals/sstable
 part: internals
 sidebar:
@@ -97,7 +97,7 @@ second read on every access. Node size and that window are chosen together — s
 [Block manager](/internals/block-manager).
 :::
 
-## The partition range filter
+## The partitioned bloom filter
 
 A bloom filter answers "is this key definitely absent?" and lets a lookup skip a file
 entirely. The difficulty is that one filter over a whole sstable is sized by the entry count,

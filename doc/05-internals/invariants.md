@@ -220,7 +220,7 @@ if the rule were broken. The enforcement column distinguishes three cases:
 | The footer records the geometry the file was written with | [SSTable](/internals/sstable) | `sstable`, `fuzz_decode` |
 | The footer's encoding pipeline is the one the nodes were encoded with | [SSTable](/internals/sstable) | `fuzz_standalone` — its families draw real pipelines and it reconfigures them mid-run, which is what caught the builder reading the family's pipeline twice and straddling a reconfigure |
 | Every value-log block carries the encoding chain it was written through | [Value log](/internals/value-log) | `fuzz_standalone` — a value carried forward by compaction into an sstable recording a different pipeline decodes by its own chain or not at all |
-| The filter directory holds full first keys — no false negatives | [SSTable](/internals/sstable) | `pr_filter` tests |
+| The filter directory holds full first keys — no false negatives | [SSTable](/internals/sstable) | `partitioned_bloom_filter` tests |
 | A snapshot carries `SEQ` and `CF_SEQ` | [Manifest](/internals/manifest) | `test_engine_cf_id_not_reused_after_drop_reopen` |
 | High-water marks are raised, never stored | [Manifest](/internals/manifest) | `manifest` tests |
 | No module below the engine takes a `tidesdb_t` | [Architecture](/internals/architecture) | Structural: every subsystem test constructs its module without a database, so a violation would not compile |

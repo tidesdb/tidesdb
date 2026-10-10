@@ -12,13 +12,13 @@
 #include "compat.h" /* fixed-width ints, size_t */
 
 /* the db-global block cache. one bounded memory pool behind the sstable read path -- a btree node,
- * a partition-range filter partition, any raw block the klog reader fetches. the value log does not
- * read through it: a value is read once and is large, so caching values evicts the btree nodes that
- * are read repeatedly, and the budget buys more as index than as data. it is keyed by (file_id,
- * offset): the 64-bit id of the owning file and the block's byte offset, which together name one
- * block unambiguously. entries live in fixed per-shard slot arrays and are never freed while a
- * reader holds them; only their payloads are reclaimed, each by its own reclaim function, so parsed
- * nodes and raw byte blocks share one cache.
+ * a partitioned bloom filter partition, any raw block the klog reader fetches. the value log does
+ * not read through it: a value is read once and is large, so caching values evicts the btree nodes
+ * that are read repeatedly, and the budget buys more as index than as data. it is keyed by
+ * (file_id, offset): the 64-bit id of the owning file and the block's byte offset, which together
+ * name one block unambiguously. entries live in fixed per-shard slot arrays and are never freed
+ * while a reader holds them; only their payloads are reclaimed, each by its own reclaim function,
+ * so parsed nodes and raw byte blocks share one cache.
  *
  * reads are lock-free (probe, pin with the shared lock-free refcount, recheck); writes take a
  * per-shard lock. a payload is reclaimed exactly once, on whichever thread drops its last

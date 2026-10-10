@@ -953,6 +953,22 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, uint8_t **value, size_t *value_size);
 
 /**
+ * tidesdb_txn_get_ttl
+ * read the visible key's expiry, including pending writes, using the transaction's snapshot and
+ * read tracking
+ * @param txn transaction
+ * @param cf target column family
+ * @param key key data
+ * @param key_size size of key in bytes; must be nonzero
+ * @param ttl out -- absolute expiry in unix seconds, or -1 for no expiration; unchanged on failure
+ * @return TDB_SUCCESS, TDB_ERR_NOT_FOUND for missing, deleted or expired keys, TDB_ERR_INVALID_ARGS
+ * for a NULL argument or empty key, TDB_ERR_TOO_LARGE if the deadline cannot fit in time_t, or
+ * the transaction and source errors returned by tidesdb_txn_get
+ */
+int tidesdb_txn_get_ttl(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
+                        size_t key_size, time_t* ttl);
+
+/**
  * tidesdb_txn_get_notrack
  * read a key at the transaction snapshot without recording it into the conflict footprint, for
  * existence probes (such as primary-key uniqueness) that should not pollute the write-write base
@@ -1442,6 +1458,16 @@ int tidesdb_iter_key(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size);
  * TDB_ERR_CORRUPTION when resolving a separated value
  */
 int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size);
+
+/**
+ * tidesdb_iter_ttl
+ * read the current entry's expiry without another lookup or expiry check
+ * @param iter iterator
+ * @param ttl out -- absolute expiry in unix seconds, or -1 for no expiration; unchanged on failure
+ * @return TDB_SUCCESS, TDB_ERR_NOT_FOUND when unpositioned or exhausted, TDB_ERR_INVALID_ARGS for
+ * a NULL argument or detached iterator, or TDB_ERR_TOO_LARGE if the deadline cannot fit in time_t
+ */
+int tidesdb_iter_ttl(tidesdb_iter_t* iter, time_t* ttl);
 
 /**
  * tidesdb_iter_key_value

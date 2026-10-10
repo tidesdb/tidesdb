@@ -79,6 +79,14 @@ int engine_txn_get(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
                        ENGINE_NUM_SOURCES, value, value_size);
 }
 
+int engine_txn_get_ttl(tidesdb_txn_t* txn, cf_t* cf, const uint8_t* key, size_t key_size,
+                       int64_t* ttl)
+{
+    if (!txn || !cf) return TDB_ERR_INVALID_ARGS;
+    return tdb_txn_get_ttl(txn->inner, (uint32_t)cf->cf_id, key, key_size, txn->db->sources,
+                           ENGINE_NUM_SOURCES, ttl);
+}
+
 /* attribute a committed write set's logical and wal bytes to the families it touched, for stats. an
  * op's wal cost is its marginal contribution to the encoded batch, so the shared per-commit header
  * is left unattributed. a one-slot cache collapses the usual single-family commit to one registry

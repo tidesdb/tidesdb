@@ -355,6 +355,15 @@ int engine_iter_value(tidesdb_iter_t *it, uint8_t **value, size_t *value_size)
     return engine_iter_dup_value(it, v, vs, voff, value, value_size);
 }
 
+int engine_iter_ttl(tidesdb_iter_t* it, int64_t* ttl)
+{
+    if (!it || !it->txn || !ttl) return TDB_ERR_INVALID_ARGS;
+    int64_t expiry = 0;
+    const int rc = cf_iter_get(it->inner, NULL, NULL, NULL, NULL, NULL, NULL, &expiry, NULL);
+    if (rc == TDB_SUCCESS) *ttl = expiry > 0 ? expiry : -1;
+    return rc;
+}
+
 int engine_iter_key_value(tidesdb_iter_t *it, uint8_t **key, size_t *key_size, uint8_t **value,
                           size_t *value_size)
 {

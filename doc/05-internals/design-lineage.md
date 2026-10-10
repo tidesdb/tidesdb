@@ -98,7 +98,9 @@ verifiable at all.
 - **L1 file count.** TidesDB's L1 holds flush outputs that may overlap, so its file count is direct
   read amplification and wants an explicit bound.
 - **Tombstone density.** A delete-heavy family whose levels are not growing would never compact
-  under a capacity-only rule, and its tombstones would keep costing space and read work.
+  under a capacity-only rule, and its tombstones would keep costing space and read work. A dense
+  table below the flush tier is moved one level down, since a tombstone drops only at the largest
+  level and a merge that wrote it back into its own level would drop nothing.
 
 **Per-family policy.** Every column family runs its own instance with its own triggers.
 

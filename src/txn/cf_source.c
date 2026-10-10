@@ -298,9 +298,34 @@ static tidesdb_source_result_t cf_source_newer_in_level(cf_t *cf, int level, con
 }
 
 /* the source's conflict probe, walking levels top-down like the point lookup does */
-/* tables one interval probe reads before it gives up; a family with more than this reports busy,
- * which a commit retries rather than reading as a clear run */
-#define CF_SOURCE_RANGE_MAX_TABLES 512
+/* how many times the interval probe re-sizes its view of a family that grew between counting its
+ * tables and collecting them, before it reports busy for the commit to retry */
+#define CF_SOURCE_RANGE_COLLECT_TRIES 4
+
+/* reference every table in the family into a freshly sized array, or return -1 when allocation
+ * failed or the family kept growing faster than it could be collected. sized from the family's own
+ * count, so no size of family is too large to be seen whole */
+static int cf_source_collect_tables(cf_t *cf, sstable_t ***out)
+{
+    *out = NULL;
+    for (int tries = 0; tries < CF_SOURCE_RANGE_COLLECT_TRIES; tries++)
+    {
+        const int cap = level_set_collect_all(cf->levels, NULL, 0);
+        if (cap <= 0) return 0;
+        sstable_t **tables = malloc((size_t)cap * sizeof(*tables));
+        if (!tables) return -1;
+        /* above the capacity nothing was referenced, so the array is dropped with nothing to give
+         * back and the next try sizes it again */
+        const int n = level_set_collect_all(cf->levels, tables, cap);
+        if (n <= cap)
+        {
+            *out = tables;
+            return n;
+        }
+        free(tables);
+    }
+    return -1;
+}
 
 /**
  * cf_source_table_in_range
@@ -418,17 +443,9 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
     if (!cf || !lo || !newer) return TDB_SOURCE_BUSY;
     *newer = 0;
 
-    sstable_t **tables = malloc(CF_SOURCE_RANGE_MAX_TABLES * sizeof(*tables));
-    if (!tables) return TDB_SOURCE_BUSY;
-
-    const int n = level_set_collect_all(cf->levels, tables, CF_SOURCE_RANGE_MAX_TABLES);
-    if (n > CF_SOURCE_RANGE_MAX_TABLES)
-    {
-        for (int i = 0; i < CF_SOURCE_RANGE_MAX_TABLES; i++)
-            if (sstable_unref(tables[i])) sstable_close(tables[i]);
-        free(tables);
-        return TDB_SOURCE_BUSY; /* a partial view cannot clear a commit */
-    }
+    sstable_t **tables = NULL;
+    const int n = cf_source_collect_tables(cf, &tables);
+    if (n < 0) return TDB_SOURCE_BUSY; /* a partial view cannot clear a commit */
 
     int held = 0;
     int failed = 0;

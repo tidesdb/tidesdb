@@ -32,13 +32,16 @@
 #define CE_SNAPSHOT_RETRIES 8
 
 /* reference the job's input sstables from the live level set, summing their on-disk sizes into
- * read_bytes and recording each one's size in out_sizes so a rollback can put its catalogue entry
- * back; returns 0 with the handles on success, 1 when an input was already compacted away by a
- * raced job (skip the job), or a negative error */
+ * read_bytes, recording each one's size in out_sizes so a rollback can put its catalogue entry
+ * back, and the shallowest level any of them sits at in shallowest; returns 0 with the handles on
+ * success, 1 when an input was already compacted away by a raced job (skip the job), or a negative
+ * error */
 static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t *job,
-                             sstable_t **out, uint64_t *out_sizes, int *n_out, uint64_t *read_bytes)
+                             sstable_t **out, uint64_t *out_sizes, int *n_out, uint64_t *read_bytes,
+                             int *shallowest)
 {
     *read_bytes = 0;
+    *shallowest = 0;
     int total = level_set_snapshot(cx->cf->levels, NULL, 0);
     level_set_snapshot_entry_t *all = NULL;
     /* how many entries the collect actually wrote, which is not the capacity it was given -- the
@@ -77,6 +80,7 @@ static int ce_resolve_inputs(const compaction_ctx_t *cx, const compaction_job_t 
                 found = all[i].sst;
                 found_size = all[i].size_bytes;
                 *read_bytes += all[i].size_bytes;
+                if (*shallowest == 0 || all[i].level < *shallowest) *shallowest = all[i].level;
                 all[i].sst = NULL;
                 break;
             }
@@ -302,14 +306,18 @@ static int ce_retain(const compaction_ctx_t *cx, int is_largest, uint64_t seq, i
 }
 
 /* whether it is safe to GC-drop a base tombstone for key: safe only when no sstable outside the
- * merge inputs holds the key, since the largest level (and L1) are tiered and an older version in a
- * sibling sstable the merge did not see would resurrect once the tombstone that shadows it is gone
+ * merge inputs holds an older version of the key, since one the merge did not see would resurrect
+ * once the tombstone that shadows it is gone. levels above the shallowest input are not asked.
+ * deeper is older for every key, so what a table up there holds is newer than anything the merge
+ * reads and stays the key's answer whatever the merge drops -- and asking would refuse the drop for
+ * a key written again after its delete, and for every key once the flush tier holds more tables
+ * than the check can look at
  */
 static int ce_safe_to_drop_tomb(cf_t *cf, const uint8_t *key, size_t klen, const uint64_t *inputs,
-                                int n_inputs)
+                                int n_inputs, int from_level)
 {
     int safe = 1;
-    for (int lvl = 1; lvl <= LEVEL_SET_MAX_LEVELS && safe; lvl++)
+    for (int lvl = from_level > 1 ? from_level : 1; lvl <= LEVEL_SET_MAX_LEVELS && safe; lvl++)
     {
         sstable_t *out[CE_TOMB_SIBLING_MAX];
         const int nn =
@@ -397,7 +405,8 @@ static int ce_release_single_delete(const compaction_ctx_t *cx, const compaction
     if (!st->sd_held) return TDB_SUCCESS;
     st->sd_held = 0;
     if ((met_put || job->is_largest_level) &&
-        ce_safe_to_drop_tomb(cx->cf, st->key, st->key_size, job->input_ids, job->n_inputs))
+        ce_safe_to_drop_tomb(cx->cf, st->key, st->key_size, job->input_ids, job->n_inputs,
+                             job->shallowest_input_level))
     {
         TDB_DEBUG_LOG(TDB_LOG_TRACE, "dropping single-delete cf %s key %.*s seq %llu", cx->cf->name,
                       (int)st->key_size, (const char *)st->key, (unsigned long long)st->sd_seq);
@@ -470,7 +479,8 @@ static int ce_place_version(const compaction_ctx_t *cx, const compaction_job_t *
      * resurrect the older version once the shadowing tombstone is dropped */
     if (!keep && deleted && job->is_largest_level && is_base)
     {
-        if (ce_safe_to_drop_tomb(cx->cf, key, key_size, job->input_ids, job->n_inputs))
+        if (ce_safe_to_drop_tomb(cx->cf, key, key_size, job->input_ids, job->n_inputs,
+                                 job->shallowest_input_level))
             /* the point of no return for a delete -- once this tombstone is gone any older
              * version a sibling still holds becomes visible again */
             TDB_DEBUG_LOG(TDB_LOG_TRACE, "dropping base tombstone cf %s key %.*s seq %llu",
@@ -737,13 +747,18 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     }
     int n_inputs = 0;
     uint64_t read_bytes = 0;
-    const int resolved = ce_resolve_inputs(cx, job, inputs, in_sizes, &n_inputs, &read_bytes);
+    int shallowest = 0;
+    const int resolved =
+        ce_resolve_inputs(cx, job, inputs, in_sizes, &n_inputs, &read_bytes, &shallowest);
     if (resolved != 0)
     {
         free(inputs);
         free(in_sizes);
         return resolved > 0 ? TDB_SUCCESS : resolved; /* a stale job is a no-op, not a failure */
     }
+    /* the merge runs a copy that knows where its inputs sit, which the planner cannot promise */
+    compaction_job_t run = *job;
+    run.shallowest_input_level = shallowest;
 
     ce_sink_t sink;
     memset(&sink, 0, sizeof(sink));
@@ -752,14 +767,14 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     range_tombstone_set_t *carried = NULL;
     /* built before anything is written, so a failure to gather what the inputs carry stops the
      * merge while its inputs are still installed and the whole job can be run again */
-    int rc = ce_union_intervals(cx, job, inputs, n_inputs, &carried);
+    int rc = ce_union_intervals(cx, &run, inputs, n_inputs, &carried);
     sink.carried = carried;
-    const int k = ce_subdivisions(cx, job);
+    const int k = ce_subdivisions(cx, &run);
     if (rc == TDB_SUCCESS)
-        rc = k > 1 ? ce_merge_subdivided(cx, job, inputs, n_inputs, k, &sink)
-                   : ce_merge_inputs(cx, job, inputs, n_inputs, &sink, NULL, 0, NULL, 0);
+        rc = k > 1 ? ce_merge_subdivided(cx, &run, inputs, n_inputs, k, &sink)
+                   : ce_merge_inputs(cx, &run, inputs, n_inputs, &sink, NULL, 0, NULL, 0);
     if (rc == TDB_SUCCESS) rc = ce_sink_carry_alone(&sink);
-    if (rc == TDB_SUCCESS) rc = ce_commit(cx, job, inputs, in_sizes, n_inputs, &sink);
+    if (rc == TDB_SUCCESS) rc = ce_commit(cx, &run, inputs, in_sizes, n_inputs, &sink);
 
     if (rc == TDB_SUCCESS)
     {

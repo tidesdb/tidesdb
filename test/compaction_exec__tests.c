@@ -655,6 +655,47 @@ static void ce_compact(ce_db_t *db, const uint64_t *inputs, int n_inputs, int ta
     ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
 }
 
+/* a tombstone merged into the largest level drops even while a table above the merge holds the key,
+ * because deeper is older and what that table holds is newer than anything the merge reads. here k
+ * is deleted, the tombstone settles at L2, and k is written again into L1 -- the delete is spent,
+ * the new put is the key's answer, and keeping the tombstone at the largest level would cost its
+ * space until the put happened to merge down on top of it */
+void test_compaction_drops_tombstone_below_a_newer_version(void)
+{
+    ce_db_t db;
+    ce_db_open(&db);
+
+    const ce_entry_t put[] = {{"k", "old", 1, 0}, {"keep", "v", 1, 0}};
+    const ce_entry_t del[] = {{"k", NULL, 2, 1}};
+    const uint64_t id0 = ce_flush(&db, put, 2, 1);
+    const uint64_t id1 = ce_flush(&db, del, 1, 2);
+    const uint64_t first[2] = {id0, id1};
+    ce_compact(&db, first, 2, 2, 0, UINT64_MAX); /* the tombstone at L2, not yet the largest */
+    uint8_t dl = 0;
+    ASSERT_EQ(ce_key_entries(db.cf, "k", &dl), 1);
+    ASSERT_TRUE(dl != 0);
+
+    const ce_entry_t again[] = {{"k", "new", 3, 0}};
+    (void)ce_flush(&db, again, 1, 3); /* k written again, into L1 above the tombstone */
+
+    sstable_t *l2 = NULL;
+    ASSERT_EQ(level_set_overlapping(db.cf->levels, 2, (const uint8_t *)"k", 1, (const uint8_t *)"k",
+                                    1, &l2, 1),
+              1);
+    const uint64_t second[1] = {l2->id};
+    if (sstable_unref(l2)) sstable_close(l2);
+    ce_compact(&db, second, 1, 3, 1, UINT64_MAX); /* into the largest level */
+
+    /* only the new put is left of k, and it is the answer */
+    dl = 0;
+    ASSERT_EQ(ce_key_entries(db.cf, "k", &dl), 1);
+    ASSERT_EQ((int)dl, 0);
+    ASSERT_TRUE(ce_merged_present(db.cf, "k"));
+    ce_assert_read(db.cf, 3, "keep", "v");
+
+    ce_db_close(&db);
+}
+
 /* a single-delete that meets its put in a merge drops with it below the largest level, where a
  * plain tombstone would be carried down, and leaves nothing of the key in any table */
 void test_compaction_single_delete_drops_with_its_put(void)
@@ -924,6 +965,7 @@ int main(int argc, char **argv)
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_within_boundaries, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_excludes_spilled_values, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_keeps_tombstone_with_sibling, tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_drops_tombstone_below_a_newer_version, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_single_delete_drops_with_its_put, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_single_delete_kept_apart_from_its_put_stays_single,
                              tests_passed);

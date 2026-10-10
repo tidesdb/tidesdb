@@ -48,6 +48,12 @@ int tidesdb_compact(tidesdb_t *db, tidesdb_column_family_t *cf);
 Runs one compaction pass synchronously, merging even when no trigger is due. Returns when
 the pass is finished.
 
+A pass always moves data. With the flush tier holding files it merges them down as a trigger would.
+With the tier empty it moves the shallowest level holding anything one level down, and with only the
+largest level holding anything it rewrites that level in place, which is what collects the versions
+and tombstones no reader needs any more. Collecting everything a delete freed can therefore take a
+call per level between where the tombstones sit and the largest level.
+
 This is I/O-heavy in proportion to how much data the pass merges, and it competes with the
 background compaction pool for the same device. Forcing it during peak load makes latency
 worse, not better.

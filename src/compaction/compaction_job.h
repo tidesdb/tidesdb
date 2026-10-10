@@ -47,6 +47,10 @@ typedef enum
  * subdividing those too would multiply the two. an unaligned merge is the case this exists for: its
  * inputs span partitions so the planner could not split it, yet its output still rolls at the same
  * boundaries, so the ranges between them are independent
+ * @param shallowest_input_level the shallowest level any input sat at when the executor resolved
+ * them, filled by the executor and 0 from the planner. a table above it holds only versions newer
+ * than any the merge reads, since deeper is older, so it cannot hold one a dropped tombstone would
+ * bring back. 0 asks about every level
  */
 typedef struct
 {
@@ -60,6 +64,7 @@ typedef struct
     const size_t *boundary_sizes;
     int n_boundaries;
     int may_subdivide;
+    int shallowest_input_level;
 } compaction_job_t;
 
 #endif /* __TIDESDB_COMPACTION_JOB_H__ */

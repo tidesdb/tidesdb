@@ -276,9 +276,6 @@ void cf_free(cf_t *cf)
     free(cf);
 }
 
-/* tables one interval lookup reads before it gives up rather than answer from a partial view */
-#define CF_INTERVAL_SCAN_MAX 512
-
 int cf_range_tombstone_covering(cf_t *cf, const uint8_t *key, const size_t key_size,
                                 const uint64_t snapshot, uint64_t *out_seq)
 {
@@ -292,36 +289,9 @@ int cf_range_tombstone_covering(cf_t *cf, const uint8_t *key, const size_t key_s
     /* asked of the tables, since a table carries the intervals it was built with and there is no
      * store of the family's own to ask instead. every table is consulted rather than only those
      * whose key range holds the key, because an interval covers a range the table it rode in on
-     * need not have a single key of */
-    sstable_t *tables[CF_INTERVAL_SCAN_MAX];
-    const int n = level_set_collect_all(cf->levels, tables, CF_INTERVAL_SCAN_MAX);
-    if (n <= 0) return 0;
-    if (n > CF_INTERVAL_SCAN_MAX)
-    {
-        /* a partial view could miss the interval that covers this key and report it live, so the
-         * read is answered as covered by nothing only when the whole family was seen */
-        for (int i = 0; i < CF_INTERVAL_SCAN_MAX; i++)
-            if (sstable_unref(tables[i])) sstable_close(tables[i]);
-        return 0;
-    }
-
-    int covered = 0;
-    uint64_t newest = 0;
-    for (int i = 0; i < n; i++)
-    {
-        uint64_t seq = 0;
-        if (tables[i]->range_tombstones &&
-            range_tombstone_max_covering(tables[i]->range_tombstones, key, key_size, snapshot,
-                                         &seq) == 1 &&
-            (!covered || seq > newest))
-        {
-            covered = 1;
-            newest = seq;
-        }
-        if (sstable_unref(tables[i])) sstable_close(tables[i]);
-    }
-    if (covered) *out_seq = newest;
-    return covered;
+     * need not have a single key of. the whole family is always asked, since an answer from part
+     * of it could miss the interval that covers the key and report a deleted key live */
+    return level_set_interval_covering(cf->levels, key, key_size, snapshot, out_seq);
 }
 
 /* free a configuration displaced by a reconfigure, once the epoch says no reader holds it */

@@ -368,9 +368,9 @@ uint64_t tdb_txn_read_floor(const tdb_txn_t *txn)
 /* the store half of a get, at a ceiling the caller holds -- the external source stack at that
  * snapshot, absorbing a transient busy internally, with the read recorded for validation when the
  * level keeps a read set */
-static int txn_get_store(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                         const tidesdb_source_t* sources, int num_sources, const uint64_t snapshot,
-                         uint8_t** value, size_t* value_size, int64_t* ttl, int record_read)
+static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         const tidesdb_source_t *sources, int num_sources, const uint64_t snapshot,
+                         uint8_t **value, size_t *value_size, int64_t *ttl, int record_read)
 {
     for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
     {
@@ -423,9 +423,9 @@ static int txn_get_store(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, 
                         */
 }
 
-static int txn_get_impl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                        const tidesdb_source_t* sources, int num_sources, uint8_t** value,
-                        size_t* value_size, int64_t* ttl, int record_read)
+static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources, uint8_t **value,
+                        size_t *value_size, int64_t *ttl, int record_read)
 {
     if (!key || (!ttl && (!value || !value_size))) return TDB_ERR_INVALID_ARGS;
     const int active = txn_require_active(txn);
@@ -445,7 +445,7 @@ static int txn_get_impl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, s
         }
         if (value)
         {
-            uint8_t* copy = NULL;
+            uint8_t *copy = NULL;
             if (own.value_size)
             {
                 copy = malloc(own.value_size);
@@ -476,8 +476,8 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
                         1);
 }
 
-int tdb_txn_get_ttl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                    const tidesdb_source_t* sources, int num_sources, int64_t* ttl)
+int tdb_txn_get_ttl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                    const tidesdb_source_t *sources, int num_sources, int64_t *ttl)
 {
     if (!ttl || key_size == 0) return TDB_ERR_INVALID_ARGS;
     return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, NULL, NULL, ttl, 1);

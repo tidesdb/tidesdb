@@ -965,8 +965,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
  * for a NULL argument or empty key, TDB_ERR_TOO_LARGE if the deadline cannot fit in time_t, or
  * the transaction and source errors returned by tidesdb_txn_get
  */
-int tidesdb_txn_get_ttl(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
-                        size_t key_size, time_t* ttl);
+int tidesdb_txn_get_ttl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                        size_t key_size, time_t *ttl);
 
 /**
  * tidesdb_txn_get_notrack
@@ -1467,7 +1467,7 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
  * @return TDB_SUCCESS, TDB_ERR_NOT_FOUND when unpositioned or exhausted, TDB_ERR_INVALID_ARGS for
  * a NULL argument or detached iterator, or TDB_ERR_TOO_LARGE if the deadline cannot fit in time_t
  */
-int tidesdb_iter_ttl(tidesdb_iter_t* iter, time_t* ttl);
+int tidesdb_iter_ttl(tidesdb_iter_t *iter, time_t *ttl);
 
 /**
  * tidesdb_iter_key_value

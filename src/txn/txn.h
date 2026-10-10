@@ -175,8 +175,8 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
  * @param ttl out, receives the absolute expiry or -1 for none; unchanged on error
  * @return the same codes as tdb_txn_get; missing, deleted, or expired keys are not found
  */
-int tdb_txn_get_ttl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                    const tidesdb_source_t* sources, int num_sources, int64_t* ttl);
+int tdb_txn_get_ttl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                    const tidesdb_source_t *sources, int num_sources, int64_t *ttl);
 
 /**
  * tdb_txn_get_notrack

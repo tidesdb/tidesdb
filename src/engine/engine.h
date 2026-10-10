@@ -338,8 +338,8 @@ int engine_txn_get(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
  * @param ttl out -- absolute expiry in unix seconds, or -1 for none; unchanged on failure
  * @return the same codes as engine_txn_get; expired pending writes also return TDB_ERR_NOT_FOUND
  */
-int engine_txn_get_ttl(tidesdb_txn_t* txn, cf_t* cf, const uint8_t* key, size_t key_size,
-                       int64_t* ttl);
+int engine_txn_get_ttl(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_size,
+                       int64_t *ttl);
 
 /**
  * engine_txn_commit
@@ -896,7 +896,7 @@ int engine_iter_value(tidesdb_iter_t *it, uint8_t **value, size_t *value_size);
  * @param ttl out -- absolute expiry in unix seconds, or -1 for none; unchanged on failure
  * @return TDB_SUCCESS, TDB_ERR_NOT_FOUND when unpositioned, or TDB_ERR_INVALID_ARGS
  */
-int engine_iter_ttl(tidesdb_iter_t* it, int64_t* ttl);
+int engine_iter_ttl(tidesdb_iter_t *it, int64_t *ttl);
 
 int engine_iter_key_value(tidesdb_iter_t *it, uint8_t **key, size_t *key_size, uint8_t **value,
                           size_t *value_size);

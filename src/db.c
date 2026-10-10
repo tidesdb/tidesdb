@@ -244,7 +244,7 @@ static int64_t tidesdb_ttl_deadline(time_t ttl_seconds)
 }
 
 /* an absolute deadline can exceed time_t even when the lifetime used to set it fits */
-static int tidesdb_ttl_output(int64_t expiry, time_t* ttl)
+static int tidesdb_ttl_output(int64_t expiry, time_t *ttl)
 {
     const time_t converted = (time_t)expiry;
     if ((int64_t)converted != expiry) return TDB_ERR_TOO_LARGE;
@@ -267,12 +267,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     return tdb_public_rc(engine_txn_get(txn, (cf_t *)cf, key, key_size, value, value_size));
 }
 
-int tidesdb_txn_get_ttl(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
-                        size_t key_size, time_t* ttl)
+int tidesdb_txn_get_ttl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                        size_t key_size, time_t *ttl)
 {
     if (!txn || !cf || !key || key_size == 0 || !ttl) return TDB_ERR_INVALID_ARGS;
     int64_t expiry = TDB_TTL_NONE;
-    const int rc = engine_txn_get_ttl(txn, (cf_t*)cf, key, key_size, &expiry);
+    const int rc = engine_txn_get_ttl(txn, (cf_t *)cf, key, key_size, &expiry);
     return rc == TDB_SUCCESS ? tidesdb_ttl_output(expiry, ttl) : tdb_public_rc(rc);
 }
 
@@ -431,7 +431,7 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
     return tdb_public_rc(engine_iter_value(iter, value, value_size));
 }
 
-int tidesdb_iter_ttl(tidesdb_iter_t* iter, time_t* ttl)
+int tidesdb_iter_ttl(tidesdb_iter_t *iter, time_t *ttl)
 {
     if (!iter || !ttl) return TDB_ERR_INVALID_ARGS;
     int64_t expiry = TDB_TTL_NONE;

@@ -355,7 +355,7 @@ int engine_iter_value(tidesdb_iter_t *it, uint8_t **value, size_t *value_size)
     return engine_iter_dup_value(it, v, vs, voff, value, value_size);
 }
 
-int engine_iter_ttl(tidesdb_iter_t* it, int64_t* ttl)
+int engine_iter_ttl(tidesdb_iter_t *it, int64_t *ttl)
 {
     if (!it || !it->txn || !ttl) return TDB_ERR_INVALID_ARGS;
     int64_t expiry = 0;

@@ -191,7 +191,7 @@ refusing commits of disjoint keys, which a benchmark can only report as a higher
 ### `fuzz_decode` — untrusted input
 
 Feeds mutated bytes to the decoders — sstable footers, column-family configurations, WAL records,
-partition range filters, btree nodes, and manifest batches.
+partitioned bloom filters, btree nodes, and manifest batches.
 
 These are the one place untrusted input enters the engine. Everything else operates on data the
 engine itself wrote; a decoder operates on whatever is on disk, which after a crash or a bad
@@ -301,23 +301,25 @@ cmake --build build-bench -j
 | `fillseq` | Sequential inserts |
 | `fillrandom` | Random inserts |
 | `readrandom` | Point reads of present keys |
-| `readmissing` | Point reads of absent keys — the filter path |
+| `readmissing` | Point reads of absent keys, each in the **gap between two written keys** — the filter path. Needs `--key_size` above 8; at 8 or less there is no gap and it reads past the last key instead |
 | `readwrite` | Mixed, split by `--read_ratio` |
 | `deleterandom` | Random deletes |
 | `deletewhileread` | Deletes concurrent with reads |
 | `scan` | Range scans of `--scan_length` |
 | `scanrange` | The same scans told their range up front, so the two forms can be compared on one dataset |
 | `scanempty` | Bounded scans of a range holding no keys, in the **gap between two written keys** — what it costs to prove a range empty |
-| `fillindex` | Builds a table family and an index family together, one row and the index entry pointing at it per transaction. Needs `--cfs=2`; it is what `indexscan` and `indexmixed` read |
+| `fillindex` | Builds a table family and an index family together, one row and the index entry pointing at it per transaction. Needs `--cfs=2`; it is what `indexscan`, `indexprobe` and `indexmixed` read |
 | `indexscan` | A secondary-index `ref` join: seek the index family, then a point get on the **table** family per matching entry, which is what the MariaDB plugin's `index_read_secondary` issues. One op per lookup, since the lookup is the unit being measured. `--index_fanout` sets rows per indexed value |
+| `indexprobe` | The index half of `indexscan` alone, the bounded scan over one indexed value without fetching any row, so what a filter on the index family could prune is measured apart from the row gets that dominate a full lookup |
 | `indexmixed` | The same lookups running concurrently with writes, split by `--read_ratio`. The one to use for an index measurement that should mean anything — see the caution below |
 
 Several may be given at once: `--benchmarks=fillrandom,readrandom,scan`.
 
-:::caution[`scanempty` probes an interior gap on purpose]
-A range past the last key is excluded by every sstable's recorded bounds before a block is read, so
-it measures the pruning fast path rather than the question. The probe sits between two adjacent
-written keys, where the bounds of every file spanning that point overlap it and none can be pruned.
+:::caution[`scanempty` and `readmissing` probe an interior gap on purpose]
+A key or range past the last key is excluded by every sstable's recorded bounds before a block or a
+filter is read, so it measures the pruning fast path rather than the question. The probe sits
+between two adjacent written keys, where the bounds of every file spanning that point overlap it and
+none can be pruned.
 **Check the cache counters before believing any latency from this workload** — `hits=0 misses=0`
 means nothing was read and the fast path ate the experiment.
 :::

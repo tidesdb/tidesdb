@@ -270,7 +270,7 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * this build lacks is accepted so a database written elsewhere still opens, and fails when such a
  * node is read
  * @param encoding_count number of entries in the pipeline, at most TDB_ENCODING_PIPELINE_MAX
- * @param enable_bloom_filter build a partition-range filter for point-get pruning
+ * @param enable_bloom_filter build a partitioned bloom filter for point-get pruning
  * @param bloom_fpr target bloom false-positive rate when the filter is enabled
  * @param default_isolation_level isolation applied to a transaction opened without an explicit
  * level
@@ -432,11 +432,12 @@ typedef struct tidesdb_config_t
  * @param unflushed_key_count distinct keys resident in the shared memtables for this cf and not yet
  * in any sstable, so total_keys plus this is the live logical key count including what is still in
  * memory
- * @param filter_resident_bytes memory this family's partition range filters hold outside the block
- * cache -- one routing directory per sstable, holding each partition's offset and its whole first
- * key. the filter bit arrays themselves are not counted here: those are fetched per probe and live
- * in the cache, where block_cache_size already bounds them. a directory is built on a table's first
- * probe, so this reads zero for a family nothing has read from yet and rises as tables are touched
+ * @param filter_resident_bytes memory this family's partitioned bloom filters hold outside the
+ * block cache -- one routing directory per sstable, holding each partition's offset and its whole
+ * first key. the filter bit arrays themselves are not counted here: those are fetched per probe and
+ * live in the cache, where block_cache_size already bounds them. a directory is built on a table's
+ * first probe, so this reads zero for a family nothing has read from yet and rises as tables are
+ * touched
  */
 typedef struct tidesdb_cf_stats_t
 {

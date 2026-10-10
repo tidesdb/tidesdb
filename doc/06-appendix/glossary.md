@@ -56,7 +56,7 @@ namespaced by a four-byte family index prefix.
 **MVCC** — Multi-version concurrency control. Writes append new versions rather than overwriting,
 so readers never block writers.
 
-**Partition range filter** — A per-sstable bloom filter split by key range, so its resident cost
+**Partitioned bloom filter** — A per-sstable bloom filter split by key range, so its resident cost
 is bounded by the block cache rather than by the entry count.
 
 **Prepared transaction** — One that has passed phase one of two-phase commit: durably logged,

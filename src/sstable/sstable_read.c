@@ -21,8 +21,8 @@
 
 /**
  * sstable_bloom_cache_reclaim
- * the cache's per-entry reclaim for a cached pr_filter partition; frees the blob once the last
- * reference to it drops, on whichever thread drops it
+ * the cache's per-entry reclaim for a cached partitioned_bloom_filter partition; frees the blob
+ * once the last reference to it drops, on whichever thread drops it
  * @param payload the cached partition bytes
  * @param ctx unused
  */
@@ -34,8 +34,8 @@ static void sstable_bloom_cache_reclaim(void *payload, void *ctx)
 
 /**
  * sstable_bloom_read_block
- * read one pr_filter blob's block out of the klog, resolving the live block manager so a reaper
- * reopen between probes is transparent
+ * read one partitioned_bloom_filter blob's block out of the klog, resolving the live block manager
+ * so a reaper reopen between probes is transparent
  * @param sst the sstable owning the klog
  * @param offset byte offset of the blob's block
  * @param size the size the directory records for the blob; a mismatch means the block is not it
@@ -63,10 +63,10 @@ static block_manager_block_t *sstable_bloom_read_block(sstable_t *sst, uint64_t 
 
 /**
  * sstable_bloom_fetch_cached
- * fetch a pr_filter blob through the block cache, keyed in the sstable's namespace by the blob's
- * klog offset so it cannot collide with a btree node; a miss reads the blob once, hands it to the
- * cache, and re-gets to pin whichever copy won. keeping the blob cached is what stops a probe from
- * re-reading and re-checksumming a whole partition per key
+ * fetch a partitioned_bloom_filter blob through the block cache, keyed in the sstable's namespace
+ * by the blob's klog offset so it cannot collide with a btree node; a miss reads the blob once,
+ * hands it to the cache, and re-gets to pin whichever copy won. keeping the blob cached is what
+ * stops a probe from re-reading and re-checksumming a whole partition per key
  * @param sst the sstable owning the klog and the borrowed cache
  * @param offset byte offset of the blob's block
  * @param size the size the directory records for the blob
@@ -143,21 +143,22 @@ static void sstable_bloom_release(void *ctx, void *pin)
 /* open the bloom reader on first probe and publish it with a cas; a loser frees its own reader. an
  * sstable with no bloom directory has nothing to open and returns NULL, meaning probe-as-present.
  */
-static pr_filter_reader_t *sstable_ensure_bloom(sstable_t *sst)
+static partitioned_bloom_filter_reader_t *sstable_ensure_bloom(sstable_t *sst)
 {
-    pr_filter_reader_t *bloom = atomic_load_explicit(&sst->bloom, memory_order_acquire);
+    partitioned_bloom_filter_reader_t *bloom =
+        atomic_load_explicit(&sst->bloom, memory_order_acquire);
     if (bloom) return bloom;
     if (sst->bloom_dir_size == 0) return NULL;
 
-    pr_filter_reader_t *opened = NULL;
-    if (pr_filter_reader_open(&opened, sst->bloom_dir_offset, sst->bloom_dir_size,
-                              sstable_bloom_fetch, sstable_bloom_release, sst) != 0)
+    partitioned_bloom_filter_reader_t *opened = NULL;
+    if (partitioned_bloom_filter_reader_open(&opened, sst->bloom_dir_offset, sst->bloom_dir_size,
+                                             sstable_bloom_fetch, sstable_bloom_release, sst) != 0)
         return NULL;
 
-    pr_filter_reader_t *expected = NULL;
+    partitioned_bloom_filter_reader_t *expected = NULL;
     if (atomic_compare_exchange_strong(&sst->bloom, &expected, opened)) return opened;
 
-    pr_filter_reader_free(opened);
+    partitioned_bloom_filter_reader_free(opened);
     return expected;
 }
 
@@ -267,8 +268,8 @@ int sstable_get_at_seq(sstable_t *sst, const uint8_t *key, size_t key_size, uint
 
     /* a definite bloom miss avoids the klog entirely; membership is version-agnostic, so it holds
      * for any ceiling */
-    pr_filter_reader_t *bloom = sstable_ensure_bloom(sst);
-    if (bloom && pr_filter_reader_maybe_contains(bloom, key, key_size) == 0)
+    partitioned_bloom_filter_reader_t *bloom = sstable_ensure_bloom(sst);
+    if (bloom && partitioned_bloom_filter_reader_maybe_contains(bloom, key, key_size) == 0)
         return TDB_ERR_NOT_FOUND;
 
     const int already_open = atomic_load_explicit(&sst->klog_bm, memory_order_acquire) != NULL;

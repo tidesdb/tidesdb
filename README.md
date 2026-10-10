@@ -18,7 +18,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Ordered bidirectional iteration, with range-bounded scans
 - Range deletes
 - Configurable compression pipeline (Snappy, LZ4, Zstd)
-- Partition range filters
+- Partitioned bloom filters
 - TTL
 - Configurable durability (none, interval, full sync)
 - Extensive statistics and metrics

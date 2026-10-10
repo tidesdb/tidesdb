@@ -6,7 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-#include "sstable/pr_filter.h"
+#include "sstable/partitioned_bloom_filter.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -64,11 +64,11 @@ typedef struct
     uint32_t first_key_len;
 } bbf_partition_t;
 
-struct pr_filter_builder
+struct partitioned_bloom_filter_builder
 {
     double fpr;
     uint32_t partition_entries;
-    pr_filter_write_fn write_fn;
+    partitioned_bloom_filter_write_fn write_fn;
     void *write_ctx;
 
     /* the open partition's keys, as the hashes their bits derive from. a bloom filter's bit count
@@ -89,10 +89,10 @@ struct pr_filter_builder
     int failed; /* sticky -- a write or allocation failure poisons the build */
 };
 
-struct pr_filter_reader
+struct partitioned_bloom_filter_reader
 {
-    pr_filter_fetch_fn fetch_fn;
-    pr_filter_release_fn release_fn;
+    partitioned_bloom_filter_fetch_fn fetch_fn;
+    partitioned_bloom_filter_release_fn release_fn;
     void *cb_ctx;
 
     bbf_partition_t *parts; /* ascending key order; first_key owned */
@@ -112,13 +112,16 @@ static void bbf_partitions_free(bbf_partition_t *parts, size_t n)
     free(parts);
 }
 
-int pr_filter_builder_new(pr_filter_builder_t **out, double fpr, uint32_t partition_entries,
-                          pr_filter_write_fn write_fn, void *write_ctx)
+int partitioned_bloom_filter_builder_new(partitioned_bloom_filter_builder_t **out, double fpr,
+                                         uint32_t partition_entries,
+                                         partitioned_bloom_filter_write_fn write_fn,
+                                         void *write_ctx)
 {
     if (!out || !write_fn || !(fpr > 0.0 && fpr < 1.0)) return -1;
-    if (partition_entries == 0) partition_entries = TDB_PR_FILTER_DEFAULT_PARTITION_ENTRIES;
+    if (partition_entries == 0)
+        partition_entries = TDB_PARTITIONED_BLOOM_FILTER_DEFAULT_PARTITION_ENTRIES;
 
-    pr_filter_builder_t *b = calloc(1, sizeof(*b));
+    partitioned_bloom_filter_builder_t *b = calloc(1, sizeof(*b));
     if (!b) return -1;
 
     b->fpr = fpr;
@@ -138,7 +141,7 @@ int pr_filter_builder_new(pr_filter_builder_t **out, double fpr, uint32_t partit
 /* serialize the current partition and record it, holding its blob until finish writes it after the
  * sstable's klog data. takes ownership of current_first_key on success. a no-op when no partition
  * is open. */
-static int bbf_seal_current(pr_filter_builder_t *b)
+static int bbf_seal_current(partitioned_bloom_filter_builder_t *b)
 {
     if (b->current_count == 0) return 0;
 
@@ -184,7 +187,8 @@ static int bbf_seal_current(pr_filter_builder_t *b)
     return 0;
 }
 
-int pr_filter_builder_add(pr_filter_builder_t *b, const uint8_t *key, size_t key_size)
+int partitioned_bloom_filter_builder_add(partitioned_bloom_filter_builder_t *b, const uint8_t *key,
+                                         size_t key_size)
 {
     if (!b) return 0; /* a NULL builder means the filter is disabled -- adding is a no-op */
     if (!key || key_size == 0) return -1;
@@ -218,7 +222,7 @@ int pr_filter_builder_add(pr_filter_builder_t *b, const uint8_t *key, size_t key
 }
 
 /* serialized directory size for the recorded partitions */
-static size_t bbf_dir_size(const pr_filter_builder_t *b)
+static size_t bbf_dir_size(const partitioned_bloom_filter_builder_t *b)
 {
     size_t total = BBF_DIR_HEADER_BYTES;
     for (size_t i = 0; i < b->num_parts; i++)
@@ -226,8 +230,9 @@ static size_t bbf_dir_size(const pr_filter_builder_t *b)
     return total;
 }
 
-int pr_filter_builder_finish(pr_filter_builder_t *b, uint64_t *out_dir_offset,
-                             uint32_t *out_dir_size, uint64_t *out_total_entries)
+int partitioned_bloom_filter_builder_finish(partitioned_bloom_filter_builder_t *b,
+                                            uint64_t *out_dir_offset, uint32_t *out_dir_size,
+                                            uint64_t *out_total_entries)
 {
     if (!b || !out_dir_offset || !out_dir_size) return -1;
     if (b->failed) return -1;
@@ -293,7 +298,7 @@ int pr_filter_builder_finish(pr_filter_builder_t *b, uint64_t *out_dir_offset,
     return 0;
 }
 
-void pr_filter_builder_free(pr_filter_builder_t *b)
+void partitioned_bloom_filter_builder_free(partitioned_bloom_filter_builder_t *b)
 {
     if (!b) return;
     free(b->current_hashes);
@@ -367,9 +372,11 @@ static int bbf_parse_dir(const uint8_t *data, size_t len, bbf_partition_t **out_
     return 0;
 }
 
-int pr_filter_reader_open(pr_filter_reader_t **out, uint64_t dir_offset, uint32_t dir_size,
-                          pr_filter_fetch_fn fetch_fn, pr_filter_release_fn release_fn,
-                          void *cb_ctx)
+int partitioned_bloom_filter_reader_open(partitioned_bloom_filter_reader_t **out,
+                                         uint64_t dir_offset, uint32_t dir_size,
+                                         partitioned_bloom_filter_fetch_fn fetch_fn,
+                                         partitioned_bloom_filter_release_fn release_fn,
+                                         void *cb_ctx)
 {
     if (!out || !fetch_fn || dir_size == 0) return -1;
 
@@ -384,7 +391,7 @@ int pr_filter_reader_open(pr_filter_reader_t **out, uint64_t dir_offset, uint32_
     if (pin && release_fn) release_fn(cb_ctx, pin);
     if (rc != 0) return -1;
 
-    pr_filter_reader_t *r = calloc(1, sizeof(*r));
+    partitioned_bloom_filter_reader_t *r = calloc(1, sizeof(*r));
     if (!r)
     {
         bbf_partitions_free(parts, n);
@@ -402,7 +409,8 @@ int pr_filter_reader_open(pr_filter_reader_t **out, uint64_t dir_offset, uint32_
 
 /* index of the partition whose range covers key, or -1 if key sorts before the first partition.
  * partitions are ascending, so this is the rightmost first_key <= key. */
-static int64_t bbf_route(const pr_filter_reader_t *r, const uint8_t *key, size_t key_size)
+static int64_t bbf_route(const partitioned_bloom_filter_reader_t *r, const uint8_t *key,
+                         size_t key_size)
 {
     int64_t lo = 0, hi = (int64_t)r->num_parts - 1, res = -1;
     while (lo <= hi)
@@ -422,7 +430,8 @@ static int64_t bbf_route(const pr_filter_reader_t *r, const uint8_t *key, size_t
     return res;
 }
 
-int pr_filter_reader_maybe_contains(pr_filter_reader_t *r, const uint8_t *key, size_t key_size)
+int partitioned_bloom_filter_reader_maybe_contains(partitioned_bloom_filter_reader_t *r,
+                                                   const uint8_t *key, size_t key_size)
 {
     if (!r || !key || key_size == 0) return -1;
     if (r->num_parts == 0) return 1; /* no filter -- safe answer is may-present */
@@ -441,12 +450,12 @@ int pr_filter_reader_maybe_contains(pr_filter_reader_t *r, const uint8_t *key, s
     return c;
 }
 
-size_t pr_filter_reader_resident_bytes(const pr_filter_reader_t *r)
+size_t partitioned_bloom_filter_reader_resident_bytes(const partitioned_bloom_filter_reader_t *r)
 {
     return r ? r->resident_bytes : 0;
 }
 
-void pr_filter_reader_free(pr_filter_reader_t *r)
+void partitioned_bloom_filter_reader_free(partitioned_bloom_filter_reader_t *r)
 {
     if (!r) return;
     bbf_partitions_free(r->parts, r->num_parts);

@@ -176,7 +176,7 @@ oversubscribed machine, spinning through another thread's clock sweep wastes exa
 capacity the sweep is competing for.
 
 :::caution[Cache sizing is not just a hit-rate knob]
-The capacity also bounds the **filter** footprint. Partition range filter blobs are fetched on
+The capacity also bounds the **filter** footprint. Partitioned bloom filter blobs are fetched on
 demand and are meant to live here — see [SSTable](/internals/sstable). A cache too small to
 hold the working set of filter partitions makes every point lookup re-read its filter, which
 costs more than the filter saves.

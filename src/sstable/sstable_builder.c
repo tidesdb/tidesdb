@@ -21,7 +21,7 @@ struct sstable_builder
     block_manager_t *klog_bm; /* borrowed until finish adopts it into the produced sstable */
     vlog_t *vlog;             /* the cf's shared value log, borrowed; NULL forbids a spill */
     btree_builder_t *btree_builder;
-    pr_filter_builder_t *bloom_builder; /* NULL when the bloom is disabled */
+    partitioned_bloom_filter_builder_t *bloom_builder; /* NULL when the bloom is disabled */
 
     size_t value_threshold;
     /* this build's own copy, since the caller's set may be rebuilt before finish writes the block
@@ -126,8 +126,8 @@ static int sstable_builder_note_value(sstable_builder_t *builder, uint64_t vlog_
     return TDB_SUCCESS;
 }
 
-/* write callback the pr_filter builder uses to land each partition and its directory as klog
- * blocks; the returned offset is the block frame the reader's fetch will read back */
+/* write callback the partitioned_bloom_filter builder uses to land each partition and its directory
+ * as klog blocks; the returned offset is the block frame the reader's fetch will read back */
 static int sstable_bloom_write(void *ctx, const uint8_t *data, size_t size, uint64_t *out_offset)
 {
     block_manager_t *bm = ctx;
@@ -199,8 +199,9 @@ int sstable_builder_new(sstable_builder_t **out, block_manager_t *klog_bm, vlog_
         return TDB_ERR_MEMORY;
     }
 
-    if (config->enable_bloom && pr_filter_builder_new(&b->bloom_builder, config->bloom_fpr, 0,
-                                                      sstable_bloom_write, klog_bm) != 0)
+    if (config->enable_bloom &&
+        partitioned_bloom_filter_builder_new(&b->bloom_builder, config->bloom_fpr, 0,
+                                             sstable_bloom_write, klog_bm) != 0)
     {
         btree_builder_free(b->btree_builder);
         free(b->klog_path);
@@ -254,7 +255,7 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key, 
     if (is_new_distinct)
     {
         if (builder->bloom_builder &&
-            pr_filter_builder_add(builder->bloom_builder, key, key_size) != 0)
+            partitioned_bloom_filter_builder_add(builder->bloom_builder, key, key_size) != 0)
             return TDB_ERR_MEMORY;
         builder->distinct_key_count++;
         builder->total_key_bytes += key_size;
@@ -388,7 +389,7 @@ static int sstable_finish_range_dels(sstable_builder_t *builder, uint64_t *out_o
 
 /**
  * sstable_finish_bloom
- * close out the partition range filter, when the build has one, and report where its directory
+ * close out the partitioned bloom filter, when the build has one, and report where its directory
  * landed in the klog
  * @param builder the builder, whose filter builder is consumed
  * @param out_offset receives the filter directory offset, 0 when the build has no filter
@@ -403,10 +404,11 @@ static int sstable_finish_bloom(sstable_builder_t *builder, uint64_t *out_offset
     if (!builder->bloom_builder) return TDB_SUCCESS;
 
     uint64_t total = 0;
-    if (pr_filter_builder_finish(builder->bloom_builder, out_offset, out_size, &total) != 0)
+    if (partitioned_bloom_filter_builder_finish(builder->bloom_builder, out_offset, out_size,
+                                                &total) != 0)
         return TDB_ERR_IO;
 
-    pr_filter_builder_free(builder->bloom_builder);
+    partitioned_bloom_filter_builder_free(builder->bloom_builder);
     builder->bloom_builder = NULL;
     return TDB_SUCCESS;
 }
@@ -417,7 +419,7 @@ static int sstable_finish_bloom(sstable_builder_t *builder, uint64_t *out_offset
  * which is what lets a reader open the table knowing only the file
  * @param builder the builder, for the counts it accumulated
  * @param tree the finished btree, for its shape and key bounds
- * @param bloom_dir_offset where the partition range filter directory landed
+ * @param bloom_dir_offset where the partitioned bloom filter directory landed
  * @param bloom_dir_size how large that directory is
  * @param range_del_offset where this table's interval-delete block landed, 0 when it carries none
  * @param range_del_size how large that block is, 0 when it carries none
@@ -503,7 +505,7 @@ static int sstable_copy_key_bounds(sstable_t *sst, const btree_t *tree)
  * builder's klog block manager so a fresh build stays hot rather than being reopened to be read
  * @param builder the builder, whose klog block manager is taken on success
  * @param tree the finished btree
- * @param bloom_dir_offset where the partition range filter directory landed
+ * @param bloom_dir_offset where the partitioned bloom filter directory landed
  * @param bloom_dir_size how large that directory is
  * @param range_del_offset where this table's interval-delete block landed, 0 when it carries none
  * @param range_del_size how large that block is, 0 when it carries none
@@ -660,7 +662,7 @@ void sstable_builder_free(sstable_builder_t *builder)
      * left to the caller on an unfinished build, or already moved into the sstable on a finished
      * one */
     if (builder->btree_builder) btree_builder_free(builder->btree_builder);
-    if (builder->bloom_builder) pr_filter_builder_free(builder->bloom_builder);
+    if (builder->bloom_builder) partitioned_bloom_filter_builder_free(builder->bloom_builder);
     /* NULL once a finish moved it onto the produced sstable */
     range_tombstone_set_free(builder->range_tombstones);
     free(builder->klog_path);

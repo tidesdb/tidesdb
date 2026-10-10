@@ -187,7 +187,7 @@ include_directories(SYSTEM external)
 # users can override with -DBUILD_SHARED_LIBS=ON/OFF
 set(TIDESDB_SOURCES
     src/db.c src/engine/engine.c src/engine/engine_l0.c src/engine/engine_recovery.c src/engine/engine_txn.c src/engine/engine_compaction.c src/engine/engine_reaper.c src/engine/engine_iter.c src/engine/engine_stats.c src/engine/engine_ops.c src/engine/engine_backup.c src/engine/engine_cf_ops.c src/engine/engine_prepared.c src/io/block_manager_core.c src/io/block_manager_util.c src/io/block_manager_write.c src/io/block_manager_cursor.c src/io/block_manager_recover.c src/io/block_manager_fault.c src/base/alloc_fault.c src/datastructures/skip_list/skip_list_node.c src/datastructures/skip_list/skip_list_core.c src/datastructures/skip_list/skip_list_read.c src/datastructures/skip_list/skip_list_cursor.c src/datastructures/skip_list/skip_list_write.c src/base/encoding/compress.c src/sstable/bloom_filter.c
-    src/sstable/pr_filter.c
+    src/sstable/partitioned_bloom_filter.c
     src/manifest/manifest_set.c src/manifest/manifest_record.c src/manifest/manifest_log.c src/manifest/manifest_api.c src/column_family/cf_config.c src/column_family/column_family.c src/column_family/cf_registry.c src/column_family/cf_iter.c src/flush/flush.c src/compaction/compaction_exec.c src/compaction/compaction_commit.c src/compaction/compaction_planner.c src/iter/merge_iter.c src/iter/merge_sources.c src/iter/merge_level_source.c src/column_family/level/level_set.c src/fdmanager/fdmanager.c src/fdmanager/reaper.c src/datastructures/queue.c src/range_tombstone/range_tombstone.c src/sstable/btree/btree_node.c src/sstable/btree/btree_node_encode.c src/sstable/btree/btree_builder.c src/sstable/btree/btree_read.c src/sstable/btree/btree_cursor.c
     src/sstable/vlog.c src/sstable/vlog_reclaim.c src/sstable/vlog_segment.c src/sstable/sstable.c
     src/sstable/sstable_footer.c
@@ -705,7 +705,7 @@ if(TIDESDB_BUILD_TESTS)
         skip_list_tests
         compress_tests
         bloom_filter_tests
-        pr_filter_tests
+        partitioned_bloom_filter_tests
         manifest_tests
         queue_tests
         range_tombstone_tests
@@ -806,7 +806,7 @@ if(TIDESDB_BUILD_TESTS)
     if(WIN32)
         set(TIDESDB_TEST_TARGETS
                 block_manager_tests skip_list_tests compress_tests bloom_filter_tests
-                pr_filter_tests manifest_tests queue_tests)
+                partitioned_bloom_filter_tests manifest_tests queue_tests)
 
         if(MINGW)
             # On MinGW (MSYS2), the test exes link against shared snappy/zstd/lz4

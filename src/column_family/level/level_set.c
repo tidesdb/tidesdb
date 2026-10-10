@@ -293,6 +293,36 @@ uint32_t level_set_interval_tables(const level_set_t *ls)
     return ls ? atomic_load_explicit(&ls->interval_tables, memory_order_acquire) : 0;
 }
 
+int level_set_interval_covering(level_set_t *ls, const uint8_t *key, const size_t key_size,
+                                const uint64_t snapshot, uint64_t *out_seq)
+{
+    if (!ls || !key || !out_seq) return 0;
+
+    /* the layout holds a reference on every table in it and is retired through the epoch, so the
+     * walk reads each table's intervals in place. nothing is copied out, so no family is too large
+     * to be asked whole, and nothing is referenced, so there is nothing to give back */
+    tdb_epoch_enter(&ls->epoch);
+    const level_layout_t *lay = atomic_load_explicit(&ls->layout, memory_order_acquire);
+    int covered = 0;
+    uint64_t newest = 0;
+    for (int i = 0; i < LEVEL_SET_MAX_LEVELS; i++)
+        for (int j = 0; j < lay->counts[i]; j++)
+        {
+            const range_tombstone_set_t *rts = lay->levels[i][j].sst->range_tombstones;
+            uint64_t seq = 0;
+            if (rts && range_tombstone_max_covering(rts, key, key_size, snapshot, &seq) == 1 &&
+                (!covered || seq > newest))
+            {
+                covered = 1;
+                newest = seq;
+            }
+        }
+    tdb_epoch_exit(&ls->epoch);
+
+    if (covered) *out_seq = newest;
+    return covered;
+}
+
 uint64_t level_set_generation(const level_set_t *ls)
 {
     return ls ? atomic_load_explicit(&ls->generation, memory_order_acquire) : 0;

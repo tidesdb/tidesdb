@@ -229,4 +229,19 @@ uint32_t level_set_occupancy(const level_set_t *ls);
  */
 uint32_t level_set_interval_tables(const level_set_t *ls);
 
+/**
+ * level_set_interval_covering
+ * the newest interval at or below snapshot covering key, across every table in the set. read in
+ * place under the layout's epoch, so it answers for a family of any size and never a partial view
+ * @param ls the level set
+ * @param key the key to test
+ * @param key_size length of key in bytes
+ * @param snapshot the ceiling the read is looking below, inclusive
+ * @param out_seq set to the covering interval's sequence when the call returns 1, untouched
+ * otherwise
+ * @return 1 when an interval covers the key, 0 when none does or on a bad argument
+ */
+int level_set_interval_covering(level_set_t *ls, const uint8_t *key, size_t key_size,
+                                uint64_t snapshot, uint64_t *out_seq);
+
 #endif /* __TIDESDB_LEVEL_SET_H__ */

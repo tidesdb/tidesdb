@@ -82,17 +82,26 @@ also keeps output files large enough to be written as long sequential runs.
 
 ## The tree grows with the data
 
-A family starts at one level and gains levels as it fills. When a merge would land in the largest
-level and that level is already at its capacity, it lands one level deeper instead — which is how a
-level is added. The count settles near `log_T(N/B)`, and the capacities above are what bound the
-space that costs.
+A family starts at one level and gains levels as it fills. A merge lands in the smallest level that
+can hold what it carries, and when not even the largest level can, it lands one level deeper instead
+— which is how a level is added. The count settles near `log_T(N/B)`, and the capacities above are
+what bound the space that costs.
 
-The step is easy to leave out and expensive to omit. Without it a family stops deepening, so every
-merge has to land in a level it already occupies, the dividing level collapses onto the flush tier,
-and the tier grows one run per flush with nowhere to drain to. Every trigger still fires, every plan
-still produces jobs, every job still succeeds — and a scan of any range still ends up opening every
-run in the tier. Growth is evaluated where the target is chosen, **after** a merge has been selected
-rather than before, so it cannot preempt a dividing merge that was already due.
+There are two places that question is asked, because there are two kinds of merge. A two-level tree
+grows when the merge of its flush tier would land in a largest level already at its capacity. A
+deeper tree grows through the dividing merge: once the levels from the dividing level down would
+overflow the largest level's capacity together, the merge writes them into a new level below it.
+
+The step is easy to leave out and expensive to omit, and it has to be in both places. Without it a
+family stops deepening, so every merge has to land in a level it already occupies. At two levels the
+dividing level collapses onto the flush tier, and the tier grows one run per flush with nowhere to
+drain to. At three, the dividing merge lands in the largest level however much it already holds, so
+that level grows past its capacity without limit and every dividing merge rewrites the whole of it —
+a merge that should touch a fraction of the data touches all of it, at a cost that grows with the
+store. Every trigger still fires, every plan still produces jobs, every job still succeeds, and
+nothing reports the tree as the wrong shape. Growth is evaluated where the target is chosen,
+**after** a merge has been selected rather than before, so it cannot preempt a dividing merge that
+was already due.
 
 ## Partitioned merges fan out when their inputs allow it
 
@@ -102,7 +111,15 @@ level's boundary partitions, the plan emits **one job per partition**. Those job
 they may run at the same time, and each costs one partition of transient space rather than the whole
 span of levels it covers.
 
-That is only sound when the inputs really are aligned, and the plan checks rather than assumes it.
+A partition is worth a job whenever it holds a file above the target, however few files it holds.
+Into an empty level that is every partition, each holding the one file a dividing merge wrote there
+and nothing beneath it. The move is the point of the merge, so a partition with a single file above
+the target still gets a job, and only one with nothing above the target is left alone. Skipping the
+single ones instead plans nothing at all, the dividing level stays over its capacity for good, and
+the flush tier above it grows until admission stops every writer.
+
+Fanning out is only sound when the inputs really are aligned, and the plan checks rather than
+assumes it.
 The largest level is partitioned to these boundaries by construction, and a dividing merge writes
 its output the same way — so alignment holds once the levels above have been through one. But a run
 flushed straight into the tier spans whatever its memtable happened to hold, which under interleaved
@@ -165,12 +182,17 @@ point where that starts.
 
 ## And sheds one when the data goes away
 
-The reverse also happens. When the largest level has shrunk to less than a size ratio's worth of its
-own capacity, that level is merged into the one above it and the tree loses a level.
+The reverse also happens. When the largest level holds less than a size ratio's worth of the
+capacity the level above it would have as the largest — `C_L / T²` — that level is merged into the
+one above it and the tree loses a level.
 
-The two thresholds are deliberately far apart — growth at the capacity, shrink at a `T`-th of it —
-and that gap is hysteresis. A family sitting near a boundary would otherwise grow and shed the same
-level repeatedly, paying a full merge each time.
+The two thresholds are deliberately a size ratio apart, and that gap is hysteresis. A level is added
+when the largest reaches its capacity `C_L`, so the new largest starts out holding about `C_L`, which
+is a `T`-th of its own capacity. Shedding at a `T`-th of the largest level's own capacity would shed
+at the very size the level was added at, and a growth merge that dropped any garbage on the way down
+would be undone by the next plan — two whole rewrites of the family for nothing, and again on every
+crossing. At `T²` a family has to lose nine tenths of what grew it, at the default ratio, before it
+gives the level back, and lands a full size ratio below the point that would grow it again.
 
 Shedding is judged **on its own**, not behind the backlog triggers. A family whose data was mostly
 deleted has no level at capacity and no tier over its file count, which is exactly the state an
@@ -193,13 +215,44 @@ Three triggers, checked against the snapshot:
 | --- | --- |
 | **L1 file count** | L1 holds at least `l1_file_count_trigger` files |
 | **Level capacity** | Some level's size has reached its DCA capacity |
-| **Tombstone density** | An sstable's tombstone fraction has reached `tombstone_density_trigger`, above a minimum entry count |
+| **Tombstone density** | An sstable's tombstone fraction has reached `tombstone_density_trigger`, above a minimum entry count. In the flush tier it makes the ordinary merge due; below it, it moves the table one level down; at the largest level it plans nothing |
 
 The L1 trigger is the read-amplification guard: L1 files overlap, so every one of them is a
 file a point lookup may have to consult. The capacity triggers keep the shape of the tree. The
 tombstone trigger exists because deleted data costs space and read work until a merge can
 prove it is safe to drop — a family that is mostly deletes would otherwise never compact, since
 its levels are not growing.
+
+### A dense table moves down
+
+What the tombstone trigger plans depends on where the dense table sits, because a tombstone drops
+only at the largest level. A merge that wrote a dense table back into its own level would keep every
+tombstone in it, leave it exactly as dense, and be planned again on the next pass — rewriting the
+same bytes for as long as the database stays open, while the data the tombstones deleted sits
+untouched in the levels below.
+
+So a dense table between the flush tier and the largest level is merged **one level down**, with
+every table there whose range it meets. Each such merge is progress, and the tombstones drop once the
+table reaches the largest level, taking the versions they shadow with them. The level below is a
+non-overlapping run and every table there that meets the moving table's range is taken, so the
+outputs replace exactly the span they cover. The tables left at the dense table's level do not meet
+its range, and everything shallower is newer, so deeper stays older for every key.
+
+One plan moves **every** dense table that can move without sharing an input, one job each, and the
+jobs run at once. A store that deleted most of its data has a dense table in most partitions, and
+moving one per plan would take a scheduler pass per table to give the space back. A table whose move
+would take an input another job already holds waits for the next plan, which keeps the jobs disjoint.
+Tables are taken shallowest first, so a dense table whose level below is itself moving waits rather
+than racing it.
+
+A dense file in the flush tier needs nothing of its own, since any merge the tier is part of moves
+it below. A dense table **at** the largest level is left alone. A tombstone still in it is one its
+own merge could not drop — a reader below the floor, or a table outside the merge reaching into its
+key — and rewriting it alone would write the same table and plan the same merge again. The next
+merge into the largest level rewrites it anyway.
+
+The trigger plans this only when nothing else is due. Data arriving keeps the ordinary triggers
+firing, and those merges carry a dense table down with everything else.
 
 A forced [`tidesdb_compact`](/reference/maintenance#tidesdb_compact) sets `force`, which plans a
 merge whether or not a trigger is due.
@@ -238,6 +291,20 @@ A scan of any range then opens all of them, which is the read-side collapse reac
 component failing.
 
 The tier is always an **input** to a merge and never its destination.
+
+### A merge always carries something down
+
+The same failure has a second shape one level lower. A three-level family's dividing level is the
+flush tier, so when the tier is empty and L2 has reached its capacity, the ordinary merge targets L2
+and reads only L2. It writes L2 straight back, L2 is still at its capacity, and the trigger plans the
+same merge on the next pass, for as long as the database stays open.
+
+So a merge with nothing above its target is never planned. The shallowest level holding anything
+moves down instead, into the smallest level below that can hold it, which is the choice a dividing
+merge would make from that level. When the largest level is the only one holding anything there is
+nowhere below to go, and it grows into a new level if it is over its capacity. A forced pass in that
+shape rewrites the largest level in place, since that is what collects what it holds below the
+floor, and a caller asked for it.
 
 ## Jobs
 
@@ -344,8 +411,17 @@ A tombstone must be retained until the merge can prove that no older version of 
 survives *beneath* it. Drop it while an older value still exists in a deeper level, and that
 value becomes visible again — the delete is undone.
 
-So a tombstone may only be dropped when the merge includes **every sstable that could hold the
-key**. If the merge covers a subset, the tombstone is written to the output and lives on.
+So a tombstone may only be dropped when the merge includes **every sstable that could hold an
+older version of the key**. If the merge covers a subset, the tombstone is written to the output
+and lives on.
+
+The check starts at the shallowest level the merge reads from. Deeper is older for every key, so a
+table above every input holds only versions newer than anything the merge reads, and the newest of
+those stays the key's answer whatever the merge drops beneath it. Asking those tables too would
+refuse the drop for no reason in two common shapes. A key written again after its delete keeps
+its tombstone at the largest level until the new put happens to merge down on top of it, and a
+flush tier holding more tables than the check examines, which spans the key space under steady
+writes, refuses every drop at the largest level while it does.
 
 This interacts directly with partitioned merges. A partitioned sub-merge sees only part of the
 keyspace, so its notion of "every sstable holding this key" has to be evaluated over the
@@ -363,9 +439,11 @@ A **single-delete** is the exception: the caller has promised the key was writte
 since its last delete, so the tombstone and that one put drop together as soon as a merge sees
 them together, at any level. The merge holds a single-delete back when it is the key's newest
 version at or below the floor, and looks at the next version. If that is a live put and no
-table outside the merge holds the key, both go. The engine cannot check the promise, so the
-second condition is the same proof a base tombstone at the largest level needs. A put in a
-table the merge did not read keeps the single-delete, and that covers a key written twice.
+table outside the merge, from its shallowest level down, holds the key, both go. The engine cannot
+check the promise, so the second condition is the same proof a base tombstone at the largest level
+needs. An older put in a table the merge did not read keeps the single-delete, and that covers a key
+written twice. A put written after the single-delete sits above the merge and is the key's answer
+either way, so it does not hold the pair back.
 A kept single-delete is written back with its subtype, so the merge that later meets the put
 can still drop the pair. Breaking the promise therefore costs space, never a resurrected key.
 
@@ -431,7 +509,8 @@ round of compaction rewrites its data and keeps the previous copy.
 | --- | --- |
 | The planner performs no I/O and reads no clock | Determinism is what makes policy testable |
 | Versions are dropped only below `min_snapshot_seq` | A live snapshot must still see what it could see |
-| A tombstone drops only when every sstable holding the key is in the merge | Otherwise a deeper value is resurrected |
+| A tombstone drops only when every sstable that could hold an older version of the key is in the merge | Otherwise a deeper value is resurrected. A table above every input holds only newer versions, so it is not asked |
+| A merge carries something into its target from above | A merge that reads its target alone writes the same data back, and a trigger that made it due plans it again on every pass |
 | Tombstone safety is evaluated over the whole job, not a sub-range | A partitioned sub-merge sees only part of the keyspace |
 | Outputs and removals commit in one manifest batch | The set must never hold both or neither |
 | A merged-away input is unlinked when its last reference drops | Earlier and a reader is still inside it, or a crash leaves the manifest naming a missing file; never, and the store grows without bound while the live set looks healthy |

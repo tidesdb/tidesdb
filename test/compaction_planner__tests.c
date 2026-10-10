@@ -384,8 +384,9 @@ void test_plan_partitioned(void)
         sst(1, 1, 10, "a", "z"),    /* small L1 */
         sst(2, 2, 600, "a", "l"),   /* L2 file overlapping partition 0 */
         sst(3, 2, 600, "m", "z"),   /* L2 file overlapping partition 1 */
-        sst(4, 3, 5000, "a", "l"),  /* L3 file 1 -> partition 0 */
-        sst(5, 3, 5000, "m", "z")}; /* L3 file 2 -> partition 1 */
+        sst(4, 3, 4000, "a", "l"),  /* L3 file 1 -> partition 0 */
+        sst(5, 3, 4000, "m", "z")}; /* L3 file 2 -> partition 1 */
+    /* C2 = 8000 / 10 = 800, so L2 is due, and L3 has room for all of it under C3 = 10000 */
     const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 5, .num_levels = 3};
 
     compaction_plan_t *plan = NULL;
@@ -415,11 +416,12 @@ void test_plan_partitioned_spanning_input(void)
     c.dividing_level_offset = 0; /* X = 1, the dividing level, is L1 */
     c.min_levels = 1;
     c.base_capacity = 100;
-    /* L1 (X) is over its cap of n_largest/T = 100, and its single file spans both L2 partitions */
+    /* L1 (X) is over its cap of n_largest/T = 80, and its single file spans both L2 partitions.
+     * L2 has room for the merge under C2 = 1000, so it lands there rather than in a new level */
     const compaction_sstable_info_t ssts[] = {
         sst(1, 1, 150, "a", "z"),  /* the spanning dividing-level file */
-        sst(2, 2, 500, "a", "l"),  /* largest-level partition 0 */
-        sst(3, 2, 500, "m", "z")}; /* largest-level partition 1 */
+        sst(2, 2, 400, "a", "l"),  /* largest-level partition 0 */
+        sst(3, 2, 400, "m", "z")}; /* largest-level partition 1 */
     const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 3, .num_levels = 2};
 
     compaction_plan_t *plan = NULL;
@@ -466,6 +468,254 @@ void test_plan_tombstone_density(void)
     compaction_plan_free(plan2);
 }
 
+/* a tree of three levels whose largest is full grows a fourth. the dividing merge is what is due,
+ * since L1 is over its capacity, and with L1 and L2 together over L2's capacity it would land in
+ * L3 -- which is already at its own, so it has to land in a new level instead. landing in L3
+ * rewrites the whole of the largest level on every such merge and the tree never deepens */
+void test_plan_partitioned_merge_grows_a_level_when_the_largest_is_full(void)
+{
+    const compaction_planner_config_t c = cfg(); /* T = 10, base 100, X = 3 - 1 - 1 = 1 */
+
+    /* caps C3 = 100 * T^2 = 10000, C2 = N3 / 10 = 1000, C1 = N3 / 100 = 100. L3 sits at C3, L1 is
+     * over C1, and L1 + L2 = 1050 overflows C2 */
+    const compaction_sstable_info_t full[] = {sst(1, 1, 150, "a", "z"), sst(2, 2, 900, "a", "z"),
+                                              sst(3, 3, 5000, "a", "l"), sst(4, 3, 5000, "m", "z")};
+    const compaction_snapshot_t snap = {.sstables = full, .n_sstables = 4, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 1);
+    ASSERT_EQ(compaction_plan_job(plan, 0)->target_level, 4);
+    compaction_plan_free(plan);
+
+    /* the same merge into a largest level with room left lands there and adds nothing */
+    const compaction_sstable_info_t room[] = {sst(1, 1, 150, "a", "z"), sst(2, 2, 900, "a", "z"),
+                                              sst(3, 3, 4000, "a", "l"), sst(4, 3, 4000, "m", "z")};
+    const compaction_snapshot_t snap2 = {.sstables = room, .n_sstables = 4, .num_levels = 3};
+
+    plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap2, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 1);
+    ASSERT_EQ(compaction_plan_job(plan, 0)->target_level, 3);
+    compaction_plan_free(plan);
+}
+
+/* a level at its capacity with nothing above it moves down rather than into itself. the dividing
+ * level of a three-level tree is the flush tier, which here is empty and under its capacity, so the
+ * ordinary merge targets L2 and reads only L2 -- writing it straight back leaves it at its
+ * capacity, and the next pass plans the same merge again for as long as the database is open */
+void test_plan_never_rewrites_a_level_into_itself(void)
+{
+    const compaction_planner_config_t c = cfg(); /* T = 10, base 100, X = 1 */
+
+    /* C2 = N3 / 10 = 500, and L2 holds 600 with L1 empty */
+    const compaction_sstable_info_t ssts[] = {sst(1, 2, 600, "a", "z"), sst(2, 3, 2500, "a", "l"),
+                                              sst(3, 3, 2500, "m", "z")};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 3, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 1);
+    const compaction_job_t *j = compaction_plan_job(plan, 0);
+    ASSERT_EQ(j->target_level, 3);
+    ASSERT_EQ(j->n_inputs, 3); /* the spanning L2 file and both L3 files it meets */
+    compaction_plan_free(plan);
+}
+
+/* a forced pass over a family whose flush tier is empty moves the shallowest level holding anything
+ * down a level. one that targets L2 reads only L2 and writes it back, so a caller compacting to
+ * collect tombstones gets a full rewrite and keeps every tombstone */
+void test_plan_forced_pass_moves_the_shallowest_level_down(void)
+{
+    compaction_planner_config_t c = cfg();
+    c.force = 1;
+
+    /* nothing is due -- L2 holds 100 under C2 = 500 -- so only the force makes this plan */
+    const compaction_sstable_info_t ssts[] = {sst(1, 2, 100, "a", "z"), sst(2, 3, 2500, "a", "l"),
+                                              sst(3, 3, 2500, "m", "z")};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 3, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 1);
+    ASSERT_EQ(compaction_plan_job(plan, 0)->target_level, 3);
+    ASSERT_EQ(compaction_plan_job(plan, 0)->is_largest_level, 1);
+    compaction_plan_free(plan);
+}
+
+/* with only the largest level holding anything there is nowhere below to move to, so a forced pass
+ * rewrites it in place, which is what collects what it holds below the floor, and an unforced plan
+ * does nothing at all */
+void test_plan_forced_pass_rewrites_a_lone_largest_level(void)
+{
+    compaction_planner_config_t c = cfg();
+    c.min_levels = 3; /* keeps the near-empty upper levels from being shed first */
+    const compaction_sstable_info_t ssts[] = {sst(1, 3, 2500, "a", "l"), sst(2, 3, 2500, "m", "z")};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 2, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 0);
+    compaction_plan_free(plan);
+
+    c.force = 1;
+    plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 1);
+    const compaction_job_t *j = compaction_plan_job(plan, 0);
+    ASSERT_EQ(j->target_level, 3);
+    ASSERT_EQ(j->n_inputs, 2);
+    ASSERT_EQ(j->is_largest_level, 1);
+    compaction_plan_free(plan);
+}
+
+/* a partitioned merge into an empty level still moves each partition's one file down. once a tree
+ * is four levels deep the dividing level is L2, and a dividing merge wrote its files aligned to the
+ * largest level's partitions, so each partition holds exactly one of them and nothing from the
+ * empty L3 below. a partition is worth a job whenever it holds a file above the target, however few
+ * files it holds -- skipping the single ones plans nothing, the dividing level is never drained,
+ * and the flush tier above it grows until admission stops every writer */
+void test_plan_partitioned_merge_moves_a_lone_file_into_an_empty_level(void)
+{
+    const compaction_planner_config_t c = cfg(); /* T = 10, base 100, X = 4 - 1 - 1 = 2 */
+
+    /* C4 = 100 * T^3 = 100000, C3 = N4 / 10 = 400, C2 = N4 / 100 = 40. L2 holds 60, over C2, and
+     * fits in the empty L3 */
+    const compaction_sstable_info_t ssts[] = {
+        sst(1, 1, 10, "a", "z"),    /* the tier, above the dividing level and not part of it */
+        sst(2, 2, 30, "a", "l"),    /* L2, inside partition 0 */
+        sst(3, 2, 30, "m", "z"),    /* L2, inside partition 1 */
+        sst(4, 4, 2000, "a", "l"),  /* L4 partition 0 */
+        sst(5, 4, 2000, "m", "z")}; /* L4 partition 1 */
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 5, .num_levels = 4};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 2);
+    for (int i = 0; i < 2; i++)
+    {
+        const compaction_job_t *j = compaction_plan_job(plan, i);
+        ASSERT_EQ(j->target_level, 3);
+        ASSERT_EQ(j->n_inputs, 1);
+        ASSERT_TRUE(j->input_ids[0] == 2 || j->input_ids[0] == 3);
+    }
+    ASSERT_TRUE(plan_inputs_disjoint(plan));
+    compaction_plan_free(plan);
+}
+
+/* a merge that density alone made due moves the dense table deeper. a tombstone drops only at the
+ * largest level, so a merge writing the table back into its own level keeps every tombstone, the
+ * table stays exactly as dense, and the next pass plans the identical merge again -- a rewrite of
+ * the same bytes for as long as the database stays open, while the deleted data beneath is never
+ * reclaimed */
+void test_plan_tombstone_density_moves_the_dense_table_deeper(void)
+{
+    compaction_planner_config_t c = cfg();
+    c.tombstone_density_min_entries = 10;
+
+    /* nothing over capacity and L1 under its file trigger, so only L2's density makes this due.
+     * the dense table spans c..f, which meets the first two L3 tables and not the third */
+    compaction_sstable_info_t dense = sst(2, 2, 50, "c", "f");
+    dense.entry_count = 100;
+    dense.tombstone_count = 90;
+    const compaction_sstable_info_t ssts[] = {sst(1, 1, 10, "a", "z"), dense,
+                                              sst(3, 3, 2000, "a", "d"), sst(4, 3, 2000, "e", "h"),
+                                              sst(5, 3, 1000, "p", "z")};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 5, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 1);
+    const compaction_job_t *j = compaction_plan_job(plan, 0);
+    ASSERT_EQ(j->target_level, 3);
+    ASSERT_EQ(j->is_largest_level, 1);
+    ASSERT_EQ(j->n_inputs, 3);
+    int seen[6] = {0};
+    for (int i = 0; i < j->n_inputs; i++) seen[j->input_ids[i]] = 1;
+    ASSERT_TRUE(seen[2] && seen[3] && seen[4]);
+    ASSERT_TRUE(!seen[1] && !seen[5]); /* the newer tier stays above, the far L3 table untouched */
+    compaction_plan_free(plan);
+}
+
+/* every dense table that can move without sharing an input moves in the same plan. a store that
+ * deleted most of its data has a dense table in most partitions, and one per plan would take a
+ * scheduler pass per table to give the space back. a table whose move would share an input with one
+ * already planned waits for a later plan, so the jobs stay disjoint and may run at once */
+void test_plan_tombstone_density_moves_disjoint_tables_together(void)
+{
+    compaction_planner_config_t c = cfg();
+    c.tombstone_density_min_entries = 10;
+
+    compaction_sstable_info_t a = sst(2, 2, 20, "b", "c");   /* meets L3 table 5 */
+    compaction_sstable_info_t mid = sst(3, 2, 20, "d", "e"); /* meets 5 and 6, so 5 is shared */
+    compaction_sstable_info_t b = sst(4, 2, 20, "q", "r");   /* meets L3 table 7 */
+    compaction_sstable_info_t *dense[] = {&a, &mid, &b};
+    for (int i = 0; i < 3; i++)
+    {
+        dense[i]->entry_count = 100;
+        dense[i]->tombstone_count = 90;
+    }
+    const compaction_sstable_info_t ssts[] = {
+        a, mid, b, sst(5, 3, 2000, "a", "d"), sst(6, 3, 2000, "e", "h"), sst(7, 3, 1000, "p", "z")};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 6, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 2);
+    ASSERT_TRUE(plan_inputs_disjoint(plan));
+    int seen[8] = {0};
+    for (int k = 0; k < 2; k++)
+    {
+        const compaction_job_t *j = compaction_plan_job(plan, k);
+        ASSERT_EQ(j->target_level, 3);
+        ASSERT_EQ(j->n_inputs, 2);
+        for (int i = 0; i < j->n_inputs; i++) seen[j->input_ids[i]] = 1;
+    }
+    ASSERT_TRUE(seen[2] && seen[5] && seen[4] && seen[7]);
+    ASSERT_TRUE(!seen[3] && !seen[6]); /* the one sharing table 5 waits */
+    compaction_plan_free(plan);
+}
+
+/* a table dense in tombstones at the largest level plans nothing on density alone. the tombstones
+ * it still holds are ones its own merge could not drop, so rewriting it alone would write the same
+ * table and plan the same merge on every pass */
+void test_plan_tombstone_density_at_the_largest_level_waits(void)
+{
+    compaction_planner_config_t c = cfg();
+    c.tombstone_density_min_entries = 10;
+
+    compaction_sstable_info_t dense = sst(3, 3, 5000, "a", "z");
+    dense.entry_count = 100;
+    dense.tombstone_count = 90;
+    const compaction_sstable_info_t ssts[] = {sst(2, 2, 50, "a", "z"), dense};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 2, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 0);
+    compaction_plan_free(plan);
+}
+
+/* a level just added is not shed again. growth fires when the largest reaches its capacity, so the
+ * new largest starts out holding about the old capacity, and a growth merge that dropped a little
+ * garbage leaves it slightly under. that must sit well above the shedding threshold, or the next
+ * plan undoes the growth and the family pays two whole rewrites per crossing */
+void test_plan_does_not_shed_a_level_it_just_added(void)
+{
+    compaction_planner_config_t c = cfg();
+    c.min_levels = 1;
+
+    /* a two-level tree grows at C2 = 100 * T = 1000. here the new L3 holds 950 of it, a little
+     * dropped on the way down, and nothing else is due */
+    const compaction_sstable_info_t ssts[] = {sst(1, 3, 950, "a", "z")};
+    const compaction_snapshot_t snap = {.sstables = ssts, .n_sstables = 1, .num_levels = 3};
+
+    compaction_plan_t *plan = NULL;
+    ASSERT_EQ(compaction_planner_plan(&snap, &c, &plan), TDB_SUCCESS);
+    ASSERT_EQ(compaction_plan_job_count(plan), 0);
+    compaction_plan_free(plan);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -477,6 +727,15 @@ int main(int argc, char **argv)
     RUN_TEST(test_plan_does_not_shed_below_min_levels, tests_passed);
     RUN_TEST(test_planner_triggered, tests_passed);
     RUN_TEST(test_plan_tombstone_density, tests_passed);
+    RUN_TEST(test_plan_partitioned_merge_grows_a_level_when_the_largest_is_full, tests_passed);
+    RUN_TEST(test_plan_never_rewrites_a_level_into_itself, tests_passed);
+    RUN_TEST(test_plan_forced_pass_moves_the_shallowest_level_down, tests_passed);
+    RUN_TEST(test_plan_forced_pass_rewrites_a_lone_largest_level, tests_passed);
+    RUN_TEST(test_plan_partitioned_merge_moves_a_lone_file_into_an_empty_level, tests_passed);
+    RUN_TEST(test_plan_tombstone_density_moves_the_dense_table_deeper, tests_passed);
+    RUN_TEST(test_plan_tombstone_density_moves_disjoint_tables_together, tests_passed);
+    RUN_TEST(test_plan_tombstone_density_at_the_largest_level_waits, tests_passed);
+    RUN_TEST(test_plan_does_not_shed_a_level_it_just_added, tests_passed);
     RUN_TEST(test_plan_not_triggered, tests_passed);
     RUN_TEST(test_plan_grow, tests_passed);
     RUN_TEST(test_plan_grows_a_level_when_the_largest_is_full, tests_passed);

@@ -613,7 +613,7 @@ A tombstone carrying a **promise from the caller**: this key was written at most
 was last deleted. A compaction that reads the single-delete with its put directly beneath it
 drops both, at whatever level the merge writes, instead of carrying the tombstone down to
 the largest level the way a plain delete is carried. Both go only once no reader can still
-see the put, and only when no table outside the merge holds the key.
+see the put, and only when no table outside the merge holds an older version of the key.
 
 Reads are the same as after [`tidesdb_txn_delete`](#tidesdb_txn_delete): the key is gone.
 The promise only decides whether the space comes back early. A key written twice still

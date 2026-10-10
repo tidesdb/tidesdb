@@ -553,6 +553,132 @@ void test_cf_source_compaction_drops_an_interval_it_has_finished(void)
     cs_db_close(&db);
 }
 
+/* table counts the range delete is checked at, either side of the 512 a fixed view once held, and
+ * the count the family is grown to for the concurrent check */
+#define CS_MANY_TABLES_AT_VIEW   512
+#define CS_MANY_TABLES_PAST_VIEW 513
+#define CS_MANY_TABLES           700
+
+/* the catalogued size the moving table is restated at, which only the level byte totals read */
+#define CS_MOVED_TABLE_SIZE 1
+
+/* everything a range delete [j, l) at seq 2 over j, k and l at seq 1 must answer, asked of a family
+ * holding however many tables it holds now */
+static void cs_assert_range_delete_seen(cf_t *cf)
+{
+    tidesdb_source_t src;
+    cf_source(cf, &src);
+    tidesdb_source_version_t out;
+
+    /* after the delete k and the inclusive lower bound j are deleted, the exclusive upper bound l
+     * is not, and before it k is the value it was */
+    ASSERT_EQ(cs_get(cf, "k", UINT64_MAX, &out), TDB_SOURCE_FOUND);
+    ASSERT_EQ((int)out.deleted, 1);
+    free(out.value);
+    ASSERT_EQ(cs_get(cf, "j", UINT64_MAX, &out), TDB_SOURCE_FOUND);
+    ASSERT_EQ((int)out.deleted, 1);
+    free(out.value);
+    cs_assert_live(cf, "l", UINT64_MAX, "vl", 1);
+    cs_assert_live(cf, "k", 1, "old", 1);
+
+    /* a commit asking about k sees the delete as a newer write above its floor, and nothing newer
+     * once its floor is the delete itself */
+    int newer = 0;
+    ASSERT_EQ(src.has_newer(src.ctx, 0, (const uint8_t *)"k", 1, 1, UINT64_MAX, &newer),
+              TDB_SOURCE_FOUND);
+    ASSERT_EQ(newer, 1);
+    newer = 0;
+    ASSERT_TRUE(src.has_newer(src.ctx, 0, (const uint8_t *)"k", 1, 2, UINT64_MAX, &newer) !=
+                TDB_SOURCE_BUSY);
+    ASSERT_EQ(newer, 0);
+
+    /* and a range delete over the same span is asked about the whole family, never a part of it */
+    newer = 0;
+    ASSERT_EQ(src.range_has_newer(src.ctx, 0, (const uint8_t *)"j", 1, (const uint8_t *)"l", 1, 1,
+                                  UINT64_MAX, &newer),
+              TDB_SOURCE_FOUND);
+    ASSERT_EQ(newer, 1);
+    newer = 0;
+    ASSERT_EQ(src.range_has_newer(src.ctx, 0, (const uint8_t *)"j", 1, (const uint8_t *)"l", 1, 2,
+                                  UINT64_MAX, &newer),
+              TDB_SOURCE_NOT_FOUND);
+    ASSERT_EQ(newer, 0);
+}
+
+/* flush single-key tables outside the deleted range until the family holds count tables */
+static void cs_grow_tables_to(cs_db_t *db, int count, uint64_t *generation, uint64_t *seq)
+{
+    while (level_set_collect_all(db->cf->levels, NULL, 0) < count)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "u%05llu", (unsigned long long)*seq);
+        const cs_entry_t row[] = {{key, "vu", 0, *seq, 0}};
+        (void)cs_flush(db, row, 1, (*generation)++);
+        (*seq)++;
+    }
+}
+
+/* a range delete is answered for a family of any size. the interval rides in one table among
+ * hundreds that know nothing of it, and every lookup that asks what covers a key -- the point read,
+ * the commit's probe of one key, the commit's probe of a range -- has to find it there however many
+ * tables surround it. an answer drawn from part of the family would report a deleted key live */
+void test_cf_source_a_range_delete_is_seen_past_any_table_count(void)
+{
+    cs_db_t db;
+    cs_db_open(&db);
+
+    const cs_entry_t rows[] = {{"j", "vj", 0, 1, 0}, {"k", "old", 0, 1, 0}, {"l", "vl", 0, 1, 0}};
+    (void)cs_flush(&db, rows, 3, 1);
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(db.l0, 0, (const uint8_t *)"j", 1,
+                                               (const uint8_t *)"l", 1, 2),
+              TDB_SUCCESS);
+    const cs_entry_t beside[] = {{"z", "vz", 0, 2, 0}};
+    (void)cs_flush(&db, beside, 1, 2);
+    ASSERT_EQ((int)level_set_interval_tables(db.cf->levels), 1);
+
+    uint64_t generation = 3, seq = 3;
+    cs_grow_tables_to(&db, CS_MANY_TABLES_AT_VIEW, &generation, &seq);
+    cs_assert_range_delete_seen(db.cf);
+    cs_grow_tables_to(&db, CS_MANY_TABLES_PAST_VIEW, &generation, &seq);
+    cs_assert_range_delete_seen(db.cf);
+    cs_grow_tables_to(&db, CS_MANY_TABLES, &generation, &seq);
+    cs_assert_range_delete_seen(db.cf);
+    ASSERT_EQ(level_set_collect_all(db.cf->levels, NULL, 0), CS_MANY_TABLES);
+
+    /* and while the layout is replaced under the read, one unrelated table moving between levels */
+    sstable_t *table = NULL;
+    ASSERT_EQ(level_set_overlapping(db.cf->levels, 1, (const uint8_t *)"u00003", 6,
+                                    (const uint8_t *)"u00003", 6, &table, 1),
+              1);
+    cs_mover_t mover = {
+        .cf = db.cf, .table = table, .size = CS_MOVED_TABLE_SIZE, .level_a = 2, .level_b = 1};
+    atomic_init(&mover.stop, 0);
+    pthread_t thread;
+    ASSERT_EQ(pthread_create(&thread, NULL, cs_move_between_levels, &mover), 0);
+
+    int live = 0, busy = 0;
+    for (int i = 0; i < CS_MOVE_READS; i++)
+    {
+        tidesdb_source_version_t out;
+        const tidesdb_source_result_t r = cs_get(db.cf, "k", UINT64_MAX, &out);
+        if (r == TDB_SOURCE_BUSY)
+        {
+            busy++;
+            continue;
+        }
+        if (r != TDB_SOURCE_FOUND || !out.deleted) live++;
+        if (r == TDB_SOURCE_FOUND) free(out.value);
+    }
+    atomic_store_explicit(&mover.stop, 1, memory_order_release);
+    pthread_join(thread, NULL);
+    printf("  %d reads over %d tables while one moved: %d busy, %d live\n", CS_MOVE_READS,
+           CS_MANY_TABLES, busy, live);
+    ASSERT_EQ(live, 0);
+
+    if (sstable_unref(table)) sstable_close(table);
+    cs_db_close(&db);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -567,6 +693,7 @@ int main(int argc, char **argv)
              tests_passed);
     RUN_TEST(test_cf_source_compaction_carries_input_intervals, tests_passed);
     RUN_TEST(test_cf_source_compaction_drops_an_interval_it_has_finished, tests_passed);
+    RUN_TEST(test_cf_source_a_range_delete_is_seen_past_any_table_count, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

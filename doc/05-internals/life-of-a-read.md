@@ -160,6 +160,13 @@ whose key range holds the key, since the table an interval rode in on need not h
 its own. A family that has never deleted a range answers from one load of a count the level set
 republishes with each layout.
 
+The question is asked of the whole family however many tables it holds, because an answer drawn from
+part of it could miss the interval that covers the key and report a deleted key live. The walk
+reads each table's intervals in place under the layout's epoch rather than copying the tables out
+first, so there is no array to outgrow and nothing to reference. A commit checking a range delete
+asks a heavier question, one that may read a table's keys, so it does take references, into an
+array sized from the family's own count and sized again if the family grew in between.
+
 Whichever is newer wins. An interval laid after a version deletes it, and a version written after an
 interval survives it. The comparison is against the sequence, exactly as it is between two versions
 of the same key, and a covering interval resolves to an absent answer rather than a fall-through to

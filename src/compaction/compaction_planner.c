@@ -328,16 +328,20 @@ static int ce_emit_partition_jobs(compaction_plan_t *p, const compaction_snapsho
     for (int part = 0; part <= p->n_boundaries && rc == TDB_SUCCESS; part++)
     {
         int cnt = 0;
+        int above = 0;
         for (int i = 0; i < snap->n_sstables; i++)
         {
             const compaction_sstable_info_t *s = &snap->sstables[i];
             if (s->level < x || s->level > z) continue;
             if (ce_partition_of_key(p, s->min_key, s->min_key_size) != part) continue;
             ids[cnt++] = s->id;
+            if (s->level < z) above++;
         }
-        /* a partition holding one file has nothing to merge with, and rewriting it alone would be
-         * work for no consolidation */
-        if (cnt < 2) continue;
+        /* a partition with nothing above the target has nothing to move, and rewriting what is
+         * already there would be work for no consolidation. one file above it is still a move the
+         * merge exists to make -- into an empty level that is every partition, and skipping them
+         * plans nothing while the dividing level stays over its capacity for good */
+        if (above == 0) continue;
 
         uint64_t *kept = ce_plan_keep_ids(p, ids, cnt);
         if (!kept)
@@ -406,7 +410,10 @@ static int ce_emit_partitioned(compaction_plan_t *p, const compaction_snapshot_t
 }
 
 /* the target level of a partitioned merge: the smallest level in X+1..L that can hold the
- * cumulative data across X..z, else the largest level */
+ * cumulative data across X..z. when not even the largest can, the merge lands in a new level below
+ * it, which is how a tree of three or more levels deepens -- landing in the largest regardless
+ * would leave it over its capacity for good, and every later dividing merge would rewrite the
+ * whole of it */
 static int ce_partitioned_target(const compaction_state_t *st, int x, const uint64_t *caps)
 {
     uint64_t cumulative = st->size[x - 1];
@@ -415,13 +422,18 @@ static int ce_partitioned_target(const compaction_state_t *st, int x, const uint
         cumulative += st->size[z - 1];
         if (caps[z - 1] >= cumulative) return z;
     }
-    return st->num_levels;
+    return st->num_levels < LEVEL_SET_MAX_LEVELS ? st->num_levels + 1 : st->num_levels;
 }
 
-/* whether the tree should shed a level: its largest has shrunk to less than a size ratio's worth of
- * its own capacity, so the data now belongs one level up. the gap between this and the growth
- * condition -- growth at the capacity, shrink at a T-th of it -- is the hysteresis that stops a
- * tree oscillating between depths as it crosses a boundary.
+/* whether the tree should shed a level: its largest holds less than a size ratio's worth of the
+ * capacity the level above would have as the largest, so the data now belongs one level up and
+ * would sit there a whole size ratio below the point that grows it again.
+ *
+ * the gap is the hysteresis that stops a tree oscillating between depths. a level is added when the
+ * largest reaches its capacity C_L, so the new largest starts out holding about C_L, which is
+ * C_(L+1) / T. shedding at a T-th of the new largest's own capacity would therefore shed at the
+ * very size the level was added at, and a growth merge that dropped any garbage at all would be
+ * undone by the next plan, two whole rewrites for nothing.
  *
  * without it a tree that grew under load and then had most of its data deleted stays as deep as it
  * ever was, so every read keeps paying for levels that hold almost nothing
@@ -440,8 +452,8 @@ static int ce_shrink_due(const compaction_state_t *st, const compaction_planner_
     int floor_levels = cfg->min_levels > CE_MIN_TREE_LEVELS ? cfg->min_levels : CE_MIN_TREE_LEVELS;
     if (st->num_levels <= floor_levels) return 0;
 
-    const uint64_t cap = caps[st->num_levels - 1];
-    return cap > 0 && st->size[st->num_levels - 1] < cap / cfg->size_ratio;
+    const uint64_t threshold = caps[st->num_levels - 1] / cfg->size_ratio / cfg->size_ratio;
+    return threshold > 0 && st->size[st->num_levels - 1] < threshold;
 }
 
 /* merge the largest level and the one above it into a single run one level up, which removes the
@@ -478,18 +490,225 @@ static int ce_emit_shrink(compaction_plan_t *p, const compaction_snapshot_t *sna
     return ce_plan_add(p, &job);
 }
 
-/* whether any sstable is dense enough in tombstones to be worth rewriting on its own */
-static int ce_density_due(const compaction_snapshot_t *snap, const compaction_planner_config_t *cfg)
+/* the fraction of an sstable's entries that are tombstones, or zero when it is too small to judge
+ */
+static double ce_density(const compaction_sstable_info_t *s, const compaction_planner_config_t *cfg)
 {
-    if (cfg->tombstone_density_trigger <= 0.0) return 0;
+    if (cfg->tombstone_density_trigger <= 0.0) return 0.0;
+    if (s->entry_count < cfg->tombstone_density_min_entries || s->entry_count == 0) return 0.0;
+    const double density = (double)s->tombstone_count / (double)s->entry_count;
+    return density >= cfg->tombstone_density_trigger ? density : 0.0;
+}
+
+/* whether a file in the flush tier is dense enough in tombstones to be worth merging. any merge
+ * the tier is part of moves it below, so the ordinary plan serves */
+static int ce_tier_density_due(const compaction_snapshot_t *snap,
+                               const compaction_planner_config_t *cfg)
+{
+    for (int i = 0; i < snap->n_sstables; i++)
+        if (snap->sstables[i].level == CE_FLUSH_TIER_LEVEL &&
+            ce_density(&snap->sstables[i], cfg) > 0)
+            return 1;
+    return 0;
+}
+
+/* whether a table sits between the flush tier and the largest level dense enough in tombstones to
+ * move down. a table at the largest level is left out, since a tombstone it still holds is one its
+ * own merge could not drop -- a reader below the floor or a sibling reaching into its key -- and
+ * rewriting it alone would keep the same tombstones and be planned again on the next pass. the next
+ * merge into the largest level rewrites it anyway */
+static int ce_mid_table_dense(const compaction_snapshot_t *snap, int i,
+                              const compaction_planner_config_t *cfg)
+{
+    const compaction_sstable_info_t *s = &snap->sstables[i];
+    return s->level > CE_FLUSH_TIER_LEVEL && s->level < snap->num_levels && ce_density(s, cfg) > 0;
+}
+
+/* whether any table is dense enough to move down */
+static int ce_any_mid_table_dense(const compaction_snapshot_t *snap,
+                                  const compaction_planner_config_t *cfg)
+{
+    for (int i = 0; i < snap->n_sstables; i++)
+        if (ce_mid_table_dense(snap, i, cfg)) return 1;
+    return 0;
+}
+
+/* whether two key ranges meet. a table that records no bounds holds only an interval and is taken
+ * to meet everything, so a merge built from this includes it rather than leaving it behind */
+static int ce_ranges_meet(const compaction_sstable_info_t *a, const compaction_sstable_info_t *b)
+{
+    if (!a->min_key || !a->max_key || !b->min_key || !b->max_key) return 1;
+    return tdb_key_cmp(a->min_key, a->min_key_size, b->max_key, b->max_key_size) <= 0 &&
+           tdb_key_cmp(b->min_key, b->min_key_size, a->max_key, a->max_key_size) <= 0;
+}
+
+/* gather a dense table and every table one level down that its range meets into ids, returning the
+ * count, or 0 when any of them is already an input of a job in this plan. taken marks the tables
+ * earlier jobs claimed, so the jobs a plan emits share no input and may run at once */
+static int ce_density_inputs(const compaction_snapshot_t *snap, int dense, const uint8_t *taken,
+                             uint64_t *ids)
+{
+    const compaction_sstable_info_t *d = &snap->sstables[dense];
+    if (taken[dense]) return 0;
+    int cnt = 0;
+    ids[cnt++] = d->id;
     for (int i = 0; i < snap->n_sstables; i++)
     {
-        const compaction_sstable_info_t *s = &snap->sstables[i];
-        if (s->entry_count < cfg->tombstone_density_min_entries || s->entry_count == 0) continue;
-        if ((double)s->tombstone_count / (double)s->entry_count >= cfg->tombstone_density_trigger)
-            return 1;
+        if (snap->sstables[i].level != d->level + 1 || !ce_ranges_meet(d, &snap->sstables[i]))
+            continue;
+        if (taken[i]) return 0;
+        ids[cnt++] = snap->sstables[i].id;
     }
+    return cnt;
+}
+
+/* mark every table a job just claimed, so no later job in the plan takes it as well */
+static void ce_density_take(const compaction_snapshot_t *snap, const uint64_t *ids, int cnt,
+                            uint8_t *taken)
+{
+    for (int i = 0; i < snap->n_sstables; i++)
+        for (int k = 0; k < cnt; k++)
+            if (snap->sstables[i].id == ids[k]) taken[i] = 1;
+}
+
+/* merge one table dense in tombstones one level down, together with every table there its range
+ * meets. a tombstone drops only at the largest level, so writing the table back into its own level
+ * would keep each one, leave the table exactly as dense, and plan the same merge on every pass.
+ * moving it down is progress each time, and the tombstones drop once it reaches the largest level.
+ *
+ * the level below is a non-overlapping run, and every table there that meets the moving table's
+ * range is taken, so the outputs replace exactly the span they cover and the run stays
+ * non-overlapping. the tables left at the dense table's level do not meet its range, and everything
+ * shallower is newer, so deeper stays older for every key */
+static int ce_emit_density_job(compaction_plan_t *p, const compaction_snapshot_t *snap, int target,
+                               const uint64_t *ids, int cnt, int x, uint64_t file_max)
+{
+    uint64_t *kept = ce_plan_keep_ids(p, ids, cnt);
+    if (!kept) return TDB_ERR_MEMORY;
+
+    compaction_job_t job = {0};
+    job.input_ids = kept;
+    job.n_inputs = cnt;
+    job.target_level = target;
+    job.is_largest_level = target >= snap->num_levels;
+    job.split = target >= x ? COMPACTION_SPLIT_BOUNDARIES : COMPACTION_SPLIT_NONE;
+    job.file_max = file_max;
+    if (job.split == COMPACTION_SPLIT_BOUNDARIES)
+    {
+        job.boundaries = p->boundary_keys;
+        job.boundary_sizes = p->boundary_sizes;
+        job.n_boundaries = p->n_boundaries;
+    }
+    return ce_plan_add(p, &job);
+}
+
+/* move every dense table down that can move without sharing an input, one job each. a store that
+ * deleted most of its data has a dense table in most partitions, and moving them one plan at a time
+ * would take a scheduler pass per table to give back what the deletes freed. tables are taken
+ * shallowest first, so a dense table whose level below is itself moving waits for the next plan
+ * rather than racing it */
+static int ce_emit_density(compaction_plan_t *p, const compaction_snapshot_t *snap,
+                           const compaction_planner_config_t *cfg, int x, uint64_t file_max)
+{
+    uint64_t *ids = malloc((size_t)snap->n_sstables * sizeof(*ids));
+    uint8_t *taken = calloc((size_t)snap->n_sstables, sizeof(*taken));
+    if (!ids || !taken)
+    {
+        free(ids);
+        free(taken);
+        return TDB_ERR_MEMORY;
+    }
+
+    int rc = TDB_SUCCESS;
+    for (int level = CE_FLUSH_TIER_LEVEL + 1; level < snap->num_levels && rc == TDB_SUCCESS;
+         level++)
+        for (int i = 0; i < snap->n_sstables && rc == TDB_SUCCESS; i++)
+        {
+            if (snap->sstables[i].level != level) continue;
+            if (!ce_mid_table_dense(snap, i, cfg)) continue;
+            const int cnt = ce_density_inputs(snap, i, taken, ids);
+            if (cnt == 0) continue;
+            ce_density_take(snap, ids, cnt, taken);
+            rc = ce_emit_density_job(p, snap, level + 1, ids, cnt, x, file_max);
+        }
+
+    free(ids);
+    free(taken);
+    return rc;
+}
+
+/* whether a merge of every level down to target would carry anything into it from above */
+static int ce_moves_into(const compaction_snapshot_t *snap, int target)
+{
+    for (int i = 0; i < snap->n_sstables; i++)
+        if (snap->sstables[i].level >= CE_FLUSH_TIER_LEVEL && snap->sstables[i].level < target)
+            return 1;
     return 0;
+}
+
+/* the merge to plan when the ordinary one would move nothing. a merge with nothing above its target
+ * reads that level and writes it straight back -- the same data in the same place, and planned
+ * again on the next pass if a trigger made it due, since nothing it did changes what the trigger
+ * sees. so the shallowest level holding anything moves down instead, into the smallest level below
+ * that can hold it, which is the dividing merge's choice made from that level.
+ *
+ * when the largest level is the only one holding anything there is nowhere below to move to. it
+ * grows into a new level if it is over its capacity, and a forced pass rewrites it in place, which
+ * is what collects the versions and tombstones below the floor -- a caller asked for that pass, so
+ * it is not repeated unless asked again */
+static int ce_plan_descent(compaction_plan_t *p, const compaction_snapshot_t *snap,
+                           const compaction_planner_config_t *cfg, const compaction_state_t *st,
+                           const uint64_t *caps, uint64_t file_max)
+{
+    const int largest = st->num_levels;
+    int shallowest = 0;
+    for (int lv = CE_FLUSH_TIER_LEVEL; lv <= largest && shallowest == 0; lv++)
+        if (st->file_count[lv - 1] > 0) shallowest = lv;
+    if (shallowest == 0) return TDB_SUCCESS;
+
+    if (shallowest < largest)
+        return ce_emit_partitioned(p, snap, shallowest, ce_partitioned_target(st, shallowest, caps),
+                                   file_max);
+    if (largest < LEVEL_SET_MAX_LEVELS && caps[largest - 1] > 0 &&
+        st->size[largest - 1] >= caps[largest - 1])
+        return ce_emit_partitioned(p, snap, largest, largest + 1, file_max);
+    if (cfg->force) return ce_emit_simple(p, snap, largest, COMPACTION_SPLIT_BOUNDARIES, file_max);
+    return TDB_SUCCESS;
+}
+
+/* plan the merge a trigger made due -- the tier into a new level for a single-level tree, a
+ * partitioned merge when the dividing level is full, else a merge of the small levels into the
+ * smallest that holds them */
+static int ce_plan_due(compaction_plan_t *p, const compaction_snapshot_t *snap,
+                       const compaction_planner_config_t *cfg, const compaction_state_t *st,
+                       const uint64_t *caps, uint64_t file_max)
+{
+    int rc = ce_plan_boundaries(p, snap, st->num_levels);
+    if (rc != TDB_SUCCESS) return rc;
+
+    /* a single-level tree grows: consolidate the L1 tier into one run at the new L2 */
+    if (st->num_levels < CE_MIN_TREE_LEVELS)
+        return ce_emit_simple(p, snap, st->num_levels + 1, COMPACTION_SPLIT_NONE, file_max);
+
+    const int x = compaction_planner_dividing_level(st, cfg);
+    if (x >= 1 && caps[x - 1] > 0 && st->size[x - 1] >= caps[x - 1])
+        return ce_emit_partitioned(p, snap, x, ce_partitioned_target(st, x, caps), file_max);
+
+    int target = compaction_planner_target_level(st, cfg, caps);
+    /* the tree evolves with the data it holds. when the merge would land in the largest level and
+     * that level is already at its capacity, it lands one level deeper instead, which is Spooky
+     * adding a level -- the step that keeps the level count at about log_T(N/B) and that dynamic
+     * capacity adaptation exists to bound the space cost of. without it a family stops deepening,
+     * the dividing level collapses onto the flush tier, and the tier grows a run per flush with
+     * nowhere to drain to. this is the two-level case, where the target can be the largest level;
+     * a deeper tree grows through the partitioned merge's target instead */
+    if (target == st->num_levels && st->num_levels < LEVEL_SET_MAX_LEVELS &&
+        caps[st->num_levels - 1] > 0 && st->size[st->num_levels - 1] >= caps[st->num_levels - 1])
+        target = st->num_levels + 1;
+    if (!ce_moves_into(snap, target)) return ce_plan_descent(p, snap, cfg, st, caps, file_max);
+    return ce_emit_simple(p, snap, target,
+                          target == x ? COMPACTION_SPLIT_BOUNDARIES : COMPACTION_SPLIT_NONE,
+                          file_max);
 }
 
 int compaction_planner_plan(const compaction_snapshot_t *snap,
@@ -525,40 +744,20 @@ int compaction_planner_plan(const compaction_snapshot_t *snap,
         return TDB_SUCCESS;
     }
 
-    if (cfg->force || compaction_planner_triggered(&st, cfg, caps) || ce_density_due(snap, cfg))
+    if (cfg->force || compaction_planner_triggered(&st, cfg, caps) ||
+        ce_tier_density_due(snap, cfg))
     {
-        rc = ce_plan_boundaries(p, snap, st.num_levels);
-
-        if (rc == TDB_SUCCESS && st.num_levels < CE_MIN_TREE_LEVELS)
+        rc = ce_plan_due(p, snap, cfg, &st, caps, file_max);
+    }
+    else
+    {
+        /* density alone, below the flush tier, moves each dense table one level down */
+        if (ce_any_mid_table_dense(snap, cfg))
         {
-            /* a single-level tree grows: consolidate the L1 tier into one run at the new L2 */
-            rc = ce_emit_simple(p, snap, st.num_levels + 1, COMPACTION_SPLIT_NONE, file_max);
-        }
-        else if (rc == TDB_SUCCESS)
-        {
-            const int x = compaction_planner_dividing_level(&st, cfg);
-            if (x >= 1 && caps[x - 1] > 0 && st.size[x - 1] >= caps[x - 1])
-            {
-                const int z = ce_partitioned_target(&st, x, caps);
-                rc = ce_emit_partitioned(p, snap, x, z, file_max);
-            }
-            else
-            {
-                int target = compaction_planner_target_level(&st, cfg, caps);
-                /* the tree evolves with the data it holds. when the merge would land in the largest
-                 * level and that level is already at its capacity, it lands one level deeper
-                 * instead, which is Spooky adding a level -- the step that keeps the level count at
-                 * about log_T(N/B) and that dynamic capacity adaptation exists to bound the space
-                 * cost of. without it a family stops deepening, the dividing level collapses onto
-                 * the flush tier, and the tier grows a run per flush with nowhere to drain to */
-                if (target == st.num_levels && st.num_levels < LEVEL_SET_MAX_LEVELS &&
-                    caps[st.num_levels - 1] > 0 &&
-                    st.size[st.num_levels - 1] >= caps[st.num_levels - 1])
-                    target = st.num_levels + 1;
-                rc = ce_emit_simple(
-                    p, snap, target,
-                    target == x ? COMPACTION_SPLIT_BOUNDARIES : COMPACTION_SPLIT_NONE, file_max);
-            }
+            rc = ce_plan_boundaries(p, snap, st.num_levels);
+            if (rc == TDB_SUCCESS)
+                rc = ce_emit_density(p, snap, cfg, compaction_planner_dividing_level(&st, cfg),
+                                     file_max);
         }
     }
 

@@ -164,6 +164,21 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
                 size_t *value_size);
 
 /**
+ * tdb_txn_get_ttl
+ * read a key's expiry with the same visibility and conflict tracking as tdb_txn_get
+ * @param txn the transaction
+ * @param cf_index the target column family's prefix index
+ * @param key the key bytes
+ * @param key_size length of key, greater than zero
+ * @param sources the caller's newest-first external source stack
+ * @param num_sources number of external sources
+ * @param ttl out, receives the absolute expiry or -1 for none; unchanged on error
+ * @return the same codes as tdb_txn_get; missing, deleted, or expired keys are not found
+ */
+int tdb_txn_get_ttl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                    const tidesdb_source_t* sources, int num_sources, int64_t* ttl);
+
+/**
  * tdb_txn_get_notrack
  * like tdb_txn_get but does not record the read into the conflict footprint; for uniqueness probes
  * that must not add read-write antidependencies

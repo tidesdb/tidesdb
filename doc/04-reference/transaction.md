@@ -484,6 +484,31 @@ else if (rc != TDB_ERR_NOT_FOUND)
 [`tidesdb_txn_get_notrack`](#tidesdb_txn_get_notrack),
 [`tidesdb_txn_contains`](#tidesdb_txn_contains)
 
+## tidesdb_txn_get_ttl
+
+Read the expiry of the key version visible to the transaction.
+
+### Synopsis
+
+```c
+int tidesdb_txn_get_ttl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
+                        const uint8_t *key, size_t key_size, time_t *ttl);
+```
+
+### Description
+
+Writes the absolute expiry in Unix seconds to `ttl`, or `-1` when the key has no
+expiration. This is the stored deadline, unlike the lifetime in seconds accepted by
+[`tidesdb_txn_put`](#tidesdb_txn_put). The lookup sees pending writes and follows the
+same snapshot and read tracking as [`tidesdb_txn_get`](#tidesdb_txn_get).
+
+### Errors
+
+Missing, deleted and expired keys return `TDB_ERR_NOT_FOUND`, including expired pending
+writes. A `NULL` argument or zero-length key returns `TDB_ERR_INVALID_ARGS`. A deadline
+that cannot be represented by `time_t` returns `TDB_ERR_TOO_LARGE`. Transaction and source
+errors are the same as for `tidesdb_txn_get`. The output is unchanged on every error.
+
 ## tidesdb_txn_get_notrack
 
 Read a key without recording it for conflict detection.

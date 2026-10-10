@@ -8,6 +8,7 @@
  */
 #include <time.h>
 
+#include "../src/engine/engine.h"
 #include "db.h"
 #include "test_utils.h"
 
@@ -37,26 +38,28 @@ static int tests_failed = 0;
 /* how long to let the engine's once-a-second clock catch up to a deadline the test's own
  * clock has passed; generous because it only bounds a failure, never a success */
 #define TTL_ABSENT_MAX_POLLS 200
+/* retry slow setup with a longer lifetime, leaving time to assert the entry is initially live */
+#define TTL_SETUP_ATTEMPTS 3
 /* keys written alongside the expiring one, enough that a merge has real work and the family does
  * not consist of a single entry */
 #define TTL_FILLER_KEYS 64
 
-static tidesdb_t *ttl_open(char *db_path)
+static tidesdb_t* ttl_open(char* db_path)
 {
     tidesdb_config_t cfg = tidesdb_default_config();
     cfg.db_path = db_path;
-    tidesdb_t *db = NULL;
+    tidesdb_t* db = NULL;
     ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
     ASSERT_TRUE(db != NULL);
     return db;
 }
 
-static void ttl_put(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key, time_t ttl)
+static void ttl_put(tidesdb_t* db, tidesdb_column_family_t* cf, const char* key, time_t ttl)
 {
-    tidesdb_txn_t *txn = NULL;
+    tidesdb_txn_t* txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
     ASSERT_EQ(
-        tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key), (const uint8_t *)"v", 1, ttl),
+        tidesdb_txn_put(txn, cf, (const uint8_t*)key, strlen(key), (const uint8_t*)"v", 1, ttl),
         TDB_SUCCESS);
     ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
     tidesdb_txn_free(txn);
@@ -79,13 +82,13 @@ static time_t ttl_wait_for_tick(void)
 }
 
 /* read a key in its own transaction and report the engine's result code */
-static int ttl_get(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
+static int ttl_get(tidesdb_t* db, tidesdb_column_family_t* cf, const char* key)
 {
-    tidesdb_txn_t *txn = NULL;
+    tidesdb_txn_t* txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
-    uint8_t *value = NULL;
+    uint8_t* value = NULL;
     size_t value_size = 0;
-    const int rc = tidesdb_txn_get(txn, cf, (const uint8_t *)key, strlen(key), &value, &value_size);
+    const int rc = tidesdb_txn_get(txn, cf, (const uint8_t*)key, strlen(key), &value, &value_size);
     free(value);
     (void)tidesdb_txn_rollback(txn);
     tidesdb_txn_free(txn);
@@ -102,7 +105,7 @@ static int ttl_get(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
  * @param key the key expected to lapse
  * @return the engine's result once the key reads as absent, or its last result at the timeout
  */
-static int ttl_wait_until_absent(tidesdb_t *db, tidesdb_column_family_t *cf, const char *key)
+static int ttl_wait_until_absent(tidesdb_t* db, tidesdb_column_family_t* cf, const char* key)
 {
     int rc = TDB_SUCCESS;
     for (int i = 0; i < TTL_ABSENT_MAX_POLLS && rc == TDB_SUCCESS; i++)
@@ -115,7 +118,7 @@ static int ttl_wait_until_absent(tidesdb_t *db, tidesdb_column_family_t *cf, con
 }
 
 /* assert the three keys read as expected, so each stage checks the same thing */
-static void ttl_expect(tidesdb_t *db, tidesdb_column_family_t *cf, int soon_rc)
+static void ttl_expect(tidesdb_t* db, tidesdb_column_family_t* cf, int soon_rc)
 {
     ASSERT_EQ(ttl_get(db, cf, "soon"), soon_rc);
     ASSERT_EQ(ttl_get(db, cf, "later"), TDB_SUCCESS);
@@ -129,11 +132,11 @@ void test_ttl_expires_across_memtable_flush_and_reopen(void)
 {
     (void)remove_directory(TTL_DB_DIR);
     char db_path[] = TTL_DB_DIR;
-    tidesdb_t *db = ttl_open(db_path);
+    tidesdb_t* db = ttl_open(db_path);
 
     tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
     ASSERT_EQ(tidesdb_create_column_family(db, TTL_CF, &cc), TDB_SUCCESS);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, TTL_CF);
+    tidesdb_column_family_t* cf = tidesdb_get_column_family(db, TTL_CF);
     ASSERT_TRUE(cf != NULL);
 
     /* the deadline is computed from the lifetime at put time, so note when that was in order to
@@ -179,11 +182,11 @@ void test_ttl_expires_after_reaching_an_sstable(void)
 {
     (void)remove_directory(TTL_DB_DIR);
     char db_path[] = TTL_DB_DIR;
-    tidesdb_t *db = ttl_open(db_path);
+    tidesdb_t* db = ttl_open(db_path);
 
     tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
     ASSERT_EQ(tidesdb_create_column_family(db, TTL_CF, &cc), TDB_SUCCESS);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, TTL_CF);
+    tidesdb_column_family_t* cf = tidesdb_get_column_family(db, TTL_CF);
     ASSERT_TRUE(cf != NULL);
 
     const time_t written_at = ttl_wait_for_tick();
@@ -216,7 +219,7 @@ void test_ttl_expires_after_reaching_an_sstable(void)
 
 /* read the family's live key total, which is what says whether a lapsed entry was physically
  * collected rather than merely hidden from a reader */
-static uint64_t ttl_total_keys(tidesdb_column_family_t *cf)
+static uint64_t ttl_total_keys(tidesdb_column_family_t* cf)
 {
     tidesdb_cf_stats_t st;
     ASSERT_EQ(tidesdb_get_cf_stats(cf, &st), TDB_SUCCESS);
@@ -230,11 +233,11 @@ void test_ttl_expired_entry_is_collected_by_compaction(void)
 {
     (void)remove_directory(TTL_DB_DIR);
     char db_path[] = TTL_DB_DIR;
-    tidesdb_t *db = ttl_open(db_path);
+    tidesdb_t* db = ttl_open(db_path);
 
     tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
     ASSERT_EQ(tidesdb_create_column_family(db, TTL_CF, &cc), TDB_SUCCESS);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, TTL_CF);
+    tidesdb_column_family_t* cf = tidesdb_get_column_family(db, TTL_CF);
     ASSERT_TRUE(cf != NULL);
 
     const time_t written_at = ttl_wait_for_tick();
@@ -273,12 +276,515 @@ void test_ttl_expired_entry_is_collected_by_compaction(void)
     (void)remove_directory(TTL_DB_DIR);
 }
 
-int main(int argc, char **argv)
+static tidesdb_t* ttl_getter_fresh(char* db_path, tidesdb_column_family_t** cf)
+{
+    (void)remove_directory(db_path);
+    tidesdb_config_t cfg = tidesdb_default_config();
+    cfg.db_path = db_path;
+    cfg.value_separation_threshold = 64;
+    cfg.txn_timeout_seconds = 0;
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, TTL_CF, &cc), TDB_SUCCESS);
+    *cf = tidesdb_get_column_family(db, TTL_CF);
+    ASSERT_TRUE(*cf != NULL);
+    return db;
+}
+
+static void ttl_assert_deadline(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const char* key,
+                                int expected_rc, time_t expected)
+{
+    time_t actual = 123;
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)key, strlen(key), &actual), expected_rc);
+    ASSERT_EQ(actual, expected_rc == TDB_SUCCESS ? expected : (time_t)123);
+}
+
+/* wait for real expiry: mingw x86 memtables read time(NULL), bypassing the cached clock */
+static void ttl_wait_for_expired_deadline(tidesdb_txn_t* txn, tidesdb_column_family_t* cf,
+                                          const char* key, time_t deadline)
+{
+    int rc = TDB_SUCCESS;
+    time_t actual = 123;
+    const time_t now = time(NULL);
+    const int64_t remaining = deadline > now ? (int64_t)(deadline - now) : 0;
+    const int64_t max_polls = TTL_ABSENT_MAX_POLLS + remaining * (1000000 / TTL_POLL_US);
+    for (int64_t i = 0; i < max_polls; i++)
+    {
+        actual = 123;
+        rc = tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)key, strlen(key), &actual);
+        if (rc != TDB_SUCCESS) break;
+        ASSERT_EQ(actual, deadline);
+        usleep(TTL_POLL_US);
+    }
+    ASSERT_EQ(rc, TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(actual, (time_t)123);
+    ASSERT_TRUE(time(NULL) >= deadline);
+}
+
+/* capture the stored deadline, and check that a duration became an absolute timestamp */
+static time_t ttl_buffer_deadline(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const char* key,
+                                  const uint8_t* value, size_t value_size, time_t seconds)
+{
+    const time_t before = time(NULL);
+    ASSERT_EQ(
+        tidesdb_txn_put(txn, cf, (const uint8_t*)key, strlen(key), value, value_size, seconds),
+        TDB_SUCCESS);
+    const time_t after = time(NULL);
+    time_t deadline = 123;
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)key, strlen(key), &deadline),
+              TDB_SUCCESS);
+    if (seconds > 0)
+    {
+        ASSERT_TRUE(deadline >= before + seconds);
+        ASSERT_TRUE(deadline <= after + seconds);
+    }
+    else
+        ASSERT_EQ(deadline, (time_t)-1);
+    return deadline;
+}
+
+static time_t ttl_commit_deadline(tidesdb_t* db, tidesdb_column_family_t* cf, const char* key,
+                                  time_t seconds)
+{
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    const time_t deadline = ttl_buffer_deadline(txn, cf, key, (const uint8_t*)"v", 1, seconds);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+    return deadline;
+}
+
+void test_txn_get_ttl_pending_and_errors(void)
+{
+    char path[] = TTL_DB_DIR;
+    tidesdb_column_family_t* cf = NULL;
+    tidesdb_t* db = ttl_getter_fresh(path, &cf);
+    ttl_put(db, cf, "range_old", TTL_FOREVER);
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    time_t out = 123;
+    ASSERT_EQ(tidesdb_txn_get_ttl(NULL, cf, (const uint8_t*)"key", 3, &out), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, NULL, (const uint8_t*)"key", 3, &out), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, NULL, 3, &out), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)"key", 0, &out), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)"key", 3, NULL), TDB_ERR_INVALID_ARGS);
+    ttl_assert_deadline(txn, cf, "missing", TDB_ERR_NOT_FOUND, 0);
+
+    const uint8_t value[] = "value";
+    time_t deadline = ttl_buffer_deadline(txn, cf, "key", value, sizeof(value), TTL_LONG_SECS);
+    ttl_assert_deadline(txn, cf, "key", TDB_SUCCESS, deadline);
+    (void)ttl_buffer_deadline(txn, cf, "key", value, sizeof(value), 0);
+    (void)ttl_buffer_deadline(txn, cf, "key", value, sizeof(value), -42);
+    deadline = ttl_buffer_deadline(txn, cf, "key", NULL, 0, TTL_LONG_SECS);
+
+    /* the oldest buffered key must remain findable after the write set grows */
+    for (int i = 0; i < 128; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "other%03d", i);
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (const uint8_t*)key, strlen(key), value, sizeof(value), 0),
+            TDB_SUCCESS);
+    }
+    ttl_assert_deadline(txn, cf, "key", TDB_SUCCESS, deadline);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (const uint8_t*)"key", 3), TDB_SUCCESS);
+    ttl_assert_deadline(txn, cf, "key", TDB_ERR_NOT_FOUND, 0);
+
+    (void)ttl_buffer_deadline(txn, cf, "range_new", value, sizeof(value), TTL_LONG_SECS);
+    ASSERT_EQ(
+        tidesdb_txn_delete_range(txn, cf, (const uint8_t*)"range_", 6, (const uint8_t*)"range`", 6),
+        TDB_SUCCESS);
+    ttl_assert_deadline(txn, cf, "range_old", TDB_ERR_NOT_FOUND, 0);
+    ttl_assert_deadline(txn, cf, "range_new", TDB_ERR_NOT_FOUND, 0);
+    deadline = ttl_buffer_deadline(txn, cf, "range_new", value, sizeof(value), TTL_LONG_SECS);
+    ttl_assert_deadline(txn, cf, "range_new", TDB_SUCCESS, deadline);
+
+    ASSERT_EQ(tidesdb_txn_rollback(txn), TDB_SUCCESS);
+    ttl_assert_deadline(txn, cf, "key", TDB_ERR_INVALID_ARGS, 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(threadmanager_stop(db->threads, "txn_clock"), 0);
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_set_timeout(txn, 1), TDB_SUCCESS);
+    atomic_fetch_add(&db->now_seconds, 2);
+    ttl_assert_deadline(txn, cf, "range_old", TDB_ERR_TXN_EXPIRED, 0);
+    tidesdb_txn_free(txn);
+    atomic_store(&db->now_seconds, (int64_t)time(NULL));
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(path);
+}
+
+void test_txn_get_ttl_commit_flush_and_reopen(void)
+{
+    char path[] = TTL_DB_DIR;
+    tidesdb_column_family_t* cf = NULL;
+    tidesdb_t* db = ttl_getter_fresh(path, &cf);
+    const char* keys[] = {"inline", "large", "forever", "negative", "empty"};
+    const time_t durations[] = {TTL_LONG_SECS, TTL_LONG_SECS + 10, 0, -42, TTL_LONG_SECS + 20};
+    const size_t sizes[] = {8, 4096, 8, 8, 0};
+    time_t deadlines[5];
+    uint8_t value[4096];
+    memset(value, 'v', sizeof(value));
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    for (int i = 0; i < 5; i++)
+        deadlines[i] = ttl_buffer_deadline(txn, cf, keys[i], value, sizes[i], durations[i]);
+    (void)ttl_buffer_deadline(txn, cf, "deleted", value, 8, TTL_LONG_SECS);
+    (void)ttl_buffer_deadline(txn, cf, "ranged", value, 8, TTL_LONG_SECS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    ttl_assert_deadline(txn, cf, "inline", TDB_ERR_INVALID_ARGS, 0);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (const uint8_t*)"deleted", 7), TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_txn_delete_range(txn, cf, (const uint8_t*)"range", 5, (const uint8_t*)"rangf", 5),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    for (int stage = 0; stage < 3; stage++)
+    {
+        if (stage == 1) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+        if (stage == 2)
+        {
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+            db = ttl_open(path);
+            cf = tidesdb_get_column_family(db, TTL_CF);
+            ASSERT_TRUE(cf != NULL);
+        }
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        for (int i = 0; i < 5; i++)
+        {
+            ttl_assert_deadline(txn, cf, keys[i], TDB_SUCCESS, deadlines[i]);
+            uint8_t* actual = NULL;
+            size_t size = 0;
+            ASSERT_EQ(
+                tidesdb_txn_get(txn, cf, (const uint8_t*)keys[i], strlen(keys[i]), &actual, &size),
+                TDB_SUCCESS);
+            ASSERT_EQ(size, sizes[i]);
+            if (size) ASSERT_EQ(memcmp(actual, value, size), 0);
+            free(actual);
+        }
+        ttl_assert_deadline(txn, cf, "deleted", TDB_ERR_NOT_FOUND, 0);
+        ttl_assert_deadline(txn, cf, "ranged", TDB_ERR_NOT_FOUND, 0);
+        ttl_assert_deadline(txn, cf, "missing", TDB_ERR_NOT_FOUND, 0);
+        tidesdb_txn_free(txn);
+    }
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(path);
+}
+
+void test_txn_get_ttl_snapshot_and_read_committed(void)
+{
+    char path[] = TTL_DB_DIR;
+    tidesdb_column_family_t* cf = NULL;
+    tidesdb_t* db = ttl_getter_fresh(path, &cf);
+    const time_t first = ttl_commit_deadline(db, cf, "key", TTL_LONG_SECS);
+    tidesdb_txn_t *snapshot = NULL, *read_committed = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &snapshot), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &read_committed),
+              TDB_SUCCESS);
+    ttl_assert_deadline(snapshot, cf, "key", TDB_SUCCESS, first);
+    ttl_assert_deadline(read_committed, cf, "key", TDB_SUCCESS, first);
+    const time_t second = ttl_commit_deadline(db, cf, "key", 2 * TTL_LONG_SECS);
+    ASSERT_TRUE(second > first);
+    for (int stage = 0; stage < 2; stage++)
+    {
+        if (stage) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+        ttl_assert_deadline(snapshot, cf, "key", TDB_SUCCESS, first);
+        ttl_assert_deadline(read_committed, cf, "key", TDB_SUCCESS, second);
+    }
+    tidesdb_txn_free(snapshot);
+    tidesdb_txn_free(read_committed);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(path);
+}
+
+void test_txn_get_ttl_reads_participate_in_conflicts(void)
+{
+    const tidesdb_isolation_level_t levels[] = {TDB_ISOLATION_REPEATABLE_READ,
+                                                TDB_ISOLATION_SERIALIZABLE};
+    for (int level = 0; level < 2; level++)
+    {
+        for (int present = 0; present < 2; present++)
+        {
+            char path[] = TTL_DB_DIR;
+            tidesdb_column_family_t* cf = NULL;
+            tidesdb_t* db = ttl_getter_fresh(path, &cf);
+            time_t initial = -1;
+            if (present) initial = ttl_commit_deadline(db, cf, "watched", TTL_LONG_SECS);
+            tidesdb_txn_t* reader = NULL;
+            ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, levels[level], &reader), TDB_SUCCESS);
+            ttl_assert_deadline(reader, cf, "watched", present ? TDB_SUCCESS : TDB_ERR_NOT_FOUND,
+                                initial);
+            (void)ttl_commit_deadline(db, cf, "watched", 2 * TTL_LONG_SECS);
+            ASSERT_EQ(tidesdb_txn_put(reader, cf, (const uint8_t*)"unrelated", 9,
+                                      (const uint8_t*)"v", 1, 0),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(reader), TDB_ERR_CONFLICT);
+            tidesdb_txn_free(reader);
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+            (void)remove_directory(path);
+        }
+    }
+}
+
+void test_txn_get_ttl_expired_masks_older(void)
+{
+    /* pending, committed memtable, sstable, and reopened sstable each expire independently */
+    for (int stage = 0; stage < 4; stage++)
+    {
+        int checked = 0;
+        for (int attempt = 0; attempt < TTL_SETUP_ATTEMPTS && !checked; attempt++)
+        {
+            char path[] = TTL_DB_DIR;
+            tidesdb_column_family_t* cf = NULL;
+            tidesdb_t* db = ttl_getter_fresh(path, &cf);
+            ttl_put(db, cf, "key", TTL_FOREVER);
+            ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+            (void)ttl_wait_for_tick();
+            tidesdb_txn_t* txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+            const time_t lifetime = TTL_ON_DISK_SECS * (1 << attempt);
+            const time_t deadline =
+                ttl_buffer_deadline(txn, cf, "key", (const uint8_t*)"new", 3, lifetime);
+            if (stage > 0)
+            {
+                ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+                tidesdb_txn_free(txn);
+            }
+            if (stage >= 2) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+            if (stage == 3)
+            {
+                ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+                db = ttl_open(path);
+                cf = tidesdb_get_column_family(db, TTL_CF);
+                ASSERT_TRUE(cf != NULL);
+            }
+            if (stage > 0) ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+            if (time(NULL) + 1 < deadline)
+            {
+                time_t actual = 123;
+                const int rc = tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)"key", 3, &actual);
+                /* a slow disk lookup can consume the remaining setup time; retry in that case */
+                if (rc == TDB_ERR_NOT_FOUND && time(NULL) >= deadline)
+                    ASSERT_EQ(actual, (time_t)123);
+                else
+                {
+                    ASSERT_EQ(rc, TDB_SUCCESS);
+                    ASSERT_EQ(actual, deadline);
+                    ttl_wait_for_expired_deadline(txn, cf, "key", deadline);
+                    checked = 1;
+                }
+            }
+            tidesdb_txn_free(txn);
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+            (void)remove_directory(path);
+        }
+        ASSERT_TRUE(checked);
+    }
+}
+
+static void ttl_assert_iterator_at(tidesdb_iter_t* iter, const char* expected_key,
+                                   time_t expected_ttl)
+{
+    uint8_t* key = NULL;
+    size_t key_size = 0;
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), TDB_SUCCESS);
+    ASSERT_EQ(key_size, strlen(expected_key));
+    ASSERT_EQ(memcmp(key, expected_key, key_size), 0);
+    free(key);
+    time_t actual = 123;
+    ASSERT_EQ(tidesdb_iter_ttl(iter, &actual), TDB_SUCCESS);
+    ASSERT_EQ(actual, expected_ttl);
+}
+
+static void ttl_assert_iterator_scan(tidesdb_txn_t* txn, tidesdb_column_family_t* cf,
+                                     const time_t* deadlines)
+{
+    const char* keys[] = {"a_expiring", "b_forever", "c_negative", "d_empty", "e_large"};
+    tidesdb_iter_t* iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), TDB_SUCCESS);
+    time_t out = 123;
+    ASSERT_EQ(tidesdb_iter_ttl(NULL, &out), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_iter_ttl(iter, NULL), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_iter_ttl(iter, &out), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+    for (int i = 0; i < 5; i++)
+    {
+        ttl_assert_iterator_at(iter, keys[i], deadlines[i]);
+        const int rc = tidesdb_iter_next(iter);
+        ASSERT_EQ(rc, i == 4 ? TDB_ERR_NOT_FOUND : TDB_SUCCESS);
+    }
+    ASSERT_EQ(tidesdb_iter_ttl(iter, &out), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(out, (time_t)123);
+    ASSERT_EQ(tidesdb_iter_seek_for_prev(iter, (const uint8_t*)"z", 1), TDB_SUCCESS);
+    for (int i = 4; i >= 0; i--)
+    {
+        ttl_assert_iterator_at(iter, keys[i], deadlines[i]);
+        const int rc = tidesdb_iter_prev(iter);
+        ASSERT_EQ(rc, i == 0 ? TDB_ERR_NOT_FOUND : TDB_SUCCESS);
+    }
+    ASSERT_EQ(tidesdb_iter_ttl(iter, &out), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(out, (time_t)123);
+    tidesdb_iter_free(iter);
+}
+
+void test_iterator_ttl_pending_commit_flush_and_reopen(void)
+{
+    char path[] = TTL_DB_DIR;
+    tidesdb_column_family_t* cf = NULL;
+    tidesdb_t* db = ttl_getter_fresh(path, &cf);
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    tidesdb_iter_t* empty = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &empty), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(empty), TDB_ERR_NOT_FOUND);
+    time_t out = 123;
+    ASSERT_EQ(tidesdb_iter_ttl(empty, &out), TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(out, (time_t)123);
+    tidesdb_iter_free(empty);
+
+    const char* keys[] = {"a_expiring", "b_forever", "c_negative", "d_empty", "e_large"};
+    const time_t durations[] = {TTL_LONG_SECS, 0, -42, TTL_LONG_SECS + 10, TTL_LONG_SECS + 20};
+    const size_t sizes[] = {8, 8, 8, 0, 4096};
+    time_t deadlines[5];
+    uint8_t value[4096];
+    memset(value, 'v', sizeof(value));
+    for (int i = 0; i < 5; i++)
+        deadlines[i] = ttl_buffer_deadline(txn, cf, keys[i], value, sizes[i], durations[i]);
+    (void)ttl_buffer_deadline(txn, cf, "f_deleted", value, 8, TTL_LONG_SECS);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (const uint8_t*)"f_deleted", 9), TDB_SUCCESS);
+    ttl_assert_iterator_scan(txn, cf, deadlines);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+    for (int stage = 0; stage < 3; stage++)
+    {
+        if (stage == 1) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+        if (stage == 2)
+        {
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+            db = ttl_open(path);
+            cf = tidesdb_get_column_family(db, TTL_CF);
+            ASSERT_TRUE(cf != NULL);
+        }
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        ttl_assert_iterator_scan(txn, cf, deadlines);
+        tidesdb_txn_free(txn);
+    }
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(path);
+}
+
+void test_iterator_ttl_current_expiry_and_detached(void)
+{
+    for (int on_disk = 0; on_disk < 2; on_disk++)
+    {
+        int checked = 0;
+        for (int attempt = 0; attempt < TTL_SETUP_ATTEMPTS && !checked; attempt++)
+        {
+            char path[] = TTL_DB_DIR;
+            tidesdb_column_family_t* cf = NULL;
+            tidesdb_t* db = ttl_getter_fresh(path, &cf);
+            ttl_put(db, cf, "b_forever", TTL_FOREVER);
+            (void)ttl_wait_for_tick();
+            const time_t lifetime = TTL_ON_DISK_SECS * (1 << attempt);
+            const time_t deadline = ttl_commit_deadline(db, cf, "a_expiring", lifetime);
+            if (on_disk) ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+            tidesdb_txn_t* txn = NULL;
+            tidesdb_iter_t* iter = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+            if (time(NULL) + 1 < deadline)
+            {
+                ttl_assert_iterator_at(iter, "a_expiring", deadline);
+
+                /* expiry after positioning must not change the metadata of the current entry */
+                ttl_wait_for_expired_deadline(txn, cf, "a_expiring", deadline);
+                ttl_assert_iterator_at(iter, "a_expiring", deadline);
+                ASSERT_EQ(tidesdb_iter_next(iter), TDB_SUCCESS);
+                ttl_assert_iterator_at(iter, "b_forever", -1);
+                ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+                ttl_assert_iterator_at(iter, "b_forever", -1);
+                ASSERT_EQ(tidesdb_iter_prev(iter), TDB_ERR_NOT_FOUND);
+                ASSERT_EQ(tidesdb_iter_seek_to_last(iter), TDB_SUCCESS);
+                ttl_assert_iterator_at(iter, "b_forever", -1);
+                checked = 1;
+            }
+
+            tidesdb_txn_free(txn);
+            time_t out = 123;
+            ASSERT_EQ(tidesdb_iter_ttl(iter, &out), TDB_ERR_INVALID_ARGS);
+            ASSERT_EQ(out, (time_t)123);
+            tidesdb_iter_free(iter);
+            ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+            (void)remove_directory(path);
+        }
+        ASSERT_TRUE(checked);
+    }
+}
+
+void test_ttl_getters_respect_time_t_range(void)
+{
+    char path[] = TTL_DB_DIR;
+    tidesdb_column_family_t* cf = NULL;
+    tidesdb_t* db = ttl_getter_fresh(path, &cf);
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    const int64_t before = (int64_t)time(NULL);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t*)"key", 3, (const uint8_t*)"v", 1,
+                              (time_t)INT32_MAX),
+              TDB_SUCCESS);
+    const int64_t after = (int64_t)time(NULL);
+    const int expected_rc = sizeof(time_t) == 4 ? TDB_ERR_TOO_LARGE : TDB_SUCCESS;
+    time_t out = 123;
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, (const uint8_t*)"key", 3, &out), expected_rc);
+    if (expected_rc == TDB_SUCCESS)
+    {
+        ASSERT_TRUE((int64_t)out >= before + INT32_MAX);
+        ASSERT_TRUE((int64_t)out <= after + INT32_MAX);
+    }
+    else
+        ASSERT_EQ(out, (time_t)123);
+
+    tidesdb_iter_t* iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+    const time_t expected = out;
+    out = 123;
+    ASSERT_EQ(tidesdb_iter_ttl(iter, &out), expected_rc);
+    ASSERT_EQ(out, expected);
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(path);
+}
+
+int main(int argc, char** argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_ttl_expires_across_memtable_flush_and_reopen, tests_passed);
     RUN_TEST(test_ttl_expires_after_reaching_an_sstable, tests_passed);
     RUN_TEST(test_ttl_expired_entry_is_collected_by_compaction, tests_passed);
+    RUN_TEST(test_txn_get_ttl_pending_and_errors, tests_passed);
+    RUN_TEST(test_txn_get_ttl_commit_flush_and_reopen, tests_passed);
+    RUN_TEST(test_txn_get_ttl_snapshot_and_read_committed, tests_passed);
+    RUN_TEST(test_txn_get_ttl_reads_participate_in_conflicts, tests_passed);
+    RUN_TEST(test_txn_get_ttl_expired_masks_older, tests_passed);
+    RUN_TEST(test_iterator_ttl_pending_commit_flush_and_reopen, tests_passed);
+    RUN_TEST(test_iterator_ttl_current_expiry_and_detached, tests_passed);
+    RUN_TEST(test_ttl_getters_respect_time_t_range, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

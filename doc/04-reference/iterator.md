@@ -380,6 +380,30 @@ should not call it — that is most of the benefit of key/value separation.
 Same as [`tidesdb_iter_key`](#tidesdb_iter_key), plus `TDB_ERR_IO` or `TDB_ERR_CORRUPTION`
 if a separated value cannot be read back.
 
+## tidesdb_iter_ttl
+
+Read the expiry of the iterator's current entry.
+
+### Synopsis
+
+```c
+int tidesdb_iter_ttl(tidesdb_iter_t *iter, time_t *ttl);
+```
+
+### Description
+
+Writes the current entry's absolute expiry in Unix seconds to `ttl`, or `-1` when it
+has no expiration. Reads the metadata already held at the iterator position, without
+fetching the value or checking the clock again. If time passes while the iterator stays
+on an entry, the accessor continues to report that entry's original deadline.
+
+### Errors
+
+An unpositioned or exhausted iterator returns `TDB_ERR_NOT_FOUND`. A `NULL` argument or
+an iterator detached from its transaction returns `TDB_ERR_INVALID_ARGS`. A deadline
+that cannot be represented by `time_t` returns `TDB_ERR_TOO_LARGE`. The output is
+unchanged on every error.
+
 ## tidesdb_iter_key_value
 
 Read both in one call.

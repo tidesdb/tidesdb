@@ -9,6 +9,7 @@
 #include "../src/base/errors.h"
 #include "../src/column_family/column_family.h"
 #include "../src/compaction/compaction_exec.h"
+#include "../src/fdmanager/reaper.h"
 #include "../src/flush/flush.h"
 #include "../src/txn/cf_source.h"
 #include "test_utils.h"
@@ -38,14 +39,16 @@ typedef struct
     _Atomic(uint64_t) next_id;
 } cs_db_t;
 
-static void cs_db_open(cs_db_t *db)
+/* open the fixture with a descriptor budget, 0 for none. a fixture runs no reaper of its own, so
+ * one that asks for a budget gives descriptors back itself with cs_reap */
+static void cs_db_open_budget(cs_db_t *db, int max_open)
 {
     (void)remove_directory(CS_DB_DIR);
     ASSERT_EQ(mkdir(CS_DB_DIR, 0755), 0);
     const vlog_config_t vc = {.sync_mode = BLOCK_MANAGER_SYNC_NONE, .segment_target_bytes = 0};
     ASSERT_EQ(vlog_open(CS_DB_DIR, &vc, &db->vlog), VLOG_OK);
     db->cache = cache_create(NULL);
-    ASSERT_EQ(fd_manager_init(&db->fdm, 0), 0);
+    ASSERT_EQ(fd_manager_init(&db->fdm, max_open), 0);
     snprintf(db->manifest_path, sizeof(db->manifest_path), "%s%sMANIFEST", CS_DB_DIR,
              PATH_SEPARATOR);
     db->manifest = tidesdb_manifest_open(db->manifest_path);
@@ -67,6 +70,11 @@ static void cs_db_open(cs_db_t *db)
     tidesdb_l0_set_active(db->l0,
                           tidesdb_memtable_create(NULL, 0, 0, CS_MAX_LEVEL, CS_PROB, NULL, NULL));
     atomic_init(&db->next_id, 100);
+}
+
+static void cs_db_open(cs_db_t *db)
+{
+    cs_db_open_budget(db, 0);
 }
 
 static void cs_db_close(cs_db_t *db)
@@ -562,6 +570,27 @@ void test_cf_source_compaction_drops_an_interval_it_has_finished(void)
 /* the catalogued size the moving table is restated at, which only the level byte totals read */
 #define CS_MOVED_TABLE_SIZE 1
 
+/* the descriptor budget the many-tables fixture holds itself to, far below every platform's
+ * default open-file limit, OpenBSD's included, so hundreds of tables never hold one each */
+#define CS_MANY_TABLES_FD_BUDGET 64
+
+/* give idle descriptors back down to the fixture's budget, as the engine's reaper tick does */
+static void cs_reap(cs_db_t *db)
+{
+    const int cap = level_set_collect_all(db->cf->levels, NULL, 0);
+    if (cap <= 0) return;
+    sstable_t **tables = malloc((size_t)cap * sizeof(*tables));
+    ASSERT_TRUE(tables != NULL);
+    const int n = level_set_collect_all(db->cf->levels, tables, cap);
+    if (n <= cap)
+    {
+        (void)fd_reaper_run(&db->fdm, tables, n, db->vlog);
+        for (int i = 0; i < n; i++)
+            if (sstable_unref(tables[i])) sstable_close(tables[i]);
+    }
+    free(tables);
+}
+
 /* everything a range delete [j, l) at seq 2 over j, k and l at seq 1 must answer, asked of a family
  * holding however many tables it holds now */
 static void cs_assert_range_delete_seen(cf_t *cf)
@@ -615,6 +644,7 @@ static void cs_grow_tables_to(cs_db_t *db, int count, uint64_t *generation, uint
         const cs_entry_t row[] = {{key, "vu", 0, *seq, 0}};
         (void)cs_flush(db, row, 1, (*generation)++);
         (*seq)++;
+        cs_reap(db);
     }
 }
 
@@ -625,7 +655,7 @@ static void cs_grow_tables_to(cs_db_t *db, int count, uint64_t *generation, uint
 void test_cf_source_a_range_delete_is_seen_past_any_table_count(void)
 {
     cs_db_t db;
-    cs_db_open(&db);
+    cs_db_open_budget(&db, CS_MANY_TABLES_FD_BUDGET);
 
     const cs_entry_t rows[] = {{"j", "vj", 0, 1, 0}, {"k", "old", 0, 1, 0}, {"l", "vl", 0, 1, 0}};
     (void)cs_flush(&db, rows, 3, 1);

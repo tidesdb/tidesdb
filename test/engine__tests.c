@@ -6700,6 +6700,44 @@ void test_engine_copy_file_reports_a_failed_sync(void)
 }
 #endif
 
+/* finite copies require every requested byte, while an unlimited copy ends normally at eof */
+void test_engine_copy_file_checks_expected_length(void)
+{
+    const char *src = "." PATH_SEPARATOR "test_engine_copy_length_src";
+    const char *dst = "." PATH_SEPARATOR "test_engine_copy_length_dst";
+    (void)remove(dst);
+    (void)remove(src);
+
+    const char bytes[] = "known source bytes";
+    const size_t size = sizeof(bytes) - 1;
+    FILE *f = fopen(src, "wb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fwrite(bytes, 1, size, f), size);
+    ASSERT_EQ(fclose(f), 0);
+
+    /* check the copied contents and length for exact, prefix, empty, and unlimited copies */
+    const uint64_t limits[] = {size, 5, 0, UINT64_MAX};
+    const size_t expected_sizes[] = {size, 5, 0, size};
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++)
+    {
+        ASSERT_EQ(engine_copy_file(src, dst, limits[i], 0), TDB_SUCCESS);
+        f = fopen(dst, "rb");
+        ASSERT_TRUE(f != NULL);
+        char actual[sizeof(bytes)];
+        ASSERT_EQ(fread(actual, 1, sizeof(actual), f), expected_sizes[i]);
+        ASSERT_EQ(memcmp(actual, bytes, expected_sizes[i]), 0);
+        ASSERT_EQ(fgetc(f), EOF);
+        ASSERT_EQ(ferror(f), 0);
+        ASSERT_EQ(fclose(f), 0);
+    }
+
+    /* the source ends one byte before the requested length */
+    ASSERT_EQ(engine_copy_file(src, dst, size + 1, 0), TDB_ERR_IO);
+
+    ASSERT_EQ(remove(dst), 0);
+    ASSERT_EQ(remove(src), 0);
+}
+
 void test_engine_raise_open_file_limit(void)
 {
     const long current = tidesdb_raise_open_file_limit(0); /* report only */
@@ -7742,6 +7780,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_recovered_prepare_keeps_its_scanned_range, tests_passed);
     RUN_TEST(test_engine_scan_footprint_refuses_a_phantom, tests_passed);
     RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
+    RUN_TEST(test_engine_copy_file_checks_expected_length, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
 #ifdef __linux__
     RUN_TEST(test_engine_copy_file_rejects_aliases, tests_passed);

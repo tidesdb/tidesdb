@@ -755,12 +755,12 @@ int engine_checkpoint(tidesdb_t *db);
 
 /**
  * engine_copy_file
- * stream at most limit bytes from src to dst, overwriting dst; a block-manager file is copied to
+ * stream exactly limit bytes from src to dst, overwriting dst; a block-manager file is copied to
  * its logical size (not its preallocated on-disk size) so a reopen, which derives the size from
- * fstat, sees the same end-of-file. pass UINT64_MAX for a plain file. defined in engine_backup.c
+ * fstat, sees the same end-of-file. pass UINT64_MAX to copy until eof. defined in engine_backup.c
  * @param src the source file path
  * @param dst the destination file path, created or overwritten; must not alias src
- * @param limit the maximum number of bytes to copy
+ * @param limit the required number of bytes to copy, or UINT64_MAX to copy until eof
  * @param durable non-zero to sync the copy and its directory entry before returning, which a backup
  * always asks for and a clone asks for when the database syncs its own commits
  * @return TDB_SUCCESS, TDB_ERR_IO, or TDB_ERR_MEMORY

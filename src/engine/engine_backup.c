@@ -136,7 +136,8 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
             }
             remaining -= got;
         }
-        if (rc == TDB_SUCCESS && ferror(in)) rc = TDB_ERR_IO;
+        if (rc == TDB_SUCCESS && (ferror(in) || (limit != UINT64_MAX && remaining > 0)))
+            rc = TDB_ERR_IO;
     }
 
     /* a durable copy is relied on the moment this returns, a clone's catalogue names it and a

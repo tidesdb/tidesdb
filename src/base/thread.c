@@ -38,23 +38,29 @@ int tdb_thread_start(tdb_thread_t *t, tdb_thread_fn fn, void *arg)
         pthread_mutex_destroy(&t->mtx);
         return -1;
     }
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, tdb_thread_run, t) != 0)
+    if (pthread_create(&t->tid, NULL, tdb_thread_run, t) != 0)
     {
         pthread_cond_destroy(&t->cv);
         pthread_mutex_destroy(&t->mtx);
         return -1;
     }
-    (void)pthread_detach(tid);
+    if (TDB_THREAD_DETACHED) (void)pthread_detach(t->tid);
     return 0;
 }
 
 void tdb_thread_finish(tdb_thread_t *t)
 {
     if (!t) return;
-    pthread_mutex_lock(&t->mtx);
-    while (!t->finished) pthread_cond_wait(&t->cv, &t->mtx);
-    pthread_mutex_unlock(&t->mtx);
+    if (TDB_THREAD_DETACHED)
+    {
+        pthread_mutex_lock(&t->mtx);
+        while (!t->finished) pthread_cond_wait(&t->cv, &t->mtx);
+        pthread_mutex_unlock(&t->mtx);
+    }
+    else
+    {
+        (void)pthread_join(t->tid, NULL);
+    }
     pthread_cond_destroy(&t->cv);
     pthread_mutex_destroy(&t->mtx);
 }

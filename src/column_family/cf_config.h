@@ -26,6 +26,11 @@
  * variable encoding-id array of encoding_count bytes follows */
 #define CF_CONFIG_BLOB_FIXED_SIZE 60
 
+/* the range filter's fields, its enable byte and its false-positive rate, which follow the encoding
+ * ids. a blob written before they existed ends at the ids and reads as no range filter, and a build
+ * that predates them stops at the ids and never sees them, so they need no new blob version */
+#define CF_CONFIG_BLOB_RANGE_FILTER_SIZE 9
+
 /* the highest encoding id a pipeline entry may carry, named from the enum it is cast to rather than
  * written as a number so adding an algorithm cannot leave this behind */
 #define CF_CONFIG_MAX_ENCODING_ID TDB_COMPRESS_LZ4_FAST

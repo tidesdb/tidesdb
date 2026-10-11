@@ -202,6 +202,24 @@ The value log references are how an sstable records which segments it draws sepa
 and how much of each it holds, which is what lets a reclaim decide a segment is worth draining
 without reading every key log.
 
+A table carrying a range filter follows the references with an extension area. A table without one
+writes none, so its footer is byte for byte what it was before the area existed:
+
+```
+     4  extension magic 0x54444258 ("TDBX")
+     4  extension count
+  per extension:
+     4  tag
+     4  payload length
+     n  payload
+```
+
+Tag 1 is the range filter, whose 12-byte payload is the directory's offset (8) and size (4). A tag
+the reader does not know is stepped over by its length. A parser that predates the area stops at the
+references and never reads it, which is what lets the area grow without moving the format version
+that parser checks. An area that does not hold together leaves the table without a range filter
+rather than failing the footer, since a table without one is simply read in full.
+
 Every length in the tail is bounds-checked against the remaining bytes, so a truncated or lying
 footer is rejected rather than read past.
 
@@ -236,6 +254,63 @@ inheritance -- it moves only when *this* layout changes, so a later release can 
 while the rest move on. The blobs it points at are ordinary bloom filters fetched on demand
 through the block cache, which is what bounds the filter's resident cost to the directory alone.
 :::
+
+## Range filter directory
+
+The resident half of a table's range filter, at the offset and size the footer's extension area
+records. Little-endian throughout:
+
+```
+  4 bytes  magic 0x54445246 ("TDRF")
+  4 bytes  format version (10)
+  4 bytes  flags, none defined, and a reader refuses any it does not know
+  1 byte   sample interval T as a power of two
+  1 byte   quotient bits
+  1 byte   remainder bits
+  1 byte   reserved
+  8 bytes  key count
+  4 bytes  model length
+  n bytes  model, the coder's weights per context
+  4 bytes  sample count
+  then, per sample:
+    4 bytes  length in bits
+    n bytes  the encoded key, most significant bit first
+  4 bytes  partition count
+  then, per partition:
+    8 bytes  blob offset within the key log
+    4 bytes  blob size
+    4 bytes  first gap
+```
+
+The samples are every T-th key and the last, encoded, so their count follows from the key count and a
+reader checks that it does, along with their rising order and a partition table that starts at gap 0
+and rises. A gap is the stretch of keys between two adjacent samples. The model is read back into code
+tables only, its weights dropped once the trees are derived, and its size is held to a share of the
+filter's at build time, so a small run's model is little more than its order-0 tree.
+
+Each partition is a blob holding the stores of a run of gaps, fetched on demand through the block
+cache like a bloom partition:
+
+```
+  4 bytes  gap count
+  4 bytes  per gap, its store's offset in the stores, then one past the last
+  n bytes  the stores
+```
+
+and each store is
+
+```
+  4 bytes  slot count n
+  then, when n > 0, three bitmaps of whole 8-byte words:
+    2^q bits  occupieds, bit i set when some infix has quotient i, least significant bit first
+    n bits    runends, bit j set when slot j ends its run, least significant bit first
+    n*r bits  remainders, slot after slot, most significant bit first
+```
+
+A store is checked before it is searched. Its sizes must match its slot count, its occupied quotients
+must equal its run ends in number, its last slot must end a run, and nothing may be set past the end
+of any bitmap. A filter that fails any check answers that a range may hold a key, which costs the
+pruning and never a key.
 
 ## Range tombstone block
 

@@ -87,6 +87,13 @@
  * @param unflushed_key_count distinct keys resident in the shared memtables for this family and not
  *                            yet in any sstable, raised by the l0 as new keys land and lowered by
  *                            flush as they drain to L1, for stats
+ * @param range_filter_on whether the family's config has range filters on, copied out of the config
+ * whenever one is published so a scan reads one word rather than the config. a family with them
+ * off neither builds them nor consults the ones its tables already carry
+ * @param range_filter_probes tables a bounded scan or a range probe asked a range filter about,
+ * for stats
+ * @param range_filter_skips of those, the tables the filter said held no key in the range and that
+ * were left unread, for stats
  */
 typedef struct cf
 {
@@ -123,6 +130,9 @@ typedef struct cf
     _Atomic(tidesdb_commit_hook_fn) commit_hook_fn;
     _Atomic(void *) commit_hook_ctx;
     _Atomic(int64_t) unflushed_key_count;
+    _Atomic(int) range_filter_on;
+    _Atomic(uint64_t) range_filter_probes;
+    _Atomic(uint64_t) range_filter_skips;
 } cf_t;
 
 /**

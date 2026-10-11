@@ -90,6 +90,12 @@ whose values all stay inline still reports the shape you would expect from one l
 copy per flush and merge.
 :::
 
+**Range filter.** `range_filter_probes` counts the sstables a bounded scan or a range delete's
+conflict probe asked a range filter about, and `range_filter_skips` how many of them it showed held
+no key in the range, which were then never read. Both are cumulative since open and stay zero for a
+family that builds no range filters. Their ratio is the share of candidate tables the filter is
+saving a descent into.
+
 **In memory.** `unflushed_key_count` is the distinct keys belonging to this family that are
 still only in the memtable. It is the family's share of what a flush would write and what a
 crash would have to recover. It is reported as an unsigned figure and floored at zero: the
@@ -97,9 +103,10 @@ underlying count can dip below it for an instant when a flush's decrement is obs
 matching apply increment, and that dip is an artefact of reading two independent updates rather
 than a real figure.
 
-**Filter memory.** `filter_resident_bytes` is what this family's partitioned bloom filters hold
-**outside the block cache**. Each open sstable keeps one routing directory — every partition's
-offset and its whole first key — and that directory is ordinary heap memory, not charged against
+**Filter memory.** `filter_resident_bytes` is what this family's filters hold **outside the block
+cache**. Each open sstable keeps one bloom routing directory — every partition's offset and its whole
+first key — and, when the family builds range filters, one range filter directory, holding its
+model, its samples and its partition table. Both are ordinary heap memory, not charged against
 `block_cache_size`. The filter bit arrays are not counted: those are fetched one partition at a time
 per probe and live in the cache, where the configured budget already bounds them.
 

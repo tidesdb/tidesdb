@@ -41,6 +41,9 @@ typedef struct
 
 /* open the fixture with a descriptor budget, 0 for none. a fixture runs no reaper of its own, so
  * one that asks for a budget gives descriptors back itself with cs_reap */
+/* when set, the next fixture opened builds a range filter into every table */
+static int cs_range_filter_on;
+
 static void cs_db_open_budget(cs_db_t *db, int max_open)
 {
     (void)remove_directory(CS_DB_DIR);
@@ -62,6 +65,8 @@ static void cs_db_open_budget(cs_db_t *db, int max_open)
     cfg.btree_klog_block_size = 4096;
     cfg.enable_bloom_filter = 1;
     cfg.bloom_fpr = 0.01;
+    cfg.enable_range_filter = cs_range_filter_on;
+    cfg.range_filter_fpr = 0.01;
     ASSERT_EQ(
         cf_create(CS_DB_DIR, 0, &cfg, NULL, db->vlog, db->cache, &db->fdm, NULL, NULL, &db->cf), 0);
     ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, 0, "cf0", NULL, 0), 0);
@@ -709,6 +714,43 @@ void test_cf_source_a_range_delete_is_seen_past_any_table_count(void)
     cs_db_close(&db);
 }
 
+/* a range delete's conflict probe asks a table's range filter before descending it. a range the
+ * table's key range admits but that holds none of its keys is ruled out by the filter, and a range
+ * holding a newer key is still found */
+void test_cf_source_range_probe_skips_a_table_its_filter_rules_out(void)
+{
+    cs_range_filter_on = 1;
+    cs_db_t db;
+    cs_db_open(&db);
+    cs_range_filter_on = 0;
+    const cs_entry_t e[] = {
+        {"m0", "v", 0, 10, 0}, {"m2", "v", 0, 11, 0}, {"m4", "v", 0, 12, 0}, {"m6", "v", 0, 13, 0}};
+    (void)cs_flush(&db, e, 4, 1);
+    tidesdb_source_t src;
+    cf_source(db.cf, &src);
+    int newer = 1;
+    /* [m3, m3z) holds no key, though the table's range [m0, m6] admits it */
+    ASSERT_EQ(src.range_has_newer(src.ctx, 0, (const uint8_t *)"m3", 2, (const uint8_t *)"m3z", 3,
+                                  0, UINT64_MAX, &newer),
+              TDB_SOURCE_NOT_FOUND);
+    ASSERT_EQ(newer, 0);
+    ASSERT_EQ(atomic_load(&db.cf->range_filter_skips), (uint64_t)1);
+    /* [m3, m5) holds m4, newer than the floor */
+    newer = 0;
+    ASSERT_EQ(src.range_has_newer(src.ctx, 0, (const uint8_t *)"m3", 2, (const uint8_t *)"m5", 2, 0,
+                                  UINT64_MAX, &newer),
+              TDB_SOURCE_FOUND);
+    ASSERT_EQ(newer, 1);
+    /* unbounded above, from past the last key, holds nothing */
+    newer = 1;
+    ASSERT_TRUE(src.range_has_newer(src.ctx, 0, (const uint8_t *)"m61", 3, NULL, 0, 0, UINT64_MAX,
+                                    &newer) != TDB_SOURCE_BUSY);
+    ASSERT_EQ(newer, 0);
+    /* the last range lies past the table's keys, ruled out by its key range before its filter */
+    ASSERT_EQ(atomic_load(&db.cf->range_filter_probes), (uint64_t)2);
+    cs_db_close(&db);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
@@ -724,6 +766,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_cf_source_compaction_carries_input_intervals, tests_passed);
     RUN_TEST(test_cf_source_compaction_drops_an_interval_it_has_finished, tests_passed);
     RUN_TEST(test_cf_source_a_range_delete_is_seen_past_any_table_count, tests_passed);
+    RUN_TEST(test_cf_source_range_probe_skips_a_table_its_filter_rules_out, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

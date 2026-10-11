@@ -449,6 +449,8 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
 
     int held = 0;
     int failed = 0;
+    uint64_t probes = 0, skips = 0;
+    const int consult = atomic_load_explicit(&cf->range_filter_on, memory_order_relaxed);
     for (int i = 0; i < n; i++)
     {
         if (*newer || failed) continue;
@@ -461,6 +463,20 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
         }
         if (tables[i]->max_seq <= seq_floor) continue; /* nothing in it can be newer */
         if (!cf_source_table_in_range(tables[i], lo, lo_size, hi, hi_size)) continue;
+        /* its intervals were ruled out above, so a table whose range filter shows no key in the
+         * range holds nothing the delete could have missed. the filter takes the bound inclusive,
+         * which asks about one key more than the delete covers and so only ever keeps a table */
+        if (consult && sstable_has_range_filter(tables[i]))
+        {
+            probes++;
+            const uint8_t *top = hi_size > 0 ? hi : tables[i]->max_key;
+            const size_t top_size = hi_size > 0 ? hi_size : tables[i]->max_key_size;
+            if (!sstable_range_may_contain(tables[i], lo, lo_size, top, top_size))
+            {
+                skips++;
+                continue;
+            }
+        }
 
         held = 1;
         if (cf_source_table_range_has_newer(tables[i], lo, lo_size, hi, hi_size, seq_floor,
@@ -470,6 +486,9 @@ static tidesdb_source_result_t cf_source_range_has_newer(void *ctx, uint32_t cf_
     for (int i = 0; i < n; i++)
         if (sstable_unref(tables[i])) sstable_close(tables[i]);
     free(tables);
+    if (probes > 0)
+        atomic_fetch_add_explicit(&cf->range_filter_probes, probes, memory_order_relaxed);
+    if (skips > 0) atomic_fetch_add_explicit(&cf->range_filter_skips, skips, memory_order_relaxed);
 
     if (failed) return TDB_SOURCE_BUSY;
     return held ? TDB_SOURCE_FOUND : TDB_SOURCE_NOT_FOUND;

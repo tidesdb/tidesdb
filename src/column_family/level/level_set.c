@@ -44,11 +44,14 @@ typedef struct
  * listed sstable.
  * @param levels per-level arrays of entries, index level-1; L1 unordered, L2+ sorted by min_key
  * @param counts number of entries at each level
+ * @param interval_counts how many entries at each level carry range tombstones, held in the layout
+ * so a reader judging a level by it judges the same tables it then walks
  */
 typedef struct
 {
     level_entry_t *levels[LEVEL_SET_MAX_LEVELS];
     int counts[LEVEL_SET_MAX_LEVELS];
+    int interval_counts[LEVEL_SET_MAX_LEVELS];
 } level_layout_t;
 
 /**
@@ -261,9 +264,11 @@ static void level_publish(level_set_t *ls, level_layout_t *fresh)
     for (int i = 0; i < LEVEL_SET_MAX_LEVELS; i++)
     {
         if (fresh->counts[i] > 0) occ |= 1u << i;
+        fresh->interval_counts[i] = 0;
         for (int j = 0; j < fresh->counts[i]; j++)
             if (range_tombstone_set_count(fresh->levels[i][j].sst->range_tombstones) > 0)
-                carrying++;
+                fresh->interval_counts[i]++;
+        carrying += (uint32_t)fresh->interval_counts[i];
     }
 
     /* the layout, the mask and the interval count are three words a reader loads one at a time, and
@@ -473,18 +478,15 @@ int level_set_l1_overlap_depth(level_set_t *ls)
     return level_set_count(ls, LEVEL_SET_L1);
 }
 
-int level_set_overlapping(level_set_t *ls, const int level, const uint8_t *min_key,
-                          const size_t min_key_size, const uint8_t *max_key,
-                          const size_t max_key_size, sstable_t **out, const int max_out)
+/* the tables of one layout's level whose key range meets [min_key, max_key], referenced into out up
+ * to max_out, returning how many meet. the caller is inside the reader epoch */
+static int level_overlapping_in(const level_layout_t *lay, const int idx, const uint8_t *min_key,
+                                const size_t min_key_size, const uint8_t *max_key,
+                                const size_t max_key_size, sstable_t **out, const int max_out)
 {
-    if (!ls || level < LEVEL_SET_L1 || level > LEVEL_SET_MAX_LEVELS || !min_key || !max_key || !out)
-        return -1;
-    const int idx = level - 1;
-
-    tdb_epoch_enter(&ls->epoch);
-    const level_layout_t *lay = atomic_load_explicit(&ls->layout, memory_order_acquire);
     const level_entry_t *arr = lay->levels[idx];
     const int n = lay->counts[idx];
+    const int level = idx + 1;
 
     /* L1 is unordered and its files overlap, so every one of them is a candidate. every deeper
      * level is a non-overlapping run kept sorted by min_key, and on one of those the files meeting
@@ -521,8 +523,61 @@ int level_set_overlapping(level_set_t *ls, const int level, const uint8_t *min_k
         }
         overlapping++;
     }
+    return overlapping;
+}
+
+int level_set_overlapping(level_set_t *ls, const int level, const uint8_t *min_key,
+                          const size_t min_key_size, const uint8_t *max_key,
+                          const size_t max_key_size, sstable_t **out, const int max_out)
+{
+    if (!ls || level < LEVEL_SET_L1 || level > LEVEL_SET_MAX_LEVELS || !min_key || !max_key || !out)
+        return -1;
+    tdb_epoch_enter(&ls->epoch);
+    const level_layout_t *lay = atomic_load_explicit(&ls->layout, memory_order_acquire);
+    const int overlapping = level_overlapping_in(lay, level - 1, min_key, min_key_size, max_key,
+                                                 max_key_size, out, max_out);
     tdb_epoch_exit(&ls->epoch);
     return overlapping;
+}
+
+int level_set_meeting(level_set_t *ls, const int level, const uint8_t *min_key,
+                      const size_t min_key_size, const uint8_t *max_key, const size_t max_key_size,
+                      sstable_t **out, const int max_out)
+{
+    if (!ls || level < LEVEL_SET_L1 || level > LEVEL_SET_MAX_LEVELS || !min_key || !max_key || !out)
+        return -1;
+    const int idx = level - 1;
+    tdb_epoch_enter(&ls->epoch);
+    const level_layout_t *lay = atomic_load_explicit(&ls->layout, memory_order_acquire);
+    if (lay->interval_counts[idx] == 0)
+    {
+        /* no table here carries an interval, so meeting the range is overlapping it, answered from
+         * the same layout the count was read from */
+        const int overlapping = level_overlapping_in(lay, idx, min_key, min_key_size, max_key,
+                                                     max_key_size, out, max_out);
+        tdb_epoch_exit(&ls->epoch);
+        return overlapping;
+    }
+    /* a table's key range says nothing of where its intervals reach, so the whole level is walked
+     * in its order, which keeps a sorted level sorted for the caller */
+    const level_entry_t *arr = lay->levels[idx];
+    int meeting = 0;
+    for (int j = 0; j < lay->counts[idx]; j++)
+    {
+        sstable_t *sst = arr[j].sst;
+        if (!level_ranges_overlap(sst, min_key, min_key_size, max_key, max_key_size) &&
+            !range_tombstone_set_meets(sst->range_tombstones, min_key, min_key_size, max_key,
+                                       max_key_size))
+            continue;
+        if (meeting < max_out)
+        {
+            sstable_ref(sst);
+            out[meeting] = sst;
+        }
+        meeting++;
+    }
+    tdb_epoch_exit(&ls->epoch);
+    return meeting;
 }
 
 int level_set_collect_all(level_set_t *ls, sstable_t **out, const int max)

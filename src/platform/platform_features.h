@@ -134,6 +134,103 @@ static inline int tdb_ctz64_portable(uint64_t x)
 #define TDB_CTZ64(x) tdb_ctz64_portable(x)
 #endif
 
+/* cross-platform count leading zeros for 64-bit integers. every variant defines a zero input as 64,
+ * since the compiler builtin leaves it undefined and a caller asking how many leading bits two
+ * equal words share should get the whole word rather than undefined behaviour */
+#if defined(__GNUC__) || defined(__clang__)
+#define TDB_CLZ64(x) ((x) == 0 ? 64 : __builtin_clzll(x))
+#elif defined(_MSC_VER)
+/*
+ * tdb_clz64_msvc
+ * counts leading zeros in a 64-bit integer (MSVC version)
+ * @param x the value to count leading zeros in
+ * @return number of leading zero bits (0-63), or 64 if x is 0
+ */
+static inline int tdb_clz64_msvc(uint64_t x)
+{
+    unsigned long index;
+#if defined(_WIN64)
+    if (_BitScanReverse64(&index, x))
+    {
+        return 63 - (int)index;
+    }
+#else
+    /* 32-bit MSVC -- check the high half first, then the low */
+    if (_BitScanReverse(&index, (unsigned long)(x >> 32)))
+    {
+        return 31 - (int)index;
+    }
+    if (_BitScanReverse(&index, (unsigned long)x))
+    {
+        return 63 - (int)index;
+    }
+#endif
+    return 64; /* all zeros */
+}
+#define TDB_CLZ64(x) tdb_clz64_msvc(x)
+#else
+/*
+ * tdb_clz64_portable
+ * counts leading zeros in a 64-bit integer (portable version), halving the window each step
+ * @param x the value to count leading zeros in
+ * @return number of leading zero bits (0-63), or 64 if x is 0
+ */
+static inline int tdb_clz64_portable(uint64_t x)
+{
+    if (x == 0) return 64;
+    int n = 0;
+    if ((x >> 32) == 0)
+    {
+        n += 32;
+        x <<= 32;
+    }
+    if ((x >> 48) == 0)
+    {
+        n += 16;
+        x <<= 16;
+    }
+    if ((x >> 56) == 0)
+    {
+        n += 8;
+        x <<= 8;
+    }
+    if ((x >> 60) == 0)
+    {
+        n += 4;
+        x <<= 4;
+    }
+    if ((x >> 62) == 0)
+    {
+        n += 2;
+        x <<= 2;
+    }
+    if ((x >> 63) == 0) n += 1;
+    return n;
+}
+#define TDB_CLZ64(x) tdb_clz64_portable(x)
+#endif
+
+/* cross-platform population count for 64-bit integers */
+#if defined(__GNUC__) || defined(__clang__)
+#define TDB_POPCOUNT64(x) __builtin_popcountll(x)
+#else
+/*
+ * tdb_popcount64_portable
+ * counts the set bits in a 64-bit integer by summing them in parallel, pairs then nibbles then
+ * bytes, which is also what MSVC is given since its intrinsic needs a cpu feature check
+ * @param x the value to count the set bits of
+ * @return the number of set bits, 0 to 64
+ */
+static inline int tdb_popcount64_portable(uint64_t x)
+{
+    x = x - ((x >> 1) & UINT64_C(0x5555555555555555));
+    x = (x & UINT64_C(0x3333333333333333)) + ((x >> 2) & UINT64_C(0x3333333333333333));
+    x = (x + (x >> 4)) & UINT64_C(0x0F0F0F0F0F0F0F0F);
+    return (int)((x * UINT64_C(0x0101010101010101)) >> 56);
+}
+#define TDB_POPCOUNT64(x) tdb_popcount64_portable(x)
+#endif
+
 /* whether a condition variable can be pinned to the monotonic clock with
  * pthread_condattr_setclock, the posix clock selection option. where it can, a timed wait cannot be
  * stretched by a wall clock step -- an ntp correction, or a hypervisor resuming a guest it had

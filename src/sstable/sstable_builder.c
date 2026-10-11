@@ -22,6 +22,9 @@ struct sstable_builder
     vlog_t *vlog;             /* the cf's shared value log, borrowed; NULL forbids a spill */
     btree_builder_t *btree_builder;
     partitioned_bloom_filter_builder_t *bloom_builder; /* NULL when the bloom is disabled */
+    sstable_rf_build_t *rf_build; /* NULL when the table carries no range filter */
+    uint64_t rf_dir_offset;       /* where the range filter's directory landed, once written */
+    uint32_t rf_dir_size;
 
     size_t value_threshold;
     /* this build's own copy, since the caller's set may be rebuilt before finish writes the block
@@ -126,9 +129,7 @@ static int sstable_builder_note_value(sstable_builder_t *builder, uint64_t vlog_
     return TDB_SUCCESS;
 }
 
-/* write callback the partitioned_bloom_filter builder uses to land each partition and its directory
- * as klog blocks; the returned offset is the block frame the reader's fetch will read back */
-static int sstable_bloom_write(void *ctx, const uint8_t *data, size_t size, uint64_t *out_offset)
+int sstable_blob_write(void *ctx, const uint8_t *data, size_t size, uint64_t *out_offset)
 {
     block_manager_t *bm = ctx;
     block_manager_block_t *block = block_manager_block_create(size, data);
@@ -201,8 +202,19 @@ int sstable_builder_new(sstable_builder_t **out, block_manager_t *klog_bm, vlog_
 
     if (config->enable_bloom &&
         partitioned_bloom_filter_builder_new(&b->bloom_builder, config->bloom_fpr, 0,
-                                             sstable_bloom_write, klog_bm) != 0)
+                                             sstable_blob_write, klog_bm) != 0)
     {
+        btree_builder_free(b->btree_builder);
+        free(b->klog_path);
+        free(b);
+        return TDB_ERR_MEMORY;
+    }
+
+    if (config->range_filter_r_bits > 0 &&
+        sstable_rf_build_new(config->range_filter_r_bits, config->range_filter_expected_keys,
+                             klog_bm, &b->rf_build) != TDB_SUCCESS)
+    {
+        partitioned_bloom_filter_builder_free(b->bloom_builder);
         btree_builder_free(b->btree_builder);
         free(b->klog_path);
         free(b);
@@ -257,6 +269,11 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key, 
         if (builder->bloom_builder &&
             partitioned_bloom_filter_builder_add(builder->bloom_builder, key, key_size) != 0)
             return TDB_ERR_MEMORY;
+        if (builder->rf_build)
+        {
+            const int rf_rc = sstable_rf_build_add(builder->rf_build, key, key_size);
+            if (rf_rc != TDB_SUCCESS) return rf_rc;
+        }
         builder->distinct_key_count++;
         builder->total_key_bytes += key_size;
         if (!(flags & TDB_KV_FLAG_TOMBSTONE)) builder->total_value_bytes += value_size;
@@ -455,6 +472,8 @@ static int sstable_write_footer(sstable_builder_t *builder, const btree_t *tree,
     memcpy(footer.encoding_pipeline, builder->encoding_pipeline, builder->encoding_count);
     footer.vlog_refs = builder->vlog_refs;
     footer.vlog_ref_count = builder->vlog_ref_count;
+    footer.range_filter_dir_offset = builder->rf_dir_offset;
+    footer.range_filter_dir_size = builder->rf_dir_size;
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
@@ -531,6 +550,8 @@ static int sstable_build_handle(sstable_builder_t *builder, const btree_t *tree,
     sst->last_leaf_offset = tree->last_leaf_offset;
     sst->bloom_dir_offset = bloom_dir_offset;
     sst->bloom_dir_size = bloom_dir_size;
+    sst->range_filter_dir_offset = builder->rf_dir_offset;
+    sst->range_filter_dir_size = builder->rf_dir_size;
     sst->range_del_offset = range_del_offset;
     sst->range_del_size = range_del_size;
     /* the handle takes the build's own set rather than reading the block back, since it is already
@@ -612,6 +633,9 @@ int sstable_builder_finish(sstable_builder_t *builder, sstable_t **out, uint64_t
     uint64_t range_del_offset = 0;
     uint32_t range_del_size = 0;
     int rc = sstable_finish_bloom(builder, &bloom_dir_offset, &bloom_dir_size);
+    if (rc == TDB_SUCCESS && builder->rf_build)
+        rc = sstable_rf_build_finish(builder->rf_build, &builder->rf_dir_offset,
+                                     &builder->rf_dir_size);
     if (rc == TDB_SUCCESS)
         rc = sstable_finish_range_dels(builder, &range_del_offset, &range_del_size);
     if (rc == TDB_SUCCESS)
@@ -663,6 +687,7 @@ void sstable_builder_free(sstable_builder_t *builder)
      * one */
     if (builder->btree_builder) btree_builder_free(builder->btree_builder);
     if (builder->bloom_builder) partitioned_bloom_filter_builder_free(builder->bloom_builder);
+    sstable_rf_build_free(builder->rf_build);
     /* NULL once a finish moved it onto the produced sstable */
     range_tombstone_set_free(builder->range_tombstones);
     free(builder->klog_path);

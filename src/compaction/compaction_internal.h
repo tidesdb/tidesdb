@@ -24,7 +24,9 @@
 #define CE_TOMB_SIBLING_MAX 64
 
 /* the output-building sink: the current in-progress output plus the finished ones, so a merge can
- * roll to a new file at a boundary or a size cap without the write loop knowing the details */
+ * roll to a new file at a boundary or a size cap without the write loop knowing the details. an
+ * output is expected to hold about expected_keys distinct keys, which sizes its range filter's
+ * model */
 typedef struct
 {
     const compaction_ctx_t *cx;
@@ -38,6 +40,7 @@ typedef struct
     int cur_open;
     int cur_partition;
     const range_tombstone_set_t *carried;
+    uint64_t expected_keys;
 } ce_sink_t;
 
 /**

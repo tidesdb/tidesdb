@@ -36,6 +36,8 @@ static tidesdb_column_family_config_t make_config(void)
     c.btree_klog_block_size = 8192;
     c.enable_bloom_filter = 1;
     c.bloom_fpr = 0.01;
+    c.enable_range_filter = 1;
+    c.range_filter_fpr = 0.005;
     c.default_isolation_level = TDB_ISOLATION_SNAPSHOT;
     c.l1_file_count_trigger = 4;
     c.tombstone_density_trigger = 0.25;
@@ -54,7 +56,8 @@ void test_cf_config_roundtrip(void)
     size_t len = 0;
     ASSERT_EQ(cf_config_serialize(&in, &blob, &len), 0);
     ASSERT_TRUE(blob != NULL);
-    ASSERT_EQ((int)len, CF_CONFIG_BLOB_FIXED_SIZE + in.encoding_count);
+    ASSERT_EQ((int)len,
+              CF_CONFIG_BLOB_FIXED_SIZE + in.encoding_count + CF_CONFIG_BLOB_RANGE_FILTER_SIZE);
     ASSERT_EQ((int)blob[0], CF_CONFIG_BLOB_VERSION);
 
     tidesdb_column_family_config_t out;
@@ -75,7 +78,52 @@ void test_cf_config_roundtrip(void)
     ASSERT_EQ(out.encoding_count, 2);
     ASSERT_EQ(out.encoding_pipeline[0], TDB_COMPRESS_SNAPPY);
     ASSERT_EQ(out.encoding_pipeline[1], TDB_COMPRESS_NONE);
+    ASSERT_EQ(out.enable_range_filter, 1);
+    ASSERT_TRUE(cf_config_same_double(out.range_filter_fpr, 0.005));
 
+    free(blob);
+}
+
+/* a blob written before the range filter fields ends at the encoding ids and reads with the filter
+ * off and every other field intact, and the bytes before those fields are what that older writer
+ * produced, which is all an older reader looks at */
+void test_cf_config_range_filter_fields_are_backward_compatible(void)
+{
+    tidesdb_column_family_config_t in = make_config();
+    uint8_t *blob = NULL;
+    size_t len = 0;
+    ASSERT_EQ(cf_config_serialize(&in, &blob, &len), 0);
+    const size_t old_len = len - CF_CONFIG_BLOB_RANGE_FILTER_SIZE;
+
+    tidesdb_column_family_config_t out;
+    memset(&out, 0, sizeof(out));
+    out.enable_range_filter = 1; /* left over from a previous use, and the read must clear it */
+    out.range_filter_fpr = 0.5;
+    ASSERT_EQ(cf_config_deserialize(blob, old_len, &out), 0);
+    ASSERT_EQ(out.enable_range_filter, 0);
+    ASSERT_TRUE(cf_config_same_double(out.range_filter_fpr, 0.0));
+    ASSERT_EQ(out.encoding_count, 2);
+    ASSERT_EQ(out.encoding_pipeline[0], TDB_COMPRESS_SNAPPY);
+    ASSERT_EQ(out.enable_bloom_filter, 1);
+
+    /* cut inside the range filter fields, it still reads as an older blob */
+    ASSERT_EQ(cf_config_deserialize(blob, len - 1, &out), 0);
+    ASSERT_EQ(out.enable_range_filter, 0);
+
+    /* an enabled filter whose rate is outside (0, 1) is refused, from a caller or from disk */
+    in.range_filter_fpr = 1.0;
+    ASSERT_EQ(cf_config_validate(&in, NULL), -1);
+    in.range_filter_fpr = 0.0;
+    ASSERT_EQ(cf_config_validate(&in, NULL), -1);
+    in.enable_range_filter = 0;
+    ASSERT_EQ(cf_config_validate(&in, NULL), 0);
+    in.enable_range_filter = 1;
+    in.range_filter_fpr = 1.0;
+    uint8_t *bad = NULL;
+    size_t bad_len = 0;
+    ASSERT_EQ(cf_config_serialize(&in, &bad, &bad_len), 0);
+    ASSERT_EQ(cf_config_deserialize(bad, bad_len, &out), -1);
+    free(bad);
     free(blob);
 }
 
@@ -295,6 +343,7 @@ int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_cf_config_roundtrip, tests_passed);
+    RUN_TEST(test_cf_config_range_filter_fields_are_backward_compatible, tests_passed);
     RUN_TEST(test_cf_config_validate, tests_passed);
     RUN_TEST(test_cf_config_value_threshold, tests_passed);
     RUN_TEST(test_cf_config_warn_layout, tests_passed);

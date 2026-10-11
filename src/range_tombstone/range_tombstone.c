@@ -437,6 +437,20 @@ int range_tombstone_fragment_overlaps(const rt_fragment_t *frag, const uint8_t *
     return 1;
 }
 
+int range_tombstone_set_meets(const range_tombstone_set_t *set, const uint8_t *lo,
+                              const size_t lo_size, const uint8_t *hi, const size_t hi_size)
+{
+    if (!set || !lo || !hi) return 0;
+    for (size_t i = 0; i < set->count; i++)
+    {
+        const rt_fragment_t *f = &set->frags[i];
+        if (tdb_key_cmp(f->lo, f->lo_size, hi, hi_size) > 0) continue;
+        if (f->hi && tdb_key_cmp(lo, lo_size, f->hi, f->hi_size) >= 0) continue;
+        return 1;
+    }
+    return 0;
+}
+
 int range_tombstone_set_fragment_at(const range_tombstone_set_t *set, const size_t i,
                                     const rt_fragment_t **out)
 {

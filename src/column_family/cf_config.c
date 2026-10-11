@@ -90,6 +90,8 @@ int cf_config_validate(const tidesdb_column_family_config_t *cfg,
 
     /* a bloom filter needs a false-positive rate strictly inside (0, 1) */
     if (cfg->enable_bloom_filter && (cfg->bloom_fpr <= 0.0 || cfg->bloom_fpr >= 1.0)) return -1;
+    if (cfg->enable_range_filter && (cfg->range_filter_fpr <= 0.0 || cfg->range_filter_fpr >= 1.0))
+        return -1;
 
     /* the tombstone density trigger is a ratio in [0, 1]; 0 disables it */
     if (cfg->tombstone_density_trigger < 0.0 || cfg->tombstone_density_trigger > 1.0) return -1;
@@ -114,7 +116,8 @@ int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out
     if (!cfg || !out || !out_len) return -1;
     if (cfg->encoding_count > TDB_ENCODING_PIPELINE_MAX) return -1;
 
-    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count;
+    const size_t len =
+        CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count + CF_CONFIG_BLOB_RANGE_FILTER_SIZE;
     uint8_t *buf = malloc(len);
     if (!buf) return -1;
 
@@ -142,6 +145,9 @@ int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out
     off += 8;
     buf[off++] = cfg->encoding_count;
     memcpy(buf + off, cfg->encoding_pipeline, cfg->encoding_count);
+    off += cfg->encoding_count;
+    buf[off++] = (uint8_t)(cfg->enable_range_filter ? 1 : 0);
+    tdb_encode_be64(cf_config_double_to_bits(cfg->range_filter_fpr), buf + off);
 
     *out = buf;
     *out_len = len;
@@ -181,6 +187,16 @@ int cf_config_deserialize(const uint8_t *data, size_t len, tidesdb_column_family
     if (len < (size_t)CF_CONFIG_BLOB_FIXED_SIZE + encoding_count) return -1;
     out->encoding_count = encoding_count;
     memcpy(out->encoding_pipeline, data + off, encoding_count);
+    off += encoding_count;
+
+    /* a blob that ends at the ids was written before the range filter fields and reads as off */
+    out->enable_range_filter = 0;
+    out->range_filter_fpr = 0.0;
+    if (len >= off + CF_CONFIG_BLOB_RANGE_FILTER_SIZE)
+    {
+        out->enable_range_filter = data[off++];
+        out->range_filter_fpr = cf_config_bits_to_double(tdb_decode_be64(data + off));
+    }
 
     /* every field above came off disk, where a torn write or a hostile blob can leave any bit
      * pattern that still passes the version and length checks. the decoded config then reaches the

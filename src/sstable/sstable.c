@@ -75,6 +75,8 @@ sstable_t *sstable_alloc_owning_path(uint64_t id, int partition, char *klog_path
 
     atomic_init(&sst->klog_bm, NULL);
     atomic_init(&sst->bloom, NULL);
+    atomic_init(&sst->range_filter, NULL);
+    atomic_init(&sst->range_filter_refused, 0);
     atomic_init(&sst->root_node, NULL);
     atomic_init(&sst->refcount, TDB_SSTABLE_REF_OWNER);
     atomic_init(&sst->last_access_time, (int64_t)time(NULL));
@@ -112,6 +114,8 @@ static void sstable_adopt_footer(sstable_t *sst, sstable_footer_t *footer)
     sst->last_leaf_offset = footer->last_leaf_offset;
     sst->bloom_dir_offset = footer->bloom_dir_offset;
     sst->bloom_dir_size = footer->bloom_dir_size;
+    sst->range_filter_dir_offset = footer->range_filter_dir_offset;
+    sst->range_filter_dir_size = footer->range_filter_dir_size;
     sst->distinct_key_count = footer->distinct_key_count;
     sst->tombstone_count = footer->tombstone_count;
     sst->max_seq = footer->max_seq;
@@ -327,6 +331,7 @@ void sstable_close(sstable_t *sst)
         if (sst->fdm) fd_manager_note_close(sst->fdm, FD_LABEL_SSTABLE_KLOG);
     }
     partitioned_bloom_filter_reader_free(atomic_load_explicit(&sst->bloom, memory_order_acquire));
+    range_filter_reader_free(atomic_load_explicit(&sst->range_filter, memory_order_acquire));
     cache_release(sst->root_pin);
 
     /* a superseded sstable's bytes stay charged to the filesystem until the file is unlinked, and

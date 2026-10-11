@@ -89,6 +89,9 @@ typedef enum
  * @param flush_threads the number of flush worker threads, 0 leaves the engine default
  * @param compaction_threads the number of compaction worker threads, 0 leaves the engine default
  * @param bloom whether column families enable a bloom filter
+ * @param range_filter whether column families build a range filter into every table
+ * @param range_filter_fpr the range filter's false positive rate, negative leaves the family
+ * default
  * @param isolation the transaction isolation level
  * @param log_level the engine log level, so a run can capture engine traces
  * @param log_file path the engine log is written to, empty to leave it on stderr
@@ -132,6 +135,8 @@ typedef struct
     int compaction_threads;
     int bloom;
     double bloom_fpr;
+    int range_filter;
+    double range_filter_fpr;
     tidesdb_isolation_level_t isolation;
     int log_level;
 

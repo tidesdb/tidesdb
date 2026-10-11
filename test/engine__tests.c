@@ -2378,7 +2378,7 @@ void test_engine_backup_rejects_source_directory(void)
     engine_put(db, cf, 0);
     ASSERT_EQ(tidesdb_checkpoint(db), TDB_SUCCESS);
 
-    ASSERT_NE(tidesdb_backup(db, db_path), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_backup(db, db_path), TDB_ERR_IO);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
     /* reopen so cached data cannot hide damage to the source files */

@@ -1577,7 +1577,7 @@ int tidesdb_sync_wal(tidesdb_t *db);
  * snapshot while compaction is held off, so the copy references no file that a merge could delete
  * mid-copy
  * @param db database handle
- * @param dir destination directory, created if absent
+ * @param dir destination directory, must be absent or empty
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_LOCKED if a family stayed under compaction
  * for the whole freeze window, TDB_ERR_MEMORY, or TDB_ERR_IO on a copy or io error
  */

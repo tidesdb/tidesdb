@@ -312,6 +312,20 @@ int engine_backup(tidesdb_t *db, const char *dir)
     if (!db || !dir) return TDB_ERR_INVALID_ARGS;
     if (mkdir(dir, ENGINE_BACKUP_DIR_MODE) != 0 && errno != EEXIST) return TDB_ERR_IO;
 
+    /* reject nonempty destinations before flushing or copying any source files */
+    DIR *d = opendir(dir);
+    if (!d) return TDB_ERR_IO;
+    struct dirent *ent;
+    errno = 0;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        closedir(d);
+        return TDB_ERR_IO;
+    }
+    const int read_error = errno;
+    if (closedir(d) != 0 || read_error != 0) return TDB_ERR_IO;
+
     TDB_DEBUG_LOG(TDB_LOG_INFO, "backup of %s starting to %s", db->db_path, dir);
 
     /* land the memtable in L1 first, so the copied sstables hold every committed write */

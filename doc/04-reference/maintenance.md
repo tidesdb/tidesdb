@@ -268,7 +268,7 @@ Cost and free space required are proportional to the live on-disk size.
 | Parameter | Description |
 | --- | --- |
 | `db` | Database handle |
-| `dir` | Destination directory, created if absent. Must not be the live database directory. |
+| `dir` | Destination directory, created if absent. An existing directory must be empty. Must not be the live database directory.
 
 ### Errors
 

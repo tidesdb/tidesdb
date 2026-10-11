@@ -788,7 +788,7 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name);
  * with compaction frozen and ddl held off, copy the manifest, value log, wals, and every cf's klogs
  * so no copied file can be deleted mid-copy. defined in engine_backup.c
  * @param db the engine
- * @param dir the destination directory, created if absent
+ * @param dir the destination directory, must be absent or empty
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_BUSY when compaction cannot be quiesced, or an
  * io or allocation error
  */

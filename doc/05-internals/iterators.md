@@ -102,6 +102,13 @@ a handful of descents instead of hundreds, and concurrent narrow scans stop comp
 store at once. Measured on a family of 32 disjoint sstables, a four-key scan went from 128 block
 cache lookups to 4.
 
+A table's key range is not the whole of what it can say about a range, though. A range delete is
+written into the table its memtable flushed to, beside whatever keys that memtable held, so the
+interval can cover keys far from the table's own. A scan therefore also takes every table carrying
+an interval that meets its range, whatever that table's keys are. A level holding no such table is
+still answered by its binary search, and the count of them is kept in the layout itself, so the
+level a scan judges and the tables it then walks come from the same snapshot.
+
 :::caution[A short scan is dominated by what it opens, not by what it reads]
 Building the merge opens a cursor into every source it kept, and each sstable cursor descends that
 tree from its root. So the setup is proportional to how many runs overlap the range, while the
@@ -231,4 +238,5 @@ that always returns both.
 | A level below L1 is one source | Its tables never overlap, so a seek descends the one table that can hold the key; a source per table descended all of them |
 | Sources stay pinned for the iterator's life | A compaction may replace a layout mid-scan |
 | A bounded iterator answers only inside its bounds | Sources outside the range were never opened, so a key beyond it may have no source that holds it |
+| A bounded scan takes every table whose range deletes meet its range | A range delete can sit in a table whose own keys lie elsewhere; `test_cf_iter_bounded_scan_sees_an_interval_held_by_a_table_outside_the_bounds` |
 | The snapshot is fixed for the iterator's life | Stability is the guarantee an iterator makes; which snapshot it is comes from the isolation level, but it does not move once chosen |

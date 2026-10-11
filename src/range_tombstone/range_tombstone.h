@@ -182,6 +182,20 @@ int range_tombstone_covering_fragment(const range_tombstone_set_t *set, const ui
 size_t range_tombstone_set_count(const range_tombstone_set_t *set);
 
 /**
+ * range_tombstone_set_meets
+ * whether any interval of a set shares a key with a range whose ends are both inclusive, as a
+ * scan's bounds are when they select the tables to read
+ * @param set the set, which may be NULL or empty
+ * @param lo the range's low end
+ * @param lo_size length of lo in bytes
+ * @param hi the range's high end
+ * @param hi_size length of hi in bytes
+ * @return 1 when one does, 0 otherwise
+ */
+int range_tombstone_set_meets(const range_tombstone_set_t *set, const uint8_t *lo, size_t lo_size,
+                              const uint8_t *hi, size_t hi_size);
+
+/**
  * range_tombstone_set_fragment_at
  * borrow one fragment by position, for a builder writing the set out or a test inspecting it. the
  * fragment belongs to the set and is valid until the set is changed or freed

@@ -759,7 +759,7 @@ int engine_checkpoint(tidesdb_t *db);
  * its logical size (not its preallocated on-disk size) so a reopen, which derives the size from
  * fstat, sees the same end-of-file. pass UINT64_MAX for a plain file. defined in engine_backup.c
  * @param src the source file path
- * @param dst the destination file path, created or overwritten
+ * @param dst the destination file path, created or overwritten; must not alias src
  * @param limit the maximum number of bytes to copy
  * @param durable non-zero to sync the copy and its directory entry before returning, which a backup
  * always asks for and a clone asks for when the database syncs its own commits

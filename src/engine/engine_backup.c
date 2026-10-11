@@ -69,8 +69,7 @@ static int engine_copy_prepare(int src_fd, int dst_fd)
 #else
     struct stat src_info, dst_info;
     if (fstat(src_fd, &src_info) != 0 || fstat(dst_fd, &dst_info) != 0) return TDB_ERR_IO;
-    if (src_info.st_dev == dst_info.st_dev && src_info.st_ino == dst_info.st_ino)
-        return TDB_ERR_IO;
+    if (src_info.st_dev == dst_info.st_dev && src_info.st_ino == dst_info.st_ino) return TDB_ERR_IO;
     /* devices such as /dev/null accept writes but cannot be truncated */
     if (!S_ISREG(dst_info.st_mode)) return TDB_SUCCESS;
 #endif

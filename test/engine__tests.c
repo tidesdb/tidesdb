@@ -2326,10 +2326,11 @@ void test_engine_checkpoint(void)
 
 /* a backup is a consistent, directly-openable copy: every key written to the source reads back from
  * a database opened on the backup directory */
-void test_engine_backup(void)
+static void engine_test_backup(int existing_empty)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
     (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    if (existing_empty) ASSERT_EQ(mkdir(ENGINE_TEST_BACKUP_DIR, 0755), 0);
     char db_path[] = ENGINE_TEST_DB_DIR;
     tidesdb_t *db = NULL;
     tidesdb_column_family_t *cf = NULL;
@@ -2366,6 +2367,16 @@ void test_engine_backup(void)
     (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
 }
 
+void test_engine_backup(void)
+{
+    engine_test_backup(0);
+}
+
+void test_engine_backup_existing_empty_directory(void)
+{
+    engine_test_backup(1);
+}
+
 /* rejecting a backup into the live directory preserves the source across a reopen */
 void test_engine_backup_rejects_source_directory(void)
 {
@@ -2379,6 +2390,14 @@ void test_engine_backup_rejects_source_directory(void)
     ASSERT_EQ(tidesdb_checkpoint(db), TDB_SUCCESS);
 
     ASSERT_EQ(tidesdb_backup(db, db_path), TDB_ERR_IO);
+    ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_DB_DIR PATH_SEPARATOR "."), TDB_ERR_IO);
+#ifndef _WIN32
+    const char *alias = "." PATH_SEPARATOR "test_engine_backup_alias";
+    (void)remove(alias);
+    ASSERT_EQ(symlink(db_path, alias), 0);
+    ASSERT_EQ(tidesdb_backup(db, alias), TDB_ERR_IO);
+    ASSERT_EQ(remove(alias), 0);
+#endif
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
     /* reopen so cached data cannot hide damage to the source files */
@@ -2391,6 +2410,54 @@ void test_engine_backup_rejects_source_directory(void)
 
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* rejection preserves unrelated destination files as well as the live database */
+void test_engine_backup_rejects_nonempty_directory(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    ASSERT_EQ(mkdir(ENGINE_TEST_BACKUP_DIR, 0755), 0);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+    engine_put(db, cf, 0);
+    ASSERT_EQ(tidesdb_checkpoint(db), TDB_SUCCESS);
+
+    const char *paths[] = {ENGINE_TEST_BACKUP_DIR PATH_SEPARATOR "keep",
+                           ENGINE_TEST_BACKUP_DIR PATH_SEPARATOR ".keep"};
+    const char bytes[] = "existing destination contents";
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+    {
+        FILE *f = fopen(paths[i], "wb");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+        ASSERT_EQ(fclose(f), 0);
+
+        ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_BACKUP_DIR), TDB_ERR_IO);
+        f = fopen(paths[i], "rb");
+        ASSERT_TRUE(f != NULL);
+        char actual[sizeof(bytes)];
+        ASSERT_EQ(fread(actual, 1, sizeof(actual), f), sizeof(actual));
+        ASSERT_EQ(memcmp(actual, bytes, sizeof(bytes)), 0);
+        ASSERT_EQ(fgetc(f), EOF);
+        ASSERT_EQ(ferror(f), 0);
+        ASSERT_EQ(fclose(f), 0);
+        ASSERT_EQ(remove(paths[i]), 0);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    db = NULL;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "key00000", "val00000");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
 }
 
 /* listing returns every created column family's name exactly once */
@@ -7706,6 +7773,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_range_stats_wide_range_is_estimated, tests_passed);
     RUN_TEST(test_engine_checkpoint, tests_passed);
     RUN_TEST(test_engine_backup, tests_passed);
+    RUN_TEST(test_engine_backup_existing_empty_directory, tests_passed);
+    RUN_TEST(test_engine_backup_rejects_nonempty_directory, tests_passed);
     RUN_TEST(test_engine_backup_rejects_source_directory, tests_passed);
     RUN_TEST(test_engine_list_column_families, tests_passed);
     RUN_TEST(test_engine_cf_update_runtime_config, tests_passed);

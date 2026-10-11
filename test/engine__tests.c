@@ -2366,6 +2366,33 @@ void test_engine_backup(void)
     (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
 }
 
+/* rejecting a backup into the live directory preserves the source across a reopen */
+void test_engine_backup_rejects_source_directory(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    engine_put(db, cf, 0);
+    ASSERT_EQ(tidesdb_checkpoint(db), TDB_SUCCESS);
+
+    ASSERT_NE(tidesdb_backup(db, db_path), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* reopen so cached data cannot hide damage to the source files */
+    db = NULL;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "key00000", "val00000");
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 /* listing returns every created column family's name exactly once */
 void test_engine_list_column_families(void)
 {
@@ -7589,6 +7616,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_range_stats_wide_range_is_estimated, tests_passed);
     RUN_TEST(test_engine_checkpoint, tests_passed);
     RUN_TEST(test_engine_backup, tests_passed);
+    RUN_TEST(test_engine_backup_rejects_source_directory, tests_passed);
     RUN_TEST(test_engine_list_column_families, tests_passed);
     RUN_TEST(test_engine_cf_update_runtime_config, tests_passed);
     RUN_TEST(test_engine_commit_hook, tests_passed);

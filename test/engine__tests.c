@@ -6630,6 +6630,37 @@ void test_engine_drop_removes_only_that_familys_files(void)
 #ifdef __linux__
 #define ENGINE_TEST_COPY_SRC "." PATH_SEPARATOR "test_engine_copy_src"
 
+/* copying to a hard link must reject the alias without truncating the source */
+void test_engine_copy_file_rejects_hard_link(void)
+{
+    const char *src = "." PATH_SEPARATOR "test_engine_copy_alias_src";
+    const char *dst = "." PATH_SEPARATOR "test_engine_copy_alias_dst";
+    (void)remove(dst);
+    (void)remove(src);
+
+    const char bytes[] = "source bytes must survive an aliased copy";
+    FILE *f = fopen(src, "wb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+    ASSERT_EQ(fclose(f), 0);
+
+    /* both paths now name the same underlying file */
+    ASSERT_EQ(link(src, dst), 0);
+    ASSERT_EQ(engine_copy_file(src, dst, sizeof(bytes), 0), TDB_ERR_IO);
+
+    f = fopen(src, "rb");
+    ASSERT_TRUE(f != NULL);
+    char actual[sizeof(bytes)];
+    ASSERT_EQ(fread(actual, 1, sizeof(actual), f), sizeof(actual));
+    ASSERT_EQ(memcmp(actual, bytes, sizeof(bytes)), 0);
+    ASSERT_EQ(fgetc(f), EOF);
+    ASSERT_EQ(ferror(f), 0);
+    ASSERT_EQ(fclose(f), 0);
+
+    ASSERT_EQ(remove(dst), 0);
+    ASSERT_EQ(remove(src), 0);
+}
+
 /* a copy is synced before it is reported done, since a clone's catalogue and a finished backup both
  * rely on it the moment the call returns. /dev/null takes the bytes and refuses the sync, so a copy
  * there has to fail rather than report a destination it never made durable */
@@ -7692,6 +7723,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
 #ifdef __linux__
+    RUN_TEST(test_engine_copy_file_rejects_hard_link, tests_passed);
     RUN_TEST(test_engine_copy_file_reports_a_failed_sync, tests_passed);
 #endif
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

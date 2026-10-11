@@ -268,7 +268,7 @@ Cost and free space required are proportional to the live on-disk size.
 | Parameter | Description |
 | --- | --- |
 | `db` | Database handle |
-| `dir` | Destination directory, created if absent. Must not be the live database directory. |
+| `dir` | Destination directory, created if absent. An existing directory must be empty. Must not be the live database directory. |
 
 ### Errors
 
@@ -277,7 +277,7 @@ Cost and free space required are proportional to the live on-disk size.
 | `TDB_ERR_INVALID_ARGS` | `db` or `dir` is `NULL` |
 | `TDB_ERR_LOCKED` | A column family stayed under compaction for the whole freeze window, so it could not be copied at a consistent point. Retryable |
 | `TDB_ERR_MEMORY` | Allocation failed |
-| `TDB_ERR_IO` | The directory could not be created, or a file could not be read or written |
+| `TDB_ERR_IO` | The destination is nonempty, the directory could not be created or inspected, or a file could not be read or written |
 
 ### See Also
 

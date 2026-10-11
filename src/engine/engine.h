@@ -755,12 +755,12 @@ int engine_checkpoint(tidesdb_t *db);
 
 /**
  * engine_copy_file
- * stream at most limit bytes from src to dst, overwriting dst; a block-manager file is copied to
+ * stream exactly limit bytes from src to dst, overwriting dst; a block-manager file is copied to
  * its logical size (not its preallocated on-disk size) so a reopen, which derives the size from
- * fstat, sees the same end-of-file. pass UINT64_MAX for a plain file. defined in engine_backup.c
+ * fstat, sees the same end-of-file. pass UINT64_MAX to copy until eof. defined in engine_backup.c
  * @param src the source file path
- * @param dst the destination file path, created or overwritten
- * @param limit the maximum number of bytes to copy
+ * @param dst the destination file path, created or overwritten; must not alias src
+ * @param limit the required number of bytes to copy, or UINT64_MAX to copy until eof
  * @param durable non-zero to sync the copy and its directory entry before returning, which a backup
  * always asks for and a clone asks for when the database syncs its own commits
  * @return TDB_SUCCESS, TDB_ERR_IO, or TDB_ERR_MEMORY
@@ -788,7 +788,7 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name);
  * with compaction frozen and ddl held off, copy the manifest, value log, wals, and every cf's klogs
  * so no copied file can be deleted mid-copy. defined in engine_backup.c
  * @param db the engine
- * @param dir the destination directory, created if absent
+ * @param dir the destination directory, must be absent or empty
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_BUSY when compaction cannot be quiesced, or an
  * io or allocation error
  */

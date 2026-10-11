@@ -2326,10 +2326,11 @@ void test_engine_checkpoint(void)
 
 /* a backup is a consistent, directly-openable copy: every key written to the source reads back from
  * a database opened on the backup directory */
-void test_engine_backup(void)
+static void engine_test_backup(int existing_empty)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
     (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    if (existing_empty) ASSERT_EQ(mkdir(ENGINE_TEST_BACKUP_DIR, 0755), 0);
     char db_path[] = ENGINE_TEST_DB_DIR;
     tidesdb_t *db = NULL;
     tidesdb_column_family_t *cf = NULL;
@@ -2361,6 +2362,99 @@ void test_engine_backup(void)
         engine_assert_committed(copy, ccf, key, val);
     }
     ASSERT_EQ(tidesdb_close(copy), TDB_SUCCESS);
+
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+}
+
+void test_engine_backup(void)
+{
+    engine_test_backup(0);
+}
+
+void test_engine_backup_existing_empty_directory(void)
+{
+    engine_test_backup(1);
+}
+
+/* rejecting a backup into the live directory preserves the source across a reopen */
+void test_engine_backup_rejects_source_directory(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    engine_put(db, cf, 0);
+    ASSERT_EQ(tidesdb_checkpoint(db), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_backup(db, db_path), TDB_ERR_IO);
+    ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_DB_DIR PATH_SEPARATOR "."), TDB_ERR_IO);
+#ifndef _WIN32
+    const char *alias = "." PATH_SEPARATOR "test_engine_backup_alias";
+    (void)remove(alias);
+    ASSERT_EQ(symlink(db_path, alias), 0);
+    ASSERT_EQ(tidesdb_backup(db, alias), TDB_ERR_IO);
+    ASSERT_EQ(remove(alias), 0);
+#endif
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* reopen so cached data cannot hide damage to the source files */
+    db = NULL;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "key00000", "val00000");
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* rejection preserves unrelated destination files as well as the live database */
+void test_engine_backup_rejects_nonempty_directory(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    ASSERT_EQ(mkdir(ENGINE_TEST_BACKUP_DIR, 0755), 0);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+    engine_put(db, cf, 0);
+    ASSERT_EQ(tidesdb_checkpoint(db), TDB_SUCCESS);
+
+    const char *paths[] = {ENGINE_TEST_BACKUP_DIR PATH_SEPARATOR "keep",
+                           ENGINE_TEST_BACKUP_DIR PATH_SEPARATOR ".keep"};
+    const char bytes[] = "existing destination contents";
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+    {
+        FILE *f = fopen(paths[i], "wb");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+        ASSERT_EQ(fclose(f), 0);
+
+        ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_BACKUP_DIR), TDB_ERR_IO);
+        f = fopen(paths[i], "rb");
+        ASSERT_TRUE(f != NULL);
+        char actual[sizeof(bytes)];
+        ASSERT_EQ(fread(actual, 1, sizeof(actual), f), sizeof(actual));
+        ASSERT_EQ(memcmp(actual, bytes, sizeof(bytes)), 0);
+        ASSERT_EQ(fgetc(f), EOF);
+        ASSERT_EQ(ferror(f), 0);
+        ASSERT_EQ(fclose(f), 0);
+        ASSERT_EQ(remove(paths[i]), 0);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    db = NULL;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "key00000", "val00000");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
     (void)remove_directory(ENGINE_TEST_DB_DIR);
     (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
@@ -6603,6 +6697,58 @@ void test_engine_drop_removes_only_that_familys_files(void)
 #ifdef __linux__
 #define ENGINE_TEST_COPY_SRC "." PATH_SEPARATOR "test_engine_copy_src"
 
+/* copying to a hard link must reject the alias without truncating the source */
+void test_engine_copy_file_rejects_aliases(void)
+{
+    const char *src = "." PATH_SEPARATOR "test_engine_copy_alias_src";
+    const char *dst = "." PATH_SEPARATOR "test_engine_copy_alias_dst";
+    (void)remove(dst);
+    (void)remove(src);
+
+    const char bytes[] = "source bytes must survive an aliased copy";
+    FILE *f = fopen(src, "wb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+    ASSERT_EQ(fclose(f), 0);
+
+    /* both paths now name the same underlying file */
+    ASSERT_EQ(link(src, dst), 0);
+    ASSERT_EQ(engine_copy_file(src, dst, sizeof(bytes), 0), TDB_ERR_IO);
+    ASSERT_EQ(engine_copy_file(src, src, sizeof(bytes), 0), TDB_ERR_IO);
+    ASSERT_EQ(remove(dst), 0);
+    ASSERT_EQ(symlink(src, dst), 0);
+    ASSERT_EQ(engine_copy_file(src, dst, sizeof(bytes), 0), TDB_ERR_IO);
+
+    f = fopen(src, "rb");
+    ASSERT_TRUE(f != NULL);
+    char actual[sizeof(bytes)];
+    ASSERT_EQ(fread(actual, 1, sizeof(actual), f), sizeof(actual));
+    ASSERT_EQ(memcmp(actual, bytes, sizeof(bytes)), 0);
+    ASSERT_EQ(fgetc(f), EOF);
+    ASSERT_EQ(ferror(f), 0);
+    ASSERT_EQ(fclose(f), 0);
+
+    ASSERT_EQ(remove(dst), 0);
+
+    /* a distinct existing file is still overwritten, including its old trailing bytes */
+    f = fopen(dst, "wb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+    ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+    ASSERT_EQ(fclose(f), 0);
+    ASSERT_EQ(engine_copy_file(src, dst, sizeof(bytes), 0), TDB_SUCCESS);
+    f = fopen(dst, "rb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fread(actual, 1, sizeof(actual), f), sizeof(actual));
+    ASSERT_EQ(memcmp(actual, bytes, sizeof(bytes)), 0);
+    ASSERT_EQ(fgetc(f), EOF);
+    ASSERT_EQ(ferror(f), 0);
+    ASSERT_EQ(fclose(f), 0);
+
+    ASSERT_EQ(remove(dst), 0);
+    ASSERT_EQ(remove(src), 0);
+}
+
 /* a copy is synced before it is reported done, since a clone's catalogue and a finished backup both
  * rely on it the moment the call returns. /dev/null takes the bytes and refuses the sync, so a copy
  * there has to fail rather than report a destination it never made durable */
@@ -6620,6 +6766,44 @@ void test_engine_copy_file_reports_a_failed_sync(void)
     (void)remove(ENGINE_TEST_COPY_SRC);
 }
 #endif
+
+/* finite copies require every requested byte, while an unlimited copy ends normally at eof */
+void test_engine_copy_file_checks_expected_length(void)
+{
+    const char *src = "." PATH_SEPARATOR "test_engine_copy_length_src";
+    const char *dst = "." PATH_SEPARATOR "test_engine_copy_length_dst";
+    (void)remove(dst);
+    (void)remove(src);
+
+    const char bytes[] = "known source bytes";
+    const size_t size = sizeof(bytes) - 1;
+    FILE *f = fopen(src, "wb");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(fwrite(bytes, 1, size, f), size);
+    ASSERT_EQ(fclose(f), 0);
+
+    /* check the copied contents and length for exact, prefix, empty, and unlimited copies */
+    const uint64_t limits[] = {size, 5, 0, UINT64_MAX};
+    const size_t expected_sizes[] = {size, 5, 0, size};
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++)
+    {
+        ASSERT_EQ(engine_copy_file(src, dst, limits[i], 0), TDB_SUCCESS);
+        f = fopen(dst, "rb");
+        ASSERT_TRUE(f != NULL);
+        char actual[sizeof(bytes)];
+        ASSERT_EQ(fread(actual, 1, sizeof(actual), f), expected_sizes[i]);
+        ASSERT_EQ(memcmp(actual, bytes, expected_sizes[i]), 0);
+        ASSERT_EQ(fgetc(f), EOF);
+        ASSERT_EQ(ferror(f), 0);
+        ASSERT_EQ(fclose(f), 0);
+    }
+
+    /* the source ends one byte before the requested length */
+    ASSERT_EQ(engine_copy_file(src, dst, size + 1, 0), TDB_ERR_IO);
+
+    ASSERT_EQ(remove(dst), 0);
+    ASSERT_EQ(remove(src), 0);
+}
 
 void test_engine_raise_open_file_limit(void)
 {
@@ -7589,6 +7773,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_range_stats_wide_range_is_estimated, tests_passed);
     RUN_TEST(test_engine_checkpoint, tests_passed);
     RUN_TEST(test_engine_backup, tests_passed);
+    RUN_TEST(test_engine_backup_existing_empty_directory, tests_passed);
+    RUN_TEST(test_engine_backup_rejects_nonempty_directory, tests_passed);
+    RUN_TEST(test_engine_backup_rejects_source_directory, tests_passed);
     RUN_TEST(test_engine_list_column_families, tests_passed);
     RUN_TEST(test_engine_cf_update_runtime_config, tests_passed);
     RUN_TEST(test_engine_commit_hook, tests_passed);
@@ -7662,8 +7849,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_recovered_prepare_keeps_its_scanned_range, tests_passed);
     RUN_TEST(test_engine_scan_footprint_refuses_a_phantom, tests_passed);
     RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
+    RUN_TEST(test_engine_copy_file_checks_expected_length, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
 #ifdef __linux__
+    RUN_TEST(test_engine_copy_file_rejects_aliases, tests_passed);
     RUN_TEST(test_engine_copy_file_reports_a_failed_sync, tests_passed);
 #endif
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

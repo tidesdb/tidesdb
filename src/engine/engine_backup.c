@@ -54,6 +54,28 @@ static int engine_is_wal_name(const char *name)
     return nlen >= elen && strcmp(name + nlen - elen, TDB_WAL_EXT) == 0;
 }
 
+/* compare opened files before truncating, so path aliases cannot destroy the source */
+static int engine_copy_prepare(int src_fd, int dst_fd)
+{
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION src_info, dst_info;
+    if (!GetFileInformationByHandle((HANDLE)_get_osfhandle(src_fd), &src_info) ||
+        !GetFileInformationByHandle((HANDLE)_get_osfhandle(dst_fd), &dst_info))
+        return TDB_ERR_IO;
+    if (src_info.dwVolumeSerialNumber == dst_info.dwVolumeSerialNumber &&
+        src_info.nFileIndexHigh == dst_info.nFileIndexHigh &&
+        src_info.nFileIndexLow == dst_info.nFileIndexLow)
+        return TDB_ERR_IO;
+#else
+    struct stat src_info, dst_info;
+    if (fstat(src_fd, &src_info) != 0 || fstat(dst_fd, &dst_info) != 0) return TDB_ERR_IO;
+    if (src_info.st_dev == dst_info.st_dev && src_info.st_ino == dst_info.st_ino) return TDB_ERR_IO;
+    /* devices such as /dev/null accept writes but cannot be truncated */
+    if (!S_ISREG(dst_info.st_mode)) return TDB_SUCCESS;
+#endif
+    return ftruncate(dst_fd, 0) == 0 ? TDB_SUCCESS : TDB_ERR_IO;
+}
+
 int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int durable)
 {
     FILE *in = fopen(src, "rb");
@@ -62,10 +84,33 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup cannot read %s", src);
         return TDB_ERR_IO;
     }
-    FILE *out = fopen(dst, "wb");
-    if (!out)
+    /* omit truncation until the opened destination is known to differ from the source */
+#ifdef _WIN32
+    const int dst_fd = open(dst, O_WRONLY | O_CREAT | O_BINARY, 0666);
+#else
+    const int dst_fd = open(dst, O_WRONLY | O_CREAT, 0666);
+#endif
+    if (dst_fd < 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup cannot write %s", dst);
+        fclose(in);
+        return TDB_ERR_IO;
+    }
+
+    if (engine_copy_prepare(tdb_fileno(in), dst_fd) != TDB_SUCCESS)
+    {
+        close(dst_fd);
+        fclose(in);
+        return TDB_ERR_IO;
+    }
+#ifdef _WIN32
+    FILE *out = _fdopen(dst_fd, "wb");
+#else
+    FILE *out = fdopen(dst_fd, "wb");
+#endif
+    if (!out)
+    {
+        close(dst_fd);
         fclose(in);
         return TDB_ERR_IO;
     }
@@ -90,7 +135,8 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
             }
             remaining -= got;
         }
-        if (rc == TDB_SUCCESS && ferror(in)) rc = TDB_ERR_IO;
+        if (rc == TDB_SUCCESS && (ferror(in) || (limit != UINT64_MAX && remaining > 0)))
+            rc = TDB_ERR_IO;
     }
 
     /* a durable copy is relied on the moment this returns, a clone's catalogue names it and a
@@ -311,6 +357,20 @@ int engine_backup(tidesdb_t *db, const char *dir)
 {
     if (!db || !dir) return TDB_ERR_INVALID_ARGS;
     if (mkdir(dir, ENGINE_BACKUP_DIR_MODE) != 0 && errno != EEXIST) return TDB_ERR_IO;
+
+    /* reject nonempty destinations before flushing or copying any source files */
+    DIR *d = opendir(dir);
+    if (!d) return TDB_ERR_IO;
+    struct dirent *ent;
+    errno = 0;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        closedir(d);
+        return TDB_ERR_IO;
+    }
+    const int read_error = errno;
+    if (closedir(d) != 0 || read_error != 0) return TDB_ERR_IO;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "backup of %s starting to %s", db->db_path, dir);
 

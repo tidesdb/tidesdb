@@ -916,12 +916,78 @@ void test_cf_iter_scan_resolves_by_sequence_where_a_point_get_resolves_by_positi
     cfi_db_close(&db);
 }
 
+/* the bands a range delete covers in the test below, first inclusive and end exclusive, and the
+ * band far from them that the table carrying the delete holds its one key in */
+#define CFI_COVERED_FIRST 10
+#define CFI_COVERED_END   12
+#define CFI_HOLDER_BAND   40
+
+/* a sequence above every key the bands were written at, so the delete covers them all */
+#define CFI_COVER_SEQ 100000
+
+/* a scan bounded to the covered bands still hides them. the table carrying the range delete holds
+ * its own key in another band entirely, so its key range never meets the scan, and the delete has
+ * to reach the scan anyway */
+void test_cf_iter_bounded_scan_sees_an_interval_held_by_a_table_outside_the_bounds(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_cf(&db, cf, &next_id, &fx, cfs);
+
+    char lo[CFI_BAND_KEY_LEN], hi[CFI_BAND_KEY_LEN], holder[CFI_BAND_KEY_LEN];
+    snprintf(lo, sizeof(lo), "b%03d", CFI_COVERED_FIRST);
+    snprintf(hi, sizeof(hi), "b%03d", CFI_COVERED_END);
+    snprintf(holder, sizeof(holder), "b%03d_k%03d", CFI_HOLDER_BAND, 0);
+    ASSERT_EQ(tidesdb_l0_apply_range_tombstone(l0, 0, (const uint8_t *)lo, strlen(lo),
+                                               (const uint8_t *)hi, strlen(hi), CFI_COVER_SEQ),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_apply(l0, 0, (const uint8_t *)holder, strlen(holder), (const uint8_t *)"v",
+                               1, -1, CFI_COVER_SEQ + 1, 0),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_l0_rotate(l0, tidesdb_memtable_create(NULL, CFI_BANDS + 1, CFI_BANDS + 1,
+                                                            CFI_MAX_LEVEL, CFI_PROB, NULL, NULL)),
+              TDB_SUCCESS);
+    tidesdb_memtable_t *immutable = tidesdb_l0_dequeue_immutable(l0);
+    ASSERT_TRUE(immutable != NULL);
+    ASSERT_EQ(flush_immutable(&fx, immutable), TDB_SUCCESS);
+
+    char first[CFI_BAND_KEY_LEN], last[CFI_BAND_KEY_LEN];
+    snprintf(first, sizeof(first), "b%03d_k%03d", CFI_COVERED_FIRST, 0);
+    snprintf(last, sizeof(last), "b%03d_k%03d", CFI_COVERED_END - 1, CFI_KEYS_PER_BAND - 1);
+    const cf_iter_bounds_t bounds = {.lower = (const uint8_t *)first,
+                                     .lower_size = strlen(first),
+                                     .upper = (const uint8_t *)last,
+                                     .upper_size = strlen(last)};
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new_bounded(cf, l0, UINT64_MAX, NULL, &bounds, &it), TDB_SUCCESS);
+    ASSERT_EQ(cf_iter_seek(it, (const uint8_t *)first, strlen(first)), TDB_SUCCESS);
+    /* the first key the scan yields, if any, must lie past the covered bands */
+    if (cf_iter_valid(it))
+    {
+        char at[CFI_BAND_KEY_LEN];
+        cfi_key_at(it, at, sizeof(at));
+        ASSERT_TRUE(strcmp(at, last) > 0);
+    }
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_cf_iter_memtable_over_sstable, tests_passed);
     RUN_TEST(test_cf_iter_full_scan_spans_every_sstable, tests_passed);
     RUN_TEST(test_cf_iter_narrow_range_scan_does_not_open_every_sstable, tests_passed);
+    RUN_TEST(test_cf_iter_bounded_scan_sees_an_interval_held_by_a_table_outside_the_bounds,
+             tests_passed);
     RUN_TEST(test_cf_iter_seek_hides_tombstones, tests_passed);
     RUN_TEST(test_cf_iter_direction_flip_across_sources, tests_passed);
     RUN_TEST(test_cf_iter_level_reads_as_one_source_in_both_directions, tests_passed);

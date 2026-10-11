@@ -144,6 +144,27 @@ int level_set_overlapping(level_set_t *ls, int level, const uint8_t *min_key, si
                           int max_out);
 
 /**
+ * level_set_meeting
+ * collect the sstables at a level a scan of [min_key, max_key] has to read, those whose key range
+ * meets it and those carrying a range tombstone that meets it. a range delete is held by the table
+ * its memtable flushed to, whose own keys may lie anywhere, so a table holding no key in the range
+ * can still hide keys other tables hold there. returned in the level's order and referenced for the
+ * caller, who drops each with sstable_unref
+ * @param ls the level set
+ * @param level 1-based level
+ * @param min_key low end of the range (inclusive)
+ * @param min_key_size size of min_key
+ * @param max_key high end of the range (inclusive)
+ * @param max_key_size size of max_key
+ * @param out destination array receiving referenced sstables, filled up to max_out
+ * @param max_out capacity of out
+ * @return how many sstables meet the range, which may exceed max_out, with the same meaning as for
+ *         level_set_overlapping. -1 on a bad argument
+ */
+int level_set_meeting(level_set_t *ls, int level, const uint8_t *min_key, size_t min_key_size,
+                      const uint8_t *max_key, size_t max_key_size, sstable_t **out, int max_out);
+
+/**
  * level_set_collect_all
  * reference every sstable across all levels for a full snapshot scan; the caller drops each with
  * sstable_unref. atomic against the layout, so the caller queries the count with a NULL out,

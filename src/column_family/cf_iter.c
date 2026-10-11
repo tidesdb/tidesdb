@@ -87,8 +87,10 @@ static int cf_iter_collect_level_in_range(cf_iter_t *it, cf_t *cf, int level,
     if (room <= 0) return TDB_ERR_BUSY; /* nothing left to collect into; the caller re-sizes */
 
     sstable_t **slot = &it->ssts[at];
-    const int got = level_set_overlapping(cf->levels, level, bounds->lower, bounds->lower_size,
-                                          bounds->upper, bounds->upper_size, slot, room);
+    /* every table a scan of the bounds has to read, including one whose range deletes reach into
+     * them from a table whose own keys lie elsewhere */
+    const int got = level_set_meeting(cf->levels, level, bounds->lower, bounds->lower_size,
+                                      bounds->upper, bounds->upper_size, slot, room);
     if (got < 0) return TDB_ERR_BUSY;
     if (got > room)
     {

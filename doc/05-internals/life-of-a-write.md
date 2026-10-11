@@ -141,7 +141,9 @@ does not feed the write should not narrow the window the write is validated over
 A [range delete](/reference/transaction#tidesdb_txn_delete_range) is scanned over its interval
 rather than as a key: *does any key in these bounds sit above my snapshot*, in the store and among
 the commits in flight sequenced below this one. Probing its lower bound as though it were a key
-would clear a commit about to delete data another transaction had just written. The interval it
+would clear a commit about to delete data another transaction had just written. A table its range
+filter shows holding no key in the interval is not descended, once its own intervals have been
+checked, since a filter covers keys and not intervals. The interval it
 holds from stage 3 is released once the batch is visible, which is what carries a two-phase range
 delete through its in-doubt window; the table is almost always empty, so a point write's check of
 it is a single atomic load of its count.

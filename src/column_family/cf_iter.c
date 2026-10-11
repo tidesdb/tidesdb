@@ -87,8 +87,8 @@ static int cf_iter_collect_level_in_range(cf_iter_t *it, cf_t *cf, int level,
     if (room <= 0) return TDB_ERR_BUSY; /* nothing left to collect into; the caller re-sizes */
 
     sstable_t **slot = &it->ssts[at];
-    const int got = level_set_overlapping(cf->levels, level, bounds->lower, bounds->lower_size,
-                                          bounds->upper, bounds->upper_size, slot, room);
+    const int got = level_set_meeting(cf->levels, level, bounds->lower, bounds->lower_size,
+                                      bounds->upper, bounds->upper_size, slot, room);
     if (got < 0) return TDB_ERR_BUSY;
     if (got > room)
     {
@@ -98,6 +98,36 @@ static int cf_iter_collect_level_in_range(cf_iter_t *it, cf_t *cf, int level,
         return TDB_ERR_BUSY;
     }
     return got;
+}
+
+/* drop the tables a range filter shows hold no key in the bounds, keeping their order, and count
+ * what was asked and what was dropped. returns how many tables remain */
+static int cf_iter_prune_by_filter(sstable_t **slot, int got, const cf_iter_bounds_t *b,
+                                   uint64_t *probes, uint64_t *skips)
+{
+    int kept = 0;
+    for (int i = 0; i < got; i++)
+    {
+        sstable_t *t = slot[i];
+        /* a scan learns what a table's intervals delete only from that table's own source, so a
+         * table whose intervals meet the range stays even when it holds no key there */
+        if (!sstable_has_range_filter(t) ||
+            range_tombstone_set_meets(t->range_tombstones, b->lower, b->lower_size, b->upper,
+                                      b->upper_size))
+        {
+            slot[kept++] = t;
+            continue;
+        }
+        (*probes)++;
+        if (sstable_range_may_contain(t, b->lower, b->lower_size, b->upper, b->upper_size))
+        {
+            slot[kept++] = t;
+            continue;
+        }
+        (*skips)++;
+        if (sstable_unref(t)) sstable_close(t);
+    }
+    return kept;
 }
 
 /* reference only the sstables that could hold a key in the bounds, across every level */
@@ -124,17 +154,25 @@ static int cf_iter_collect_ssts_in_range(cf_iter_t *it, cf_t *cf, const cf_iter_
 
         it->ssts = arr;
         int n = 0, rc = TDB_SUCCESS;
+        uint64_t probes = 0, skips = 0;
+        const int consult = atomic_load_explicit(&cf->range_filter_on, memory_order_relaxed);
         for (int level = LEVEL_SET_L1; level <= LEVEL_SET_MAX_LEVELS && rc == TDB_SUCCESS; level++)
         {
             if (n >= cap) break; /* the family grew past the sizing; the retry below re-sizes */
-            const int got = cf_iter_collect_level_in_range(it, cf, level, bounds, n, cap - n);
+            int got = cf_iter_collect_level_in_range(it, cf, level, bounds, n, cap - n);
             if (got < 0)
                 rc = got;
-            else
-                for (int i = 0; i < got; i++) levels[n++] = level;
+            else if (consult)
+                got = cf_iter_prune_by_filter(&arr[n], got, bounds, &probes, &skips);
+            for (int i = 0; i < got && rc == TDB_SUCCESS; i++) levels[n++] = level;
         }
         if (rc == TDB_SUCCESS)
         {
+            /* once a scan, rather than once a table, so readers do not share a line per table */
+            if (probes > 0)
+                atomic_fetch_add_explicit(&cf->range_filter_probes, probes, memory_order_relaxed);
+            if (skips > 0)
+                atomic_fetch_add_explicit(&cf->range_filter_skips, skips, memory_order_relaxed);
             it->levels = levels;
             it->n_ssts = n;
             return TDB_SUCCESS;

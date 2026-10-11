@@ -54,6 +54,8 @@ takes the name separately, and the separate argument wins. See
 | `encoding_count` | 0 | Entries in the pipeline |
 | `enable_bloom_filter` | 1 | Build a partitioned bloom filter per sstable |
 | `bloom_fpr` | 0.01 | Target false positive rate |
+| `enable_range_filter` | 0 | Build a range filter per sstable, answering whether a key range may hold any of its keys. It costs about `log2(2 / range_filter_fpr) + 2` bits a key and roughly 80 to 110 ns a key when a table is built |
+| `range_filter_fpr` | 0.01 | Target false positive rate for a range over uniformly spread keys |
 | `default_isolation_level` | `TDB_ISOLATION_READ_COMMITTED` | Level used by `tidesdb_txn_begin_cf` |
 | `l1_file_count_trigger` | 4 | L1 file count that triggers compaction |
 | `tombstone_density_trigger` | 0.5 | Tombstone fraction that triggers compaction |

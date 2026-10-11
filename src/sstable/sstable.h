@@ -17,9 +17,10 @@
 #include "db.h"                     /* TDB_MAX_CF_NAME_LEN */
 #include "fdmanager/fdmanager.h"    /* the descriptor budget guarding klog reopens */
 #include "io/block_manager.h"
-#include "manifest/manifest.h"               /* tidesdb_manifest_entry_t names the file to open */
-#include "range_tombstone/range_tombstone.h" /* the tombstone block a table carries */
-#include "sstable/btree/btree.h"             /* btree_t, btree_builder for the sstable klog */
+#include "manifest/manifest.h"                /* tidesdb_manifest_entry_t names the file to open */
+#include "range_filter/range_filter_reader.h" /* the range filter a table may carry */
+#include "range_tombstone/range_tombstone.h"  /* the tombstone block a table carries */
+#include "sstable/btree/btree.h"              /* btree_t, btree_builder for the sstable klog */
 #include "sstable/partitioned_bloom_filter.h"
 #include "sstable/vlog.h" /* the shared db-global value log, borrowed by the builder */
 
@@ -41,6 +42,14 @@
 /* on-disk footer format version, aligned with the v10 on-disk generation, so a future layout change
  * is detected rather than misread */
 #define TDB_SSTABLE_FORMAT_VERSION 10
+
+/* the footer's extension area follows the value-log histogram, opened by this magic, "TDBX". a
+ * parser that predates it stops at the histogram and never sees the area, so a field added here
+ * reaches new readers without moving the format version older readers check */
+#define TDB_SSTABLE_FOOTER_EXT_MAGIC 0x54444258 /* "TDBX" */
+
+/* the extension tag naming the range filter's directory, its offset then its size */
+#define TDB_SSTABLE_FOOTER_EXT_RANGE_FILTER 1
 
 /* an sstable can name at most one segment per segment that exists, and the segment table is fixed
  * at open, so the histogram is bounded by construction and never has to refuse an entry -- which
@@ -100,6 +109,9 @@ typedef struct
  *        each they hold, owned by the footer (freed by sstable_footer_free). summed over the live
  *        tables it is what the store's segment liveness is, so reclamation needs no scan
  * @param vlog_ref_count how many entries vlog_refs holds
+ * @param range_filter_dir_offset where the range filter's directory landed, read from the footer's
+ *        extension area, 0 when the table carries no range filter
+ * @param range_filter_dir_size how large that directory is, 0 when the table carries none
  */
 typedef struct
 {
@@ -128,6 +140,8 @@ typedef struct
     uint8_t encoding_count;
     sstable_vlog_ref_t *vlog_refs;
     uint32_t vlog_ref_count;
+    uint64_t range_filter_dir_offset;
+    uint32_t range_filter_dir_size;
 } sstable_footer_t;
 
 /**
@@ -144,11 +158,17 @@ typedef struct
  * reopen
  * @param bloom membership front, lazily opened on first read and published by a cas; stays NULL
  * when the sstable has no bloom (no keys)
+ * @param range_filter range front, lazily opened on first range probe and published by a cas;
+ * stays NULL when the sstable carries none
+ * @param range_filter_refused set once the range filter's directory failed its checks, so a damaged
+ * filter is not fetched and decoded again on every probe
  * @param root_offset cached footer field, lets a reopen btree_open without re-reading the footer
  * @param first_leaf_offset cached footer field
  * @param last_leaf_offset cached footer field
  * @param bloom_dir_offset cached footer field
  * @param bloom_dir_size cached footer field
+ * @param range_filter_dir_offset cached footer field, from the extension area, 0 without a filter
+ * @param range_filter_dir_size cached footer field, 0 without a filter
  * @param distinct_key_count cached footer field
  * @param tombstone_count cached footer field
  * @param max_seq cached footer field
@@ -211,6 +231,8 @@ typedef struct
 
     _Atomic(block_manager_t *) klog_bm;
     _Atomic(partitioned_bloom_filter_reader_t *) bloom;
+    _Atomic(range_filter_reader_t *) range_filter;
+    _Atomic(int) range_filter_refused;
     _Atomic(btree_node_t *) root_node;
     cache_entry_t *root_pin;
 
@@ -219,6 +241,8 @@ typedef struct
     int64_t last_leaf_offset;
     uint64_t bloom_dir_offset;
     uint32_t bloom_dir_size;
+    uint64_t range_filter_dir_offset;
+    uint32_t range_filter_dir_size;
     uint64_t distinct_key_count;
     uint64_t tombstone_count;
     uint64_t max_seq;
@@ -328,6 +352,28 @@ int sstable_open_from_manifest(sstable_t **out, const char *cf_dir, const char *
  * @return the open block manager, or NULL if the reopen failed (an fd budget or io error)
  */
 block_manager_t *sstable_ensure_open(sstable_t *sst);
+
+/**
+ * sstable_range_may_contain
+ * whether [lo, hi] may hold a key of this table, asked of its range filter, so a bounded scan can
+ * skip a table that holds none. a table without a filter, or one that cannot be read, answers yes
+ * @param sst the sstable
+ * @param lo the low key, inclusive
+ * @param lo_size its length
+ * @param hi the high key, inclusive
+ * @param hi_size its length
+ * @return 0 when the range certainly holds no key of the table, 1 otherwise
+ */
+int sstable_range_may_contain(sstable_t *sst, const uint8_t *lo, size_t lo_size, const uint8_t *hi,
+                              size_t hi_size);
+
+/**
+ * sstable_has_range_filter
+ * whether the table was written with a range filter
+ * @param sst the sstable
+ * @return 1 when it was, 0 otherwise
+ */
+int sstable_has_range_filter(const sstable_t *sst);
 
 /**
  * sstable_get_at_seq
@@ -546,6 +592,9 @@ void sstable_close(sstable_t *sst);
  * @param enable_bloom build a partitioned bloom filter (partitioned_bloom_filter) for point-get
  * pruning
  * @param bloom_fpr target bloom false-positive rate when enable_bloom is set
+ * @param range_filter_r_bits the remainder width of the range filter to build, 0 to build none
+ * @param range_filter_expected_keys the distinct keys the table is expected to hold, which sizes
+ * the range filter's model, 0 when the caller cannot say
  * @param sync_mode block-manager sync mode, drives the durability barrier at finish
  * @param id sstable id for the produced sstable and its manifest row
  * @param partition partition shard, or MANIFEST_NO_PARTITION
@@ -572,6 +621,8 @@ typedef struct
     const range_tombstone_set_t *range_tombstones;
     int enable_bloom;
     double bloom_fpr;
+    unsigned range_filter_r_bits;
+    uint64_t range_filter_expected_keys;
     int sync_mode;
     uint64_t id;
     int partition;

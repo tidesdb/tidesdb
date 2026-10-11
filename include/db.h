@@ -272,6 +272,10 @@ typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_op
  * @param encoding_count number of entries in the pipeline, at most TDB_ENCODING_PIPELINE_MAX
  * @param enable_bloom_filter build a partitioned bloom filter for point-get pruning
  * @param bloom_fpr target bloom false-positive rate when the filter is enabled
+ * @param enable_range_filter build a range filter into every sstable, which answers whether a key
+ * range may hold any of the table's keys. off by default
+ * @param range_filter_fpr target false-positive rate for a range of uniformly spread keys when the
+ * range filter is enabled. it costs about log2(2 / fpr) + 2 bits a key, so 0.01 takes about ten
  * @param default_isolation_level isolation applied to a transaction opened without an explicit
  * level
  * @param l1_file_count_trigger L1 sstable count that triggers compaction
@@ -295,6 +299,8 @@ typedef struct tidesdb_column_family_config_t
     uint8_t encoding_count;
     int enable_bloom_filter;
     double bloom_fpr;
+    int enable_range_filter;
+    double range_filter_fpr;
     tidesdb_isolation_level_t default_isolation_level;
     int l1_file_count_trigger;
     double tombstone_density_trigger;
@@ -432,12 +438,17 @@ typedef struct tidesdb_config_t
  * @param unflushed_key_count distinct keys resident in the shared memtables for this cf and not yet
  * in any sstable, so total_keys plus this is the live logical key count including what is still in
  * memory
- * @param filter_resident_bytes memory this family's partitioned bloom filters hold outside the
- * block cache -- one routing directory per sstable, holding each partition's offset and its whole
- * first key. the filter bit arrays themselves are not counted here: those are fetched per probe and
- * live in the cache, where block_cache_size already bounds them. a directory is built on a table's
- * first probe, so this reads zero for a family nothing has read from yet and rises as tables are
- * touched
+ * @param filter_resident_bytes memory this family's filters hold outside the block cache -- per
+ * sstable, the bloom filter's routing directory, holding each partition's offset and its whole
+ * first key, and when the family builds one the range filter's directory, holding its model, its
+ * samples and its partition table. the partitions themselves are not counted here: those are
+ * fetched per probe and live in the cache, where block_cache_size already bounds them. a directory
+ * is built on a table's first probe, so this reads zero for a family nothing has read from yet and
+ * rises as tables are touched
+ * @param range_filter_probes sstables a bounded scan or a range delete's conflict probe asked a
+ * range filter about, since the database opened
+ * @param range_filter_skips of those, the sstables the range filter showed held no key in the
+ * range, which were left unread
  */
 typedef struct tidesdb_cf_stats_t
 {
@@ -467,6 +478,8 @@ typedef struct tidesdb_cf_stats_t
     uint64_t compaction_count;
     uint64_t unflushed_key_count;
     uint64_t filter_resident_bytes;
+    uint64_t range_filter_probes;
+    uint64_t range_filter_skips;
 } tidesdb_cf_stats_t;
 
 /**

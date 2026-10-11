@@ -120,6 +120,8 @@ static void ce_builder_config(const compaction_ctx_t *cx, uint64_t id, const cha
     config->value_threshold = cf_config_value_threshold(cc, cx->value_threshold);
     config->enable_bloom = cc->enable_bloom_filter;
     config->bloom_fpr = cc->bloom_fpr;
+    config->range_filter_r_bits =
+        cc->enable_range_filter ? range_filter_remainder_bits(cc->range_filter_fpr) : 0;
     config->sync_mode = cx->sync_mode;
     config->id = id;
     config->partition = MANIFEST_NO_PARTITION;
@@ -162,6 +164,7 @@ static int ce_sink_open(ce_sink_t *s)
     tidesdb_column_family_config_t cc;
     ce_builder_config(s->cx, id, klog_path, &cc, &config);
     config.range_tombstones = s->carried;
+    config.range_filter_expected_keys = s->expected_keys;
     if (sstable_builder_new(&s->cur_builder, s->cur_bm, s->cx->cf->vlog, &config) != TDB_SUCCESS)
     {
         /* the klog was never adopted, so it was not counted; close it without a note_close, and
@@ -572,6 +575,22 @@ static int ce_merge_inputs(const compaction_ctx_t *cx, const compaction_job_t *j
     return rc;
 }
 
+/* the distinct keys one output is expected to hold, the inputs' keys or, when outputs roll at a
+ * size cap, the share of them that fits under it. an estimate only sizes a range filter's model, so
+ * the versions a merge drops are not worth counting */
+static uint64_t ce_expected_output_keys(const compaction_job_t *job, sstable_t *const *inputs,
+                                        int n_inputs)
+{
+    uint64_t keys = 0, bytes = 0;
+    for (int i = 0; i < n_inputs; i++)
+    {
+        keys += inputs[i]->distinct_key_count;
+        bytes += inputs[i]->klog_logical_bytes;
+    }
+    if (job->file_max == 0 || bytes <= job->file_max) return keys;
+    return (uint64_t)((double)keys * (double)job->file_max / (double)bytes);
+}
+
 /* one worker's share of a subdivided merge: a contiguous run of the job's boundary partitions, and
  * the sink the outputs for that run are built into */
 typedef struct
@@ -693,6 +712,9 @@ static int ce_merge_subdivided(const compaction_ctx_t *cx, const compaction_job_
         tasks[i].inputs = inputs;
         tasks[i].n_inputs = n_inputs;
         tasks[i].sink.cx = cx;
+        /* a range's outputs share its slice of the keys, and none outgrows the per-output share */
+        const uint64_t slice = ce_expected_output_keys(job, inputs, n_inputs) / (uint64_t)k;
+        tasks[i].sink.expected_keys = slice < sink->expected_keys ? slice : sink->expected_keys;
         tasks[i].rc = TDB_SUCCESS;
         ce_range_bounds(&tasks[i], job, lo, hi);
         lo = hi;
@@ -763,6 +785,7 @@ int compaction_exec(const compaction_ctx_t *cx, const compaction_job_t *job)
     ce_sink_t sink;
     memset(&sink, 0, sizeof(sink));
     sink.cx = cx;
+    sink.expected_keys = ce_expected_output_keys(&run, inputs, n_inputs);
     /* borrowed by the sink for the length of the merge; every output clones what it is given */
     range_tombstone_set_t *carried = NULL;
     /* built before anything is written, so a failure to gather what the inputs carry stops the

@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "../src/base/errors.h"
+#include "../src/base/keycmp.h"
 #include "../src/compaction/compaction_exec.h"
 #include "../src/flush/flush.h"
 #include "test_utils.h"
@@ -34,6 +35,9 @@ typedef struct
     size_t value_threshold;
 } ce_db_t;
 
+/* when set, the next fixture opened builds a range filter into every table */
+static int ce_range_filter_on;
+
 static void ce_db_open_threshold(ce_db_t *db, size_t value_threshold)
 {
     (void)remove_directory(CE_DB_DIR);
@@ -56,6 +60,8 @@ static void ce_db_open_threshold(ce_db_t *db, size_t value_threshold)
     cfg.btree_klog_block_size = 4096;
     cfg.enable_bloom_filter = 1;
     cfg.bloom_fpr = 0.01;
+    cfg.enable_range_filter = ce_range_filter_on;
+    cfg.range_filter_fpr = 0.01;
     ASSERT_EQ(
         cf_create(CE_DB_DIR, 0, &cfg, NULL, db->vlog, db->cache, &db->fdm, NULL, NULL, &db->cf), 0);
     ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, 0, "cf0", NULL, 0), 0);
@@ -355,6 +361,113 @@ void test_compaction_split_size(void)
               level_set_count(db.cf->levels, 2));
     ce_assert_read(db.cf, 2, "k0", "value-0");
     ce_assert_read(db.cf, 2, "k9", "value-9");
+    ce_db_close(&db);
+}
+
+/* keys in the range filter merge test, enough to split into several outputs */
+#define CE_RF_KEYS 3000
+
+/* the size each output of that merge rolls at, in klog bytes */
+#define CE_RF_FILE_MAX (16 * 1024)
+
+/* the most tables the test collects from one level */
+#define CE_RF_MAX_TABLES 64
+
+/* every this many keys is written as a tombstone */
+#define CE_RF_TOMB_EVERY 5
+
+/* every table at a level, by asking for the widest range */
+static int ce_level_tables(cf_t *cf, int level, sstable_t **out, int cap)
+{
+    static const uint8_t hi[] = {0xFF, 0xFF, 0xFF, 0xFF};
+    return level_set_overlapping(cf->levels, level, (const uint8_t *)"", 0, hi, sizeof(hi), out,
+                                 cap);
+}
+
+/* the even keys a flush writes and the odd ones between them */
+static void ce_rf_key(char *buf, size_t cap, int n)
+{
+    snprintf(buf, cap, "rk%07d", n);
+}
+
+/* how many of the gaps between a table's own keys its filter refuses, asserting it accepts every
+ * key the table holds */
+static int ce_rf_check_table(sstable_t *t, char (*keys)[16], int *gaps)
+{
+    int refused = 0;
+    for (int i = 0; i < CE_RF_KEYS; i++)
+    {
+        const uint8_t *k = (const uint8_t *)keys[i];
+        const size_t ks = strlen(keys[i]);
+        /* only the keys inside this table's bounds belong to it */
+        if (tdb_key_cmp(k, ks, t->min_key, t->min_key_size) < 0 ||
+            tdb_key_cmp(k, ks, t->max_key, t->max_key_size) >= 0)
+            continue;
+        ASSERT_EQ(sstable_range_may_contain(t, k, ks, k, ks), 1);
+        char odd[16];
+        ce_rf_key(odd, sizeof(odd), 2 * i + 1);
+        (*gaps)++;
+        refused += sstable_range_may_contain(t, (const uint8_t *)odd, strlen(odd),
+                                             (const uint8_t *)odd, strlen(odd)) == 0;
+    }
+    return refused;
+}
+
+/* with the range filter on, a flush and a merge that splits by size both write it into every table
+ * they produce. each table answers yes for every key it holds, tombstones included, since skipping
+ * a table that holds only a key's tombstone would bring back the value it hides, and no for most
+ * of the gaps between its keys */
+void test_compaction_writes_range_filters_into_every_output(void)
+{
+    ce_range_filter_on = 1;
+    ce_db_t db;
+    ce_db_open(&db);
+    ce_range_filter_on = 0;
+    ce_entry_t *e = malloc(CE_RF_KEYS * sizeof(*e));
+    char(*keys)[16] = malloc(CE_RF_KEYS * sizeof(*keys));
+    ASSERT_TRUE(e != NULL && keys != NULL);
+    for (int i = 0; i < CE_RF_KEYS; i++)
+    {
+        ce_rf_key(keys[i], sizeof(keys[i]), 2 * i);
+        e[i] = (ce_entry_t){keys[i], "v", (uint64_t)(i + 1), i % CE_RF_TOMB_EVERY == 0};
+    }
+    const uint64_t id0 = ce_flush(&db, e, CE_RF_KEYS, 1);
+    sstable_t *tables[CE_RF_MAX_TABLES];
+    int n = ce_level_tables(db.cf, 1, tables, CE_RF_MAX_TABLES);
+    ASSERT_EQ(n, 1);
+    ASSERT_TRUE(sstable_has_range_filter(tables[0]));
+    if (sstable_unref(tables[0])) sstable_close(tables[0]);
+
+    const uint64_t inputs[1] = {id0};
+    compaction_job_t job = {0};
+    job.input_ids = inputs;
+    job.n_inputs = 1;
+    job.target_level = 2;
+    job.is_largest_level = 0; /* keep the tombstones, which the filter has to hold */
+    job.split = COMPACTION_SPLIT_NONE;
+    job.file_max = CE_RF_FILE_MAX;
+    const compaction_ctx_t cx = {.cf = db.cf,
+                                 .manifest = db.manifest,
+                                 .manifest_path = db.manifest_path,
+                                 .next_sstable_id = &db.next_id,
+                                 .gc_floor = UINT64_MAX,
+                                 .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                                 .value_threshold = db.value_threshold};
+    ASSERT_EQ(compaction_exec(&cx, &job), TDB_SUCCESS);
+    n = ce_level_tables(db.cf, 2, tables, CE_RF_MAX_TABLES);
+    ASSERT_TRUE(n > 1);
+    int refused = 0, gaps = 0;
+    for (int t = 0; t < n; t++)
+    {
+        ASSERT_TRUE(sstable_has_range_filter(tables[t]));
+        refused += ce_rf_check_table(tables[t], keys, &gaps);
+    }
+    fprintf(stderr, "  %d outputs, %d of %d gaps refused\n", n, refused, gaps);
+    ASSERT_TRUE(refused * 2 > gaps);
+    for (int t = 0; t < n; t++)
+        if (sstable_unref(tables[t])) sstable_close(tables[t]);
+    free(e);
+    free(keys);
     ce_db_close(&db);
 }
 
@@ -962,6 +1075,7 @@ int main(int argc, char **argv)
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_boundaries, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_subdivided_merge_matches_one_thread, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size, tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_compaction_writes_range_filters_into_every_output, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_within_boundaries, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_split_size_excludes_spilled_values, tests_passed);
     RUN_TEST_HANDLE_BALANCED(test_compaction_keeps_tombstone_with_sibling, tests_passed);

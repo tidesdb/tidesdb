@@ -50,6 +50,7 @@
 #define TDB_DEFAULT_CF_LEVEL_SIZE_RATIO 10
 #define TDB_DEFAULT_CF_MIN_LEVELS       1
 #define TDB_DEFAULT_CF_BLOOM_FPR        0.01
+#define TDB_DEFAULT_CF_RANGE_FILTER_FPR 0.01
 /* the dividing level sits this far above the largest, so X = L - 2. Spooky measures X = L - 1 as
  * running out of space at scale, since a dividing merge there rewrites a level holding a tenth of
  * the data at once, and X = L - 4 as exhausting the open-file budget; L - 2 is the balance it
@@ -139,6 +140,8 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
     c.encoding_count = 0;
     c.enable_bloom_filter = 1;
     c.bloom_fpr = TDB_DEFAULT_CF_BLOOM_FPR;
+    c.enable_range_filter = 0;
+    c.range_filter_fpr = TDB_DEFAULT_CF_RANGE_FILTER_FPR;
     c.default_isolation_level = TDB_ISOLATION_READ_COMMITTED;
     c.l1_file_count_trigger = TDB_DEFAULT_CF_L1_FILE_COUNT_TRIGGER;
     c.tombstone_density_trigger = TDB_DEFAULT_CF_TOMBSTONE_DENSITY;

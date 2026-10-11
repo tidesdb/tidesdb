@@ -411,6 +411,7 @@ the key logs are a rounding error and everything else would report a figure belo
 | `--memtable_size`, `--cache_size`, `--l0_stall` | The engine knobs most worth sweeping |
 | `--flush_threads`, `--compaction_threads` | Background pool sizes |
 | `--bloom`, `--bloom_fpr` | Filter on or off, and its false-positive target |
+| `--range_filter`, `--range_filter_fpr` | Range filter on or off, and its false-positive target |
 | `--seconds` | Run each workload for a wall-clock duration instead of to its operation count. Prefer it: a run bounded by operations takes whatever time it takes, and at high thread counts that is often a fraction of a second |
 | `--compression` | The column families' encoding pipeline — `none`, `snappy`, `lz4`, `lz4fast`, `zstd`. **A store that compresses is a different engine from one that does not**: every key-log node is encoded on the way out and decoded on every read that misses the cache, so a benchmark left at `none` does not describe a deployment that sets it |
 | `--index_fanout` | Rows sharing one indexed value, for `fillindex` and the index workloads |

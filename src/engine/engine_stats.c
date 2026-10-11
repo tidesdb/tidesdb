@@ -115,6 +115,8 @@ static void engine_cf_fold(const level_set_snapshot_entry_t *all, int count,
          * the directory is built on first probe rather than at open */
         out->filter_resident_bytes += partitioned_bloom_filter_reader_resident_bytes(
             atomic_load_explicit(&sst->bloom, memory_order_acquire));
+        out->filter_resident_bytes += range_filter_reader_resident_bytes(
+            atomic_load_explicit(&sst->range_filter, memory_order_acquire));
 
         out->btree_total_nodes += sst->btree_node_count;
         if (sst->btree_height > out->btree_max_height) out->btree_max_height = sst->btree_height;
@@ -165,6 +167,8 @@ static void engine_cf_copy_counters(const cf_t *cf, tidesdb_cf_stats_t *out)
         atomic_load_explicit(&cf->compaction_bytes_read, memory_order_relaxed);
     out->user_bytes_written = atomic_load_explicit(&cf->user_bytes_written, memory_order_relaxed);
     out->compaction_count = atomic_load_explicit(&cf->compaction_count, memory_order_relaxed);
+    out->range_filter_probes = atomic_load_explicit(&cf->range_filter_probes, memory_order_relaxed);
+    out->range_filter_skips = atomic_load_explicit(&cf->range_filter_skips, memory_order_relaxed);
 }
 
 int engine_get_cf_stats(cf_t *cf, tidesdb_cf_stats_t *out)

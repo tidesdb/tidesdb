@@ -13,6 +13,7 @@
 #include "base/log.h"
 #include "internal/types.h" /* TDB_KV_FLAG_* the iterator reports a tombstone in */
 #include "sstable.h"
+#include "sstable_internal.h"
 
 /* fraction of the recorded node size added as read slack, as a right shift; 2 adds a quarter. a
  * node is closed once it has passed the target, so the node on disk is the target plus at most one
@@ -115,11 +116,8 @@ static int sstable_bloom_fetch_cached(sstable_t *sst, uint64_t offset, uint32_t 
     return -1;
 }
 
-/* fetch a bloom blob for a probe; the context is the sstable, so the cache it borrows decides
- * whether the pin is a cache entry or a bare block and sstable_bloom_release reads the same field
- */
-static int sstable_bloom_fetch(void *ctx, uint64_t offset, uint32_t size, const uint8_t **out_data,
-                               void **out_pin)
+int sstable_blob_fetch(void *ctx, uint64_t offset, uint32_t size, const uint8_t **out_data,
+                       void **out_pin)
 {
     sstable_t *sst = (sstable_t *)ctx;
     if (sst->node_cache) return sstable_bloom_fetch_cached(sst, offset, size, out_data, out_pin);
@@ -131,7 +129,7 @@ static int sstable_bloom_fetch(void *ctx, uint64_t offset, uint32_t size, const 
     return 0;
 }
 
-static void sstable_bloom_release(void *ctx, void *pin)
+void sstable_blob_release(void *ctx, void *pin)
 {
     const sstable_t *sst = (const sstable_t *)ctx;
     if (sst->node_cache)
@@ -152,7 +150,7 @@ static partitioned_bloom_filter_reader_t *sstable_ensure_bloom(sstable_t *sst)
 
     partitioned_bloom_filter_reader_t *opened = NULL;
     if (partitioned_bloom_filter_reader_open(&opened, sst->bloom_dir_offset, sst->bloom_dir_size,
-                                             sstable_bloom_fetch, sstable_bloom_release, sst) != 0)
+                                             sstable_blob_fetch, sstable_blob_release, sst) != 0)
         return NULL;
 
     partitioned_bloom_filter_reader_t *expected = NULL;

@@ -24,6 +24,40 @@
 /* one histogram entry on disk -- segment number, framed bytes, value count */
 #define TDB_SSTABLE_VLOG_REF_BYTES 24
 
+/* an extension's header, its tag and the length of what follows */
+#define TDB_SSTABLE_EXT_HEAD_BYTES (2 * sizeof(uint32_t))
+
+/* the range filter extension's payload, the directory's offset and size */
+#define TDB_SSTABLE_EXT_RANGE_FILTER_BYTES (sizeof(uint64_t) + sizeof(uint32_t))
+
+/* the extensions a footer carrying a range filter writes, that one alone */
+#define TDB_SSTABLE_EXT_AREA_COUNT 1
+
+/* the extension area holding the range filter alone, its magic and count and the one extension */
+#define TDB_SSTABLE_EXT_AREA_BYTES \
+    (2 * sizeof(uint32_t) + TDB_SSTABLE_EXT_HEAD_BYTES + TDB_SSTABLE_EXT_RANGE_FILTER_BYTES)
+
+/**
+ * sstable_footer_put_extensions
+ * write the extension area, which holds the range filter's directory location
+ * @param footer the footer
+ * @param p where the area starts, with TDB_SSTABLE_EXT_AREA_BYTES left
+ */
+static void sstable_footer_put_extensions(const sstable_footer_t *footer, uint8_t *p)
+{
+    tdb_encode_be32(TDB_SSTABLE_FOOTER_EXT_MAGIC, p);
+    p += sizeof(uint32_t);
+    tdb_encode_be32(TDB_SSTABLE_EXT_AREA_COUNT, p);
+    p += sizeof(uint32_t);
+    tdb_encode_be32(TDB_SSTABLE_FOOTER_EXT_RANGE_FILTER, p);
+    p += sizeof(uint32_t);
+    tdb_encode_be32((uint32_t)TDB_SSTABLE_EXT_RANGE_FILTER_BYTES, p);
+    p += sizeof(uint32_t);
+    tdb_encode_be64(footer->range_filter_dir_offset, p);
+    p += sizeof(uint64_t);
+    tdb_encode_be32(footer->range_filter_dir_size, p);
+}
+
 int sstable_footer_serialize(const sstable_footer_t *footer, uint8_t **out, size_t *out_size)
 {
     if (!footer || !out || !out_size) return TDB_ERR_INVALID_ARGS;
@@ -31,10 +65,13 @@ int sstable_footer_serialize(const sstable_footer_t *footer, uint8_t **out, size
 
     if (footer->vlog_ref_count > SSTABLE_VLOG_REF_MAX) return TDB_ERR_INVALID_ARGS;
 
+    /* a table without a range filter writes no extension area, so its footer is exactly what a
+     * build without the area wrote */
+    const size_t ext = footer->range_filter_dir_size > 0 ? TDB_SSTABLE_EXT_AREA_BYTES : 0;
     const size_t total = TDB_SSTABLE_FOOTER_FIXED_BYTES + sizeof(uint32_t) + footer->min_key_size +
                          sizeof(uint32_t) + footer->max_key_size + sizeof(uint8_t) +
                          footer->encoding_count + sizeof(uint32_t) +
-                         (size_t)footer->vlog_ref_count * TDB_SSTABLE_VLOG_REF_BYTES;
+                         (size_t)footer->vlog_ref_count * TDB_SSTABLE_VLOG_REF_BYTES + ext;
 
     uint8_t *buf = malloc(total);
     if (!buf) return TDB_ERR_MEMORY;
@@ -110,6 +147,7 @@ int sstable_footer_serialize(const sstable_footer_t *footer, uint8_t **out, size
         tdb_encode_be64(footer->vlog_refs[i].count, p);
         p += sizeof(uint64_t);
     }
+    if (ext > 0) sstable_footer_put_extensions(footer, p);
 
     *out = buf;
     *out_size = total;
@@ -295,6 +333,45 @@ static int sstable_footer_parse_vlog_refs(const uint8_t **p, size_t *rem, sstabl
     return TDB_SUCCESS;
 }
 
+/**
+ * sstable_footer_parse_extensions
+ * read the extension area after the histogram, when there is one. a tag this build does not know
+ * is stepped over by its length, so a later build can add one without breaking this reader. an
+ * area that does not hold together leaves every extension unset, which costs a table its range
+ * filter and never its keys, since a table without one is read in full
+ * @param p the read cursor
+ * @param rem bytes left in the trailer
+ * @param out the footer being filled
+ */
+static void sstable_footer_parse_extensions(const uint8_t *p, size_t rem, sstable_footer_t *out)
+{
+    if (rem < 2 * sizeof(uint32_t) || tdb_decode_be32(p) != TDB_SSTABLE_FOOTER_EXT_MAGIC) return;
+    const uint32_t count = tdb_decode_be32(p + sizeof(uint32_t));
+    p += 2 * sizeof(uint32_t);
+    rem -= 2 * sizeof(uint32_t);
+    uint64_t rf_offset = 0;
+    uint32_t rf_size = 0;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (rem < TDB_SSTABLE_EXT_HEAD_BYTES) return;
+        const uint32_t tag = tdb_decode_be32(p);
+        const uint32_t len = tdb_decode_be32(p + sizeof(uint32_t));
+        p += TDB_SSTABLE_EXT_HEAD_BYTES;
+        rem -= TDB_SSTABLE_EXT_HEAD_BYTES;
+        if (len > rem) return;
+        if (tag == TDB_SSTABLE_FOOTER_EXT_RANGE_FILTER)
+        {
+            if (len != TDB_SSTABLE_EXT_RANGE_FILTER_BYTES) return;
+            rf_offset = tdb_decode_be64(p);
+            rf_size = tdb_decode_be32(p + sizeof(uint64_t));
+        }
+        p += len;
+        rem -= len;
+    }
+    out->range_filter_dir_offset = rf_offset;
+    out->range_filter_dir_size = rf_size;
+}
+
 int sstable_footer_parse(const uint8_t *data, size_t size, sstable_footer_t *out)
 {
     if (!data || !out) return TDB_ERR_INVALID_ARGS;
@@ -318,6 +395,7 @@ int sstable_footer_parse(const uint8_t *data, size_t size, sstable_footer_t *out
         rc = sstable_footer_take_key(&p, &rem, &out->max_key, &out->max_key_size, "max");
     if (rc == TDB_SUCCESS) rc = sstable_footer_parse_encodings(&p, &rem, out);
     if (rc == TDB_SUCCESS) rc = sstable_footer_parse_vlog_refs(&p, &rem, out);
+    if (rc == TDB_SUCCESS) sstable_footer_parse_extensions(p, rem, out);
 
     if (rc != TDB_SUCCESS) sstable_footer_free(out);
     return rc;

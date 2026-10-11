@@ -90,6 +90,12 @@ static void flush_builder_config(const flush_ctx_t *fx, cf_t *cf, uint64_t id,
     config->value_threshold = cf_config_value_threshold(cc, fx->value_threshold);
     config->enable_bloom = cc->enable_bloom_filter;
     config->bloom_fpr = cc->bloom_fpr;
+    config->range_filter_r_bits =
+        cc->enable_range_filter ? range_filter_remainder_bits(cc->range_filter_fpr) : 0;
+    /* the keys this family has not flushed, a bound on what this run holds that sizes the filter's
+     * model */
+    const int64_t unflushed = atomic_load_explicit(&cf->unflushed_key_count, memory_order_relaxed);
+    config->range_filter_expected_keys = unflushed > 0 ? (uint64_t)unflushed : 0;
     config->sync_mode = fx->sync_mode;
     config->id = id;
     config->partition = MANIFEST_NO_PARTITION;

@@ -34,6 +34,7 @@
  * summary printers, which are not conditional -- defining them inside the tracer's guard left every
  * platform without glibc unable to compile the file at all */
 /* bytes in a mebibyte, for the reported sizes */
+#define BENCH_KB 1024.0
 #define BENCH_MB (1024.0 * 1024.0)
 /* microseconds in a second, for the achieved-throughput column */
 #define BENCH_US_PER_SEC 1000000.0
@@ -468,6 +469,7 @@ static void bench_config_defaults(bench_config_t *c)
     c->value_separation_threshold = 0;
     c->btree_block_size = 0;
     c->bloom_fpr = -1.0;
+    c->range_filter_fpr = -1.0;
     c->large_value_size = 8192;
     c->large_ratio = 25;
     c->idle_flush_seconds = -1;
@@ -569,6 +571,10 @@ static int bench_apply_flag(bench_config_t *c, const char *key, const char *val)
         c->skip_list_probability = atof(val);
     else if (!strcmp(key, "bloom"))
         c->bloom = atoi(val);
+    else if (!strcmp(key, "range_filter"))
+        c->range_filter = atoi(val);
+    else if (!strcmp(key, "range_filter_fpr"))
+        c->range_filter_fpr = atof(val);
     else if (!strcmp(key, "log_level"))
         c->log_level = atoi(val);
     else if (!strcmp(key, "log_file"))
@@ -663,6 +669,8 @@ static int bench_open_db(const bench_config_t *c, tidesdb_t **db, tidesdb_column
             cc.tombstone_density_min_entries = c->tombstone_density_min_entries;
         if (c->btree_block_size > 0) cc.btree_klog_block_size = (size_t)c->btree_block_size;
         if (c->bloom_fpr > 0.0) cc.bloom_fpr = c->bloom_fpr;
+        cc.enable_range_filter = c->range_filter;
+        if (c->range_filter_fpr > 0.0) cc.range_filter_fpr = c->range_filter_fpr;
         /* a builtin encoding's id is its compression enum value, so the pipeline is that one id.
          * this matters because a deployment that compresses is measuring a different engine than
          * one that does not -- every klog node is encoded on the way out and decoded on every read
@@ -672,10 +680,23 @@ static int bench_open_db(const bench_config_t *c, tidesdb_t **db, tidesdb_column
             cc.encoding_pipeline[0] = (uint8_t)c->compression;
             cc.encoding_count = 1;
         }
-        (void)tidesdb_create_column_family(*db, names[i], &cc); /* ignore exists on reopen */
+        const int created = tidesdb_create_column_family(*db, names[i], &cc) == TDB_SUCCESS;
         cfs[i] = tidesdb_get_column_family(*db, names[i]);
         cf_names[i] = names[i];
         if (!cfs[i]) return -1;
+        /* a reopened store keeps the config it was made with, so the range filter switch is applied
+         * to it in memory. the tables keep the filters they were built with, and the switch decides
+         * only whether reads consult them, which is how one store is measured both ways */
+        tidesdb_cf_stats_t st;
+        if (!created && tidesdb_get_cf_stats(cfs[i], &st) == TDB_SUCCESS &&
+            st.config.enable_range_filter != c->range_filter)
+        {
+            st.config.enable_range_filter = c->range_filter;
+            if (st.config.enable_range_filter && st.config.range_filter_fpr <= 0.0)
+                st.config.range_filter_fpr = cc.range_filter_fpr;
+            if (tidesdb_cf_update_runtime_config(*db, cfs[i], &st.config, 0) != TDB_SUCCESS)
+                return -1;
+        }
     }
     return 0;
 }
@@ -703,6 +724,16 @@ static void bench_print_cf_summary(tidesdb_column_family_t **cfs, const char **c
             printf("L%d=%d/%.0f ", lvl + 1, s.level_num_sstables[lvl],
                    (double)s.level_sizes[lvl] / BENCH_MB);
         printf("\n");
+        /* what the range filter was asked over the whole run, and how many tables it kept a scan
+         * or a range probe out of */
+        if (s.range_filter_probes > 0)
+            printf(
+                "%-10s range filter probed %llu tables, skipped %llu (%.1f%%), resident %.1f "
+                "KB\n",
+                "", (unsigned long long)s.range_filter_probes,
+                (unsigned long long)s.range_filter_skips,
+                100.0 * (double)s.range_filter_skips / (double)s.range_filter_probes,
+                (double)s.filter_resident_bytes / BENCH_KB);
     }
 }
 
@@ -855,6 +886,7 @@ int main(int argc, char **argv)
             "  [--l0_stall=N] [--max_open_sstables=N] [--vlog_segment_mb=N] [--stall_trace_ms=N]\n"
             "  [--flush_threads=N] [--compaction_threads=N]\n"
             "  [--bloom=0|1] [--bloom_fpr=F] [--isolation=0..4] [--dir=PATH]\n"
+            "  [--range_filter=0|1] [--range_filter_fpr=F] a range filter in every table\n"
             "  [--fresh=0|1] [--cleanup=0|1]  remove the store dir before / after the run\n"
             "  compaction shape (each unset leaves the engine default):\n"
             "  [--level_size_ratio=N] [--min_levels=N] [--dividing_level_offset=N]\n"

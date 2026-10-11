@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "../src/base/errors.h"
+#include "../src/base/keycmp.h"
 #include "../src/column_family/cf_iter.h"
 #include "../src/flush/flush.h"
 #include "../src/txn/cf_source.h"
@@ -55,6 +56,9 @@ static void cfi_db_close(cfi_db_t *db)
     (void)remove_directory(CFI_DB_DIR);
 }
 
+/* when set, families made here build a range filter into every table */
+static int cfi_range_filter_on;
+
 static cf_t *cfi_make_cf_thresh(cfi_db_t *db, uint32_t value_threshold)
 {
     tidesdb_column_family_config_t cfg;
@@ -66,6 +70,8 @@ static cf_t *cfi_make_cf_thresh(cfi_db_t *db, uint32_t value_threshold)
     cfg.btree_klog_block_size = 4096;
     cfg.enable_bloom_filter = 1;
     cfg.bloom_fpr = 0.01;
+    cfg.enable_range_filter = cfi_range_filter_on;
+    cfg.range_filter_fpr = 0.01;
     cf_t *cf = NULL;
     ASSERT_EQ(cf_create(CFI_DB_DIR, 0, &cfg, NULL, db->vlog, db->cache, &db->fdm, NULL, NULL, &cf),
               0);
@@ -527,6 +533,128 @@ void test_cf_iter_level_interval_in_one_table_hides_keys_in_another(void)
     cfi_db_close(&db);
 }
 
+/* a scan bounded to the covered bands still hides them. the table carrying the range delete holds
+ * its own keys in another band entirely, so its key range never meets the scan, and the delete has
+ * to reach the scan anyway */
+static void cfi_bounded_scan_over_covered_bands(void)
+{
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_level(&db, cf, &next_id, &fx, cfs, 1);
+
+    char lo[CFI_BAND_KEY_LEN], hi[CFI_BAND_KEY_LEN];
+    snprintf(lo, sizeof(lo), "b%03d_k%03d", CFI_COVERED_FIRST, 0);
+    snprintf(hi, sizeof(hi), "b%03d_k%03d", CFI_COVERED_END - 1, CFI_KEYS_PER_BAND - 1);
+    const cf_iter_bounds_t bounds = {.lower = (const uint8_t *)lo,
+                                     .lower_size = strlen(lo),
+                                     .upper = (const uint8_t *)hi,
+                                     .upper_size = strlen(hi)};
+    static char got[CFI_BANDS * CFI_KEYS_PER_BAND * (CFI_BAND_KEY_LEN + 4)];
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new_bounded(cf, l0, UINT64_MAX, NULL, &bounds, &it), TDB_SUCCESS);
+    ASSERT_EQ(cf_iter_seek(it, (const uint8_t *)lo, strlen(lo)), TDB_SUCCESS);
+    /* the first key the scan yields, if any, must lie past the covered bands */
+    if (cf_iter_valid(it))
+    {
+        const uint8_t *key = NULL, *value = NULL;
+        size_t key_size = 0, value_size = 0;
+        uint64_t seq = 0, vlog_offset = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        ASSERT_EQ(cf_iter_get(it, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl,
+                              &deleted),
+                  TDB_SUCCESS);
+        snprintf(got, sizeof(got), "%.*s", (int)key_size, (const char *)key);
+        ASSERT_TRUE(strcmp(got, hi) > 0);
+    }
+    cf_iter_free(it);
+
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+}
+
+void test_cf_iter_bounded_scan_sees_an_interval_held_by_a_table_outside_the_bounds(void)
+{
+    cfi_bounded_scan_over_covered_bands();
+}
+
+/* the same scan with range filters. the table carrying the delete holds no key in the scan's range
+ * and its filter says so, so pruning by the filter alone would drop it and the covered keys would
+ * come back. a table whose intervals meet the range is kept whatever its filter says */
+void test_cf_iter_range_filter_keeps_a_table_whose_interval_meets_the_range(void)
+{
+    cfi_range_filter_on = 1;
+    cfi_bounded_scan_over_covered_bands();
+    cfi_range_filter_on = 0;
+}
+
+/* one scan between two neighbouring keys of the narrow band, returning what it read and leaving the
+ * family's probe and skip counts in probes and skips */
+static int cfi_scan_a_gap(int range_filter, uint64_t *probes, uint64_t *skips)
+{
+    cfi_range_filter_on = range_filter;
+    cfi_db_t db;
+    cfi_db_open(&db);
+    cf_t *cf = cfi_make_cf(&db);
+    cfi_range_filter_on = 0;
+    _Atomic(uint64_t) next_id;
+    flush_ctx_t fx;
+    memset(&fx, 0, sizeof(fx));
+    cf_t *cfs[1];
+    tidesdb_l0_t *l0 = cfi_build_banded_cf(&db, cf, &next_id, &fx, cfs);
+
+    /* inside the band's key range, so its table is selected by range, and between two of its keys
+     */
+    char lo[CFI_BAND_KEY_LEN + 2], hi[CFI_BAND_KEY_LEN + 2];
+    snprintf(lo, sizeof(lo), "b%03d_k%03da", CFI_NARROW_BAND, 0);
+    snprintf(hi, sizeof(hi), "b%03d_k%03dz", CFI_NARROW_BAND, 0);
+    const cf_iter_bounds_t bounds = {.lower = (const uint8_t *)lo,
+                                     .lower_size = strlen(lo),
+                                     .upper = (const uint8_t *)hi,
+                                     .upper_size = strlen(hi)};
+    cf_iter_t *it = NULL;
+    ASSERT_EQ(cf_iter_new_bounded(cf, l0, UINT64_MAX, NULL, &bounds, &it), TDB_SUCCESS);
+    int read = 0;
+    if (cf_iter_seek(it, (const uint8_t *)lo, strlen(lo)) == TDB_SUCCESS && cf_iter_valid(it))
+    {
+        const uint8_t *key = NULL, *value = NULL;
+        size_t key_size = 0, value_size = 0;
+        uint64_t seq = 0, vlog_offset = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        ASSERT_EQ(cf_iter_get(it, &key, &key_size, &seq, &value, &value_size, &vlog_offset, &ttl,
+                              &deleted),
+                  TDB_SUCCESS);
+        read = tdb_key_cmp(key, key_size, (const uint8_t *)hi, strlen(hi)) <= 0;
+    }
+    cf_iter_free(it);
+    *probes = atomic_load(&cf->range_filter_probes);
+    *skips = atomic_load(&cf->range_filter_skips);
+    tidesdb_l0_destroy(l0);
+    cf_free(cf);
+    cfi_db_close(&db);
+    return read;
+}
+
+/* a scan landing between two keys of a table that its key range admits is answered by the table's
+ * range filter, which leaves the table unread, and the scan finds nothing either way */
+void test_cf_iter_range_filter_skips_a_table_with_no_key_in_the_range(void)
+{
+    uint64_t probes = 0, skips = 0;
+    ASSERT_EQ(cfi_scan_a_gap(1, &probes, &skips), 0);
+    ASSERT_TRUE(probes >= 1);
+    ASSERT_EQ(skips, probes);
+    ASSERT_EQ(cfi_scan_a_gap(0, &probes, &skips), 0);
+    ASSERT_EQ(probes, (uint64_t)0);
+    ASSERT_EQ(skips, (uint64_t)0);
+}
+
 /* a cf iterator folds a flushed sstable and the live memtable into one snapshot stream, the newest
  * version across the two winning per key */
 void test_cf_iter_memtable_over_sstable(void)
@@ -928,6 +1056,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_cf_iter_level_seeks_land_in_the_right_table, tests_passed);
     RUN_TEST(test_cf_iter_level_seek_descends_one_table, tests_passed);
     RUN_TEST(test_cf_iter_level_interval_in_one_table_hides_keys_in_another, tests_passed);
+    RUN_TEST(test_cf_iter_bounded_scan_sees_an_interval_held_by_a_table_outside_the_bounds,
+             tests_passed);
+    RUN_TEST(test_cf_iter_range_filter_keeps_a_table_whose_interval_meets_the_range, tests_passed);
+    RUN_TEST(test_cf_iter_range_filter_skips_a_table_with_no_key_in_the_range, tests_passed);
     RUN_TEST(test_cf_iter_spilled_value_reports_offset_not_stale_bytes, tests_passed);
     RUN_TEST(test_cf_iter_scan_resolves_by_sequence_where_a_point_get_resolves_by_position,
              tests_passed);

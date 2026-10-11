@@ -123,6 +123,8 @@ static void cf_init_counters(cf_t *cf)
     atomic_init(&cf->compaction_bytes_written, 0);
     atomic_init(&cf->compaction_bytes_read, 0);
     atomic_init(&cf->compaction_count, 0);
+    atomic_init(&cf->range_filter_probes, 0);
+    atomic_init(&cf->range_filter_skips, 0);
     atomic_init(&cf->commit_hook_fn, NULL);
     atomic_init(&cf->commit_hook_ctx, NULL);
 }
@@ -339,6 +341,8 @@ int cf_config_publish(cf_t *cf, const tidesdb_column_family_config_t *config)
 
     tidesdb_column_family_config_t *old =
         atomic_exchange_explicit(&cf->config, fresh, memory_order_acq_rel);
+    atomic_store_explicit(&cf->range_filter_on, fresh->enable_range_filter ? 1 : 0,
+                          memory_order_relaxed);
     if (old) tdb_retire(&cf->config_retire, old, &cf->config_epoch, cf_config_reclaim, NULL);
     return TDB_SUCCESS;
 }

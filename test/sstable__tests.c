@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../src/base/encoding/serialization.h"
 #include "../src/base/errors.h"
 #include "../src/cache/cache.h"
 #include "../src/fdmanager/fdmanager.h"
@@ -204,6 +205,116 @@ void test_footer_rejects_bad_input(void)
     ASSERT_EQ(sstable_footer_parse(tiny, sizeof(tiny), &out), TDB_ERR_CORRUPTION);
 
     free(buf);
+}
+
+/* a footer naming a range filter, its keys and histogram set so the area sits after real fields */
+static void footer_with_filter(sstable_footer_t *in, sstable_vlog_ref_t *refs)
+{
+    memset(in, 0, sizeof(*in));
+    in->version = TDB_SSTABLE_FORMAT_VERSION;
+    in->min_key = (uint8_t *)"alpha";
+    in->min_key_size = 5;
+    in->max_key = (uint8_t *)"omega";
+    in->max_key_size = 5;
+    refs[0] = (sstable_vlog_ref_t){3, 4096, 9};
+    in->vlog_refs = refs;
+    in->vlog_ref_count = 1;
+    in->range_filter_dir_offset = 77777;
+    in->range_filter_dir_size = 1234;
+}
+
+/* the range filter's location round-trips through the extension area, and the bytes before the area
+ * are exactly the footer a table without a filter writes, which is all a parser that predates the
+ * area reads, since it stops at the histogram */
+void test_footer_range_filter_extension_is_backward_compatible(void)
+{
+    sstable_vlog_ref_t refs[1];
+    sstable_footer_t in;
+    footer_with_filter(&in, refs);
+    uint8_t *with = NULL, *without = NULL;
+    size_t with_size = 0, without_size = 0;
+    ASSERT_EQ(sstable_footer_serialize(&in, &with, &with_size), TDB_SUCCESS);
+    sstable_footer_t out = {0};
+    ASSERT_EQ(sstable_footer_parse(with, with_size, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.range_filter_dir_offset, in.range_filter_dir_offset);
+    ASSERT_EQ(out.range_filter_dir_size, in.range_filter_dir_size);
+    ASSERT_EQ(out.vlog_ref_count, 1u);
+    ASSERT_EQ(out.vlog_refs[0].bytes, refs[0].bytes);
+    sstable_footer_free(&out);
+
+    in.range_filter_dir_offset = 0;
+    in.range_filter_dir_size = 0;
+    ASSERT_EQ(sstable_footer_serialize(&in, &without, &without_size), TDB_SUCCESS);
+    ASSERT_TRUE(without_size < with_size);
+    ASSERT_TRUE(memcmp(with, without, without_size) == 0);
+
+    /* an old table, its footer ending at the histogram, reads with no filter */
+    ASSERT_EQ(sstable_footer_parse(with, without_size, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.range_filter_dir_size, 0u);
+    ASSERT_EQ(out.range_filter_dir_offset, (uint64_t)0);
+    ASSERT_EQ(out.min_key_size, 5u);
+    sstable_footer_free(&out);
+    free(with);
+    free(without);
+}
+
+/* a tag this build does not know is stepped over, and an area that does not hold together, or is
+ * not an area at all, leaves the table without a filter while the footer still reads */
+void test_footer_extension_skips_unknown_and_survives_damage(void)
+{
+    sstable_vlog_ref_t refs[1];
+    sstable_footer_t in;
+    footer_with_filter(&in, refs);
+    in.range_filter_dir_size = 0;
+    uint8_t *base = NULL;
+    size_t base_size = 0;
+    ASSERT_EQ(sstable_footer_serialize(&in, &base, &base_size), TDB_SUCCESS);
+
+    /* the area by hand, an unknown tag with five bytes and then the range filter */
+    const size_t area = 4 + 4 + (8 + 5) + (8 + 12);
+    uint8_t *buf = malloc(base_size + area);
+    ASSERT_TRUE(buf != NULL);
+    memcpy(buf, base, base_size);
+    uint8_t *p = buf + base_size;
+    tdb_encode_be32(TDB_SSTABLE_FOOTER_EXT_MAGIC, p);
+    tdb_encode_be32(2, p + 4);
+    tdb_encode_be32(99, p + 8);
+    tdb_encode_be32(5, p + 12);
+    memset(p + 16, 0xEE, 5);
+    tdb_encode_be32(TDB_SSTABLE_FOOTER_EXT_RANGE_FILTER, p + 21);
+    tdb_encode_be32(12, p + 25);
+    tdb_encode_be64(555, p + 29);
+    tdb_encode_be32(66, p + 37);
+    sstable_footer_t out = {0};
+    ASSERT_EQ(sstable_footer_parse(buf, base_size + area, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.range_filter_dir_offset, (uint64_t)555);
+    ASSERT_EQ(out.range_filter_dir_size, 66u);
+    sstable_footer_free(&out);
+
+    /* every cut through the area, a wrong length for the filter's payload, and a count past what
+     * is there each read as no filter */
+    for (size_t cut = base_size; cut < base_size + area; cut++)
+    {
+        ASSERT_EQ(sstable_footer_parse(buf, cut, &out), TDB_SUCCESS);
+        ASSERT_EQ(out.range_filter_dir_size, 0u);
+        sstable_footer_free(&out);
+    }
+    tdb_encode_be32(11, p + 25);
+    ASSERT_EQ(sstable_footer_parse(buf, base_size + area, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.range_filter_dir_size, 0u);
+    sstable_footer_free(&out);
+    tdb_encode_be32(12, p + 25);
+    tdb_encode_be32(3, p + 4);
+    ASSERT_EQ(sstable_footer_parse(buf, base_size + area, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.range_filter_dir_size, 0u);
+    sstable_footer_free(&out);
+    /* bytes after the histogram that are not an area are left alone */
+    tdb_encode_be32(0x12345678, p);
+    ASSERT_EQ(sstable_footer_parse(buf, base_size + area, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.range_filter_dir_size, 0u);
+    sstable_footer_free(&out);
+    free(buf);
+    free(base);
 }
 
 /* the .klog file name carries the owning family and the sstable id, both zero-padded. the family
@@ -1093,6 +1204,141 @@ void test_get_through_cache(void)
     (void)remove_directory(TEST_SSTABLE_DIR);
 }
 
+/* keys in the range filter tests, one short of the model's warm-up and well past it */
+#define TEST_SSTABLE_RF_SMALL 50
+#define TEST_SSTABLE_RF_LARGE 20000
+
+/* the range filter's remainder width in these tests */
+#define TEST_SSTABLE_RF_R_BITS 10
+
+/* every this many keys is written as a tombstone, which the filter must still hold */
+#define TEST_SSTABLE_RF_TOMB_EVERY 7
+
+/* even numbers as keys, so every odd number lies between two of them and holds none */
+static void rf_key(char *buf, size_t cap, int n)
+{
+    snprintf(buf, cap, "key%07d", n);
+}
+
+/* build a table of count keys, the even numbers from 0, every few a tombstone, with a range filter
+ * of r_bits, or none at 0 */
+static void build_rf_sstable(uint64_t id, int count, unsigned r_bits)
+{
+    tidesdb_manifest_entry_t entry;
+    full_sstable_entry(&entry, id);
+    char filename[128], path[256];
+    ASSERT_EQ(sstable_klog_filename(&entry, filename, sizeof(filename)), TDB_SUCCESS);
+    snprintf(path, sizeof(path), "%s%s%s", TEST_SSTABLE_DIR, PATH_SEPARATOR, filename);
+    block_manager_t *klog_bm = NULL;
+    ASSERT_EQ(block_manager_open(&klog_bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+    sstable_builder_config_t config;
+    default_builder_config(&config, id, path);
+    config.range_filter_r_bits = r_bits;
+    sstable_builder_t *builder = NULL;
+    ASSERT_EQ(sstable_builder_new(&builder, klog_bm, NULL, &config), TDB_SUCCESS);
+    for (int i = 0; i < count; i++)
+    {
+        char key[32];
+        rf_key(key, sizeof(key), 2 * i);
+        const int tomb = i % TEST_SSTABLE_RF_TOMB_EVERY == 0;
+        ASSERT_EQ(sstable_builder_add(builder, (const uint8_t *)key, strlen(key),
+                                      tomb ? NULL : (const uint8_t *)TEST_SSTABLE_VALUE,
+                                      tomb ? 0 : strlen(TEST_SSTABLE_VALUE), (uint64_t)(i + 1), 0,
+                                      tomb ? TDB_KV_FLAG_TOMBSTONE : 0),
+                  TDB_SUCCESS);
+    }
+    sstable_t *sst = NULL;
+    ASSERT_EQ(sstable_builder_finish(builder, &sst, NULL), TDB_SUCCESS);
+    sstable_builder_free(builder);
+    if (r_bits > 0)
+    {
+        ASSERT_TRUE(sstable_has_range_filter(sst));
+        /* the filter lands after the table's data, so its leaves stay contiguous */
+        ASSERT_TRUE(sst->range_filter_dir_offset > (uint64_t)sst->last_leaf_offset);
+    }
+    sstable_close(sst);
+}
+
+/* answer every key, every range between neighbours, and every odd number into answers */
+static void rf_probe_all(sstable_t *sst, int count, int *answers)
+{
+    for (int i = 0; i < count; i++)
+    {
+        char a[32], b[32], odd[32];
+        rf_key(a, sizeof(a), 2 * i);
+        rf_key(b, sizeof(b), 2 * i + 2);
+        rf_key(odd, sizeof(odd), 2 * i + 1);
+        ASSERT_EQ(sstable_range_may_contain(sst, (const uint8_t *)a, strlen(a), (const uint8_t *)a,
+                                            strlen(a)),
+                  1);
+        ASSERT_EQ(sstable_range_may_contain(sst, (const uint8_t *)a, strlen(a), (const uint8_t *)b,
+                                            strlen(b)),
+                  1);
+        answers[i] = sstable_range_may_contain(sst, (const uint8_t *)odd, strlen(odd),
+                                               (const uint8_t *)odd, strlen(odd));
+    }
+}
+
+/* a table built with a range filter answers yes for every key it holds, tombstones included, and no
+ * for most of the gaps between them, and reopened from its footer it answers exactly the same. a
+ * table built without one answers yes to everything */
+void test_builder_writes_a_range_filter_that_reopens(void)
+{
+    static const int counts[] = {TEST_SSTABLE_RF_SMALL, TEST_SSTABLE_RF_LARGE};
+    int *built = malloc(TEST_SSTABLE_RF_LARGE * sizeof(*built));
+    int *reopened = malloc(TEST_SSTABLE_RF_LARGE * sizeof(*reopened));
+    ASSERT_TRUE(built != NULL && reopened != NULL);
+    for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++)
+    {
+        (void)remove_directory(TEST_SSTABLE_DIR);
+        ASSERT_EQ(mkdir(TEST_SSTABLE_DIR, TEST_SSTABLE_DIR_PERMISSIONS), 0);
+        const int count = counts[c];
+        build_rf_sstable(700, count, TEST_SSTABLE_RF_R_BITS);
+        build_rf_sstable(701, count, 0);
+        cache_t *cache = cache_create(NULL);
+        ASSERT_TRUE(cache != NULL);
+        tidesdb_manifest_entry_t entry;
+        sstable_t *sst = NULL;
+        /* uncached first, then through the cache, so both fetch paths are exercised */
+        full_sstable_entry(&entry, 700);
+        ASSERT_EQ(sstable_open_from_manifest(&sst, TEST_SSTABLE_DIR, "cf", &entry,
+                                             BLOCK_MANAGER_SYNC_NONE, NULL, NULL, NULL, NULL, NULL),
+                  TDB_SUCCESS);
+        ASSERT_TRUE(sstable_has_range_filter(sst));
+        rf_probe_all(sst, count, built);
+        sstable_close(sst);
+        ASSERT_EQ(
+            sstable_open_from_manifest(&sst, TEST_SSTABLE_DIR, "cf", &entry,
+                                       BLOCK_MANAGER_SYNC_NONE, NULL, cache, NULL, NULL, NULL),
+            TDB_SUCCESS);
+        rf_probe_all(sst, count, reopened);
+        sstable_close(sst);
+        int refused = 0;
+        for (int i = 0; i < count; i++)
+        {
+            ASSERT_EQ(built[i], reopened[i]);
+            refused += built[i] == 0;
+        }
+        fprintf(stderr, "  %d keys, %d of %d gaps refused\n", count, refused, count);
+        ASSERT_TRUE(refused * 2 > count);
+
+        full_sstable_entry(&entry, 701);
+        ASSERT_EQ(
+            sstable_open_from_manifest(&sst, TEST_SSTABLE_DIR, "cf", &entry,
+                                       BLOCK_MANAGER_SYNC_NONE, NULL, cache, NULL, NULL, NULL),
+            TDB_SUCCESS);
+        ASSERT_TRUE(!sstable_has_range_filter(sst));
+        ASSERT_EQ(sstable_range_may_contain(sst, (const uint8_t *)"key0000001", 10,
+                                            (const uint8_t *)"key0000001", 10),
+                  1);
+        sstable_close(sst);
+        cache_destroy(cache);
+    }
+    free(built);
+    free(reopened);
+    (void)remove_directory(TEST_SSTABLE_DIR);
+}
+
 /* keys enough to force the klog btree past a single node, so its root is an internal node and the
  * held-root path is exercised; zero padded so insertion order is also key order */
 #define TEST_SSTABLE_DEEP_KEY_COUNT  20000
@@ -1685,6 +1931,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_footer_roundtrip, tests_passed);
     RUN_TEST(test_footer_roundtrip_empty, tests_passed);
     RUN_TEST(test_footer_rejects_bad_input, tests_passed);
+    RUN_TEST(test_footer_range_filter_extension_is_backward_compatible, tests_passed);
+    RUN_TEST(test_footer_extension_skips_unknown_and_survives_damage, tests_passed);
     RUN_TEST(test_klog_filename, tests_passed);
     RUN_TEST(test_open_from_manifest, tests_passed);
     RUN_TEST(test_refcount_basics, tests_passed);
@@ -1696,6 +1944,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_respilled_value_crosses_codecs_intact, tests_passed);
     RUN_TEST(test_builder_tombstone_count, tests_passed);
     RUN_TEST(test_get_through_cache, tests_passed);
+    RUN_TEST(test_builder_writes_a_range_filter_that_reopens, tests_passed);
     RUN_TEST(test_get_borrows_a_root_held_across_reads, tests_passed);
     RUN_TEST(test_open_from_manifest_preallocation_tail, tests_passed);
     RUN_TEST(test_get_at_seq_version_chain, tests_passed);

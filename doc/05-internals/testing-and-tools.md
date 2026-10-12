@@ -53,7 +53,15 @@ alone is sufficient to use the database.
 unloads the library, and only then lets that thread exit. The read leaves the block manager's
 per-thread read buffer behind, and its destructor runs at the thread's exit, so a library that the
 unload had unmapped takes the process down there. It is built only for shared builds on ELF
-platforms, the ones linked with `-z nodelete`.
+platforms.
+
+`library_unload_plugin_tests` covers the form a database server actually takes. A stand-in plugin
+links the library the way the build produced it, statically into the plugin or as the shared library
+beside it, and the host loads the plugin, reads through it on a worker thread or on the main thread,
+unloads it, and asserts that the module holding the library's code is still mapped. It asserts the
+mapping rather than waiting for a crash, since a platform can unmap the module without the later exit
+happening to fault. It runs on Windows as well as on POSIX, and is the test that fails if the pin
+described in [Building](/administration/building) stops working.
 
 :::caution[Assert on the contract, not on success]
 The administrative calls — manual compaction, manual flush, backup, and the column-family

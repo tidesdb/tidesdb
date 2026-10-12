@@ -52,11 +52,15 @@ Every option below is set with `-DNAME=VALUE` at configure time.
 Everything is built position-independent, so a static archive still links into a shared
 module without a rebuild.
 
-On ELF platforms the shared library is linked with `-z nodelete`, so `dlclose` never unmaps it.
-Each thread that reads holds a buffer freed by a destructor inside the library when the thread
-exits, and a host that unloads the library while those threads live on (a database server at
-shutdown) would otherwise run that destructor from unmapped memory. A host on macOS or Windows
-that unloads the library must join its reading threads first.
+The module holding the library's code is never unmapped once a thread has read through it. Each
+thread that reads holds a buffer freed by a destructor inside the library when the thread exits,
+and a host that unloads the library while those threads live on (a database server at shutdown,
+whose main thread read during recovery) would otherwise run that destructor from unmapped memory.
+The library pins its own module the first time a thread reads, with `GetModuleHandleExW` on
+Windows and `dlopen` with `RTLD_NODELETE` elsewhere, so `FreeLibrary` or `dlclose` leaves it
+mapped whether it is the shared library or a plugin that linked it statically. A platform without
+`RTLD_NODELETE`, or a library linked into an executable, is left as it was, which for an
+executable changes nothing since it is never unloaded.
 
 ### Compression backends
 

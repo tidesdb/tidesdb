@@ -211,12 +211,12 @@ set_target_properties(tidesdb PROPERTIES
 
 target_include_directories(tidesdb PRIVATE src)
 
-# the block manager's per-thread read buffer is freed by a thread-specific destructor that lives in
-# this library, and a host that unloads it (a plugin server at shutdown) still has threads that ran
-# a read. their exit would call into unmapped code, so the shared library is marked never to be
-# unmapped. ELF linkers take the flag; Mach-O and PE have no equivalent
-if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
-    target_link_options(tidesdb PRIVATE "LINKER:-z,nodelete")
+# the block manager pins the module holding its thread-specific destructor at run time, so a host
+# that unloads the library, or a plugin linking it statically, never leaves a thread exit calling
+# into unmapped code. finding and pinning the module takes dladdr and dlopen, which older glibc and
+# some BSDs keep in a library of their own
+if(CMAKE_DL_LIBS)
+    target_link_libraries(tidesdb PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 # the test and fuzz sources declare their cases as bare
@@ -802,11 +802,48 @@ if(TIDESDB_BUILD_TESTS)
         set_tests_properties(library_unload_tests PROPERTIES FIXTURES_REQUIRED library_unload_db)
     endif()
 
+    # loads a stand-in plugin that links the library as it was built, statically into the plugin or
+    # as the shared library, reads through it on a thread and on the main thread, unloads it, and
+    # asserts the module holding the library's code is still mapped, as a server that unloads a
+    # plugin at shutdown needs. a static library goes into a module only when it was built position
+    # independent, which windows does not ask for
+    if(BUILD_SHARED_LIBS OR WIN32 OR CMAKE_POSITION_INDEPENDENT_CODE)
+        add_library(library_unload_plugin MODULE test/library_unload_plugin.c)
+        target_include_directories(library_unload_plugin PRIVATE
+                                   include ${CMAKE_CURRENT_BINARY_DIR}/include)
+        target_link_libraries(library_unload_plugin PRIVATE tidesdb)
+        add_executable(library_unload_plugin_tests test/library_unload_plugin__tests.c)
+        add_dependencies(library_unload_plugin_tests library_unload_plugin)
+        if(NOT WIN32)
+            target_link_libraries(library_unload_plugin_tests PRIVATE ${CMAKE_DL_LIBS} pthread)
+        endif()
+        foreach(mode thread main)
+            set(UNLOAD_PLUGIN_DB
+                $<TARGET_FILE:library_unload_plugin_tests>_library_unload_plugin_db_${mode})
+            add_test(NAME library_unload_plugin_${mode}_reset
+                     COMMAND ${CMAKE_COMMAND} -E rm -rf ${UNLOAD_PLUGIN_DB})
+            add_test(NAME library_unload_plugin_${mode}
+                     COMMAND library_unload_plugin_tests $<TARGET_FILE:library_unload_plugin> ${mode})
+            add_test(NAME library_unload_plugin_${mode}_cleanup
+                     COMMAND ${CMAKE_COMMAND} -E rm -rf ${UNLOAD_PLUGIN_DB})
+            set_tests_properties(library_unload_plugin_${mode} PROPERTIES SKIP_RETURN_CODE 77)
+            set_tests_properties(library_unload_plugin_${mode}_reset PROPERTIES
+                                 FIXTURES_SETUP library_unload_plugin_${mode}_db)
+            set_tests_properties(library_unload_plugin_${mode}_cleanup PROPERTIES
+                                 FIXTURES_CLEANUP library_unload_plugin_${mode}_db)
+            set_tests_properties(library_unload_plugin_${mode} PROPERTIES
+                                 FIXTURES_REQUIRED library_unload_plugin_${mode}_db)
+        endforeach()
+    endif()
+
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)
         set(TIDESDB_TEST_TARGETS
                 block_manager_tests skip_list_tests compress_tests bloom_filter_tests
                 partitioned_bloom_filter_tests manifest_tests queue_tests)
+        if(TARGET library_unload_plugin_tests)
+            list(APPEND TIDESDB_TEST_TARGETS library_unload_plugin_tests)
+        endif()
 
         if(MINGW)
             # On MinGW (MSYS2), the test exes link against shared snappy/zstd/lz4

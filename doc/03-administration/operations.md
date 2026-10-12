@@ -30,8 +30,10 @@ into the sstables being copied, so a log would add nothing, and a log still bein
 copy torn. That is also why the copy has nothing to replay when you open it.
 
 - The database **stays writable** throughout.
-- Writes committed during the backup are **not** included; the copy is consistent as of the
-  flush at the start.
+- The copy is **one point in time** between the call and its return. It holds every write committed
+  before the call, plus whatever a later flush landed before the backup copied its manifest, with
+  nothing past that point and nothing before it missing. Commit a marker key just before the call
+  if you need a guaranteed floor.
 - Cost and free space needed are proportional to the live on-disk size.
 
 The result is a database directory, not an archive. Restore by pointing `tidesdb_open` at it, or

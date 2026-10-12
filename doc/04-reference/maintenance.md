@@ -258,8 +258,12 @@ copy can never reference a file a merge deleted mid-copy.
 The result is a database directory, not an archive. Point
 [`tidesdb_open`](/reference/database#tidesdb_open) at it and it opens.
 
-The database stays writable throughout. Writes committed during the backup are not included:
-the copy is consistent as of the flush at the start.
+The database stays writable throughout, and the copy is a single point in time somewhere between
+the call and its return. It holds every write committed before the call, since the flush at the
+start lands them in sstables, plus every write that a later flush landed before the backup copied
+its manifest. Nothing past that point is included and nothing before it is missing, the same shape
+a crash at that moment would leave. To know exactly which writes made it, commit a marker key just
+before the call and treat it as the guaranteed floor.
 
 Cost and free space required are proportional to the live on-disk size.
 

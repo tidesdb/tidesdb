@@ -321,4 +321,44 @@ static inline size_t get_available_memory_impl(void)
     return 0;
 }
 #endif
+/* keep the module holding an address mapped for the rest of the process, whatever unload the host
+ * asks for later. the library leaves a thread-specific destructor armed on every thread that reads
+ * through it, and a host that unloads it, a plugin server at shutdown, still has threads whose exit
+ * runs that destructor, which would then call into code no longer mapped. pinning by address pins
+ * whichever module holds the code, so it covers the library built shared, linked statically into a
+ * plugin, or linked into an executable. returns 0 when the module is pinned and -1 when it could
+ * not be, which leaves the module exactly as unloadable as it was */
+#if defined(_WIN32)
+static inline int tdb_pin_module_containing(const void *addr)
+{
+    HMODULE module = NULL;
+    return GetModuleHandleExW(
+               GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+               (LPCWSTR)addr, &module)
+               ? 0
+               : -1;
+}
+#else
+#include <dlfcn.h>
+/* a reference that is never closed already keeps the module mapped, so a loader without
+ * RTLD_NODELETE still pins it. RTLD_NOLOAD is what keeps the call from loading anything, an
+ * executable's own path included, so without it nothing is opened */
+#if defined(RTLD_NODELETE)
+#define TDB_PIN_NODELETE RTLD_NODELETE
+#else
+#define TDB_PIN_NODELETE 0
+#endif
+static inline int tdb_pin_module_containing(const void *addr)
+{
+#if defined(RTLD_NOLOAD)
+    Dl_info info;
+    if (dladdr((void *)(uintptr_t)addr, &info) == 0 || !info.dli_fname) return -1;
+    return dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD | TDB_PIN_NODELETE) ? 0 : -1;
+#else
+    (void)addr;
+    return -1;
+#endif
+}
+#endif
+
 #endif /* __PLATFORM_RUNTIME_H__ */

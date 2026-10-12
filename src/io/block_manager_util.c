@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "base/log.h" /* TDB_DEBUG_LOG, for a module that could not be pinned */
 #include "block_manager_internal.h"
 
 /**
@@ -48,8 +49,8 @@ _Static_assert(BLOCK_MANAGER_FOOTER_SIZE == 8, "block footer must stay size plus
 _Static_assert(BLOCK_MANAGER_FOOTER_MAGIC_OFFSET == 4, "footer magic must follow the size field");
 
 /* the destructor behind this key runs at the exit of every thread that read, including a host's
- * threads that outlive an unload of the library, so the shared build is linked never to be
- * unmapped (see the nodelete flag in CMakeLists.txt) */
+ * threads that outlive an unload of the library, so the module holding it is pinned when the key
+ * is created and is never unmapped */
 static pthread_key_t bm_tls_key;
 
 static pthread_once_t bm_tls_once = PTHREAD_ONCE_INIT;
@@ -91,6 +92,14 @@ static void bm_tls_destructor(void *ptr)
  */
 static void bm_tls_init_key(void)
 {
+    /* the destructor is code in this module, and a thread that read through it can exit after the
+     * host unloaded it, so the module is pinned before the first destructor is armed. a module that
+     * cannot be pinned keeps the destructor all the same, since refusing the key would fail every
+     * read where only an unload at exit is at risk. an executable is the usual reason, it cannot be
+     * reopened by name to pin it and it is never unloaded either, so the failure is traced rather
+     * than warned about */
+    if (tdb_pin_module_containing((const void *)(uintptr_t)&bm_tls_destructor) != 0)
+        TDB_DEBUG_LOG(TDB_LOG_TRACE, "block manager module not pinned against unloading");
     bm_tls_key_ready = pthread_key_create(&bm_tls_key, bm_tls_destructor) == 0;
 }
 

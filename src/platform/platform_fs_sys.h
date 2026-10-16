@@ -573,6 +573,11 @@ static inline uint64_t tdb_process_rss(void)
      * unsampled on windows rather than forcing that link on every consumer */
     return 0;
 #elif defined(__APPLE__)
+#ifndef MACH_TASK_BASIC_INFO /* macOS < 10.8 does not have MACH_* versions. */
+#define MACH_TASK_BASIC_INFO       TASK_BASIC_INFO
+#define MACH_TASK_BASIC_INFO_COUNT TASK_BASIC_INFO_COUNT
+#define mach_task_basic_info       task_basic_info
+#endif
     struct mach_task_basic_info info;
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) ==

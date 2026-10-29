@@ -334,8 +334,8 @@ block_manager_t *sstable_ensure_open(sstable_t *sst);
  * look up the newest version of a key visible at a sequence ceiling in this sstable -- the highest
  * seq that does not exceed seq_ceiling, walking the version chain a flush or compaction retained.
  * this is the snapshot-aware point get the read path uses; the newest version overall is
- * seq_ceiling UINT64_MAX. the caller must already hold a reference so the reaper cannot evict the
- * klog mid-read. the bloom front short-circuits a definite miss (membership is version-agnostic);
+ * seq_ceiling UINT64_MAX. the caller must hold its reference throughout the call; the read takes
+ * an additional pin against klog eviction. the bloom front short-circuits a definite miss;
  * on a hit the btree reads through the borrowed node cache. a value large enough to have spilled
  * comes back as a vlog offset the caller resolves against the db-global value log.
  * @param sst the sstable
@@ -350,7 +350,8 @@ block_manager_t *sstable_ensure_open(sstable_t *sst);
  * @param ttl out -- the resolved version's expiry, or 0 for none
  * @param deleted out -- non-zero when the resolved version is a tombstone
  * @return TDB_SUCCESS on a hit, TDB_ERR_NOT_FOUND on a miss or no version at or below the ceiling,
- *         TDB_ERR_BUSY when over the reader fd budget, or TDB_ERR_IO on an open or read failure
+ *         TDB_ERR_BUSY when over the reader fd budget or unable to pin the klog, or TDB_ERR_IO on
+ *         an open or read failure
  */
 int sstable_get_at_seq(sstable_t *sst, const uint8_t *key, size_t key_size, uint64_t seq_ceiling,
                        uint8_t **value, size_t *value_size, uint64_t *vlog_offset, uint64_t *seq,
@@ -371,7 +372,7 @@ int sstable_get_at_seq(sstable_t *sst, const uint8_t *key, size_t key_size, uint
  * @param ttl out -- the resolved version's expiry, or 0 for none
  * @param deleted out -- non-zero when the resolved version is a tombstone
  * @return TDB_SUCCESS on a hit, TDB_ERR_NOT_FOUND on a miss, TDB_ERR_BUSY when over the reader fd
- *         budget, or TDB_ERR_IO on an open or read failure
+ *         budget or unable to pin the klog, or TDB_ERR_IO on an open or read failure
  */
 int sstable_get(sstable_t *sst, const uint8_t *key, size_t key_size, uint8_t **value,
                 size_t *value_size, uint64_t *vlog_offset, uint64_t *seq, int64_t *ttl,
@@ -380,9 +381,11 @@ int sstable_get(sstable_t *sst, const uint8_t *key, size_t key_size, uint8_t **v
 /**
  * sstable_sync_klog
  * force a resident sstable's klog to disk, for a checkpoint durability barrier; an evicted sstable
- * settled its durability when it was closed, so this is a no-op for it
- * @param sst the sstable
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL sstable, or TDB_ERR_IO on an fsync failure
+ * settled its durability when it was closed, so this is a no-op for it. the call pins the resident
+ * manager against eviction until the sync finishes
+ * @param sst the sstable, with a caller-owned reference held throughout the call
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a NULL sstable, TDB_ERR_BUSY if the klog could not
+ * be pinned, or TDB_ERR_IO on an fsync failure
  */
 int sstable_sync_klog(sstable_t *sst);
 
@@ -403,17 +406,17 @@ const range_tombstone_set_t *sstable_iter_intervals(const sstable_iter_t *it);
 
 /**
  * sstable_iter_new
- * open a bidirectional cursor over the sstable. the caller must already hold a reference so the
- * reaper cannot evict the klog for the cursor's lifetime. use_cache reads node blocks through the
- * borrowed node cache; a compaction scan passes 0 so a bulk read neither pollutes nor trusts the
- * cache, which a txn iterator (passing 1) wants for locality. the cursor starts unpositioned; seek
- * it before reading.
+ * open a bidirectional cursor over the sstable. the caller must hold its reference for the cursor's
+ * lifetime; the cursor takes an additional pin against klog eviction. use_cache reads blocks
+ * through the borrowed node cache; a compaction scan passes 0 so a bulk read neither pollutes nor
+ * trusts the cache, which a txn iterator (passing 1) wants for locality. the cursor starts
+ * unpositioned; seek it before reading.
  * @param sst the sstable
  * @param use_cache non-zero to read node blocks through the node cache, 0 to read straight from
  * disk
  * @param out out -- the cursor on success, owned by the caller (freed by sstable_iter_free)
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_BUSY over the reader fd budget, TDB_ERR_IO, or
- *         TDB_ERR_MEMORY
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_BUSY over the reader fd budget or when unable
+ *         to pin the klog, TDB_ERR_IO, or TDB_ERR_MEMORY
  */
 int sstable_iter_new(sstable_t *sst, int use_cache, sstable_iter_t **out);
 

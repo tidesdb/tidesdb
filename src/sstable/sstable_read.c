@@ -12,12 +12,40 @@
 #include "base/errors.h" /* TDB_SUCCESS and the TDB_ERR_* result codes */
 #include "base/log.h"
 #include "internal/types.h" /* TDB_KV_FLAG_* the iterator reports a tombstone in */
-#include "sstable.h"
+#include "sstable_internal.h"
 
 /* fraction of the recorded node size added as read slack, as a right shift; 2 adds a quarter. a
  * node is closed once it has passed the target, so the node on disk is the target plus at most one
  * entry */
 #define SSTABLE_NODE_SIZE_SLACK_SHIFT 2
+
+#ifdef TDB_TEST_SSTABLE_READ_PIN_HOOK
+static _Thread_local void (*sstable_read_hook)(sstable_t *, void *);
+static _Thread_local void *sstable_read_hook_ctx;
+
+void sstable_test_set_read_hook(void (*hook)(sstable_t *, void *), void *ctx)
+{
+    sstable_read_hook = hook;
+    sstable_read_hook_ctx = ctx;
+}
+#endif
+
+/* once a layout retires, the caller plus reaper candidate can equal the reaper's idle baseline.
+ * an extra reference keeps a block-manager borrow above that baseline. try_ref also waits out an
+ * eviction already in progress before the reader can borrow the resident manager */
+static int sstable_read_pin(sstable_t *sst)
+{
+    if (!tdb_try_ref(&sst->refcount)) return 0;
+#ifdef TDB_TEST_SSTABLE_READ_PIN_HOOK
+    if (sstable_read_hook) sstable_read_hook(sst, sstable_read_hook_ctx);
+#endif
+    return 1;
+}
+
+static void sstable_read_unpin(sstable_t *sst)
+{
+    if (sstable_unref(sst)) sstable_close(sst);
+}
 
 /**
  * sstable_bloom_cache_reclaim
@@ -258,14 +286,11 @@ static int64_t sstable_now(const sstable_t *sst)
     return sstable_clock_read(sst->now);
 }
 
-int sstable_get_at_seq(sstable_t *sst, const uint8_t *key, size_t key_size, uint64_t seq_ceiling,
-                       uint8_t **value, size_t *value_size, uint64_t *vlog_offset, uint64_t *seq,
-                       int64_t *ttl, uint8_t *deleted)
+static int sstable_get_at_seq_pinned(sstable_t *sst, const uint8_t *key, size_t key_size,
+                                     uint64_t seq_ceiling, uint8_t **value, size_t *value_size,
+                                     uint64_t *vlog_offset, uint64_t *seq, int64_t *ttl,
+                                     uint8_t *deleted)
 {
-    if (!sst || !key || key_size == 0 || !value || !value_size || !vlog_offset || !seq || !ttl ||
-        !deleted)
-        return TDB_ERR_INVALID_ARGS;
-
     /* a definite bloom miss avoids the klog entirely; membership is version-agnostic, so it holds
      * for any ceiling */
     partitioned_bloom_filter_reader_t *bloom = sstable_ensure_bloom(sst);
@@ -302,6 +327,20 @@ int sstable_get_at_seq(sstable_t *sst, const uint8_t *key, size_t key_size, uint
     return rc == 0 ? TDB_SUCCESS : TDB_ERR_NOT_FOUND;
 }
 
+int sstable_get_at_seq(sstable_t *sst, const uint8_t *key, size_t key_size, uint64_t seq_ceiling,
+                       uint8_t **value, size_t *value_size, uint64_t *vlog_offset, uint64_t *seq,
+                       int64_t *ttl, uint8_t *deleted)
+{
+    if (!sst || !key || key_size == 0 || !value || !value_size || !vlog_offset || !seq || !ttl ||
+        !deleted)
+        return TDB_ERR_INVALID_ARGS;
+    if (!sstable_read_pin(sst)) return TDB_ERR_BUSY;
+    const int rc = sstable_get_at_seq_pinned(sst, key, key_size, seq_ceiling, value, value_size,
+                                             vlog_offset, seq, ttl, deleted);
+    sstable_read_unpin(sst);
+    return rc;
+}
+
 int sstable_get(sstable_t *sst, const uint8_t *key, size_t key_size, uint8_t **value,
                 size_t *value_size, uint64_t *vlog_offset, uint64_t *seq, int64_t *ttl,
                 uint8_t *deleted)
@@ -313,25 +352,25 @@ int sstable_get(sstable_t *sst, const uint8_t *key, size_t key_size, uint8_t **v
 int sstable_sync_klog(sstable_t *sst)
 {
     if (!sst) return TDB_ERR_INVALID_ARGS;
+    if (!sstable_read_pin(sst)) return TDB_ERR_BUSY;
 
     /* only a resident klog needs syncing; an evicted one was closed, settling its durability then,
      * so there is nothing to force here */
     block_manager_t *bm = atomic_load_explicit(&sst->klog_bm, memory_order_acquire);
-    if (!bm) return TDB_SUCCESS;
-    return block_manager_escalate_fsync(bm) == 0 ? TDB_SUCCESS : TDB_ERR_IO;
+    const int rc = !bm || block_manager_escalate_fsync(bm) == 0 ? TDB_SUCCESS : TDB_ERR_IO;
+    sstable_read_unpin(sst);
+    return rc;
 }
 
 /* the bidirectional cursor over one sstable, opened once and reused; the borrowed btree reads the
  * klog either through the node cache or straight from the file */
 struct sstable_iter
 {
+    sstable_t *read_pin;
     btree_t *tree;
     btree_cursor_t *cursor;
-    /* the sstable's clock rather than the sstable, so the cursor holds no second handle on a
-     * refcounted object it does not own */
+    /* borrowed from the pinned table for the cursor's lifetime */
     _Atomic(int64_t) *now;
-    /* and the intervals it carries, borrowed on the same terms -- the caller holds the table open
-     * for as long as this cursor lives, so the set outlives it */
     const range_tombstone_set_t *intervals;
 };
 
@@ -354,9 +393,16 @@ int sstable_iter_new(sstable_t *sst, const int use_cache, sstable_iter_t **out)
     sstable_iter_t *it = calloc(1, sizeof(*it));
     if (!it) return TDB_ERR_MEMORY;
 
+    if (!sstable_read_pin(sst))
+    {
+        free(it);
+        return TDB_ERR_BUSY;
+    }
+    it->read_pin = sst;
     const int open_rc = sstable_open_tree(sst, use_cache, &it->tree);
     if (open_rc != TDB_SUCCESS)
     {
+        sstable_read_unpin(sst);
         free(it);
         return open_rc;
     }
@@ -364,6 +410,7 @@ int sstable_iter_new(sstable_t *sst, const int use_cache, sstable_iter_t **out)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "btree cursor init failed on %s", sst->klog_path);
         btree_free(it->tree);
+        sstable_read_unpin(sst);
         free(it);
         return TDB_ERR_IO;
     }
@@ -459,5 +506,6 @@ void sstable_iter_free(sstable_iter_t *it)
     if (!it) return;
     btree_cursor_free(it->cursor);
     btree_free(it->tree);
+    sstable_read_unpin(it->read_pin);
     free(it);
 }

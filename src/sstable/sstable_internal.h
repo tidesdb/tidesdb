@@ -34,4 +34,14 @@
 sstable_t *sstable_alloc_owning_path(uint64_t id, int partition, char *klog_path,
                                      const char *cf_name, int sync_mode);
 
+#ifdef TDB_TEST_SSTABLE_READ_PIN_HOOK
+/**
+ * sstable_test_set_read_hook
+ * install a thread-local callback after read-pin acquisition, before any block-manager borrow
+ * @param hook callback for deterministic reaper tests, or NULL to disarm
+ * @param ctx borrowed callback context
+ */
+void sstable_test_set_read_hook(void (*hook)(sstable_t *, void *), void *ctx);
+#endif
+
 #endif /* __TIDESDB_SSTABLE_INTERNAL_H__ */

@@ -277,6 +277,11 @@ if(TIDESDB_BUILD_TESTS OR TIDESDB_BUILD_FUZZERS)
     target_compile_definitions(tidesdb PUBLIC TDB_TEST_INTERNALS)
 endif()
 
+# deterministic reaper callback after sstable read-pin acquisition
+if(TIDESDB_BUILD_TESTS)
+    target_compile_definitions(tidesdb PUBLIC TDB_TEST_SSTABLE_READ_PIN_HOOK)
+endif()
+
 # split the build and install views: an exported target must not carry this machine's source path.
 # the build tree offers both include/ (so an in-tree consumer writes "db.h") and the assembled
 # binary include/ (so it can also write <tidesdb/db.h>, matching what installs); the install tree

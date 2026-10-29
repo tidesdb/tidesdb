@@ -6,17 +6,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "../src/column_family/level/level_set.h"
 #include "../src/fdmanager/reaper.h"
-#include "../src/sstable/sstable.h"
+#include "../src/sstable/sstable_internal.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-#define TEST_REAPER_DIR      "." PATH_SEPARATOR "test_reaper"
-#define TEST_REAPER_MODE     0755
-#define TEST_REAPER_MAX_OPEN 8
-#define TEST_REAPER_COUNT    6
+#define TEST_REAPER_DIR       "." PATH_SEPARATOR "test_reaper"
+#define TEST_REAPER_MODE      0755
+#define TEST_REAPER_MAX_OPEN  8
+#define TEST_REAPER_COUNT     6
+#define TEST_REAPER_IDLE_REFS 2
 
 /* build a small real sstable klog on disk under the given id, leaving the file for a reopen */
 static void build_sst(uint64_t id)
@@ -77,6 +79,31 @@ static sstable_t *open_and_hold(uint64_t id, fd_manager_t *fdm)
 static int klog_open(sstable_t *sst)
 {
     return atomic_load_explicit(&sst->klog_bm, memory_order_acquire) != NULL;
+}
+
+static void drop_sstable_ref(sstable_t *sst)
+{
+    if (sstable_unref(sst)) sstable_close(sst);
+}
+
+typedef struct
+{
+    fd_manager_t *fdm;
+    sstable_t **candidates;
+    sstable_t *victim;
+    int calls;
+    int failed;
+} read_pin_probe_t;
+
+/* force descriptor pressure while a point read or sync holds its pin, so a candidate at the former
+ * caller-plus-reaper baseline proves that the new pin keeps its block manager resident */
+static void reap_during_read_pin(sstable_t *sst, void *context)
+{
+    read_pin_probe_t *probe = context;
+    probe->calls++;
+    if (fd_reaper_run(probe->fdm, probe->candidates, TEST_REAPER_COUNT, NULL) != 1 ||
+        !klog_open(sst) || klog_open(probe->victim))
+        probe->failed = 1;
 }
 
 /* the reaper reclaims idle klogs until the resident count is back under the open budget */
@@ -160,12 +187,140 @@ void test_reaper_unlimited_noop(void)
     (void)remove_directory(TEST_REAPER_DIR);
 }
 
+/* a cursor must pin a table after the layout that owned it has been retired: the reaper's candidate
+ * reference and this caller's reference alone look idle after the deferred layout is reclaimed */
+void test_reaper_keeps_retired_iterator_reader_resident(void)
+{
+    (void)remove_directory(TEST_REAPER_DIR);
+    ASSERT_EQ(mkdir(TEST_REAPER_DIR, TEST_REAPER_MODE), 0);
+
+    fd_manager_t fdm;
+    ASSERT_EQ(fd_manager_init(&fdm, TEST_REAPER_MAX_OPEN), 0);
+    const int budget = fd_manager_open_budget(&fdm);
+    ASSERT_TRUE(budget < TEST_REAPER_COUNT);
+
+    level_set_t *levels = NULL;
+    ASSERT_EQ(level_set_create(&levels), 0);
+    sstable_t *tables[TEST_REAPER_COUNT] = {0};
+    sstable_t *candidates[TEST_REAPER_COUNT] = {0};
+    sstable_iter_t *reader = NULL;
+    sstable_t *caller_ref = NULL;
+
+    for (int i = 0; i < TEST_REAPER_COUNT; i++)
+    {
+        const uint64_t id = (uint64_t)(800 + i);
+        build_sst(id);
+        tables[i] = open_and_hold(id, &fdm);
+        drop_sstable_ref(tables[i]); /* open_and_hold's test reference is not layout ownership */
+        ASSERT_EQ(level_set_install(levels, tables[i], LEVEL_SET_L1, 1), 0);
+        drop_sstable_ref(tables[i]); /* transfer the open's ownership to the layout */
+        tables[i] = NULL;
+    }
+    ASSERT_EQ(level_set_collect_all(levels, candidates, TEST_REAPER_COUNT), TEST_REAPER_COUNT);
+
+    caller_ref = candidates[0];
+    sstable_ref(caller_ref); /* the reader's source owns this table while its cursor is live */
+    ASSERT_EQ(sstable_iter_new(caller_ref, 0, &reader), TDB_SUCCESS);
+    ASSERT_EQ(sstable_iter_seek(reader, (const uint8_t *)"k", 1), TDB_SUCCESS);
+
+    ASSERT_EQ(level_set_swap(levels, candidates, 1, NULL, NULL, NULL, 0), 0);
+    level_set_reclaim_deferred(levels);
+
+    ASSERT_EQ(fd_reaper_run(&fdm, candidates, TEST_REAPER_COUNT, NULL), TEST_REAPER_COUNT - budget);
+    ASSERT_TRUE(klog_open(caller_ref)); /* check before using the cursor: upstream evicts this */
+
+    uint8_t *key = NULL, *value = NULL, deleted = 0;
+    size_t key_size = 0, value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    ASSERT_EQ(sstable_iter_seek(reader, (const uint8_t *)"k", 1), TDB_SUCCESS);
+    ASSERT_EQ(sstable_iter_get(reader, &key, &key_size, &value, &value_size, &vlog_offset, &seq,
+                               &ttl, &deleted),
+              TDB_SUCCESS);
+    ASSERT_EQ(key_size, 1);
+    ASSERT_EQ(value_size, 1);
+    ASSERT_EQ(key[0], 'k');
+    ASSERT_EQ(value[0], 'v');
+    ASSERT_FALSE(deleted);
+    sstable_iter_free(reader);
+    reader = NULL;
+
+    /* point reads and checkpoints need the same short-lived pin, while their hook makes eviction
+     * contend with the borrow before either path touches the klog */
+    ASSERT_TRUE(sstable_ensure_open(caller_ref) != NULL);
+    ASSERT_TRUE(sstable_ensure_open(candidates[1]) != NULL);
+    read_pin_probe_t probe = {
+        .fdm = &fdm,
+        .candidates = candidates,
+        .victim = candidates[1],
+    };
+    sstable_test_set_read_hook(reap_during_read_pin, &probe);
+    key = NULL;
+    value = NULL;
+    ASSERT_EQ(sstable_get(caller_ref, (const uint8_t *)"k", 1, &value, &value_size, &vlog_offset,
+                          &seq, &ttl, &deleted),
+              TDB_SUCCESS);
+    sstable_test_set_read_hook(NULL, NULL);
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_FALSE(probe.failed);
+    ASSERT_EQ(value_size, 1);
+    ASSERT_EQ(value[0], 'v');
+    free(value);
+
+    ASSERT_TRUE(sstable_ensure_open(candidates[1]) != NULL);
+    sstable_test_set_read_hook(reap_during_read_pin, &probe);
+    ASSERT_EQ(sstable_sync_klog(caller_ref), TDB_SUCCESS);
+    sstable_test_set_read_hook(NULL, NULL);
+    ASSERT_EQ(probe.calls, 2);
+    ASSERT_FALSE(probe.failed);
+
+    ASSERT_TRUE(sstable_ensure_open(candidates[1]) != NULL);
+    ASSERT_EQ(fd_reaper_run(&fdm, candidates, TEST_REAPER_COUNT, NULL), 1);
+    ASSERT_FALSE(klog_open(caller_ref)); /* all three operations released their pins */
+
+    /* missing keys and failed opens must return the operation's pin too */
+    value = NULL;
+    ASSERT_EQ(sstable_get_at_seq(caller_ref, (const uint8_t *)"k", 1, 0, &value, &value_size,
+                                 &vlog_offset, &seq, &ttl, &deleted),
+              TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(atomic_load(&caller_ref->refcount), TEST_REAPER_IDLE_REFS);
+    ASSERT_EQ(fd_reaper_run(&fdm, candidates, TEST_REAPER_COUNT, NULL), 1);
+    ASSERT_EQ(sstable_sync_klog(caller_ref), TDB_SUCCESS); /* a nonresident klog needs no sync */
+    ASSERT_EQ(atomic_load(&caller_ref->refcount), TEST_REAPER_IDLE_REFS);
+
+    char missing_path[] = TEST_REAPER_DIR PATH_SEPARATOR "missing" PATH_SEPARATOR "table.klog";
+    char *saved_path = caller_ref->klog_path;
+    caller_ref->klog_path = missing_path;
+    ASSERT_EQ(sstable_get(caller_ref, (const uint8_t *)"k", 1, &value, &value_size, &vlog_offset,
+                          &seq, &ttl, &deleted),
+              TDB_ERR_IO);
+    ASSERT_EQ(atomic_load(&caller_ref->refcount), TEST_REAPER_IDLE_REFS);
+    ASSERT_EQ(sstable_iter_new(caller_ref, 0, &reader), TDB_ERR_IO);
+    ASSERT_EQ(atomic_load(&caller_ref->refcount), TEST_REAPER_IDLE_REFS);
+    caller_ref->klog_path = saved_path;
+
+    value = NULL;
+    ASSERT_EQ(sstable_get(caller_ref, (const uint8_t *)"k", 1, &value, &value_size, &vlog_offset,
+                          &seq, &ttl, &deleted),
+              TDB_SUCCESS);
+    free(value);
+    ASSERT_EQ(fd_reaper_run(&fdm, candidates, TEST_REAPER_COUNT, NULL), 1);
+    ASSERT_FALSE(klog_open(caller_ref));
+
+    drop_sstable_ref(caller_ref);
+    for (int i = 0; i < TEST_REAPER_COUNT; i++) drop_sstable_ref(candidates[i]);
+    level_set_free(levels);
+    fd_manager_destroy(&fdm);
+    (void)remove_directory(TEST_REAPER_DIR);
+}
+
 int main(int argc, char **argv)
 {
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_reaper_evicts_to_budget, tests_passed);
     RUN_TEST(test_reaper_respects_refs, tests_passed);
     RUN_TEST(test_reaper_unlimited_noop, tests_passed);
+    RUN_TEST_HANDLE_BALANCED(test_reaper_keeps_retired_iterator_reader_resident, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

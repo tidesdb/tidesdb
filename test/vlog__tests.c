@@ -1987,6 +1987,8 @@ void test_recover_cleanup_survives_a_torn_fresh_successor(void)
     ASSERT_EQ(test_spawn_self(vlog_test_exe, VLOG_RECOVERY_CHILD_FLAG, VLOG_RECOVERY_CHILD_PHASE,
                               "1", &child_status),
               0);
+    if (child_status != 0)
+        fprintf(stderr, "torn fresh successor child failed status=%d\n", child_status);
     ASSERT_EQ(child_status, 0);
 
     /* the interrupted open removed the empty file before it tore the successor header */

@@ -902,9 +902,12 @@ static void* blob_backup_writer(void* arg)
     {
         const uint8_t key[] = {(uint8_t)writer->index, (uint8_t)i};
         memset(value, (int)(group + i), sizeof(value));
-        ASSERT_EQ(tidesdb_blob_put_group(writer->db, writer->media, group, key, sizeof(key), value,
-                                         sizeof(value)),
-                  TDB_SUCCESS);
+        const int rc = tidesdb_blob_put_group(writer->db, writer->media, group, key, sizeof(key),
+                                              value, sizeof(value));
+        if (rc != TDB_SUCCESS)
+            fprintf(stderr, "grouped backup writer failed rc=%d group=%u key=%u/%u\n", rc, group,
+                    key[0], key[1]);
+        ASSERT_EQ(rc, TDB_SUCCESS);
         blob_put_kv(writer->db, writer->kv, key, sizeof(key), value, sizeof(value));
         atomic_fetch_add(writer->committed_kv, 1);
     }

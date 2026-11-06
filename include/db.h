@@ -386,6 +386,22 @@ typedef struct tidesdb_config_t
     int64_t txn_timeout_seconds;
 } tidesdb_config_t;
 
+/**
+ * tidesdb_open_options_t
+ * additive open-time choices kept out of tidesdb_config_t so callers compiled against an older
+ * public header retain that struct's by-value ABI
+ * @param size bytes the caller supplied, set to sizeof(tidesdb_open_options_t). a shorter known
+ *             prefix is accepted and leaves later fields at their defaults; a value smaller than
+ *             the size field is invalid
+ * @param enable_vlog_indexes nonzero to publish rebuildable indexes for sealed value-log segments,
+ *                             0 to retain payload-scan recovery, which is the default
+ */
+typedef struct tidesdb_open_options_t
+{
+    size_t size;
+    uint64_t enable_vlog_indexes;
+} tidesdb_open_options_t;
+
 /* ===== statistics ===== */
 
 /* the maximum number of sstable levels a column family keeps; per-level stat arrays are sized to
@@ -687,6 +703,20 @@ long tidesdb_raise_open_file_limit(long desired);
  * a wal could not be opened, or TDB_ERR_CORRUPTION on a column family config that does not decode
  */
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
+
+/**
+ * tidesdb_open_with_options
+ * open or create a database with additive, size-tagged open-time options while leaving the
+ * tidesdb_config_t ABI unchanged
+ * @param config database configuration, borrowed; follows the same rules as tidesdb_open
+ * @param options optional open-time choices, borrowed; NULL selects every default. size must name
+ *                at least the size field, and fields beyond size retain their defaults
+ * @param db out -- the open database handle on success, untouched on failure
+ * @return TDB_SUCCESS and the same errors as tidesdb_open, or TDB_ERR_INVALID_ARGS when options
+ *         names less than its size field
+ */
+int tidesdb_open_with_options(const tidesdb_config_t *config,
+                              const tidesdb_open_options_t *options, tidesdb_t **db);
 
 /**
  * tidesdb_close

@@ -9,7 +9,7 @@
 #ifndef __VLOG_INTERNAL_H__
 #define __VLOG_INTERNAL_H__
 #include "base/lockfree.h"
-#include "sstable/vlog.h"
+#include "sstable/vlog_sidecar.h"
 
 /* private to the vlog module -- the segment table and id index shared between vlog.c, which owns
  * the index and the value paths, and vlog_segment.c, which owns segment files and their lifetime */
@@ -193,6 +193,22 @@ struct vlog
     pthread_mutex_t roll_mu;
     vlog_segment_t segments[VLOG_MAX_SEGMENTS];
 
+    /* indexed writers hold a shared admission through their map update. the roller takes the
+     * exclusive side before it publishes a sidecar or changes the active slot. index_rw protects
+     * the accumulating vector between concurrent writers; recovery runs before either can enter. */
+    int enable_vlog_indexes;
+    pthread_rwlock_t seal_rw;
+    vlog_sidecar_entry_t *pending;
+    size_t pending_cap;
+    size_t pending_count;
+    int pending_incomplete;
+#ifdef TDB_FAULT_INJECTION
+    uint64_t recovery_payload_bytes;
+    size_t recovery_index_hits;
+    void (*after_append)(vlog_t *v);
+    void (*publication_hook)(int after_rename);
+#endif
+
     pthread_rwlock_t index_rw;
     vlog_index_entry_t *buckets;
     size_t bucket_cap;
@@ -319,12 +335,18 @@ int vlog_segment_roll(vlog_t *v, uint32_t full_slot);
  * @param v the store
  * @param payload the block payload, its vlog header included
  * @param payload_len length of payload
- * @param out_slot receives the slot the payload landed in
- * @param out_offset receives the block offset within that segment
- * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_FULL
+ * @param entry value metadata; receives the offset assigned by the block manager
+ * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_FULL
  */
-int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len, uint32_t *out_slot,
-                        uint64_t *out_offset);
+int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
+                        vlog_sidecar_entry_t *entry);
+
+/* called under index_rw by an admitted writer, or during single-threaded recovery */
+int vlog_record_entry(vlog_t *v, uint32_t slot, const vlog_sidecar_entry_t *entry);
+
+/* publish the accumulated complete segment if possible. sidecar failures leave scan recovery in
+ * charge. starts the next segment with an empty vector, reusing its capacity. */
+void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent);
 
 /**
  * vlog_index_locate

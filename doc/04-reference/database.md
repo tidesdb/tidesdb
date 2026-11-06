@@ -85,6 +85,45 @@ Safe to call from any thread at any time. It reads no shared state.
 [`tidesdb_open`](#tidesdb_open),
 [`tidesdb_default_column_family_config`](/reference/column-family#tidesdb_default_column_family_config)
 
+## tidesdb_open_with_options
+
+Open or create a database with additive open-time options.
+
+### Synopsis
+
+```c
+tidesdb_config_t config = tidesdb_default_config();
+config.db_path = "./store";
+tidesdb_open_options_t options = {
+    .size = sizeof(options),
+    .enable_vlog_indexes = 1,
+};
+int rc = tidesdb_open_with_options(&config, &options, &db);
+```
+
+### Description
+
+Pass `NULL` for `options` to use the same defaults as `tidesdb_open`. Otherwise, set
+`options.size` to `sizeof(options)`. The library reads only fields that fit within that size.
+
+Set `enable_vlog_indexes` to a nonzero value to publish a rebuildable `.vix` beside each
+sealed value-log segment. This applies to ordinary separated values across all column families.
+Recovery checks the sidecar against the segment's identity, extent and frame metadata. An index
+hit skips the value bytes. Point reads still verify the block checksum. A missing, damaged or
+mismatched index triggers a scan of that segment and a rebuild if the frames cover its extent.
+For example, copying a database to new files requires this scan on the first indexed open.
+
+The default is zero. Both modes write the existing v10 value-log format. Older binaries can
+read these value logs and ignore the optional index files.
+
+### Parameters
+
+| Parameter | Description |
+| --- | --- |
+| `config` | Database configuration, borrowed; follows [`tidesdb_open`](#tidesdb_open). |
+| `options` | Optional borrowed size-tagged options; `NULL` uses defaults. |
+| `db` | Out parameter. Receives the handle on success; untouched on failure. |
+
 ## tidesdb_open
 
 Open or create a database.

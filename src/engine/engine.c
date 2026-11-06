@@ -397,9 +397,10 @@ static int engine_open_init(tidesdb_t *db, const tidesdb_config_t *config)
  * open the db-level stores every column family shares -- the block cache, the descriptor budget,
  * the arena pool, the manifest, and the value log
  * @param db the database, already through engine_open_init
+ * @param enable_vlog_indexes whether sealed value-log segments publish rebuildable indexes
  * @return TDB_SUCCESS, TDB_ERR_MEMORY, TDB_ERR_IO, or TDB_ERR_INVALID_ARGS on an unformattable path
  */
-static int engine_open_stores(tidesdb_t *db)
+static int engine_open_stores(tidesdb_t *db, const int enable_vlog_indexes)
 {
     const cache_config_t cc = {.capacity_bytes = db->config.block_cache_size};
     db->cache = cache_create(&cc);
@@ -468,6 +469,7 @@ static int engine_open_stores(tidesdb_t *db)
     const vlog_config_t vc = {.encodings = &db->encodings,
                               .sync_mode = engine_durable_sync_mode(db->config.memtable_sync_mode),
                               .segment_target_bytes = db->config.vlog_segment_size,
+                              .enable_vlog_indexes = enable_vlog_indexes,
                               .fdm = db->fdm_inited ? &db->fdm : NULL};
     if (vlog_open(db->db_path, &vc, &db->vlog) != VLOG_OK) return TDB_ERR_IO;
     return TDB_SUCCESS;
@@ -623,7 +625,7 @@ static int engine_open_threads(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
-int engine_open(const tidesdb_config_t *config, tidesdb_t **out)
+int engine_open(const tidesdb_config_t *config, const int enable_vlog_indexes, tidesdb_t **out)
 {
     if (!config || !config->db_path || config->db_path[0] == '\0' || !out)
         return TDB_ERR_INVALID_ARGS;
@@ -638,7 +640,7 @@ int engine_open(const tidesdb_config_t *config, tidesdb_t **out)
      */
     int recovered = 0;
     int rc = engine_open_init(db, config);
-    if (rc == TDB_SUCCESS) rc = engine_open_stores(db);
+    if (rc == TDB_SUCCESS) rc = engine_open_stores(db, enable_vlog_indexes != 0);
     if (rc == TDB_SUCCESS) rc = engine_open_recover(db, &recovered);
     if (rc == TDB_SUCCESS) rc = engine_open_txn(db);
     if (rc == TDB_SUCCESS) rc = engine_open_threads(db);

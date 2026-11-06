@@ -196,21 +196,73 @@ static int vlog_index_put(vlog_t *v, uint64_t id, uint32_t segment, uint64_t off
     return VLOG_OK;
 }
 
+/* sidecars are expendable. failure to grow their staging area cannot lose a completed append
+ * or produce a partial index: stop collecting for this segment and let recovery scan it. */
+static void vlog_collect_entry(vlog_t *v, const vlog_sidecar_entry_t *entry)
+{
+    if (v->pending_incomplete) return;
+    if (v->pending_count == v->pending_cap)
+    {
+        const size_t cap = v->pending_cap ? v->pending_cap * 2 : VLOG_INDEX_INITIAL_CAP;
+        vlog_sidecar_entry_t *more = NULL;
+        if (cap > v->pending_cap && cap <= SIZE_MAX / sizeof(*more))
+            more = realloc(v->pending, cap * sizeof(*more));
+        if (!more)
+        {
+            v->pending_incomplete = 1;
+            return;
+        }
+        v->pending = more;
+        v->pending_cap = cap;
+    }
+    v->pending[v->pending_count++] = *entry;
+}
+
+int vlog_record_entry(vlog_t *v, uint32_t slot, const vlog_sidecar_entry_t *entry)
+{
+    if (v->enable_vlog_indexes) vlog_collect_entry(v, entry);
+    return vlog_index_put(v, entry->id, slot, entry->offset, entry->value_len, entry->disk_len,
+                          entry->chain);
+}
+
+void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent)
+{
+    if (v->pending_count && !v->pending_incomplete &&
+        vlog_sidecar_publish(v, slot, v->pending, v->pending_count, extent) != VLOG_OK)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "vlog segment %llu will require a recovery scan",
+                      (unsigned long long)v->segments[slot].number);
+    v->pending_count = 0;
+    v->pending_incomplete = 0;
+}
+
+/* parse once for both a freshly encoded value and a verified block returned by a recovery scan.
+ * only the ids in the actual frame describe what was stored when a codec fell back to verbatim. */
+static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, uint32_t size, uint64_t offset)
+{
+    const uint64_t word = decode_uint64_le_compat(data + VLOG_BLK_ID_SIZE);
+    int count = (int)(word >> VLOG_BLK_CHAIN_SHIFT);
+    if (count > TDB_ENCODING_PIPELINE_MAX || size < VLOG_BLK_HDR_SIZE + (size_t)count) count = 0;
+    return (vlog_sidecar_entry_t){.id = decode_uint64_le_compat(data),
+                                  .offset = offset,
+                                  .value_len = word & VLOG_BLK_LEN_MASK,
+                                  .disk_len = block_manager_framed_size(size),
+                                  .chain = vlog_chain_key(data + VLOG_BLK_HDR_SIZE, count)};
+}
+
 /**
- * vlog_recover_segment
+ * vlog_scan_segment
  * rebuilds index entries from one segment's blocks, skipping a torn tail or a block left
  * half-written by a crashed reclaim
  * @param v vlog handle
  * @param slot the segment's table slot
+ * @param bm opened block manager for this segment
+ * @param fsize recovery extent at open
  * @param out_max_id raised to the highest id seen
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_MEMORY
  */
-static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
+static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint64_t fsize,
+                             uint64_t *out_max_id)
 {
-    uint64_t fsize = 0;
-    block_manager_t *bm = vlog_segment_ensure_open(v, slot);
-    if (!bm || block_manager_get_size(bm, &fsize) != 0) return VLOG_ERR_IO;
-
     block_manager_cursor_t cur;
     if (block_manager_cursor_init_stack(&cur, bm) != 0) return VLOG_ERR_IO;
 
@@ -227,29 +279,50 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
         }
         if (block->size >= VLOG_BLK_HDR_SIZE)
         {
-            const uint64_t id = decode_uint64_le_compat(block->data);
+            const vlog_sidecar_entry_t entry =
+                vlog_frame_entry(block->data, (uint32_t)block->size, offset);
+#ifdef TDB_FAULT_INJECTION
             const uint64_t word =
-                decode_uint64_le_compat((const uint8_t *)block->data + VLOG_BLK_ID_SIZE);
-            const uint64_t vlen = word & VLOG_BLK_LEN_MASK;
-
-            /* the chain is read back off the value itself, so a store reopened after its family
-             * changed codec still attributes each value to what actually encoded it */
-            int chain_count = (int)(word >> VLOG_BLK_CHAIN_SHIFT);
-            if (chain_count > TDB_ENCODING_PIPELINE_MAX) chain_count = 0;
-            if (block->size < VLOG_BLK_HDR_SIZE + (size_t)chain_count) chain_count = 0;
-            const uint64_t chain =
-                vlog_chain_key((const uint8_t *)block->data + VLOG_BLK_HDR_SIZE, chain_count);
-
-            if (id > *out_max_id) *out_max_id = id;
-            if (id != VLOG_ID_INVALID &&
-                vlog_index_put(v, id, slot, offset, vlen,
-                               block_manager_framed_size((uint32_t)block->size), chain) != VLOG_OK)
-                rc = VLOG_ERR_MEMORY;
+                decode_uint64_le_compat((uint8_t *)block->data + VLOG_BLK_ID_SIZE);
+            const size_t header = VLOG_BLK_HDR_SIZE + (size_t)(word >> VLOG_BLK_CHAIN_SHIFT);
+            if (block->size >= header) v->recovery_payload_bytes += block->size - header;
+#endif
+            if (entry.id > *out_max_id) *out_max_id = entry.id;
+            if (entry.id != VLOG_ID_INVALID) rc = vlog_record_entry(v, slot, &entry);
         }
         block_manager_block_free(block);
         if (rc != VLOG_OK) break;
         if (block_manager_cursor_next(&cur) != 0) break;
     }
+    return rc;
+}
+
+static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *max_id)
+{
+    uint64_t extent = 0;
+    block_manager_t *bm = vlog_segment_ensure_open(v, slot);
+    if (!bm || block_manager_get_size(bm, &extent) != 0) return VLOG_ERR_IO;
+
+    vlog_sidecar_entry_t *entries = NULL;
+    size_t count = 0;
+    if (v->enable_vlog_indexes && vlog_sidecar_load(v, slot, extent, &entries, &count) == VLOG_OK)
+    {
+        int rc = VLOG_OK;
+        for (size_t i = 0; rc == VLOG_OK && i < count; ++i)
+        {
+            const vlog_sidecar_entry_t *e = &entries[i];
+            rc = vlog_index_put(v, e->id, slot, e->offset, e->value_len, e->disk_len, e->chain);
+            if (e->id > *max_id) *max_id = e->id;
+        }
+        free(entries);
+#ifdef TDB_FAULT_INJECTION
+        ++v->recovery_index_hits;
+#endif
+        return rc;
+    }
+
+    const int rc = vlog_scan_segment(v, slot, bm, extent, max_id);
+    if (v->enable_vlog_indexes && rc == VLOG_OK) vlog_publish_pending(v, slot, extent);
     return rc;
 }
 
@@ -289,6 +362,7 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
     if (!v) return VLOG_ERR_MEMORY;
 
     memcpy(v->dir, dir, strlen(dir) + 1);
+    v->enable_vlog_indexes = config->enable_vlog_indexes;
     v->sync_mode = config->sync_mode;
     v->fdm = config->fdm;
     /* no builder is in flight yet, so every slot is free and nothing is protected */
@@ -301,12 +375,18 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
     atomic_init(&v->next_number, 0);
     atomic_init(&v->active_slot, 0);
     atomic_init(&v->seg_high, 0);
+    if (v->enable_vlog_indexes && pthread_rwlock_init(&v->seal_rw, NULL) != 0)
+    {
+        free(v);
+        return VLOG_ERR_IO;
+    }
     pthread_mutex_init(&v->roll_mu, NULL);
     pthread_rwlock_init(&v->index_rw, NULL);
     v->bucket_cap = VLOG_INDEX_INITIAL_CAP;
     v->buckets = calloc(v->bucket_cap, sizeof(*v->buckets));
     if (!v->buckets)
     {
+        if (v->enable_vlog_indexes) pthread_rwlock_destroy(&v->seal_rw);
         pthread_mutex_destroy(&v->roll_mu);
         pthread_rwlock_destroy(&v->index_rw);
         free(v);
@@ -350,6 +430,8 @@ void vlog_close(vlog_t *v)
     }
     pthread_mutex_destroy(&v->roll_mu);
     pthread_rwlock_destroy(&v->index_rw);
+    if (v->enable_vlog_indexes) pthread_rwlock_destroy(&v->seal_rw);
+    free(v->pending);
     free(v->buckets);
     free(v);
 }
@@ -446,24 +528,15 @@ int vlog_write(vlog_t *v, const uint8_t *value, size_t value_len, const uint8_t 
     int rc = vlog_frame_payload(v, id, value, value_len, ids, id_count, &payload, &payload_len);
     if (rc != VLOG_OK) return rc;
 
-    uint32_t slot = 0;
-    uint64_t offset = 0;
-    const uint64_t framed = block_manager_framed_size((uint32_t)payload_len);
-    rc = vlog_segment_append(v, payload, payload_len, &slot, &offset);
-    if (rc == VLOG_OK)
-    {
-        pthread_rwlock_wrlock(&v->index_rw);
-        rc = vlog_index_put(v, id, slot, offset, (uint64_t)value_len, framed,
-                            vlog_chain_key(ids, id_count));
-        pthread_rwlock_unlock(&v->index_rw);
-    }
+    vlog_sidecar_entry_t entry = vlog_frame_entry(payload, (uint32_t)payload_len, 0);
+    rc = vlog_segment_append(v, payload, payload_len, &entry);
     free(payload);
 
     if (rc == VLOG_OK)
     {
         *out_id = id;
-        if (out_disk_bytes) *out_disk_bytes = framed;
-        atomic_fetch_add_explicit(&v->bytes_written, framed, memory_order_relaxed);
+        if (out_disk_bytes) *out_disk_bytes = entry.disk_len;
+        atomic_fetch_add_explicit(&v->bytes_written, entry.disk_len, memory_order_relaxed);
     }
     return rc;
 }

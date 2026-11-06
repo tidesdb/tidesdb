@@ -38,6 +38,8 @@ static int tests_failed = 0;
  * such values to write, so the store must open more than the one segment it starts with */
 #define ENGINE_TEST_VLOG_SEGMENT_SIZE (64u * 1024)
 #define ENGINE_TEST_VLOG_SEGMENT_KEYS 200
+#define ENGINE_TEST_VLOG_INDEX_PATH \
+    ENGINE_TEST_DB_DIR PATH_SEPARATOR "000000000000.vix"
 
 /* the transaction id an undecided prepare is left under, to pin the log generation holding it */
 #define ENGINE_TEST_PIN_XID "pin-the-generation"
@@ -160,6 +162,9 @@ void test_engine_rejects_bad_args(void)
 
     tidesdb_config_t no_path = engine_test_config(NULL);
     ASSERT_EQ(tidesdb_open(&no_path, &db), TDB_ERR_INVALID_ARGS);
+
+    const tidesdb_open_options_t undersized_options = {.size = 0, .enable_vlog_indexes = 1};
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &undersized_options, &db), TDB_ERR_INVALID_ARGS);
 
     ASSERT_EQ(tidesdb_close(NULL), TDB_ERR_INVALID_ARGS);
 }
@@ -4996,6 +5001,89 @@ void test_engine_vlog_segment_size_is_honoured(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* write one value large enough to fill a segment followed by a distinct key whose append seals it.
+ * both option cases use this exact fixture, so the sidecar difference is attributable to the open
+ * option rather than their stored data. */
+static void engine_test_write_sealed_index_fixture(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    const uint8_t key[] = "indexed-key";
+    const uint8_t roll_key[] = "roll-key";
+    const uint8_t roll_value[] = "r";
+    const size_t value_size = ENGINE_TEST_VLOG_SEGMENT_SIZE;
+    uint8_t *value = malloc(value_size);
+    ASSERT_TRUE(value != NULL);
+    memset(value, 'I', value_size);
+    tidesdb_txn_t *write = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &write), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(write, cf, key, sizeof(key) - 1, value, value_size, -1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(write), TDB_SUCCESS);
+    tidesdb_txn_free(write);
+    free(value);
+    write = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &write), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(write, cf, roll_key, sizeof(roll_key) - 1, roll_value,
+                              sizeof(roll_value) - 1, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(write), TDB_SUCCESS);
+    tidesdb_txn_free(write);
+}
+
+/* an ordinary KV family can opt into sealed value-log indexes through the additive public open
+ * options, and reopening still resolves the separated value written before the segment sealed */
+void test_engine_open_options_enable_vlog_indexes_for_ordinary_kv(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    cfg.vlog_segment_size = ENGINE_TEST_VLOG_SEGMENT_SIZE;
+    cfg.value_separation_threshold = 1;
+    const tidesdb_open_options_t options = {.size = sizeof(options), .enable_vlog_indexes = 1};
+    const tidesdb_open_options_t short_options = {.size = sizeof(short_options.size),
+                                                   .enable_vlog_indexes = 1};
+    tidesdb_t *db = NULL;
+
+    /* an options payload ending at its size tag is a supported older caller and must leave the
+     * newer field disabled. the shared fixture seals an ordinary KV value-log segment. */
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &short_options, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_test_write_sealed_index_fixture(db, cf);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    ASSERT_TRUE(access(ENGINE_TEST_VLOG_INDEX_PATH, F_OK) != 0);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_test_write_sealed_index_fixture(db, cf);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    ASSERT_EQ(access(ENGINE_TEST_VLOG_INDEX_PATH, F_OK), 0);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    const uint8_t key[] = "indexed-key";
+    const size_t value_size = ENGINE_TEST_VLOG_SEGMENT_SIZE;
+    tidesdb_txn_t *read = NULL;
+    uint8_t *got = NULL;
+    size_t got_size = 0;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_get(read, cf, key, sizeof(key) - 1, &got, &got_size), TDB_SUCCESS);
+    ASSERT_EQ(got_size, value_size);
+    ASSERT_EQ(got[0], 'I');
+    free(got);
+    ASSERT_EQ(tidesdb_txn_commit(read), TDB_SUCCESS);
+    tidesdb_txn_free(read);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 /* write the same run of oversized values into one family and report what the value log grew by */
 static uint64_t engine_test_write_oversized(tidesdb_t *db, const char *cf_name)
 {
@@ -7812,6 +7900,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_clone_carries_range_tombstones, tests_passed);
     RUN_TEST(test_engine_clone_column_family, tests_passed);
     RUN_TEST(test_engine_vlog_segment_size_is_honoured, tests_passed);
+    RUN_TEST(test_engine_open_options_enable_vlog_indexes_for_ordinary_kv, tests_passed);
     RUN_TEST(test_engine_value_separation_is_db_level_with_a_family_opt_out, tests_passed);
     RUN_TEST(test_engine_memtable_reference_resolves_on_every_path, tests_passed);
     RUN_TEST(test_engine_separated_value_survives_reopen_and_reclaim, tests_passed);

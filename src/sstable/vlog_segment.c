@@ -140,7 +140,12 @@ int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_
         int removed = 0;
         rc = vlog_segment_remove_empty(path, &removed);
         if (rc != VLOG_OK) break;
-        if (removed) continue;
+        if (removed)
+        {
+            if (vlog_sidecar_unlink(v, number) != VLOG_OK)
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "could not remove unused vlog index for %s", path);
+            continue;
+        }
 
         /* apply the slot limit after removing empty files, including in older stores */
         if (count >= max)
@@ -296,7 +301,14 @@ int vlog_segment_retire(vlog_t *v, uint32_t slot)
         (void)block_manager_close(bm);
         if (v->fdm) fd_manager_note_close(v->fdm, FD_LABEL_VLOG_SEGMENT);
     }
-    if (have_path == VLOG_OK) (void)remove(path);
+    /* unlink the cache first: an interruption can always rebuild it from a surviving segment. */
+    if (have_path == VLOG_OK)
+    {
+        if (vlog_sidecar_unlink(v, v->segments[slot].number) != VLOG_OK)
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "could not remove retired vlog index for %s", path);
+        if (remove(path) != 0)
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "could not remove retired vlog segment %s", path);
+    }
 
     /* the slot is reusable only once it reads absent, and the block manager must already be gone
      * when it does, so this store is the last thing to happen */
@@ -304,80 +316,104 @@ int vlog_segment_retire(vlog_t *v, uint32_t slot)
     return VLOG_OK;
 }
 
-int vlog_segment_roll(vlog_t *v, uint32_t full_slot)
+/* roll_mu protects slot installation against retire. indexed rolls also hold exclusive writer
+ * admission and pin the old segment so a descriptor reaper cannot close it during publication. */
+static int vlog_roll_locked(vlog_t *v, uint32_t full_slot)
 {
-    if (!v) return VLOG_ERR_INVALID;
-
-    pthread_mutex_lock(&v->roll_mu);
-
-    /* another thread may have rolled between the caller's size check and this lock, in which case
-     * the active segment is no longer the one observed full and there is nothing to do */
-    if (atomic_load_explicit(&v->active_slot, memory_order_acquire) != full_slot)
-    {
-        pthread_mutex_unlock(&v->roll_mu);
-        return VLOG_OK;
-    }
+    if (atomic_load_explicit(&v->active_slot, memory_order_acquire) != full_slot) return VLOG_OK;
 
     const uint64_t number = atomic_load_explicit(&v->next_number, memory_order_acquire);
     uint32_t slot = 0;
     const int rc = vlog_segment_open(v, number, &slot);
-    if (rc == VLOG_OK) atomic_store_explicit(&v->active_slot, slot, memory_order_release);
+    if (rc != VLOG_OK) return rc;
 
+    if (v->enable_vlog_indexes)
+    {
+        block_manager_t *bm = vlog_segment_ensure_open(v, full_slot);
+        uint64_t extent = 0;
+        if (!bm || block_manager_get_size(bm, &extent) != 0 || block_manager_last_errno(bm) != 0)
+            v->pending_incomplete = 1;
+        vlog_publish_pending(v, full_slot, extent);
+    }
+    atomic_store_explicit(&v->active_slot, slot, memory_order_release);
+    return VLOG_OK;
+}
+
+int vlog_segment_roll(vlog_t *v, uint32_t full_slot)
+{
+    if (!v) return VLOG_ERR_INVALID;
+    if (v->enable_vlog_indexes)
+    {
+        pthread_rwlock_wrlock(&v->seal_rw);
+        if (full_slot != atomic_load_explicit(&v->active_slot, memory_order_acquire))
+        {
+            pthread_rwlock_unlock(&v->seal_rw);
+            return VLOG_OK;
+        }
+        if (!vlog_segment_acquire(v, full_slot))
+        {
+            pthread_rwlock_unlock(&v->seal_rw);
+            return VLOG_ERR_IO;
+        }
+    }
+    pthread_mutex_lock(&v->roll_mu);
+    const int rc = vlog_roll_locked(v, full_slot);
     pthread_mutex_unlock(&v->roll_mu);
+    if (v->enable_vlog_indexes)
+    {
+        vlog_segment_release(v, full_slot);
+        pthread_rwlock_unlock(&v->seal_rw);
+    }
     return rc;
 }
 
-int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len, uint32_t *out_slot,
-                        uint64_t *out_offset)
+/* the caller pins this slot through both the physical append and its index update. a failed
+ * descriptor is treated like a full segment so retry takes a fresh file. */
+static int vlog_append_to_slot(vlog_t *v, uint32_t slot, const uint8_t *payload, uint32_t size,
+                               vlog_sidecar_entry_t *entry)
 {
-    if (!v || !payload || payload_len == 0 || !out_slot || !out_offset) return VLOG_ERR_INVALID;
+    block_manager_t *bm = vlog_segment_ensure_open(v, slot);
+    uint64_t extent = 0;
+    if (!bm || block_manager_get_size(bm, &extent) != 0) return VLOG_ERR_IO;
+    if (extent >= v->segment_target_bytes || block_manager_last_errno(bm) != 0)
+        return VLOG_ERR_FULL;
 
+    const int64_t offset = block_manager_write_raw(bm, payload, size);
+    if (offset < 0) return VLOG_ERR_IO;
+    entry->offset = (uint64_t)offset;
+#ifdef TDB_FAULT_INJECTION
+    if (v->after_append) v->after_append(v);
+#endif
+    pthread_rwlock_wrlock(&v->index_rw);
+    const int rc = vlog_record_entry(v, slot, entry);
+    pthread_rwlock_unlock(&v->index_rw);
+    return rc;
+}
+
+int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
+                        vlog_sidecar_entry_t *entry)
+{
+    if (!v || !payload || !payload_len || payload_len > UINT32_MAX || !entry)
+        return VLOG_ERR_INVALID;
     for (int attempt = 0; attempt < VLOG_APPEND_MAX_ATTEMPTS; attempt++)
     {
+        if (v->enable_vlog_indexes) pthread_rwlock_rdlock(&v->seal_rw);
         const uint32_t slot = atomic_load_explicit(&v->active_slot, memory_order_acquire);
-
-        /* the slot read a moment ago may already be retired: a reclaim rolls the active segment and
-         * may then drain the one it just sealed, so an appender can arrive at a slot that is on its
-         * way out. that is a lost race rather than a failure -- retry and the next read finds the
-         * segment that replaced it */
-        if (!vlog_segment_acquire(v, slot)) continue;
-
-        block_manager_t *bm = vlog_segment_ensure_open(v, slot);
-        uint64_t size = 0;
-        if (!bm || block_manager_get_size(bm, &size) != 0)
+        int rc = VLOG_ERR_BUSY;
+        if (vlog_segment_acquire(v, slot))
         {
+            rc = vlog_append_to_slot(v, slot, payload, (uint32_t)payload_len, entry);
             vlog_segment_release(v, slot);
-            return VLOG_ERR_IO;
         }
+        if (v->enable_vlog_indexes) pthread_rwlock_unlock(&v->seal_rw);
+        if (rc == VLOG_ERR_BUSY) continue;
+        if (rc != VLOG_ERR_FULL) return rc;
 
-        /* roll on the observed size rather than under a lock, so two appenders may both land in a
-         * segment already at its target. overshooting by a block is harmless; serializing every
-         * append behind a size check would not be. a segment whose write or sync has failed is
-         * rolled too, since it refuses every append after the failure and the values must go on
-         * landing somewhere */
-        if (size >= v->segment_target_bytes || block_manager_last_errno(bm) != 0)
-        {
-            vlog_segment_release(v, slot);
-            const int rolled = vlog_segment_roll(v, slot);
-            if (rolled == VLOG_ERR_FULL)
-            {
-                /* every slot is taken, which happens while writers are ahead of reclamation rather
-                 * than because the store is genuinely out of room. wait for a retire and look
-                 * again; the attempt budget is what stops this becoming an unbounded spin */
-                usleep(VLOG_APPEND_FULL_PAUSE_US);
-                continue;
-            }
-            if (rolled != VLOG_OK) return rolled;
-            continue;
-        }
-
-        const int64_t offset = block_manager_write_raw(bm, payload, (uint32_t)payload_len);
-        vlog_segment_release(v, slot);
-        if (offset < 0) return VLOG_ERR_IO;
-
-        *out_slot = slot;
-        *out_offset = (uint64_t)offset;
-        return VLOG_OK;
+        const int rolled = vlog_segment_roll(v, slot);
+        if (rolled == VLOG_ERR_FULL)
+            usleep(VLOG_APPEND_FULL_PAUSE_US);
+        else if (rolled != VLOG_OK)
+            return rolled;
     }
     return VLOG_ERR_FULL;
 }

@@ -12,6 +12,7 @@
 #include "../src/io/block_manager_fault.h"
 #include "../src/sstable/vlog.h"
 #include "../src/sstable/vlog_internal.h" /* the segment table, for the retire guard test */
+#include "../external/xxhash.h"
 #include "test_utils.h"
 
 #ifndef _WIN32
@@ -24,12 +25,34 @@ static int tests_failed = 0;
 #define VDIR      "." PATH_SEPARATOR "test_vlog_db"
 #define VDIR_MODE 0755
 
+/* vix sidecars have the segment name as their stable stem, so recovery can associate one without
+ * changing the authoritative segment inventory. these fixtures deliberately name the published and
+ * temporary forms independently: a crash may leave either one behind. */
+#define VLOG_INDEX_EXT     ".vix"
+#define VLOG_INDEX_TMP_EXT ".vix.tmp"
+
+/* vix v1 wire positions used only to forge a structurally well-checksummed hostile input. the
+ * production codec remains the source of ordinary sidecars. */
+#define VIX_HEADER_SIZE        72
+#define VIX_TRAILER_SIZE       8
+#define VIX_ENTRY_COUNT_OFFSET 48
+
+/* a small bounded fixture that rolls several segments while keeping each payload obvious in a
+ * recovery-byte accounting assertion */
+#define V_INDEX_VALUES 12
+
 #define VLOG_RECOVERY_CHILD_FLAG  "--vlog-recovery-child"
 #define VLOG_RECOVERY_CHILD_PHASE "open"
+#define VLOG_INDEX_CHILD_BEFORE_RENAME "vix-before-rename"
+#define VLOG_INDEX_CHILD_AFTER_RENAME  "vix-after-rename"
 #define VLOG_RECOVERY_CHILD_POLLS 5000
 
 #ifdef TDB_FAULT_INJECTION
 static const char *vlog_test_exe = NULL;
+static int vlog_index_child_after_rename = 0;
+static _Atomic(int) vlog_append_hook_entered = 0;
+static _Atomic(int) vlog_append_hook_release = 0;
+static _Atomic(int) vlog_seal_started = 0;
 #endif
 
 /* a target small enough that a handful of values seals a segment, so tests exercise rolling and
@@ -105,18 +128,30 @@ static tidesdb_encoding_registry_t g_vlog_reg;
 static uint8_t g_put_ids[TDB_ENCODING_PIPELINE_MAX];
 static int g_put_id_count;
 
-static vlog_t *open_store(tidesdb_compression_algorithm_t comp, uint64_t target)
+static vlog_t *open_store_at(const char *dir, tidesdb_compression_algorithm_t comp,
+                                   uint64_t target, int enable_indexes)
 {
     ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
     g_put_id_count = comp == TDB_COMPRESS_NONE ? 0 : 1;
     g_put_ids[0] = (uint8_t)comp;
     const vlog_config_t cfg = {.encodings = &g_vlog_reg,
                                .sync_mode = BLOCK_MANAGER_SYNC_NONE,
-                               .segment_target_bytes = target};
+                               .segment_target_bytes = target,
+                               .enable_vlog_indexes = enable_indexes};
     vlog_t *v = NULL;
-    ASSERT_TRUE(vlog_open(VDIR, &cfg, &v) == VLOG_OK);
+    ASSERT_EQ(vlog_open(dir, &cfg, &v), VLOG_OK);
     ASSERT_TRUE(v != NULL);
     return v;
+}
+
+static vlog_t *open_store(tidesdb_compression_algorithm_t comp, uint64_t target)
+{
+    return open_store_at(VDIR, comp, target, 0);
+}
+
+static vlog_t *open_index_store(const char *dir)
+{
+    return open_store_at(dir, TDB_COMPRESS_NONE, V_SEG_TARGET, 1);
 }
 
 #ifdef __linux__
@@ -210,8 +245,161 @@ static uint64_t active_segment_number(vlog_t *v)
     return v->segments[slot].number;
 }
 
+typedef struct
+{
+    vlog_id_t id;
+    vlog_index_entry_t entry;
+} vlog_index_fixture_t;
+
+static void index_sidecar_path(const char *dir, uint64_t number, const char *ext, char *out,
+                               size_t out_size)
+{
+    const int temporary = strcmp(ext, VLOG_INDEX_TMP_EXT) == 0;
+    char name[VLOG_SIDECAR_NAME_MAX];
+    ASSERT_EQ(vlog_sidecar_name(number, temporary, name, sizeof(name)), VLOG_OK);
+    ASSERT_TRUE(snprintf(out, out_size, "%s%s%s", dir, PATH_SEPARATOR, name) > 0);
+}
+
+static void copy_test_file(const char *from, const char *to)
+{
+    FILE *src = fopen(from, "rb");
+    ASSERT_TRUE(src != NULL);
+    FILE *dst = fopen(to, "wb");
+    ASSERT_TRUE(dst != NULL);
+    uint8_t bytes[1024];
+    size_t read = 0;
+    while ((read = fread(bytes, 1, sizeof(bytes), src)) > 0)
+        ASSERT_EQ(fwrite(bytes, 1, read, dst), read);
+    ASSERT_TRUE(feof(src));
+    test_fsync_file(dst);
+    ASSERT_EQ(fclose(dst), 0);
+    ASSERT_EQ(fclose(src), 0);
+}
+
+static uint64_t vix_hash(const uint8_t *data, size_t size)
+{
+    return XXH3_64bits(data, size);
+}
+
+/* preserve the checksum while making the count impossible for this sealed extent. this proves
+ * recovery applies independent bounds checks instead of treating a valid checksum as authority. */
+static void forge_index_count_beyond_segment_bounds(const char *path)
+{
+    FILE *file = fopen(path, "r+b");
+    ASSERT_TRUE(file != NULL);
+    ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+    const long length = ftell(file);
+    ASSERT_TRUE(length > VIX_HEADER_SIZE + VIX_TRAILER_SIZE);
+    ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+    uint8_t *bytes = malloc((size_t)length);
+    ASSERT_TRUE(bytes != NULL);
+    ASSERT_EQ(fread(bytes, 1, (size_t)length, file), (size_t)length);
+    encode_uint64_le_compat(bytes + VIX_ENTRY_COUNT_OFFSET, UINT64_MAX);
+    encode_uint64_le_compat(bytes + (size_t)length - VIX_TRAILER_SIZE,
+                            vix_hash(bytes, (size_t)length - VIX_TRAILER_SIZE));
+    ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+    ASSERT_EQ(fwrite(bytes, 1, (size_t)length, file), (size_t)length);
+    test_fsync_file(file);
+    ASSERT_EQ(fclose(file), 0);
+    free(bytes);
+}
+
+/* write enough fixed-size records to make every data segment immutable, then retain the exact
+ * recovered index fields. a scan and a sidecar are interchangeable only if every one agrees. */
+static size_t build_index_fixture(vlog_t *v, vlog_index_fixture_t *out, size_t max)
+{
+    ASSERT_TRUE(max >= V_INDEX_VALUES);
+    for (size_t i = 0; i < V_INDEX_VALUES; i++)
+    {
+        uint8_t *value = pattern(V_MEDIUM, (unsigned)(101 + i));
+        out[i].id = put(v, value, V_MEDIUM);
+        free(value);
+    }
+    const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    ASSERT_EQ(vlog_segment_roll(v, active), VLOG_OK);
+    for (size_t i = 0; i < V_INDEX_VALUES; i++)
+    {
+        const size_t bucket = vlog_index_locate(v, out[i].id, NULL);
+        ASSERT_TRUE(bucket != SIZE_MAX);
+        out[i].entry = v->buckets[bucket];
+    }
+    return V_INDEX_VALUES;
+}
+
+static void assert_fixture_index(vlog_t *v, const vlog_index_fixture_t *want, size_t count,
+                                 uint64_t next_id)
+{
+    ASSERT_EQ(vlog_next_id(v), next_id);
+    for (size_t i = 0; i < count; i++)
+    {
+        const size_t bucket = vlog_index_locate(v, want[i].id, NULL);
+        ASSERT_TRUE(bucket != SIZE_MAX);
+        const vlog_index_entry_t *got = &v->buckets[bucket];
+        ASSERT_EQ(got->id, want[i].entry.id);
+        ASSERT_EQ(got->offset, want[i].entry.offset);
+        ASSERT_EQ(got->value_len, want[i].entry.value_len);
+        ASSERT_EQ(got->disk_len, want[i].entry.disk_len);
+        ASSERT_EQ(got->chain, want[i].entry.chain);
+        ASSERT_EQ(got->segment, want[i].entry.segment);
+    }
+}
+
+static size_t fixture_entries_in_segment(const vlog_index_fixture_t *fixture, size_t count,
+                                         uint64_t segment)
+{
+    size_t matches = 0;
+    for (size_t i = 0; i < count; i++)
+        if (fixture[i].entry.segment == segment) matches++;
+    return matches;
+}
+
+static void write_test_byte(const char *path)
+{
+    FILE *file = fopen(path, "wb");
+    ASSERT_TRUE(file != NULL);
+    const uint8_t byte = 0;
+    ASSERT_EQ(fwrite(&byte, 1, 1, file), 1);
+    test_fsync_file(file);
+    ASSERT_EQ(fclose(file), 0);
+}
+
 #ifdef TDB_FAULT_INJECTION
 static _Atomic(int) vlog_recovery_child_done = 0;
+
+static void vlog_index_publication_crash(int after_rename)
+{
+    if (after_rename == vlog_index_child_after_rename) _exit(0);
+}
+
+static void await_index_test_event(_Atomic(int) *event)
+{
+    for (int poll = 0; poll < VLOG_RECOVERY_CHILD_POLLS; poll++)
+    {
+        if (atomic_load_explicit(event, memory_order_acquire)) return;
+        usleep(1000);
+    }
+    ASSERT_TRUE(atomic_load(event));
+}
+
+static void vlog_index_append_pause(vlog_t *v)
+{
+    (void)v; /* the hook coordinates just this test's two threads */
+    atomic_store_explicit(&vlog_append_hook_entered, 1, memory_order_release);
+    await_index_test_event(&vlog_append_hook_release);
+}
+
+static void vlog_index_publication_child(const char *phase)
+{
+    vlog_index_child_after_rename = strcmp(phase, VLOG_INDEX_CHILD_AFTER_RENAME) == 0;
+    vlog_t *v = open_index_store(VDIR);
+    v->publication_hook = vlog_index_publication_crash;
+    uint8_t *value = pattern(V_MEDIUM, 191);
+    (void)put(v, value, V_MEDIUM);
+    free(value);
+    const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    ASSERT_EQ(vlog_segment_roll(v, active), VLOG_OK);
+    _exit(8); /* the hook must have modelled the crash before roll returns */
+}
 
 static void *vlog_recovery_child_open(void *arg)
 {
@@ -804,6 +992,351 @@ void test_recover_appends_to_a_fresh_segment(void)
     vlog_close(v);
 }
 
+void test_recover_sealed_indexes_skip_payloads_and_preserve_every_index_field(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[V_INDEX_VALUES];
+    vlog_t *v = open_index_store(VDIR);
+    const size_t count = build_index_fixture(v, fixture, V_INDEX_VALUES);
+    const uint64_t next_id = vlog_next_id(v);
+    vlog_close(v);
+
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_payload_bytes, 0);
+    ASSERT_EQ(v->recovery_index_hits, 3);
+    assert_fixture_index(v, fixture, count, next_id);
+    for (size_t i = 0; i < count; i++)
+    {
+        uint8_t *value = pattern(V_MEDIUM, (unsigned)(101 + i));
+        assert_reads(v, fixture[i].id, value, V_MEDIUM);
+        free(value);
+    }
+    vlog_close(v);
+}
+
+void test_recover_missing_or_truncated_sealed_index_scans_that_segment(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[V_INDEX_VALUES];
+    vlog_t *v = open_index_store(VDIR);
+    const size_t count = build_index_fixture(v, fixture, V_INDEX_VALUES);
+    const uint64_t next_id = vlog_next_id(v);
+    uint64_t first_segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &first_segment, NULL), VLOG_OK);
+    vlog_close(v);
+
+    char sidecar[512];
+    index_sidecar_path(VDIR, first_segment, VLOG_INDEX_EXT, sidecar, sizeof(sidecar));
+    ASSERT_EQ(remove(sidecar), 0);
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 2);
+    ASSERT_EQ(v->recovery_payload_bytes,
+              fixture_entries_in_segment(fixture, count, first_segment) * V_MEDIUM);
+    assert_fixture_index(v, fixture, count, next_id);
+    vlog_close(v);
+
+    /* a malformed sidecar is no better than no sidecar: its segment alone is rebuilt from the
+     * authoritative frame stream while valid siblings remain eligible for their indexes. */
+    FILE *truncated = fopen(sidecar, "wb");
+    ASSERT_TRUE(truncated != NULL);
+    const uint8_t one_byte = 0;
+    ASSERT_EQ(fwrite(&one_byte, 1, 1, truncated), 1);
+    test_fsync_file(truncated);
+    ASSERT_EQ(fclose(truncated), 0);
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 2);
+    ASSERT_EQ(v->recovery_payload_bytes,
+              fixture_entries_in_segment(fixture, count, first_segment) * V_MEDIUM);
+    assert_fixture_index(v, fixture, count, next_id);
+    vlog_close(v);
+
+    FILE *damaged = fopen(sidecar, "r+b");
+    ASSERT_TRUE(damaged != NULL);
+    ASSERT_EQ(fseek(damaged, -1, SEEK_END), 0);
+    const int last = fgetc(damaged);
+    ASSERT_TRUE(last != EOF);
+    ASSERT_EQ(fseek(damaged, -1, SEEK_END), 0);
+    ASSERT_TRUE(fputc(last ^ 1, damaged) != EOF);
+    ASSERT_EQ(fclose(damaged), 0);
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 2);
+    ASSERT_EQ(v->recovery_payload_bytes,
+              fixture_entries_in_segment(fixture, count, first_segment) * V_MEDIUM);
+    assert_fixture_index(v, fixture, count, next_id);
+    ASSERT_EQ(vlog_reclaim(v), VLOG_OK);
+    ASSERT_TRUE(access(sidecar, F_OK) != 0 && errno == ENOENT);
+    vlog_close(v);
+}
+
+void test_recover_rejects_foreign_same_number_and_size_index(void)
+{
+    static const char foreign_dir[] = "." PATH_SEPARATOR "test_vlog_foreign_index_db";
+    fresh_dir();
+    (void)remove_directory(foreign_dir);
+    ASSERT_EQ(mkdir(foreign_dir, VDIR_MODE), 0);
+
+    vlog_index_fixture_t local[V_INDEX_VALUES];
+    vlog_t *v = open_index_store(VDIR);
+    const size_t count = build_index_fixture(v, local, V_INDEX_VALUES);
+    const uint64_t next_id = vlog_next_id(v);
+    uint64_t segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, local[0].id, &segment, NULL), VLOG_OK);
+    vlog_close(v);
+
+    vlog_index_fixture_t foreign[V_INDEX_VALUES];
+    v = open_index_store(foreign_dir);
+    ASSERT_EQ(build_index_fixture(v, foreign, V_INDEX_VALUES), V_INDEX_VALUES);
+    vlog_close(v);
+
+    char local_index[512], foreign_index[512];
+    index_sidecar_path(VDIR, segment, VLOG_INDEX_EXT, local_index, sizeof(local_index));
+    index_sidecar_path(foreign_dir, segment, VLOG_INDEX_EXT, foreign_index, sizeof(foreign_index));
+    copy_test_file(foreign_index, local_index);
+
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 2);
+    ASSERT_EQ(v->recovery_payload_bytes,
+              fixture_entries_in_segment(local, count, segment) * V_MEDIUM);
+    assert_fixture_index(v, local, count, next_id);
+    vlog_close(v);
+    (void)remove_directory(foreign_dir);
+}
+
+void test_recover_rejects_well_checksummed_index_with_impossible_count(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[V_INDEX_VALUES];
+    vlog_t *v = open_index_store(VDIR);
+    const size_t count = build_index_fixture(v, fixture, V_INDEX_VALUES);
+    const uint64_t next_id = vlog_next_id(v);
+    uint64_t segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &segment, NULL), VLOG_OK);
+    vlog_close(v);
+
+    char index[512];
+    index_sidecar_path(VDIR, segment, VLOG_INDEX_EXT, index, sizeof(index));
+    forge_index_count_beyond_segment_bounds(index);
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 2);
+    ASSERT_EQ(v->recovery_payload_bytes,
+              fixture_entries_in_segment(fixture, count, segment) * V_MEDIUM);
+    assert_fixture_index(v, fixture, count, next_id);
+    vlog_close(v);
+}
+
+void test_recover_rejects_stale_index_after_its_segment_extent_changes(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[V_INDEX_VALUES];
+    vlog_t *v = open_index_store(VDIR);
+    const size_t count = build_index_fixture(v, fixture, V_INDEX_VALUES);
+    const uint64_t next_id = vlog_next_id(v);
+    uint64_t segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &segment, NULL), VLOG_OK);
+    vlog_close(v);
+
+    char name[VLOG_SEGMENT_NAME_MAX], path[512];
+    ASSERT_EQ(vlog_segment_name(segment, name, sizeof(name)), VLOG_OK);
+    ASSERT_TRUE(snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) > 0);
+    FILE *segment_file = fopen(path, "ab");
+    ASSERT_TRUE(segment_file != NULL);
+    const uint8_t torn_tail = 0;
+    ASSERT_EQ(fwrite(&torn_tail, 1, 1, segment_file), 1);
+    test_fsync_file(segment_file);
+    ASSERT_EQ(fclose(segment_file), 0);
+
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 2);
+    ASSERT_EQ(v->recovery_payload_bytes,
+              fixture_entries_in_segment(fixture, count, segment) * V_MEDIUM);
+    assert_fixture_index(v, fixture, count, next_id);
+    vlog_close(v);
+}
+
+void test_index_hit_still_checks_payload_on_point_read(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[V_INDEX_VALUES];
+    vlog_t *v = open_index_store(VDIR);
+    (void)build_index_fixture(v, fixture, V_INDEX_VALUES);
+    uint64_t segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &segment, NULL), VLOG_OK);
+    const uint64_t offset = fixture[0].entry.offset;
+    vlog_close(v);
+
+    char path[512];
+    char name[VLOG_SEGMENT_NAME_MAX];
+    ASSERT_EQ(vlog_segment_name(segment, name, sizeof(name)), VLOG_OK);
+    ASSERT_TRUE(snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) > 0);
+    FILE *payload = fopen(path, "r+b");
+    ASSERT_TRUE(payload != NULL);
+    ASSERT_EQ(fseek(payload, (long)(offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + VLOG_BLK_HDR_SIZE),
+                    SEEK_SET),
+              0);
+    const uint8_t corruption = 0x7f;
+    ASSERT_EQ(fwrite(&corruption, 1, 1, payload), 1);
+    test_fsync_file(payload);
+    ASSERT_EQ(fclose(payload), 0);
+
+    v = open_index_store(VDIR);
+    ASSERT_TRUE(v->recovery_index_hits > 0);
+    uint8_t *got = NULL;
+    size_t got_len = 0;
+    ASSERT_EQ(vlog_read(v, fixture[0].id, &got, &got_len), VLOG_ERR_IO);
+    ASSERT_TRUE(got == NULL);
+    vlog_close(v);
+}
+
+void test_index_recovery_preserves_verbatim_fallback_when_requested_codec_is_unknown(void)
+{
+    fresh_dir();
+    vlog_t *v = open_index_store(VDIR);
+    uint8_t *value = pattern(V_MEDIUM, 181);
+    const uint8_t unknown_codec[] = {UINT8_MAX};
+    vlog_id_t id = VLOG_ID_INVALID;
+    ASSERT_EQ(vlog_write(v, value, V_MEDIUM, unknown_codec, 1, &id, NULL), VLOG_OK);
+    const size_t before_bucket = vlog_index_locate(v, id, NULL);
+    ASSERT_TRUE(before_bucket != SIZE_MAX);
+    ASSERT_EQ(v->buckets[before_bucket].chain, 0);
+    const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    ASSERT_EQ(vlog_segment_roll(v, active), VLOG_OK);
+    vlog_close(v);
+
+    v = open_index_store(VDIR);
+    ASSERT_TRUE(v->recovery_index_hits > 0);
+    const size_t after_bucket = vlog_index_locate(v, id, NULL);
+    ASSERT_TRUE(after_bucket != SIZE_MAX);
+    ASSERT_EQ(v->buckets[after_bucket].chain, 0);
+    assert_reads(v, id, value, V_MEDIUM);
+    free(value);
+    vlog_close(v);
+}
+
+void test_index_recovery_preserves_a_nonzero_codec_chain(void)
+{
+    fresh_dir();
+    vlog_t *v = open_index_store(VDIR);
+    uint8_t *value = runs(V_LARGE, 71);
+    const uint8_t codec[] = {TDB_COMPRESS_LZ4};
+    vlog_id_t id = VLOG_ID_INVALID;
+    ASSERT_EQ(vlog_write(v, value, V_LARGE, codec, 1, &id, NULL), VLOG_OK);
+    const size_t before_bucket = vlog_index_locate(v, id, NULL);
+    ASSERT_TRUE(before_bucket != SIZE_MAX);
+    const uint64_t chain = v->buckets[before_bucket].chain;
+    ASSERT_NE(chain, 0);
+    const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    ASSERT_EQ(vlog_segment_roll(v, active), VLOG_OK);
+    vlog_close(v);
+
+    v = open_index_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 1);
+    const size_t after_bucket = vlog_index_locate(v, id, NULL);
+    ASSERT_TRUE(after_bucket != SIZE_MAX);
+    ASSERT_EQ(v->buckets[after_bucket].chain, chain);
+    assert_reads(v, id, value, V_LARGE);
+    free(value);
+    vlog_close(v);
+}
+
+#ifdef TDB_FAULT_INJECTION
+typedef struct
+{
+    vlog_t *v;
+    int rc;
+    vlog_id_t id;
+} vlog_index_writer_t;
+
+static void *vlog_index_writer(void *arg)
+{
+    vlog_index_writer_t *writer = (vlog_index_writer_t *)arg;
+    uint8_t *value = pattern(V_MEDIUM, 211);
+    writer->rc = vlog_write(writer->v, value, V_MEDIUM, NULL, 0, &writer->id, NULL);
+    free(value);
+    return NULL;
+}
+
+static void *vlog_index_sealer(void *arg)
+{
+    vlog_index_writer_t *sealer = (vlog_index_writer_t *)arg;
+    const uint32_t active = atomic_load_explicit(&sealer->v->active_slot, memory_order_acquire);
+#ifndef _MSC_VER
+    ASSERT_EQ(pthread_rwlock_trywrlock(&sealer->v->seal_rw), EBUSY);
+#endif
+    atomic_store_explicit(&vlog_seal_started, 1, memory_order_release);
+    sealer->rc = vlog_segment_roll(sealer->v, active);
+    return NULL;
+}
+
+void test_seal_waits_for_an_admitted_writer_before_publishing_its_index(void)
+{
+    fresh_dir();
+    vlog_t *v = open_index_store(VDIR);
+    v->after_append = vlog_index_append_pause;
+    atomic_store(&vlog_append_hook_entered, 0);
+    atomic_store(&vlog_append_hook_release, 0);
+    atomic_store(&vlog_seal_started, 0);
+
+    vlog_index_writer_t writer = {.v = v, .rc = VLOG_ERR_IO, .id = VLOG_ID_INVALID};
+    vlog_index_writer_t sealer = {.v = v, .rc = VLOG_ERR_IO, .id = VLOG_ID_INVALID};
+    pthread_t writer_thread, seal_thread;
+    ASSERT_EQ(pthread_create(&writer_thread, NULL, vlog_index_writer, &writer), 0);
+    await_index_test_event(&vlog_append_hook_entered);
+    ASSERT_EQ(pthread_create(&seal_thread, NULL, vlog_index_sealer, &sealer), 0);
+    await_index_test_event(&vlog_seal_started);
+    /* the writer is already admitted when seal begins; releasing it lets its index insertion win
+     * before the sealed snapshot publishes. */
+    atomic_store_explicit(&vlog_append_hook_release, 1, memory_order_release);
+    ASSERT_EQ(pthread_join(writer_thread, NULL), 0);
+    ASSERT_EQ(pthread_join(seal_thread, NULL), 0);
+    ASSERT_EQ(writer.rc, VLOG_OK);
+    ASSERT_EQ(sealer.rc, VLOG_OK);
+    v->after_append = NULL;
+    vlog_close(v);
+
+    v = open_index_store(VDIR);
+    ASSERT_TRUE(v->recovery_index_hits > 0);
+    uint8_t *value = pattern(V_MEDIUM, 211);
+    assert_reads(v, writer.id, value, V_MEDIUM);
+    free(value);
+    vlog_close(v);
+}
+
+void test_crash_before_or_after_index_rename_leaves_recoverable_authoritative_data(void)
+{
+    const char *phases[] = {VLOG_INDEX_CHILD_BEFORE_RENAME, VLOG_INDEX_CHILD_AFTER_RENAME};
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++)
+    {
+        fresh_dir();
+        int child_status = -1;
+        ASSERT_EQ(test_spawn_self(vlog_test_exe, VLOG_RECOVERY_CHILD_FLAG, phases[i], "1",
+                                  &child_status),
+                  0);
+        ASSERT_EQ(child_status, 0);
+
+        vlog_t *v = open_index_store(VDIR);
+        uint8_t *value = pattern(V_MEDIUM, 191);
+        assert_reads(v, 1, value, V_MEDIUM);
+        free(value);
+        ASSERT_EQ(vlog_next_id(v), 2);
+        if (strcmp(phases[i], VLOG_INDEX_CHILD_BEFORE_RENAME) == 0)
+        {
+            ASSERT_EQ(v->recovery_index_hits, 0);
+            ASSERT_EQ(v->recovery_payload_bytes, V_MEDIUM);
+        }
+        else
+        {
+            ASSERT_EQ(v->recovery_index_hits, 1);
+            ASSERT_EQ(v->recovery_payload_bytes, 0);
+        }
+        vlog_close(v);
+
+        char tmp[512];
+        index_sidecar_path(VDIR, 0, VLOG_INDEX_TMP_EXT, tmp, sizeof(tmp));
+        ASSERT_TRUE(access(tmp, F_OK) != 0);
+    }
+}
+#endif
+
 void test_recover_prunes_header_only_segments_before_adoption(void)
 {
     fresh_dir();
@@ -815,6 +1348,15 @@ void test_recover_prunes_header_only_segments_before_adoption(void)
     char empty_a[512], empty_b[512];
     make_header_only_segment(7, empty_a, sizeof(empty_a));
     make_header_only_segment(17, empty_b, sizeof(empty_b));
+    char empty_a_index[512], empty_a_tmp[512], empty_b_index[512], empty_b_tmp[512];
+    index_sidecar_path(VDIR, 7, VLOG_INDEX_EXT, empty_a_index, sizeof(empty_a_index));
+    index_sidecar_path(VDIR, 7, VLOG_INDEX_TMP_EXT, empty_a_tmp, sizeof(empty_a_tmp));
+    index_sidecar_path(VDIR, 17, VLOG_INDEX_EXT, empty_b_index, sizeof(empty_b_index));
+    index_sidecar_path(VDIR, 17, VLOG_INDEX_TMP_EXT, empty_b_tmp, sizeof(empty_b_tmp));
+    write_test_byte(empty_a_index);
+    write_test_byte(empty_a_tmp);
+    write_test_byte(empty_b_index);
+    write_test_byte(empty_b_tmp);
 
     /* the fresh successor must be numbered past both removed files */
     v = open_store(TDB_COMPRESS_NONE, 0);
@@ -822,6 +1364,10 @@ void test_recover_prunes_header_only_segments_before_adoption(void)
     ASSERT_EQ(active_segment_number(v), 18);
     ASSERT_TRUE(access(empty_a, F_OK) != 0);
     ASSERT_TRUE(access(empty_b, F_OK) != 0);
+    ASSERT_TRUE(access(empty_a_index, F_OK) != 0);
+    ASSERT_TRUE(access(empty_a_tmp, F_OK) != 0);
+    ASSERT_TRUE(access(empty_b_index, F_OK) != 0);
+    ASSERT_TRUE(access(empty_b_tmp, F_OK) != 0);
     assert_reads(v, saved, value, V_MEDIUM);
     vlog_close(v);
 
@@ -1574,7 +2120,12 @@ int main(int argc, char **argv)
 #ifdef TDB_FAULT_INJECTION
     if (argc >= 2 && strcmp(argv[1], VLOG_RECOVERY_CHILD_FLAG) == 0)
     {
-        vlog_recovery_child();
+        if (argc >= 3 && strcmp(argv[2], VLOG_RECOVERY_CHILD_PHASE) == 0)
+            vlog_recovery_child();
+        else if (argc >= 3)
+            vlog_index_publication_child(argv[2]);
+        else
+            return 2;
         return 2; /* the child always exits itself */
     }
     vlog_test_exe = argv[0];
@@ -1605,9 +2156,22 @@ int main(int argc, char **argv)
     RUN_TEST(test_recover_keeps_everything, tests_passed);
     RUN_TEST(test_recover_after_reclaim, tests_passed);
     RUN_TEST(test_recover_appends_to_a_fresh_segment, tests_passed);
+    RUN_TEST(test_recover_sealed_indexes_skip_payloads_and_preserve_every_index_field,
+             tests_passed);
+    RUN_TEST(test_recover_missing_or_truncated_sealed_index_scans_that_segment, tests_passed);
+    RUN_TEST(test_recover_rejects_foreign_same_number_and_size_index, tests_passed);
+    RUN_TEST(test_recover_rejects_well_checksummed_index_with_impossible_count, tests_passed);
+    RUN_TEST(test_recover_rejects_stale_index_after_its_segment_extent_changes, tests_passed);
+    RUN_TEST(test_index_hit_still_checks_payload_on_point_read, tests_passed);
+    RUN_TEST(test_index_recovery_preserves_verbatim_fallback_when_requested_codec_is_unknown,
+             tests_passed);
+    RUN_TEST(test_index_recovery_preserves_a_nonzero_codec_chain, tests_passed);
     RUN_TEST(test_recover_prunes_header_only_segments_before_adoption, tests_passed);
 #ifdef TDB_FAULT_INJECTION
     RUN_TEST(test_recover_cleanup_survives_a_torn_fresh_successor, tests_passed);
+    RUN_TEST(test_seal_waits_for_an_admitted_writer_before_publishing_its_index, tests_passed);
+    RUN_TEST(test_crash_before_or_after_index_rename_leaves_recoverable_authoritative_data,
+             tests_passed);
 #endif
     RUN_TEST(test_recover_preserves_torn_and_corrupt_segment_candidates, tests_passed);
 #ifndef _WIN32

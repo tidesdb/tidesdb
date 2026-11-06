@@ -446,50 +446,40 @@ static inline int tdb_fsync_parent_dir(const char *path)
 }
 
 /**
- * atomic_rename_file
- * atomically renames a file from old_path to new_path
- * on POSIX systems, rename() is atomic and replaces existing files
- * on windows rename() fails if the target exists, so it is removed first
- * @param old_path the current path of the file
- * @param new_path the new path for the file
- * @return 0 on success, -1 on failure
+ * tdb_replace_file
+ * replace one directory entry atomically so the caller can order its directory durability barrier
+ * @param old_path the temporary file
+ * @param new_path the published path, which may already exist
+ * @return 0 on success or -1 on an invalid argument or rename failure
  */
-static inline int atomic_rename_file(const char *old_path, const char *new_path)
+static inline int tdb_replace_file(const char *old_path, const char *new_path)
 {
     if (!old_path || !new_path) return -1;
-
 #ifdef _WIN32
-    /* MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
-     * this is truly atomic and replaces the target file if it exists */
     if (!MoveFileEx(old_path, new_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {
         errno = GetLastError();
         return -1;
     }
-
-    /* flush parent directory to ensure rename is durable. best-effort here, the return says whether
-     * the rename happened, and a caller that needs it durable syncs the directory itself */
-    (void)tdb_fsync_parent_dir(new_path);
-
     return 0;
 #else
-    /* POSIX rename() is atomic and replaces existing files */
-    if (rename(old_path, new_path) != 0)
-    {
-        return -1;
-    }
-
-    /* sync the parent directory so the rename metadata is durable
-     * this is critical for crash safety on non-journaling filesystems
-     * https://groups.google.com/g/comp.unix.programmer/c/AM2V83RCOVE?pli=1
-     * https://man7.org/linux/man-pages/man2/rename.2.html
-     * best-effort here, the return says whether the rename happened, and a caller that needs it
-     * durable syncs the directory itself and checks the result
-     */
-    (void)tdb_fsync_parent_dir(new_path);
-
-    return 0;
+    return rename(old_path, new_path);
 #endif
+}
+
+/**
+ * atomic_rename_file
+ * replace a file atomically and attempt to make the directory entry durable
+ * @param old_path the current path of the file
+ * @param new_path the new path for the file
+ * @return 0 once renamed, or -1 on failure
+ */
+static inline int atomic_rename_file(const char *old_path, const char *new_path)
+{
+    if (tdb_replace_file(old_path, new_path) != 0) return -1;
+    /* callers requiring a durable rename check their own directory barrier */
+    (void)tdb_fsync_parent_dir(new_path);
+    return 0;
 }
 /**
  * tdb_get_cpu_count

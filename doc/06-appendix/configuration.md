@@ -12,6 +12,15 @@ sidebar:
 Two structures. Both are filled by a `tidesdb_default_*` call and adjusted; both are borrowed
 by the call that takes them and may be freed immediately after.
 
+`tidesdb_open_with_options` additionally accepts an optional size-tagged
+`tidesdb_open_options_t`. It keeps additive open-time choices out of the by-value
+`tidesdb_config_t` ABI. Set `size` to `sizeof(tidesdb_open_options_t)`; a `NULL` pointer selects
+all defaults.
+
+| Open option | Default | Effect |
+| --- | --- | --- |
+| `enable_vlog_indexes` | 0 | Publish a rebuildable `.vix` sidecar when a shared value-log segment seals. This covers separated values in every column family. Recovery falls back to the authoritative `.vlog` when a sidecar is absent, damaged, stale, or copied from another segment. Ordinary value logs remain readable by earlier v10 binaries. |
+
 ## Database configuration
 
 `tidesdb_config_t`, from `tidesdb_default_config()`.

@@ -168,6 +168,7 @@ static inline size_t btree_compute_prefix_len(const uint8_t *key1, const size_t 
  * @param values array of value pointers
  * @param num_entries current number of entries
  * @param capacity maximum capacity of arrays
+ * @param suffix_bytes stored key bytes when the size target exceeds the leaf offset range
  * @param current_size current serialized size estimate
  * @param first_key first key in this leaf (for separator)
  * @param first_key_size size of first key
@@ -182,6 +183,7 @@ typedef struct btree_pending_leaf_t
     uint32_t num_entries;
     uint32_t capacity;
     size_t current_size;
+    size_t suffix_bytes;
     uint8_t *first_key;
     size_t first_key_size;
     uint8_t *last_key;

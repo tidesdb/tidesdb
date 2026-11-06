@@ -905,6 +905,61 @@ void test_btree_multi_version_resolution()
     (void)remove(TEST_BTREE_FILE);
 }
 
+/* The leaf key-offset table is uint16-based, while a public blob key may itself be 64 KiB.  A
+ * large target must not make the builder place two distinct maximum-size keys in one leaf; multiple
+ * versions of the first key still belong together and have zero compressed suffixes. */
+void test_btree_max_size_keys_flush_and_keep_versions_together()
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, TEST_BTREE_FILE, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    btree_config_t config = {.target_node_size = 8 * BTREE_DEFAULT_NODE_SIZE};
+    btree_builder_t *builder = NULL;
+    ASSERT_TRUE(btree_builder_new(&builder, bm, &config) == 0);
+
+    const size_t key_size = (size_t)UINT16_MAX + 1u;
+    uint8_t *key = malloc(key_size);
+    ASSERT_TRUE(key != NULL);
+    memset(key, 'K', key_size);
+
+    const uint8_t old_value = 1, newest_value = 2;
+    key[0] = 0;
+    ASSERT_EQ(btree_builder_add(builder, key, key_size, &old_value, 1, 0, 1, 0, 0), 0);
+    ASSERT_EQ(btree_builder_add(builder, key, key_size, &newest_value, 1, 0, 2, 0, 0), 0);
+    for (uint8_t i = 1; i < 4; ++i)
+    {
+        const uint8_t value = (uint8_t)(10 + i);
+        key[0] = i;
+        ASSERT_EQ(btree_builder_add(builder, key, key_size, &value, 1, 0, 3 + i, 0, 0), 0);
+    }
+
+    btree_t *tree = NULL;
+    ASSERT_EQ(btree_builder_finish(builder, &tree), 0);
+    ASSERT_EQ(tree->entry_count, 5);
+    for (uint8_t i = 0; i < 4; ++i)
+    {
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint64_t vlog_offset = 0, seq = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        key[0] = i;
+        ASSERT_EQ(
+            btree_get(tree, key, key_size, &value, &value_size, &vlog_offset, &seq, &ttl, &deleted),
+            0);
+        ASSERT_EQ(value_size, 1);
+        ASSERT_EQ(value[0], i == 0 ? newest_value : (uint8_t)(10 + i));
+        ASSERT_EQ(seq, i == 0 ? 2 : (uint64_t)(3 + i));
+        free(value);
+    }
+
+    free(key);
+    btree_free(tree);
+    btree_builder_free(builder);
+    (void)block_manager_close(bm);
+    (void)remove(TEST_BTREE_FILE);
+}
+
 void test_btree_large_keys_values()
 {
     block_manager_t *bm = NULL;
@@ -2479,6 +2534,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_btree_single_entry, tests_passed);
     RUN_TEST(test_btree_duplicate_keys, tests_passed);
     RUN_TEST(test_btree_multi_version_resolution, tests_passed);
+    RUN_TEST(test_btree_max_size_keys_flush_and_keep_versions_together, tests_passed);
     RUN_TEST(test_btree_large_keys_values, tests_passed);
     RUN_TEST(test_btree_seek_edge_cases, tests_passed);
     RUN_TEST(test_btree_compression_single_leaf, tests_passed);

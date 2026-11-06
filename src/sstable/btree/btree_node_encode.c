@@ -166,10 +166,10 @@ static int btree_leaf_encode(const btree_pending_leaf_t *leaf, const int64_t pre
     const size_t keys_start = off;
     for (uint32_t i = 0; i < leaf->num_entries; i++)
     {
-        /* the offset slot is a little-endian uint16, so a keys section past 64KB would wrap it and
-         * deserialization would read from the wrong place */
+        /* only a nonempty suffix needs an address. repeated versions of a maximum-size key
+         * can stay in this leaf after its stored bytes pass the uint16 offset range. */
         const size_t raw_off = off - keys_start;
-        if (raw_off > UINT16_MAX) return -1;
+        if (suffix_lens[i] != 0 && raw_off > UINT16_MAX) return -1;
 
         const uint16_t key_off = (uint16_t)raw_off;
         buffer[indirection_table_pos + i * BTREE_KEY_OFFSET_BYTES] = (uint8_t)(key_off & 0xFF);

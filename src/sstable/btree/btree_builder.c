@@ -344,23 +344,26 @@ int btree_builder_add(btree_builder_t *builder, const uint8_t *key, const size_t
      * that share a key. a key's versions must all stay within one leaf so
      * internal-node routing lands on the single leaf holding them and btree_get
      * can resolve the whole run. */
-    if (builder->current_leaf->current_size >= builder->config.target_node_size &&
-        builder->current_leaf->num_entries >= BTREE_MIN_ENTRIES_PER_LEAF)
+    btree_pending_leaf_t *leaf = builder->current_leaf;
+    const int wide = builder->config.target_node_size > UINT16_MAX;
+    /* below the offset limit the size target already forces a split, except for a single
+     * oversized key or its repeated versions. wide nodes track their actual compressed suffix
+     * bytes so the value area and shared key prefixes do not cause premature splits. */
+    const size_t stored_keys = wide ? leaf->suffix_bytes : leaf->first_key_size;
+    const int target_full = leaf->current_size >= builder->config.target_node_size &&
+                            leaf->num_entries >= BTREE_MIN_ENTRIES_PER_LEAF;
+    if ((target_full || stored_keys > UINT16_MAX) &&
+        !(leaf->last_key_size == key_size && memcmp(leaf->last_key, key, key_size) == 0))
     {
-        const btree_pending_leaf_t *cur = builder->current_leaf;
-        const int same_key_as_last = cur->last_key != NULL && cur->last_key_size == key_size &&
-                                     memcmp(cur->last_key, key, key_size) == 0;
-        if (!same_key_as_last && btree_builder_flush_leaf(builder) != 0)
-        {
-            return -1;
-        }
+        if (btree_builder_flush_leaf(builder) != 0) return -1;
+        leaf = builder->current_leaf;
     }
-
-    if (btree_pending_leaf_add(builder->current_leaf, key, key_size, value, value_size, vlog_offset,
-                               seq, ttl, flags) != 0)
-    {
+    const size_t shared =
+        wide ? btree_compute_prefix_len(leaf->last_key, leaf->last_key_size, key, key_size) : 0;
+    if (btree_pending_leaf_add(leaf, key, key_size, value, value_size, vlog_offset, seq, ttl,
+                               flags) != 0)
         return -1;
-    }
+    if (wide) leaf->suffix_bytes += key_size - shared;
 
     /* this pair becomes the sstable's key range in the footer, and overlap checks compare against
      * it to decide which files a lookup consults. a missing range reads as an empty one, which

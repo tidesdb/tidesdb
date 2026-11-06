@@ -416,15 +416,9 @@ static int txn_load_value(tidesdb_source_version_t *v, const txn_value_range_t *
         if (rc == TDB_SUCCESS) free(bytes);
         return rc;
     }
-    if (!range)
-    {
-        /* full gets retain their retry on a transient descriptor or a respilled reference */
-        return vlog_read(v->vlog, v->vlog_id, &v->value, &v->value_size) == VLOG_OK ? TDB_SUCCESS
-                                                                                    : TDB_ERR_BUSY;
-    }
-
-    const int rc = vlog_read_range(v->vlog, v->vlog_id, range->offset, range->length, &v->value,
-                                   &v->value_size);
+    const int rc = range ? vlog_read_range(v->vlog, v->vlog_id, range->offset, range->length,
+                                           &v->value, &v->value_size)
+                         : vlog_read(v->vlog, v->vlog_id, &v->value, &v->value_size);
     switch (rc)
     {
         case VLOG_OK:

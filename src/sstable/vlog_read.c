@@ -30,6 +30,12 @@ static int vlog_lookup_pin(vlog_t* v, vlog_id_t id, vlog_index_entry_t* out)
     return rc;
 }
 
+static int vlog_read_result(const int rc)
+{
+    if (rc == BLOCK_MANAGER_READ_ERR_CORRUPTION) return VLOG_ERR_CORRUPTION;
+    return rc == BLOCK_MANAGER_READ_ERR_MEMORY ? VLOG_ERR_MEMORY : VLOG_ERR_IO;
+}
+
 static int vlog_decode_value(const vlog_t* v, const uint8_t* payload, uint32_t payload_len,
                              uint64_t value_len, uint8_t** out_value, size_t* out_len)
 {
@@ -94,19 +100,14 @@ int vlog_read(vlog_t* v, vlog_id_t id, uint8_t** out_value, size_t* out_len)
     if (pinned != VLOG_OK) return pinned;
     const uint32_t hint = (uint32_t)(VLOG_BLK_HDR_SIZE + entry.value_len);
     uint32_t payload_len = 0;
-    const uint8_t* payload = block_manager_borrow_block_data_at_offset(
-        vlog_segment_ensure_open(v, entry.segment), entry.offset, hint, &payload_len);
+    int read = BLOCK_MANAGER_READ_ERR_IO;
+    const uint8_t* payload = block_manager_borrow_block_data_at_offset_checked(
+        vlog_segment_ensure_open(v, entry.segment), entry.offset, hint, &payload_len, &read);
     vlog_segment_release(v, entry.segment);
-    if (!payload) return VLOG_ERR_IO;
+    if (!payload) return vlog_read_result(read);
     if (payload_len < VLOG_BLK_HDR_SIZE || decode_uint64_le_compat(payload) != id)
         return VLOG_ERR_CORRUPTION;
     return vlog_decode_value(v, payload, payload_len, entry.value_len, out_value, out_len);
-}
-
-static int vlog_range_result(int rc)
-{
-    if (rc == BLOCK_MANAGER_READ_ERR_CORRUPTION) return VLOG_ERR_CORRUPTION;
-    return rc == BLOCK_MANAGER_READ_ERR_MEMORY ? VLOG_ERR_MEMORY : VLOG_ERR_IO;
 }
 
 static int vlog_read_range_verbatim(block_manager_t* bm, const vlog_index_entry_t* entry,
@@ -123,7 +124,7 @@ static int vlog_read_range_verbatim(block_manager_t* bm, const vlog_index_entry_
     if (rc != BLOCK_MANAGER_READ_OK)
     {
         free(slice);
-        return vlog_range_result(rc);
+        return vlog_read_result(rc);
     }
     const uint64_t word = decode_uint64_le_compat(header + VLOG_BLK_ID_SIZE);
     if (decode_uint64_le_compat(header) != entry->id || word != entry->value_len ||
@@ -153,7 +154,7 @@ static int vlog_read_range_encoded(vlog_t* v, block_manager_t* bm, const vlog_in
     if (read != BLOCK_MANAGER_READ_OK)
     {
         free(payload);
-        return vlog_range_result(read);
+        return vlog_read_result(read);
     }
     if (verified_len != payload_len)
     {

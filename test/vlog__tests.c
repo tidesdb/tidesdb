@@ -1526,7 +1526,7 @@ void test_index_hit_still_checks_payload_on_point_read(void)
     ASSERT_TRUE(v->recovery_index_hits > 0);
     uint8_t *got = NULL;
     size_t got_len = 0;
-    ASSERT_EQ(vlog_read(v, fixture[0].id, &got, &got_len), VLOG_ERR_IO);
+    ASSERT_EQ(vlog_read(v, fixture[0].id, &got, &got_len), VLOG_ERR_CORRUPTION);
     ASSERT_TRUE(got == NULL);
     vlog_close(v);
 }

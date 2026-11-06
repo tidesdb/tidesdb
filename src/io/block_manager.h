@@ -756,6 +756,17 @@ const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, ui
                                                          uint32_t *data_size);
 
 /**
+ * block_manager_borrow_block_data_at_offset_checked
+ * as block_manager_borrow_block_data_at_offset, while classifying a failed frame read
+ * @param out_rc receives BLOCK_MANAGER_READ_OK, _ERR_IO, _ERR_CORRUPTION, or _ERR_MEMORY
+ * @return borrowed thread-local payload on success, NULL on failure
+ */
+const uint8_t *block_manager_borrow_block_data_at_offset_checked(block_manager_t *bm,
+                                                                 uint64_t offset,
+                                                                 uint32_t payload_hint,
+                                                                 uint32_t *data_size, int *out_rc);
+
+/**
  * block_manager_read_verified_block_slices
  * verifies one framed block while retaining only a prefix and one positioned payload slice
  * @param bm the block manager to read from

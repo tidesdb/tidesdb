@@ -1264,6 +1264,7 @@ void test_blob_range_rejects_corruption_outside_the_requested_slice(void)
     size_t got_size = 0;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
     ASSERT_EQ(tidesdb_txn_contains(txn, cf, key, sizeof(key) - 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key) - 1, &got, &got_size), TDB_ERR_CORRUPTION);
     ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, sizeof(key) - 1, 0, 1, &got, &got_size),
               TDB_ERR_CORRUPTION);
     ASSERT_EQ(

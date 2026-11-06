@@ -78,6 +78,20 @@ static inline void tdb_set_thread_name(const char *name)
 #define SSIZE_MAX (sizeof(ssize_t) == sizeof(int64_t) ? INT64_MAX : INT32_MAX)
 #endif
 
+/* largest portable single positioned transfer. Darwin and the Windows CRT limit byte counts
+ * to signed int. Linux rounds INT_MAX down to a page boundary in MAX_RW_COUNT. */
+static inline uint64_t tdb_single_io_limit(void)
+{
+#if defined(__linux__)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) return (uint64_t)INT32_MAX - (uint64_t)INT32_MAX % (uint64_t)page_size;
+    /* use a conservative single transfer if the kernel could not report its page size */
+    return (uint64_t)INT32_MAX / 2;
+#else
+    return INT32_MAX;
+#endif
+}
+
 /* cross-platform pwritev for scatter-gather I/O
  * Linux and modern BSDs have native pwritev in <sys/uio.h>
  * macOS added pwritev in 10.16/11.0 (Big Sur)

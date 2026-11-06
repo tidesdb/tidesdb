@@ -49,10 +49,11 @@ int engine_build_path(const char *dir, const char *name, char *out, size_t out_s
  * @param db the engine
  * @param name the cf name, non-empty
  * @param config the cf configuration, borrowed
+ * @param is_blob nonzero for a dedicated blob family
  * @return as engine_create_cf
  */
-int engine_create_cf_locked(tidesdb_t *db, const char *name,
-                            const tidesdb_column_family_config_t *config);
+int engine_create_cf_locked(tidesdb_t* db, const char* name,
+                            const tidesdb_column_family_config_t* config, int is_blob);
 
 /**
  * engine_drop_cf_locked

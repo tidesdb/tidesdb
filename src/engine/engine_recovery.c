@@ -289,7 +289,7 @@ static int engine_rebuild_from_sstables(tidesdb_t *db)
 
         uint8_t *blob = NULL;
         size_t blob_len = 0;
-        if (cf_config_serialize(&cc, &blob, &blob_len) != 0)
+        if (cf_config_serialize(&cc, 0, &blob, &blob_len) != 0)
         {
             rc = TDB_ERR_MEMORY;
             break;

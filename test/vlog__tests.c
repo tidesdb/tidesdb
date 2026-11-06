@@ -2404,7 +2404,7 @@ void test_invalid_args(void)
     ASSERT_TRUE(vlog_open(VDIR, &cfg, NULL) == VLOG_ERR_INVALID);
     ASSERT_TRUE(vlog_write(NULL, &byte, 1, NULL, 0, &id, NULL) == VLOG_ERR_INVALID);
     ASSERT_TRUE(vlog_write(v, NULL, 1, NULL, 0, &id, NULL) == VLOG_ERR_INVALID);
-    ASSERT_TRUE(vlog_write(v, &byte, 0, NULL, 0, &id, NULL) == VLOG_ERR_INVALID);
+    ASSERT_EQ(vlog_write(v, &byte, 0, NULL, 0, &id, NULL), VLOG_OK);
     ASSERT_TRUE(vlog_write(v, &byte, 1, NULL, 0, NULL, NULL) == VLOG_ERR_INVALID);
     const uint64_t next_id = vlog_next_id(v);
     const size_t too_long = (size_t)UINT32_MAX - VLOG_BLK_HDR_SIZE + 1;

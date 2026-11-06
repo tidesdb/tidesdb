@@ -459,6 +459,7 @@ typedef struct
     int wal_calls;
     int apply_calls;
     int last_apply_count;
+    size_t last_wal_size;
     int fail_bp;
     int fail_wal;
     int fail_apply;
@@ -476,6 +477,10 @@ typedef struct
     int racer_rc;                      /* what the racer's prepare returned */
     _Atomic(int) *hold;                /* when set, an append waits here until it reads zero */
     _Atomic(int) entered;              /* set once an append is waiting on hold */
+    int forced_calls;
+    const uint8_t* forced_value;
+    size_t forced_value_size;
+    uint64_t forced_id;
 } mockbe;
 
 static tdb_txn_backend_t mkbackend(mockbe *m);
@@ -492,6 +497,7 @@ static int mb_wal(void *ctx, const uint8_t *batch, size_t size)
 {
     mockbe *m = (mockbe *)ctx;
     m->wal_calls++;
+    m->last_wal_size = size;
     if (size >= 2) m->last_wal_kind = batch[1]; /* version byte then the record kind */
     if (m->hold)
     {
@@ -511,6 +517,17 @@ static int mb_wal(void *ctx, const uint8_t *batch, size_t size)
         if (m->racer_rc == TDB_SUCCESS) (void)tdb_txn_rollback_prepared(racer, &racer_be);
     }
     return m->fail_wal ? -1 : 0;
+}
+static int mb_separate_forced(void* ctx, uint32_t cf_index, const uint8_t* value, size_t value_size,
+                              uint64_t* out_id)
+{
+    mockbe* m = (mockbe*)ctx;
+    (void)cf_index;
+    m->forced_calls++;
+    m->forced_value = value;
+    m->forced_value_size = value_size;
+    *out_id = m->forced_id;
+    return m->forced_id != 0 ? 1 : -1;
 }
 static int mb_apply(void *ctx, const tidesdb_wal_entry_t *entries, int count)
 {
@@ -539,6 +556,51 @@ static tdb_txn_backend_t mkbackend(mockbe *m)
     tdb_txn_backend_t b = {
         .backpressure = mb_bp, .wal_append = mb_wal, .apply = mb_apply, .ctx = m};
     return b;
+}
+
+/* a borrowed object copies only its key, reaches the forced separator after validation, and leaves
+ * the WAL with an id rather than its caller-owned payload. an empty object follows the same path
+ * with a NULL value and zero logical length. */
+void test_txn_borrowed_put_forces_a_value_log_reference(void)
+{
+    tidesdb_mvcc_t* clock = tidesdb_mvcc_create();
+    mockbe m = {.forced_id = 91};
+    tdb_txn_backend_t be = mkbackend(&m);
+    be.separator.separate_forced = mb_separate_forced;
+    be.separator.ctx = &m;
+    uint8_t value[] = {'b', 'l', 'o', 'b'};
+
+    tdb_txn_t* t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_put_borrowed(t, 7, (const uint8_t*)"media", 5, value, sizeof(value), -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_EQ(m.forced_calls, 1);
+    ASSERT_TRUE(m.forced_value == value && m.forced_value_size == sizeof(value));
+    ASSERT_EQ(tdb_txn_forced_vlog_id(t), m.forced_id);
+
+    tidesdb_wal_entry_t ref = {.cf_index = 7,
+                               .seq = tdb_txn_commit_seq(t),
+                               .ttl = -1,
+                               .flags = TDB_WAL_ENTRY_VLOG_REF,
+                               .key = (const uint8_t*)"media",
+                               .key_size = 5,
+                               .value = NULL,
+                               .value_size = sizeof(value),
+                               .vlog_id = m.forced_id};
+    ASSERT_EQ(m.last_wal_size, tidesdb_wal_batch_size(TDB_WAL_KIND_WRITE_BATCH, NULL, 0, &ref, 1));
+    value[0] = 'x'; /* the transaction no longer retains the caller's payload after it returns */
+
+    tdb_txn_free(t);
+    m.forced_id = 92;
+    t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_put_borrowed(t, 7, (const uint8_t*)"empty", 5, NULL, 0, -1), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
+    ASSERT_EQ(m.forced_calls, 2);
+    ASSERT_TRUE(m.forced_value == NULL && m.forced_value_size == 0);
+    ASSERT_EQ(tdb_txn_forced_vlog_id(t), m.forced_id);
+
+    tdb_txn_free(t);
+    tidesdb_mvcc_destroy(clock);
 }
 
 /* a transaction that begins while another commit is applying sees nothing of that commit. its
@@ -1832,6 +1894,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_txn_read_conflict_none, tests_passed);
     RUN_TEST(test_txn_write_scan_conflict, tests_passed);
     RUN_TEST(test_txn_commit, tests_passed);
+    RUN_TEST(test_txn_borrowed_put_forces_a_value_log_reference, tests_passed);
     RUN_TEST(test_txn_begun_during_an_apply_sees_nothing_of_it, tests_passed);
     RUN_TEST(test_txn_failed_commit_leaves_the_watermark_advancing, tests_passed);
     RUN_TEST(test_txn_prepared_sequence_does_not_hold_the_watermark, tests_passed);

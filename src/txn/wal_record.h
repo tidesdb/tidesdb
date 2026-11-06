@@ -83,6 +83,7 @@
  * @param value_size the value's logical length, whether its bytes are here or in the value log
  * @param vlog_id the value log entry holding the value, read only when the entry's flags carry
  * TDB_WAL_ENTRY_VLOG_REF, which is what makes it a reference at all
+ * @param force_separate transient commit input: invoke the forced separator before encoding
  */
 typedef struct
 {
@@ -95,6 +96,7 @@ typedef struct
     const uint8_t *value;
     size_t value_size;
     uint64_t vlog_id;
+    uint8_t force_separate;
 } tidesdb_wal_entry_t;
 
 /**

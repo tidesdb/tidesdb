@@ -36,6 +36,8 @@
  * @param buf coalesced key+value allocation (only pointer freed for this op)
  * @param key_size length of the key portion at the head of buf
  * @param value_size length of the value portion after the key
+ * @param borrowed_value caller-owned value bytes, NULL when buf carries the value
+ * @param borrows_value non-zero when value belongs to the caller through commit return
  * @param ttl absolute expiry time, or -1 for none
  * @param flags op flag bits (tombstone / single-delete)
  */
@@ -45,8 +47,10 @@ typedef struct
     uint8_t *buf;
     size_t key_size;
     size_t value_size;
+    const uint8_t* borrowed_value;
     int64_t ttl;
     uint8_t flags;
+    uint8_t borrows_value;
 } writeset_op;
 
 /**
@@ -170,9 +174,9 @@ static int writeset_note(tidesdb_writeset_t *ws, const int i)
     return rc;
 }
 
-int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
-                         size_t key_size, const uint8_t *value, size_t value_size, int64_t ttl,
-                         uint8_t flags)
+static int writeset_add(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
+                        size_t key_size, const uint8_t* value, size_t value_size, int64_t ttl,
+                        uint8_t flags, int borrows_value)
 {
     if (!ws || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
@@ -180,11 +184,14 @@ int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_
      * own, so its upper bound rides in that field. dropping it here would leave every interval
      * open above and delete far more than the caller asked for */
     if ((flags & TDB_WAL_ENTRY_TOMBSTONE) && !(flags & TDB_WAL_ENTRY_RANGE_DELETE)) value_size = 0;
+    if (value_size != 0 && !value) return TDB_ERR_INVALID_ARGS;
 
-    uint8_t *buf = malloc(key_size + value_size);
+    const size_t copied_value_size = borrows_value ? 0 : value_size;
+    if (copied_value_size > SIZE_MAX - key_size) return TDB_ERR_TOO_LARGE;
+    uint8_t* buf = malloc(key_size + copied_value_size);
     if (!buf) return TDB_ERR_MEMORY;
     memcpy(buf, key, key_size);
-    if (value_size) memcpy(buf + key_size, value, value_size);
+    if (copied_value_size) memcpy(buf + key_size, value, copied_value_size);
 
     pthread_rwlock_wrlock(&ws->lock);
     if (ws->count == ws->capacity)
@@ -200,10 +207,17 @@ int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_
         ws->ops = grown;
         ws->capacity = new_cap;
     }
-    ws->ops[ws->count] = (writeset_op){cf_index, buf, key_size, value_size, ttl, flags};
+    ws->ops[ws->count] = (writeset_op){.cf_index = cf_index,
+                                       .buf = buf,
+                                       .key_size = key_size,
+                                       .value_size = value_size,
+                                       .borrowed_value = borrows_value ? value : NULL,
+                                       .ttl = ttl,
+                                       .flags = flags,
+                                       .borrows_value = (uint8_t)borrows_value};
     ws->count++;
     atomic_fetch_add_explicit(&ws->mem_bytes,
-                              (int64_t)(sizeof(writeset_op) + key_size + value_size),
+                              (int64_t)(sizeof(writeset_op) + key_size + copied_value_size),
                               memory_order_relaxed);
     /* noted once it is in the array, so the key list never names an op the array does not hold. a
      * put that could not be noted is refused rather than left out of the list, since a lookup that
@@ -213,12 +227,26 @@ int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_
     {
         ws->count--;
         atomic_fetch_sub_explicit(&ws->mem_bytes,
-                                  (int64_t)(sizeof(writeset_op) + key_size + value_size),
+                                  (int64_t)(sizeof(writeset_op) + key_size + copied_value_size),
                                   memory_order_relaxed);
         free(buf);
     }
     pthread_rwlock_unlock(&ws->lock);
     return rc;
+}
+
+int tidesdb_writeset_put(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
+                         size_t key_size, const uint8_t* value, size_t value_size, int64_t ttl,
+                         uint8_t flags)
+{
+    return writeset_add(ws, cf_index, key, key_size, value, value_size, ttl, flags, 0);
+}
+
+int tidesdb_writeset_put_borrowed(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
+                                  size_t key_size, const uint8_t* value, size_t value_size,
+                                  int64_t ttl)
+{
+    return writeset_add(ws, cf_index, key, key_size, value, value_size, ttl, 0, 1);
 }
 
 int tidesdb_writeset_count(const tidesdb_writeset_t *ws)
@@ -232,10 +260,12 @@ static void writeset_view(const writeset_op *op, tidesdb_writeset_op_t *out)
     out->cf_index = op->cf_index;
     out->key = op->buf;
     out->key_size = op->key_size;
-    out->value = op->value_size ? op->buf + op->key_size : NULL;
+    out->value =
+        op->borrows_value ? op->borrowed_value : (op->value_size ? op->buf + op->key_size : NULL);
     out->value_size = op->value_size;
     out->ttl = op->ttl;
     out->flags = op->flags;
+    out->borrowed_value = op->borrows_value;
 }
 
 int tidesdb_writeset_op_at(const tidesdb_writeset_t *ws, int index, tidesdb_writeset_op_t *out)
@@ -358,7 +388,8 @@ int tidesdb_writeset_truncate(tidesdb_writeset_t *ws, int count)
         {
             atomic_fetch_sub_explicit(
                 &ws->mem_bytes,
-                (int64_t)(sizeof(writeset_op) + ws->ops[i].key_size + ws->ops[i].value_size),
+                (int64_t)(sizeof(writeset_op) + ws->ops[i].key_size +
+                          (ws->ops[i].borrows_value ? 0 : ws->ops[i].value_size)),
                 memory_order_relaxed);
             free(ws->ops[i].buf);
         }

@@ -201,7 +201,7 @@ int cf_open(const char *db_dir, tidesdb_manifest_t *manifest, const uint64_t cf_
      * is the copy that becomes the family's configuration */
     tidesdb_column_family_config_t loaded;
     memset(&loaded, 0, sizeof(loaded));
-    if (cf_config_deserialize(config_blob, blob_len, &loaded) != 0)
+    if (cf_config_deserialize(config_blob, blob_len, &loaded, &cf->is_blob) != 0)
     {
         free(cf);
         return -1;

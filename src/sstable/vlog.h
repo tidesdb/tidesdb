@@ -239,8 +239,9 @@ void vlog_close(vlog_t *vlog);
  * compresses a value, appends it as one block to the active segment, and returns its logical id.
  * rolls to a fresh segment first when the active one has reached its target size
  * @param vlog handle
- * @param value value bytes, borrowed until this call returns
- * @param value_len length of value, must be non-zero
+ * @param value value bytes, borrowed until this call returns; may be NULL only when value_len is
+ *              zero
+ * @param value_len length of value, including zero for a separated empty value
  * @param ids the encoding ids to apply, in order, recorded with the value so a later read undoes
  *        exactly what was applied whatever any family or sstable is configured with by then
  * @param id_count how many ids, 0 to store the value verbatim

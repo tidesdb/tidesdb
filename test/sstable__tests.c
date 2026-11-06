@@ -895,6 +895,102 @@ void test_builder_respills_a_value_out_of_a_draining_segment(void)
     (void)remove_directory(TEST_SSTABLE_DIR);
 }
 
+/* a blob family keeps even empty and tiny values separated when a draining segment is rewritten;
+ * otherwise a later GC would leave those values inline while only large blobs kept vlog lifetime
+ * accounting. */
+void test_blob_builder_respills_empty_and_tiny_references(void)
+{
+    (void)remove_directory(TEST_SSTABLE_DIR);
+    ASSERT_EQ(mkdir(TEST_SSTABLE_DIR, TEST_SSTABLE_DIR_PERMISSIONS), 0);
+
+    vlog_config_t vcfg = {.segment_target_bytes = 8 * 1024};
+    vlog_t* vlog = NULL;
+    ASSERT_EQ(vlog_open(TEST_SSTABLE_DIR, &vcfg, &vlog), VLOG_OK);
+
+    uint64_t ids[2] = {0};
+    uint64_t disk[2] = {0};
+    ASSERT_EQ(vlog_write(vlog, NULL, 0, NULL, 0, &ids[0], &disk[0]), VLOG_OK);
+    ASSERT_EQ(vlog_write(vlog, (const uint8_t*)"x", 1, NULL, 0, &ids[1], &disk[1]), VLOG_OK);
+    uint8_t filler[1024];
+    memset(filler, 'V', sizeof(filler));
+    for (int i = 0; i < 24; i++)
+    {
+        uint64_t ignored_id = 0;
+        uint64_t ignored_disk = 0;
+        ASSERT_EQ(vlog_write(vlog, filler, sizeof(filler), NULL, 0, &ignored_id, &ignored_disk),
+                  VLOG_OK);
+    }
+
+    uint64_t old_segment = 0;
+    uint64_t ignored_bytes = 0;
+    ASSERT_EQ(vlog_segment_of(vlog, ids[0], &old_segment, &ignored_bytes), VLOG_OK);
+    vlog_live_reset(vlog);
+    vlog_live_add(vlog, old_segment, disk[0] + disk[1], 2);
+    ASSERT_TRUE(vlog_mark_drainable(vlog) >= 1);
+    ASSERT_EQ(vlog_should_respill(vlog, ids[0]), 1);
+    ASSERT_EQ(vlog_should_respill(vlog, ids[1]), 1);
+
+    tidesdb_manifest_entry_t entry = {
+        .birth_level = 1, .id = 275, .partition = MANIFEST_NO_PARTITION};
+    char filename[128], path[256];
+    ASSERT_EQ(sstable_klog_filename(&entry, filename, sizeof(filename)), TDB_SUCCESS);
+    snprintf(path, sizeof(path), "%s%s%s", TEST_SSTABLE_DIR, PATH_SEPARATOR, filename);
+    block_manager_t* klog_bm = NULL;
+    ASSERT_EQ(block_manager_open(&klog_bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+
+    sstable_builder_config_t config;
+    default_builder_config(&config, entry.id, path);
+    config.always_separate_values = 1;
+    sstable_builder_t* builder = NULL;
+    ASSERT_EQ(sstable_builder_new(&builder, klog_bm, vlog, &config), TDB_SUCCESS);
+    ASSERT_EQ(
+        sstable_builder_add_reference(builder, (const uint8_t*)"empty", 5, ids[0], 0, 1, 0, 0),
+        TDB_SUCCESS);
+    ASSERT_EQ(sstable_builder_add_reference(builder, (const uint8_t*)"tiny", 4, ids[1], 1, 2, 0, 0),
+              TDB_SUCCESS);
+
+    sstable_t* sst = NULL;
+    ASSERT_EQ(sstable_builder_finish(builder, &sst, NULL), TDB_SUCCESS);
+    sstable_builder_free(builder);
+    ASSERT_EQ(sst->vlog_ref_count, 1u);
+    ASSERT_TRUE(sst->vlog_refs[0].segment != old_segment);
+    ASSERT_EQ(sst->vlog_refs[0].count, 2u);
+
+    const char* keys[] = {"empty", "tiny"};
+    const size_t lengths[] = {0, 1};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+    {
+        uint8_t* value = NULL;
+        size_t value_size = 0;
+        uint64_t id = 0, seq = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+        ASSERT_EQ(sstable_get(sst, (const uint8_t*)keys[i], strlen(keys[i]), &value, &value_size,
+                              &id, &seq, &ttl, &deleted),
+                  TDB_SUCCESS);
+        ASSERT_TRUE(value == NULL);
+        ASSERT_TRUE(id != 0 && id != ids[i]);
+        ASSERT_EQ(value_size, lengths[i]);
+        uint8_t* resolved = NULL;
+        size_t resolved_len = 0;
+        ASSERT_EQ(vlog_read(vlog, id, &resolved, &resolved_len), VLOG_OK);
+        ASSERT_EQ(resolved_len, lengths[i]);
+        if (lengths[i] > 0) ASSERT_EQ(resolved[0], 'x');
+        free(resolved);
+    }
+
+    vlog_live_reset(vlog);
+    vlog_live_add(vlog, sst->vlog_refs[0].segment, sst->vlog_refs[0].bytes,
+                  sst->vlog_refs[0].count);
+    ASSERT_EQ(vlog_reclaim(vlog), VLOG_OK);
+    uint8_t* gone = NULL;
+    size_t gone_len = 0;
+    ASSERT_EQ(vlog_read(vlog, ids[0], &gone, &gone_len), VLOG_ERR_NOT_FOUND);
+    sstable_close(sst);
+    vlog_close(vlog);
+    (void)remove_directory(TEST_SSTABLE_DIR);
+}
+
 /* a value carries the encoding it was written under, not the one of whatever table happens to
  * reference it. that already mattered because compaction carries a value forward by id, and it
  * matters more now that a drained segment's values are re-spilled: the family doing the merge
@@ -1744,6 +1840,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_builder_vlog_spill, tests_passed);
     RUN_TEST(test_builder_records_vlog_segment_references, tests_passed);
     RUN_TEST(test_builder_respills_a_value_out_of_a_draining_segment, tests_passed);
+    RUN_TEST(test_blob_builder_respills_empty_and_tiny_references, tests_passed);
     RUN_TEST(test_respilled_value_crosses_codecs_intact, tests_passed);
     RUN_TEST(test_builder_tombstone_count, tests_passed);
     RUN_TEST(test_get_through_cache, tests_passed);

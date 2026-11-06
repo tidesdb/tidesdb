@@ -500,7 +500,7 @@ static void engine_open_duplicate_name(const int where)
     snprintf(named.name, sizeof(named.name), "%s", "dup");
     uint8_t *blob = NULL;
     size_t blob_len = 0;
-    ASSERT_EQ(cf_config_serialize(&named, &blob, &blob_len), 0);
+    ASSERT_EQ(cf_config_serialize(&named, 0, &blob, &blob_len), 0);
     ASSERT_EQ(tidesdb_manifest_add_cf(db->manifest, loser_id, "dup", blob, blob_len), 0);
     ASSERT_EQ(tidesdb_manifest_commit(db->manifest, db->manifest->path, 1), 0);
     free(blob);

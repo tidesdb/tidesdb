@@ -154,6 +154,8 @@ typedef struct
  * against txn_commits it is the retry rate the levels above read committed are paying
  * @param vlog_gc_active set while a value-log reclaim job is queued or running, so at most one runs
  * at a time
+ * @param max_blob_size maximum supported verbatim payload, capped at open by frame and platform
+ * limits
  * @param opened set once open fully succeeds, so close persists the clock only for a built engine
  * @param owns_log_sink whether this handle installed the process-wide log sink, so only it closes
  * it
@@ -171,6 +173,7 @@ typedef struct
 struct tidesdb_t
 {
     tidesdb_config_t config;
+    uint64_t max_blob_size;
     char *db_path;
 
     cache_t *cache;

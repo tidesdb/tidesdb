@@ -183,6 +183,7 @@ int tidesdb_wal_cursor_next(tidesdb_wal_cursor_t *c, tidesdb_wal_entry_t *out)
     out->value = value;
     out->value_size = (size_t)value_size;
     out->vlog_id = vlog_id;
+    out->force_separate = 0;
     c->remaining--;
     return 1;
 }

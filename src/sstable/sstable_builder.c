@@ -24,6 +24,7 @@ struct sstable_builder
     partitioned_bloom_filter_builder_t *bloom_builder; /* NULL when the bloom is disabled */
 
     size_t value_threshold;
+    int always_separate_values;
     /* this build's own copy, since the caller's set may be rebuilt before finish writes the block
      */
     range_tombstone_set_t *range_tombstones;
@@ -143,7 +144,8 @@ static int sstable_bloom_write(void *ctx, const uint8_t *data, size_t size, uint
 int sstable_builder_new(sstable_builder_t **out, block_manager_t *klog_bm, vlog_t *cf_vlog,
                         const sstable_builder_config_t *config)
 {
-    if (!out || !klog_bm || !config || !config->cf_name || !config->klog_path)
+    if (!out || !klog_bm || !config || !config->cf_name || !config->klog_path ||
+        (config->always_separate_values && !cf_vlog))
         return TDB_ERR_INVALID_ARGS;
     if (config->encoding_count > TDB_ENCODING_PIPELINE_MAX) return TDB_ERR_INVALID_ARGS;
 
@@ -212,6 +214,7 @@ int sstable_builder_new(sstable_builder_t **out, block_manager_t *klog_bm, vlog_
     b->klog_bm = klog_bm;
     b->vlog = cf_vlog;
     b->value_threshold = config->value_threshold;
+    b->always_separate_values = config->always_separate_values;
     /* cloned rather than borrowed, since the family's set may be rebuilt while this build runs */
     b->range_tombstones =
         config->range_tombstones ? range_tombstone_set_clone(config->range_tombstones) : NULL;
@@ -293,8 +296,9 @@ int sstable_builder_add(sstable_builder_t *builder, const uint8_t *key, size_t k
     /* spill a large live value to the shared vlog; the btree entry then stores the id in place of
      * the bytes, so a later compaction can carry the id forward without rewriting the value */
     uint64_t vlog_id = 0;
-    if (builder->vlog && value && value_size > 0 && !deleted &&
-        value_size >= builder->value_threshold)
+    if (builder->vlog && !deleted &&
+        (builder->always_separate_values ||
+         (value && value_size > 0 && value_size >= builder->value_threshold)))
     {
         uint64_t disk = 0;
         /* a separated value carries the family's codec too. these are the values above the spill

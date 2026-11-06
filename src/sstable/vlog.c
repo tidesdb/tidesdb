@@ -487,14 +487,14 @@ void vlog_close(vlog_t *v)
 int vlog_write(vlog_t *v, const uint8_t *value, size_t value_len, const uint8_t *ids,
                const int id_count, vlog_id_t *out_id, uint64_t *out_disk_bytes)
 {
-    if (!v || !value || value_len == 0 || (uint64_t)value_len > VLOG_BLK_LEN_MASK || !out_id)
+    if (!v || (!value && value_len != 0) || (uint64_t)value_len > VLOG_BLK_LEN_MASK || !out_id)
         return VLOG_ERR_INVALID;
 
     const uint8_t *stored = value;
     size_t stored_len = value_len;
     uint8_t *encoded = NULL;
     int stored_count = 0;
-    if (id_count > 0 && v->encodings)
+    if (value_len && id_count > 0 && v->encodings)
     {
         if (tidesdb_encoding_pipeline_encode(v->encodings, ids, id_count, value, value_len,
                                              &encoded, &stored_len) == TDB_SUCCESS)

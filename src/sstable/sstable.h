@@ -545,6 +545,7 @@ void sstable_close(sstable_t *sst);
  * the inputs that shape a build, snapshotted at sstable_builder_new
  * @param target_node_size btree node target size in bytes, 0 selects the btree default
  * @param value_threshold values at or above this size spill to the shared vlog
+ * @param always_separate_values every live value, including an empty one, stays in the shared vlog
  * @param range_tombstones the tombstones this table is to carry, borrowed and written into a block
  * of its own, or NULL to carry none. a flush passes what its memtable held and a merge passes what
  * its inputs carried, so an interval lives exactly as long as a table holding it
@@ -574,6 +575,7 @@ typedef struct
 {
     size_t target_node_size;
     size_t value_threshold;
+    int always_separate_values;
     const range_tombstone_set_t *range_tombstones;
     int enable_bloom;
     double bloom_fpr;

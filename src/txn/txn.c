@@ -238,6 +238,20 @@ int tdb_txn_put(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
     return txn_buffer(txn, cf_index, key, key_size, value, value_size, ttl, 0);
 }
 
+int tdb_txn_put_borrowed(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                         const uint8_t* value, size_t value_size, int64_t ttl)
+{
+    const int rc = txn_require_active(txn);
+    if (rc != TDB_SUCCESS) return rc;
+    return tidesdb_writeset_put_borrowed(txn->writeset, cf_index, key, key_size, value, value_size,
+                                         ttl);
+}
+
+uint64_t tdb_txn_forced_vlog_id(const tdb_txn_t* txn)
+{
+    return txn ? txn->forced_vlog_id : 0;
+}
+
 int tdb_txn_delete(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size)
 {
     return txn_buffer(txn, cf_index, key, key_size, NULL, 0, -1, TDB_WAL_ENTRY_TOMBSTONE);

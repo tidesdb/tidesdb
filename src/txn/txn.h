@@ -85,6 +85,21 @@ int tdb_txn_put(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
                 const uint8_t *value, size_t value_size, int64_t ttl);
 
 /**
+ * tdb_txn_put_borrowed
+ * stage a live value without copying it; commit forces it into the value log after validation
+ * @param txn the transaction
+ * @param cf_index the target column family's prefix index
+ * @param key the key bytes, copied now
+ * @param key_size length of key (must be > 0)
+ * @param value the caller-owned value bytes, NULL only when value_size is 0
+ * @param value_size length of value
+ * @param ttl absolute expiry time, or -1 for none
+ * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS (bad args or finished txn) / TDB_ERR_MEMORY
+ */
+int tdb_txn_put_borrowed(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                         const uint8_t* value, size_t value_size, int64_t ttl);
+
+/**
  * tdb_txn_delete
  * buffer a tombstone delete
  * @param txn the transaction
@@ -238,12 +253,16 @@ int tdb_txn_contains(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size
  * @param separate separate one value, returning 1 with out_id set when the bytes went to the value
  *                 log, 0 when the policy keeps them in the record, and negative when the append
  *                 failed
+ * @param separate_forced append one borrowed object verbatim after validation, returning 1 with an
+ *                        id; NULL leaves borrowed puts unavailable on this backend
  * @param ctx opaque context passed to separate
  */
 typedef struct
 {
     int (*separate)(void *ctx, uint32_t cf_index, const uint8_t *value, size_t value_size,
                     uint64_t *out_id);
+    int (*separate_forced)(void* ctx, uint32_t cf_index, const uint8_t* value, size_t value_size,
+                           uint64_t* out_id);
     void *ctx;
 } tdb_value_separator_t;
 
@@ -300,6 +319,14 @@ const tidesdb_wal_entry_t *tdb_txn_prepared_entries(const tdb_txn_t *txn, int *o
  */
 int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
                    const tidesdb_source_t *sources, int num_sources);
+
+/**
+ * tdb_txn_forced_vlog_id
+ * return the one forced value-log id a committed transaction published, or zero otherwise
+ * @param txn the transaction
+ * @return the value-log id after a successful one-object forced commit, or 0
+ */
+uint64_t tdb_txn_forced_vlog_id(const tdb_txn_t* txn);
 
 /**
  * tdb_txn_prepare

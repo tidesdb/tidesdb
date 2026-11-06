@@ -22,6 +22,9 @@
  * the largest inlined size */
 #define CF_CONFIG_MIN_ENTRIES_PER_BLOCK 4
 
+/* optional trailing family kind, after the legacy codec list */
+#define CF_CONFIG_KIND_BLOB 1
+
 /* a double is serialized by its raw IEEE-754 bits (copied to a u64, not aliased) so the value
  * survives a round-trip byte for byte; the engine already assumes IEEE-754 doubles */
 static uint64_t cf_config_double_to_bits(const double v)
@@ -109,12 +112,13 @@ int cf_config_validate(const tidesdb_column_family_config_t *cfg,
     return 0;
 }
 
-int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out, size_t *out_len)
+int cf_config_serialize(const tidesdb_column_family_config_t* cfg, int is_blob, uint8_t** out,
+                        size_t* out_len)
 {
     if (!cfg || !out || !out_len) return -1;
     if (cfg->encoding_count > TDB_ENCODING_PIPELINE_MAX) return -1;
 
-    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count;
+    const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count + (is_blob ? 1 : 0);
     uint8_t *buf = malloc(len);
     if (!buf) return -1;
 
@@ -143,12 +147,14 @@ int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out
     buf[off++] = cfg->encoding_count;
     memcpy(buf + off, cfg->encoding_pipeline, cfg->encoding_count);
 
+    if (is_blob) buf[off + cfg->encoding_count] = CF_CONFIG_KIND_BLOB;
     *out = buf;
     *out_len = len;
     return 0;
 }
 
-int cf_config_deserialize(const uint8_t *data, size_t len, tidesdb_column_family_config_t *out)
+int cf_config_deserialize(const uint8_t* data, size_t len, tidesdb_column_family_config_t* out,
+                          int* is_blob)
 {
     if (!data || !out || len < CF_CONFIG_BLOB_FIXED_SIZE) return -1;
     if (data[0] != CF_CONFIG_BLOB_VERSION) return -1;
@@ -181,6 +187,12 @@ int cf_config_deserialize(const uint8_t *data, size_t len, tidesdb_column_family
     if (len < (size_t)CF_CONFIG_BLOB_FIXED_SIZE + encoding_count) return -1;
     out->encoding_count = encoding_count;
     memcpy(out->encoding_pipeline, data + off, encoding_count);
+
+    const size_t end = off + encoding_count;
+    const int media = len > end;
+    if (media && (len != end + 1 || data[end] != CF_CONFIG_KIND_BLOB)) return -1;
+    if (media && (out->keep_values_inline || encoding_count)) return -1;
+    if (is_blob) *is_blob = media;
 
     /* every field above came off disk, where a torn write or a hostile blob can leave any bit
      * pattern that still passes the version and length checks. the decoded config then reaches the

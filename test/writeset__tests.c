@@ -250,6 +250,25 @@ void test_writeset_keeps_a_live_entry_with_an_empty_value(void)
     tidesdb_writeset_free(ws);
 }
 
+/* borrowed writes retain only the key allocation and expose the caller bytes unchanged until the
+ * owner resolves or truncates the transaction's write set. */
+void test_writeset_borrows_value_bytes(void)
+{
+    tidesdb_writeset_t* ws = tidesdb_writeset_create();
+    const uint8_t key[] = "k";
+    uint8_t value[] = {'v', '1'};
+    ASSERT_EQ(tidesdb_writeset_put_borrowed(ws, 0, key, 1, value, sizeof(value), -1), TDB_SUCCESS);
+    tidesdb_writeset_op_t op;
+    ASSERT_EQ(tidesdb_writeset_lookup(ws, 0, key, 1, &op), 1);
+    ASSERT_TRUE(op.borrowed_value && op.value == value && op.value_size == sizeof(value));
+    value[1] = '2';
+    ASSERT_TRUE(op.value[1] == '2');
+    ASSERT_EQ(tidesdb_writeset_put_borrowed(ws, 0, key, 1, NULL, 1, -1), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_writeset_put(ws, 0, key, 1, NULL, 1, -1, 0), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_writeset_put(ws, 0, key, 1, value, SIZE_MAX, -1, 0), TDB_ERR_TOO_LARGE);
+    tidesdb_writeset_free(ws);
+}
+
 /* read-your-own-writes has to honour a buffered prefix delete over every key under it, not just the
  * one key whose bytes happen to equal the prefix */
 void test_writeset_prefix_delete_shadows_the_keys_under_it(void)
@@ -312,6 +331,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_writeset_growth, tests_passed);
     RUN_TEST(test_writeset_null_safe, tests_passed);
     RUN_TEST(test_writeset_keeps_a_live_entry_with_an_empty_value, tests_passed);
+    RUN_TEST(test_writeset_borrows_value_bytes, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

@@ -124,6 +124,13 @@ database to new files requires this scan on the first indexed open.
 The index option defaults to zero. Both modes write the existing v10 value-log format.
 Earlier v10 binaries ignore the optional index files.
 
+Set `max_blob_size` to bound the number of bytes accepted by a single `tidesdb_blob_put`.
+Zero selects the largest object that fits one positioned write. The object shares the
+transfer with a 16-byte value header and 16 bytes of block framing. On macOS the maximum
+object is 2,147,483,615 bytes. Linux rounds the transfer limit down to a page boundary
+before subtracting the headers. Lowering the option on reopen still permits reads of larger
+objects already in the database.
+
 Set `max_vlog_segments` to choose how many value-log files this database can retain
 simultaneously. Zero or an omitted field selects 4,096. Explicit capacities range from 1
 through 65,536. The engine allocates the slot table once per open. Segment file numbers

@@ -214,6 +214,15 @@ static tidesdb_source_result_t engine_sstable_source_has_newer(void *ctx, uint32
     return s.has_newer(s.ctx, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
 }
 
+/* a blob always occupies its own verbatim frame, even when it has no payload bytes */
+static int engine_separate_blob(void* ctx, const uint32_t cf_index, const uint8_t* value,
+                                const size_t value_size, uint64_t* out_id)
+{
+    (void)cf_index; /* the synchronous caller has validated the family */
+    tidesdb_t* db = ctx;
+    return vlog_write(db->vlog, value, value_size, NULL, 0, out_id, NULL) == VLOG_OK ? 1 : -1;
+}
+
 /* the db-level interval probe, resolving the cf-index the same way the read source does so a commit
  * checking a prefix delete reaches the per-cf metadata skip */
 static tidesdb_source_result_t engine_sstable_source_range_has_newer(
@@ -561,6 +570,7 @@ static int engine_open_txn(tidesdb_t *db)
     /* the separator is the engine's rather than the adapter's, since the policy needs the family
      * registry and the adapter is deliberately kept clear of it */
     db->backend.separator.separate = engine_separate_value;
+    db->backend.separator.separate_forced = engine_separate_blob;
     db->backend.separator.ctx = db;
     tidesdb_l0_source(&db->l0_ctx, &db->sources[0]);
     db->sources[1].name = "cf_sstable_dispatch";
@@ -637,6 +647,12 @@ int engine_open(const tidesdb_config_t *config, const tidesdb_open_options_t *op
     /* zero is a descriptor a close would happily act on, so the unheld state is stated explicitly
      */
     db->lock_fd = -1;
+
+    /* the direct value-log path submits one frame per positioned write. reject an impossible
+     * transfer before drawing an id or reserving an extent on the shared segment. */
+    db->max_blob_size = tdb_single_io_limit() - block_manager_framed_size(VLOG_BLK_HDR_SIZE);
+    if (options->max_blob_size && options->max_blob_size < db->max_blob_size)
+        db->max_blob_size = options->max_blob_size;
 
     /* each stage leaves whatever it opened on db, so one engine_close unwinds however far this got
      */
@@ -764,8 +780,8 @@ void engine_close(tidesdb_t *db)
     if (owned_log_sink) tidesdb_log_close_sink();
 }
 
-int engine_create_cf_locked(tidesdb_t *db, const char *name,
-                            const tidesdb_column_family_config_t *config)
+int engine_create_cf_locked(tidesdb_t* db, const char* name,
+                            const tidesdb_column_family_config_t* config, int is_blob)
 {
     if (!db || !name || name[0] == '\0' || !config) return TDB_ERR_INVALID_ARGS;
     if (atomic_load_explicit(&db->closing, memory_order_acquire)) return TDB_ERR_INVALID_DB;
@@ -797,7 +813,8 @@ int engine_create_cf_locked(tidesdb_t *db, const char *name,
 
     uint8_t *blob = NULL;
     size_t blob_len = 0;
-    if (cf_config_serialize(&cfg, &blob, &blob_len) != 0)
+    cf->is_blob = is_blob;
+    if (cf_config_serialize(&cfg, is_blob, &blob, &blob_len) != 0)
     {
         cf_free(cf);
         return TDB_ERR_MEMORY;
@@ -833,14 +850,15 @@ int engine_create_cf_locked(tidesdb_t *db, const char *name,
     return TDB_SUCCESS;
 }
 
-int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_family_config_t *config)
+int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_family_config_t* config,
+                     int is_blob)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
     /* held from the name check to the registry publish. without it every creator of one name
      * found it free, each persisted a manifest record of its own under a fresh id, and all but one
      * then found the registry taken -- leaving records the next open could not reconcile */
     pthread_mutex_lock(&db->ddl_lock);
-    const int rc = engine_create_cf_locked(db, name, config);
+    const int rc = engine_create_cf_locked(db, name, config, is_blob);
     pthread_mutex_unlock(&db->ddl_lock);
     return rc;
 }

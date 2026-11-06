@@ -37,6 +37,7 @@
  * the ceiling is published by the first and released by the last, so a scan's lower ceiling is not
  * lifted by a point read inside it
  * @param commit_seq the assigned commit sequence, 0 until commit or prepare
+ * @param forced_vlog_id the id a successful one-object forced separation wrote, or 0 otherwise
  * @param prepared_entries the entries staged by prepare, applied at phase-2 commit, NULL otherwise
  * @param prepared_count number of prepared entries
  * @param xid the two-phase-commit transaction id, owned, NULL unless prepared
@@ -73,6 +74,7 @@ struct tdb_txn
     _Atomic(uint64_t) read_ceiling;
     int read_holds;
     uint64_t commit_seq;
+    uint64_t forced_vlog_id;
     tidesdb_wal_entry_t *prepared_entries;
     int prepared_count;
     uint8_t *xid;

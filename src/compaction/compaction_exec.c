@@ -118,6 +118,7 @@ static void ce_builder_config(const compaction_ctx_t *cx, uint64_t id, const cha
     memset(config, 0, sizeof(*config));
     config->target_node_size = cc->btree_klog_block_size;
     config->value_threshold = cf_config_value_threshold(cc, cx->value_threshold);
+    config->always_separate_values = cx->cf->is_blob;
     config->enable_bloom = cc->enable_bloom_filter;
     config->bloom_fpr = cc->bloom_fpr;
     config->sync_mode = cx->sync_mode;

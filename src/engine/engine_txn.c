@@ -45,10 +45,62 @@ int engine_txn_begin(tidesdb_t *db, tidesdb_isolation_level_t isolation, tidesdb
 int engine_txn_put(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_size,
                    const uint8_t *value, size_t value_size, int64_t ttl)
 {
-    if (!txn || !cf) return TDB_ERR_INVALID_ARGS;
+    if (!txn || !cf || cf->vlog != txn->db->vlog || cf->is_blob) return TDB_ERR_INVALID_ARGS;
     /* the family id is the key prefix, narrowed to the width the prefix is. engine_create_cf will
      * not hand out an id past TDB_CF_INDEX_MAX, which is what makes this lossless */
     return tdb_txn_put(txn->inner, (uint32_t)cf->cf_id, key, key_size, value, value_size, ttl);
+}
+
+/* a competing snapshot writer may still own the key while it syncs its frame. retry with a fresh
+ * snapshot so its eventual bytes decide the result. a long-lived prepare can hold the key longer
+ * than this budget, in which case the caller receives the normal retryable contention result. */
+#define ENGINE_BLOB_CLAIM_ATTEMPTS 1024
+#define ENGINE_BLOB_CLAIM_WAIT_US  1000
+
+int engine_blob_put(tidesdb_t* db, cf_t* cf, const uint8_t* key, const size_t key_size,
+                    const uint8_t* value, const size_t value_size)
+{
+    if (!db || !cf || !key || key_size == 0 || (!value && value_size) || !cf->is_blob ||
+        cf->vlog != db->vlog)
+        return TDB_ERR_INVALID_ARGS;
+    if (value_size > db->max_blob_size || key_size > TDB_BLOB_MAX_KEY_SIZE)
+        return TDB_ERR_TOO_LARGE;
+
+    for (int attempt = 0; attempt < ENGINE_BLOB_CLAIM_ATTEMPTS; attempt++)
+    {
+        tidesdb_txn_t* txn = NULL;
+        int rc = engine_txn_begin(db, TDB_ISOLATION_SNAPSHOT, &txn);
+        if (rc != TDB_SUCCESS) return rc;
+
+        uint8_t* stored = NULL;
+        size_t stored_size = 0;
+        rc = engine_txn_get_notrack(txn, cf, key, key_size, &stored, &stored_size);
+        if (rc == TDB_SUCCESS)
+        {
+            const int equal = stored_size == value_size &&
+                              (!value_size || memcmp(stored, value, value_size) == 0);
+            free(stored);
+            engine_txn_free(txn);
+            return equal ? TDB_SUCCESS : TDB_ERR_CONFLICT;
+        }
+        if (rc == TDB_ERR_NOT_FOUND)
+        {
+            rc = tdb_txn_put_borrowed(txn->inner, (uint32_t)cf->cf_id, key, key_size, value,
+                                      value_size, TDB_TTL_NONE);
+            if (rc == TDB_SUCCESS)
+            {
+                /* rotation and flush can release the old memtable's floor between append and
+                 * apply. hold a builder floor until the receiving memtable protects the id. */
+                const int token = vlog_build_enter(db->vlog);
+                rc = engine_txn_commit(txn);
+                vlog_build_leave(db->vlog, token);
+            }
+        }
+        engine_txn_free(txn);
+        if (rc != TDB_ERR_CONFLICT) return rc;
+        usleep(ENGINE_BLOB_CLAIM_WAIT_US);
+    }
+    return TDB_ERR_LOCKED;
 }
 
 int engine_txn_delete(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_size)
@@ -125,6 +177,12 @@ static void engine_account_commit(tidesdb_t *db, tdb_txn_t *inner)
         entry.ttl = op.ttl;
         entry.flags = op.flags;
         if (op.ttl != -1) entry.flags |= TDB_WAL_ENTRY_HAS_TTL;
+        if (op.borrowed_value)
+        {
+            entry.flags |= TDB_WAL_ENTRY_VLOG_REF;
+            entry.vlog_id = tdb_txn_forced_vlog_id(inner);
+            entry.seq = tdb_txn_commit_seq(inner);
+        }
         entry.key = op.key;
         entry.key_size = op.key_size;
         entry.value = op.value;

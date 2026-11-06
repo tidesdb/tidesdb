@@ -398,12 +398,15 @@ typedef struct tidesdb_config_t
  * @param max_vlog_segments simultaneous value-log slots, including the active segment. 0 selects
  *                          4096 (default), and the largest supported capacity is 65536. reopening
  *                          requires a free slot after adopting all retained nonempty segments
+ * @param max_blob_size maximum logical bytes per blob put. zero selects the largest verbatim value
+ *                      that fits one value-log frame on this platform
  */
 typedef struct tidesdb_open_options_t
 {
     size_t size;
     uint64_t enable_vlog_indexes;
     uint64_t max_vlog_segments;
+    uint64_t max_blob_size;
 } tidesdb_open_options_t;
 
 /* ===== statistics ===== */
@@ -750,6 +753,34 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config);
 
 /**
+ * tidesdb_create_blob_column_family
+ * create a dedicated column family for immutable, verbatim values in the shared value log
+ * @param db open database
+ * @param name unique family name, nonempty and shorter than TDB_MAX_CF_NAME_LEN
+ * @return TDB_SUCCESS or the same errors as tidesdb_create_column_family
+ */
+int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name);
+
+/* media keys are bounded independently of the object they name */
+#define TDB_BLOB_MAX_KEY_SIZE 65536u
+
+/**
+ * tidesdb_blob_put
+ * synchronously create one immutable blob, or check that a live key already holds identical bytes
+ * @param db open database whose WAL sync policy applies to this commit
+ * @param cf blob column family belonging to db
+ * @param key media key
+ * @param key_size key length in bytes, from 1 through TDB_BLOB_MAX_KEY_SIZE
+ * @param value bytes borrowed until return, may be NULL when value_size is zero
+ * @param value_size logical size, including zero for a present, empty object
+ * @return TDB_SUCCESS for a create or identical retry, TDB_ERR_CONFLICT for different live bytes,
+ *         TDB_ERR_TOO_LARGE for an oversized object or key, TDB_ERR_INVALID_ARGS for an invalid
+ *         argument, TDB_ERR_LOCKED for unresolved contention, or the transaction or storage error
+ */
+int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
+                     size_t key_size, const uint8_t* value, size_t value_size);
+
+/**
  * tidesdb_drop_column_family
  * drop a column family by name, deleting its sstables and manifest records. waits out any
  * compaction already running on the family, so a heavily compacting family takes longer to drop.
@@ -952,7 +983,8 @@ int tidesdb_txn_begin_cf(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn
 
 /**
  * tidesdb_txn_put
- * buffer a put into a transaction
+ * buffer a put into a transaction on an ordinary column family. use tidesdb_blob_put for a blob
+ * family
  * @param txn transaction
  * @param cf target column family
  * @param key key data

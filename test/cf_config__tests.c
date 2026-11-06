@@ -52,14 +52,14 @@ void test_cf_config_roundtrip(void)
 
     uint8_t *blob = NULL;
     size_t len = 0;
-    ASSERT_EQ(cf_config_serialize(&in, &blob, &len), 0);
+    ASSERT_EQ(cf_config_serialize(&in, 0, &blob, &len), 0);
     ASSERT_TRUE(blob != NULL);
     ASSERT_EQ((int)len, CF_CONFIG_BLOB_FIXED_SIZE + in.encoding_count);
     ASSERT_EQ((int)blob[0], CF_CONFIG_BLOB_VERSION);
 
     tidesdb_column_family_config_t out;
     memset(&out, 0, sizeof(out));
-    ASSERT_EQ(cf_config_deserialize(blob, len, &out), 0);
+    ASSERT_EQ(cf_config_deserialize(blob, len, &out, NULL), 0);
 
     ASSERT_EQ((int)out.level_size_ratio, 10);
     ASSERT_EQ(out.min_levels, 3);
@@ -219,11 +219,11 @@ void test_cf_config_version_reject(void)
     tidesdb_column_family_config_t in = make_config();
     uint8_t *blob = NULL;
     size_t len = 0;
-    ASSERT_EQ(cf_config_serialize(&in, &blob, &len), 0);
+    ASSERT_EQ(cf_config_serialize(&in, 0, &blob, &len), 0);
 
     blob[0] = CF_CONFIG_BLOB_VERSION - 1; /* an older version is refused, not misread */
     tidesdb_column_family_config_t out;
-    ASSERT_EQ(cf_config_deserialize(blob, len, &out), -1);
+    ASSERT_EQ(cf_config_deserialize(blob, len, &out, NULL), -1);
 
     free(blob);
 }
@@ -233,12 +233,12 @@ void test_cf_config_truncated(void)
     tidesdb_column_family_config_t in = make_config();
     uint8_t *blob = NULL;
     size_t len = 0;
-    ASSERT_EQ(cf_config_serialize(&in, &blob, &len), 0);
+    ASSERT_EQ(cf_config_serialize(&in, 0, &blob, &len), 0);
 
     tidesdb_column_family_config_t out;
     /* short of the fixed header, and short of the declared encoding array, both fail */
-    ASSERT_EQ(cf_config_deserialize(blob, 10, &out), -1);
-    ASSERT_EQ(cf_config_deserialize(blob, CF_CONFIG_BLOB_FIXED_SIZE, &out), -1);
+    ASSERT_EQ(cf_config_deserialize(blob, 10, &out, NULL), -1);
+    ASSERT_EQ(cf_config_deserialize(blob, CF_CONFIG_BLOB_FIXED_SIZE, &out, NULL), -1);
 
     free(blob);
 }
@@ -253,14 +253,14 @@ void test_cf_config_rejects_out_of_range_fields(void)
     tidesdb_column_family_config_t in = make_config();
     uint8_t *blob = NULL;
     size_t len = 0;
-    ASSERT_EQ(cf_config_serialize(&in, &blob, &len), 0);
+    ASSERT_EQ(cf_config_serialize(&in, 0, &blob, &len), 0);
 
     /* locate the isolation word by re-serializing a config that differs only there */
     tidesdb_column_family_config_t probe = make_config();
     probe.default_isolation_level = TDB_ISOLATION_READ_UNCOMMITTED;
     uint8_t *probe_blob = NULL;
     size_t probe_len = 0;
-    ASSERT_EQ(cf_config_serialize(&probe, &probe_blob, &probe_len), 0);
+    ASSERT_EQ(cf_config_serialize(&probe, 0, &probe_blob, &probe_len), 0);
     ASSERT_EQ(len, probe_len);
 
     /* the two configs differ only in the isolation level, and the encoder writes it big-endian, so
@@ -286,7 +286,7 @@ void test_cf_config_rejects_out_of_range_fields(void)
     blob[iso_off + 3] = 99;
 
     tidesdb_column_family_config_t out;
-    ASSERT_EQ(cf_config_deserialize(blob, len, &out), -1);
+    ASSERT_EQ(cf_config_deserialize(blob, len, &out, NULL), -1);
 
     free(blob);
 }

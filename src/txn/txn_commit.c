@@ -171,6 +171,7 @@ static tidesdb_wal_entry_t *txn_build_entries(tidesdb_writeset_t *ws, uint64_t c
         e->value = op.value;
         e->value_size = op.value_size;
         e->vlog_id = 0; /* the commit path holds its own bytes; nothing separates them yet */
+        e->force_separate = op.borrowed_value;
     }
     free(superseded_of);
     *out_count = k;
@@ -186,19 +187,20 @@ static tidesdb_wal_entry_t *txn_build_entries(tidesdb_writeset_t *ws, uint64_t c
 static int txn_separate_values(const tdb_txn_backend_t *backend, tidesdb_wal_entry_t *entries,
                                const int count)
 {
-    if (!backend->separator.separate) return TDB_SUCCESS;
-
     for (int i = 0; i < count; i++)
     {
         tidesdb_wal_entry_t *e = &entries[i];
-        /* a tombstone names no bytes, and an empty value has none worth moving */
-        if ((e->flags & TDB_WAL_ENTRY_TOMBSTONE) || e->value == NULL || e->value_size == 0)
-            continue;
+        if (e->flags & TDB_WAL_ENTRY_TOMBSTONE) continue;
+
+        int (*separate)(void*, uint32_t, const uint8_t*, size_t, uint64_t*) =
+            e->force_separate ? backend->separator.separate_forced : backend->separator.separate;
+        if (!separate && e->force_separate) return TDB_ERR_INVALID_ARGS;
+        if (!separate) continue;
+        if (!e->force_separate && (e->value == NULL || e->value_size == 0)) continue;
 
         uint64_t id = 0;
-        const int sep = backend->separator.separate(backend->separator.ctx, e->cf_index, e->value,
-                                                    e->value_size, &id);
-        if (sep < 0) return TDB_ERR_IO;
+        const int sep = separate(backend->separator.ctx, e->cf_index, e->value, e->value_size, &id);
+        if (sep < 0 || (e->force_separate && (sep == 0 || id == 0))) return TDB_ERR_IO;
         if (sep == 0) continue;
 
         e->flags |= TDB_WAL_ENTRY_VLOG_REF;
@@ -837,6 +839,7 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
     tidesdb_mvcc_mark(txn->clock, seq, 1);
     tidesdb_mvcc_wait_visible(txn->clock, seq);
     txn->commit_seq = seq;
+    if (count == 1 && entries[0].force_separate) txn->forced_vlog_id = entries[0].vlog_id;
 
     /* the claims and the intervals go once the batch is visible, and not before: from here the
      * store holds the versions a later writer's validation finds, and until the mark it did not */

@@ -41,6 +41,7 @@
 /**
  * cf_t
  * a runtime column family, composing its config and tiered sstables over a borrowed db-global vlog
+ * @param is_blob immutable family kind, requiring separated, verbatim writes through the blob API
  * @param cf_id stable id from the manifest registry, the key every manifest entry references
  * @param name column family name, NUL-terminated
  * @param config the validated, persisted configuration, published as an immutable snapshot. a
@@ -91,6 +92,7 @@
 typedef struct cf
 {
     uint64_t cf_id;
+    int is_blob;
     /* published rather than written in place. a rename rewrites it while a flush may be reading it
      * to stamp onto an sstable, where it is the first component of a block cache key, so the name a
      * reader holds has to stay whole -- it is replaced by publishing another and freeing the old

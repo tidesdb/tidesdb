@@ -80,6 +80,30 @@ threshold exists to avoid, that compaction rewrites those bytes on every merge.
 [`tidesdb_create_column_family`](#tidesdb_create_column_family),
 [`tidesdb_cf_update_runtime_config`](#tidesdb_cf_update_runtime_config)
 
+## Immutable blobs
+
+Create a dedicated media family with `tidesdb_create_blob_column_family(db, name)`.
+Obtain its handle with `tidesdb_get_column_family`. Write an object with
+`tidesdb_blob_put(db, cf, key, key_size, value, value_size)`. The binary key identifies
+the object and can contain 1 through 65,536 bytes. The caller owns both buffers and can
+reuse them as soon as the synchronous call returns.
+
+An absent key creates an object. An identical retry returns `TDB_SUCCESS`. Different
+bytes under the same live key return `TDB_ERR_CONFLICT`. A long-held competing transaction
+can return `TDB_ERR_LOCKED`, which the caller can retry. Passing `NULL` and a value length
+of zero creates a present, empty object. Use ordinary transaction reads and deletes on
+this family. A visible delete frees the key for a new create.
+
+Every object uses a verbatim value-log record. The WAL and memtable hold its ID and length.
+Blob puts follow the configured WAL sync policy. FULL waits for durability. INTERVAL uses
+the background WAL sync interval. NONE acknowledges a staged WAL record and can lose recent
+writes on a crash. A checkpoint supplies an explicit durable recovery point.
+
+The manifest records the family kind on creation, rename, clone and persisted reconfiguration.
+Earlier v10 readers can read ungrouped blob values as ordinary separated values. Use a
+blob-aware binary for writes and family administration because older binaries treat the
+family as ordinary and can discard its kind when rewriting its configuration.
+
 ## tidesdb_compression_available
 
 Report whether this build can use a compression algorithm.

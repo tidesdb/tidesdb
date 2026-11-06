@@ -188,7 +188,7 @@ void test_cf_open_empty(void)
     size_t blob_len = 0;
     tidesdb_column_family_config_t saved;
     cf_config_get(created, &saved);
-    ASSERT_EQ(cf_config_serialize(&saved, &blob, &blob_len), 0);
+    ASSERT_EQ(cf_config_serialize(&saved, 0, &blob, &blob_len), 0);
     cf_free(created);
 
     char manifest_path[512];
@@ -229,7 +229,7 @@ void test_cf_open_rebuilds_levels(void)
     size_t blob_len = 0;
     tidesdb_column_family_config_t saved;
     cf_config_get(created, &saved);
-    ASSERT_EQ(cf_config_serialize(&saved, &blob, &blob_len), 0);
+    ASSERT_EQ(cf_config_serialize(&saved, 0, &blob, &blob_len), 0);
 
     /* two sstables written into the family directory, one at each of two levels */
     build_sstable_on_disk(created->dir, TEST_CF_ID, 1);
@@ -299,7 +299,7 @@ void test_cf_open_self_heals_torn_l1(void)
     size_t blob_len = 0;
     tidesdb_column_family_config_t saved;
     cf_config_get(created, &saved);
-    ASSERT_EQ(cf_config_serialize(&saved, &blob, &blob_len), 0);
+    ASSERT_EQ(cf_config_serialize(&saved, 0, &blob, &blob_len), 0);
 
     build_sstable_on_disk(created->dir, TEST_CF_ID, 1); /* an L1 flush output, about to be torn */
     build_sstable_on_disk(created->dir, TEST_CF_ID, 2); /* a good sstable at a deeper level */
@@ -348,7 +348,7 @@ void test_cf_open_fails_on_torn_deep_level(void)
     size_t blob_len = 0;
     tidesdb_column_family_config_t saved;
     cf_config_get(created, &saved);
-    ASSERT_EQ(cf_config_serialize(&saved, &blob, &blob_len), 0);
+    ASSERT_EQ(cf_config_serialize(&saved, 0, &blob, &blob_len), 0);
 
     build_sstable_on_disk(created->dir, TEST_CF_ID, 1);
     corrupt_klog(created->dir, TEST_CF_ID, 1);

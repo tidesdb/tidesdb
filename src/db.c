@@ -107,6 +107,9 @@ int tidesdb_open_with_options(const tidesdb_config_t *config, const tidesdb_open
         if (options->size >= offsetof(tidesdb_open_options_t, enable_vlog_indexes) +
                                  sizeof(options->enable_vlog_indexes))
             resolved_options.enable_vlog_indexes = options->enable_vlog_indexes;
+        if (options->size >=
+            offsetof(tidesdb_open_options_t, max_blob_size) + sizeof(options->max_blob_size))
+            resolved_options.max_blob_size = options->max_blob_size;
         if (options->size >= offsetof(tidesdb_open_options_t, max_vlog_segments) +
                                  sizeof(options->max_vlog_segments))
         {
@@ -173,7 +176,21 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
-    return tdb_public_rc(engine_create_cf(db, name, config));
+    return tdb_public_rc(engine_create_cf(db, name, config, 0));
+}
+
+int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name)
+{
+    if (!db || !name || !*name || strnlen(name, TDB_MAX_CF_NAME_LEN) >= TDB_MAX_CF_NAME_LEN)
+        return TDB_ERR_INVALID_ARGS;
+    const tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+    return tdb_public_rc(engine_create_cf(db, name, &config, 1));
+}
+
+int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
+                     size_t key_size, const uint8_t* value, size_t value_size)
+{
+    return tdb_public_rc(engine_blob_put(db, (cf_t*)cf, key, key_size, value, value_size));
 }
 
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name)

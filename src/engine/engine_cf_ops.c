@@ -68,14 +68,14 @@ int engine_list_column_families(tidesdb_t *db, char ***out_names, int *out_count
 
 /* register a family's name and config in the manifest and commit; the caller has set config already
  */
-static int engine_cf_persist_config(tidesdb_t *db, uint64_t cf_id, const char *name,
-                                    const tidesdb_column_family_config_t *config)
+static int engine_cf_persist_config(tidesdb_t* db, cf_t* cf, const char* name,
+                                    const tidesdb_column_family_config_t* config)
 {
     uint8_t *blob = NULL;
     size_t blob_len = 0;
-    if (cf_config_serialize(config, &blob, &blob_len) != 0) return TDB_ERR_MEMORY;
+    if (cf_config_serialize(config, cf->is_blob, &blob, &blob_len) != 0) return TDB_ERR_MEMORY;
     const int ok =
-        tidesdb_manifest_add_cf(db->manifest, cf_id, name, blob, blob_len) == 0 &&
+        tidesdb_manifest_add_cf(db->manifest, cf->cf_id, name, blob, blob_len) == 0 &&
         tidesdb_manifest_commit(db->manifest, db->manifest->path, engine_durable_writes(db)) == 0;
     free(blob);
     return ok ? TDB_SUCCESS : TDB_ERR_IO;
@@ -85,6 +85,8 @@ int engine_cf_update_runtime_config(tidesdb_t *db, cf_t *cf,
                                     const tidesdb_column_family_config_t *new_config, int persist)
 {
     if (!db || !cf || !new_config) return TDB_ERR_INVALID_ARGS;
+    if (cf->is_blob && (new_config->keep_values_inline || new_config->encoding_count))
+        return TDB_ERR_INVALID_ARGS;
     /* validated against the registry, exactly as a create is. with no registry the pipeline ids are
      * only range-checked, so an id naming a codec this build lacks would be accepted here and then
      * fail in every later sstable build -- leaving the family unflushable and its data stranded in
@@ -115,8 +117,7 @@ int engine_cf_update_runtime_config(tidesdb_t *db, cf_t *cf,
     cf->planned_generation = 0;
     cf->planned_gc_floor = 0;
 
-    const int rc =
-        persist ? engine_cf_persist_config(db, cf->cf_id, cf->name, &merged) : TDB_SUCCESS;
+    const int rc = persist ? engine_cf_persist_config(db, cf, cf->name, &merged) : TDB_SUCCESS;
 
     atomic_store_explicit(&cf->compacting, 0, memory_order_release);
     return rc;
@@ -167,7 +168,7 @@ static int engine_rename_cf_locked(tidesdb_t *db, const char *old_name, const ch
     }
 
     /* the manifest commit fsyncs and needs no lock; the claim keeps another DDL off the family */
-    if (rc == TDB_SUCCESS) rc = engine_cf_persist_config(db, cf->cf_id, new_name, &renamed);
+    if (rc == TDB_SUCCESS) rc = engine_cf_persist_config(db, cf, new_name, &renamed);
 
     /* the old name is gone from every in-memory record once this returns, so the line naming both
      * is the only place the two ever appear together */
@@ -276,7 +277,7 @@ static int engine_clone_cf_locked(tidesdb_t *db, const char *src_name, const cha
     snprintf(dst_cfg.name, sizeof(dst_cfg.name), "%s", dst_name);
     dst_cfg.commit_hook_fn = NULL;
     dst_cfg.commit_hook_ctx = NULL;
-    rc = engine_create_cf_locked(db, dst_name, &dst_cfg);
+    rc = engine_create_cf_locked(db, dst_name, &dst_cfg, src->is_blob);
 
     if (rc == TDB_SUCCESS)
     {

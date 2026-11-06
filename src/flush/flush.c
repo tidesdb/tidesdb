@@ -88,6 +88,7 @@ static void flush_builder_config(const flush_ctx_t *fx, cf_t *cf, uint64_t id,
     memset(config, 0, sizeof(*config));
     config->target_node_size = cc->btree_klog_block_size;
     config->value_threshold = cf_config_value_threshold(cc, fx->value_threshold);
+    config->always_separate_values = cf->is_blob;
     config->enable_bloom = cc->enable_bloom_filter;
     config->bloom_fpr = cc->bloom_fpr;
     config->sync_mode = fx->sync_mode;

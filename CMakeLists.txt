@@ -735,6 +735,7 @@ if(TIDESDB_BUILD_TESTS)
         engine_tests
         ttl_tests
         txn_api_tests
+        blob_tests
         iter_api_tests
         isolation_history_tests
         isolation_history_ops_tests

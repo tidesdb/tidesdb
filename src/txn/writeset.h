@@ -38,6 +38,7 @@ typedef struct tidesdb_writeset tidesdb_writeset_t;
  * @param value_size length of value, 0 for a tombstone
  * @param ttl absolute expiry time, or -1 for none
  * @param flags op flag bits (TDB_WAL_ENTRY_TOMBSTONE / SINGLE_DELETE)
+ * @param borrowed_value non-zero when value is caller-owned through commit return
  */
 typedef struct
 {
@@ -48,6 +49,7 @@ typedef struct
     size_t value_size;
     int64_t ttl;
     uint8_t flags;
+    uint8_t borrowed_value;
 } tidesdb_writeset_op_t;
 
 /**
@@ -81,6 +83,23 @@ void tidesdb_writeset_free(tidesdb_writeset_t *ws);
 int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
                          size_t key_size, const uint8_t *value, size_t value_size, int64_t ttl,
                          uint8_t flags);
+
+/**
+ * tidesdb_writeset_put_borrowed
+ * append a live write whose key is copied but whose value remains caller-owned through commit
+ * return
+ * @param ws the write set
+ * @param cf_index the target column family's prefix index
+ * @param key the key bytes
+ * @param key_size length of key (must be > 0)
+ * @param value the caller-owned value bytes, NULL only when value_size is 0
+ * @param value_size length of value
+ * @param ttl absolute expiry time, or -1 for none
+ * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS / TDB_ERR_MEMORY
+ */
+int tidesdb_writeset_put_borrowed(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
+                                  size_t key_size, const uint8_t* value, size_t value_size,
+                                  int64_t ttl);
 
 /**
  * tidesdb_writeset_count

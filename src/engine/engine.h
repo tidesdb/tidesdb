@@ -42,9 +42,25 @@ void engine_close(tidesdb_t *db);
  * @param db the engine
  * @param name the cf name, non-empty
  * @param config the cf configuration, borrowed
+ * @param is_blob nonzero for a dedicated blob family
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_EXISTS, TDB_ERR_IO, or TDB_ERR_MEMORY
  */
-int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_family_config_t *config);
+int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_family_config_t* config,
+                     int is_blob);
+
+/**
+ * engine_blob_put
+ * resolve the immutable media key at a snapshot and commit a borrowed value if absent
+ * @param db owning database
+ * @param cf dedicated blob family
+ * @param key nonempty media key
+ * @param key_size key length
+ * @param value caller buffer, nullable for an empty object
+ * @param value_size logical blob length
+ * @return as tidesdb_blob_put
+ */
+int engine_blob_put(tidesdb_t* db, cf_t* cf, const uint8_t* key, size_t key_size,
+                    const uint8_t* value, size_t value_size);
 
 /**
  * engine_drop_cf

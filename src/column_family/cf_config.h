@@ -75,12 +75,14 @@ void cf_config_warn_layout(const tidesdb_column_family_config_t *cfg, size_t db_
  * cf_config_serialize
  * encode a config's persisted fields into a freshly allocated blob the caller frees. the name (held
  * on the manifest cf record) and the runtime-only commit hook are not persisted here.
+ * @param is_blob whether to persist the dedicated blob family kind
  * @param cfg the config to serialize
  * @param out out -- newly allocated blob on success, owned by the caller
  * @param out_len out -- length of the blob in bytes
  * @return 0 on success, -1 on a bad argument or allocation failure
  */
-int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out, size_t *out_len);
+int cf_config_serialize(const tidesdb_column_family_config_t* cfg, int is_blob, uint8_t** out,
+                        size_t* out_len);
 
 /**
  * cf_config_deserialize
@@ -92,10 +94,12 @@ int cf_config_serialize(const tidesdb_column_family_config_t *cfg, uint8_t **out
  * be installed from whatever the caller's memory held
  * @param data the blob bytes
  * @param len length of data in bytes
+ * @param is_blob receives the dedicated blob family kind, or NULL to ignore it
  * @param out the config to fill, zeroed by the caller; persisted fields only
  * @return 0 on success, -1 on a bad argument, a wrong version, a truncated blob, or a blob whose
  *         decoded values are ones the create path would itself have refused
  */
-int cf_config_deserialize(const uint8_t *data, size_t len, tidesdb_column_family_config_t *out);
+int cf_config_deserialize(const uint8_t* data, size_t len, tidesdb_column_family_config_t* out,
+                          int* is_blob);
 
 #endif /* __TIDESDB_CF_CONFIG_H__ */

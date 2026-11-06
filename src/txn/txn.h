@@ -230,6 +230,12 @@ int tdb_txn_get_notrack(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
                         const tidesdb_source_t *sources, int num_sources, uint8_t **value,
                         size_t *value_size);
 
+/* check the visible value by length before loading its bytes for an exact comparison.
+ * immutable creation distinguishes a conflicting live value from an absent key at this snapshot. */
+int tdb_txn_check_value(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources, const uint8_t *expected,
+                        size_t expected_size);
+
 /**
  * tdb_txn_record_scan
  * record the interval a scan covered into the conflict footprint, at the transaction's snapshot, so

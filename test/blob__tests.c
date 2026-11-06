@@ -1241,7 +1241,7 @@ void test_grouped_blob_range_matches_full_read(void)
 }
 
 /* verifying the whole framed block prevents a short read from accepting a damaged suffix, while
- * contains only resolves metadata and remains usable for a corrupt object's existence probe. */
+ * metadata-only operations remain usable without touching the corrupted payload. */
 void test_blob_range_rejects_corruption_outside_the_requested_slice(void)
 {
     const uint8_t key[] = "corrupt-range";
@@ -1262,8 +1262,14 @@ void test_blob_range_rejects_corruption_outside_the_requested_slice(void)
     tidesdb_txn_t* txn = NULL;
     uint8_t* got = NULL;
     size_t got_size = 0;
+    time_t ttl = 0;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
     ASSERT_EQ(tidesdb_txn_contains(txn, cf, key, sizeof(key) - 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_get_ttl(txn, cf, key, sizeof(key) - 1, &ttl), TDB_SUCCESS);
+    ASSERT_EQ(ttl, TDB_TTL_NONE);
+    const uint8_t different = 0;
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, &different, sizeof(different)),
+              TDB_ERR_CONFLICT);
     ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key) - 1, &got, &got_size), TDB_ERR_CORRUPTION);
     ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, sizeof(key) - 1, 0, 1, &got, &got_size),
               TDB_ERR_CORRUPTION);

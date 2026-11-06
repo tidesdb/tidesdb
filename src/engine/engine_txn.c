@@ -104,29 +104,22 @@ int engine_blob_put(tidesdb_t *db, cf_t *cf, const uint32_t group, const uint8_t
         int rc = engine_txn_begin(db, TDB_ISOLATION_SNAPSHOT, &txn);
         if (rc != TDB_SUCCESS) return rc;
 
-        uint8_t *stored = NULL;
-        size_t stored_size = 0;
-        rc = engine_txn_get_notrack(txn, cf, key, key_size, &stored, &stored_size);
+        rc = tdb_txn_check_value(txn->inner, (uint32_t)cf->cf_id, key, key_size, db->sources,
+                                 ENGINE_NUM_SOURCES, value, value_size);
+        if (rc != TDB_ERR_NOT_FOUND)
+        {
+            engine_txn_free(txn);
+            return rc;
+        }
+        rc = tdb_txn_put_borrowed(txn->inner, (uint32_t)cf->cf_id, key, key_size, value, value_size,
+                                  TDB_TTL_NONE);
         if (rc == TDB_SUCCESS)
         {
-            const int equal = stored_size == value_size &&
-                              (!value_size || memcmp(stored, value, value_size) == 0);
-            free(stored);
-            engine_txn_free(txn);
-            return equal ? TDB_SUCCESS : TDB_ERR_CONFLICT;
-        }
-        if (rc == TDB_ERR_NOT_FOUND)
-        {
-            rc = tdb_txn_put_borrowed(txn->inner, (uint32_t)cf->cf_id, key, key_size, value,
-                                      value_size, TDB_TTL_NONE);
-            if (rc == TDB_SUCCESS)
-            {
-                /* rotation and flush can release the old memtable's floor between append and
-                 * apply. hold a builder floor until the receiving memtable protects the id. */
-                const int token = vlog_build_enter(db->vlog);
-                rc = engine_commit_blob(txn, group);
-                vlog_build_leave(db->vlog, token);
-            }
+            /* rotation can release the old memtable between append and apply. keep the id
+             * protected until the receiving memtable has taken over its floor. */
+            const int token = vlog_build_enter(db->vlog);
+            rc = engine_commit_blob(txn, group);
+            vlog_build_leave(db->vlog, token);
         }
         engine_txn_free(txn);
         if (rc != TDB_ERR_CONFLICT) return rc;

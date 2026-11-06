@@ -443,6 +443,7 @@ typedef struct
 {
     uint8_t **value;
     size_t *value_size;
+    const size_t *expected_size;
     int64_t *ttl;
     const txn_value_range_t *range;
     int track;
@@ -461,8 +462,13 @@ static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, 
         tidesdb_source_result_t r =
             tidesdb_source_stack_get(sources, num_sources, cf_index, key, key_size, snapshot, &v);
 
-        if (r == TDB_SOURCE_FOUND && !v.deleted && (read->value || read->ttl))
+        if (r == TDB_SOURCE_FOUND && !v.deleted && read->value)
         {
+            if (read->expected_size && v.value_size != *read->expected_size)
+            {
+                free(v.value);
+                return TDB_ERR_CONFLICT;
+            }
             const int rc = txn_load_value(&v, read->range);
             if (rc == TDB_ERR_BUSY)
                 r = TDB_SOURCE_BUSY;
@@ -538,6 +544,7 @@ static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
                                          : (int64_t)time(NULL);
             if (own.ttl <= now) return TDB_ERR_NOT_FOUND;
         }
+        if (read->expected_size && own.value_size != *read->expected_size) return TDB_ERR_CONFLICT;
         if (read->value)
             return txn_copy_value(own.value, own.value_size, read->range, read->value,
                                   read->value_size);
@@ -582,6 +589,21 @@ int tdb_txn_get_ttl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_
     if (!ttl || key_size == 0) return TDB_ERR_INVALID_ARGS;
     const txn_read_request_t read = {.ttl = ttl, .track = 1};
     return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
+}
+
+int tdb_txn_check_value(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources, const uint8_t *expected,
+                        size_t expected_size)
+{
+    uint8_t *stored = NULL;
+    size_t size = 0;
+    const txn_read_request_t read = {
+        .value = &stored, .value_size = &size, .expected_size = &expected_size};
+    const int rc = txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
+    if (rc != TDB_SUCCESS) return rc;
+    const int equal = size == expected_size && (!size || memcmp(stored, expected, size) == 0);
+    free(stored);
+    return equal ? TDB_SUCCESS : TDB_ERR_CONFLICT;
 }
 
 int tdb_txn_record_scan(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,

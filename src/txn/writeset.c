@@ -44,13 +44,13 @@
 typedef struct
 {
     uint32_t cf_index;
+    uint8_t flags;
+    uint8_t borrows_value;
     uint8_t *buf;
     size_t key_size;
     size_t value_size;
     const uint8_t *borrowed_value;
     int64_t ttl;
-    uint8_t flags;
-    uint8_t borrows_value;
 } writeset_op;
 
 /**

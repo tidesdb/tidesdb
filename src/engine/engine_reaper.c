@@ -42,6 +42,25 @@
 #define ENGINE_IDLE_FLUSH_LABEL         "idle_flush"
 #define ENGINE_IDLE_FLUSH_US_PER_SECOND 1000000ull
 
+#define ENGINE_VLOG_SCRUB_LABEL       "vlog_scrub"
+#define ENGINE_VLOG_SCRUB_INTERVAL_US 1000000
+
+static void engine_vlog_scrub_tick(void* ctx)
+{
+    tidesdb_t* db = ctx;
+    if (atomic_load_explicit(&db->closing, memory_order_acquire)) return;
+    vlog_scrub_pass_t pass;
+    const int rc = vlog_scrub_pass(db->vlog, VLOG_SCRUB_PASS_BYTES, VLOG_SCRUB_PASS_READS, &pass);
+    if (rc == VLOG_ERR_CORRUPTION)
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "vlog scrub corruption in %s, segment %llu at offset %llu",
+                      db->db_path, (unsigned long long)pass.segment_number,
+                      (unsigned long long)pass.frame_offset);
+    else if (rc != VLOG_OK)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "vlog scrub failed in %s, segment %llu at offset %llu (rc %d)",
+                      db->db_path, (unsigned long long)pass.segment_number,
+                      (unsigned long long)pass.frame_offset, rc);
+}
+
 /* qsort comparator ordering sstables oldest-access-first, the eviction order fd_reaper_run expects
  */
 static int engine_sstable_lru_cmp(const void *a, const void *b)
@@ -192,7 +211,7 @@ static void engine_wake_fd_reaper(void *ctx)
     bg_ticker_wake((bg_ticker_t *)ctx);
 }
 
-int engine_reaper_init(tidesdb_t *db)
+int engine_reaper_init(tidesdb_t* db, int scrub_enabled)
 {
     /* seeded before the ticker starts so a transaction opened in the first second ages against a
      * real clock rather than against zero */
@@ -230,5 +249,8 @@ int engine_reaper_init(tidesdb_t *db)
         rc = engine_start_ticker(db, interval, engine_wal_sync_tick, ENGINE_WAL_SYNC_LABEL, NULL);
         if (rc != TDB_SUCCESS) return rc;
     }
+    if (scrub_enabled)
+        return engine_start_ticker(db, ENGINE_VLOG_SCRUB_INTERVAL_US, engine_vlog_scrub_tick,
+                                   ENGINE_VLOG_SCRUB_LABEL, NULL);
     return TDB_SUCCESS;
 }

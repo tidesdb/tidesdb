@@ -113,6 +113,9 @@ int tidesdb_open_with_options(const tidesdb_config_t *config, const tidesdb_open
         if (options->size >= offsetof(tidesdb_open_options_t, max_blob_shard_groups) +
                                  sizeof(options->max_blob_shard_groups))
             resolved_options.max_blob_shard_groups = options->max_blob_shard_groups;
+        if (options->size >= offsetof(tidesdb_open_options_t, blob_scrub_enabled) +
+                                 sizeof(options->blob_scrub_enabled))
+            resolved_options.blob_scrub_enabled = options->blob_scrub_enabled;
         if (options->size >= offsetof(tidesdb_open_options_t, max_vlog_segments) +
                                  sizeof(options->max_vlog_segments))
         {

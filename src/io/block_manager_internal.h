@@ -37,6 +37,30 @@
  * giant temporary allocation merely because a caller needs a small slice of it. */
 #define BM_RANGE_READ_SCRATCH_BYTES (64u * 1024u)
 
+/* the positive result marks a complete frame. failures share the block reader's error classes. */
+enum
+{
+    BM_FRAME_VERIFY_MORE = 0,
+    BM_FRAME_VERIFY_DONE = 1,
+    BM_FRAME_VERIFY_ERR_INVALID = BLOCK_MANAGER_READ_ERR_INVALID,
+    BM_FRAME_VERIFY_ERR_IO = BLOCK_MANAGER_READ_ERR_IO,
+    BM_FRAME_VERIFY_ERR_CORRUPTION = BLOCK_MANAGER_READ_ERR_CORRUPTION,
+    BM_FRAME_VERIFY_ERR_MEMORY = BLOCK_MANAGER_READ_ERR_MEMORY
+};
+
+/* a resumable payload checksum and frame parser; it carries no descriptor, so each step can use a
+ * newly borrowed read-only fd after a scrubber releases its previous slot pin. */
+typedef struct
+{
+    uint64_t offset;
+    uint64_t extent_limit;
+    uint32_t payload_size;
+    uint32_t expected_checksum;
+    uint32_t payload_read;
+    XXH3_state_t* checksum_state;
+    int complete;
+} bm_frame_verify_state_t;
+
 /* a block at or below this size is read without consulting the memory budget, covering every data
  * block and the common small footer block so the hot read path is just integer compares. blocks
  * larger than this (a multi-hundred-MB bloom filter on a huge bottom-level sstable) are rare and
@@ -240,8 +264,40 @@ void *bm_flush_thread(void *arg);
  * first make sure the bytes it means to sync have left the staging ring */
 int bm_wait_flushed(block_manager_t *bm, uint64_t need);
 
+/* as block_manager_cursor_resync_past_hole, optionally certifying an all-zero suffix when no
+ * later frame is found. a short or failed read cannot certify the suffix. */
+int bm_cursor_resync_past_hole(block_manager_cursor_t* cursor, int* out_zero_tail);
+
 /* cursor -- read one block at offset into the thread-local buffer, verifying its checksum */
 uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, uint32_t payload_hint,
                            uint32_t *out_size);
+
+/**
+ * bm_frame_verify_init
+ * prepare a resumable, read-only framed-block verifier against a captured logical extent;
+ * initialization intentionally performs no I/O or descriptor ownership
+ * @param state receives the verifier state
+ * @param checksum_state caller-owned XXH3 state that remains valid for every step
+ * @param offset frame header offset within extent_limit
+ * @param extent_limit immutable logical end of the sealed file being checked
+ * @return BM_FRAME_VERIFY_MORE when ready or BM_FRAME_VERIFY_ERR_INVALID for invalid arguments
+ */
+int bm_frame_verify_init(bm_frame_verify_state_t* state, XXH3_state_t* checksum_state,
+                         uint64_t offset, uint64_t extent_limit);
+
+/**
+ * bm_frame_verify_step
+ * verify as much of one frame as the exact byte and positioned-read budgets permit, retaining the
+ * incremental checksum state for a later call and validating header, payload, footer size and magic
+ * @param state initialized verifier whose offset and extent identify the frame
+ * @param fd a currently valid read-only descriptor for the verified file; it is not retained
+ * @param byte_budget maximum bytes requested from storage in this call
+ * @param read_budget maximum positioned reads attempted in this call
+ * @param bytes_used receives bytes requested from storage, including a failed read attempt
+ * @param reads_used receives positioned reads attempted, including a failed read attempt
+ * @return BM_FRAME_VERIFY_MORE, BM_FRAME_VERIFY_DONE, or an error class
+ */
+int bm_frame_verify_step(bm_frame_verify_state_t* state, int fd, size_t byte_budget,
+                         size_t read_budget, size_t* bytes_used, size_t* reads_used);
 
 #endif /* __BLOCK_MANAGER_INTERNAL_H__ */

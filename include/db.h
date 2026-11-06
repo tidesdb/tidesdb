@@ -403,6 +403,8 @@ typedef struct tidesdb_config_t
  * @param max_blob_shard_groups zero for ungrouped writes (default). a positive ceiling requires
  *                              each blob put to name a group below it. groups allocate on demand
  * @param reserved reserved ABI space, ignored. initialize to zero. future options follow this field
+ * @param blob_scrub_enabled nonzero to verify sealed value-log frames in the background and log
+ *                           corruption with its segment number and frame offset. defaults to zero
  */
 typedef struct tidesdb_open_options_t
 {
@@ -412,6 +414,7 @@ typedef struct tidesdb_open_options_t
     uint64_t max_blob_size;
     uint32_t max_blob_shard_groups;
     uint32_t reserved;
+    uint64_t blob_scrub_enabled;
 } tidesdb_open_options_t;
 
 /* ===== statistics ===== */

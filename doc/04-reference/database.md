@@ -124,6 +124,21 @@ database to new files requires this scan on the first indexed open.
 The index option defaults to zero. Ungrouped segments use the v10 value-log format in either mode.
 Earlier v10 binaries ignore the optional index files.
 
+Set `blob_scrub_enabled` to a nonzero value to check sealed value-log segments in the
+background. This covers ordinary separated values and grouped blobs, with or without
+`.vix` indexes. The worker runs one pass at startup and waits one second between passes.
+To choose a file, a pass examines at most 64 slots. It checks one segment and requests
+at most 256 KiB in at most 32 positioned reads. A large frame's checksum continues
+on the next pass. Each pass pins the segment during I/O and releases
+the pin before waiting. The default of zero starts no scrub worker and issues zero scrub reads.
+
+On corruption, the engine writes an `ERROR` line such as
+`vlog scrub corruption in ./store, segment 7 at offset 1048`. The offset is the byte
+position of the damaged frame's header. Look for the segment number in the database's
+`.vlog` filenames, including the grouped directory. The report goes to the process log
+sink (stderr by default, or `LOG` with file logging enabled). The scrubber leaves the
+file in place.
+
 Set `max_blob_size` to bound the number of bytes accepted by a single `tidesdb_blob_put`.
 Zero selects the largest object that fits one positioned write. The object shares the
 transfer with a 16-byte value header and 16 bytes of block framing. On macOS the maximum

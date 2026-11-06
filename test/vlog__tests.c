@@ -63,6 +63,9 @@ static int vlog_index_child_after_rename = 0;
 static _Atomic(int) vlog_append_hook_entered = 0;
 static _Atomic(int) vlog_append_hook_release = 0;
 static _Atomic(int) vlog_seal_started = 0;
+static _Atomic(int) vlog_scrub_pin_entered = 0;
+static _Atomic(int) vlog_scrub_pin_release = 0;
+static _Atomic(uint32_t) vlog_scrub_pinned_slot = VLOG_MAX_SEGMENTS;
 #endif
 
 /* a target small enough that a handful of values seals a segment, so tests exercise rolling and
@@ -73,6 +76,14 @@ static _Atomic(int) vlog_seal_started = 0;
 #define V_SMALL  100
 #define V_MEDIUM 1024
 #define V_LARGE  40000
+
+/* scrub passes are deliberately much smaller than the large fixture, making the test prove the
+ * verifier resumes rather than consuming a whole frame behind its caller's back. */
+#define V_SCRUB_PASS_BYTES   73u
+#define V_SCRUB_PASS_READS   1u
+#define V_SCRUB_FRAME_PHASES 3u
+#define V_SCRUB_PASS_BOUND(bytes) \
+    ((((size_t)(bytes) / V_SCRUB_PASS_BYTES) + 1u) * V_SCRUB_FRAME_PHASES)
 
 /* enough values to fill several segments at the test target */
 #define V_MANY 200
@@ -157,6 +168,30 @@ static vlog_t *open_store_at(const char *dir, tidesdb_compression_algorithm_t co
 static vlog_t *open_store(tidesdb_compression_algorithm_t comp, uint64_t target)
 {
     return open_store_at(VDIR, comp, target, 0);
+}
+
+static vlog_t* open_scrub_store(uint32_t groups)
+{
+    ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
+    const vlog_config_t cfg = {.encodings = &g_vlog_reg,
+                               .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                               .segment_target_bytes = V_SEG_TARGET,
+                               .enable_vlog_indexes = 1,
+                               .max_blob_shard_groups = groups,
+                               .blob_scrub_enabled = 1};
+    vlog_t* v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &cfg, &v), VLOG_OK);
+    ASSERT_TRUE(v != NULL);
+    return v;
+}
+
+static uint64_t scrub_segment_extent(vlog_t* v, uint32_t slot)
+{
+    uint64_t extent = 0;
+    ASSERT_EQ(vlog_segment_acquire(v, slot), 1);
+    ASSERT_EQ(vlog_segment_inspect(v, slot, &extent), VLOG_OK);
+    vlog_segment_release(v, slot);
+    return extent;
 }
 
 static vlog_t *open_index_store(const char *dir)
@@ -2025,6 +2060,261 @@ void test_read_detects_corruption(void)
     vlog_close(v);
 }
 
+/* the scrubber is opt-in even for callers using the internal store interface. a disabled handle
+ * must neither borrow a descriptor nor claim it read a byte, while enabled passes report the exact
+ * work they did and stay inside both caller-provided budgets. */
+void test_scrub_disabled_does_no_work_and_enabled_bounds_each_pass(void)
+{
+    fresh_dir();
+    vlog_t* disabled = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
+    uint8_t* value = pattern(V_MEDIUM, 401);
+    (void)put(disabled, value, V_MEDIUM);
+    ASSERT_EQ(vlog_segment_roll(disabled, atomic_load(&disabled->active_slot)), VLOG_OK);
+    vlog_scrub_pass_t pass = {0};
+    ASSERT_EQ(vlog_scrub_pass(disabled, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass), VLOG_OK);
+    ASSERT_EQ(pass.bytes_read, 0);
+    ASSERT_EQ(pass.reads, 0);
+    vlog_close(disabled);
+    (void)remove_directory(VDIR);
+
+    fresh_dir();
+    vlog_t* enabled = open_scrub_store(0);
+    (void)put(enabled, value, V_MEDIUM);
+    ASSERT_EQ(vlog_segment_roll(enabled, atomic_load(&enabled->active_slot)), VLOG_OK);
+    /* model a high-water mark left behind by retired slots. the first pass must yield before
+     * wrapping to the sealed file in slot zero. */
+    atomic_store(&enabled->seg_high, VLOG_SCRUB_SLOT_SCAN_MAX + 2u);
+    enabled->scrub->cursor = 1;
+    ASSERT_EQ(vlog_scrub_pass(enabled, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass), VLOG_OK);
+    ASSERT_EQ(enabled->scrub->cursor, 1u + VLOG_SCRUB_SLOT_SCAN_MAX);
+    ASSERT_EQ(pass.reads, 0);
+    uint64_t bytes = 0;
+    uint64_t reads = 0;
+    const uint32_t sealed_slot = 0;
+    const uint64_t sealed_extent = scrub_segment_extent(enabled, sealed_slot);
+    ASSERT_TRUE(sealed_extent > 0);
+    for (size_t round = 0; round < V_SCRUB_PASS_BOUND(sealed_extent); round++)
+    {
+        memset(&pass, 0, sizeof(pass));
+        ASSERT_EQ(vlog_scrub_pass(enabled, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass), VLOG_OK);
+        ASSERT_TRUE(pass.bytes_read <= V_SCRUB_PASS_BYTES);
+        ASSERT_TRUE(pass.reads <= V_SCRUB_PASS_READS);
+        bytes += pass.bytes_read;
+        reads += pass.reads;
+        if (pass.complete) break;
+    }
+    ASSERT_EQ(bytes, sealed_extent - BLOCK_MANAGER_HEADER_SIZE);
+    const size_t payload = VLOG_BLK_HDR_SIZE + V_MEDIUM;
+    ASSERT_EQ(reads, 2u + (payload + V_SCRUB_PASS_BYTES - 1u) / V_SCRUB_PASS_BYTES);
+    ASSERT_TRUE(pass.complete);
+    free(value);
+    vlog_close(enabled);
+}
+
+/* ordinary and grouped segments are independently sealed, and a large frame crosses many small
+ * passes. record their real index locations so a successful scrub proves it reached each physical
+ * placement rather than merely seeing an arbitrary clean frame. */
+void test_scrub_covers_large_ordinary_and_grouped_frames(void)
+{
+    fresh_dir();
+    vlog_t* v = open_scrub_store(2);
+    uint8_t* large_value = pattern(V_LARGE, 403);
+    uint8_t* ordinary_value = pattern(V_MEDIUM, 405);
+    uint8_t* grouped_value = pattern(V_MEDIUM, 407);
+    const vlog_id_t large_id = put(v, large_value, V_LARGE);
+    const vlog_index_fixture_t large = snapshot_entry(v, large_id);
+    ASSERT_EQ(vlog_segment_roll(v, atomic_load(&v->active_slot)), VLOG_OK);
+    const vlog_id_t ordinary_id = put(v, ordinary_value, V_MEDIUM);
+    const vlog_index_fixture_t ordinary = snapshot_entry(v, ordinary_id);
+    ASSERT_EQ(vlog_segment_roll(v, atomic_load(&v->active_slot)), VLOG_OK);
+    vlog_id_t grouped_id = VLOG_ID_INVALID;
+    ASSERT_EQ(vlog_write_group(v, 1, grouped_value, V_MEDIUM, &grouped_id, NULL), VLOG_OK);
+    const vlog_index_fixture_t grouped = snapshot_entry(v, grouped_id);
+    ASSERT_EQ(vlog_seal_idle_groups(v, 0, NULL), 1);
+
+    int large_seen = 0;
+    int ordinary_seen = 0;
+    int grouped_seen = 0;
+    const uint64_t total_extent = scrub_segment_extent(v, large.entry.segment) +
+                                  scrub_segment_extent(v, ordinary.entry.segment) +
+                                  scrub_segment_extent(v, grouped.entry.segment);
+    const size_t max_passes = V_SCRUB_PASS_BOUND(total_extent);
+    for (size_t round = 0; round < max_passes; round++)
+    {
+        vlog_scrub_pass_t pass = {0};
+        ASSERT_EQ(vlog_scrub_pass(v, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass), VLOG_OK);
+        ASSERT_TRUE(pass.bytes_read <= V_SCRUB_PASS_BYTES);
+        ASSERT_TRUE(pass.reads <= V_SCRUB_PASS_READS);
+        if (!pass.complete) continue;
+        if (pass.segment_number == v->segments[large.entry.segment].number &&
+            pass.frame_offset == large.entry.offset)
+            large_seen = 1;
+        if (pass.segment_number == v->segments[ordinary.entry.segment].number &&
+            pass.frame_offset == ordinary.entry.offset)
+            ordinary_seen = 1;
+        if (pass.segment_number == v->segments[grouped.entry.segment].number &&
+            pass.frame_offset == grouped.entry.offset && pass.group == 1)
+            grouped_seen = 1;
+        if (large_seen && ordinary_seen && grouped_seen) break;
+    }
+    ASSERT_TRUE(large_seen);
+    ASSERT_TRUE(ordinary_seen);
+    ASSERT_TRUE(grouped_seen);
+    free(large_value);
+    free(ordinary_value);
+    free(grouped_value);
+    vlog_close(v);
+}
+
+/* a sidecar can still be perfectly valid after the payload it indexes is damaged. the scrub result
+ * must name the frame the sidecar still names, so the engine can report an actionable segment and
+ * byte offset rather than a generic background failure. */
+void test_scrub_reports_the_exact_corrupt_indexed_frame(void)
+{
+    fresh_dir();
+    vlog_t* v = open_scrub_store(0);
+    uint8_t* clean = pattern(V_MEDIUM, 409);
+    uint8_t* damaged = pattern(V_MEDIUM, 411);
+    (void)put(v, clean, V_MEDIUM);
+    const vlog_id_t id = put(v, damaged, V_MEDIUM);
+    const vlog_index_fixture_t fixture = snapshot_entry(v, id);
+    const uint64_t number = v->segments[fixture.entry.segment].number;
+    ASSERT_EQ(vlog_segment_roll(v, fixture.entry.segment), VLOG_OK);
+    char name[VLOG_SEGMENT_NAME_MAX];
+    char path[VLOG_PATH_MAX];
+    ASSERT_EQ(vlog_segment_name(number, name, sizeof(name)), VLOG_OK);
+    ASSERT_TRUE(snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) > 0);
+    const uint64_t payload =
+        fixture.entry.offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + VLOG_BLK_HDR_SIZE;
+    vlog_close(v);
+
+    /* keep the published sidecar valid while changing the second frame's payload after a clean
+     * first frame. reopening must trust that index, leaving scrub as the reader that detects it. */
+    FILE* file = fopen(path, "r+b");
+    ASSERT_TRUE(file != NULL);
+    ASSERT_EQ(fseek(file, (long)payload, SEEK_SET), 0);
+    uint8_t corrupt = 0;
+    ASSERT_EQ(fread(&corrupt, sizeof(corrupt), 1, file), 1);
+    corrupt ^= UINT8_MAX;
+    ASSERT_EQ(fseek(file, (long)payload, SEEK_SET), 0);
+    ASSERT_EQ(fwrite(&corrupt, sizeof(corrupt), 1, file), 1);
+    ASSERT_EQ(fclose(file), 0);
+
+    v = open_scrub_store(0);
+    const vlog_index_fixture_t reopened = snapshot_entry(v, id);
+    ASSERT_EQ(v->segments[reopened.entry.segment].number, number);
+    ASSERT_EQ(reopened.entry.offset, fixture.entry.offset);
+
+    vlog_scrub_pass_t pass = {0};
+    int rc = VLOG_OK;
+    const uint64_t sealed_extent = scrub_segment_extent(v, reopened.entry.segment);
+    ASSERT_TRUE(sealed_extent > 0);
+    for (size_t round = 0; round < V_SCRUB_PASS_BOUND(sealed_extent); round++)
+    {
+        memset(&pass, 0, sizeof(pass));
+        rc = vlog_scrub_pass(v, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass);
+        ASSERT_TRUE(pass.bytes_read <= V_SCRUB_PASS_BYTES);
+        ASSERT_TRUE(pass.reads <= V_SCRUB_PASS_READS);
+        if (rc != VLOG_OK) break;
+    }
+    ASSERT_EQ(rc, VLOG_ERR_CORRUPTION);
+    ASSERT_EQ(pass.segment_number, number);
+    ASSERT_EQ(pass.frame_offset, fixture.entry.offset);
+    free(clean);
+    free(damaged);
+    vlog_close(v);
+}
+
+#ifdef TDB_FAULT_INJECTION
+typedef struct
+{
+    vlog_t* v;
+    int rc;
+} vlog_scrub_thread_t;
+
+static void vlog_scrub_pin_pause(vlog_t* v, uint32_t slot)
+{
+    (void)v;
+    atomic_store_explicit(&vlog_scrub_pinned_slot, slot, memory_order_release);
+    atomic_store_explicit(&vlog_scrub_pin_entered, 1, memory_order_release);
+    await_index_test_event(&vlog_scrub_pin_release);
+}
+
+static void* vlog_scrub_once(void* arg)
+{
+    vlog_scrub_thread_t* thread = arg;
+    vlog_scrub_pass_t pass = {0};
+    thread->rc = vlog_scrub_pass(thread->v, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass);
+    return NULL;
+}
+
+/* retirement has to observe the exact pin the scrubber took, not a synthetic refcount. after the
+ * verifier releases it, reclaim may retire the old file and the next roll must reuse that slot. */
+void test_scrub_pin_hands_a_retired_slot_back_for_reuse(void)
+{
+    fresh_dir();
+    vlog_t* v = open_scrub_store(0);
+    uint8_t* old_value = pattern(V_LARGE, 413);
+    (void)put(v, old_value, V_LARGE);
+    const uint32_t old_slot = atomic_load(&v->active_slot);
+    ASSERT_EQ(vlog_segment_roll(v, old_slot), VLOG_OK);
+    const uint32_t active_slot = atomic_load(&v->active_slot);
+    ASSERT_NE(old_slot, active_slot);
+
+    atomic_store(&vlog_scrub_pin_entered, 0);
+    atomic_store(&vlog_scrub_pin_release, 0);
+    atomic_store(&vlog_scrub_pinned_slot, VLOG_MAX_SEGMENTS);
+    vlog_test_set_scrub_pin_hook(vlog_scrub_pin_pause);
+    vlog_scrub_thread_t thread = {.v = v, .rc = VLOG_ERR_INVALID};
+    pthread_t worker;
+    ASSERT_EQ(pthread_create(&worker, NULL, vlog_scrub_once, &thread), 0);
+    await_index_test_event(&vlog_scrub_pin_entered);
+    ASSERT_EQ(atomic_load(&vlog_scrub_pinned_slot), old_slot);
+    vlog_stats_t held;
+    ASSERT_EQ(vlog_get_stats(v, &held), VLOG_OK);
+    ASSERT_EQ(vlog_reclaim(v), VLOG_OK);
+    vlog_stats_t blocked;
+    ASSERT_EQ(vlog_get_stats(v, &blocked), VLOG_OK);
+    ASSERT_EQ(blocked.segments_retired, held.segments_retired);
+
+    atomic_store(&vlog_scrub_pin_release, 1);
+    ASSERT_EQ(pthread_join(worker, NULL), 0);
+    vlog_test_set_scrub_pin_hook(NULL);
+    ASSERT_EQ(thread.rc, VLOG_OK);
+    const uint64_t stale_number = v->segments[old_slot].number;
+    ASSERT_EQ(vlog_reclaim(v), VLOG_OK);
+    vlog_stats_t released;
+    ASSERT_EQ(vlog_get_stats(v, &released), VLOG_OK);
+    ASSERT_TRUE(released.segments_retired > blocked.segments_retired);
+    ASSERT_EQ(vlog_segment_roll(v, active_slot), VLOG_OK);
+    ASSERT_EQ(atomic_load(&v->active_slot), old_slot);
+    const uint8_t replacement_value = 0x79;
+    const vlog_id_t replacement_id = put(v, &replacement_value, sizeof(replacement_value));
+    const vlog_index_fixture_t replacement = snapshot_entry(v, replacement_id);
+    const uint64_t replacement_number = v->segments[replacement.entry.segment].number;
+    ASSERT_EQ(replacement.entry.segment, old_slot);
+    ASSERT_NE(replacement_number, stale_number);
+    ASSERT_EQ(vlog_segment_roll(v, old_slot), VLOG_OK);
+    const uint64_t replacement_extent = scrub_segment_extent(v, old_slot);
+    int replacement_complete = 0;
+    for (size_t round = 0;
+         round < VLOG_SCRUB_SLOT_SCAN_MAX + V_SCRUB_PASS_BOUND(replacement_extent); round++)
+    {
+        vlog_scrub_pass_t pass = {0};
+        ASSERT_EQ(vlog_scrub_pass(v, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass), VLOG_OK);
+        if (pass.complete && pass.segment_number == replacement_number &&
+            pass.frame_offset == replacement.entry.offset)
+        {
+            replacement_complete = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(replacement_complete);
+    free(old_value);
+    vlog_close(v);
+}
+#endif
+
 /* a handle opened with no encoding registry, standing in for a build lacking the codecs a value was
  * written through, or for a caller that never configured any */
 static vlog_t *open_store_without_encodings(void)
@@ -2891,6 +3181,12 @@ int main(int argc, char **argv)
 #endif
     RUN_TEST(test_recover_torn_tail_ignored, tests_passed);
     RUN_TEST(test_read_detects_corruption, tests_passed);
+    RUN_TEST(test_scrub_disabled_does_no_work_and_enabled_bounds_each_pass, tests_passed);
+    RUN_TEST(test_scrub_covers_large_ordinary_and_grouped_frames, tests_passed);
+    RUN_TEST(test_scrub_reports_the_exact_corrupt_indexed_frame, tests_passed);
+#ifdef TDB_FAULT_INJECTION
+    RUN_TEST(test_scrub_pin_hands_a_retired_slot_back_for_reuse, tests_passed);
+#endif
     RUN_TEST(test_read_reports_corruption_when_the_chain_cannot_be_resolved, tests_passed);
     RUN_TEST(test_stats_report_reclaim_activity, tests_passed);
     RUN_TEST(test_stats_counters_are_per_handle, tests_passed);

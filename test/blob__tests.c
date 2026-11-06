@@ -19,6 +19,7 @@
 #include "../src/sstable/sstable.h"
 #include "../src/sstable/vlog_group_disk.h"
 #include "../src/sstable/vlog_internal.h"
+#include "../src/threadmanager/threadmanager.h"
 #include "../src/txn/wal_record.h"
 #include "test_utils.h"
 
@@ -49,10 +50,11 @@ static int tests_failed = 0;
 #define BLOB_PHASE_PRE_WAL    "pre-wal"
 #define BLOB_PHASE_POST_WAL   "post-wal"
 #define BLOB_CHILD_NTH        "0"
+#define BLOB_SCRUB_LOG_NAME    "LOG"
 
 _Static_assert(offsetof(tidesdb_open_options_t, reserved) + sizeof(uint32_t) ==
-                   sizeof(tidesdb_open_options_t),
-               "keep the size-tagged options prefix free of implicit tail padding");
+                   offsetof(tidesdb_open_options_t, blob_scrub_enabled),
+               "keep the old size-tagged options prefix free of implicit tail padding");
 
 static const char* blob_exe = NULL;
 
@@ -278,12 +280,33 @@ static void blob_corrupt_value_byte(tidesdb_t* db, vlog_id_t id, size_t value_of
     block_manager_t* bm =
         atomic_load_explicit(&vlog->segments[entry.segment].bm, memory_order_acquire);
     ASSERT_TRUE(bm != NULL);
-    const uint8_t corrupt = BLOB_CORRUPT_VALUE;
     const uint64_t payload = entry.offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + VLOG_BLK_HDR_SIZE;
     ASSERT_TRUE(payload <= INT64_MAX - value_offset);
+    uint8_t corrupt = 0;
+    ASSERT_EQ(block_manager_read_at_offset(bm, payload + value_offset, sizeof(corrupt), &corrupt),
+              0);
+    corrupt ^= BLOB_CORRUPT_VALUE;
     ASSERT_EQ(
         block_manager_write_at(bm, (int64_t)(payload + value_offset), &corrupt, sizeof(corrupt)),
         0);
+}
+
+static int blob_log_contains(const char* path, const char* needle)
+{
+    FILE* file = fopen(path, "rb");
+    if (file == NULL) return 0;
+    ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+    const long end = ftell(file);
+    ASSERT_TRUE(end >= 0);
+    ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+    char* contents = malloc((size_t)end + 1u);
+    ASSERT_TRUE(contents != NULL);
+    ASSERT_EQ(fread(contents, 1, (size_t)end, file), (size_t)end);
+    contents[end] = '\0';
+    const int found = strstr(contents, needle) != NULL;
+    free(contents);
+    ASSERT_EQ(fclose(file), 0);
+    return found;
 }
 
 /* run one process to the exact commit seam that surrounds WAL publication. the child exits without
@@ -958,6 +981,81 @@ void test_blob_range_rejects_corruption_outside_the_requested_slice(void)
     (void)remove_directory(dir);
 }
 
+/* the public flag starts a real ticker rather than merely changing the direct vlog API. a valid
+ * sidecar survives this post-seal payload flip, so the log's segment and frame offset prove the
+ * background verifier, not recovery, found the damaged second object. */
+void test_blob_scrub_ticker_reports_the_damaged_indexed_frame(void)
+{
+    const uint8_t clean_key[] = "scrub-clean";
+    const uint8_t damaged_key[] = "scrub-damaged";
+    uint8_t clean[BLOB_RANGE_VALUE_BYTES];
+    uint8_t damaged[BLOB_RANGE_VALUE_BYTES];
+    char dir[] = BLOB_DB_DIR;
+    char log_path[MAX_FILE_PATH_LENGTH];
+    char expected[2 * MAX_FILE_PATH_LENGTH];
+    (void)remove_directory(dir);
+    memset(clean, BLOB_RANGE_FILL, sizeof(clean));
+    memset(damaged, BLOB_GC_FILL, sizeof(damaged));
+
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    cfg.log_to_file = 1;
+    cfg.log_level = TDB_LOG_ERROR;
+    tidesdb_open_options_t options = {.size = sizeof(options), .enable_vlog_indexes = 1};
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* cf = blob_create_cf(db);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, clean_key, sizeof(clean_key) - 1, clean, sizeof(clean)),
+              TDB_SUCCESS);
+    blob_wal_probe_t probe = {0};
+    blob_install_wal_probe(db, &probe);
+    ASSERT_EQ(
+        tidesdb_blob_put(db, cf, damaged_key, sizeof(damaged_key) - 1, damaged, sizeof(damaged)),
+        TDB_SUCCESS);
+    blob_remove_wal_probe(db, &probe);
+    ASSERT_EQ(probe.decoded, 0);
+    const vlog_id_t damaged_id = probe.entry.vlog_id;
+    pthread_rwlock_rdlock(&db->vlog->index_rw);
+    const size_t bucket = vlog_index_locate(db->vlog, damaged_id, NULL);
+    ASSERT_TRUE(bucket != SIZE_MAX);
+    const vlog_index_entry_t entry = db->vlog->buckets[bucket];
+    pthread_rwlock_unlock(&db->vlog->index_rw);
+    const uint64_t segment = db->vlog->segments[entry.segment].number;
+    ASSERT_EQ(vlog_segment_roll(db->vlog, entry.segment), VLOG_OK);
+    blob_corrupt_value_byte(db, damaged_id, BLOB_CORRUPT_BYTE);
+    ASSERT_TRUE(snprintf(log_path, sizeof(log_path), "%s%s%s", dir, PATH_SEPARATOR,
+                         BLOB_SCRUB_LOG_NAME) > 0);
+    ASSERT_TRUE(snprintf(expected, sizeof(expected),
+                         "vlog scrub corruption in %s, segment %llu at offset %llu", dir,
+                         (unsigned long long)segment, (unsigned long long)entry.offset) > 0);
+
+    ASSERT_EQ(threadmanager_stop(db->threads, "vlog_scrub"), -1);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    options.blob_scrub_enabled = 1;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+#ifdef TDB_FAULT_INJECTION
+    ASSERT_EQ(db->vlog->recovery_index_hits, 1);
+    ASSERT_EQ(db->vlog->recovery_payload_bytes, 0);
+#endif
+    int reported = 0;
+    for (size_t round = 0; round < BLOB_RACE_WAIT_TICKS; round++)
+    {
+        threadmanager_wake(db->threads, "vlog_scrub");
+        usleep(BLOB_RACE_WAIT_US);
+        if (blob_log_contains(log_path, expected))
+        {
+            reported = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(reported);
+    uint8_t* got = NULL;
+    size_t length = 0;
+    ASSERT_EQ(vlog_read_range(db->vlog, damaged_id, 0, 1, &got, &length), VLOG_ERR_CORRUPTION);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
 /* the range API is a visible-KV operation: inline values, a transaction's pending replacement,
  * and its pending tombstone must agree with get and contains before a media segment is involved. */
 void test_range_read_obeys_inline_overlay_and_tombstone_visibility(void)
@@ -1103,6 +1201,7 @@ int main(int argc, char** argv)
     RUN_TEST(test_blob_range_matches_full_read_before_and_after_flush, tests_passed);
     RUN_TEST(test_grouped_blob_range_matches_full_read, tests_passed);
     RUN_TEST(test_blob_range_rejects_corruption_outside_the_requested_slice, tests_passed);
+    RUN_TEST(test_blob_scrub_ticker_reports_the_damaged_indexed_frame, tests_passed);
     RUN_TEST(test_range_read_obeys_inline_overlay_and_tombstone_visibility, tests_passed);
     RUN_TEST(test_blob_delete_snapshot_visibility_and_reclaim_after_release, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

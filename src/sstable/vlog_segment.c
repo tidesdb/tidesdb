@@ -213,13 +213,17 @@ static int vlog_segment_install(vlog_t* v, uint32_t slot, uint64_t number, uint3
     v->segments[slot].number = number;
     v->segments[slot].group = group;
     if (v->max_blob_shard_groups) vlog_group_set_epoch(v, slot, UINT64_MAX);
-    atomic_store_explicit(&v->segments[slot].rc, VLOG_SEG_BASELINE, memory_order_relaxed);
-
     /* a retired segment leaves its liveness behind in the slot, and slots are reused, so the fresh
      * segment starts from nothing rather than inheriting what its predecessor was holding */
     atomic_store_explicit(&v->segments[slot].live_bytes, 0, memory_order_relaxed);
     atomic_store_explicit(&v->segments[slot].live_count, 0, memory_order_relaxed);
     atomic_store_explicit(&v->segments[slot].draining, 0, memory_order_relaxed);
+    if (v->scrub) atomic_store_explicit(&v->scrub->sealed_extents[slot], 0, memory_order_relaxed);
+
+    /* a ref acquired after observing an old OPEN can wait through retirement and win this new
+     * baseline before it sees the new OPEN. release-publishing the baseline last gives that
+     * acquire the complete new generation, including its reset scrub extent. */
+    atomic_store_explicit(&v->segments[slot].rc, VLOG_SEG_BASELINE, memory_order_release);
 
     /* published last and with release ordering, so a thread that observes the slot open also
      * observes the block manager and number stored above it */
@@ -398,13 +402,16 @@ int vlog_segment_retire(vlog_t *v, uint32_t slot)
  * closes the builder protection interval for every route through the value log. */
 static void vlog_seal_writer(vlog_t* v, uint32_t slot, vlog_pending_t* writer)
 {
-    if (v->enable_vlog_indexes)
+    if (v->enable_vlog_indexes || v->scrub)
     {
         block_manager_t* bm = vlog_segment_ensure_open(v, slot);
         uint64_t extent = 0;
         if (!bm || block_manager_get_size(bm, &extent) != 0 || block_manager_last_errno(bm) != 0)
             writer->incomplete = 1;
-        vlog_publish_pending(v, slot, writer, extent, VLOG_SIDECAR_SEALED);
+        else if (v->scrub)
+            atomic_store_explicit(&v->scrub->sealed_extents[slot], extent, memory_order_release);
+        if (v->enable_vlog_indexes)
+            vlog_publish_pending(v, slot, writer, extent, VLOG_SIDECAR_SEALED);
     }
     if (v->max_blob_shard_groups) vlog_group_seal_epoch(v, slot);
 }
@@ -428,8 +435,7 @@ static int vlog_roll_locked(vlog_t *v, uint32_t full_slot)
 int vlog_segment_roll(vlog_t *v, uint32_t full_slot)
 {
     if (!v) return VLOG_ERR_INVALID;
-    const int admit = v->enable_vlog_indexes || v->max_blob_shard_groups;
-    if (admit)
+    if (v->use_seal_lock)
     {
         pthread_rwlock_wrlock(&v->seal_rw);
         if (full_slot != atomic_load_explicit(&v->active_slot, memory_order_acquire))
@@ -446,7 +452,7 @@ int vlog_segment_roll(vlog_t *v, uint32_t full_slot)
     pthread_mutex_lock(&v->roll_mu);
     const int rc = vlog_roll_locked(v, full_slot);
     pthread_mutex_unlock(&v->roll_mu);
-    if (admit)
+    if (v->use_seal_lock)
     {
         vlog_segment_release(v, full_slot);
         pthread_rwlock_unlock(&v->seal_rw);
@@ -512,10 +518,9 @@ int vlog_segment_append(vlog_t *v, const struct iovec *spans, int count,
                         vlog_sidecar_entry_t *entry)
 {
     if (!v || !spans || count <= 0 || !entry) return VLOG_ERR_INVALID;
-    const int admit = v->enable_vlog_indexes || v->max_blob_shard_groups;
     for (int attempt = 0; attempt < VLOG_APPEND_MAX_ATTEMPTS; attempt++)
     {
-        if (admit) pthread_rwlock_rdlock(&v->seal_rw);
+        if (v->use_seal_lock) pthread_rwlock_rdlock(&v->seal_rw);
         const uint32_t slot = atomic_load_explicit(&v->active_slot, memory_order_acquire);
         int rc = VLOG_ERR_BUSY;
         if (vlog_segment_acquire(v, slot))
@@ -523,7 +528,7 @@ int vlog_segment_append(vlog_t *v, const struct iovec *spans, int count,
             rc = vlog_append_to_slot(v, slot, &v->writer, spans, count, entry);
             vlog_segment_release(v, slot);
         }
-        if (admit)
+        if (v->use_seal_lock)
         {
             const int due = v->enable_vlog_indexes && rc == VLOG_OK &&
                             entry->offset + entry->disk_len >= v->writer.checkpoint_at;
@@ -717,6 +722,29 @@ int vlog_segment_inspect(vlog_t *v, uint32_t slot, uint64_t *size)
     if (!size && block_manager_last_errno(atomic_load_explicit(&segment->bm, memory_order_acquire)))
         return VLOG_ERR_IO;
     return rc == 0 ? VLOG_OK : VLOG_ERR_IO;
+}
+
+int vlog_segment_scrub_fd(vlog_t* v, uint32_t slot, int* out_fd, int* out_owned)
+{
+    if (!v || !out_fd || !out_owned || slot >= v->max_segments) return VLOG_ERR_INVALID;
+    block_manager_t* bm = atomic_load_explicit(&v->segments[slot].bm, memory_order_acquire);
+    if (bm)
+    {
+        *out_fd = bm->fd;
+        *out_owned = 0;
+        return VLOG_OK;
+    }
+
+    char path[VLOG_PATH_MAX];
+    if (vlog_segment_path(v, v->segments[slot].number, v->segments[slot].group, path,
+                          sizeof(path)) != VLOG_OK)
+        return VLOG_ERR_INVALID;
+    const int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) return VLOG_ERR_IO;
+    fd_manager_note_open(v->fdm, FD_LABEL_VLOG_SEGMENT);
+    *out_fd = fd;
+    *out_owned = 1;
+    return VLOG_OK;
 }
 
 int vlog_segment_evict(vlog_t *v, uint32_t slot)

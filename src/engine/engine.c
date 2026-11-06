@@ -504,6 +504,7 @@ static int engine_open_stores(tidesdb_t *db, const tidesdb_open_options_t *optio
                               .sync_mode = engine_durable_sync_mode(db->config.memtable_sync_mode),
                               .segment_target_bytes = db->config.vlog_segment_size,
                               .enable_vlog_indexes = options->enable_vlog_indexes != 0,
+                              .blob_scrub_enabled = options->blob_scrub_enabled != 0,
                               .max_segments = (uint32_t)options->max_vlog_segments,
                               .max_blob_shard_groups = options->max_blob_shard_groups,
                               .fdm = db->fdm_inited ? &db->fdm : NULL};
@@ -689,7 +690,7 @@ int engine_open(const tidesdb_config_t *config, const tidesdb_open_options_t *op
     if (rc == TDB_SUCCESS) rc = engine_open_txn(db);
     if (rc == TDB_SUCCESS) rc = engine_open_threads(db);
     if (rc == TDB_SUCCESS) rc = engine_compaction_init(db);
-    if (rc == TDB_SUCCESS) rc = engine_reaper_init(db);
+    if (rc == TDB_SUCCESS) rc = engine_reaper_init(db, options->blob_scrub_enabled != 0);
     if (rc != TDB_SUCCESS)
     {
         engine_close(db);

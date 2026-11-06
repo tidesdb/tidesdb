@@ -5225,6 +5225,27 @@ void test_engine_open_options_enable_vlog_indexes_for_ordinary_kv(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* the old reserved word and an incomplete new field must both leave scrubbing disabled */
+static void test_engine_open_options_scrub_requires_complete_field(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    tidesdb_config_t cfg = engine_test_config(ENGINE_TEST_DB_DIR);
+    tidesdb_open_options_t options = {
+        .max_vlog_segments = 8, .reserved = UINT32_MAX, .blob_scrub_enabled = UINT64_MAX};
+    const size_t end =
+        offsetof(tidesdb_open_options_t, blob_scrub_enabled) + sizeof(options.blob_scrub_enabled);
+    for (size_t size = offsetof(tidesdb_open_options_t, blob_scrub_enabled); size < end; size++)
+    {
+        options.size = size;
+        tidesdb_t* db = NULL;
+        ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+        ASSERT_EQ(vlog_max_segments(db->vlog), options.max_vlog_segments);
+        ASSERT_EQ(threadmanager_stop(db->threads, "vlog_scrub"), -1);
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 /* a newer options tail is ignored for an older size-tagged caller, while a supplied value past the
  * public maximum is refused before opening or modifying the database. */
 void test_engine_open_options_vlog_capacity_preserves_prefix_abi_and_rejects_overflow(void)
@@ -8070,6 +8091,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_clone_column_family, tests_passed);
     RUN_TEST(test_engine_vlog_segment_size_is_honoured, tests_passed);
     RUN_TEST(test_engine_open_options_enable_vlog_indexes_for_ordinary_kv, tests_passed);
+    RUN_TEST(test_engine_open_options_scrub_requires_complete_field, tests_passed);
     RUN_TEST(test_engine_open_options_vlog_capacity_preserves_prefix_abi_and_rejects_overflow,
              tests_passed);
     RUN_TEST(test_engine_value_separation_is_db_level_with_a_family_opt_out, tests_passed);

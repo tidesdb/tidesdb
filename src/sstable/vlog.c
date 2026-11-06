@@ -267,18 +267,21 @@ static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, const uint8_t 
  * @param start first byte not already recovered from a valid sidecar
  * @param fsize recovery extent at open
  * @param out_max_id raised to the highest id seen
+ * @param out_scrub_extent receives the end up to which recovery expects frames
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_MEMORY
  */
-static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint64_t start,
-                             uint64_t fsize, uint64_t *out_max_id)
+static int vlog_scan_segment(vlog_t* v, uint32_t slot, block_manager_t* bm, uint64_t start,
+                             uint64_t fsize, uint64_t* out_max_id, uint64_t* out_scrub_extent)
 {
-    if (!v || !bm || !out_max_id || start < BLOCK_MANAGER_HEADER_SIZE || start > fsize)
+    if (!v || !bm || !out_max_id || !out_scrub_extent || start < BLOCK_MANAGER_HEADER_SIZE ||
+        start > fsize)
         return VLOG_ERR_INVALID;
     block_manager_cursor_t cur;
     if (block_manager_cursor_init_stack(&cur, bm) != 0) return VLOG_ERR_IO;
     if (block_manager_cursor_goto(&cur, start) != 0) return VLOG_ERR_IO;
 
     int rc = VLOG_OK;
+    *out_scrub_extent = fsize;
     while (cur.current_pos < fsize)
     {
         const uint64_t offset = cur.current_pos;
@@ -288,7 +291,13 @@ static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint
             /* salvage later frames as usual, but keep the last valid prefix if the physical
              * extent includes an unfinished reservation or a preallocated tail. */
             v->writer.incomplete = 1;
-            if (block_manager_cursor_resync_past_hole(&cur) == 0) continue;
+            int zero_tail = 0;
+            if (bm_cursor_resync_past_hole(&cur, v->scrub ? &zero_tail : NULL) == 0) continue;
+            if (zero_tail)
+            {
+                *out_scrub_extent = offset;
+                break;
+            }
             if (block_manager_cursor_skip_corrupt(&cur) == 0) continue;
             break;
         }
@@ -341,6 +350,9 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *max_id)
         if (rc != VLOG_OK || indexed_extent == extent)
         {
             free(entries);
+            if (v->scrub && rc == VLOG_OK)
+                atomic_store_explicit(&v->scrub->sealed_extents[slot], extent,
+                                      memory_order_release);
             return rc;
         }
 
@@ -355,9 +367,12 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *max_id)
         start = indexed_extent;
     }
 
-    const int rc = vlog_scan_segment(v, slot, bm, start, extent, max_id);
+    uint64_t valid_extent = start;
+    const int rc = vlog_scan_segment(v, slot, bm, start, extent, max_id, &valid_extent);
     if (v->enable_vlog_indexes && rc == VLOG_OK)
         vlog_publish_pending(v, slot, &v->writer, extent, VLOG_SIDECAR_SEALED);
+    if (v->scrub && rc == VLOG_OK)
+        atomic_store_explicit(&v->scrub->sealed_extents[slot], valid_extent, memory_order_release);
     return rc;
 }
 
@@ -427,6 +442,8 @@ int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog
 
     v->max_segments = capacity;
     v->max_blob_shard_groups = config->max_blob_shard_groups;
+    v->use_seal_lock =
+        config->enable_vlog_indexes || config->max_blob_shard_groups || config->blob_scrub_enabled;
     memcpy(v->dir, dir, strlen(dir) + 1);
     v->enable_vlog_indexes = config->enable_vlog_indexes;
     v->writer.checkpoint_at = BLOCK_MANAGER_HEADER_SIZE + VLOG_CHECKPOINT_INTERVAL_BYTES;
@@ -442,22 +459,23 @@ int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog
     atomic_init(&v->next_number, 0);
     atomic_init(&v->active_slot, capacity); /* every adopted file is eligible for eviction */
     atomic_init(&v->seg_high, 0);
-    if ((v->enable_vlog_indexes || v->max_blob_shard_groups) &&
-        pthread_rwlock_init(&v->seal_rw, NULL) != 0)
+    if (v->use_seal_lock && pthread_rwlock_init(&v->seal_rw, NULL) != 0)
     {
         free(v);
         return VLOG_ERR_IO;
     }
     pthread_mutex_init(&v->roll_mu, NULL);
     pthread_rwlock_init(&v->index_rw, NULL);
+    if (config->blob_scrub_enabled)
+    {
+        v->scrub = calloc(1, sizeof(*v->scrub) + (size_t)capacity * sizeof(_Atomic(uint64_t)));
+        if (v->scrub) v->scrub->checksum = XXH3_createState();
+    }
     v->bucket_cap = VLOG_INDEX_INITIAL_CAP;
     v->buckets = calloc(v->bucket_cap, sizeof(*v->buckets));
-    if (!v->buckets)
+    if (!v->buckets || (config->blob_scrub_enabled && (!v->scrub || !v->scrub->checksum)))
     {
-        if (v->enable_vlog_indexes || v->max_blob_shard_groups) pthread_rwlock_destroy(&v->seal_rw);
-        pthread_mutex_destroy(&v->roll_mu);
-        pthread_rwlock_destroy(&v->index_rw);
-        free(v);
+        vlog_close(v);
         return VLOG_ERR_MEMORY;
     }
 
@@ -518,7 +536,12 @@ void vlog_close(vlog_t *v)
     }
     pthread_mutex_destroy(&v->roll_mu);
     pthread_rwlock_destroy(&v->index_rw);
-    if (v->enable_vlog_indexes || v->max_blob_shard_groups) pthread_rwlock_destroy(&v->seal_rw);
+    if (v->use_seal_lock) pthread_rwlock_destroy(&v->seal_rw);
+    if (v->scrub)
+    {
+        (void)XXH3_freeState(v->scrub->checksum); /* the hash destructor always succeeds */
+        free(v->scrub);
+    }
     free(v->writer.entries);
     free(v->buckets);
     free(v);

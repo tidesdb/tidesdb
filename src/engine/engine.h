@@ -834,12 +834,12 @@ int engine_backup(tidesdb_t *db, const char *dir);
 
 /**
  * engine_reaper_init
- * start the reaper bg_tickers and register them on the threadmanager -- the fd-eviction reaper that
- * closes idle klog descriptors down to the fd budget
+ * start the engine maintenance tickers and register them on the threadmanager
  * @param db the engine
+ * @param scrub_enabled nonzero to schedule verification of sealed value-log segments
  * @return TDB_SUCCESS or TDB_ERR_MEMORY
  */
-int engine_reaper_init(tidesdb_t *db);
+int engine_reaper_init(tidesdb_t* db, int scrub_enabled);
 
 /* ===== range iteration (src/engine/engine_iter.c) ===== */
 

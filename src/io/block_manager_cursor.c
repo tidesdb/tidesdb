@@ -27,6 +27,111 @@ static ssize_t bm_read_size_field(int fd, uint64_t pos, uint32_t *out)
     return n;
 }
 
+/* a short read inside the captured extent means a truncated frame. foreground reads have
+ * historically returned an I/O error for a short read, so each caller chooses that outcome. */
+static int bm_frame_read(int fd, uint64_t offset, uint8_t* buf, size_t count, int short_read)
+{
+    const ssize_t n = pread(fd, buf, count, (off_t)offset);
+    if (n < 0) return BLOCK_MANAGER_READ_ERR_IO;
+    return n == (ssize_t)count ? BLOCK_MANAGER_READ_OK : short_read;
+}
+
+static int bm_frame_read_header(bm_frame_verify_state_t* frame, int fd, int short_read)
+{
+    uint8_t header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
+    const int rc = bm_frame_read(fd, frame->offset, header, sizeof(header), short_read);
+    if (rc != BLOCK_MANAGER_READ_OK) return rc;
+    frame->payload_size = decode_uint32_le_compat(header);
+    frame->expected_checksum = decode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE);
+    if (!frame->payload_size ||
+        block_manager_framed_size(frame->payload_size) > frame->extent_limit - frame->offset)
+        return BLOCK_MANAGER_READ_ERR_CORRUPTION;
+    return XXH3_64bits_reset(frame->checksum_state) == XXH_OK ? BLOCK_MANAGER_READ_OK
+                                                              : BLOCK_MANAGER_READ_ERR_IO;
+}
+
+/* both range reads and scrubs authenticate the exact bytes already in scratch */
+static int bm_frame_read_payload(bm_frame_verify_state_t* frame, int fd, uint8_t* scratch,
+                                 size_t count, int short_read)
+{
+    const uint64_t pos = frame->offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + frame->payload_read;
+    const int rc = bm_frame_read(fd, pos, scratch, count, short_read);
+    if (rc != BLOCK_MANAGER_READ_OK) return rc;
+    if (XXH3_64bits_update(frame->checksum_state, scratch, count) != XXH_OK)
+        return BLOCK_MANAGER_READ_ERR_IO;
+    frame->payload_read += (uint32_t)count;
+    if (frame->payload_read == frame->payload_size &&
+        (uint32_t)XXH3_64bits_digest(frame->checksum_state) != frame->expected_checksum)
+        return BLOCK_MANAGER_READ_ERR_CORRUPTION;
+    return BLOCK_MANAGER_READ_OK;
+}
+
+static int bm_frame_read_footer(bm_frame_verify_state_t* frame, int fd)
+{
+    uint8_t footer[BLOCK_MANAGER_FOOTER_SIZE];
+    const uint64_t pos = frame->offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + frame->payload_size;
+    const int rc =
+        bm_frame_read(fd, pos, footer, sizeof(footer), BLOCK_MANAGER_READ_ERR_CORRUPTION);
+    if (rc != BLOCK_MANAGER_READ_OK) return rc;
+    if (decode_uint32_le_compat(footer) != frame->payload_size ||
+        decode_uint32_le_compat(footer + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET) !=
+            BLOCK_MANAGER_FOOTER_MAGIC)
+        return BLOCK_MANAGER_READ_ERR_CORRUPTION;
+    frame->complete = 1;
+    return BLOCK_MANAGER_READ_OK;
+}
+
+int bm_frame_verify_init(bm_frame_verify_state_t* state, XXH3_state_t* checksum_state,
+                         uint64_t offset, uint64_t extent_limit)
+{
+    if (!state || !checksum_state || offset > extent_limit) return BM_FRAME_VERIFY_ERR_INVALID;
+    *state = (bm_frame_verify_state_t){
+        .offset = offset, .extent_limit = extent_limit, .checksum_state = checksum_state};
+    return BM_FRAME_VERIFY_MORE;
+}
+
+int bm_frame_verify_step(bm_frame_verify_state_t* state, int fd, size_t byte_budget,
+                         size_t read_budget, size_t* bytes_used, size_t* reads_used)
+{
+    if (!state || !state->checksum_state || fd < 0 || !bytes_used || !reads_used)
+        return BM_FRAME_VERIFY_ERR_INVALID;
+    *bytes_used = 0;
+    *reads_used = 0;
+    while (!state->complete && *reads_used < read_budget && *bytes_used < byte_budget)
+    {
+        const size_t available = byte_budget - *bytes_used;
+        size_t count;
+        int rc;
+        if (!state->payload_size)
+        {
+            count = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+            if (state->extent_limit - state->offset < count) return BM_FRAME_VERIFY_ERR_CORRUPTION;
+            if (available < count) break;
+            rc = bm_frame_read_header(state, fd, BLOCK_MANAGER_READ_ERR_CORRUPTION);
+        }
+        else if (state->payload_read < state->payload_size)
+        {
+            count = state->payload_size - state->payload_read;
+            if (count > BM_RANGE_READ_SCRATCH_BYTES) count = BM_RANGE_READ_SCRATCH_BYTES;
+            if (count > available) count = available;
+            uint8_t* scratch = bm_get_read_buf(count);
+            if (!scratch) return BM_FRAME_VERIFY_ERR_MEMORY;
+            rc =
+                bm_frame_read_payload(state, fd, scratch, count, BLOCK_MANAGER_READ_ERR_CORRUPTION);
+        }
+        else
+        {
+            count = BLOCK_MANAGER_FOOTER_SIZE;
+            if (available < count) break;
+            rc = bm_frame_read_footer(state, fd);
+        }
+        *bytes_used += count;
+        ++*reads_used;
+        if (rc != BLOCK_MANAGER_READ_OK) return rc;
+    }
+    return state->complete ? BM_FRAME_VERIFY_DONE : BM_FRAME_VERIFY_MORE;
+}
+
 int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manager_t *bm)
 {
     if (!cursor || !bm) return -1;
@@ -269,21 +374,28 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     return block;
 }
 
-int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
+int bm_cursor_resync_past_hole(block_manager_cursor_t* cursor, int* out_zero_tail)
 {
+    if (out_zero_tail) *out_zero_tail = 0;
     if (!cursor) return -1;
 
     /* a reservation hole reads back as a zero size field. a nonzero size is either a real block or
      * genuine corruption block_manager_cursor_skip_corrupt already stopped on, so leave it alone.
      */
-    uint32_t hole_size;
-    if (bm_read_size_field(cursor->bm->fd, cursor->current_pos, &hole_size) !=
-        BLOCK_MANAGER_SIZE_FIELD_SIZE)
-        return -1;
-    if (hole_size != 0) return -1;
-
     const uint64_t extent =
         atomic_load_explicit(&cursor->bm->current_file_size, memory_order_acquire);
+    if (cursor->current_pos >= extent) return -1;
+    uint8_t head[BLOCK_MANAGER_SIZE_FIELD_SIZE] = {0};
+    const uint64_t remaining = extent - cursor->current_pos;
+    const size_t want_head = remaining < sizeof(head) ? (size_t)remaining : sizeof(head);
+    if (pread(cursor->bm->fd, head, want_head, (off_t)cursor->current_pos) != (ssize_t)want_head ||
+        decode_uint32_le_compat(head) != 0)
+        return -1;
+    if (want_head < sizeof(head))
+    {
+        if (out_zero_tail) *out_zero_tail = 1;
+        return -1;
+    }
 
     unsigned char magic[BLOCK_MANAGER_FOOTER_MAGIC_SIZE];
     encode_uint32_le_compat(magic, BLOCK_MANAGER_FOOTER_MAGIC);
@@ -302,13 +414,27 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
      * every candidate is validated by re-reading the framed block, so a magic-shaped byte run in a
      * value cannot fool the resync, and a zero region holds no magic and resolves to end of data.
      */
+    /* a scrub-enabled recovery uses the bytes this search already reads to distinguish unused
+     * preallocation from a malformed tail. only a complete scan can certify a zero suffix. */
+    int all_zero = out_zero_tail != NULL;
     uint64_t pos = cursor->current_pos;
-    while (pos + BLOCK_MANAGER_FOOTER_SIZE <= extent)
+    while (extent - pos >= BLOCK_MANAGER_FOOTER_SIZE || (all_zero && pos < extent))
     {
         size_t want = BM_RESYNC_CHUNK;
         if ((uint64_t)want > extent - pos) want = (size_t)(extent - pos);
 
         const ssize_t got = pread(cursor->bm->fd, buf, want, (off_t)pos);
+        if (got <= 0) break;
+        if (all_zero)
+        {
+            static const unsigned char zeros[BM_RESYNC_CHUNK] = {0};
+            all_zero = memcmp(buf, zeros, (size_t)got) == 0;
+            if (all_zero && (uint64_t)got == extent - pos)
+            {
+                *out_zero_tail = 1;
+                break;
+            }
+        }
         if (got < (ssize_t)BLOCK_MANAGER_FOOTER_MAGIC_SIZE) break;
 
         for (ssize_t i = 0; i + (ssize_t)BLOCK_MANAGER_FOOTER_MAGIC_SIZE <= got; i++)
@@ -350,6 +476,11 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
     }
 
     return -1;
+}
+
+int block_manager_cursor_resync_past_hole(block_manager_cursor_t* cursor)
+{
+    return bm_cursor_resync_past_hole(cursor, NULL);
 }
 
 block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
@@ -647,38 +778,29 @@ int block_manager_read_verified_block_slices(block_manager_t* bm, const uint64_t
         return BLOCK_MANAGER_READ_ERR_INVALID;
 
     const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
-    if (offset > extent || extent - offset < BLOCK_MANAGER_BLOCK_HEADER_SIZE)
+    XXH3_state_t checksum;
+    bm_frame_verify_state_t frame;
+    if (bm_frame_verify_init(&frame, &checksum, offset, extent) != BM_FRAME_VERIFY_MORE ||
+        extent - offset < BLOCK_MANAGER_BLOCK_HEADER_SIZE)
         return BLOCK_MANAGER_READ_ERR_CORRUPTION;
-
-    uint8_t header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    if (pread(bm->fd, header, sizeof(header), (off_t)offset) != (ssize_t)sizeof(header))
-        return BLOCK_MANAGER_READ_ERR_IO;
-
-    const uint32_t size = decode_uint32_le_compat(header);
-    const uint32_t checksum = decode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE);
-    const uint64_t frame_size =
-        BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)size + BLOCK_MANAGER_FOOTER_SIZE;
-    if (size == 0 || frame_size > extent - offset || prefix_size > size || slice_offset > size ||
-        slice_size > size - slice_offset)
+    int rc = bm_frame_read_header(&frame, bm->fd, BLOCK_MANAGER_READ_ERR_IO);
+    if (rc != BLOCK_MANAGER_READ_OK) return rc;
+    const uint32_t size = frame.payload_size;
+    if (prefix_size > size || slice_offset > size || slice_size > size - slice_offset)
         return BLOCK_MANAGER_READ_ERR_CORRUPTION;
-
-    XXH3_state_t state;
-    if (XXH3_64bits_reset(&state) != XXH_OK) return BLOCK_MANAGER_READ_ERR_IO;
 
     uint8_t* scratch = bm_get_read_buf(BM_RANGE_READ_SCRATCH_BYTES);
     if (!scratch) return BLOCK_MANAGER_READ_ERR_MEMORY;
-    uint32_t read_at = 0;
-    while (read_at < size)
+    while (frame.payload_read < size)
     {
+        const uint32_t read_at = frame.payload_read;
         const uint32_t remaining = size - read_at;
         const uint32_t count =
             remaining < BM_RANGE_READ_SCRATCH_BYTES ? remaining : BM_RANGE_READ_SCRATCH_BYTES;
-        const off_t file_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + read_at;
-        if (pread(bm->fd, scratch, count, file_offset) != (ssize_t)count ||
-            XXH3_64bits_update(&state, scratch, count) != XXH_OK)
-            return BLOCK_MANAGER_READ_ERR_IO;
+        rc = bm_frame_read_payload(&frame, bm->fd, scratch, count, BLOCK_MANAGER_READ_ERR_IO);
+        if (rc != BLOCK_MANAGER_READ_OK) return rc;
 
-        const uint32_t chunk_end = read_at + count;
+        const uint32_t chunk_end = frame.payload_read;
         if (read_at < prefix_size)
         {
             const uint32_t copy_end = chunk_end < prefix_size ? chunk_end : prefix_size;
@@ -692,11 +814,7 @@ int block_manager_read_verified_block_slices(block_manager_t* bm, const uint64_t
             memcpy(slice + (copy_start - slice_offset), scratch + (copy_start - read_at),
                    copy_end - copy_start);
         }
-        read_at += count;
     }
-
-    const uint32_t actual_checksum = (uint32_t)XXH3_64bits_digest(&state);
-    if (actual_checksum != checksum) return BLOCK_MANAGER_READ_ERR_CORRUPTION;
     *payload_size = size;
     return BLOCK_MANAGER_READ_OK;
 }

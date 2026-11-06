@@ -84,6 +84,12 @@
  * draining one segment is a bounded amount of copying */
 #define VLOG_DEFAULT_SEGMENT_TARGET_BYTES (256ull * 1024 * 1024)
 
+/* one background tick may request no more than this much sealed value-log data or this many
+ * positioned reads. callers pass these limits to vlog_scrub_pass so its scheduling contract is
+ * visible without exposing its private cursor state. */
+#define VLOG_SCRUB_PASS_BYTES (256u * 1024u)
+#define VLOG_SCRUB_PASS_READS 32u
+
 /* return codes. 0 is success, negatives are distinct failures so callers can react (a corrupt
  * read is recoverable by retry from another sstable, a missing id is a logic error). */
 #define VLOG_OK             0
@@ -109,6 +115,8 @@ typedef struct vlog vlog_t;
  * @param segment_target_bytes size at which the active segment seals and a fresh one opens
  * @param max_segments simultaneous segment slots including the active one, 0 for the default
  * @param enable_vlog_indexes whether segments publish a rebuildable index at checkpoints and seal
+ * @param blob_scrub_enabled whether sealed segments retain their exact logical extent for bounded
+ *        read-only background verification
  * @param encodings the db-global registry a stored value's recorded ids resolve against. the
  *        registry is db-global even though a pipeline is per-family, so the store can decode any
  *        value it holds
@@ -121,6 +129,7 @@ typedef struct
     int sync_mode;
     uint64_t segment_target_bytes;
     int enable_vlog_indexes;
+    int blob_scrub_enabled;
     uint32_t max_segments;
     uint32_t max_blob_shard_groups;
     const tidesdb_encoding_registry_t *encodings;
@@ -170,6 +179,26 @@ typedef struct
     uint64_t segments_retired;
     uint64_t segments_drainable;
 } vlog_stats_t;
+
+/**
+ * vlog_scrub_pass_t
+ * outcome of one bounded sealed-value-log verification slice
+ * @param bytes_read bytes requested from storage in this slice
+ * @param frame_offset frame header offset checked or resumed
+ * @param segment_number physical segment carrying the frame
+ * @param reads positioned reads attempted in this slice
+ * @param group VLOG_GROUP_UNGROUPED for ordinary values, otherwise the shard owner
+ * @param complete nonzero when the selected segment reached its sealed logical end
+ */
+typedef struct
+{
+    size_t bytes_read;
+    uint64_t frame_offset;
+    uint64_t segment_number;
+    size_t reads;
+    uint32_t group;
+    int complete;
+} vlog_scrub_pass_t;
 
 /* how many distinct encoding chains the store accounts for separately, and so the most
  * vlog_get_chain_stats can report. a family changes its codec rarely, and every change leaves
@@ -245,6 +274,18 @@ uint32_t vlog_max_segments(const vlog_t *vlog);
  * @param vlog handle to close (may be NULL)
  */
 void vlog_close(vlog_t *vlog);
+
+/**
+ * vlog_scrub_pass
+ * verify a bounded piece of one sealed segment, round-robin selecting another segment when the
+ * prior target completed or was retired; no segment reference or descriptor is held after return
+ * @param vlog open store, with a single caller driving the cursor; a disabled store does no work
+ * @param byte_budget maximum bytes requested in this call, at least one frame header
+ * @param read_budget maximum positioned reads attempted in this call
+ * @param out receives work and the segment/frame identity
+ * @return VLOG_OK, VLOG_ERR_CORRUPTION, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_INVALID
+ */
+int vlog_scrub_pass(vlog_t* vlog, size_t byte_budget, size_t read_budget, vlog_scrub_pass_t* out);
 
 /**
  * vlog_write

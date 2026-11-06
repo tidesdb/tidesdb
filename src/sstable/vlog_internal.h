@@ -9,6 +9,7 @@
 #ifndef __VLOG_INTERNAL_H__
 #define __VLOG_INTERNAL_H__
 #include "base/lockfree.h"
+#include "io/block_manager_internal.h"
 #include "sstable/vlog_sidecar.h"
 
 /* private to the vlog module -- the segment table and id index shared between vlog.c, which owns
@@ -71,6 +72,21 @@
 #define VLOG_INDEX_INITIAL_CAP 64
 #define VLOG_INDEX_LOAD_NUM    3
 #define VLOG_INDEX_LOAD_DEN    4
+
+/* one invocation examines only this many slots before it yields. the round-robin cursor makes
+ * absent and active slots unable to starve a sealed one behind them. */
+#define VLOG_SCRUB_SLOT_SCAN_MAX 64
+
+typedef struct
+{
+    bm_frame_verify_state_t frame;
+    XXH3_state_t* checksum;
+    uint64_t number;
+    uint32_t slot;
+    uint32_t cursor;
+    int active;
+    _Atomic(uint64_t) sealed_extents[];
+} vlog_scrub_t;
 
 /**
  * vlog_segment_t
@@ -221,6 +237,7 @@ struct vlog
      * exclusive side before it publishes a sidecar or changes the active slot. index_rw protects
      * the accumulating vector between concurrent writers; recovery runs before either can enter. */
     int enable_vlog_indexes;
+    int use_seal_lock;
     uint32_t max_blob_shard_groups;
     pthread_rwlock_t seal_rw;
     vlog_pending_t writer;
@@ -252,6 +269,7 @@ struct vlog
     _Atomic(uint64_t) reclaim_calls;
     _Atomic(uint64_t) reclaim_passes;
     _Atomic(uint64_t) segments_retired;
+    vlog_scrub_t* scrub;
     _Atomic(uint64_t) build_floors[VLOG_MAX_BUILDERS];
     vlog_group_t* groups;
     vlog_segment_t segments[];
@@ -315,6 +333,24 @@ block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot);
  * @return VLOG_OK, VLOG_ERR_INVALID for an invalid store or slot, or VLOG_ERR_IO on a file error
  */
 int vlog_segment_inspect(vlog_t *v, uint32_t slot, uint64_t *size);
+
+/**
+ * vlog_segment_scrub_fd
+ * borrow a pinned segment's resident descriptor or open a private read-only descriptor without
+ * invoking block-manager recovery, so a scrub cannot change the file it is checking
+ * @param v the store
+ * @param slot pinned open segment slot
+ * @param out_fd receives a descriptor valid until the slot is released or the owned descriptor is
+ * closed
+ * @param out_owned receives nonzero when the caller must close out_fd
+ * @return VLOG_OK or VLOG_ERR_IO
+ */
+int vlog_segment_scrub_fd(vlog_t* v, uint32_t slot, int* out_fd, int* out_owned);
+
+#ifdef TDB_FAULT_INJECTION
+/* called after a scrub takes and validates a real slot pin, before it borrows the descriptor */
+void vlog_test_set_scrub_pin_hook(void (*hook)(vlog_t* v, uint32_t slot));
+#endif
 
 #ifdef TDB_FAULT_INJECTION
 /* install or clear only with scans quiescent; the hook runs on the borrowed private handle */

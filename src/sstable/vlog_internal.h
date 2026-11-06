@@ -304,7 +304,7 @@ int vlog_segment_scan_dir(vlog_t* v, int grouped, uint64_t* numbers, size_t max,
  *         no free slot
  */
 int vlog_segment_open(vlog_t* v, uint64_t number, uint32_t* out_slot);
-int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t* out_slot);
+int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t first, uint32_t* out_slot);
 int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32_t* out_slot);
 
 /**

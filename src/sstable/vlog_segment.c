@@ -165,10 +165,11 @@ int vlog_segment_scan_dir(vlog_t* v, int grouped, uint64_t* numbers, size_t max,
     return VLOG_OK;
 }
 
-/* claim the lowest free slot in the table, raising the high-water so scans stop early */
-static int vlog_segment_claim_slot(vlog_t* v, uint32_t* out_slot)
+/* runtime rolls reuse the lowest free slot. exclusive recovery builds a dense table and
+ * starts directly at its first unused slot. both publish the same scan high-water. */
+static int vlog_segment_claim_slot(vlog_t* v, uint32_t first, uint32_t* out_slot)
 {
-    for (uint32_t i = 0; i < v->max_segments; i++)
+    for (uint32_t i = first; i < v->max_segments; i++)
     {
         if (atomic_load_explicit(&v->segments[i].state, memory_order_acquire) != VLOG_SEG_ABSENT)
             continue;
@@ -241,11 +242,11 @@ static int vlog_segment_install(vlog_t* v, uint32_t slot, uint64_t number, uint3
     return VLOG_OK;
 }
 
-int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t* out_slot)
+int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t first, uint32_t* out_slot)
 {
     if (!v || !out_slot || number == UINT64_MAX) return VLOG_ERR_INVALID;
     uint32_t slot = 0;
-    const int claimed = vlog_segment_claim_slot(v, &slot);
+    const int claimed = vlog_segment_claim_slot(v, first, &slot);
     if (claimed != VLOG_OK) return claimed;
     uint32_t group = grouped ? 0 : VLOG_GROUP_UNGROUPED;
     block_manager_t* bm = NULL;
@@ -262,7 +263,7 @@ int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t* out_sl
 
 int vlog_segment_open(vlog_t* v, uint64_t number, uint32_t* out_slot)
 {
-    return vlog_segment_adopt(v, number, 0, out_slot);
+    return vlog_segment_adopt(v, number, 0, 0, out_slot);
 }
 
 int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32_t* out_slot)
@@ -270,7 +271,7 @@ int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32
     if (!v || !out_slot || group == VLOG_GROUP_UNGROUPED || number == UINT64_MAX)
         return VLOG_ERR_INVALID;
     uint32_t slot = 0;
-    const int claimed = vlog_segment_claim_slot(v, &slot);
+    const int claimed = vlog_segment_claim_slot(v, 0, &slot);
     if (claimed != VLOG_OK) return claimed;
     /* a failed directory sync or reopen may leave a metadata-only final file. never let an
      * ordinary roll or another group reuse its number before recovery cleans it. */

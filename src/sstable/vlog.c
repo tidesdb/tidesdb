@@ -408,7 +408,7 @@ static int vlog_adopt_segments(vlog_t *v)
         }
         previous = number;
         uint32_t slot = 0;
-        rc = vlog_segment_adopt(v, number, use_group, &slot);
+        rc = vlog_segment_adopt(v, number, use_group, atomic_load(&v->seg_high), &slot);
         if (rc != VLOG_OK) break;
         rc = vlog_recover_segment(v, slot, &max_id);
         if (v->max_blob_shard_groups) vlog_group_set_epoch(v, slot, max_id);
@@ -486,7 +486,8 @@ int vlog_open_after_preflight(const char *dir, const vlog_config_t *config, vlog
          * segment sealed before a restart stays immutable across it and reclaim never has to
          * reason about a segment that grew after it was adopted */
         uint32_t slot = 0;
-        rc = vlog_segment_open(v, atomic_load(&v->next_number), &slot);
+        rc = vlog_segment_adopt(v, atomic_load(&v->next_number), 0, atomic_load(&v->seg_high),
+                                &slot);
         if (rc == VLOG_OK) atomic_store(&v->active_slot, slot);
     }
     if (rc != VLOG_OK)

@@ -40,6 +40,13 @@ when it reaches its target size and a fresh one takes over.
 **A sealed segment is immutable for the rest of its life.** Nothing rewrites it, shifts it, or
 truncates it. It is read until it is unlinked, and then it is gone.
 
+Recovery removes files containing only a complete, valid block-manager header before adopting
+segments into the bounded table. This keeps idle open/close cycles from accumulating empty files,
+including stores that already have more empty files than the table can hold. A file with any bytes
+past its header, or an invalid header, is not eligible for this cleanup. Recovery still creates a
+fresh append segment, numbered beyond every file it observed; it never resumes appending to a
+recovered segment.
+
 A klog entry references a value by an **opaque logical id**, never a physical location. The id
 names one block for the whole of its life, and nothing in the store ever moves it. What the
 indirection buys is that no sstable records *where* a value sits, so ordinary compaction carries

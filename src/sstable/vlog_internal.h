@@ -229,16 +229,17 @@ int vlog_segment_name(uint64_t number, char *out, size_t out_size);
 
 /**
  * vlog_segment_scan_dir
- * collects the numbers of every segment file in dir, ascending, so recovery adopts them in write
- * order. a directory that cannot be opened is an empty store rather than an error, which is what
- * makes a first open work
- * @param dir the store directory
+ * removes validated header-only files before collecting the remaining segment numbers, ascending,
+ * so idle reopens cannot fill the fixed segment table. advances next_number beyond every observed
+ * file, including removed ones. recovery only, before the store is published; the caller owns the
+ * database directory exclusively. an absent directory is a fresh store
+ * @param v the store being recovered
  * @param numbers receives the numbers found
  * @param max capacity of numbers
  * @param out_count receives how many were found
- * @return VLOG_OK or VLOG_ERR_FULL when dir holds more segments than max
+ * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_INVALID, or VLOG_ERR_FULL when too many segments remain
  */
-int vlog_segment_scan_dir(const char *dir, uint64_t *numbers, size_t max, size_t *out_count);
+int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_count);
 
 /**
  * vlog_segment_open

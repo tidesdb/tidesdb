@@ -3245,7 +3245,7 @@ void test_block_manager_write_rawv_buffered_wrap_and_oversized(void)
               0);
     ASSERT_EQ(block_manager_close(bm), 0);
 
-    const int fd = open(path, O_RDONLY);
+    const int fd = open(path, O_RDONLY, 0);
     ASSERT_TRUE(fd >= 0);
     rawv_test_assert_payload_at(fd, (uint64_t)filler_offset, filler, RAWV_TEST_FILLER_SIZE);
     rawv_test_assert_payload_at(fd, (uint64_t)wrap_offset, wrap_expected, RAWV_TEST_WRAP_SIZE);

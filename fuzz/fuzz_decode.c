@@ -68,7 +68,7 @@ static void fzd_cf_config(const uint8_t *data, size_t size)
 {
     tidesdb_column_family_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    (void)cf_config_deserialize(data, size, &cfg);
+    (void)cf_config_deserialize(data, size, &cfg, NULL);
 }
 
 static void fzd_wal(const uint8_t *data, size_t size)

@@ -125,7 +125,7 @@ static int vlog_sidecar_record(int fd, uint64_t offset, uint64_t extent,
     if (block_manager_framed_size(size) != entry->disk_len ||
         decode_uint64_le_compat(value) != entry->id ||
         (word & VLOG_BLK_LEN_MASK) != entry->value_len || stages > TDB_ENCODING_PIPELINE_MAX ||
-        size < VLOG_BLK_HDR_SIZE + stages)
+        size < VLOG_BLK_HDR_SIZE + (uint32_t)stages)
         return VLOG_ERR_CORRUPTION;
 
     uint8_t ids[sizeof(entry->chain)] = {0};

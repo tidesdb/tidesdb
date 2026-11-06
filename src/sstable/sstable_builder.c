@@ -478,6 +478,7 @@ static int sstable_write_footer(sstable_builder_t *builder, const btree_t *tree,
     memcpy(footer.encoding_pipeline, builder->encoding_pipeline, builder->encoding_count);
     footer.vlog_refs = builder->vlog_refs;
     footer.vlog_ref_count = builder->vlog_ref_count;
+    footer.family_kind = builder->always_separate_values ? TDB_SSTABLE_FAMILY_BLOB : 0;
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
@@ -585,6 +586,7 @@ static int sstable_build_handle(sstable_builder_t *builder, const btree_t *tree,
      * freed independently. a table installed straight from a build has to report the same segment
      * references as the same table read back from its footer, or the store's liveness would depend
      * on whether a segment's tables happened to have been reopened */
+    sst->family_kind = builder->always_separate_values ? TDB_SSTABLE_FAMILY_BLOB : 0;
     if (builder->vlog_ref_count > 0)
     {
         const size_t refs_bytes = builder->vlog_ref_count * sizeof(*sst->vlog_refs);

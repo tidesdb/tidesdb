@@ -178,7 +178,7 @@ int engine_sweep_orphan_sstables(tidesdb_t *db)
 /* readopt one family's klogs into the manifest, each at L1. returns the number adopted, or -1 when
  * the directory could not be read */
 static int engine_readopt_cf_dir(tidesdb_t *db, const char *cf_dir, uint64_t cf_id,
-                                 const char *cf_name)
+                                 const char *cf_name, int *is_blob)
 {
     DIR *d = opendir(cf_dir);
     if (!d) return -1;
@@ -215,6 +215,7 @@ static int engine_readopt_cf_dir(tidesdb_t *db, const char *cf_dir, uint64_t cf_
         if (bm) (void)block_manager_get_size(bm, &bytes);
         const uint64_t entries = sst->distinct_key_count;
         const uint64_t max_seq = sst->max_seq;
+        if (sst->family_kind == TDB_SSTABLE_FAMILY_BLOB) *is_blob = 1;
         if (sstable_unref(sst)) sstable_close(sst);
 
         if (tidesdb_manifest_add_sstable(db->manifest, cf_id, ENGINE_REBUILD_LEVEL, id, entries,
@@ -287,9 +288,17 @@ static int engine_rebuild_from_sstables(tidesdb_t *db)
         snprintf(cc.name, sizeof(cc.name), CF_DIR_PREFIX "%0*llu", CF_DIR_ID_DIGITS,
                  (unsigned long long)cf_id);
 
+        int is_blob = 0;
+        const int n = engine_readopt_cf_dir(db, cf_dir, cf_id, cc.name, &is_blob);
+        if (n < 0)
+        {
+            rc = TDB_ERR_MEMORY;
+            break;
+        }
+        /* a surviving blob footer must keep this family immutable, even in a mixed inventory */
         uint8_t *blob = NULL;
         size_t blob_len = 0;
-        if (cf_config_serialize(&cc, 0, &blob, &blob_len) != 0)
+        if (cf_config_serialize(&cc, is_blob, &blob, &blob_len) != 0)
         {
             rc = TDB_ERR_MEMORY;
             break;
@@ -298,13 +307,6 @@ static int engine_rebuild_from_sstables(tidesdb_t *db)
             rc = TDB_ERR_MEMORY;
         free(blob);
         if (rc != TDB_SUCCESS) break;
-
-        const int n = engine_readopt_cf_dir(db, cf_dir, cf_id, cc.name);
-        if (n < 0)
-        {
-            rc = TDB_ERR_MEMORY;
-            break;
-        }
         if (cf_id > max_cf_id) max_cf_id = cf_id;
         families++;
         tables += n;
@@ -324,7 +326,8 @@ static int engine_rebuild_from_sstables(tidesdb_t *db)
     TDB_DEBUG_LOG(
         TDB_LOG_WARN,
         "manifest was unreadable, rebuilt %d families and %d sstables from disk at L1; "
-        "families are named for their id and carry the default configuration until renamed",
+        "families are named for their id and carry the default configuration until renamed "
+        "while preserving a recorded blob kind",
         families, tables);
     if (capped)
         TDB_DEBUG_LOG(

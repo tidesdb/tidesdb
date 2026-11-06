@@ -3944,6 +3944,55 @@ void test_engine_open_keeps_sstables_when_manifest_self_healed(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* The footer keeps the blob-family bit when a corrupt manifest loses the CF config. The rebuilt
+ * config is then durable itself, so both the self-healing open and its next reopen still reject
+ * an ordinary transactional overwrite. */
+void test_engine_manifest_self_heal_preserves_blob_family_kind(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    const uint8_t key[] = "media";
+    const uint8_t value[] = {0x91, 0x33, 0x07};
+    tidesdb_t *db = NULL;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_create_blob_column_family(db, "media"), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "media");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    FILE *f = fopen(ENGINE_TEST_DB_DIR PATH_SEPARATOR "MANIFEST", "wb");
+    ASSERT_TRUE(f != NULL);
+    fputs("not a manifest", f);
+    fclose(f);
+
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    char **names = NULL;
+    int count = 0;
+    ASSERT_EQ(tidesdb_list_column_families(db, &names, &count), TDB_SUCCESS);
+    ASSERT_EQ(count, 1);
+    cf = tidesdb_get_column_family(db, names[0]);
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key) - 1, (const uint8_t *)"replace", 7, 0),
+              TDB_ERR_INVALID_ARGS);
+    tidesdb_txn_free(txn);
+    tidesdb_free(names[0]);
+    tidesdb_free(names);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "cf_0000000000");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
 void test_engine_create_completes_under_sustained_flush(void)
 {
     (void)remove_directory(ENGINE_TEST_DB_DIR);
@@ -8260,6 +8309,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_create_cf_refuses_an_id_past_the_key_prefix, tests_passed);
     RUN_TEST(test_engine_open_sweeps_orphaned_sstables, tests_passed);
     RUN_TEST(test_engine_open_keeps_sstables_when_manifest_self_healed, tests_passed);
+    RUN_TEST(test_engine_manifest_self_heal_preserves_blob_family_kind, tests_passed);
     RUN_TEST(test_engine_runtime_config_rejects_an_unbacked_encoding, tests_passed);
     RUN_TEST(test_engine_compaction_drops_versions_a_range_tombstone_covers, tests_passed);
     RUN_TEST(test_engine_range_tombstone_lives_as_long_as_a_table_carries_it, tests_passed);

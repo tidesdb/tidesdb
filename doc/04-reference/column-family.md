@@ -116,6 +116,8 @@ the background WAL sync interval. NONE acknowledges a staged WAL record and can 
 writes on a crash. A checkpoint supplies an explicit durable recovery point.
 
 The manifest records the family kind on creation, rename, clone and persisted reconfiguration.
+Blob SSTables also record their family kind so reconstruction from surviving tables preserves
+immutability even if the manifest header is lost.
 Earlier v10 readers can read ungrouped blob values as ordinary separated values. Use a
 blob-aware binary for writes and family administration because older binaries treat the
 family as ordinary and can discard its kind when rewriting its configuration.

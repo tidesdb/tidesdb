@@ -196,6 +196,7 @@ Then a variable tail:
      n  encoding pipeline ids
      4  value log reference count
     24  per reference: segment(8) + bytes(8) + count(8)
+     1  blob tables only: immutable-family marker (1)
 ```
 
 The value log references are how an sstable records which segments it draws separated values from

@@ -130,6 +130,7 @@ static void sstable_adopt_footer(sstable_t *sst, sstable_footer_t *footer)
     sst->max_key_size = footer->max_key_size;
     sst->vlog_refs = footer->vlog_refs;
     sst->vlog_ref_count = footer->vlog_ref_count;
+    sst->family_kind = footer->family_kind;
     footer->min_key = NULL;
     footer->max_key = NULL;
     footer->vlog_refs = NULL;

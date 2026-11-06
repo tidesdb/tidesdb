@@ -183,6 +183,30 @@ void test_footer_roundtrip_empty(void)
     sstable_footer_free(&out);
 }
 
+/* ordinary v10 bytes remain intact. only blob tables add a marker for manifest recovery. */
+void test_footer_blob_family_marker(void)
+{
+    sstable_footer_t in = {.version = TDB_SSTABLE_FORMAT_VERSION};
+    uint8_t *ordinary = NULL, *blob = NULL;
+    size_t n = 0, m = 0;
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_DEFAULT_MAX_SEGMENTS, &ordinary, &n), TDB_SUCCESS);
+    in.family_kind = TDB_SSTABLE_FAMILY_BLOB;
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_DEFAULT_MAX_SEGMENTS, &blob, &m), TDB_SUCCESS);
+    ASSERT_EQ(m, n + 1);
+    ASSERT_EQ(memcmp(ordinary, blob, n), 0);
+    sstable_footer_t out = {0};
+    ASSERT_EQ(sstable_footer_parse(blob, m, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.family_kind, TDB_SSTABLE_FAMILY_BLOB);
+    sstable_footer_free(&out);
+    ASSERT_EQ(sstable_footer_parse(ordinary, n, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.family_kind, 0);
+    sstable_footer_free(&out);
+    blob[n] ^= 0xff;
+    ASSERT_EQ(sstable_footer_parse(blob, m, &out), TDB_ERR_CORRUPTION);
+    free(blob);
+    free(ordinary);
+}
+
 /* the v10 trailer length is unchanged. the writer applies the store's cap, while the
  * reader checks both the supported maximum and the space left in the actual footer block. */
 void test_footer_extended_vlog_refs(void)
@@ -1888,6 +1912,7 @@ int main(int argc, char **argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_footer_roundtrip, tests_passed);
     RUN_TEST(test_footer_roundtrip_empty, tests_passed);
+    RUN_TEST(test_footer_blob_family_marker, tests_passed);
     RUN_TEST(test_footer_extended_vlog_refs, tests_passed);
     RUN_TEST(test_footer_rejects_bad_input, tests_passed);
     RUN_TEST(test_klog_filename, tests_passed);

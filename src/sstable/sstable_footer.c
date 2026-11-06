@@ -29,6 +29,8 @@ int sstable_footer_serialize(const sstable_footer_t *footer, uint32_t max_refs, 
 {
     if (!footer || !out || !out_size) return TDB_ERR_INVALID_ARGS;
     if (footer->encoding_count > TDB_ENCODING_PIPELINE_MAX) return TDB_ERR_INVALID_ARGS;
+    if (footer->family_kind != 0 && footer->family_kind != TDB_SSTABLE_FAMILY_BLOB)
+        return TDB_ERR_INVALID_ARGS;
 
     if (max_refs > SSTABLE_VLOG_REF_MAX || footer->vlog_ref_count > max_refs ||
         (footer->vlog_ref_count && !footer->vlog_refs))
@@ -37,7 +39,8 @@ int sstable_footer_serialize(const sstable_footer_t *footer, uint32_t max_refs, 
     const size_t total = TDB_SSTABLE_FOOTER_FIXED_BYTES + sizeof(uint32_t) + footer->min_key_size +
                          sizeof(uint32_t) + footer->max_key_size + sizeof(uint8_t) +
                          footer->encoding_count + sizeof(uint32_t) +
-                         (size_t)footer->vlog_ref_count * TDB_SSTABLE_VLOG_REF_BYTES;
+                         (size_t)footer->vlog_ref_count * TDB_SSTABLE_VLOG_REF_BYTES +
+                         (footer->family_kind ? 1u : 0u);
 
     uint8_t *buf = malloc(total);
     if (!buf) return TDB_ERR_MEMORY;
@@ -113,6 +116,7 @@ int sstable_footer_serialize(const sstable_footer_t *footer, uint32_t max_refs, 
         tdb_encode_be64(footer->vlog_refs[i].count, p);
         p += sizeof(uint64_t);
     }
+    if (footer->family_kind) *p = footer->family_kind;
 
     *out = buf;
     *out_size = total;
@@ -321,6 +325,13 @@ int sstable_footer_parse(const uint8_t *data, size_t size, sstable_footer_t *out
         rc = sstable_footer_take_key(&p, &rem, &out->max_key, &out->max_key_size, "max");
     if (rc == TDB_SUCCESS) rc = sstable_footer_parse_encodings(&p, &rem, out);
     if (rc == TDB_SUCCESS) rc = sstable_footer_parse_vlog_refs(&p, &rem, out);
+    if (rc == TDB_SUCCESS && rem)
+    {
+        if (rem == 1 && *p == TDB_SSTABLE_FAMILY_BLOB)
+            out->family_kind = *p;
+        else
+            rc = TDB_ERR_CORRUPTION;
+    }
 
     if (rc != TDB_SUCCESS) sstable_footer_free(out);
     return rc;

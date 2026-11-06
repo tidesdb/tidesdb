@@ -38,9 +38,11 @@
  */
 #define TDB_SSTABLE_FOOTER_MAGIC 0x53535442 /* "SSTB" */
 
-/* on-disk footer format version, aligned with the v10 on-disk generation, so a future layout change
- * is detected rather than misread */
+/* version of the v10 fixed footer layout */
 #define TDB_SSTABLE_FORMAT_VERSION 10
+
+/* optional blob-family marker after the v10 histogram; ordinary families omit it */
+#define TDB_SSTABLE_FAMILY_BLOB 1
 
 /* an sstable can name at most one segment per segment that exists, and the segment table is fixed
  * at open, so the histogram is bounded by construction and never has to refuse an entry -- which
@@ -100,6 +102,7 @@ typedef struct
  *        each they hold, owned by the footer (freed by sstable_footer_free). summed over the live
  *        tables it is what the store's segment liveness is, so reclamation needs no scan
  * @param vlog_ref_count how many entries vlog_refs holds
+ * @param family_kind dedicated blob-family marker, or ordinary for legacy footers without it
  */
 typedef struct
 {
@@ -128,6 +131,7 @@ typedef struct
     uint8_t encoding_count;
     sstable_vlog_ref_t *vlog_refs;
     uint32_t vlog_ref_count;
+    uint8_t family_kind;
 } sstable_footer_t;
 
 /**
@@ -244,6 +248,7 @@ typedef struct
 
     sstable_vlog_ref_t *vlog_refs;
     uint32_t vlog_ref_count;
+    uint8_t family_kind;
 
     tdb_refcount_t refcount;
     _Atomic(int64_t) last_access_time;

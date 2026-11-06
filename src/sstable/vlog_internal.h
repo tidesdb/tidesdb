@@ -275,15 +275,6 @@ struct vlog
     vlog_segment_t segments[];
 };
 
-/**
- * vlog_segment_name
- * formats a segment file name from its number
- * @param number the segment number
- * @param out receives the name
- * @param out_size capacity of out
- * @return VLOG_OK or VLOG_ERR_INVALID when the name would not fit
- */
-int vlog_segment_name(uint64_t number, char *out, size_t out_size);
 int vlog_segment_parse_number(const char* name, uint64_t* out_number);
 
 /**

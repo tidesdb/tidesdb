@@ -19,7 +19,9 @@
 #include "../src/sstable/sstable.h"
 #include "../src/sstable/vlog_group_disk.h"
 #include "../src/sstable/vlog_internal.h"
+#include "../src/sstable/vlog_sidecar.h"
 #include "../src/threadmanager/threadmanager.h"
+#include "../src/txn/txn.h"
 #include "../src/txn/wal_record.h"
 #include "test_utils.h"
 
@@ -51,6 +53,12 @@ static int tests_failed = 0;
 #define BLOB_PHASE_POST_WAL   "post-wal"
 #define BLOB_CHILD_NTH        "0"
 #define BLOB_SCRUB_LOG_NAME    "LOG"
+#define BLOB_BACKUP_DIR           BLOB_DB_DIR "_backup"
+#define BLOB_FOREIGN_DIR          BLOB_DB_DIR "_foreign"
+#define BLOB_BACKUP_WRITERS       3u
+#define BLOB_BACKUP_WRITES        32u
+#define BLOB_BACKUP_VALUE_BYTES   160u
+#define BLOB_BACKUP_SEGMENT_BYTES 1024u
 
 _Static_assert(offsetof(tidesdb_open_options_t, reserved) + sizeof(uint32_t) ==
                    offsetof(tidesdb_open_options_t, blob_scrub_enabled),
@@ -266,6 +274,38 @@ static void blob_delete(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_
     ASSERT_EQ(tidesdb_txn_delete(txn, cf, key, key_size), TDB_SUCCESS);
     ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
     tidesdb_txn_free(txn);
+}
+
+static void blob_put_kv(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
+                        size_t key_size, const uint8_t* value, size_t value_size)
+{
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, key_size, value, value_size, -1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+}
+
+static void blob_sidecar_path(const char* dir, uint64_t number, char* out, size_t out_size)
+{
+    char name[VLOG_SIDECAR_NAME_MAX];
+    ASSERT_EQ(vlog_sidecar_name(number, 0, name, sizeof(name)), VLOG_OK);
+    ASSERT_TRUE(snprintf(out, out_size, "%s%s%s", dir, PATH_SEPARATOR, name) > 0);
+}
+
+static void blob_copy_file(const char* source, const char* destination)
+{
+    FILE* in = fopen(source, "rb");
+    ASSERT_TRUE(in != NULL);
+    FILE* out = fopen(destination, "wb");
+    ASSERT_TRUE(out != NULL);
+    uint8_t bytes[1024];
+    size_t count = 0;
+    while ((count = fread(bytes, 1, sizeof(bytes), in)) != 0)
+        ASSERT_EQ(fwrite(bytes, 1, count, out), count);
+    ASSERT_TRUE(feof(in));
+    ASSERT_EQ(fclose(out), 0);
+    ASSERT_EQ(fclose(in), 0);
 }
 
 static void blob_corrupt_value_byte(tidesdb_t* db, vlog_id_t id, size_t value_offset)
@@ -813,6 +853,260 @@ static void blob_expect_owner(vlog_t* vlog, vlog_id_t id, uint32_t want)
     ASSERT_EQ(group, want);
 }
 
+typedef struct
+{
+    uint64_t seq[BLOB_BACKUP_WRITERS][BLOB_BACKUP_WRITES];
+} blob_backup_commits_t;
+
+/* each key belongs to one writer. joining the writers publishes the complete source history. */
+static int blob_backup_note_commit(const tidesdb_commit_op_t* ops, int count, uint64_t seq,
+                                   void* ctx)
+{
+    blob_backup_commits_t* commits = ctx;
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(ops[0].key_size, 2u);
+    const uint8_t* key = ops[0].key;
+    ASSERT_TRUE(key[0] < BLOB_BACKUP_WRITERS && key[1] < BLOB_BACKUP_WRITES);
+    commits->seq[key[0]][key[1]] = seq;
+    return 0;
+}
+
+typedef struct
+{
+    tidesdb_t* db;
+    tidesdb_column_family_t* media;
+    tidesdb_column_family_t* kv;
+    unsigned int index;
+    _Atomic(int)* start;
+    _Atomic(int)* done;
+    _Atomic(unsigned int)* committed_kv;
+} blob_backup_writer_t;
+
+typedef struct
+{
+    tidesdb_t* db;
+    _Atomic(int)* start;
+    _Atomic(int)* done;
+    _Atomic(unsigned int)* calls;
+} blob_backup_gc_t;
+
+static void* blob_backup_writer(void* arg)
+{
+    blob_backup_writer_t* writer = arg;
+    uint8_t value[BLOB_BACKUP_VALUE_BYTES];
+    for (int tick = 0; !atomic_load(writer->start) && tick < BLOB_RACE_WAIT_TICKS; tick++)
+        usleep(BLOB_RACE_WAIT_US);
+    ASSERT_TRUE(atomic_load(writer->start));
+    const uint32_t group = writer->index % 2u;
+    for (unsigned int i = 0; i < BLOB_BACKUP_WRITES; i++)
+    {
+        const uint8_t key[] = {(uint8_t)writer->index, (uint8_t)i};
+        memset(value, (int)(group + i), sizeof(value));
+        ASSERT_EQ(tidesdb_blob_put_group(writer->db, writer->media, group, key, sizeof(key), value,
+                                         sizeof(value)),
+                  TDB_SUCCESS);
+        blob_put_kv(writer->db, writer->kv, key, sizeof(key), value, sizeof(value));
+        atomic_fetch_add(writer->committed_kv, 1);
+    }
+    atomic_fetch_add(writer->done, 1);
+    return NULL;
+}
+
+static void* blob_backup_gc(void* arg)
+{
+    blob_backup_gc_t* gc = arg;
+    for (int tick = 0; tick < BLOB_RACE_WAIT_TICKS; tick++)
+    {
+        if (atomic_load_explicit(gc->start, memory_order_acquire)) break;
+        usleep(BLOB_RACE_WAIT_US);
+    }
+    for (int tick = 0;
+         tick < BLOB_RACE_WAIT_TICKS && atomic_load(gc->done) < (int)BLOB_BACKUP_WRITERS; ++tick)
+    {
+        /* production claims this flag before enqueueing the worker. use its same exclusion with
+         * a small test store below the scheduler's minimum garbage threshold. */
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&gc->db->vlog_gc_active, &expected, 1))
+        {
+            engine_vlog_gc(gc->db);
+            atomic_fetch_add(gc->calls, 1);
+            atomic_store(&gc->db->vlog_gc_active, 0);
+        }
+        usleep(BLOB_RACE_WAIT_US);
+    }
+    return NULL;
+}
+
+/* a finished public backup is a complete cut: concurrent grouped and ordinary writers may advance
+ * after that cut, but no pre-existing key or value-log reference may be missing. sealed sidecars
+ * are copied with the image, and a same-number, same-length grouped sidecar from another database
+ * must be rejected instead of lending its ids to this one. */
+void test_blob_backup_captures_a_complete_cut_during_grouped_writes_and_gc(void)
+{
+    enum
+    {
+        seed_count = 8
+    };
+    char dir[] = BLOB_DB_DIR, backup[] = BLOB_BACKUP_DIR, foreign[] = BLOB_FOREIGN_DIR;
+    (void)remove_directory(dir);
+    (void)remove_directory(backup);
+    (void)remove_directory(foreign);
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    cfg.value_separation_threshold = 1;
+    cfg.vlog_segment_size = BLOB_BACKUP_SEGMENT_BYTES;
+    tidesdb_open_options_t options = {
+        .size = sizeof(options), .enable_vlog_indexes = 1, .max_blob_shard_groups = 2};
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* media = blob_create_cf(db);
+    tidesdb_column_family_config_t plain_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, BLOB_PLAIN_CF, &plain_config), TDB_SUCCESS);
+    tidesdb_column_family_t* kv = tidesdb_get_column_family(db, BLOB_PLAIN_CF);
+    ASSERT_TRUE(kv != NULL);
+
+    for (unsigned int i = 0; i < seed_count; i++)
+    {
+        char blob_key[24], kv_key[24];
+        uint8_t blob_value[BLOB_BACKUP_VALUE_BYTES], kv_value[BLOB_BACKUP_VALUE_BYTES];
+        const int blob_n = snprintf(blob_key, sizeof(blob_key), "seed-blob-%u", i);
+        const int kv_n = snprintf(kv_key, sizeof(kv_key), "seed-kv-%u", i);
+        ASSERT_TRUE(blob_n > 0 && (size_t)blob_n < sizeof(blob_key));
+        ASSERT_TRUE(kv_n > 0 && (size_t)kv_n < sizeof(kv_key));
+        memset(blob_value, (int)(0x40u + i), sizeof(blob_value));
+        memset(kv_value, (int)(0x60u + i), sizeof(kv_value));
+        ASSERT_EQ(tidesdb_blob_put_group(db, media, 0, (const uint8_t*)blob_key, (size_t)blob_n,
+                                         blob_value, sizeof(blob_value)),
+                  TDB_SUCCESS);
+        blob_put_kv(db, kv, (const uint8_t*)kv_key, (size_t)kv_n, kv_value, sizeof(kv_value));
+    }
+    char local_index[256];
+    blob_sidecar_path(dir, 1, local_index, sizeof(local_index));
+    ASSERT_EQ(access(local_index, F_OK), 0);
+
+    _Atomic(int) start = 0, done = 0;
+    _Atomic(unsigned int) gc_calls = 0;
+    _Atomic(unsigned int) committed_kv = 0;
+    blob_backup_commits_t media_history = {0}, kv_history = {0};
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(db, media, blob_backup_note_commit, &media_history),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(db, kv, blob_backup_note_commit, &kv_history),
+              TDB_SUCCESS);
+    blob_backup_writer_t writers[BLOB_BACKUP_WRITERS];
+    pthread_t writer_threads[BLOB_BACKUP_WRITERS], gc_thread;
+    for (unsigned int i = 0; i < BLOB_BACKUP_WRITERS; i++)
+    {
+        writers[i] = (blob_backup_writer_t){db, media, kv, i, &start, &done, &committed_kv};
+        ASSERT_EQ(pthread_create(&writer_threads[i], NULL, blob_backup_writer, &writers[i]), 0);
+    }
+    blob_backup_gc_t gc = {db, &start, &done, &gc_calls};
+    ASSERT_EQ(pthread_create(&gc_thread, NULL, blob_backup_gc, &gc), 0);
+    atomic_store_explicit(&start, 1, memory_order_release);
+    for (int tick = 0; tick < BLOB_RACE_WAIT_TICKS; tick++)
+    {
+        if (atomic_load_explicit(&committed_kv, memory_order_acquire) >= BLOB_BACKUP_WRITERS) break;
+        usleep(BLOB_RACE_WAIT_US);
+    }
+    ASSERT_TRUE(atomic_load_explicit(&committed_kv, memory_order_acquire) >= BLOB_BACKUP_WRITERS);
+    ASSERT_EQ(tidesdb_backup(db, backup), TDB_SUCCESS);
+    for (unsigned int i = 0; i < BLOB_BACKUP_WRITERS; i++)
+    {
+        ASSERT_EQ(pthread_join(writer_threads[i], NULL), 0);
+    }
+    ASSERT_EQ(pthread_join(gc_thread, NULL), 0);
+    ASSERT_TRUE(atomic_load_explicit(&gc_calls, memory_order_relaxed) > 0);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    cfg.db_path = backup;
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    media = tidesdb_get_column_family(db, BLOB_CF);
+    kv = tidesdb_get_column_family(db, BLOB_PLAIN_CF);
+    ASSERT_TRUE(media != NULL && kv != NULL);
+    for (unsigned int i = 0; i < seed_count; i++)
+    {
+        char blob_key[24], kv_key[24];
+        uint8_t blob_value[BLOB_BACKUP_VALUE_BYTES], kv_value[BLOB_BACKUP_VALUE_BYTES];
+        const int blob_n = snprintf(blob_key, sizeof(blob_key), "seed-blob-%u", i);
+        const int kv_n = snprintf(kv_key, sizeof(kv_key), "seed-kv-%u", i);
+        memset(blob_value, (int)(0x40u + i), sizeof(blob_value));
+        memset(kv_value, (int)(0x60u + i), sizeof(kv_value));
+        blob_expect_value(db, media, (const uint8_t*)blob_key, (size_t)blob_n, blob_value,
+                          sizeof(blob_value));
+        blob_expect_value(db, kv, (const uint8_t*)kv_key, (size_t)kv_n, kv_value, sizeof(kv_value));
+    }
+    ASSERT_TRUE(db->vlog->recovery_index_hits > 0);
+    ASSERT_EQ(db->vlog->recovery_payload_bytes, 0u);
+    const uint64_t cut = tidesdb_mvcc_visible_seq(db->clock);
+    for (unsigned int writer = 0; writer < BLOB_BACKUP_WRITERS; writer++)
+        for (unsigned int i = 0; i < BLOB_BACKUP_WRITES; i++)
+        {
+            const uint8_t key[] = {(uint8_t)writer, (uint8_t)i};
+            uint8_t value[BLOB_BACKUP_VALUE_BYTES];
+            memset(value, (int)(writer % 2u + i), sizeof(value));
+            const uint64_t media_seq = media_history.seq[writer][i];
+            const uint64_t kv_seq = kv_history.seq[writer][i];
+            ASSERT_TRUE(media_seq > 0 && kv_seq > media_seq);
+            if (media_seq <= cut)
+                blob_expect_value(db, media, key, sizeof(key), value, sizeof(value));
+            else
+                blob_expect_absent(db, media, key, sizeof(key));
+            if (kv_seq <= cut)
+                blob_expect_value(db, kv, key, sizeof(key), value, sizeof(value));
+            else
+                blob_expect_absent(db, kv, key, sizeof(key));
+        }
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* a separate store repeats the initial grouped record shape, retaining ids, frame lengths, and
+     * the segment number while changing the payload fingerprint. */
+    cfg.db_path = foreign;
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    media = blob_create_cf(db);
+    for (unsigned int i = 0; i < seed_count; i++)
+    {
+        char key[24];
+        uint8_t value[BLOB_BACKUP_VALUE_BYTES];
+        const int n = snprintf(key, sizeof(key), "seed-blob-%u", i);
+        memset(value, (int)(0x80u + i), sizeof(value));
+        ASSERT_EQ(tidesdb_blob_put_group(db, media, 0, (const uint8_t*)key, (size_t)n, value,
+                                         sizeof(value)),
+                  TDB_SUCCESS);
+    }
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    char foreign_index[256], backup_index[256];
+    blob_sidecar_path(foreign, 1, foreign_index, sizeof(foreign_index));
+    blob_sidecar_path(backup, 1, backup_index, sizeof(backup_index));
+    struct STAT_STRUCT local_stat, foreign_stat;
+    ASSERT_EQ(STAT_FUNC(backup_index, &local_stat), 0);
+    ASSERT_EQ(STAT_FUNC(foreign_index, &foreign_stat), 0);
+    ASSERT_EQ(local_stat.st_size, foreign_stat.st_size);
+    blob_copy_file(foreign_index, backup_index);
+
+    cfg.db_path = backup;
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db->vlog->recovery_payload_bytes > 0);
+    media = tidesdb_get_column_family(db, BLOB_CF);
+    uint8_t first[BLOB_BACKUP_VALUE_BYTES];
+    memset(first, 0x40, sizeof(first));
+    blob_expect_value(db, media, (const uint8_t*)"seed-blob-0", sizeof("seed-blob-0") - 1, first,
+                      sizeof(first));
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_EQ(remove(backup_index), 0);
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db->vlog->recovery_payload_bytes > 0);
+    media = tidesdb_get_column_family(db, BLOB_CF);
+    blob_expect_value(db, media, (const uint8_t*)"seed-blob-0", sizeof("seed-blob-0") - 1, first,
+                      sizeof(first));
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+    (void)remove_directory(backup);
+    (void)remove_directory(foreign);
+}
+
 /* a near-maximum ceiling touches two distant groups. all three routes reach the same WAL and
  * backup owners. a backup has its own files and must recover placement from the data itself. */
 void test_blob_sparse_groups_interleave_with_kv_and_restore(void)
@@ -1187,6 +1481,7 @@ int main(int argc, char** argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_blob_group_zero_requires_opt_in_and_an_explicit_id, tests_passed);
     RUN_TEST(test_blob_group_preflight_is_read_only_for_torn_and_temporary_files, tests_passed);
+    RUN_TEST(test_blob_backup_captures_a_complete_cut_during_grouped_writes_and_gc, tests_passed);
     RUN_TEST(test_blob_sparse_groups_interleave_with_kv_and_restore, tests_passed);
     RUN_TEST(test_blob_put_requires_a_blob_column_family, tests_passed);
     RUN_TEST(test_blob_put_is_idempotent_and_conflicts_on_different_bytes, tests_passed);

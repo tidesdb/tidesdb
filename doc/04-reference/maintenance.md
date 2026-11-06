@@ -251,19 +251,25 @@ int tidesdb_backup(tidesdb_t *db, const char *dir);
 
 ### Description
 
-Flushes the memtable, then copies the manifest, the shared value log, and every sstable the
-manifest references — all at a single manifest snapshot, with compaction held off, so the
-copy can never reference a file a merge deleted mid-copy.
+The backup includes every committed transaction through one MVCC cut across all column
+families. It drains writes at the cut, flushes them, and captures the manifest, its named
+sstables, and the logical extents of the ordinary and grouped value logs. Later commits can
+proceed while the bulk files are copied. Compaction and value-log reclamation wait until
+the copy has finished. A marker key committed before the call is included.
 
-The result is a database directory, not an archive. Point
-[`tidesdb_open`](/reference/database#tidesdb_open) at it and it opens.
+The result is a directly openable database directory. The engine builds it in a sibling
+staging directory and publishes the complete image with one directory rename. The parent
+must allow directory creation and rename. On POSIX the published directory is private to
+its owner. A process interrupted before publication can leave its staging directory behind.
 
-The database stays writable throughout, and the copy is a single point in time somewhere between
-the call and its return. It holds every write committed before the call, since the flush at the
-start lands them in sstables, plus every write that a later flush landed before the backup copied
-its manifest. Nothing past that point is included and nothing before it is missing, the same shape
-a crash at that moment would leave. To know exactly which writes made it, commit a marker key just
-before the call and treat it as the guaranteed floor.
+Transfer the finished directory as a unit into a fresh destination. Value IDs and segment
+numbers are local to each database. Keep the grouped subdirectory and open the copy with
+a shard-group ceiling that covers its owners and at least one more segment slot than the
+number of retained nonempty segments. A matching optional
+index is bound to the copied segment. An additional bytewise transfer creates new file
+identities, so the first open can rebuild indexes from the authoritative value logs. For a
+replica seed, verify the transferred file names, lengths and hashes against the finished
+source image before opening and activating the receiver.
 
 Cost and free space required are proportional to the live on-disk size.
 
@@ -279,7 +285,7 @@ Cost and free space required are proportional to the live on-disk size.
 | Code | Cause |
 | --- | --- |
 | `TDB_ERR_INVALID_ARGS` | `db` or `dir` is `NULL` |
-| `TDB_ERR_LOCKED` | A column family stayed under compaction for the whole freeze window, so it could not be copied at a consistent point. Retryable |
+| `TDB_ERR_LOCKED` | The engine could not establish the cut or obtain its maintenance claims within the wait bound. Retryable |
 | `TDB_ERR_MEMORY` | Allocation failed |
 | `TDB_ERR_IO` | The destination is nonempty, the directory could not be created or inspected, or a file could not be read or written |
 

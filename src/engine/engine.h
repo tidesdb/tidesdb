@@ -820,13 +820,12 @@ int engine_clone_cf(tidesdb_t *db, const char *src_name, const char *dst_name);
 
 /**
  * engine_backup
- * write a consistent, directly-openable copy of the database into dir -- flush the memtable, then,
- * with compaction frozen and ddl held off, copy the manifest, value log, wals, and every cf's klogs
- * so no copied file can be deleted mid-copy. defined in engine_backup.c
+ * capture one committed cut and publish its manifest, klogs, value-log files and optional indexes
+ * together in a directly openable directory
  * @param db the engine
- * @param dir the destination directory, must be absent or empty
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_BUSY when compaction cannot be quiesced, or an
- * io or allocation error
+ * @param dir absent or empty destination in a writable parent directory
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_LOCKED on a capture timeout, or an io or
+ * allocation error
  */
 int engine_backup(tidesdb_t *db, const char *dir);
 

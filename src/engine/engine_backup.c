@@ -23,8 +23,9 @@
 #include "sstable/vlog_group_disk.h"
 #include "txn/mvcc.h"
 
-/* a backup directory and its per-cf subdirectories are created with the same mode as the live db */
-#define ENGINE_BACKUP_DIR_MODE 0755
+/* keep the unfinished image private until its single directory rename */
+#define ENGINE_BACKUP_DIR_MODE    0700
+#define ENGINE_BACKUP_STAGE_TRIES 64
 
 /* the copy buffer for streaming one file to the backup */
 #define ENGINE_BACKUP_COPY_BUF 65536
@@ -153,13 +154,12 @@ static const char *engine_basename(const char *path)
     return sep ? sep + 1 : path;
 }
 
-/* copy the manifest into dir. the length is measured and applied inside one hold, because a commit
- * that pushes the log past its rollover bound renames a fresh snapshot over this path -- a length
- * measured before the copy would then be applied to a file that is not the one it described.
- * copying it before anything else is what makes the backup coherent, since every klog and segment
- * it names is captured by the passes that follow, and nothing removes one while the compaction and
- * reclaim claims are held */
-static int engine_backup_copy_manifest(tidesdb_t *db, const char *dir)
+/* capture the manifest and its exact table inventory in one short read hold. the hold keeps a
+ * rollover from replacing the path while it is copied, and makes every later klog decision come
+ * from the catalogue image actually placed in the backup. it deliberately ends before the bulk
+ * data copies, so a slow backup does not block flush or DDL commits. */
+static int engine_backup_capture_manifest(tidesdb_t* db, const char* dir,
+                                          tidesdb_manifest_entry_t** out_entries, int* out_count)
 {
     char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
     const char *name = engine_basename(db->manifest->path);
@@ -168,23 +168,41 @@ static int engine_backup_copy_manifest(tidesdb_t *db, const char *dir)
 
     uint64_t len = 0;
     if (tidesdb_manifest_hold(db->manifest, &len) != 0) return TDB_ERR_IO;
-    const int rc = engine_copy_file(src, dst, len, 1);
+    const int count = db->manifest->num_entries;
+    int rc = TDB_SUCCESS;
+    if (count > 0)
+    {
+        *out_entries = malloc((size_t)count * sizeof(**out_entries));
+        if (*out_entries)
+            memcpy(*out_entries, db->manifest->entries, (size_t)count * sizeof(**out_entries));
+        else
+            rc = TDB_ERR_MEMORY;
+    }
+    if (rc == TDB_SUCCESS) rc = engine_copy_file(src, dst, len, 1);
     tidesdb_manifest_release(db->manifest);
+    *out_count = count;
     return rc;
 }
 
-/* reclaim is excluded across the copy, so every name in this inventory stays reachable.
- * copy each segment once to its logical extent, even when its file has a preallocated tail. */
-static int engine_backup_copy_vlog(tidesdb_t *db, const char *dir)
+/* every append through the transaction cut has finished, its flush has installed, and the
+ * maintenance claims exclude builders and reclamation while the extents are sampled. */
+static int engine_backup_capture_vlog(tidesdb_t* db, vlog_segment_info_t** out, size_t* count)
 {
     if (!db->vlog) return TDB_SUCCESS;
     const uint32_t capacity = vlog_max_segments(db->vlog);
-    vlog_segment_info_t *segs = calloc(capacity, sizeof(*segs));
-    if (!segs) return TDB_ERR_MEMORY;
+    *out = calloc(capacity, sizeof(**out));
+    if (!*out) return TDB_ERR_MEMORY;
+    const int rc = vlog_backup_inventory(db->vlog, *out, capacity, count);
+    if (rc == VLOG_ERR_MEMORY) return TDB_ERR_MEMORY;
+    if (rc == VLOG_ERR_BUSY) return TDB_ERR_LOCKED;
+    return rc == VLOG_OK ? TDB_SUCCESS : TDB_ERR_IO;
+}
 
-    size_t count = 0;
-    int rc =
-        vlog_list_segments(db->vlog, segs, capacity, &count) == VLOG_OK ? TDB_SUCCESS : TDB_ERR_IO;
+/* copy each captured prefix once. reclaim is excluded through the final index rebind. */
+static int engine_backup_copy_vlog(tidesdb_t* db, const char* dir, const vlog_segment_info_t* segs,
+                                   size_t count)
+{
+    int rc = TDB_SUCCESS;
     for (size_t i = 0; rc == TDB_SUCCESS && i < count; i++)
     {
         char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
@@ -205,38 +223,35 @@ static int engine_backup_copy_vlog(tidesdb_t *db, const char *dir)
             source_dir = source_guard;
             destination_dir = destination_guard;
         }
-        if (engine_join(src, sizeof(src), source_dir, segs[i].name) != 0 ||
-            engine_join(dst, sizeof(dst), destination_dir, segs[i].name) != 0)
+        char name[VLOG_SEGMENT_NAME_MAX];
+        if (vlog_segment_name(segs[i].number, name, sizeof(name)) != VLOG_OK ||
+            engine_join(src, sizeof(src), source_dir, name) != 0 ||
+            engine_join(dst, sizeof(dst), destination_dir, name) != 0)
             rc = TDB_ERR_IO;
         else
             rc = engine_copy_file(src, dst, segs[i].logical_size, 1);
+        if (rc == TDB_SUCCESS)
+        {
+            const int indexed = vlog_backup_index(db->vlog, &segs[i], src, dst, dir);
+            if (indexed != VLOG_OK) rc = indexed == VLOG_ERR_MEMORY ? TDB_ERR_MEMORY : TDB_ERR_IO;
+        }
     }
-    free(segs);
     return rc;
 }
 
-/* copy one family's klogs into the backup, each to the exact on-disk size the manifest records so
- * the preallocated tail of a live file is dropped. the files sit beside each other in the backup
- * root as they do in the source, their names carrying which family they belong to */
-static int engine_backup_copy_cf(tidesdb_t *db, cf_t *cf, const char *dir)
+/* copy the klogs named by the captured catalogue, each to its recorded size so the preallocated
+ * tail of a live file is dropped. compaction claims prevent any of these names from being removed
+ * after the manifest hold ends; a later flush adds a different entry and is outside this cut. */
+static int engine_backup_copy_entries(tidesdb_t* db, const char* dir,
+                                      const tidesdb_manifest_entry_t* entries, int count)
 {
-    const int count = tidesdb_manifest_copy_entries(db->manifest, cf->cf_id, NULL, 0);
-    if (count <= 0) return count == 0 ? TDB_SUCCESS : TDB_ERR_IO;
-
-    tidesdb_manifest_entry_t *entries = malloc((size_t)count * sizeof(*entries));
-    if (!entries) return TDB_ERR_MEMORY;
-    /* a table landing between the count and the copy is reported but not copied, so only what fit
-     * in the array is read */
-    const int matched = tidesdb_manifest_copy_entries(db->manifest, cf->cf_id, entries, count);
-    const int got = matched < count ? matched : count;
-
     int rc = TDB_SUCCESS;
-    for (int i = 0; i < got && rc == TDB_SUCCESS; i++)
+    for (int i = 0; i < count && rc == TDB_SUCCESS; i++)
     {
         char name[TDB_SSTABLE_KLOG_NAME_MAX];
         char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
         if (sstable_klog_filename(&entries[i], name, sizeof(name)) != TDB_SUCCESS ||
-            engine_join(src, sizeof(src), cf->dir, name) != 0 ||
+            engine_join(src, sizeof(src), db->db_path, name) != 0 ||
             engine_join(dst, sizeof(dst), dir, name) != 0)
         {
             rc = TDB_ERR_IO;
@@ -244,7 +259,6 @@ static int engine_backup_copy_cf(tidesdb_t *db, cf_t *cf, const char *dir)
         }
         rc = engine_copy_file(src, dst, entries[i].size_bytes, 1);
     }
-    free(entries);
     return rc;
 }
 
@@ -269,7 +283,7 @@ static int engine_sync_cf_klogs(cf_t *cf)
 
 /* force the value log and every klog to disk so the copy captures complete files, then commit the
  * clock high-water */
-static int engine_backup_sync(tidesdb_t *db, cf_t *const *cfs, int n)
+static int engine_backup_sync(tidesdb_t* db, cf_t* const* cfs, int n, uint64_t sequence)
 {
     for (int i = 0; i < n; i++)
     {
@@ -280,22 +294,9 @@ static int engine_backup_sync(tidesdb_t *db, cf_t *const *cfs, int n)
 
     /* record the clock high-water so a database opened on the copy, which has no wal to replay,
      * seeds its sequence past every key the copied sstables hold rather than filtering them out */
-    tidesdb_manifest_update_sequence(db->manifest, tidesdb_mvcc_current_seq(db->clock));
+    tidesdb_manifest_update_sequence(db->manifest, sequence);
     return tidesdb_manifest_commit(db->manifest, db->manifest->path, 1) == 0 ? TDB_SUCCESS
                                                                              : TDB_ERR_IO;
-}
-
-/* copy the manifest, then the db's other top-level files, then every family's klogs into dir. the
- * caller holds every family's compaction claim and the value-log reclaim claim, which between them
- * are every path that removes a file, so everything the copied manifest names is still there for
- * the passes that follow it. a flush may still add a klog or a segment meanwhile, which the
- * manifest taken first does not name and a restore sweeps away */
-static int engine_backup_copy(tidesdb_t *db, const char *dir, cf_t *const *cfs, int n)
-{
-    int rc = engine_backup_copy_manifest(db, dir);
-    if (rc == TDB_SUCCESS) rc = engine_backup_copy_vlog(db, dir);
-    for (int i = 0; i < n && rc == TDB_SUCCESS; i++) rc = engine_backup_copy_cf(db, cfs[i], dir);
-    return rc;
 }
 
 /**
@@ -323,42 +324,21 @@ static int engine_backup_claim_vlog_gc(tidesdb_t *db, int *out_claimed)
     return TDB_ERR_LOCKED;
 }
 
-int engine_backup(tidesdb_t *db, const char *dir)
+static int engine_backup_into(tidesdb_t* db, const char* dir)
 {
-    if (!db || !dir) return TDB_ERR_INVALID_ARGS;
-    if (mkdir(dir, ENGINE_BACKUP_DIR_MODE) != 0 && errno != EEXIST) return TDB_ERR_IO;
-
-    /* reject nonempty destinations before flushing or copying any source files */
-    DIR *d = opendir(dir);
-    if (!d) return TDB_ERR_IO;
-    struct dirent *ent;
-    errno = 0;
-    while ((ent = readdir(d)) != NULL)
-    {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-        closedir(d);
-        return TDB_ERR_IO;
-    }
-    const int read_error = errno;
-    if (closedir(d) != 0 || read_error != 0) return TDB_ERR_IO;
-
     TDB_DEBUG_LOG(TDB_LOG_INFO, "backup of %s starting to %s", db->db_path, dir);
 
-    /* land the memtable in L1 first, so the copied sstables hold every committed write */
-    int rc = engine_flush_memtable(db);
-    if (rc != TDB_SUCCESS)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup could not flush the memtable first rc=%d", rc);
-        return rc;
-    }
+    int rc = TDB_SUCCESS;
+
+    /* exclude DDL before borrowing and claiming the families. a drop holds this lock while it
+     * waits for a claim, so taking it after a backup claim could deadlock; taken first it also
+     * means no newly cloned family can enter the manifest between this inventory and the cut below.
+     */
+    pthread_mutex_lock(&db->ddl_lock);
 
     /* claim every cf's compaction flag, which freezes compaction, the only path that deletes a
-     * klog, so the snapshot the manifest references cannot lose a file mid-copy. the claimed
-     * handles are captured here rather than re-indexed later, because a drop removes a family from
-     * the registry before it waits the flag out, so an index taken now would name a different
-     * family afterwards. this waits holding the view borrow alone and never rotate_lock, so a claim
-     * that has to wait out a running compaction does not stall rotations and flushes for the whole
-     * wait */
+     * klog, so the snapshot the manifest references cannot lose a file mid-copy. the view keeps a
+     * handle alive while it is claimed; DDL remains excluded until the cut has named all claims. */
     cf_t **live = NULL;
     int n = 0;
     cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
@@ -394,15 +374,7 @@ int engine_backup(tidesdb_t *db, const char *dir)
     cf_registry_view_leave(db->cfs, view);
 
     /* the claims keep these families alive across the copy, since a drop waits the flag out before
-     * it frees one, so the copy needs no registry lock at all.
-     *
-     * it needs no rotation lock either, and must not take one: that lock is what every committer
-     * takes to rotate a full memtable, so holding it across a copy of the whole database stops
-     * every writer for as long as the copy runs. what the copy actually requires is that nothing
-     * removes a file it is about to read, and the two things that remove files are both claimed
-     * rather than locked out -- compaction above, and the value-log reclaim here. a flush landing a
-     * new klog meanwhile is harmless, because it only adds, and the manifest is copied to the
-     * length it had before that could happen */
+     * it frees one. the value-log claim similarly excludes its only deleting path. */
     int vlog_claimed = 0;
     if (rc == TDB_SUCCESS && db->vlog)
     {
@@ -412,26 +384,137 @@ int engine_backup(tidesdb_t *db, const char *dir)
                           "backup could not quiesce the value log reclaim, one is still running");
     }
 
+    tidesdb_manifest_entry_t* entries = NULL;
+    int entry_count = 0;
+    vlog_segment_info_t* segs = NULL;
+    size_t segment_count = 0;
+    int backup_gate = 0;
+    uint64_t bound = 0;
     if (rc == TDB_SUCCESS)
     {
-        rc = engine_backup_sync(db, cfs, claimed);
+        if (tidesdb_mvcc_backup_begin(db->clock, &bound) != 0)
+            rc = TDB_ERR_LOCKED;
+        else
+        {
+            backup_gate = 1;
+            /* every later draw waits inside the clock before it can append or apply, while every
+             * earlier sequence is already drawn and must reach a visible decision here. */
+            if (bound > 1) tidesdb_mvcc_wait_visible(db->clock, bound - 1);
+            if (tidesdb_mvcc_visible_seq(db->clock) < bound - 1)
+                rc = TDB_ERR_LOCKED;
+            else
+                rc = engine_flush_memtable(db);
+        }
+    }
+    if (rc == TDB_SUCCESS)
+    {
+        /* form one completed install prefix. rotate_lock prevents a new immutable from joining the
+         * cut, and install_lock waits out and then excludes every flush install. this is
+         * deliberately held only while syncing and capturing metadata, never during the bulk file
+         * copy. */
+        pthread_mutex_lock(&db->rotate_lock);
+        pthread_mutex_lock(&db->install_lock);
+        rc = engine_backup_sync(db, cfs, claimed, bound - 1);
         if (rc != TDB_SUCCESS)
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup could not sync the durable base rc=%d", rc);
         else
         {
-            rc = engine_backup_copy(db, dir, cfs, claimed);
+            /* no flush, compaction, or DDL can mutate the manifest here, so its in-memory entries
+             * and copied on-disk log describe the same atomic cross-family install prefix. */
+            rc = engine_backup_capture_manifest(db, dir, &entries, &entry_count);
             if (rc != TDB_SUCCESS)
-                TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup copy to %s failed rc=%d", dir, rc);
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup could not capture the manifest rc=%d", rc);
         }
+        if (rc == TDB_SUCCESS) rc = engine_backup_capture_vlog(db, &segs, &segment_count);
+        pthread_mutex_unlock(&db->install_lock);
+        pthread_mutex_unlock(&db->rotate_lock);
+    }
+
+    /* DDL and committers resume before the potentially long value-log and klog copy. a later
+     * flush is outside this cut; the claims above still prevent removal of every captured file. */
+    pthread_mutex_unlock(&db->ddl_lock);
+
+    if (backup_gate) tidesdb_mvcc_backup_end(db->clock);
+
+    if (rc == TDB_SUCCESS)
+    {
+        rc = engine_backup_copy_vlog(db, dir, segs, segment_count);
+        if (rc == TDB_SUCCESS) rc = engine_backup_copy_entries(db, dir, entries, entry_count);
+        if (rc != TDB_SUCCESS)
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup copy to %s failed rc=%d", dir, rc);
     }
 
     if (vlog_claimed) atomic_store_explicit(&db->vlog_gc_active, 0, memory_order_release);
     for (int i = 0; i < claimed; i++)
         atomic_store_explicit(&cfs[i]->compacting, 0, memory_order_release);
+    free(segs);
+    free(entries);
     free(cfs);
 
     if (rc == TDB_SUCCESS)
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "backup of %s complete, %d families copied to %s", db->db_path,
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "backup of %s staged, %d families copied to %s", db->db_path,
                       claimed, dir);
     return rc;
+}
+
+/* avoid touching the source if the target already holds data. the final rename also refuses
+ * a nonempty directory, including one populated by a competing backup after this check. */
+static int engine_backup_destination(const char* dir)
+{
+    DIR* d = opendir(dir);
+    if (!d) return errno == ENOENT ? TDB_SUCCESS : TDB_ERR_IO;
+    int rc = TDB_SUCCESS;
+    struct dirent* ent;
+    errno = 0;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0)
+        {
+            rc = TDB_ERR_IO;
+            break;
+        }
+    }
+    if (errno != 0) rc = TDB_ERR_IO;
+    if (closedir(d) != 0) rc = TDB_ERR_IO;
+    return rc;
+}
+
+/* place the scratch directory beside the destination so publication stays on one filesystem.
+ * mkdir exclusively claims an unused name even across processes or after an interrupted call. */
+static int engine_backup_stage(const char* dir, char* stage, size_t capacity)
+{
+    size_t base = strlen(dir);
+    while (base && dir[base - 1] != '/' && dir[base - 1] != PATH_SEPARATOR[0]) --base;
+    /* different leading characters keep even a caller-chosen staging-like name distinct */
+    const char lead = dir[base] == '.' ? '_' : '.';
+    for (int attempt = 0; attempt < ENGINE_BACKUP_STAGE_TRIES; ++attempt)
+    {
+        const int n = snprintf(stage, capacity, "%.*s%ctidesdb-backup-%ld-%d", (int)base, dir, lead,
+                               (long)TDB_GETPID(), attempt);
+        if (n < 0 || (size_t)n >= capacity) return TDB_ERR_IO;
+        if (mkdir(stage, ENGINE_BACKUP_DIR_MODE) == 0) return TDB_SUCCESS;
+        if (errno != EEXIST) return TDB_ERR_IO;
+    }
+    return TDB_ERR_IO;
+}
+
+int engine_backup(tidesdb_t* db, const char* dir)
+{
+    if (!db || !dir) return TDB_ERR_INVALID_ARGS;
+    char destination[ENGINE_BACKUP_PATH_MAX], stage[ENGINE_BACKUP_PATH_MAX];
+    size_t len = strlen(dir);
+    if (!len || len >= sizeof(destination)) return TDB_ERR_IO;
+    memcpy(destination, dir, len + 1);
+    while (len > 1 && (destination[len - 1] == '/' || destination[len - 1] == PATH_SEPARATOR[0]))
+        destination[--len] = '\0';
+    int rc = engine_backup_destination(destination);
+    if (rc != TDB_SUCCESS) return rc;
+    rc = engine_backup_stage(destination, stage, sizeof(stage));
+    if (rc != TDB_SUCCESS) return rc;
+    rc = engine_backup_into(db, stage);
+    if (rc == TDB_SUCCESS && tdb_publish_directory(stage, destination) == 0)
+        return tdb_fsync_parent_dir(destination) == 0 ? TDB_SUCCESS : TDB_ERR_IO;
+    if (remove_directory(stage) != 0)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "could not clean incomplete backup %s", stage);
+    return rc == TDB_SUCCESS ? TDB_ERR_IO : rc;
 }

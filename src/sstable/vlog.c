@@ -659,7 +659,12 @@ int vlog_list_segments(vlog_t *v, vlog_segment_info_t *out, size_t max, size_t *
     size_t count = 0;
     for (uint32_t i = 0; i < high; i++)
     {
-        if (!vlog_segment_acquire(v, i)) continue;
+        if (!vlog_segment_acquire(v, i))
+        {
+            if (atomic_load_explicit(&v->segments[i].state, memory_order_acquire) == VLOG_SEG_OPEN)
+                return VLOG_ERR_BUSY;
+            continue;
+        }
         if (count >= max)
         {
             vlog_segment_release(v, i);
@@ -667,11 +672,10 @@ int vlog_list_segments(vlog_t *v, vlog_segment_info_t *out, size_t max, size_t *
         }
         uint64_t size = 0;
         const int sized = vlog_segment_inspect(v, i, &size);
-        const int named =
-            vlog_segment_name(v->segments[i].number, out[count].name, sizeof(out[count].name));
+        out[count].number = v->segments[i].number;
         out[count].group = v->segments[i].group;
         vlog_segment_release(v, i);
-        if (sized != VLOG_OK || named != VLOG_OK) return VLOG_ERR_IO;
+        if (sized != VLOG_OK) return VLOG_ERR_IO;
         out[count].logical_size = size;
         count++;
     }

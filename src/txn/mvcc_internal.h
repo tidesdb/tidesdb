@@ -83,6 +83,8 @@ typedef struct mvcc_orphan
  * @param orphans the claims of prepared batches whose handles were freed undecided, held for the
  *                clock's life in the handles' place
  * @param orphan_lock guards the orphan list
+ * @param backup_bound first sequence excluded from a physical backup, zero outside capture,
+ *        or TDB_MVCC_BACKUP_STARTING while the backup samples the sequence allocator
  * @param visible_lock guards the sleep of a commit waiting for the watermark
  * @param visible_cv signalled when the watermark moves while a commit sleeps on it
  * @param visible_waiters how many commits sleep on the watermark, so one that moves it wakes
@@ -109,6 +111,7 @@ struct tidesdb_mvcc
     pthread_cond_t visible_cv;
     _Atomic(int) visible_waiters;
     _Atomic(int) read_holders;
+    _Atomic(uint64_t) backup_bound;
 };
 
 /**

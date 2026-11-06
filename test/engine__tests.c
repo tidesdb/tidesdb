@@ -17,6 +17,7 @@
 #include "../src/engine/engine_internal.h" /* ENGINE_FIRST_WAL_GENERATION */
 #include "../src/engine/engine_types.h"
 #include "../src/manifest/manifest.h" /* the inner txn a prefix delete is buffered on */
+#include "../src/sstable/sstable.h"   /* name a flushed klog for the failed-copy fixture */
 #include "../src/sstable/vlog_internal.h" /* direct sealed-slot eviction in the fd-bound fixture */
 #include "../src/txn/mvcc.h"          /* TDB_MVCC_COMMIT_RING_SIZE, the eviction window */
 #include "../src/txn/txn.h"           /* tdb_txn_delete_prefix, not yet a public call */
@@ -2312,6 +2313,8 @@ void test_engine_compact_range(void)
 #define ENGINE_TEST_REAPER_SEGMENTS            160
 #define ENGINE_TEST_REAPER_RLIMIT              32
 #define ENGINE_TEST_REAPER_VALUE               "r"
+#define ENGINE_BACKUP_APPLY_WAIT_TICKS         1000
+#define ENGINE_BACKUP_APPLY_WAIT_US            1000
 
 /* a checkpoint flushes the memtable to L1 and returns cleanly, and every key survives a reopen */
 void test_engine_checkpoint(void)
@@ -2398,7 +2401,187 @@ void test_engine_backup_existing_empty_directory(void)
     engine_test_backup(1);
 }
 
+typedef struct
+{
+    int (*apply)(void* ctx, const tidesdb_wal_entry_t* entries, int count);
+    _Atomic(int) entered;
+    _Atomic(int) release;
+} engine_backup_apply_probe_t;
+
+typedef struct
+{
+    tidesdb_t* db;
+    tidesdb_column_family_t* cf;
+    int rc;
+} engine_backup_delayed_writer_t;
+
+typedef struct
+{
+    tidesdb_t* db;
+    const char* dir;
+    int rc;
+} engine_backup_runner_t;
+
+static engine_backup_apply_probe_t* engine_backup_apply_probe = NULL;
+
+static int engine_backup_delay_second_apply(void* ctx, const tidesdb_wal_entry_t* entries,
+                                            int count)
+{
+    engine_backup_apply_probe_t* probe = engine_backup_apply_probe;
+    ASSERT_TRUE(probe != NULL && count == 2);
+    const int first = probe->apply(ctx, entries, 1);
+    if (first != 0) return first;
+    atomic_store_explicit(&probe->entered, 1, memory_order_release);
+    for (int tick = 0; tick < ENGINE_BACKUP_APPLY_WAIT_TICKS; tick++)
+    {
+        if (atomic_load_explicit(&probe->release, memory_order_acquire)) break;
+        usleep(ENGINE_BACKUP_APPLY_WAIT_US);
+    }
+    if (!atomic_load_explicit(&probe->release, memory_order_acquire)) return -1;
+    return probe->apply(ctx, entries + 1, 1);
+}
+
+static void* engine_backup_delayed_writer(void* arg)
+{
+    engine_backup_delayed_writer_t* writer = arg;
+    const uint8_t first_key[] = "first";
+    const uint8_t first_value[] = "A";
+    const uint8_t second_key[] = "second";
+    const uint8_t second_value[] = "B";
+    tidesdb_txn_t* txn = NULL;
+    writer->rc = tidesdb_txn_begin(writer->db, &txn);
+    if (writer->rc == TDB_SUCCESS)
+        writer->rc = tidesdb_txn_put(txn, writer->cf, first_key, sizeof(first_key) - 1, first_value,
+                                     sizeof(first_value) - 1, -1);
+    if (writer->rc == TDB_SUCCESS)
+        writer->rc = tidesdb_txn_put(txn, writer->cf, second_key, sizeof(second_key) - 1,
+                                     second_value, sizeof(second_value) - 1, -1);
+    if (writer->rc == TDB_SUCCESS) writer->rc = tidesdb_txn_commit(txn);
+    if (txn) tidesdb_txn_free(txn);
+    return NULL;
+}
+
+static void* engine_backup_runner(void* arg)
+{
+    engine_backup_runner_t* runner = arg;
+    runner->rc = tidesdb_backup(runner->db, runner->dir);
+    return NULL;
+}
+
+/* a transaction's first apply can reach L0 while its second is held. backup must establish its cut
+ * before rotating that partially applied generation, then wait for the transaction to finish so its
+ * image never presents one half of an otherwise committed two-key write. */
+void test_engine_backup_keeps_a_delayed_sequence_across_rotation(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    cfg.value_separation_threshold = 1;
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t* cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    engine_backup_apply_probe_t probe = {0};
+    probe.apply = db->backend.apply;
+    engine_backup_apply_probe = &probe;
+    db->backend.apply = engine_backup_delay_second_apply;
+    engine_backup_delayed_writer_t writer = {db, cf, TDB_ERR_IO};
+    pthread_t thread;
+    ASSERT_EQ(pthread_create(&thread, NULL, engine_backup_delayed_writer, &writer), 0);
+    for (int tick = 0; tick < ENGINE_BACKUP_APPLY_WAIT_TICKS; tick++)
+    {
+        if (atomic_load_explicit(&probe.entered, memory_order_acquire)) break;
+        usleep(ENGINE_BACKUP_APPLY_WAIT_US);
+    }
+    ASSERT_EQ(atomic_load_explicit(&probe.entered, memory_order_acquire), 1);
+
+    const uint64_t old_generation = atomic_load_explicit(&db->active_wal_gen, memory_order_acquire);
+    engine_backup_runner_t runner = {db, ENGINE_TEST_BACKUP_DIR, TDB_ERR_IO};
+    pthread_t backup_thread;
+    ASSERT_EQ(pthread_create(&backup_thread, NULL, engine_backup_runner, &runner), 0);
+    int cut_started = 0;
+    for (int tick = 0; tick < ENGINE_BACKUP_APPLY_WAIT_TICKS; tick++)
+    {
+        if (atomic_load_explicit(&db->vlog_gc_active, memory_order_acquire) ||
+            atomic_load_explicit(&db->active_wal_gen, memory_order_acquire) != old_generation)
+        {
+            cut_started = 1;
+            break;
+        }
+        usleep(ENGINE_BACKUP_APPLY_WAIT_US);
+    }
+    ASSERT_EQ(cut_started, 1);
+
+    atomic_store_explicit(&probe.release, 1, memory_order_release);
+    ASSERT_EQ(pthread_join(thread, NULL), 0);
+    ASSERT_EQ(writer.rc, TDB_SUCCESS);
+    ASSERT_EQ(pthread_join(backup_thread, NULL), 0);
+    ASSERT_EQ(runner.rc, TDB_SUCCESS);
+    db->backend.apply = probe.apply;
+    engine_backup_apply_probe = NULL;
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    char backup_path[] = ENGINE_TEST_BACKUP_DIR;
+    cfg = engine_test_config(backup_path);
+    cfg.value_separation_threshold = 1;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "first", "A");
+    engine_assert_committed(db, cf, "second", "B");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+}
+
 #ifndef _WIN32
+/* this fault moves a resident klog while its source handle is open.
+ * failure while copying a real captured file never publishes a partial final backup. putting the
+ * klog back makes the retry independent of cache residency and proves the staged directory was
+ * discarded rather than mistaken for a completed image. */
+void test_engine_backup_hides_a_failed_staging_directory_until_retry(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t* db = NULL;
+    tidesdb_column_family_t* cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+    engine_put(db, cf, 0);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+    cf_t* inner = (cf_t*)cf;
+    tidesdb_manifest_entry_t entry;
+    ASSERT_EQ(tidesdb_manifest_copy_entries(db->manifest, inner->cf_id, &entry, 1), 1);
+    char name[TDB_SSTABLE_KLOG_NAME_MAX];
+    ASSERT_EQ(sstable_klog_filename(&entry, name, sizeof(name)), TDB_SUCCESS);
+    char source[4096], hidden[4096];
+    ASSERT_TRUE(snprintf(source, sizeof(source), "%s%s%s", inner->dir, PATH_SEPARATOR, name) > 0);
+    ASSERT_TRUE(
+        snprintf(hidden, sizeof(hidden), "%s%s%s.hidden", inner->dir, PATH_SEPARATOR, name) > 0);
+    ASSERT_EQ(rename(source, hidden), 0);
+    ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_BACKUP_DIR), TDB_ERR_IO);
+    ASSERT_EQ(access(ENGINE_TEST_BACKUP_DIR, F_OK), -1);
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(rename(hidden, source), 0);
+
+    ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_BACKUP_DIR), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    char backup_path[] = ENGINE_TEST_BACKUP_DIR;
+    tidesdb_config_t cfg = engine_test_config(backup_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "key00000", "val00000");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+}
+
 /* before its first flush a database has no sstable candidate, but repeated public separated-value
  * writes still create sealed segments. an emfile wake must evict those segments and let both the
  * remaining writes and their L0 reads complete without a test-side eviction. */
@@ -8048,7 +8231,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_checkpoint, tests_passed);
     RUN_TEST(test_engine_backup, tests_passed);
     RUN_TEST(test_engine_backup_existing_empty_directory, tests_passed);
+    RUN_TEST(test_engine_backup_keeps_a_delayed_sequence_across_rotation, tests_passed);
 #ifndef _WIN32
+    RUN_TEST(test_engine_backup_hides_a_failed_staging_directory_until_retry, tests_passed);
     RUN_TEST(test_engine_reaper_evicts_vlog_before_the_first_sstable, tests_passed);
     RUN_TEST(test_engine_backup_extended_vlog_respects_fd_budget, tests_passed);
 #endif

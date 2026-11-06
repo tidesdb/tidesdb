@@ -602,6 +602,43 @@ int vlog_seal_idle_groups(vlog_t* v, int max, int* out_freed)
     return sealed;
 }
 
+int vlog_backup_inventory(vlog_t* v, vlog_segment_info_t* out, size_t max, size_t* out_count)
+{
+    if (!v || !out || !out_count) return VLOG_ERR_INVALID;
+    *out_count = 0;
+    /* the backup cut has drained appenders before entering here. the default unindexed route needs
+     * only its captured length, while a nonempty indexed route rolls to preserve its sealed cache.
+     */
+    const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    if (active < v->max_segments && v->enable_vlog_indexes)
+    {
+        uint64_t size = 0;
+        if (vlog_segment_inspect(v, active, &size) != VLOG_OK) return VLOG_ERR_IO;
+        if (size > BLOCK_MANAGER_HEADER_SIZE)
+        {
+            const int rolled = vlog_segment_roll(v, active);
+            /* at the configured ceiling the captured prefix remains immutable. its optional
+             * checkpoint can be rebuilt when the receiver opens with room for a successor. */
+            if (rolled != VLOG_OK && rolled != VLOG_ERR_FULL) return rolled;
+        }
+    }
+    if (v->max_blob_shard_groups)
+    {
+        /* the fd reaper can also seal idle groups during a transaction cut. */
+        pthread_mutex_lock(&v->roll_mu);
+        while (v->groups)
+            (void)vlog_seal_oldest_locked(v); /* each iteration removes one active group */
+        pthread_mutex_unlock(&v->roll_mu);
+    }
+    const int rc = vlog_list_segments(v, out, max, out_count);
+    if (rc != VLOG_OK || *out_count < VLOG_MAX_SEGMENTS) return rc;
+    /* recovery prunes header-only files before adopting the rest. even the largest supported
+     * receiver needs one usable slot for its fresh active segment. */
+    for (size_t i = 0; i < *out_count; ++i)
+        if (out[i].logical_size == vlog_group_disk_data_start(out[i].group)) return VLOG_OK;
+    return VLOG_ERR_FULL;
+}
+
 static int vlog_group_append_locked(vlog_t* v, uint32_t id, const struct iovec* spans, int count,
                                     vlog_sidecar_entry_t* entry)
 {

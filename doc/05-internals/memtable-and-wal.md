@@ -287,18 +287,11 @@ The rule this leaves has two halves.
 `tidesdb_l0_sync_active_wal` is that pattern: the same pin an append takes, safe because a flush
 drains the writers epoch before it closes a log.
 
-**If you need files not to move under you, claim rather than freeze.** Backup and clone copy the
-whole database and a family's sstables respectively, and holding the lock across either would be
-the longest hold in the engine. Neither needs it. A copy only requires that nothing *removes* a
-file it is about to read, and both paths work from a snapshot taken up front: backup copies the
-length its own commit left behind, and clone copies each sstable to the length the manifest
-recorded. A flush landing a new file meanwhile is not in either snapshot, which is what a
-point-in-time copy means.
-
-What removes files is compaction and value-log reclaim, and both are claimed with an atomic flag
-rather than locked out — the same claim the compaction scheduler already used. Backup takes the
-value-log claim too, because a reclaim moves live values from one segment into another and unlinks
-the source, which can strand values a copy has already passed.
+**Backup captures the cut before the bulk copy.** It drains transactions through one sequence
+boundary, flushes their memtables, and captures the manifest and value-log inventory. It then
+releases writers. The captured tables and value-log prefixes remain available throughout the
+copy because backup holds every family's compaction claim and the value-log reclaim claim.
+A concurrent flush can install new files after capture. Those files belong to a later cut.
 
 ## Waiting for a flush
 

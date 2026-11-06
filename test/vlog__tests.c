@@ -1986,7 +1986,9 @@ void test_recover_torn_tail_ignored(void)
     ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_DEFAULT_MAX_SEGMENTS, &n) == VLOG_OK);
     ASSERT_EQ((int)n, 1);
     char path[512];
-    snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, infos[0].name);
+    char name[VLOG_SEGMENT_NAME_MAX];
+    ASSERT_EQ(vlog_segment_name(infos[0].number, name, sizeof(name)), VLOG_OK);
+    snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name);
     vlog_close(v);
 
     /* cut the file short mid-way through the second value's block, the shape a crash during an
@@ -2032,7 +2034,9 @@ void test_read_detects_corruption(void)
     size_t n = 0;
     ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_DEFAULT_MAX_SEGMENTS, &n) == VLOG_OK);
     char path[512];
-    snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, infos[0].name);
+    char name[VLOG_SEGMENT_NAME_MAX];
+    ASSERT_EQ(vlog_segment_name(infos[0].number, name, sizeof(name)), VLOG_OK);
+    snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name);
     vlog_close(v);
 
     /* flip a byte inside the block's payload, which the block checksum catches. it is caught at
@@ -2545,10 +2549,12 @@ void test_list_segments_reports_each(void)
     for (size_t i = 0; i < n; i++)
     {
         ASSERT_TRUE(infos[i].logical_size > 0);
-        const size_t nlen = strlen(infos[i].name);
+        char name[VLOG_SEGMENT_NAME_MAX];
+        ASSERT_EQ(vlog_segment_name(infos[i].number, name, sizeof(name)), VLOG_OK);
+        const size_t nlen = strlen(name);
         const size_t elen = strlen(VLOG_SEGMENT_EXT);
         ASSERT_TRUE(nlen > elen);
-        ASSERT_EQ(strcmp(infos[i].name + (nlen - elen), VLOG_SEGMENT_EXT), 0);
+        ASSERT_EQ(strcmp(name + (nlen - elen), VLOG_SEGMENT_EXT), 0);
     }
 
     /* a caller that cannot hold every segment is told so rather than handed a truncated set it

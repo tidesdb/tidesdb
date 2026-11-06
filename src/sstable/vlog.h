@@ -231,17 +231,27 @@ typedef struct
 /**
  * vlog_segment_info_t
  * one segment's identity and logical length, for a caller copying the store elsewhere
- * @param name the segment's canonical file name, without a directory component
+ * @param number segment file number, formatted into a name only by the file-owning consumer
  * @param group VLOG_GROUP_UNGROUPED for a root file; otherwise its authoritative shard owner
  * @param logical_size bytes to copy for a faithful duplicate; a preallocated tail beyond this is
  *        not part of the segment's contents
  */
 typedef struct
 {
-    char name[VLOG_SEGMENT_NAME_MAX - sizeof(uint32_t)];
+    uint64_t number;
     uint32_t group;
     uint64_t logical_size;
 } vlog_segment_info_t;
+
+/**
+ * vlog_segment_name
+ * formats a segment file name from its number
+ * @param number the segment number
+ * @param out receives the name
+ * @param out_size capacity of out
+ * @return VLOG_OK or VLOG_ERR_INVALID when the name would not fit
+ */
+int vlog_segment_name(uint64_t number, char* out, size_t out_size);
 
 /**
  * vlog_open
@@ -495,9 +505,38 @@ int vlog_sync(vlog_t *vlog);
  * @param out receives the entries, caller-allocated
  * @param max capacity of out in entries
  * @param out_count receives how many entries were written
- * @return VLOG_OK, VLOG_ERR_INVALID, or VLOG_ERR_FULL when max is smaller than the segment count
+ * @return VLOG_OK, VLOG_ERR_INVALID, VLOG_ERR_BUSY when a live segment cannot be pinned,
+ *         VLOG_ERR_IO on a size failure or VLOG_ERR_FULL when max is smaller than the segment count
  */
 int vlog_list_segments(vlog_t *vlog, vlog_segment_info_t *out, size_t max, size_t *out_count);
+
+/**
+ * vlog_backup_inventory
+ * captures authoritative lengths while the caller's backup cut excludes appenders, sealing only a
+ * nonempty indexed ordinary route and active grouped routes before returning one copy inventory
+ * @param vlog open store
+ * @param out receives the entries, caller-allocated
+ * @param max capacity of out in entries
+ * @param out_count receives how many entries were written
+ * @return VLOG_OK, VLOG_ERR_INVALID, VLOG_ERR_FULL, or VLOG_ERR_IO
+ */
+int vlog_backup_inventory(vlog_t* vlog, vlog_segment_info_t* out, size_t max, size_t* out_count);
+
+/**
+ * vlog_backup_index
+ * strictly validates a source sealed index, then validates its entries against the copied segment
+ * and atomically publishes a destination-bound optional index; missing or invalid source indexes
+ * are left for ordinary recovery to rebuild
+ * @param vlog source store that produced info
+ * @param info immutable inventory entry already copied into destination_dir
+ * @param source_path captured segment in the protected source store
+ * @param copy_path copied segment in the staging directory
+ * @param destination_dir backup root containing the copied segment
+ * @return VLOG_OK when an index was published or safely omitted, VLOG_ERR_CORRUPTION,
+ *         VLOG_ERR_INVALID, VLOG_ERR_MEMORY, or VLOG_ERR_IO for a destination failure
+ */
+int vlog_backup_index(vlog_t* vlog, const vlog_segment_info_t* info, const char* source_path,
+                      const char* copy_path, const char* destination_dir);
 
 /**
  * vlog_get_chain_stats

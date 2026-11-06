@@ -168,6 +168,23 @@ void tidesdb_mvcc_destroy(tidesdb_mvcc_t *m);
 uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m);
 
 /**
+ * tidesdb_mvcc_backup_begin
+ * establish a backup sequence bound, holding later draws before they append or apply
+ * @param m the clock whose writers are gated
+ * @param out_bound receives the first sequence excluded from the backup cut
+ * @return 0 when the gate is active, or -1 when arguments are invalid or another backup owns it
+ */
+int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t* m, uint64_t* out_bound);
+
+/**
+ * tidesdb_mvcc_backup_end
+ * release writers held above a backup sequence bound
+ * @param m the clock whose active backup gate is released
+ * @return nothing
+ */
+void tidesdb_mvcc_backup_end(tidesdb_mvcc_t* m);
+
+/**
  * tidesdb_mvcc_visible_seq
  * the watermark, the highest sequence below which every drawn sequence has committed or aborted.
  * a ceiling taken from it never admits a sequence still in flight, so a snapshot holds still for
@@ -312,7 +329,7 @@ int tidesdb_mvcc_claim_range(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit, u
  * drawing, since the validator it would keep waiting may be the one whose decision makes the room
  * @param m the clock
  * @param commit the record, or NULL to draw a sequence that no claim is ordered by
- * @return the drawn sequence
+ * @return the drawn sequence, or zero if a physical backup blocked admission past the wait bound
  */
 uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit);
 

@@ -1221,7 +1221,8 @@ int tidesdb_txn_single_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, c
  * @param txn transaction
  * @return TDB_SUCCESS, TDB_ERR_CONFLICT when another transaction committed a conflicting write
  * first, TDB_ERR_INVALID_ARGS on a NULL or already-finished txn, TDB_ERR_TXN_EXPIRED once a
- * timeout has passed, or TDB_ERR_MEMORY or TDB_ERR_IO
+ * timeout has passed, TDB_ERR_LOCKED if backup held sequence admission past its wait bound, or
+ * TDB_ERR_MEMORY or TDB_ERR_IO
  */
 int tidesdb_txn_commit(tidesdb_txn_t *txn);
 
@@ -1293,7 +1294,7 @@ void tidesdb_txn_request_abort(tidesdb_txn_t *txn);
  * @param xid the transaction id to record durably
  * @param xid_size length of xid in bytes, must be greater than zero
  * @return TDB_SUCCESS, TDB_ERR_CONFLICT, TDB_ERR_INVALID_ARGS, TDB_ERR_TXN_EXPIRED,
- *         TDB_ERR_MEMORY or TDB_ERR_IO
+ *         TDB_ERR_LOCKED on backup admission timeout, TDB_ERR_MEMORY or TDB_ERR_IO
  */
 int tidesdb_txn_prepare(tidesdb_txn_t *txn, const uint8_t *xid, size_t xid_size);
 
@@ -1303,8 +1304,8 @@ int tidesdb_txn_prepare(tidesdb_txn_t *txn, const uint8_t *xid, size_t xid_size)
  * apply its batch and make it visible. valid only on a prepared transaction. a transient io failure
  * leaves it prepared so the coordinator can retry
  * @param txn a prepared transaction
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS if the transaction is not prepared, or TDB_ERR_MEMORY
- * or TDB_ERR_IO
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS if the transaction is not prepared, TDB_ERR_LOCKED on
+ * backup admission timeout (the transaction stays prepared), TDB_ERR_MEMORY, or TDB_ERR_IO
  */
 int tidesdb_txn_commit_prepared(tidesdb_txn_t *txn);
 
@@ -1685,14 +1686,13 @@ int tidesdb_sync_wal(tidesdb_t *db);
 
 /**
  * tidesdb_backup
- * write a consistent, directly-openable copy of the database into dir: flush the memtable, then
- * copy the manifest, the shared value log, and every sstable it references at a single manifest
- * snapshot while compaction is held off, so the copy references no file that a merge could delete
- * mid-copy
+ * publish a directly-openable physical copy at one committed transaction cut across all families.
+ * the image includes the manifest, its tables, ordinary and grouped value-log extents, and
+ * matching optional indexes. later writers can proceed while the bulk files are copied
  * @param db database handle
- * @param dir destination directory, must be absent or empty
- * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_LOCKED if a family stayed under compaction
- * for the whole freeze window, TDB_ERR_MEMORY, or TDB_ERR_IO on a copy or io error
+ * @param dir absent or empty destination in a writable parent directory
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_LOCKED when the cut or maintenance claims
+ * cannot be obtained in time, TDB_ERR_MEMORY, or TDB_ERR_IO on a copy or publication error
  */
 int tidesdb_backup(tidesdb_t *db, const char *dir);
 

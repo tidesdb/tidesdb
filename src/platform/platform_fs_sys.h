@@ -388,10 +388,8 @@ static inline int remove_directory(const char *path)
  * tdb_fsync_parent_dir
  * fsync the parent directory of path so a rename's directory entry is durable on a crash. the
  * directory portion is copied into a heap buffer when it does not fit the stack one, so a very long
- * path flushes rather than silently skipping the fsync (a fixed stack buffer with a length guard
- * used to drop the flush for paths longer than the buffer). best-effort -- a directory that cannot
- * be opened or an allocation failure just skips the flush, which is the pre-existing behavior for
- * an unfsyncable directory.
+ * path flushes rather than silently skipping the fsync. a bare filename flushes the working
+ * directory.
  *
  * on posix a directory that cannot be opened or synced is reported, since a caller that needs a
  * rename durable cannot claim it was otherwise. windows stays best-effort and reports success,
@@ -407,9 +405,7 @@ static inline int tdb_fsync_parent_dir(const char *path)
     const char *last_bsep = strrchr(path, '\\');
     if (last_bsep && (!last_sep || last_bsep > last_sep)) last_sep = last_bsep;
 #endif
-    if (!last_sep) return 0;
-
-    const size_t dir_len = (size_t)(last_sep - path);
+    const size_t dir_len = last_sep && last_sep != path ? (size_t)(last_sep - path) : 1;
     char stack_buf[4096];
     char *dir_path = stack_buf;
     char *heap_buf = NULL;
@@ -419,7 +415,7 @@ static inline int tdb_fsync_parent_dir(const char *path)
         if (!heap_buf) return -1;
         dir_path = heap_buf;
     }
-    memcpy(dir_path, path, dir_len);
+    memcpy(dir_path, last_sep ? path : ".", dir_len);
     dir_path[dir_len] = '\0';
 
     int rc = 0;
@@ -443,6 +439,25 @@ static inline int tdb_fsync_parent_dir(const char *path)
 #endif
     free(heap_buf);
     return rc;
+}
+
+/**
+ * tdb_publish_directory
+ * activate a finished directory on the same filesystem at an absent or empty destination
+ * @param stage private directory containing the complete image
+ * @param dest final directory name
+ * @return 0 once published, -1 if the destination is occupied or publication failed
+ */
+static inline int tdb_publish_directory(const char* stage, const char* dest)
+{
+#ifdef _WIN32
+    /* windows cannot rename over even an empty directory. rmdir refuses a populated target,
+     * and the subsequent move refuses any entry installed by a competing publisher. */
+    if (_rmdir(dest) != 0 && errno != ENOENT) return -1;
+    return MoveFileExA(stage, dest, MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(stage, dest);
+#endif
 }
 
 /**

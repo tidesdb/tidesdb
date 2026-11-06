@@ -1043,6 +1043,26 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, uint8_t **value, size_t *value_size);
 
 /**
+ * tidesdb_txn_get_range
+ * read exactly length bytes of a visible value with the snapshot and read tracking of
+ * tidesdb_txn_get
+ * @param txn transaction
+ * @param cf column family belonging to the transaction's database
+ * @param key non-NULL key data
+ * @param key_size length of key in bytes, greater than zero
+ * @param offset zero-based byte offset, at most the logical value length
+ * @param length bytes to return, at most the logical value length minus offset
+ * @param value out -- caller frees the returned bytes; NULL on a successful empty range
+ * @param value_size out -- length on success, including zero
+ * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS for an invalid argument or out-of-bounds range,
+ * TDB_ERR_NOT_FOUND for an absent key, or a transaction or storage error as for tidesdb_txn_get.
+ * a separated value's whole block payload is verified even for an empty range
+ */
+int tidesdb_txn_get_range(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
+                          size_t key_size, size_t offset, size_t length, uint8_t** value,
+                          size_t* value_size);
+
+/**
  * tidesdb_txn_get_ttl
  * read the visible key's expiry, including pending writes, using the transaction's snapshot and
  * read tracking
@@ -1089,7 +1109,8 @@ uint64_t tidesdb_txn_read_snapshot(const tidesdb_txn_t *txn);
 
 /**
  * tidesdb_txn_contains
- * non-tracking existence check at the transaction snapshot
+ * check existence at the transaction snapshot without tracking the read or fetching a separated
+ * value
  * @param txn transaction
  * @param cf target column family
  * @param key key data

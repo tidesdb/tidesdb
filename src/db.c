@@ -318,6 +318,14 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     return tdb_public_rc(engine_txn_get(txn, (cf_t *)cf, key, key_size, value, value_size));
 }
 
+int tidesdb_txn_get_range(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
+                          size_t key_size, size_t offset, size_t length, uint8_t** value,
+                          size_t* value_size)
+{
+    return tdb_public_rc(
+        engine_txn_get_range(txn, (cf_t*)cf, key, key_size, offset, length, value, value_size));
+}
+
 int tidesdb_txn_get_ttl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                         size_t key_size, time_t *ttl)
 {

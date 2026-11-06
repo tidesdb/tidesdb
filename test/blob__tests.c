@@ -14,9 +14,11 @@
 #include "../src/column_family/column_family.h"
 #include "../src/column_family/level/level_set.h"
 #include "../src/compat.h"
+#include "../src/engine/engine.h"
 #include "../src/engine/engine_types.h"
 #include "../src/sstable/sstable.h"
 #include "../src/sstable/vlog_group_disk.h"
+#include "../src/sstable/vlog_internal.h"
 #include "../src/txn/wal_record.h"
 #include "test_utils.h"
 
@@ -31,6 +33,16 @@ static int tests_failed = 0;
 #define BLOB_VALUE_BYTES      31u
 #define BLOB_GC_SEGMENT_BYTES 1024u
 #define BLOB_GC_VALUE_BYTES   (2u * BLOB_GC_SEGMENT_BYTES)
+#define BLOB_RANGE_VALUE_BYTES 32u
+#define BLOB_RANGE_OFFSET      7u
+#define BLOB_RANGE_LENGTH      11u
+#define BLOB_CORRUPT_BYTE      (BLOB_RANGE_VALUE_BYTES - 1u)
+#define BLOB_CORRUPT_VALUE     0xffu
+#define BLOB_RANGE_FILL        0x41u
+#define BLOB_GC_FILL           0x7au
+#define BLOB_ROLL_VALUE        0x11u
+#define BLOB_KV_SLICE_OFFSET   2u
+#define BLOB_KV_SLICE_LENGTH   3u
 #define BLOB_RACE_WAIT_TICKS  1000
 #define BLOB_RACE_WAIT_US     1000
 #define BLOB_CHILD_FLAG       "--blob-child"
@@ -199,6 +211,79 @@ static void blob_expect_absent(tidesdb_t* db, tidesdb_column_family_t* cf, const
     ASSERT_EQ(tidesdb_txn_contains(txn, cf, key, key_size), TDB_ERR_NOT_FOUND);
     ASSERT_EQ(tidesdb_txn_rollback(txn), TDB_SUCCESS);
     tidesdb_txn_free(txn);
+}
+
+static void blob_expect_range(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
+                              size_t key_size, size_t offset, size_t length, const uint8_t* want)
+{
+    uint8_t* got = NULL;
+    size_t got_size = 0;
+    ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, key_size, offset, length, &got, &got_size),
+              TDB_SUCCESS);
+    ASSERT_EQ(got_size, length);
+    if (length == 0)
+        ASSERT_TRUE(got == NULL);
+    else
+        ASSERT_TRUE(memcmp(got, want, length) == 0);
+    free(got);
+}
+
+static void blob_expect_full_and_range(tidesdb_t* db, tidesdb_column_family_t* cf,
+                                       const uint8_t* key, size_t key_size, const uint8_t* value,
+                                       size_t value_size)
+{
+    tidesdb_txn_t* txn = NULL;
+    uint8_t* full = NULL;
+    size_t full_size = 0;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, key_size, &full, &full_size), TDB_SUCCESS);
+    ASSERT_EQ(full_size, value_size);
+    ASSERT_TRUE(memcmp(full, value, value_size) == 0);
+    blob_expect_range(txn, cf, key, key_size, BLOB_RANGE_OFFSET, BLOB_RANGE_LENGTH,
+                      full + BLOB_RANGE_OFFSET);
+    blob_expect_range(txn, cf, key, key_size, full_size, 0, NULL);
+    free(full);
+    uint8_t* invalid = NULL;
+    size_t invalid_size = 0;
+    ASSERT_EQ(
+        tidesdb_txn_get_range(txn, cf, key, key_size, value_size + 1, 0, &invalid, &invalid_size),
+        TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, key_size, value_size, 1, &invalid, &invalid_size),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, key_size, SIZE_MAX, 1, &invalid, &invalid_size),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_txn_rollback(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+}
+
+static void blob_delete(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
+                        size_t key_size)
+{
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, key, key_size), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+}
+
+static void blob_corrupt_value_byte(tidesdb_t* db, vlog_id_t id, size_t value_offset)
+{
+    vlog_t* vlog = db->vlog;
+    pthread_rwlock_rdlock(&vlog->index_rw);
+    const size_t bucket = vlog_index_locate(vlog, id, NULL);
+    ASSERT_TRUE(bucket != SIZE_MAX);
+    const vlog_index_entry_t entry = vlog->buckets[bucket];
+    pthread_rwlock_unlock(&vlog->index_rw);
+    ASSERT_TRUE(value_offset < entry.value_len);
+    block_manager_t* bm =
+        atomic_load_explicit(&vlog->segments[entry.segment].bm, memory_order_acquire);
+    ASSERT_TRUE(bm != NULL);
+    const uint8_t corrupt = BLOB_CORRUPT_VALUE;
+    const uint64_t payload = entry.offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + VLOG_BLK_HDR_SIZE;
+    ASSERT_TRUE(payload <= INT64_MAX - value_offset);
+    ASSERT_EQ(
+        block_manager_write_at(bm, (int64_t)(payload + value_offset), &corrupt, sizeof(corrupt)),
+        0);
 }
 
 /* run one process to the exact commit seam that surrounds WAL publication. the child exits without
@@ -782,6 +867,217 @@ void test_blob_sparse_groups_interleave_with_kv_and_restore(void)
     (void)remove_directory(backup);
 }
 
+/* range reads resolve the same visible reference as a full media read, both from L0 and after the
+ * reference has moved into an sstable. a valid endpoint at EOF names an empty object range. */
+void test_blob_range_matches_full_read_before_and_after_flush(void)
+{
+    const uint8_t key[] = "range";
+    const uint8_t empty_key[] = "empty-range";
+    uint8_t value[BLOB_RANGE_VALUE_BYTES];
+    char dir[] = BLOB_DB_DIR;
+    (void)remove_directory(dir);
+    for (size_t i = 0; i < sizeof(value); i++) value[i] = (uint8_t)i;
+
+    tidesdb_t* db = blob_open(dir, TDB_SYNC_FULL, 0);
+    tidesdb_column_family_t* cf = blob_create_cf(db);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, empty_key, sizeof(empty_key) - 1, NULL, 0), TDB_SUCCESS);
+    blob_expect_full_and_range(db, cf, key, sizeof(key) - 1, value, sizeof(value));
+    tidesdb_txn_t* empty = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &empty), TDB_SUCCESS);
+    blob_expect_range(empty, cf, empty_key, sizeof(empty_key) - 1, 0, 0, NULL);
+    uint8_t* invalid = NULL;
+    size_t invalid_size = 0;
+    ASSERT_EQ(tidesdb_txn_get_range(empty, cf, empty_key, sizeof(empty_key) - 1, 1, 0, &invalid,
+                                    &invalid_size),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_txn_rollback(empty), TDB_SUCCESS);
+    tidesdb_txn_free(empty);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    blob_expect_full_and_range(db, cf, key, sizeof(key) - 1, value, sizeof(value));
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
+/* grouped media follows the same resolved-reference read path; the group owns placement, not the
+ * value's range or visibility semantics. */
+void test_grouped_blob_range_matches_full_read(void)
+{
+    const uint8_t key[] = "group-range";
+    uint8_t value[BLOB_RANGE_VALUE_BYTES];
+    char dir[] = BLOB_DB_DIR;
+    (void)remove_directory(dir);
+    for (size_t i = 0; i < sizeof(value); i++) value[i] = (uint8_t)(BLOB_RANGE_VALUE_BYTES - i);
+
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    tidesdb_open_options_t options = {.size = sizeof(options), .max_blob_shard_groups = 2};
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* cf = blob_create_cf(db);
+    ASSERT_EQ(tidesdb_blob_put_group(db, cf, 1, key, sizeof(key) - 1, value, sizeof(value)),
+              TDB_SUCCESS);
+    blob_expect_full_and_range(db, cf, key, sizeof(key) - 1, value, sizeof(value));
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    blob_expect_full_and_range(db, cf, key, sizeof(key) - 1, value, sizeof(value));
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
+/* verifying the whole framed block prevents a short read from accepting a damaged suffix, while
+ * contains only resolves metadata and remains usable for a corrupt object's existence probe. */
+void test_blob_range_rejects_corruption_outside_the_requested_slice(void)
+{
+    const uint8_t key[] = "corrupt-range";
+    uint8_t value[BLOB_RANGE_VALUE_BYTES];
+    char dir[] = BLOB_DB_DIR;
+    (void)remove_directory(dir);
+    memset(value, BLOB_RANGE_FILL, sizeof(value));
+
+    tidesdb_t* db = blob_open(dir, TDB_SYNC_FULL, 0);
+    tidesdb_column_family_t* cf = blob_create_cf(db);
+    blob_wal_probe_t probe = {0};
+    blob_install_wal_probe(db, &probe);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    blob_remove_wal_probe(db, &probe);
+    ASSERT_EQ(probe.decoded, 0);
+    blob_corrupt_value_byte(db, probe.entry.vlog_id, BLOB_CORRUPT_BYTE);
+
+    tidesdb_txn_t* txn = NULL;
+    uint8_t* got = NULL;
+    size_t got_size = 0;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_contains(txn, cf, key, sizeof(key) - 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, sizeof(key) - 1, 0, 1, &got, &got_size),
+              TDB_ERR_CORRUPTION);
+    ASSERT_EQ(
+        tidesdb_txn_get_range(txn, cf, key, sizeof(key) - 1, sizeof(value), 0, &got, &got_size),
+        TDB_ERR_CORRUPTION);
+    ASSERT_EQ(tidesdb_txn_rollback(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
+/* the range API is a visible-KV operation: inline values, a transaction's pending replacement,
+ * and its pending tombstone must agree with get and contains before a media segment is involved. */
+void test_range_read_obeys_inline_overlay_and_tombstone_visibility(void)
+{
+    const uint8_t key[] = "ordinary-range";
+    const uint8_t inline_value[] = "abcdef";
+    const uint8_t overlay_value[] = "uvwxyz";
+    char dir[] = BLOB_DB_DIR;
+    (void)remove_directory(dir);
+    tidesdb_t* db = blob_open(dir, TDB_SYNC_FULL, 0);
+    tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, BLOB_PLAIN_CF, &config), TDB_SUCCESS);
+    tidesdb_column_family_t* cf = tidesdb_get_column_family(db, BLOB_PLAIN_CF);
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(
+        tidesdb_txn_put(txn, cf, key, sizeof(key) - 1, inline_value, sizeof(inline_value) - 1, -1),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    blob_expect_range(txn, cf, key, sizeof(key) - 1, BLOB_KV_SLICE_OFFSET, BLOB_KV_SLICE_LENGTH,
+                      inline_value + BLOB_KV_SLICE_OFFSET);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key) - 1, overlay_value,
+                              sizeof(overlay_value) - 1, -1),
+              TDB_SUCCESS);
+    blob_expect_range(txn, cf, key, sizeof(key) - 1, BLOB_KV_SLICE_OFFSET, BLOB_KV_SLICE_LENGTH,
+                      overlay_value + BLOB_KV_SLICE_OFFSET);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, key, sizeof(key) - 1), TDB_SUCCESS);
+    uint8_t* missing = NULL;
+    size_t missing_size = 0;
+    ASSERT_EQ(tidesdb_txn_get_range(txn, cf, key, sizeof(key) - 1, 0, 1, &missing, &missing_size),
+              TDB_ERR_NOT_FOUND);
+    ASSERT_EQ(tidesdb_txn_rollback(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
+/* deletes publish ordinary tombstones: a pre-delete snapshot keeps the blob readable, repeated
+ * deletes stay idempotent, and releasing that snapshot permits the obsolete sealed segment to go.
+ */
+void test_blob_delete_snapshot_visibility_and_reclaim_after_release(void)
+{
+    const uint8_t key[] = "deleted-blob";
+    const uint8_t roll_key[] = "roll";
+    uint8_t value[BLOB_GC_VALUE_BYTES];
+    const uint8_t roll_value = BLOB_ROLL_VALUE;
+    char dir[] = BLOB_DB_DIR;
+    (void)remove_directory(dir);
+    memset(value, BLOB_GC_FILL, sizeof(value));
+
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    cfg.vlog_segment_size = BLOB_GC_SEGMENT_BYTES;
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* cf = blob_create_cf(db);
+    blob_wal_probe_t probe = {0};
+    blob_install_wal_probe(db, &probe);
+    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    blob_remove_wal_probe(db, &probe);
+    ASSERT_EQ(probe.decoded, 0);
+    uint64_t deleted_segment = 0;
+    ASSERT_EQ(vlog_segment_of(db->vlog, probe.entry.vlog_id, &deleted_segment, NULL), VLOG_OK);
+    char deleted_name[VLOG_SEGMENT_NAME_MAX];
+    char deleted_path[MAX_FILE_PATH_LENGTH];
+    ASSERT_EQ(vlog_segment_name(deleted_segment, deleted_name, sizeof(deleted_name)), VLOG_OK);
+    ASSERT_TRUE(snprintf(deleted_path, sizeof(deleted_path), "%s%s%s", dir, PATH_SEPARATOR,
+                         deleted_name) > 0);
+    ASSERT_EQ(access(deleted_path, F_OK), 0);
+    ASSERT_EQ(
+        tidesdb_blob_put(db, cf, roll_key, sizeof(roll_key) - 1, &roll_value, sizeof(roll_value)),
+        TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+
+    tidesdb_snapshot_t* snapshot = NULL;
+    ASSERT_EQ(tidesdb_snapshot_create(db, &snapshot), TDB_SUCCESS);
+    blob_delete(db, cf, key, sizeof(key) - 1);
+    blob_delete(db, cf, key, sizeof(key) - 1);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    blob_expect_absent(db, cf, key, sizeof(key) - 1);
+
+    tidesdb_txn_t* past = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_at_snapshot(db, snapshot, &past), TDB_SUCCESS);
+    blob_expect_range(past, cf, key, sizeof(key) - 1, BLOB_RANGE_OFFSET, BLOB_RANGE_LENGTH,
+                      value + BLOB_RANGE_OFFSET);
+    ASSERT_EQ(tidesdb_txn_rollback(past), TDB_SUCCESS);
+    tidesdb_txn_free(past);
+
+    ASSERT_EQ(tidesdb_compact(db, cf), TDB_SUCCESS);
+    vlog_stats_t held;
+    engine_vlog_gc(db);
+    ASSERT_EQ(vlog_get_stats(db->vlog, &held), VLOG_OK);
+    uint64_t held_segment = 0;
+    ASSERT_EQ(vlog_segment_of(db->vlog, probe.entry.vlog_id, &held_segment, NULL), VLOG_OK);
+    ASSERT_EQ(held_segment, deleted_segment);
+    ASSERT_EQ(access(deleted_path, F_OK), 0);
+    ASSERT_EQ(tidesdb_txn_begin_at_snapshot(db, snapshot, &past), TDB_SUCCESS);
+    blob_expect_range(past, cf, key, sizeof(key) - 1, BLOB_RANGE_OFFSET, BLOB_RANGE_LENGTH,
+                      value + BLOB_RANGE_OFFSET);
+    ASSERT_EQ(tidesdb_txn_rollback(past), TDB_SUCCESS);
+    tidesdb_txn_free(past);
+
+    tidesdb_snapshot_release(snapshot);
+    ASSERT_EQ(tidesdb_compact(db, cf), TDB_SUCCESS);
+    engine_vlog_gc(db);
+    vlog_stats_t released;
+    ASSERT_EQ(vlog_get_stats(db->vlog, &released), VLOG_OK);
+    ASSERT_TRUE(released.segments_retired > held.segments_retired);
+    ASSERT_EQ(access(deleted_path, F_OK), -1);
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(vlog_segment_of(db->vlog, probe.entry.vlog_id, &held_segment, NULL),
+              VLOG_ERR_NOT_FOUND);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
 int main(int argc, char** argv)
 {
     if (argc == 4 && strcmp(argv[1], BLOB_CHILD_FLAG) == 0)
@@ -804,6 +1100,11 @@ int main(int argc, char** argv)
     RUN_TEST(test_blob_put_crash_on_either_side_of_wal_publication, tests_passed);
     RUN_TEST(test_blob_put_concurrent_creators_obey_identity, tests_passed);
     RUN_TEST(test_blob_put_survives_wal_sync_flush_and_reopen_for_each_sync_mode, tests_passed);
+    RUN_TEST(test_blob_range_matches_full_read_before_and_after_flush, tests_passed);
+    RUN_TEST(test_grouped_blob_range_matches_full_read, tests_passed);
+    RUN_TEST(test_blob_range_rejects_corruption_outside_the_requested_slice, tests_passed);
+    RUN_TEST(test_range_read_obeys_inline_overlay_and_tombstone_visibility, tests_passed);
+    RUN_TEST(test_blob_delete_snapshot_visibility_and_reclaim_after_release, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

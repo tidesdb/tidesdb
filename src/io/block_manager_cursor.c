@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#define XXH_STATIC_LINKING_ONLY
 #include "block_manager_internal.h"
 
 /**
@@ -635,4 +636,67 @@ const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, co
      * by the file before anything sizes a buffer from it */
     const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
     return bm_read_block_tls(bm->fd, offset, extent, payload_hint, data_size);
+}
+
+int block_manager_read_verified_block_slices(block_manager_t* bm, const uint64_t offset,
+                                             const uint32_t prefix_size, uint8_t* prefix,
+                                             const uint32_t slice_offset, const uint32_t slice_size,
+                                             uint8_t* slice, uint32_t* payload_size)
+{
+    if (!bm || !payload_size || (prefix_size && !prefix) || (slice_size && !slice))
+        return BLOCK_MANAGER_READ_ERR_INVALID;
+
+    const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
+    if (offset > extent || extent - offset < BLOCK_MANAGER_BLOCK_HEADER_SIZE)
+        return BLOCK_MANAGER_READ_ERR_CORRUPTION;
+
+    uint8_t header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
+    if (pread(bm->fd, header, sizeof(header), (off_t)offset) != (ssize_t)sizeof(header))
+        return BLOCK_MANAGER_READ_ERR_IO;
+
+    const uint32_t size = decode_uint32_le_compat(header);
+    const uint32_t checksum = decode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE);
+    const uint64_t frame_size =
+        BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)size + BLOCK_MANAGER_FOOTER_SIZE;
+    if (size == 0 || frame_size > extent - offset || prefix_size > size || slice_offset > size ||
+        slice_size > size - slice_offset)
+        return BLOCK_MANAGER_READ_ERR_CORRUPTION;
+
+    XXH3_state_t state;
+    if (XXH3_64bits_reset(&state) != XXH_OK) return BLOCK_MANAGER_READ_ERR_IO;
+
+    uint8_t* scratch = bm_get_read_buf(BM_RANGE_READ_SCRATCH_BYTES);
+    if (!scratch) return BLOCK_MANAGER_READ_ERR_MEMORY;
+    uint32_t read_at = 0;
+    while (read_at < size)
+    {
+        const uint32_t remaining = size - read_at;
+        const uint32_t count =
+            remaining < BM_RANGE_READ_SCRATCH_BYTES ? remaining : BM_RANGE_READ_SCRATCH_BYTES;
+        const off_t file_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + read_at;
+        if (pread(bm->fd, scratch, count, file_offset) != (ssize_t)count ||
+            XXH3_64bits_update(&state, scratch, count) != XXH_OK)
+            return BLOCK_MANAGER_READ_ERR_IO;
+
+        const uint32_t chunk_end = read_at + count;
+        if (read_at < prefix_size)
+        {
+            const uint32_t copy_end = chunk_end < prefix_size ? chunk_end : prefix_size;
+            memcpy(prefix + read_at, scratch, copy_end - read_at);
+        }
+        const uint32_t slice_end = slice_offset + slice_size;
+        if (slice_size && read_at < slice_end && slice_offset < chunk_end)
+        {
+            const uint32_t copy_start = read_at > slice_offset ? read_at : slice_offset;
+            const uint32_t copy_end = chunk_end < slice_end ? chunk_end : slice_end;
+            memcpy(slice + (copy_start - slice_offset), scratch + (copy_start - read_at),
+                   copy_end - copy_start);
+        }
+        read_at += count;
+    }
+
+    const uint32_t actual_checksum = (uint32_t)XXH3_64bits_digest(&state);
+    if (actual_checksum != checksum) return BLOCK_MANAGER_READ_ERR_CORRUPTION;
+    *payload_size = size;
+    return BLOCK_MANAGER_READ_OK;
 }

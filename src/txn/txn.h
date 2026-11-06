@@ -179,6 +179,25 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
                 size_t *value_size);
 
 /**
+ * tdb_txn_get_range
+ * read a byte range with the snapshot and read tracking of tdb_txn_get
+ * @param txn the transaction
+ * @param cf_index the target column family's prefix index
+ * @param key non-NULL key bytes
+ * @param key_size length of key, greater than zero
+ * @param sources the caller's newest-first external source stack
+ * @param num_sources number of external sources
+ * @param offset first logical byte in the range, at most the value length
+ * @param length number of bytes, at most the remaining length
+ * @param value out -- allocated slice, NULL for an empty range
+ * @param value_size out -- the number of bytes returned on success
+ * @return the same errors as tdb_txn_get, plus TDB_ERR_INVALID_ARGS for a range outside the value
+ */
+int tdb_txn_get_range(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                      const tidesdb_source_t* sources, int num_sources, size_t offset,
+                      size_t length, uint8_t** value, size_t* value_size);
+
+/**
  * tdb_txn_get_ttl
  * read a key's expiry with the same visibility and conflict tracking as tdb_txn_get
  * @param txn the transaction

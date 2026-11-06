@@ -15,7 +15,7 @@
 /* the read source over one column family's on-disk sstable levels -- the deepest tier in a
  * transaction's source stack, consulted after the write buffer and the shared L0. it is the sstable
  * analog of tidesdb_l0_source: it walks the cf's level_set top-down for the newest version of a key
- * visible at the reader's snapshot and resolves a spilled value through the cf's shared value log.
+ * visible at the reader's snapshot and returns its inline bytes or shared value-log reference.
  */
 
 /**

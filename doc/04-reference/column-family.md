@@ -97,8 +97,18 @@ database requires one, including for an empty object.
 An absent key creates an object. An identical retry returns `TDB_SUCCESS`. Different
 bytes under the same live key return `TDB_ERR_CONFLICT`. A long-held competing transaction
 can return `TDB_ERR_LOCKED`, which the caller can retry. Passing `NULL` and a value length
-of zero creates a present, empty object. Use ordinary transaction reads and deletes on
-this family. A visible delete frees the key for a new create.
+of zero creates a present, empty object.
+
+Use the media key with `tidesdb_txn_get` for the whole object, `tidesdb_txn_get_range`
+for an exact byte range, and `tidesdb_txn_contains` for existence. The group ID is needed
+only at creation. A range read checksums the whole blob, even for a zero-length range.
+See the [transaction reference](/reference/transaction#tidesdb_txn_get_range) for bounds
+and ownership.
+
+Call `tidesdb_txn_delete` and commit to publish a tombstone. Repeating the delete can
+commit successfully for an already absent key. A visible delete frees the key for a
+new create. An earlier snapshot can still read the old bytes. Compaction and value-log
+reclamation can retire the sealed file once its last live reference and reader are gone.
 
 Every object uses a verbatim value-log record. The WAL and memtable hold its ID and length.
 Blob puts follow the configured WAL sync policy. FULL waits for durability. INTERVAL uses

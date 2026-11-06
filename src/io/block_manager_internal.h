@@ -33,6 +33,10 @@
  * cannot know. */
 #define BM_READ_HINT_BYTES (4u * 1024u)
 
+/* a range read checksums a frame incrementally, so a giant separated value does not become one
+ * giant temporary allocation merely because a caller needs a small slice of it. */
+#define BM_RANGE_READ_SCRATCH_BYTES (64u * 1024u)
+
 /* a block at or below this size is read without consulting the memory budget, covering every data
  * block and the common small footer block so the hot read path is just integer compares. blocks
  * larger than this (a multi-hundred-MB bloom filter on a huge bottom-level sstable) are rare and

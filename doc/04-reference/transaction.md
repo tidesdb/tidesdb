@@ -484,6 +484,33 @@ else if (rc != TDB_ERR_NOT_FOUND)
 [`tidesdb_txn_get_notrack`](#tidesdb_txn_get_notrack),
 [`tidesdb_txn_contains`](#tidesdb_txn_contains)
 
+## tidesdb_txn_get_range
+
+Read a byte range of the value under a key in a blob or ordinary column family.
+
+```c
+int tidesdb_txn_get_range(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
+                          const uint8_t *key, size_t key_size, size_t offset, size_t length,
+                          uint8_t **value, size_t *value_size);
+```
+
+The transaction chooses and tracks the key version exactly as for `tidesdb_txn_get`,
+including buffered writes and deletes. On success, `*value_size` equals `length`.
+Release the returned bytes with `tidesdb_free`.
+
+Both bounds are exact. For a value of size `n`, the allowed offsets are zero through
+`n`, and the maximum length is `n - offset`. A zero-length read at any allowed offset
+succeeds with `*value == NULL` and `*value_size == 0`. At end of value only a zero-length
+read succeeds. For an empty value the only valid pair is `(0, 0)`.
+An overflowing sum or a range outside a live value returns `TDB_ERR_INVALID_ARGS`.
+A missing or deleted key returns `TDB_ERR_NOT_FOUND` for a zero-length read too.
+
+For a verbatim blob, the reader pins the file containing the visible version and
+checksums the entire stored block with positioned reads and bounded scratch space.
+A damaged payload returns `TDB_ERR_CORRUPTION` even when the damage falls outside the
+requested bytes. A short slice therefore still reads the full payload. For an ordinary
+value stored with an encoding, the engine can decode the full value to extract the slice.
+
 ## tidesdb_txn_get_ttl
 
 Read the expiry of the key version visible to the transaction.
@@ -567,7 +594,7 @@ Reads transaction state; observe the same one-thread-per-transaction rule.
 
 ## tidesdb_txn_contains
 
-Existence check without allocating or tracking.
+Check whether a key has a visible value.
 
 ### Synopsis
 
@@ -578,11 +605,10 @@ int tidesdb_txn_contains(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const 
 
 ### Description
 
-Reports whether a visible, unexpired, non-tombstoned version exists at the snapshot. Does
-not allocate and does not record the read into the conflict footprint.
-
-Cheaper than [`tidesdb_txn_get`](#tidesdb_txn_get) when the value is not needed, especially
-for a value that lives in the value log — the check is answered without dereferencing it.
+Checks the visible KV version, including pending writes and deletes, without adding to
+the transaction's conflict footprint. For a separated value, the check reads only the
+KV entry and skips the value-log payload and its checksum. A present, empty value
+returns `TDB_SUCCESS`.
 
 ### Return Value
 

@@ -15,6 +15,7 @@
 #include "base/encoding/serialization.h" /* tdb_encode_be64 for the abort record */
 #include "base/log.h"
 #include "range_tombstone/range_tombstone.h" /* the successor the prefix form of a range delete is expressed with */
+#include "sstable/vlog.h"
 #include "txn_internal.h"
 
 /* initial savepoint-array capacity, grown by doubling */
@@ -379,23 +380,109 @@ uint64_t tdb_txn_read_floor(const tdb_txn_t *txn)
     return tdb_txn_snapshot_floor(txn);
 }
 
+/* a NULL range requests all bytes; an explicit zero length requests an empty slice */
+typedef struct
+{
+    size_t offset;
+    size_t length;
+} txn_value_range_t;
+
+static int txn_copy_value(const uint8_t* bytes, size_t size, const txn_value_range_t* range,
+                          uint8_t** value, size_t* value_size)
+{
+    const size_t offset = range ? range->offset : 0;
+    const size_t length = range ? range->length : size;
+    if (offset > size || length > size - offset) return TDB_ERR_INVALID_ARGS;
+    uint8_t* copy = NULL;
+    if (length)
+    {
+        copy = malloc(length);
+        if (!copy) return TDB_ERR_MEMORY;
+        memcpy(copy, bytes + offset, length);
+    }
+    *value = copy;
+    *value_size = length;
+    return TDB_SUCCESS;
+}
+
+/* resolve only the winning live version, while the transaction still holds its read ceiling */
+static int txn_load_value(tidesdb_source_version_t* v, const txn_value_range_t* range)
+{
+    if (v->vlog_id == VLOG_ID_INVALID)
+    {
+        if (!range) return TDB_SUCCESS;
+        uint8_t* bytes = v->value;
+        const int rc = txn_copy_value(bytes, v->value_size, range, &v->value, &v->value_size);
+        if (rc == TDB_SUCCESS) free(bytes);
+        return rc;
+    }
+    if (!range)
+    {
+        /* full gets retain their retry on a transient descriptor or a respilled reference */
+        return vlog_read(v->vlog, v->vlog_id, &v->value, &v->value_size) == VLOG_OK ? TDB_SUCCESS
+                                                                                    : TDB_ERR_BUSY;
+    }
+
+    const int rc = vlog_read_range(v->vlog, v->vlog_id, range->offset, range->length, &v->value,
+                                   &v->value_size);
+    switch (rc)
+    {
+        case VLOG_OK:
+            return TDB_SUCCESS;
+        case VLOG_ERR_RANGE:
+            return TDB_ERR_INVALID_ARGS;
+        case VLOG_ERR_CORRUPTION:
+            return TDB_ERR_CORRUPTION;
+        case VLOG_ERR_MEMORY:
+            return TDB_ERR_MEMORY;
+        /* compaction can replace a reference between finding the version and pinning its file */
+        case VLOG_ERR_NOT_FOUND:
+        case VLOG_ERR_BUSY:
+            return TDB_ERR_BUSY;
+        default:
+            return TDB_ERR_IO;
+    }
+}
+
+/* outputs requested from the visible version. contains requests none */
+typedef struct
+{
+    uint8_t** value;
+    size_t* value_size;
+    int64_t* ttl;
+    const txn_value_range_t* range;
+    int track;
+} txn_read_request_t;
+
 /* the store half of a get, at a ceiling the caller holds -- the external source stack at that
  * snapshot, absorbing a transient busy internally, with the read recorded for validation when the
  * level keeps a read set */
-static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
-                         const tidesdb_source_t *sources, int num_sources, const uint64_t snapshot,
-                         uint8_t **value, size_t *value_size, int64_t *ttl, int record_read)
+static int txn_get_store(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                         const tidesdb_source_t* sources, int num_sources, const uint64_t snapshot,
+                         const txn_read_request_t* read)
 {
     for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
     {
-        tidesdb_source_version_t v;
-        const tidesdb_source_result_t r =
+        tidesdb_source_version_t v = {0};
+        tidesdb_source_result_t r =
             tidesdb_source_stack_get(sources, num_sources, cf_index, key, key_size, snapshot, &v);
+
+        if (r == TDB_SOURCE_FOUND && !v.deleted && (read->value || read->ttl))
+        {
+            const int rc = txn_load_value(&v, read->range);
+            if (rc == TDB_ERR_BUSY)
+                r = TDB_SOURCE_BUSY;
+            else if (rc != TDB_SUCCESS)
+            {
+                free(v.value);
+                return rc;
+            }
+        }
 
         /* record the read for conflict validation. an absent read is recorded at the snapshot so a
          * later insert is caught; a hit is recorded at the version's seq. only when tracking and
          * only for the levels that keep a read set. a failed record cannot guarantee isolation */
-        const int track = record_read && txn->readset;
+        const int track = read->track && txn->readset;
 
         if (r == TDB_SOURCE_NOT_FOUND)
         {
@@ -417,14 +504,14 @@ static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, 
                 free(v.value);
                 return TDB_ERR_NOT_FOUND; /* a visible tombstone reads as not-found */
             }
-            if (value)
+            if (read->value)
             {
-                *value = v.value; /* ownership transfers to the caller */
-                *value_size = v.value_size;
+                *read->value = v.value; /* ownership transfers to the caller */
+                *read->value_size = v.value_size;
             }
             else
                 free(v.value);
-            if (ttl) *ttl = v.ttl > 0 ? v.ttl : -1;
+            if (read->ttl) *read->ttl = v.ttl > 0 ? v.ttl : -1;
             return TDB_SUCCESS;
         }
         /* TDB_SOURCE_BUSY -- back off and retry; never surface it */
@@ -437,11 +524,11 @@ static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, 
                         */
 }
 
-static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
-                        const tidesdb_source_t *sources, int num_sources, uint8_t **value,
-                        size_t *value_size, int64_t *ttl, int record_read)
+static int txn_get_impl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                        const tidesdb_source_t* sources, int num_sources,
+                        const txn_read_request_t* read)
 {
-    if (!key || (!ttl && (!value || !value_size))) return TDB_ERR_INVALID_ARGS;
+    if (!key) return TDB_ERR_INVALID_ARGS;
     const int active = txn_require_active(txn);
     if (active != TDB_SUCCESS) return active;
 
@@ -451,33 +538,24 @@ static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
     if (tidesdb_writeset_lookup(txn->writeset, cf_index, key, key_size, &own))
     {
         if (own.flags & TDB_WAL_ENTRY_TOMBSTONE) return TDB_ERR_NOT_FOUND;
-        if (ttl && own.ttl > 0)
+        if (read->ttl && own.ttl > 0)
         {
             const int64_t now = txn->now ? atomic_load_explicit(txn->now, memory_order_relaxed)
                                          : (int64_t)time(NULL);
             if (own.ttl <= now) return TDB_ERR_NOT_FOUND;
         }
-        if (value)
-        {
-            uint8_t *copy = NULL;
-            if (own.value_size)
-            {
-                copy = malloc(own.value_size);
-                if (!copy) return TDB_ERR_MEMORY;
-                memcpy(copy, own.value, own.value_size);
-            }
-            *value = copy;
-            *value_size = own.value_size;
-        }
-        if (ttl) *ttl = own.ttl > 0 ? own.ttl : -1;
+        if (read->value)
+            return txn_copy_value(own.value, own.value_size, read->range, read->value,
+                                  read->value_size);
+        if (read->ttl) *read->ttl = own.ttl > 0 ? own.ttl : -1;
         return TDB_SUCCESS;
     }
 
     /* the ceiling is held against the reclamation floor for as long as the store is being read */
     uint64_t snapshot = 0;
     if (tdb_txn_read_hold(txn, &snapshot) != 0) return TDB_ERR_IO;
-    const int rc = txn_get_store(txn, cf_index, key, key_size, sources, num_sources, snapshot,
-                                 value, value_size, ttl, record_read);
+    const int rc =
+        txn_get_store(txn, cf_index, key, key_size, sources, num_sources, snapshot, read);
     tdb_txn_read_release(txn);
     return rc;
 }
@@ -486,15 +564,30 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
                 const tidesdb_source_t *sources, int num_sources, uint8_t **value,
                 size_t *value_size)
 {
-    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, value, value_size, NULL,
-                        1);
+    if (!value || !value_size) return TDB_ERR_INVALID_ARGS;
+    const txn_read_request_t read = {.value = value, .value_size = value_size, .track = 1};
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
+}
+
+int tdb_txn_get_range(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
+                      const tidesdb_source_t* sources, int num_sources, size_t offset,
+                      size_t length, uint8_t** value, size_t* value_size)
+{
+    if (!value || !value_size || key_size == 0 || key_size > SIZE_MAX - TDB_CF_PREFIX_SIZE ||
+        length > SIZE_MAX - offset)
+        return TDB_ERR_INVALID_ARGS;
+    const txn_value_range_t range = {offset, length};
+    const txn_read_request_t read = {
+        .value = value, .value_size = value_size, .range = &range, .track = 1};
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
 }
 
 int tdb_txn_get_ttl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
                     const tidesdb_source_t *sources, int num_sources, int64_t *ttl)
 {
     if (!ttl || key_size == 0) return TDB_ERR_INVALID_ARGS;
-    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, NULL, NULL, ttl, 1);
+    const txn_read_request_t read = {.ttl = ttl, .track = 1};
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
 }
 
 int tdb_txn_record_scan(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,
@@ -518,19 +611,16 @@ int tdb_txn_get_notrack(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, s
                         const tidesdb_source_t *sources, int num_sources, uint8_t **value,
                         size_t *value_size)
 {
-    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, value, value_size, NULL,
-                        0);
+    if (!value || !value_size) return TDB_ERR_INVALID_ARGS;
+    const txn_read_request_t read = {.value = value, .value_size = value_size};
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
 }
 
 int tdb_txn_contains(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
                      const tidesdb_source_t *sources, int num_sources)
 {
-    uint8_t *value = NULL;
-    size_t value_size = 0;
-    const int rc = txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &value,
-                                &value_size, NULL, 0);
-    if (rc == TDB_SUCCESS) free(value);
-    return rc;
+    const txn_read_request_t read = {0};
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
 }
 
 uint64_t tdb_txn_commit_seq(const tdb_txn_t *txn)

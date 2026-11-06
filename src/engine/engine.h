@@ -348,6 +348,23 @@ int engine_txn_get(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
                    uint8_t **value, size_t *value_size);
 
 /**
+ * engine_txn_get_range
+ * read a byte range through the database's transaction sources
+ * @param txn the transaction
+ * @param cf column family belonging to the transaction's database
+ * @param key non-NULL key bytes
+ * @param key_size length of key, greater than zero
+ * @param offset first logical byte in the range, at most the value length
+ * @param length number of bytes, at most the remaining length
+ * @param value out -- allocated slice, NULL for an empty range
+ * @param value_size out -- the number of bytes returned on success
+ * @return the same errors as engine_txn_get, plus TDB_ERR_INVALID_ARGS for a range outside the
+ * value
+ */
+int engine_txn_get_range(tidesdb_txn_t* txn, cf_t* cf, const uint8_t* key, size_t key_size,
+                         size_t offset, size_t length, uint8_t** value, size_t* value_size);
+
+/**
  * engine_txn_get_ttl
  * read the visible key's absolute expiry using the transaction's snapshot and read tracking
  * @param txn the transaction

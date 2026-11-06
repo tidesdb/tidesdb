@@ -50,19 +50,8 @@ static tidesdb_source_result_t l0_source_get(void *ctx, uint32_t cf_index, const
                                          &value_size, &vlog_id, &ttl, &deleted, &seq);
     if (rc == TDB_SUCCESS)
     {
-        /* a live value the commit separated is held here as an id, so this source resolves it the
-         * way the sstable source resolves its own -- a source hands back bytes, never a reference,
-         * so the layers above it see one kind of answer */
-        if (!deleted && vlog_id != 0)
-        {
-            uint8_t *resolved = NULL;
-            size_t resolved_len = 0;
-            if (!actx->vlog || vlog_read(actx->vlog, vlog_id, &resolved, &resolved_len) != VLOG_OK)
-                return TDB_SOURCE_BUSY;
-            free(value);
-            value = resolved;
-            value_size = resolved_len;
-        }
+        out->vlog = actx->vlog;
+        out->vlog_id = vlog_id;
         out->seq = seq;
         out->value = value;
         out->value_size = value_size;

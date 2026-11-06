@@ -163,6 +163,14 @@ int engine_txn_get(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
                        ENGINE_NUM_SOURCES, value, value_size);
 }
 
+int engine_txn_get_range(tidesdb_txn_t* txn, cf_t* cf, const uint8_t* key, size_t key_size,
+                         size_t offset, size_t length, uint8_t** value, size_t* value_size)
+{
+    if (!txn || !cf || cf->vlog != txn->db->vlog) return TDB_ERR_INVALID_ARGS;
+    return tdb_txn_get_range(txn->inner, (uint32_t)cf->cf_id, key, key_size, txn->db->sources,
+                             ENGINE_NUM_SOURCES, offset, length, value, value_size);
+}
+
 int engine_txn_get_ttl(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_size,
                        int64_t *ttl)
 {

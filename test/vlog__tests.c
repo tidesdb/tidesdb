@@ -690,6 +690,36 @@ void test_mixed_codecs_in_one_store(void)
     vlog_close(v);
 }
 
+/* an encoded KV slice uses logical offsets after decoding; a verbatim slice spanning multiple
+ * checksum chunks must copy both ends from the same bytes it verified */
+void test_range_reads_across_chunks_and_codecs(void)
+{
+    fresh_dir();
+    vlog_t* v = open_store(TDB_COMPRESS_NONE, 0);
+    const size_t size = 4 * V_LARGE;
+    const size_t offset = V_LARGE;
+    const size_t length = size - 2 * offset;
+    uint8_t* input = runs(size, 5);
+    ASSERT_TRUE(input != NULL);
+    const uint8_t codec = TDB_COMPRESS_LZ4, identity = TDB_COMPRESS_NONE;
+    vlog_id_t ids[3];
+    ASSERT_EQ(vlog_write(v, input, size, NULL, 0, &ids[0], NULL), VLOG_OK);
+    ASSERT_EQ(vlog_write(v, input, size, &codec, 1, &ids[1], NULL), VLOG_OK);
+    ASSERT_EQ(vlog_write(v, input, size, &identity, 1, &ids[2], NULL), VLOG_OK);
+
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i)
+    {
+        uint8_t* slice = NULL;
+        size_t slice_len = 0;
+        ASSERT_EQ(vlog_read_range(v, ids[i], offset, length, &slice, &slice_len), VLOG_OK);
+        ASSERT_EQ(slice_len, length);
+        ASSERT_EQ(memcmp(slice, input + offset, length), 0);
+        free(slice);
+    }
+    free(input);
+    vlog_close(v);
+}
+
 void test_compression_compressible(void)
 {
     fresh_dir();
@@ -2811,6 +2841,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_stats_used_bytes, tests_passed);
     RUN_TEST(test_stacked_chain_round_trips, tests_passed);
     RUN_TEST(test_mixed_codecs_in_one_store, tests_passed);
+    RUN_TEST(test_range_reads_across_chunks_and_codecs, tests_passed);
     RUN_TEST(test_compression_compressible, tests_passed);
     RUN_TEST(test_compression_incompressible, tests_passed);
     RUN_TEST(test_writes_roll_into_several_segments, tests_passed);

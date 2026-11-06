@@ -16,8 +16,8 @@
 
 /* the cf sstable source reads one column family's on-disk levels as a transaction read source.
  * these tests build a real cf, flush sstables into it, and drive cf_source directly: snapshot
- * visibility, highest-seq-wins across overlapping L1 files, tombstones, spilled-value resolution
- * through the vlog, top-down level shadowing, and misses -- no engine, no txn. */
+ * visibility, highest-seq-wins across overlapping L1 files, tombstones, separated value references
+ * into the vlog, top-down level shadowing, and misses -- no engine, no txn. */
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -235,8 +235,7 @@ void test_cf_source_tombstone(void)
     cs_db_close(&db);
 }
 
-/* a value larger than the spill threshold comes back resolved through the vlog, not as a raw offset
- */
+/* the visible version carries the id a reader can resolve or skip for an existence probe */
 void test_cf_source_spilled_value(void)
 {
     cs_db_t db;
@@ -250,7 +249,10 @@ void test_cf_source_spilled_value(void)
     ASSERT_EQ(cs_get(db.cf, "big", UINT64_MAX, &out), TDB_SOURCE_FOUND);
     ASSERT_EQ(out.deleted, 0);
     ASSERT_EQ((int)out.value_size, (int)sizeof(big));
-    ASSERT_TRUE(out.value != NULL && memcmp(out.value, big, sizeof(big)) == 0);
+    ASSERT_TRUE(out.value == NULL && out.vlog == db.vlog);
+    ASSERT_EQ(vlog_read(out.vlog, out.vlog_id, &out.value, &out.value_size), VLOG_OK);
+    ASSERT_EQ(out.value_size, sizeof(big));
+    ASSERT_TRUE(memcmp(out.value, big, sizeof(big)) == 0);
     free(out.value);
 
     cs_db_close(&db);

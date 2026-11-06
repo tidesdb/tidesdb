@@ -41,10 +41,12 @@ typedef enum
  * tidesdb_source_version_t
  * a version of a key returned by a source
  * @param seq the version's commit sequence number
- * @param value malloc'd copy of the value on a live hit (caller frees), NULL for a tombstone
+ * @param value owned inline bytes (caller frees), NULL for a separated value or tombstone
  * @param value_size length of value, 0 for a tombstone
  * @param ttl the entry's expiry time, or -1 for none
  * @param deleted 1 when the version is a tombstone, else 0
+ * @param vlog borrowed value log for a separated version
+ * @param vlog_id logical value id for a separated version, zero otherwise
  */
 typedef struct
 {
@@ -53,6 +55,8 @@ typedef struct
     size_t value_size;
     int64_t ttl;
     int deleted;
+    struct vlog* vlog;
+    uint64_t vlog_id;
 } tidesdb_source_version_t;
 
 /**

@@ -94,6 +94,7 @@
 #define VLOG_ERR_NOT_FOUND  (-5)
 #define VLOG_ERR_FULL       (-6)
 #define VLOG_ERR_BUSY       (-7)
+#define VLOG_ERR_RANGE      (-8)
 
 /* opaque logical value id stored in a klog entry in place of a physical offset. */
 typedef uint64_t vlog_id_t;
@@ -322,6 +323,22 @@ int vlog_seal_idle_groups(vlog_t* vlog, int max, int* out_freed);
  *         VLOG_ERR_MEMORY, or VLOG_ERR_IO
  */
 int vlog_read(vlog_t *vlog, vlog_id_t id, uint8_t **out_value, size_t *out_len);
+
+/**
+ * vlog_read_range
+ * reads a bounded value slice after validating the resolved record's complete block checksum
+ * @param vlog value log handle
+ * @param id non-zero logical value id
+ * @param offset byte offset within the uncompressed value
+ * @param length bytes to return, including zero at EOF
+ * @param out_value receives an allocated slice the caller frees, or NULL for an empty slice
+ * @param out_len receives length on success, zero for an empty slice
+ * @return VLOG_OK, VLOG_ERR_INVALID, VLOG_ERR_NOT_FOUND, VLOG_ERR_RANGE when offset and length
+ *         are outside the value, VLOG_ERR_CORRUPTION for a bad frame or value metadata,
+ *         VLOG_ERR_MEMORY, or VLOG_ERR_IO for a positioned storage failure
+ */
+int vlog_read_range(vlog_t* vlog, vlog_id_t id, size_t offset, size_t length, uint8_t** out_value,
+                    size_t* out_len);
 
 /**
  * vlog_reclaim

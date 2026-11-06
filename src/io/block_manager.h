@@ -80,6 +80,15 @@ typedef enum
     BLOCK_MANAGER_STRICT_BLOCK_VALIDATION = 1 /* error on validation */
 } tidesdb_block_validation_mode_t;
 
+/* result classes for a positioned, checksummed frame read. callers that resolved an offset from
+ * durable metadata need to distinguish a bad frame from a device failure without treating either
+ * as a caller range error. */
+#define BLOCK_MANAGER_READ_OK             0
+#define BLOCK_MANAGER_READ_ERR_INVALID    (-1)
+#define BLOCK_MANAGER_READ_ERR_IO         (-2)
+#define BLOCK_MANAGER_READ_ERR_CORRUPTION (-3)
+#define BLOCK_MANAGER_READ_ERR_MEMORY     (-4)
+
 /**
  * block_manager_t
  * block manager struct
@@ -745,5 +754,26 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, uint64_t offset
 const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, uint64_t offset,
                                                          uint32_t payload_hint,
                                                          uint32_t *data_size);
+
+/**
+ * block_manager_read_verified_block_slices
+ * verifies one framed block while retaining only a prefix and one positioned payload slice
+ * @param bm the block manager to read from
+ * @param offset the file offset of the block header
+ * @param prefix_size bytes from the beginning of the payload to copy, zero when prefix is NULL
+ * @param prefix receives the prefix when prefix_size is non-zero
+ * @param slice_offset payload-relative start of the selected slice
+ * @param slice_size bytes to copy at slice_offset, zero when slice is NULL
+ * @param slice receives the selected slice when slice_size is non-zero
+ * @param payload_size receives the complete payload length after a verified read
+ * @return BLOCK_MANAGER_READ_OK, BLOCK_MANAGER_READ_ERR_INVALID for invalid arguments,
+ *         BLOCK_MANAGER_READ_ERR_CORRUPTION for a malformed frame or checksum mismatch,
+ *         BLOCK_MANAGER_READ_ERR_MEMORY when bounded scratch allocation fails, or
+ *         BLOCK_MANAGER_READ_ERR_IO when positioned storage reads fail
+ */
+int block_manager_read_verified_block_slices(block_manager_t* bm, uint64_t offset,
+                                             uint32_t prefix_size, uint8_t* prefix,
+                                             uint32_t slice_offset, uint32_t slice_size,
+                                             uint8_t* slice, uint32_t* payload_size);
 
 #endif /* __BLOCK_MANAGER_H__ */

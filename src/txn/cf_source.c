@@ -29,16 +29,15 @@
 #define CF_SOURCE_RANGE_NO_CACHE 0
 
 /* scan one level for the newest version of key visible at snapshot. on TDB_SOURCE_FOUND, best holds
- * the winning version -- with best->value still NULL and *vlog set when the value spilled, for the
+ * the winning version -- with best->value still NULL and its id set when the value spilled, for the
  * caller to resolve. a busy or io candidate taints the level -- without reading it the max cannot
  * be trusted, so the whole level returns BUSY for the caller to retry rather than risk a stale
  * older version. */
-static tidesdb_source_result_t cf_source_scan_level(cf_t *cf, int level, const uint8_t *key,
+static tidesdb_source_result_t cf_source_scan_level(cf_t* cf, int level, const uint8_t* key,
                                                     size_t key_size, uint64_t snapshot,
-                                                    tidesdb_source_version_t *best, uint64_t *vlog)
+                                                    tidesdb_source_version_t* best)
 {
     *best = (tidesdb_source_version_t){0};
-    *vlog = 0;
 
     /* collect straight into a stack buffer rather than asking the level for a count first. the
      * collect reports how many overlap even when more overlap than fit, so one call gives both the
@@ -99,7 +98,8 @@ static tidesdb_source_result_t cf_source_scan_level(cf_t *cf, int level, const u
                 best->value_size = value_size;
                 best->ttl = ttl;
                 best->deleted = deleted;
-                *vlog = voff;
+                best->vlog = cf->vlog;
+                best->vlog_id = voff;
                 found = 1;
             }
             else
@@ -126,11 +126,7 @@ static tidesdb_source_result_t cf_source_scan_level(cf_t *cf, int level, const u
  * to, since it names no value and no expiry, only the sequence it deleted from */
 static void cf_source_deleted_at(const uint64_t seq, tidesdb_source_version_t *out)
 {
-    out->seq = seq;
-    out->value = NULL;
-    out->value_size = 0;
-    out->ttl = TDB_TTL_NONE;
-    out->deleted = 1;
+    *out = (tidesdb_source_version_t){.seq = seq, .ttl = TDB_TTL_NONE, .deleted = 1};
 }
 
 /* the source's point lookup walks the cf's levels top-down and returns the first level that holds a
@@ -174,9 +170,8 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
         if (!(occupied & (1u << (level - 1)))) continue;
 
         tidesdb_source_version_t best;
-        uint64_t vlog_id = 0;
         const tidesdb_source_result_t r =
-            cf_source_scan_level(cf, level, key, key_size, snapshot, &best, &vlog_id);
+            cf_source_scan_level(cf, level, key, key_size, snapshot, &best);
         if (r == TDB_SOURCE_BUSY) return TDB_SOURCE_BUSY;
         if (r == TDB_SOURCE_NOT_FOUND) continue;
 
@@ -197,16 +192,6 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
             return TDB_SOURCE_FOUND;
         }
 
-        /* a live spilled value comes back as a vlog id to resolve; a tombstone carries no value */
-        if (!best.deleted && best.value == NULL && vlog_id != 0)
-        {
-            uint8_t *resolved = NULL;
-            size_t resolved_len = 0;
-            if (vlog_read(cf->vlog, vlog_id, &resolved, &resolved_len) != VLOG_OK)
-                return TDB_SOURCE_BUSY;
-            best.value = resolved;
-            best.value_size = resolved_len;
-        }
         *out = best;
         return TDB_SOURCE_FOUND;
     }

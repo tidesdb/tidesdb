@@ -2628,6 +2628,20 @@ void test_engine_reaper_evicts_vlog_before_the_first_sstable(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
+/* a stats scan can briefly borrow a cold file. count installed handles directly so that
+ * temporary borrow cannot be mistaken for a descriptor retained by backup. */
+static void engine_assert_only_active_vlog_resident(tidesdb_t *db)
+{
+    vlog_t *v = db->vlog;
+    const uint32_t active = atomic_load(&v->active_slot);
+    const uint32_t high = atomic_load(&v->seg_high);
+    ASSERT_TRUE(active < high);
+    for (uint32_t slot = 0; slot < high; ++slot)
+        ASSERT_EQ(atomic_load(&v->segments[slot].bm) != NULL, slot == active);
+    ASSERT_TRUE(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT) <=
+                fd_manager_open_budget(&db->fdm));
+}
+
 /* the backup must inventory every retained value-log file without warming all of them, then its
  * directly-openable copy must recover with room for a fresh append segment under a real fd limit.
  */
@@ -2674,10 +2688,10 @@ void test_engine_backup_extended_vlog_respects_fd_budget(void)
         if (i > 0) ASSERT_EQ(vlog_segment_evict(db->vlog, i - 1), 1);
     }
     ASSERT_EQ(vlog_max_segments(db->vlog), ENGINE_TEST_EXTENDED_SLOT_CAPACITY);
-    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT), 1);
+    engine_assert_only_active_vlog_resident(db);
 
     ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_BACKUP_DIR), TDB_SUCCESS);
-    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT), 1);
+    engine_assert_only_active_vlog_resident(db);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
     char backup_path[] = ENGINE_TEST_BACKUP_DIR;

@@ -10,6 +10,11 @@
 #include "base/waitstat.h" /* tdb_wait_deadline and the condvar clock it pairs with */
 #include "block_manager_internal.h"
 
+/* inline the streaming updates so the compiler can specialize the default XXH3 state across
+ * spans. compute_checksum above still calls the shared one-shot implementation. */
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 /* record the errno of a failed write or sync on the handle, and say so once per handle. a full
  * device is the one io failure a user can act on, and it otherwise reaches them as a bare io error
  * from whichever operation happened to be running -- which is how a filled disk gets mistaken for a
@@ -272,6 +277,9 @@ static int bm_flush_drain(block_manager_t *bm)
     uint64_t p = fl;
     while (p < reserved && bm_done(bm, p))
     {
+        /* a follower may reuse the oversized writer's ring slot. acquiring its done flag also
+         * observes that writer's frontier advance, so retry before decoding at the old offset. */
+        if (p == fl && atomic_load_explicit(&bm->buf_flushed, memory_order_acquire) != fl) return 0;
         const uint32_t rs = bm_ring_read_u32(bm->ring, R, p);
         atomic_store_explicit(&bm->done_ring[p % R], 0, memory_order_relaxed);
         p += BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)rs + BLOCK_MANAGER_FOOTER_SIZE;
@@ -423,177 +431,137 @@ static inline void bm_wake_flush(block_manager_t *bm)
     }
 }
 
-/**
- * bm_buffered_append
- * append path for a buffered block manager. reserves a file offset lock-free (current_file_size
- * fetch-add), waits for ring space if the slot is still unflushed (backpressure), copies the framed
- * block into the ring in parallel with other appenders, and sets its done_ring flag -- it does not
- * pwrite, the flush thread does. a record larger than the whole ring takes the oversized path,
- * becoming the flush frontier and writing itself straight to the file.
- * @param bm the block manager
- * @param data the payload to frame and append
- * @param size the payload size in bytes
- * @param wake non-zero to signal the flush thread after staging, which a batch defers to its last
- * record so one batch costs one signal rather than one per record
- * @return the reserved file offset the record was written at, or -1 on a flush I/O error
- */
-static int64_t bm_buffered_append(block_manager_t *bm, const void *data, const uint32_t size,
-                                  int wake)
+/* the scalar one-shot and streaming forms hash exactly the same concatenation. keep the large
+ * aligned streaming state off the ordinary single-span path. */
+static int bm_checksum_spans(const struct iovec *spans, int count, uint32_t *checksum)
 {
-    const size_t total = BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)size + BLOCK_MANAGER_FOOTER_SIZE;
-    const uint64_t R = bm->ring_size;
-    const uint32_t checksum = compute_checksum(data, size);
-
-    const uint64_t off = atomic_fetch_add(&bm->current_file_size, total);
-    const uint64_t end = off + total;
-
-    /* extend the on-disk extent here rather than on the flush thread, so the write it later issues
-     * lands inside an allocated region instead of growing the file. an extending write takes the
-     * inode's write lock exclusively and journals the new size, which puts the log's small append
-     * behind whatever else is using the filesystem's journal */
-    maybe_extend_allocation(bm, end);
-
-    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
-    bm_encode_frame(header, footer, size, checksum);
-
-    /* a record larger than the whole ring cannot be staged -- it would wrap onto itself. wait to
-     * become the flush frontier (buf_flushed == off means every prior record is written and the
-     * flush thread is parked at off), pwrite the framed record straight to the file, then publish
-     * the advanced flushed watermark directly. backpressure holds every later appender until
-     * publication, so none reuses a ring slot this span aliases. rare -- only oversized commit
-     * batches.
-     */
-    if (total > R)
+    XXH3_state_t state;
+    if (XXH3_64bits_reset(&state) != XXH_OK) return -1;
+    for (int i = 0; i < count; ++i)
     {
-        if (bm_wait_flushed(bm, off) != 0) return -1;
-
-        struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
-        iov[0].iov_base = (void *)header;
-        iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-        iov[1].iov_base = (void *)(uintptr_t)data;
-        iov[1].iov_len = size;
-        iov[2].iov_base = (void *)footer;
-        iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
-        int rc = tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)off) ==
-                         (ssize_t)total
-                     ? 0
-                     : -1;
-        if (rc == 0 && bm_sync_after_write(bm) != 0) rc = -1;
-        if (rc != 0)
-            bm_note_write_failure(bm);
-        else
-            atomic_store_explicit(&bm->buf_flushed, end, memory_order_release);
-        bm_wake_flush(bm);
-        pthread_mutex_lock(&bm->buf_mtx);
-        pthread_cond_broadcast(&bm->buf_durable_cv);
-        pthread_mutex_unlock(&bm->buf_mtx);
-        return rc != 0 ? -1 : (int64_t)off;
+        if (spans[i].iov_len &&
+            XXH3_64bits_update(&state, spans[i].iov_base, spans[i].iov_len) != XXH_OK)
+            return -1;
     }
+    *checksum = (uint32_t)XXH3_64bits_digest(&state);
+    return 0;
+}
 
-    /* backpressure prevents clobbering unflushed data -- this ring slot last held bytes
-     * [off-R, end-R), so wait until they are flushed. a no-op on the first pass (end <= R). */
+/* every span, including a span split across the wrap, must be in the ring before the flush
+ * thread can acquire the completion flag. a batch defers the wake until its last record. */
+static int64_t bm_stage_frame(block_manager_t *bm, const struct iovec *iov, int count, uint64_t off,
+                              uint64_t end, int wake)
+{
+    const uint64_t R = bm->ring_size;
     if (end > R && bm_wait_flushed(bm, end - R) != 0) return -1;
-
-    bm_ring_copy(bm->ring, R, off, header, BLOCK_MANAGER_BLOCK_HEADER_SIZE);
-    bm_ring_copy(bm->ring, R, off + BLOCK_MANAGER_BLOCK_HEADER_SIZE, data, size);
-    bm_ring_copy(bm->ring, R, off + BLOCK_MANAGER_BLOCK_HEADER_SIZE + size, footer,
-                 BLOCK_MANAGER_FOOTER_SIZE);
-
-    /* publish completion -- release-ordered so the flush thread, on seeing the flag, sees the whole
-     * framed record. no waiting on other appenders; the flush thread advances over the contiguous
-     * run of set flags itself. seq_cst pairs with the flush thread's sleeping-flag StoreLoad. */
+    uint64_t pos = off;
+    for (int i = 0; i < count; ++i)
+    {
+        bm_ring_copy(bm->ring, R, pos, iov[i].iov_base, iov[i].iov_len);
+        pos += iov[i].iov_len;
+    }
     atomic_store_explicit(&bm->done_ring[off % R], (unsigned char)1, memory_order_seq_cst);
     if (wake) bm_wake_flush(bm);
     return (int64_t)off;
 }
 
-/**
- * bm_append_block
- * append one framed block [size][checksum][data][size][magic] at the atomically
- * reserved tail offset via a single pwritev. shared by block_write and write_raw
- * so the on-disk encoding lives in one place. data must be non-NULL and size
- * non-zero -- the caller validates (a zero size_field reads back as EOF).
- * @param bm the block manager
- * @param data the payload to frame and append
- * @param size the payload size in bytes
- * @return the offset written at, or -1 on failure
- */
-static int64_t bm_append_block(block_manager_t *bm, const void *data, const uint32_t size)
+/* reserve exactly one representable file extent. each failed CAS observes another reservation. */
+static int64_t bm_reserve_frame(block_manager_t *bm, uint64_t total)
 {
-    if (bm->buffered) return bm_buffered_append(bm, data, size, 1);
+    const uint64_t max_extent = sizeof(off_t) < sizeof(int64_t) ? INT32_MAX : INT64_MAX;
+    uint64_t off = atomic_load(&bm->current_file_size);
+    do
+    {
+        if (total > max_extent || off > max_extent - total) return -1;
+    } while (!atomic_compare_exchange_strong(&bm->current_file_size, &off, off + total));
+    return (int64_t)off;
+}
 
-    /* a file whose write or sync has failed stays failed. the kernel may have dropped the pages
-     * that failed and reports the error once, so a later write here could sync clean and report
-     * bytes durable that are not, and the buffered path refuses for the same reason */
-    if (BM_UNLIKELY(atomic_load_explicit(&bm->flush_error, memory_order_acquire))) return -1;
+/* scalar and vectored callers supply the same logical payload. the count and sum have been
+ * validated before this point. frame it once for either the staging ring or positioned I/O. */
+static int64_t bm_append_frame(block_manager_t *bm, const struct iovec *spans, int count,
+                               uint32_t size, int wake)
+{
+    const uint64_t total = block_manager_framed_size(size);
+    if (total > SIZE_MAX || total > (uint64_t)SSIZE_MAX ||
+        BM_UNLIKELY(atomic_load_explicit(&bm->flush_error, memory_order_acquire)))
+        return -1;
 
-    const size_t total_size =
-        BLOCK_MANAGER_BLOCK_HEADER_SIZE + (size_t)size + BLOCK_MANAGER_FOOTER_SIZE;
-    const uint32_t checksum = compute_checksum(data, size);
+    uint32_t checksum;
+    if (count == 1)
+        checksum = compute_checksum(spans[0].iov_base, size);
+    else if (bm_checksum_spans(spans, count, &checksum) != 0)
+        return -1;
 
-    /* atomically reserve space, then extend preallocation so the pwrite stays in-place */
-    const int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
-    maybe_extend_allocation(bm, (uint64_t)offset + total_size);
-
-    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    unsigned char footer[BLOCK_MANAGER_FOOTER_SIZE];
+    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE], footer[BLOCK_MANAGER_FOOTER_SIZE];
     bm_encode_frame(header, footer, size, checksum);
+    struct iovec frame[1 + BLOCK_MANAGER_MAX_PAYLOAD_SPANS + 1] = {{header, sizeof(header)}};
+    int n = 1;
+    for (int i = 0; i < count; ++i)
+        if (spans[i].iov_len) frame[n++] = spans[i];
+    frame[n++] = (struct iovec){footer, sizeof(footer)};
 
-    /* header + data + footer in a single pwritev -- zero copy from data */
-    struct iovec iov[BLOCK_MANAGER_IOVECS_PER_BLOCK];
-    iov[0].iov_base = (void *)header;
-    iov[0].iov_len = BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    iov[1].iov_base = (void *)(uintptr_t)data;
-    iov[1].iov_len = size;
-    iov[2].iov_base = (void *)footer;
-    iov[2].iov_len = BLOCK_MANAGER_FOOTER_SIZE;
+    const int64_t off = bm_reserve_frame(bm, total);
+    if (off < 0) return -1;
+    const uint64_t end = (uint64_t)off + total;
+    maybe_extend_allocation(bm, end);
+    if (bm->buffered)
+    {
+        if (total <= bm->ring_size) return bm_stage_frame(bm, frame, n, (uint64_t)off, end, wake);
+        /* a record larger than the ring writes itself once all earlier records have drained.
+         * later appenders cannot reuse a slot until this writer advances the frontier. */
+        if (bm_wait_flushed(bm, (uint64_t)off) != 0) return -1;
+    }
 
 #ifdef TDB_FAULT_INJECTION
     if (block_manager_fault_intercept_barrier()) block_manager_fault_freeze(); /* never returns */
 #endif
     const uint64_t started_us = tdb_monotonic_us();
-    const ssize_t wrote =
-        tdb_pwritev_safe(bm->fd, iov, BLOCK_MANAGER_IOVECS_PER_BLOCK, (off_t)offset);
-    bm_note_io(bm, total_size, started_us);
-    if (BM_UNLIKELY(wrote != (ssize_t)total_size))
+    const ssize_t wrote = tdb_pwritev_safe(bm->fd, frame, n, (off_t)off);
+    /* a positive short write has no errno. save a real failure before timing calls can change it.
+     */
+    const int write_errno = wrote < 0 ? errno : EIO;
+    bm_note_io(bm, total, started_us);
+    const int short_write = wrote != (ssize_t)total;
+    if (short_write) errno = write_errno;
+    const int failed = short_write || bm_sync_after_write(bm) != 0;
+    if (failed) bm_note_write_failure(bm);
+    if (bm->buffered)
     {
-        bm_note_write_failure(bm);
-        return -1;
+        if (!failed) atomic_store_explicit(&bm->buf_flushed, end, memory_order_release);
+        bm_wake_flush(bm);
+        pthread_mutex_lock(&bm->buf_mtx);
+        pthread_cond_broadcast(&bm->buf_durable_cv);
+        pthread_mutex_unlock(&bm->buf_mtx);
     }
-
-    /* with O_DSYNC the pwrite already synced; otherwise fall back to fdatasync */
-    if (bm_sync_after_write(bm) != 0)
-    {
-        bm_note_write_failure(bm);
-        return -1;
-    }
-
-    return offset;
+    return failed ? -1 : off;
 }
 
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
-    if (BM_UNLIKELY(!bm || !block)) return -1;
-
-    /* block size is stored as uint32_t, thus enforced 4GB limit */
-    if (BM_UNLIKELY(block->size > UINT32_MAX)) return -1;
-
-    /* a zero-size block encodes size_field == 0, which every reader treats as EOF;
-     * reject it so it can never truncate iteration (matches write_raw) */
-    if (BM_UNLIKELY(block->size == 0)) return -1;
-
-    /* guard size_t overflow of the framed total on 32-bit platforms */
-    if (block->size > SIZE_MAX - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
-        return -1;
-
-    return bm_append_block(bm, block->data, (uint32_t)block->size);
+    if (BM_UNLIKELY(!block || block->size > UINT32_MAX)) return -1;
+    return block_manager_write_raw(bm, block->data, (uint32_t)block->size);
 }
 
 int64_t block_manager_write_raw(block_manager_t *bm, const void *data, const uint32_t size)
 {
     if (BM_UNLIKELY(!bm || !data || size == 0)) return -1;
-    return bm_append_block(bm, data, size);
+    const struct iovec span = {(void *)(uintptr_t)data, size};
+    return bm_append_frame(bm, &span, 1, size, 1);
+}
+
+int64_t block_manager_write_rawv(block_manager_t *bm, const struct iovec *spans, int count)
+{
+    if (!bm || !spans || count <= 0 || count > BLOCK_MANAGER_MAX_PAYLOAD_SPANS) return -1;
+    uint32_t size = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        if ((!spans[i].iov_base && spans[i].iov_len) || spans[i].iov_len > UINT32_MAX - size)
+            return -1;
+        size += (uint32_t)spans[i].iov_len;
+    }
+    if (size == 0) return -1; /* a zero size field reads back as EOF */
+    return bm_append_frame(bm, spans, count, size, 1);
 }
 
 int64_t block_manager_block_write_durable(block_manager_t *bm, block_manager_block_t *block)
@@ -752,8 +720,8 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
                 continue;
             }
             if (blocks[i]->size > UINT32_MAX) return -1;
-            const int64_t off =
-                bm_buffered_append(bm, blocks[i]->data, (uint32_t)blocks[i]->size, 0);
+            const struct iovec span = {.iov_base = blocks[i]->data, .iov_len = blocks[i]->size};
+            const int64_t off = bm_append_frame(bm, &span, 1, (uint32_t)blocks[i]->size, 0);
             if (off < 0) return -1;
             offsets[i] = off;
             staged++;

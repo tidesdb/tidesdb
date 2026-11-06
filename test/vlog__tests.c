@@ -169,7 +169,7 @@ static vlog_t *open_checkpoint_store(const char *dir)
     return open_store_at(dir, TDB_COMPRESS_NONE, 0, 1);
 }
 
-#ifdef __linux__
+#ifndef _WIN32
 /* a segment whose write fails refuses every append after it, so the next value rolls to a fresh
  * segment rather than every large value failing until a restart. a descriptor opened read-only
  * refuses the write, which is the failure this takes */
@@ -190,10 +190,14 @@ void test_vlog_failed_write_rolls_to_a_fresh_segment(void)
     const int read_only_fd = open("/dev/null", O_RDONLY);
     ASSERT_TRUE(read_only_fd >= 0);
     ASSERT_TRUE(dup2(read_only_fd, bm->fd) >= 0);
-    close(read_only_fd);
+    ASSERT_EQ(close(read_only_fd), 0);
 
     const uint8_t lost[] = "the-write-fails-under-this-one";
-    ASSERT_TRUE(vlog_write(v, lost, sizeof(lost), NULL, 0, &id, NULL) != VLOG_OK);
+    const vlog_id_t first_id = id;
+    uint64_t disk_bytes = 0;
+    ASSERT_EQ(vlog_write(v, lost, sizeof(lost), NULL, 0, &id, &disk_bytes), VLOG_ERR_IO);
+    ASSERT_EQ(id, first_id);
+    ASSERT_EQ(disk_bytes, 0);
 
     const uint8_t after[] = "lands-in-a-fresh-segment";
     ASSERT_TRUE(vlog_write(v, after, sizeof(after), NULL, 0, &id, NULL) == VLOG_OK);
@@ -647,9 +651,22 @@ void test_mixed_codecs_in_one_store(void)
     uint8_t *a = runs(V_LARGE, 5);
     uint8_t *b = runs(V_LARGE, 7);
     vlog_id_t plain = 0, packed = 0;
-    ASSERT_TRUE(vlog_write(v, a, V_LARGE, NULL, 0, &plain, NULL) == VLOG_OK);
+    uint8_t *source = malloc(V_LARGE);
+    ASSERT_TRUE(source != NULL);
+    memcpy(source, a, V_LARGE);
+    uint64_t plain_disk = 0, packed_disk = 0;
+    ASSERT_EQ(vlog_write(v, source, V_LARGE, NULL, 0, &plain, &plain_disk), VLOG_OK);
+    memcpy(source, b, V_LARGE);
     const uint8_t lz4_ids[1] = {TDB_COMPRESS_LZ4};
-    ASSERT_TRUE(vlog_write(v, b, V_LARGE, lz4_ids, 1, &packed, NULL) == VLOG_OK);
+    ASSERT_EQ(vlog_write(v, source, V_LARGE, lz4_ids, 1, &packed, &packed_disk), VLOG_OK);
+    free(source);
+
+    const vlog_index_entry_t p = snapshot_entry(v, plain).entry;
+    const vlog_index_entry_t c = snapshot_entry(v, packed).entry;
+    ASSERT_EQ(plain_disk, block_manager_framed_size(VLOG_BLK_HDR_SIZE + V_LARGE));
+    ASSERT_EQ(p.offset, BLOCK_MANAGER_HEADER_SIZE);
+    ASSERT_EQ(c.offset, p.offset + plain_disk);
+    ASSERT_EQ(c.disk_len, packed_disk);
 
     /* both read back as themselves, neither decoded with the other's codec */
     assert_reads(v, plain, a, V_LARGE);
@@ -2389,6 +2406,10 @@ void test_invalid_args(void)
     ASSERT_TRUE(vlog_write(v, NULL, 1, NULL, 0, &id, NULL) == VLOG_ERR_INVALID);
     ASSERT_TRUE(vlog_write(v, &byte, 0, NULL, 0, &id, NULL) == VLOG_ERR_INVALID);
     ASSERT_TRUE(vlog_write(v, &byte, 1, NULL, 0, NULL, NULL) == VLOG_ERR_INVALID);
+    const uint64_t next_id = vlog_next_id(v);
+    const size_t too_long = (size_t)UINT32_MAX - VLOG_BLK_HDR_SIZE + 1;
+    ASSERT_EQ(vlog_write(v, &byte, too_long, NULL, 0, &id, NULL), VLOG_ERR_INVALID);
+    ASSERT_EQ(vlog_next_id(v), next_id);
     ASSERT_TRUE(vlog_read(v, VLOG_ID_INVALID, &out, &olen) == VLOG_ERR_INVALID);
     ASSERT_TRUE(vlog_read(NULL, 1, &out, &olen) == VLOG_ERR_INVALID);
     ASSERT_TRUE(vlog_read(v, 12345, &out, &olen) == VLOG_ERR_NOT_FOUND);
@@ -2719,7 +2740,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);
     RUN_TEST(test_concurrent_reads_writes_and_reclaim, tests_passed);
     RUN_TEST(test_reclaim_never_retires_a_segment_a_roll_is_publishing, tests_passed);
-#ifdef __linux__
+#ifndef _WIN32
     RUN_TEST(test_vlog_failed_write_rolls_to_a_fresh_segment, tests_passed);
 #endif
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

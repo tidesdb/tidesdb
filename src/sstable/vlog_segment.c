@@ -367,7 +367,7 @@ int vlog_segment_roll(vlog_t *v, uint32_t full_slot)
 
 /* the caller pins this slot through both the physical append and its index update. a failed
  * descriptor is treated like a full segment so retry takes a fresh file. */
-static int vlog_append_to_slot(vlog_t *v, uint32_t slot, const uint8_t *payload, uint32_t size,
+static int vlog_append_to_slot(vlog_t *v, uint32_t slot, const struct iovec *spans, int count,
                                vlog_sidecar_entry_t *entry)
 {
     block_manager_t *bm = vlog_segment_ensure_open(v, slot);
@@ -376,7 +376,7 @@ static int vlog_append_to_slot(vlog_t *v, uint32_t slot, const uint8_t *payload,
     if (extent >= v->segment_target_bytes || block_manager_last_errno(bm) != 0)
         return VLOG_ERR_FULL;
 
-    const int64_t offset = block_manager_write_raw(bm, payload, size);
+    const int64_t offset = block_manager_write_rawv(bm, spans, count);
     if (offset < 0) return VLOG_ERR_IO;
     entry->offset = (uint64_t)offset;
 #ifdef TDB_FAULT_INJECTION
@@ -411,11 +411,10 @@ static void vlog_checkpoint_active(vlog_t *v, uint32_t slot)
     pthread_rwlock_unlock(&v->seal_rw);
 }
 
-int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
+int vlog_segment_append(vlog_t *v, const struct iovec *spans, int count,
                         vlog_sidecar_entry_t *entry)
 {
-    if (!v || !payload || !payload_len || payload_len > UINT32_MAX || !entry)
-        return VLOG_ERR_INVALID;
+    if (!v || !spans || count <= 0 || !entry) return VLOG_ERR_INVALID;
     for (int attempt = 0; attempt < VLOG_APPEND_MAX_ATTEMPTS; attempt++)
     {
         if (v->enable_vlog_indexes) pthread_rwlock_rdlock(&v->seal_rw);
@@ -423,7 +422,7 @@ int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
         int rc = VLOG_ERR_BUSY;
         if (vlog_segment_acquire(v, slot))
         {
-            rc = vlog_append_to_slot(v, slot, payload, (uint32_t)payload_len, entry);
+            rc = vlog_append_to_slot(v, slot, spans, count, entry);
             vlog_segment_release(v, slot);
         }
         if (v->enable_vlog_indexes)

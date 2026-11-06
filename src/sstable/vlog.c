@@ -241,7 +241,8 @@ void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent, vlog_sideca
 
 /* parse once for both a freshly encoded value and a verified block returned by a recovery scan.
  * only the ids in the actual frame describe what was stored when a codec fell back to verbatim. */
-static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, uint32_t size, uint64_t offset)
+static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, const uint8_t *ids, uint32_t size,
+                                             uint64_t offset)
 {
     const uint64_t word = decode_uint64_le_compat(data + VLOG_BLK_ID_SIZE);
     int count = (int)(word >> VLOG_BLK_CHAIN_SHIFT);
@@ -250,7 +251,7 @@ static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, uint32_t size,
                                   .offset = offset,
                                   .value_len = word & VLOG_BLK_LEN_MASK,
                                   .disk_len = block_manager_framed_size(size),
-                                  .chain = vlog_chain_key(data + VLOG_BLK_HDR_SIZE, count)};
+                                  .chain = vlog_chain_key(ids, count)};
 }
 
 /**
@@ -291,7 +292,8 @@ static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint
         if (block->size >= VLOG_BLK_HDR_SIZE)
         {
             const vlog_sidecar_entry_t entry =
-                vlog_frame_entry(block->data, (uint32_t)block->size, offset);
+                vlog_frame_entry(block->data, (const uint8_t *)block->data + VLOG_BLK_HDR_SIZE,
+                                 (uint32_t)block->size, offset);
 #ifdef TDB_FAULT_INJECTION
             const uint64_t word =
                 decode_uint64_le_compat((uint8_t *)block->data + VLOG_BLK_ID_SIZE);
@@ -482,101 +484,53 @@ void vlog_close(vlog_t *v)
     free(v);
 }
 
-/**
- * vlog_frame_payload
- * builds the block payload for a value: the vlog header, the encoding ids the value was written
- * through, then the stored bytes
- * @param v vlog handle
- * @param id the id to stamp into the header
- * @param value the value bytes
- * @param value_len uncompressed length
- * @param ids the encoding pipeline to apply, or NULL to store verbatim
- * @param id_count entries in ids; 0 stores verbatim and records no ids. a chain that cannot be
- *                 resolved or applied also stores verbatim, since the ids are recorded only when
- *                 the bytes they describe were actually produced
- * @param out_payload receives an allocated payload the caller frees
- * @param out_len receives the payload length
- * @return VLOG_OK, VLOG_ERR_MEMORY, or VLOG_ERR_INVALID when the framed block would not fit
- */
-static int vlog_frame_payload(const vlog_t *v, uint64_t id, const uint8_t *value, size_t value_len,
-                              const uint8_t *ids, int id_count, uint8_t **out_payload,
-                              size_t *out_len)
+int vlog_write(vlog_t *v, const uint8_t *value, size_t value_len, const uint8_t *ids,
+               const int id_count, vlog_id_t *out_id, uint64_t *out_disk_bytes)
 {
+    if (!v || !value || value_len == 0 || (uint64_t)value_len > VLOG_BLK_LEN_MASK || !out_id)
+        return VLOG_ERR_INVALID;
+
     const uint8_t *stored = value;
     size_t stored_len = value_len;
     uint8_t *encoded = NULL;
     int stored_count = 0;
-
     if (id_count > 0 && v->encodings)
     {
-        tidesdb_encoding_stage_t stages[TDB_ENCODING_PIPELINE_MAX];
-        if (tidesdb_encoding_resolve(v->encodings, ids, id_count, stages,
-                                     TDB_ENCODING_PIPELINE_MAX) == id_count &&
-            tidesdb_encoding_stages_encode(stages, id_count, value, value_len, &encoded,
-                                           &stored_len) == TDB_SUCCESS)
+        if (tidesdb_encoding_pipeline_encode(v->encodings, ids, id_count, value, value_len,
+                                             &encoded, &stored_len) == TDB_SUCCESS)
         {
-            /* a chain that produced nothing usable -- a codec this build lacks, or a backend
-             * failure -- stores the value verbatim and records no ids, rather than failing a flush
-             * because a value did not compress */
             stored = encoded;
             stored_count = id_count;
         }
         else
         {
-            /* the value still stores, verbatim and with no ids recorded, so this is not a failure
-             * the caller sees -- but a family configured for compression silently storing plain is
-             * worth knowing about */
+            /* record only stages that produced the bytes actually written */
             TDB_DEBUG_LOG(TDB_LOG_WARN,
                           "value encode failed, storing verbatim, %d stages, %zu bytes", id_count,
                           value_len);
-            free(encoded);
-            encoded = NULL;
             stored_len = value_len;
         }
     }
 
-    /* a block payload length is a uint32 in the frame, so a value plus its header must fit */
-    const size_t hdr = VLOG_BLK_HDR_SIZE + (size_t)stored_count;
-    if (stored_len > UINT32_MAX - hdr)
+    const size_t prefix_len = VLOG_BLK_HDR_SIZE + (size_t)stored_count;
+    if (stored_len > UINT32_MAX - prefix_len)
     {
         free(encoded);
         return VLOG_ERR_INVALID;
     }
 
-    const size_t payload_len = hdr + stored_len;
-    uint8_t *payload = malloc(payload_len);
-    if (!payload)
-    {
-        free(encoded);
-        return VLOG_ERR_MEMORY;
-    }
-    encode_uint64_le_compat(payload, id);
-    encode_uint64_le_compat(payload + VLOG_BLK_ID_SIZE,
-                            ((uint64_t)value_len & VLOG_BLK_LEN_MASK) |
-                                ((uint64_t)stored_count << VLOG_BLK_CHAIN_SHIFT));
-    if (stored_count) memcpy(payload + VLOG_BLK_HDR_SIZE, ids, (size_t)stored_count);
-    memcpy(payload + hdr, stored, stored_len);
-    free(encoded);
-
-    *out_payload = payload;
-    *out_len = payload_len;
-    return VLOG_OK;
-}
-
-int vlog_write(vlog_t *v, const uint8_t *value, size_t value_len, const uint8_t *ids,
-               const int id_count, vlog_id_t *out_id, uint64_t *out_disk_bytes)
-{
-    if (!v || !value || value_len == 0 || !out_id) return VLOG_ERR_INVALID;
-
     const uint64_t id = atomic_fetch_add(&v->next_id, 1);
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    int rc = vlog_frame_payload(v, id, value, value_len, ids, id_count, &payload, &payload_len);
-    if (rc != VLOG_OK) return rc;
-
-    vlog_sidecar_entry_t entry = vlog_frame_entry(payload, (uint32_t)payload_len, 0);
-    rc = vlog_segment_append(v, payload, payload_len, &entry);
-    free(payload);
+    uint8_t header[VLOG_BLK_HDR_SIZE];
+    encode_uint64_le_compat(header, id);
+    encode_uint64_le_compat(header + VLOG_BLK_ID_SIZE,
+                            (uint64_t)value_len | ((uint64_t)stored_count << VLOG_BLK_CHAIN_SHIFT));
+    const struct iovec spans[] = {{header, sizeof(header)},
+                                  {(void *)(uintptr_t)ids, (size_t)stored_count},
+                                  {(void *)(uintptr_t)stored, stored_len}};
+    vlog_sidecar_entry_t entry =
+        vlog_frame_entry(header, ids, (uint32_t)(prefix_len + stored_len), 0);
+    const int rc = vlog_segment_append(v, spans, sizeof(spans) / sizeof(spans[0]), &entry);
+    free(encoded);
 
     if (rc == VLOG_OK)
     {

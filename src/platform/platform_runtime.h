@@ -74,6 +74,10 @@ static inline void tdb_set_thread_name(const char *name)
 #define TDB_O_NOATIME 0
 #endif
 
+#ifndef SSIZE_MAX
+#define SSIZE_MAX (sizeof(ssize_t) == sizeof(int64_t) ? INT64_MAX : INT32_MAX)
+#endif
+
 /* cross-platform pwritev for scatter-gather I/O
  * Linux and modern BSDs have native pwritev in <sys/uio.h>
  * macOS added pwritev in 10.16/11.0 (Big Sur)
@@ -114,8 +118,9 @@ static inline ssize_t tdb_pwritev(int fd, const struct iovec *iov, int iovcnt, o
     for (int i = 0; i < iovcnt; i++)
     {
         ssize_t n = pwrite(fd, iov[i].iov_base, iov[i].iov_len, offset);
-        if (n != (ssize_t)iov[i].iov_len) return (total > 0) ? total : -1;
+        if (n < 0) return -1; /* preserve this span's I/O error for the framed writer */
         total += n;
+        if ((size_t)n != iov[i].iov_len) return total;
         offset += n;
     }
     return total;

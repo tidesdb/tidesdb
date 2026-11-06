@@ -352,14 +352,14 @@ int vlog_segment_roll(vlog_t *v, uint32_t full_slot);
 
 /**
  * vlog_segment_append
- * appends one already-framed payload to the active segment, rolling first if it is full
+ * appends the spans of one value as a single block, rolling first if the active segment is full
  * @param v the store
- * @param payload the block payload, its vlog header included
- * @param payload_len length of payload
+ * @param spans borrowed vlog header, stored codec ids and stored value bytes
+ * @param count number of spans
  * @param entry value metadata; receives the offset assigned by the block manager
  * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_FULL
  */
-int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
+int vlog_segment_append(vlog_t *v, const struct iovec *spans, int count,
                         vlog_sidecar_entry_t *entry);
 
 /* called under index_rw by an admitted writer, or during single-threaded recovery */

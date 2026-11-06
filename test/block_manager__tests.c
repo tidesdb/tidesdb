@@ -3064,6 +3064,229 @@ void test_block_manager_large_block_read_roundtrip(void)
     (void)remove(path);
 }
 
+/* rawv must preserve the scalar writer's on-disk contract, while holding no caller storage after it
+ * returns. these helpers read the existing format rather than duplicating its frame encoder. */
+#define RAWV_TEST_SPAN_COUNT      3
+#define RAWV_TEST_MAX_SAMPLE_SIZE 257
+#define RAWV_TEST_RING_SIZE       (1024 * 1024)
+#define RAWV_TEST_WRAP_TAIL       32
+#define RAWV_TEST_FILLER_SIZE                                                \
+    (RAWV_TEST_RING_SIZE - RAWV_TEST_WRAP_TAIL - BLOCK_MANAGER_HEADER_SIZE - \
+     BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
+#define RAWV_TEST_WRAP_SIZE        257
+#define RAWV_TEST_WRAP_FIRST_SIZE  37
+#define RAWV_TEST_WRAP_SECOND_SIZE 91
+#define RAWV_TEST_WRAP_THIRD_SIZE \
+    (RAWV_TEST_WRAP_SIZE - RAWV_TEST_WRAP_FIRST_SIZE - RAWV_TEST_WRAP_SECOND_SIZE)
+#define RAWV_TEST_OVERSIZED_PART_SIZE (512 * 1024)
+/* the follower reuses the oversized record's exact ring slot */
+#define RAWV_TEST_OVERSIZED_SIZE \
+    (2 * RAWV_TEST_RING_SIZE - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
+
+static void rawv_test_assert_payload_at(int fd, uint64_t offset, const uint8_t *payload,
+                                        uint32_t payload_size)
+{
+    uint8_t header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
+    uint8_t footer[BLOCK_MANAGER_FOOTER_SIZE];
+    uint8_t *actual = malloc(payload_size);
+    ASSERT_TRUE(actual != NULL);
+    ASSERT_EQ(pread(fd, header, sizeof(header), (off_t)offset), (ssize_t)sizeof(header));
+    ASSERT_EQ(decode_uint32_le_compat(header), payload_size);
+    ASSERT_EQ(pread(fd, actual, payload_size, (off_t)(offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE)),
+              (ssize_t)payload_size);
+    ASSERT_EQ(memcmp(actual, payload, payload_size), 0);
+    ASSERT_EQ(decode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE),
+              (uint32_t)XXH3_64bits(payload, payload_size));
+    ASSERT_EQ(pread(fd, footer, sizeof(footer),
+                    (off_t)(offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + payload_size)),
+              (ssize_t)sizeof(footer));
+    ASSERT_EQ(decode_uint32_le_compat(footer), payload_size);
+    ASSERT_EQ(decode_uint32_le_compat(footer + BLOCK_MANAGER_FOOTER_MAGIC_OFFSET),
+              BLOCK_MANAGER_FOOTER_MAGIC);
+    free(actual);
+}
+
+void test_block_manager_write_rawv_frames_and_offsets(void)
+{
+    const char *path = "test_write_rawv_frames.db";
+    const uint32_t sample_sizes[] = {1, 2, 3, 4, 8, 9, 16, 17, 128, 129, 240, 241, 255, 256, 257};
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+
+    for (size_t sample = 0; sample < sizeof(sample_sizes) / sizeof(sample_sizes[0]); sample++)
+    {
+        const uint32_t size = sample_sizes[sample];
+        uint8_t payload[RAWV_TEST_MAX_SAMPLE_SIZE];
+        for (uint32_t i = 0; i < size; i++) payload[i] = (uint8_t)(sample * size + i);
+
+        const uint32_t first = size / 3;
+        const uint32_t second = (size - first) / 2;
+        const uint32_t third = size - first - second;
+        struct iovec spans[RAWV_TEST_SPAN_COUNT] = {
+            {.iov_base = first ? payload : NULL, .iov_len = first},
+            {.iov_base = second ? payload + first : NULL, .iov_len = second},
+            {.iov_base = payload + first + second, .iov_len = third},
+        };
+        const int64_t scalar_offset = block_manager_write_raw(bm, payload, size);
+        const int64_t vector_offset = block_manager_write_rawv(bm, spans, RAWV_TEST_SPAN_COUNT);
+        ASSERT_EQ(vector_offset, scalar_offset + (int64_t)block_manager_framed_size(size));
+
+        const size_t framed = block_manager_framed_size(size);
+        uint8_t scalar_frame[RAWV_TEST_MAX_SAMPLE_SIZE + BLOCK_MANAGER_BLOCK_HEADER_SIZE +
+                             BLOCK_MANAGER_FOOTER_SIZE];
+        uint8_t vector_frame[sizeof(scalar_frame)];
+        ASSERT_EQ(pread(bm->fd, scalar_frame, framed, (off_t)scalar_offset), (ssize_t)framed);
+        ASSERT_EQ(pread(bm->fd, vector_frame, framed, (off_t)vector_offset), (ssize_t)framed);
+        ASSERT_EQ(memcmp(scalar_frame, vector_frame, framed), 0);
+        ASSERT_EQ(decode_uint32_le_compat(vector_frame), size);
+        ASSERT_EQ(decode_uint32_le_compat(vector_frame + BLOCK_MANAGER_SIZE_FIELD_SIZE),
+                  (uint32_t)XXH3_64bits(payload, size));
+    }
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
+void test_block_manager_write_rawv_rejects_invalid_spans(void)
+{
+    const char *path = "test_write_rawv_invalid.db";
+    uint8_t byte = 0x5a;
+    struct iovec valid[1] = {{&byte, sizeof(byte)}};
+    struct iovec empty[RAWV_TEST_SPAN_COUNT] = {{0}};
+    struct iovec null_nonempty[1] = {{.iov_base = NULL, .iov_len = sizeof(byte)}};
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+    uint64_t before = 0;
+    ASSERT_EQ(block_manager_get_size(bm, &before), 0);
+
+    ASSERT_EQ(block_manager_write_rawv(NULL, valid, 1), -1);
+    ASSERT_EQ(block_manager_write_rawv(bm, NULL, 1), -1);
+    ASSERT_EQ(block_manager_write_rawv(bm, valid, 0), -1);
+    ASSERT_EQ(block_manager_write_rawv(bm, valid, -1), -1);
+    ASSERT_EQ(block_manager_write_rawv(bm, valid, BLOCK_MANAGER_MAX_PAYLOAD_SPANS + 1), -1);
+    ASSERT_EQ(block_manager_write_rawv(bm, empty, RAWV_TEST_SPAN_COUNT), -1);
+    ASSERT_EQ(block_manager_write_rawv(bm, null_nonempty, 1), -1);
+#if SIZE_MAX > UINT32_MAX
+    valid[0].iov_len = (size_t)UINT32_MAX + 1;
+    ASSERT_EQ(block_manager_write_rawv(bm, valid, 1), -1);
+#endif
+    struct iovec cumulative_overflow[2] = {
+        {.iov_base = (void *)&byte, .iov_len = UINT32_MAX},
+        {.iov_base = (void *)&byte, .iov_len = sizeof(byte)},
+    };
+    ASSERT_EQ(block_manager_write_rawv(bm, cumulative_overflow, 2), -1);
+
+    ASSERT_EQ(atomic_load(&bm->current_file_size), before);
+    valid[0].iov_len = sizeof(byte);
+    atomic_store(&bm->current_file_size, INT64_MAX);
+    ASSERT_EQ(block_manager_write_rawv(bm, valid, 1), -1);
+    ASSERT_EQ(atomic_load(&bm->current_file_size), (uint64_t)INT64_MAX);
+    atomic_store(&bm->current_file_size, before);
+
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
+void test_block_manager_write_rawv_buffered_wrap_and_oversized(void)
+{
+    const char *path = "test_write_rawv_buffered_framing.db";
+    uint8_t *filler = malloc(RAWV_TEST_FILLER_SIZE);
+    uint8_t wrap[RAWV_TEST_WRAP_SIZE];
+    uint8_t wrap_expected[RAWV_TEST_WRAP_SIZE];
+    uint8_t suffix[] = "rawv-suffix";
+    ASSERT_TRUE(filler != NULL);
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 1), 0);
+    uint8_t *oversized = malloc(RAWV_TEST_OVERSIZED_SIZE);
+    ASSERT_TRUE(oversized != NULL);
+    uint8_t *oversized_expected = malloc(RAWV_TEST_OVERSIZED_SIZE);
+    ASSERT_TRUE(oversized_expected != NULL);
+    memset(filler, 0x3c, RAWV_TEST_FILLER_SIZE);
+    for (uint32_t i = 0; i < RAWV_TEST_WRAP_SIZE; i++) wrap[i] = (uint8_t)(i * 7 + 3);
+    memcpy(wrap_expected, wrap, sizeof(wrap));
+    for (uint32_t i = 0; i < RAWV_TEST_OVERSIZED_SIZE; i++)
+        oversized[i] = oversized_expected[i] = (uint8_t)((i * 29 + 11) ^ (i >> 17));
+
+    struct iovec filler_span[1] = {{.iov_base = filler, .iov_len = RAWV_TEST_FILLER_SIZE}};
+    const int64_t filler_offset = block_manager_write_rawv(bm, filler_span, 1);
+    ASSERT_EQ(filler_offset, (int64_t)BLOCK_MANAGER_HEADER_SIZE);
+    struct iovec wrap_spans[RAWV_TEST_SPAN_COUNT] = {
+        {.iov_base = wrap, .iov_len = RAWV_TEST_WRAP_FIRST_SIZE},
+        {.iov_base = wrap + RAWV_TEST_WRAP_FIRST_SIZE, .iov_len = RAWV_TEST_WRAP_SECOND_SIZE},
+        {.iov_base = wrap + RAWV_TEST_WRAP_FIRST_SIZE + RAWV_TEST_WRAP_SECOND_SIZE,
+         .iov_len = RAWV_TEST_WRAP_THIRD_SIZE},
+    };
+    const int64_t wrap_offset = block_manager_write_rawv(bm, wrap_spans, RAWV_TEST_SPAN_COUNT);
+    ASSERT_EQ(wrap_offset, (int64_t)(RAWV_TEST_RING_SIZE - RAWV_TEST_WRAP_TAIL));
+    memset(wrap, 0, sizeof(wrap));
+    struct iovec oversized_spans[RAWV_TEST_SPAN_COUNT] = {
+        {.iov_base = oversized, .iov_len = RAWV_TEST_OVERSIZED_PART_SIZE},
+        {.iov_base = oversized + RAWV_TEST_OVERSIZED_PART_SIZE,
+         .iov_len = RAWV_TEST_OVERSIZED_PART_SIZE},
+        {.iov_base = oversized + RAWV_TEST_OVERSIZED_PART_SIZE * 2,
+         .iov_len = RAWV_TEST_OVERSIZED_SIZE - RAWV_TEST_OVERSIZED_PART_SIZE * 2},
+    };
+    const int64_t big_offset = block_manager_write_rawv(bm, oversized_spans, RAWV_TEST_SPAN_COUNT);
+    ASSERT_EQ(big_offset, wrap_offset + (int64_t)block_manager_framed_size(RAWV_TEST_WRAP_SIZE));
+    memset(oversized, 0, RAWV_TEST_OVERSIZED_SIZE);
+    struct iovec suffix_span[1] = {{.iov_base = suffix, .iov_len = sizeof(suffix)}};
+    const int64_t suffix_offset = block_manager_write_rawv(bm, suffix_span, 1);
+    ASSERT_EQ(suffix_offset,
+              big_offset + (int64_t)block_manager_framed_size(RAWV_TEST_OVERSIZED_SIZE));
+    memset(suffix, 0, sizeof(suffix));
+    ASSERT_EQ(block_manager_wait_durable(
+                  bm, (uint64_t)suffix_offset + block_manager_framed_size(sizeof(suffix))),
+              0);
+    ASSERT_EQ(block_manager_close(bm), 0);
+
+    const int fd = open(path, O_RDONLY);
+    ASSERT_TRUE(fd >= 0);
+    rawv_test_assert_payload_at(fd, (uint64_t)filler_offset, filler, RAWV_TEST_FILLER_SIZE);
+    rawv_test_assert_payload_at(fd, (uint64_t)wrap_offset, wrap_expected, RAWV_TEST_WRAP_SIZE);
+    rawv_test_assert_payload_at(fd, (uint64_t)big_offset, oversized_expected,
+                                RAWV_TEST_OVERSIZED_SIZE);
+    static const uint8_t suffix_expected[] = "rawv-suffix";
+    rawv_test_assert_payload_at(fd, (uint64_t)suffix_offset, suffix_expected,
+                                sizeof(suffix_expected));
+    ASSERT_EQ(close(fd), 0);
+    free(oversized_expected);
+    free(oversized);
+    free(filler);
+    (void)remove(path);
+}
+
+#ifndef _WIN32
+void test_block_manager_write_rawv_reports_fd_error(void)
+{
+    const char *path = "test_write_rawv_fd_error.db";
+    uint8_t *payload = calloc(1, RAWV_TEST_OVERSIZED_PART_SIZE);
+    ASSERT_TRUE(payload != NULL);
+    const struct iovec spans[] = {{payload, RAWV_TEST_OVERSIZED_PART_SIZE},
+                                  {payload, RAWV_TEST_OVERSIZED_PART_SIZE}};
+    (void)remove(path);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open_buffered(&bm, path, BLOCK_MANAGER_SYNC_NONE, 1), 0);
+    const int read_only_fd = open(path, O_RDONLY);
+    ASSERT_TRUE(read_only_fd >= 0);
+    ASSERT_TRUE(dup2(read_only_fd, bm->fd) >= 0);
+    ASSERT_EQ(close(read_only_fd), 0);
+    errno = 0;
+    ASSERT_EQ(block_manager_write_rawv(bm, spans, 2), -1);
+    ASSERT_EQ(block_manager_last_errno(bm), EBADF);
+    ASSERT_EQ(block_manager_write_rawv(bm, spans, 1), -1);
+    ASSERT_EQ(block_manager_close(bm), 0);
+    free(payload);
+    (void)remove(path);
+}
+#endif
+
 /* buffered-append mode -- write through block_manager_open_buffered (staging ring + flush thread),
  * then reopen on the direct path to prove the on-disk bytes are identical and every record survives
  */
@@ -3360,6 +3583,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_block_write, tests_passed);
     RUN_TEST(test_block_manager_block_write_batch, tests_passed);
     RUN_TEST(test_block_manager_write_raw, tests_passed);
+    RUN_TEST(test_block_manager_write_rawv_frames_and_offsets, tests_passed);
+    RUN_TEST(test_block_manager_write_rawv_rejects_invalid_spans, tests_passed);
+    RUN_TEST(test_block_manager_write_rawv_buffered_wrap_and_oversized, tests_passed);
+#ifndef _WIN32
+    RUN_TEST(test_block_manager_write_rawv_reports_fd_error, tests_passed);
+#endif
     RUN_TEST(test_block_manager_block_write_close_reopen_read, tests_passed);
     RUN_TEST(test_block_manager_truncate, tests_passed);
     RUN_TEST(test_block_manager_count_blocks, tests_passed);

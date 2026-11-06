@@ -52,6 +52,9 @@
 /* number of iovecs emitted per block in pwritev ( header, payload, footer ) */
 #define BLOCK_MANAGER_IOVECS_PER_BLOCK 3
 
+/* maximum payload spans accepted by the zero-copy append interface */
+#define BLOCK_MANAGER_MAX_PAYLOAD_SPANS 3
+
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
 
@@ -314,6 +317,17 @@ int64_t block_manager_block_write_durable(block_manager_t *bm, block_manager_blo
  * @return the offset where the block was written, or -1 on failure
  */
 int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t size);
+
+/**
+ * block_manager_write_rawv
+ * append up to three payload spans as one framed block without concatenating them first. zero-length
+ * spans may use a NULL base, but their concatenated payload must be non-empty.
+ * @param bm the block manager
+ * @param spans the payload spans, valid for the duration of this call
+ * @param count the number of spans, from 1 through BLOCK_MANAGER_MAX_PAYLOAD_SPANS
+ * @return the offset where the block was written, or -1 for invalid input or an I/O failure
+ */
+int64_t block_manager_write_rawv(block_manager_t *bm, const struct iovec *spans, int count);
 
 /**
  * block_manager_checksum

@@ -478,7 +478,7 @@ typedef struct
     _Atomic(int) *hold;                /* when set, an append waits here until it reads zero */
     _Atomic(int) entered;              /* set once an append is waiting on hold */
     int forced_calls;
-    const uint8_t* forced_value;
+    const uint8_t *forced_value;
     size_t forced_value_size;
     uint64_t forced_id;
 } mockbe;
@@ -518,10 +518,10 @@ static int mb_wal(void *ctx, const uint8_t *batch, size_t size)
     }
     return m->fail_wal ? -1 : 0;
 }
-static int mb_separate_forced(void* ctx, uint32_t cf_index, const uint8_t* value, size_t value_size,
-                              uint64_t* out_id)
+static int mb_separate_forced(void *ctx, uint32_t cf_index, const uint8_t *value, size_t value_size,
+                              uint64_t *out_id)
 {
-    mockbe* m = (mockbe*)ctx;
+    mockbe *m = (mockbe *)ctx;
     (void)cf_index;
     m->forced_calls++;
     m->forced_value = value;
@@ -563,15 +563,15 @@ static tdb_txn_backend_t mkbackend(mockbe *m)
  * with a NULL value and zero logical length. */
 void test_txn_borrowed_put_forces_a_value_log_reference(void)
 {
-    tidesdb_mvcc_t* clock = tidesdb_mvcc_create();
+    tidesdb_mvcc_t *clock = tidesdb_mvcc_create();
     mockbe m = {.forced_id = 91};
     tdb_txn_backend_t be = mkbackend(&m);
     be.separator.separate_forced = mb_separate_forced;
     be.separator.ctx = &m;
     uint8_t value[] = {'b', 'l', 'o', 'b'};
 
-    tdb_txn_t* t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
-    ASSERT_EQ(tdb_txn_put_borrowed(t, 7, (const uint8_t*)"media", 5, value, sizeof(value), -1),
+    tdb_txn_t *t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
+    ASSERT_EQ(tdb_txn_put_borrowed(t, 7, (const uint8_t *)"media", 5, value, sizeof(value), -1),
               TDB_SUCCESS);
     ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
     ASSERT_EQ(m.forced_calls, 1);
@@ -582,7 +582,7 @@ void test_txn_borrowed_put_forces_a_value_log_reference(void)
                                .seq = tdb_txn_commit_seq(t),
                                .ttl = -1,
                                .flags = TDB_WAL_ENTRY_VLOG_REF,
-                               .key = (const uint8_t*)"media",
+                               .key = (const uint8_t *)"media",
                                .key_size = 5,
                                .value = NULL,
                                .value_size = sizeof(value),
@@ -593,7 +593,7 @@ void test_txn_borrowed_put_forces_a_value_log_reference(void)
     tdb_txn_free(t);
     m.forced_id = 92;
     t = tdb_txn_begin(clock, TDB_ISOLATION_READ_COMMITTED, NULL, 0, NULL);
-    ASSERT_EQ(tdb_txn_put_borrowed(t, 7, (const uint8_t*)"empty", 5, NULL, 0, -1), TDB_SUCCESS);
+    ASSERT_EQ(tdb_txn_put_borrowed(t, 7, (const uint8_t *)"empty", 5, NULL, 0, -1), TDB_SUCCESS);
     ASSERT_EQ(tdb_txn_commit(t, &be, NULL, 0), TDB_SUCCESS);
     ASSERT_EQ(m.forced_calls, 2);
     ASSERT_TRUE(m.forced_value == NULL && m.forced_value_size == 0);

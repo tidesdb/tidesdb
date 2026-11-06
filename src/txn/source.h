@@ -55,7 +55,7 @@ typedef struct
     size_t value_size;
     int64_t ttl;
     int deleted;
-    struct vlog* vlog;
+    struct vlog *vlog;
     uint64_t vlog_id;
 } tidesdb_source_version_t;
 

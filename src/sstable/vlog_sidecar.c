@@ -36,10 +36,10 @@ static int vlog_sidecar_path(const char* dir, uint64_t number, int temporary, ch
     return n > 0 && (size_t)n < out_size ? VLOG_OK : VLOG_ERR_INVALID;
 }
 
-int vlog_sidecar_name(uint64_t number, int temporary, char *out, size_t out_size)
+int vlog_sidecar_name(uint64_t number, int temporary, char* out, size_t out_size)
 {
     if (!out || out_size == 0) return VLOG_ERR_INVALID;
-    const char *const ext = temporary ? VLOG_SIDECAR_TMP_EXT : VLOG_SIDECAR_EXT;
+    const char* const ext = temporary ? VLOG_SIDECAR_TMP_EXT : VLOG_SIDECAR_EXT;
     const int n =
         snprintf(out, out_size, "%0*llu%s", VLOG_SEGMENT_DIGITS, (unsigned long long)number, ext);
     return n > 0 && (size_t)n < out_size ? VLOG_OK : VLOG_ERR_INVALID;
@@ -112,7 +112,7 @@ static int vlog_sidecar_record(int fd, uint64_t offset, uint64_t extent,
     uint8_t head[BLOCK_MANAGER_BLOCK_HEADER_SIZE + VLOG_BLK_HDR_SIZE];
     if (pread(fd, head, sizeof(head), (off_t)offset) != (ssize_t)sizeof(head)) return VLOG_ERR_IO;
     const uint32_t size = decode_uint32_le_compat(head);
-    const uint8_t *value = head + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    const uint8_t* value = head + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     const uint64_t word = decode_uint64_le_compat(value + VLOG_BLK_ID_SIZE);
     const uint8_t stages = (uint8_t)(word >> VLOG_BLK_CHAIN_SHIFT);
     if (block_manager_framed_size(size) != entry->disk_len ||
@@ -146,7 +146,7 @@ static int vlog_sidecar_record(int fd, uint64_t offset, uint64_t extent,
     return VLOG_OK;
 }
 
-static int vlog_offset_compare(const void *left, const void *right)
+static int vlog_offset_compare(const void* left, const void* right)
 {
     const vlog_sidecar_entry_t *a = left, *b = right;
     return (a->offset > b->offset) - (a->offset < b->offset);
@@ -155,7 +155,7 @@ static int vlog_offset_compare(const void *left, const void *right)
 /* the caller has drained writers. only a seal releases surplus preallocation; after a checkpoint
  * subsequent appends still own that reservation. force all covered data before writing the cache.
  */
-static int vlog_sync_indexed_extent(block_manager_t *bm, uint64_t extent, vlog_sidecar_kind_t kind)
+static int vlog_sync_indexed_extent(block_manager_t* bm, uint64_t extent, vlog_sidecar_kind_t kind)
 {
     uint64_t size = 0;
     if (block_manager_get_size(bm, &size) != 0 || size != extent) return VLOG_ERR_IO;
@@ -209,7 +209,7 @@ static int vlog_write_sidecar(FILE* file, int fd, FILE* expected_records, uint64
     return VLOG_OK;
 }
 
-int vlog_sidecar_publish(vlog_t *v, uint32_t slot, vlog_sidecar_entry_t *entries, size_t count,
+int vlog_sidecar_publish(vlog_t* v, uint32_t slot, vlog_sidecar_entry_t* entries, size_t count,
                          uint64_t extent, vlog_sidecar_kind_t kind)
 {
     if (!v || !entries || !count || slot >= v->max_segments) return VLOG_ERR_INVALID;
@@ -222,11 +222,11 @@ int vlog_sidecar_publish(vlog_t *v, uint32_t slot, vlog_sidecar_entry_t *entries
         vlog_sidecar_path(v->dir, number, 0, path, sizeof(path)) != VLOG_OK)
         return VLOG_ERR_INVALID;
 
-    block_manager_t *bm = vlog_segment_ensure_open(v, slot);
+    block_manager_t* bm = vlog_segment_ensure_open(v, slot);
     if (!bm || vlog_sync_indexed_extent(bm, extent, kind) != VLOG_OK) return VLOG_ERR_IO;
     qsort(entries, count, sizeof(*entries), vlog_offset_compare);
     if (remove(tmp) != 0 && errno != ENOENT) return VLOG_ERR_IO;
-    FILE *file = fopen(tmp, "wbx");
+    FILE* file = fopen(tmp, "wbx");
     if (!file) return VLOG_ERR_IO;
     int rc =
         vlog_write_sidecar(file, bm->fd, NULL, number, extent, entries, count, kind, data_start);
@@ -272,7 +272,7 @@ static int vlog_read_sidecar(FILE* file, int fd, uint64_t number, uint64_t logic
     if (XXH3_64bits_reset(&hash) != XXH_OK ||
         XXH3_64bits_update(&hash, header, sizeof(header)) != XXH_OK)
         return VLOG_ERR_IO;
-    vlog_sidecar_entry_t *entries = malloc((size_t)n * sizeof(*entries));
+    vlog_sidecar_entry_t* entries = malloc((size_t)n * sizeof(*entries));
     if (!entries) return VLOG_ERR_MEMORY;
     int rc = VLOG_OK;
     uint64_t offset = data_start;
@@ -316,8 +316,8 @@ static int vlog_read_sidecar(FILE* file, int fd, uint64_t number, uint64_t logic
     return rc;
 }
 
-int vlog_sidecar_load(vlog_t *v, uint32_t slot, uint64_t logical_extent, vlog_sidecar_entry_t **out,
-                      size_t *count, uint64_t *out_extent)
+int vlog_sidecar_load(vlog_t* v, uint32_t slot, uint64_t logical_extent, vlog_sidecar_entry_t** out,
+                      size_t* count, uint64_t* out_extent)
 {
     if (!v || !out || !count || !out_extent || slot >= v->max_segments ||
         logical_extent < BLOCK_MANAGER_HEADER_SIZE)
@@ -328,9 +328,9 @@ int vlog_sidecar_load(vlog_t *v, uint32_t slot, uint64_t logical_extent, vlog_si
     char path[VLOG_PATH_MAX];
     if (vlog_sidecar_path(v->dir, v->segments[slot].number, 0, path, sizeof(path)) != VLOG_OK)
         return VLOG_ERR_INVALID;
-    FILE *file = fopen(path, "rb");
+    FILE* file = fopen(path, "rb");
     if (!file) return errno == ENOENT ? VLOG_ERR_NOT_FOUND : VLOG_ERR_IO;
-    block_manager_t *bm = vlog_segment_ensure_open(v, slot);
+    block_manager_t* bm = vlog_segment_ensure_open(v, slot);
     const int rc = bm ? vlog_read_sidecar(file, bm->fd, v->segments[slot].number, logical_extent,
                                           vlog_group_disk_data_start(v->segments[slot].group), out,
                                           count, out_extent)
@@ -426,7 +426,7 @@ int vlog_backup_index(vlog_t* v, const vlog_segment_info_t* info, const char* so
     return rc;
 }
 
-int vlog_sidecar_unlink(vlog_t *v, uint64_t number)
+int vlog_sidecar_unlink(vlog_t* v, uint64_t number)
 {
     if (!v) return VLOG_ERR_INVALID;
     char published[VLOG_PATH_MAX], temporary[VLOG_PATH_MAX];

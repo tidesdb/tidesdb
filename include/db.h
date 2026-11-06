@@ -731,8 +731,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
  *         names less than its size field, requests more than 65536 value-log slots, or excludes
  *         a retained blob shard group
  */
-int tidesdb_open_with_options(const tidesdb_config_t *config,
-                              const tidesdb_open_options_t *options, tidesdb_t **db);
+int tidesdb_open_with_options(const tidesdb_config_t *config, const tidesdb_open_options_t *options,
+                              tidesdb_t **db);
 
 /**
  * tidesdb_close
@@ -768,7 +768,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
  * @param name unique family name, nonempty and shorter than TDB_MAX_CF_NAME_LEN
  * @return TDB_SUCCESS or the same errors as tidesdb_create_column_family
  */
-int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name);
+int tidesdb_create_blob_column_family(tidesdb_t *db, const char *name);
 
 /* media keys are bounded independently of the object they name */
 #define TDB_BLOB_MAX_KEY_SIZE 65536u
@@ -786,8 +786,8 @@ int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name);
  *         TDB_ERR_TOO_LARGE for an oversized object or key, TDB_ERR_INVALID_ARGS for an invalid
  *         argument, TDB_ERR_LOCKED for unresolved contention, or the transaction or storage error
  */
-int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
-                     size_t key_size, const uint8_t* value, size_t value_size);
+int tidesdb_blob_put(tidesdb_t *db, tidesdb_column_family_t *cf, const uint8_t *key,
+                     size_t key_size, const uint8_t *value, size_t value_size);
 
 /**
  * tidesdb_blob_put_group
@@ -802,8 +802,8 @@ int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* 
  * @param value_size logical size, including zero for a present, empty object
  * @return the same results as tidesdb_blob_put, or TDB_ERR_INVALID_ARGS for an unavailable group
  */
-int tidesdb_blob_put_group(tidesdb_t* db, tidesdb_column_family_t* cf, uint32_t group_id,
-                           const uint8_t* key, size_t key_size, const uint8_t* value,
+int tidesdb_blob_put_group(tidesdb_t *db, tidesdb_column_family_t *cf, uint32_t group_id,
+                           const uint8_t *key, size_t key_size, const uint8_t *value,
                            size_t value_size);
 
 /**
@@ -1061,9 +1061,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
  * TDB_ERR_NOT_FOUND for an absent key, or a transaction or storage error as for tidesdb_txn_get.
  * a separated value's whole block payload is verified even for an empty range
  */
-int tidesdb_txn_get_range(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
-                          size_t key_size, size_t offset, size_t length, uint8_t** value,
-                          size_t* value_size);
+int tidesdb_txn_get_range(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                          size_t key_size, size_t offset, size_t length, uint8_t **value,
+                          size_t *value_size);
 
 /**
  * tidesdb_txn_get_ttl

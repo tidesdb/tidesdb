@@ -285,8 +285,8 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key, 
     return TDB_SUCCESS;
 }
 
-static int sstable_builder_add_value(sstable_builder_t* builder, const uint8_t* key,
-                                     size_t key_size, const uint8_t* value, size_t value_size,
+static int sstable_builder_add_value(sstable_builder_t *builder, const uint8_t *key,
+                                     size_t key_size, const uint8_t *value, size_t value_size,
                                      uint64_t seq, int64_t ttl, uint8_t flags, uint32_t group)
 {
     if (!builder || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
@@ -324,8 +324,8 @@ static int sstable_builder_add_value(sstable_builder_t* builder, const uint8_t* 
                                 ttl, flags);
 }
 
-int sstable_builder_add(sstable_builder_t* builder, const uint8_t* key, size_t key_size,
-                        const uint8_t* value, size_t value_size, uint64_t seq, int64_t ttl,
+int sstable_builder_add(sstable_builder_t *builder, const uint8_t *key, size_t key_size,
+                        const uint8_t *value, size_t value_size, uint64_t seq, int64_t ttl,
                         uint8_t flags)
 {
     return sstable_builder_add_value(builder, key, key_size, value, value_size, seq, ttl, flags,

@@ -151,7 +151,7 @@ uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m)
     return atomic_load_explicit(&m->global_seq, memory_order_acquire);
 }
 
-int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t* m, uint64_t* out_bound)
+int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t *m, uint64_t *out_bound)
 {
     if (!m || !out_bound) return -1;
     uint64_t idle = 0;
@@ -166,13 +166,13 @@ int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t* m, uint64_t* out_bound)
     return 0;
 }
 
-void tidesdb_mvcc_backup_end(tidesdb_mvcc_t* m)
+void tidesdb_mvcc_backup_end(tidesdb_mvcc_t *m)
 {
     if (!m) return;
     atomic_store_explicit(&m->backup_bound, 0, memory_order_seq_cst);
 }
 
-static int mvcc_backup_wait(tidesdb_mvcc_t* m, const uint64_t seq)
+static int mvcc_backup_wait(tidesdb_mvcc_t *m, const uint64_t seq)
 {
     for (int park = 0; park < TDB_MVCC_BACKUP_PARK_MAX; ++park)
     {

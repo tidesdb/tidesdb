@@ -96,8 +96,8 @@ int tdb_txn_put(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
  * @param ttl absolute expiry time, or -1 for none
  * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS (bad args or finished txn) / TDB_ERR_MEMORY
  */
-int tdb_txn_put_borrowed(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                         const uint8_t* value, size_t value_size, int64_t ttl);
+int tdb_txn_put_borrowed(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         const uint8_t *value, size_t value_size, int64_t ttl);
 
 /**
  * tdb_txn_delete
@@ -193,9 +193,9 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
  * @param value_size out -- the number of bytes returned on success
  * @return the same errors as tdb_txn_get, plus TDB_ERR_INVALID_ARGS for a range outside the value
  */
-int tdb_txn_get_range(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                      const tidesdb_source_t* sources, int num_sources, size_t offset,
-                      size_t length, uint8_t** value, size_t* value_size);
+int tdb_txn_get_range(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                      const tidesdb_source_t *sources, int num_sources, size_t offset,
+                      size_t length, uint8_t **value, size_t *value_size);
 
 /**
  * tdb_txn_get_ttl
@@ -280,8 +280,8 @@ typedef struct
 {
     int (*separate)(void *ctx, uint32_t cf_index, const uint8_t *value, size_t value_size,
                     uint64_t *out_id);
-    int (*separate_forced)(void* ctx, uint32_t cf_index, const uint8_t* value, size_t value_size,
-                           uint64_t* out_id);
+    int (*separate_forced)(void *ctx, uint32_t cf_index, const uint8_t *value, size_t value_size,
+                           uint64_t *out_id);
     void *ctx;
 } tdb_value_separator_t;
 
@@ -345,7 +345,7 @@ int tdb_txn_commit(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
  * @param txn the transaction
  * @return the value-log id after a successful one-object forced commit, or 0
  */
-uint64_t tdb_txn_forced_vlog_id(const tdb_txn_t* txn);
+uint64_t tdb_txn_forced_vlog_id(const tdb_txn_t *txn);
 
 /**
  * tdb_txn_prepare

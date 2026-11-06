@@ -47,7 +47,7 @@ typedef struct
     uint8_t *buf;
     size_t key_size;
     size_t value_size;
-    const uint8_t* borrowed_value;
+    const uint8_t *borrowed_value;
     int64_t ttl;
     uint8_t flags;
     uint8_t borrows_value;
@@ -174,8 +174,8 @@ static int writeset_note(tidesdb_writeset_t *ws, const int i)
     return rc;
 }
 
-static int writeset_add(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
-                        size_t key_size, const uint8_t* value, size_t value_size, int64_t ttl,
+static int writeset_add(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
+                        size_t key_size, const uint8_t *value, size_t value_size, int64_t ttl,
                         uint8_t flags, int borrows_value)
 {
     if (!ws || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
@@ -188,7 +188,7 @@ static int writeset_add(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t
 
     const size_t copied_value_size = borrows_value ? 0 : value_size;
     if (copied_value_size > SIZE_MAX - key_size) return TDB_ERR_TOO_LARGE;
-    uint8_t* buf = malloc(key_size + copied_value_size);
+    uint8_t *buf = malloc(key_size + copied_value_size);
     if (!buf) return TDB_ERR_MEMORY;
     memcpy(buf, key, key_size);
     if (copied_value_size) memcpy(buf + key_size, value, copied_value_size);
@@ -235,15 +235,15 @@ static int writeset_add(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t
     return rc;
 }
 
-int tidesdb_writeset_put(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
-                         size_t key_size, const uint8_t* value, size_t value_size, int64_t ttl,
+int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
+                         size_t key_size, const uint8_t *value, size_t value_size, int64_t ttl,
                          uint8_t flags)
 {
     return writeset_add(ws, cf_index, key, key_size, value, value_size, ttl, flags, 0);
 }
 
-int tidesdb_writeset_put_borrowed(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
-                                  size_t key_size, const uint8_t* value, size_t value_size,
+int tidesdb_writeset_put_borrowed(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
+                                  size_t key_size, const uint8_t *value, size_t value_size,
                                   int64_t ttl)
 {
     return writeset_add(ws, cf_index, key, key_size, value, value_size, ttl, 0, 1);

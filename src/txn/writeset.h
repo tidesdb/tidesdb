@@ -97,8 +97,8 @@ int tidesdb_writeset_put(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_
  * @param ttl absolute expiry time, or -1 for none
  * @return TDB_SUCCESS, or TDB_ERR_INVALID_ARGS / TDB_ERR_MEMORY
  */
-int tidesdb_writeset_put_borrowed(tidesdb_writeset_t* ws, uint32_t cf_index, const uint8_t* key,
-                                  size_t key_size, const uint8_t* value, size_t value_size,
+int tidesdb_writeset_put_borrowed(tidesdb_writeset_t *ws, uint32_t cf_index, const uint8_t *key,
+                                  size_t key_size, const uint8_t *value, size_t value_size,
                                   int64_t ttl);
 
 /**

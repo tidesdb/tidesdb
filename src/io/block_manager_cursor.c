@@ -29,14 +29,14 @@ static ssize_t bm_read_size_field(int fd, uint64_t pos, uint32_t *out)
 
 /* a short read inside the captured extent means a truncated frame. foreground reads have
  * historically returned an I/O error for a short read, so each caller chooses that outcome. */
-static int bm_frame_read(int fd, uint64_t offset, uint8_t* buf, size_t count, int short_read)
+static int bm_frame_read(int fd, uint64_t offset, uint8_t *buf, size_t count, int short_read)
 {
     const ssize_t n = pread(fd, buf, count, (off_t)offset);
     if (n < 0) return BLOCK_MANAGER_READ_ERR_IO;
     return n == (ssize_t)count ? BLOCK_MANAGER_READ_OK : short_read;
 }
 
-static int bm_frame_read_header(bm_frame_verify_state_t* frame, int fd, int short_read)
+static int bm_frame_read_header(bm_frame_verify_state_t *frame, int fd, int short_read)
 {
     uint8_t header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
     const int rc = bm_frame_read(fd, frame->offset, header, sizeof(header), short_read);
@@ -51,7 +51,7 @@ static int bm_frame_read_header(bm_frame_verify_state_t* frame, int fd, int shor
 }
 
 /* both range reads and scrubs authenticate the exact bytes already in scratch */
-static int bm_frame_read_payload(bm_frame_verify_state_t* frame, int fd, uint8_t* scratch,
+static int bm_frame_read_payload(bm_frame_verify_state_t *frame, int fd, uint8_t *scratch,
                                  size_t count, int short_read)
 {
     const uint64_t pos = frame->offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + frame->payload_read;
@@ -66,7 +66,7 @@ static int bm_frame_read_payload(bm_frame_verify_state_t* frame, int fd, uint8_t
     return BLOCK_MANAGER_READ_OK;
 }
 
-static int bm_frame_read_footer(bm_frame_verify_state_t* frame, int fd)
+static int bm_frame_read_footer(bm_frame_verify_state_t *frame, int fd)
 {
     uint8_t footer[BLOCK_MANAGER_FOOTER_SIZE];
     const uint64_t pos = frame->offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + frame->payload_size;
@@ -81,7 +81,7 @@ static int bm_frame_read_footer(bm_frame_verify_state_t* frame, int fd)
     return BLOCK_MANAGER_READ_OK;
 }
 
-int bm_frame_verify_init(bm_frame_verify_state_t* state, XXH3_state_t* checksum_state,
+int bm_frame_verify_init(bm_frame_verify_state_t *state, XXH3_state_t *checksum_state,
                          uint64_t offset, uint64_t extent_limit)
 {
     if (!state || !checksum_state || offset > extent_limit) return BM_FRAME_VERIFY_ERR_INVALID;
@@ -90,8 +90,8 @@ int bm_frame_verify_init(bm_frame_verify_state_t* state, XXH3_state_t* checksum_
     return BM_FRAME_VERIFY_MORE;
 }
 
-int bm_frame_verify_step(bm_frame_verify_state_t* state, int fd, size_t byte_budget,
-                         size_t read_budget, size_t* bytes_used, size_t* reads_used)
+int bm_frame_verify_step(bm_frame_verify_state_t *state, int fd, size_t byte_budget,
+                         size_t read_budget, size_t *bytes_used, size_t *reads_used)
 {
     if (!state || !state->checksum_state || fd < 0 || !bytes_used || !reads_used)
         return BM_FRAME_VERIFY_ERR_INVALID;
@@ -114,7 +114,7 @@ int bm_frame_verify_step(bm_frame_verify_state_t* state, int fd, size_t byte_bud
             count = state->payload_size - state->payload_read;
             if (count > BM_RANGE_READ_SCRATCH_BYTES) count = BM_RANGE_READ_SCRATCH_BYTES;
             if (count > available) count = available;
-            uint8_t* scratch = bm_get_read_buf(count);
+            uint8_t *scratch = bm_get_read_buf(count);
             if (!scratch) return BM_FRAME_VERIFY_ERR_MEMORY;
             rc =
                 bm_frame_read_payload(state, fd, scratch, count, BLOCK_MANAGER_READ_ERR_CORRUPTION);
@@ -374,7 +374,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     return block;
 }
 
-int bm_cursor_resync_past_hole(block_manager_cursor_t* cursor, int* out_zero_tail)
+int bm_cursor_resync_past_hole(block_manager_cursor_t *cursor, int *out_zero_tail)
 {
     if (out_zero_tail) *out_zero_tail = 0;
     if (!cursor) return -1;
@@ -478,7 +478,7 @@ int bm_cursor_resync_past_hole(block_manager_cursor_t* cursor, int* out_zero_tai
     return -1;
 }
 
-int block_manager_cursor_resync_past_hole(block_manager_cursor_t* cursor)
+int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
 {
     return bm_cursor_resync_past_hole(cursor, NULL);
 }
@@ -769,10 +769,10 @@ const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, co
     return bm_read_block_tls(bm->fd, offset, extent, payload_hint, data_size);
 }
 
-int block_manager_read_verified_block_slices(block_manager_t* bm, const uint64_t offset,
-                                             const uint32_t prefix_size, uint8_t* prefix,
+int block_manager_read_verified_block_slices(block_manager_t *bm, const uint64_t offset,
+                                             const uint32_t prefix_size, uint8_t *prefix,
                                              const uint32_t slice_offset, const uint32_t slice_size,
-                                             uint8_t* slice, uint32_t* payload_size)
+                                             uint8_t *slice, uint32_t *payload_size)
 {
     if (!bm || !payload_size || (prefix_size && !prefix) || (slice_size && !slice))
         return BLOCK_MANAGER_READ_ERR_INVALID;
@@ -789,7 +789,7 @@ int block_manager_read_verified_block_slices(block_manager_t* bm, const uint64_t
     if (prefix_size > size || slice_offset > size || slice_size > size - slice_offset)
         return BLOCK_MANAGER_READ_ERR_CORRUPTION;
 
-    uint8_t* scratch = bm_get_read_buf(BM_RANGE_READ_SCRATCH_BYTES);
+    uint8_t *scratch = bm_get_read_buf(BM_RANGE_READ_SCRATCH_BYTES);
     if (!scratch) return BLOCK_MANAGER_READ_ERR_MEMORY;
     while (frame.payload_read < size)
     {

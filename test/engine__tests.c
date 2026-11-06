@@ -16,11 +16,11 @@
 #include "../src/engine/engine.h"          /* engine_vlog_gc, for a direct value-log reclaim */
 #include "../src/engine/engine_internal.h" /* ENGINE_FIRST_WAL_GENERATION */
 #include "../src/engine/engine_types.h"
-#include "../src/manifest/manifest.h" /* the inner txn a prefix delete is buffered on */
-#include "../src/sstable/sstable.h"   /* name a flushed klog for the failed-copy fixture */
+#include "../src/manifest/manifest.h"     /* the inner txn a prefix delete is buffered on */
+#include "../src/sstable/sstable.h"       /* name a flushed klog for the failed-copy fixture */
 #include "../src/sstable/vlog_internal.h" /* direct sealed-slot eviction in the fd-bound fixture */
-#include "../src/txn/mvcc.h"          /* TDB_MVCC_COMMIT_RING_SIZE, the eviction window */
-#include "../src/txn/txn.h"           /* tdb_txn_delete_prefix, not yet a public call */
+#include "../src/txn/mvcc.h"              /* TDB_MVCC_COMMIT_RING_SIZE, the eviction window */
+#include "../src/txn/txn.h"               /* tdb_txn_delete_prefix, not yet a public call */
 #include "db.h"
 #include "test_utils.h"
 
@@ -44,8 +44,7 @@ static int tests_failed = 0;
  * such values to write, so the store must open more than the one segment it starts with */
 #define ENGINE_TEST_VLOG_SEGMENT_SIZE (64u * 1024)
 #define ENGINE_TEST_VLOG_SEGMENT_KEYS 200
-#define ENGINE_TEST_VLOG_INDEX_PATH \
-    ENGINE_TEST_DB_DIR PATH_SEPARATOR "000000000000.vix"
+#define ENGINE_TEST_VLOG_INDEX_PATH   ENGINE_TEST_DB_DIR PATH_SEPARATOR "000000000000.vix"
 
 /* the transaction id an undecided prepare is left under, to pin the log generation holding it */
 #define ENGINE_TEST_PIN_XID "pin-the-generation"
@@ -2403,31 +2402,31 @@ void test_engine_backup_existing_empty_directory(void)
 
 typedef struct
 {
-    int (*apply)(void* ctx, const tidesdb_wal_entry_t* entries, int count);
+    int (*apply)(void *ctx, const tidesdb_wal_entry_t *entries, int count);
     _Atomic(int) entered;
     _Atomic(int) release;
 } engine_backup_apply_probe_t;
 
 typedef struct
 {
-    tidesdb_t* db;
-    tidesdb_column_family_t* cf;
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
     int rc;
 } engine_backup_delayed_writer_t;
 
 typedef struct
 {
-    tidesdb_t* db;
-    const char* dir;
+    tidesdb_t *db;
+    const char *dir;
     int rc;
 } engine_backup_runner_t;
 
-static engine_backup_apply_probe_t* engine_backup_apply_probe = NULL;
+static engine_backup_apply_probe_t *engine_backup_apply_probe = NULL;
 
-static int engine_backup_delay_second_apply(void* ctx, const tidesdb_wal_entry_t* entries,
+static int engine_backup_delay_second_apply(void *ctx, const tidesdb_wal_entry_t *entries,
                                             int count)
 {
-    engine_backup_apply_probe_t* probe = engine_backup_apply_probe;
+    engine_backup_apply_probe_t *probe = engine_backup_apply_probe;
     ASSERT_TRUE(probe != NULL && count == 2);
     const int first = probe->apply(ctx, entries, 1);
     if (first != 0) return first;
@@ -2441,14 +2440,14 @@ static int engine_backup_delay_second_apply(void* ctx, const tidesdb_wal_entry_t
     return probe->apply(ctx, entries + 1, 1);
 }
 
-static void* engine_backup_delayed_writer(void* arg)
+static void *engine_backup_delayed_writer(void *arg)
 {
-    engine_backup_delayed_writer_t* writer = arg;
+    engine_backup_delayed_writer_t *writer = arg;
     const uint8_t first_key[] = "first";
     const uint8_t first_value[] = "A";
     const uint8_t second_key[] = "second";
     const uint8_t second_value[] = "B";
-    tidesdb_txn_t* txn = NULL;
+    tidesdb_txn_t *txn = NULL;
     writer->rc = tidesdb_txn_begin(writer->db, &txn);
     if (writer->rc == TDB_SUCCESS)
         writer->rc = tidesdb_txn_put(txn, writer->cf, first_key, sizeof(first_key) - 1, first_value,
@@ -2461,9 +2460,9 @@ static void* engine_backup_delayed_writer(void* arg)
     return NULL;
 }
 
-static void* engine_backup_runner(void* arg)
+static void *engine_backup_runner(void *arg)
 {
-    engine_backup_runner_t* runner = arg;
+    engine_backup_runner_t *runner = arg;
     runner->rc = tidesdb_backup(runner->db, runner->dir);
     return NULL;
 }
@@ -2478,11 +2477,11 @@ void test_engine_backup_keeps_a_delayed_sequence_across_rotation(void)
     char db_path[] = ENGINE_TEST_DB_DIR;
     tidesdb_config_t cfg = engine_test_config(db_path);
     cfg.value_separation_threshold = 1;
-    tidesdb_t* db = NULL;
+    tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
     tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
     ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
-    tidesdb_column_family_t* cf = tidesdb_get_column_family(db, "kv");
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
     ASSERT_TRUE(cf != NULL);
 
     engine_backup_apply_probe_t probe = {0};
@@ -2548,13 +2547,13 @@ void test_engine_backup_hides_a_failed_staging_directory_until_retry(void)
     (void)remove_directory(ENGINE_TEST_DB_DIR);
     (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
     char db_path[] = ENGINE_TEST_DB_DIR;
-    tidesdb_t* db = NULL;
-    tidesdb_column_family_t* cf = NULL;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
     engine_open_with_cf(db_path, &db, &cf);
     engine_put(db, cf, 0);
     ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
 
-    cf_t* inner = (cf_t*)cf;
+    cf_t *inner = (cf_t *)cf;
     tidesdb_manifest_entry_t entry;
     ASSERT_EQ(tidesdb_manifest_copy_entries(db->manifest, inner->cf_id, &entry, 1), 1);
     char name[TDB_SSTABLE_KLOG_NAME_MAX];
@@ -5362,7 +5361,7 @@ void test_engine_open_options_enable_vlog_indexes_for_ordinary_kv(void)
     cfg.value_separation_threshold = 1;
     const tidesdb_open_options_t options = {.size = sizeof(options), .enable_vlog_indexes = 1};
     const tidesdb_open_options_t short_options = {.size = sizeof(short_options.size),
-                                                   .enable_vlog_indexes = 1};
+                                                  .enable_vlog_indexes = 1};
     tidesdb_t *db = NULL;
 
     /* an options payload ending at its size tag is a supported older caller and must leave the
@@ -5420,7 +5419,7 @@ static void test_engine_open_options_scrub_requires_complete_field(void)
     for (size_t size = offsetof(tidesdb_open_options_t, blob_scrub_enabled); size < end; size++)
     {
         options.size = size;
-        tidesdb_t* db = NULL;
+        tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
         ASSERT_EQ(vlog_max_segments(db->vlog), options.max_vlog_segments);
         ASSERT_EQ(threadmanager_stop(db->threads, "vlog_scrub"), -1);

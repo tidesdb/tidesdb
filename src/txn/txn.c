@@ -239,8 +239,8 @@ int tdb_txn_put(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
     return txn_buffer(txn, cf_index, key, key_size, value, value_size, ttl, 0);
 }
 
-int tdb_txn_put_borrowed(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                         const uint8_t* value, size_t value_size, int64_t ttl)
+int tdb_txn_put_borrowed(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         const uint8_t *value, size_t value_size, int64_t ttl)
 {
     const int rc = txn_require_active(txn);
     if (rc != TDB_SUCCESS) return rc;
@@ -248,7 +248,7 @@ int tdb_txn_put_borrowed(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, 
                                          ttl);
 }
 
-uint64_t tdb_txn_forced_vlog_id(const tdb_txn_t* txn)
+uint64_t tdb_txn_forced_vlog_id(const tdb_txn_t *txn)
 {
     return txn ? txn->forced_vlog_id : 0;
 }
@@ -387,13 +387,13 @@ typedef struct
     size_t length;
 } txn_value_range_t;
 
-static int txn_copy_value(const uint8_t* bytes, size_t size, const txn_value_range_t* range,
-                          uint8_t** value, size_t* value_size)
+static int txn_copy_value(const uint8_t *bytes, size_t size, const txn_value_range_t *range,
+                          uint8_t **value, size_t *value_size)
 {
     const size_t offset = range ? range->offset : 0;
     const size_t length = range ? range->length : size;
     if (offset > size || length > size - offset) return TDB_ERR_INVALID_ARGS;
-    uint8_t* copy = NULL;
+    uint8_t *copy = NULL;
     if (length)
     {
         copy = malloc(length);
@@ -406,12 +406,12 @@ static int txn_copy_value(const uint8_t* bytes, size_t size, const txn_value_ran
 }
 
 /* resolve only the winning live version, while the transaction still holds its read ceiling */
-static int txn_load_value(tidesdb_source_version_t* v, const txn_value_range_t* range)
+static int txn_load_value(tidesdb_source_version_t *v, const txn_value_range_t *range)
 {
     if (v->vlog_id == VLOG_ID_INVALID)
     {
         if (!range) return TDB_SUCCESS;
-        uint8_t* bytes = v->value;
+        uint8_t *bytes = v->value;
         const int rc = txn_copy_value(bytes, v->value_size, range, &v->value, &v->value_size);
         if (rc == TDB_SUCCESS) free(bytes);
         return rc;
@@ -447,19 +447,19 @@ static int txn_load_value(tidesdb_source_version_t* v, const txn_value_range_t* 
 /* outputs requested from the visible version. contains requests none */
 typedef struct
 {
-    uint8_t** value;
-    size_t* value_size;
-    int64_t* ttl;
-    const txn_value_range_t* range;
+    uint8_t **value;
+    size_t *value_size;
+    int64_t *ttl;
+    const txn_value_range_t *range;
     int track;
 } txn_read_request_t;
 
 /* the store half of a get, at a ceiling the caller holds -- the external source stack at that
  * snapshot, absorbing a transient busy internally, with the read recorded for validation when the
  * level keeps a read set */
-static int txn_get_store(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                         const tidesdb_source_t* sources, int num_sources, const uint64_t snapshot,
-                         const txn_read_request_t* read)
+static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         const tidesdb_source_t *sources, int num_sources, const uint64_t snapshot,
+                         const txn_read_request_t *read)
 {
     for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
     {
@@ -524,9 +524,9 @@ static int txn_get_store(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, 
                         */
 }
 
-static int txn_get_impl(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                        const tidesdb_source_t* sources, int num_sources,
-                        const txn_read_request_t* read)
+static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources,
+                        const txn_read_request_t *read)
 {
     if (!key) return TDB_ERR_INVALID_ARGS;
     const int active = txn_require_active(txn);
@@ -569,9 +569,9 @@ int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t ke
     return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &read);
 }
 
-int tdb_txn_get_range(tdb_txn_t* txn, uint32_t cf_index, const uint8_t* key, size_t key_size,
-                      const tidesdb_source_t* sources, int num_sources, size_t offset,
-                      size_t length, uint8_t** value, size_t* value_size)
+int tdb_txn_get_range(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                      const tidesdb_source_t *sources, int num_sources, size_t offset,
+                      size_t length, uint8_t **value, size_t *value_size)
 {
     if (!value || !value_size || key_size == 0 || key_size > SIZE_MAX - TDB_CF_PREFIX_SIZE ||
         length > SIZE_MAX - offset)

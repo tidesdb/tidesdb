@@ -174,7 +174,7 @@ uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m);
  * @param out_bound receives the first sequence excluded from the backup cut
  * @return 0 when the gate is active, or -1 when arguments are invalid or another backup owns it
  */
-int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t* m, uint64_t* out_bound);
+int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t *m, uint64_t *out_bound);
 
 /**
  * tidesdb_mvcc_backup_end
@@ -182,7 +182,7 @@ int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t* m, uint64_t* out_bound);
  * @param m the clock whose active backup gate is released
  * @return nothing
  */
-void tidesdb_mvcc_backup_end(tidesdb_mvcc_t* m);
+void tidesdb_mvcc_backup_end(tidesdb_mvcc_t *m);
 
 /**
  * tidesdb_mvcc_visible_seq

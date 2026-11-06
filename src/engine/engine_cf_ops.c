@@ -68,8 +68,8 @@ int engine_list_column_families(tidesdb_t *db, char ***out_names, int *out_count
 
 /* register a family's name and config in the manifest and commit; the caller has set config already
  */
-static int engine_cf_persist_config(tidesdb_t* db, cf_t* cf, const char* name,
-                                    const tidesdb_column_family_config_t* config)
+static int engine_cf_persist_config(tidesdb_t *db, cf_t *cf, const char *name,
+                                    const tidesdb_column_family_config_t *config)
 {
     uint8_t *blob = NULL;
     size_t blob_len = 0;

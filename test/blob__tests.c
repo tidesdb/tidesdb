@@ -28,31 +28,31 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-#define BLOB_DB_DIR           "." PATH_SEPARATOR "test_blob_db"
-#define BLOB_CF               "media"
-#define BLOB_PLAIN_CF         "plain"
-#define BLOB_MEMTABLE_BYTES   (4u << 20)
-#define BLOB_LIMIT_BYTES      64u
-#define BLOB_VALUE_BYTES      31u
-#define BLOB_GC_SEGMENT_BYTES 1024u
-#define BLOB_GC_VALUE_BYTES   (2u * BLOB_GC_SEGMENT_BYTES)
-#define BLOB_RANGE_VALUE_BYTES 32u
-#define BLOB_RANGE_OFFSET      7u
-#define BLOB_RANGE_LENGTH      11u
-#define BLOB_CORRUPT_BYTE      (BLOB_RANGE_VALUE_BYTES - 1u)
-#define BLOB_CORRUPT_VALUE     0xffu
-#define BLOB_RANGE_FILL        0x41u
-#define BLOB_GC_FILL           0x7au
-#define BLOB_ROLL_VALUE        0x11u
-#define BLOB_KV_SLICE_OFFSET   2u
-#define BLOB_KV_SLICE_LENGTH   3u
-#define BLOB_RACE_WAIT_TICKS  1000
-#define BLOB_RACE_WAIT_US     1000
-#define BLOB_CHILD_FLAG       "--blob-child"
-#define BLOB_PHASE_PRE_WAL    "pre-wal"
-#define BLOB_PHASE_POST_WAL   "post-wal"
-#define BLOB_CHILD_NTH        "0"
-#define BLOB_SCRUB_LOG_NAME    "LOG"
+#define BLOB_DB_DIR               "." PATH_SEPARATOR "test_blob_db"
+#define BLOB_CF                   "media"
+#define BLOB_PLAIN_CF             "plain"
+#define BLOB_MEMTABLE_BYTES       (4u << 20)
+#define BLOB_LIMIT_BYTES          64u
+#define BLOB_VALUE_BYTES          31u
+#define BLOB_GC_SEGMENT_BYTES     1024u
+#define BLOB_GC_VALUE_BYTES       (2u * BLOB_GC_SEGMENT_BYTES)
+#define BLOB_RANGE_VALUE_BYTES    32u
+#define BLOB_RANGE_OFFSET         7u
+#define BLOB_RANGE_LENGTH         11u
+#define BLOB_CORRUPT_BYTE         (BLOB_RANGE_VALUE_BYTES - 1u)
+#define BLOB_CORRUPT_VALUE        0xffu
+#define BLOB_RANGE_FILL           0x41u
+#define BLOB_GC_FILL              0x7au
+#define BLOB_ROLL_VALUE           0x11u
+#define BLOB_KV_SLICE_OFFSET      2u
+#define BLOB_KV_SLICE_LENGTH      3u
+#define BLOB_RACE_WAIT_TICKS      1000
+#define BLOB_RACE_WAIT_US         1000
+#define BLOB_CHILD_FLAG           "--blob-child"
+#define BLOB_PHASE_PRE_WAL        "pre-wal"
+#define BLOB_PHASE_POST_WAL       "post-wal"
+#define BLOB_CHILD_NTH            "0"
+#define BLOB_SCRUB_LOG_NAME       "LOG"
 #define BLOB_BACKUP_DIR           BLOB_DB_DIR "_backup"
 #define BLOB_FOREIGN_DIR          BLOB_DB_DIR "_foreign"
 #define BLOB_BACKUP_WRITERS       3u

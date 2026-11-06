@@ -49,13 +49,13 @@ static int tests_failed = 0;
 #define V_CHECKPOINT_VALUES 2
 #define V_ACTIVE_VALUES     (V_CHECKPOINT_VALUES + 1)
 
-#define VLOG_RECOVERY_CHILD_FLAG  "--vlog-recovery-child"
-#define VLOG_RECOVERY_CHILD_PHASE "open"
-#define VLOG_INDEX_CHILD_BEFORE_RENAME "vix-before-rename"
-#define VLOG_INDEX_CHILD_AFTER_RENAME  "vix-after-rename"
+#define VLOG_RECOVERY_CHILD_FLAG            "--vlog-recovery-child"
+#define VLOG_RECOVERY_CHILD_PHASE           "open"
+#define VLOG_INDEX_CHILD_BEFORE_RENAME      "vix-before-rename"
+#define VLOG_INDEX_CHILD_AFTER_RENAME       "vix-after-rename"
 #define VLOG_CHECKPOINT_CHILD_BEFORE_RENAME "vix-checkpoint-before-rename"
 #define VLOG_CHECKPOINT_CHILD_AFTER_RENAME  "vix-checkpoint-after-rename"
-#define VLOG_RECOVERY_CHILD_POLLS 5000
+#define VLOG_RECOVERY_CHILD_POLLS           5000
 
 #ifdef TDB_FAULT_INJECTION
 static const char *vlog_test_exe = NULL;
@@ -149,8 +149,8 @@ static tidesdb_encoding_registry_t g_vlog_reg;
 static uint8_t g_put_ids[TDB_ENCODING_PIPELINE_MAX];
 static int g_put_id_count;
 
-static vlog_t *open_store_at(const char *dir, tidesdb_compression_algorithm_t comp,
-                                   uint64_t target, int enable_indexes)
+static vlog_t *open_store_at(const char *dir, tidesdb_compression_algorithm_t comp, uint64_t target,
+                             int enable_indexes)
 {
     ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
     g_put_id_count = comp == TDB_COMPRESS_NONE ? 0 : 1;
@@ -170,7 +170,7 @@ static vlog_t *open_store(tidesdb_compression_algorithm_t comp, uint64_t target)
     return open_store_at(VDIR, comp, target, 0);
 }
 
-static vlog_t* open_scrub_store(uint32_t groups)
+static vlog_t *open_scrub_store(uint32_t groups)
 {
     ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
     const vlog_config_t cfg = {.encodings = &g_vlog_reg,
@@ -179,13 +179,13 @@ static vlog_t* open_scrub_store(uint32_t groups)
                                .enable_vlog_indexes = 1,
                                .max_blob_shard_groups = groups,
                                .blob_scrub_enabled = 1};
-    vlog_t* v = NULL;
+    vlog_t *v = NULL;
     ASSERT_EQ(vlog_open(VDIR, &cfg, &v), VLOG_OK);
     ASSERT_TRUE(v != NULL);
     return v;
 }
 
-static uint64_t scrub_segment_extent(vlog_t* v, uint32_t slot)
+static uint64_t scrub_segment_extent(vlog_t *v, uint32_t slot)
 {
     uint64_t extent = 0;
     ASSERT_EQ(vlog_segment_acquire(v, slot), 1);
@@ -730,11 +730,11 @@ void test_mixed_codecs_in_one_store(void)
 void test_range_reads_across_chunks_and_codecs(void)
 {
     fresh_dir();
-    vlog_t* v = open_store(TDB_COMPRESS_NONE, 0);
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
     const size_t size = 4 * V_LARGE;
     const size_t offset = V_LARGE;
     const size_t length = size - 2 * offset;
-    uint8_t* input = runs(size, 5);
+    uint8_t *input = runs(size, 5);
     ASSERT_TRUE(input != NULL);
     const uint8_t codec = TDB_COMPRESS_LZ4, identity = TDB_COMPRESS_NONE;
     vlog_id_t ids[3];
@@ -744,7 +744,7 @@ void test_range_reads_across_chunks_and_codecs(void)
 
     for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i)
     {
-        uint8_t* slice = NULL;
+        uint8_t *slice = NULL;
         size_t slice_len = 0;
         ASSERT_EQ(vlog_read_range(v, ids[i], offset, length, &slice, &slice_len), VLOG_OK);
         ASSERT_EQ(slice_len, length);
@@ -1180,10 +1180,10 @@ void test_group_checkpoint_recovers_only_its_own_prefix(void)
 {
     fresh_dir();
     vlog_config_t config = {.enable_vlog_indexes = 1, .max_blob_shard_groups = UINT32_MAX};
-    vlog_t* v = NULL;
+    vlog_t *v = NULL;
     ASSERT_EQ(vlog_open(VDIR, &config, &v), VLOG_OK);
     ASSERT_TRUE(v->groups == NULL);
-    uint8_t* large = pattern(VLOG_CHECKPOINT_INTERVAL_BYTES, 42);
+    uint8_t *large = pattern(VLOG_CHECKPOINT_INTERVAL_BYTES, 42);
     const uint8_t tail = 7;
     vlog_id_t ids[4];
     ASSERT_EQ(vlog_write_group(v, UINT32_MAX - 1, &tail, 1, &ids[0], NULL), VLOG_OK);
@@ -1654,9 +1654,9 @@ void test_crash_before_or_after_index_rename_leaves_recoverable_authoritative_da
     {
         fresh_dir();
         int child_status = -1;
-        ASSERT_EQ(test_spawn_self(vlog_test_exe, VLOG_RECOVERY_CHILD_FLAG, phases[i], "1",
-                                  &child_status),
-                  0);
+        ASSERT_EQ(
+            test_spawn_self(vlog_test_exe, VLOG_RECOVERY_CHILD_FLAG, phases[i], "1", &child_status),
+            0);
         ASSERT_EQ(child_status, 0);
 
         vlog_t *v = open_index_store(VDIR);
@@ -2070,8 +2070,8 @@ void test_read_detects_corruption(void)
 void test_scrub_disabled_does_no_work_and_enabled_bounds_each_pass(void)
 {
     fresh_dir();
-    vlog_t* disabled = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
-    uint8_t* value = pattern(V_MEDIUM, 401);
+    vlog_t *disabled = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
+    uint8_t *value = pattern(V_MEDIUM, 401);
     (void)put(disabled, value, V_MEDIUM);
     ASSERT_EQ(vlog_segment_roll(disabled, atomic_load(&disabled->active_slot)), VLOG_OK);
     vlog_scrub_pass_t pass = {0};
@@ -2082,7 +2082,7 @@ void test_scrub_disabled_does_no_work_and_enabled_bounds_each_pass(void)
     (void)remove_directory(VDIR);
 
     fresh_dir();
-    vlog_t* enabled = open_scrub_store(0);
+    vlog_t *enabled = open_scrub_store(0);
     (void)put(enabled, value, V_MEDIUM);
     ASSERT_EQ(vlog_segment_roll(enabled, atomic_load(&enabled->active_slot)), VLOG_OK);
     /* model a high-water mark left behind by retired slots. the first pass must yield before
@@ -2121,10 +2121,10 @@ void test_scrub_disabled_does_no_work_and_enabled_bounds_each_pass(void)
 void test_scrub_covers_large_ordinary_and_grouped_frames(void)
 {
     fresh_dir();
-    vlog_t* v = open_scrub_store(2);
-    uint8_t* large_value = pattern(V_LARGE, 403);
-    uint8_t* ordinary_value = pattern(V_MEDIUM, 405);
-    uint8_t* grouped_value = pattern(V_MEDIUM, 407);
+    vlog_t *v = open_scrub_store(2);
+    uint8_t *large_value = pattern(V_LARGE, 403);
+    uint8_t *ordinary_value = pattern(V_MEDIUM, 405);
+    uint8_t *grouped_value = pattern(V_MEDIUM, 407);
     const vlog_id_t large_id = put(v, large_value, V_LARGE);
     const vlog_index_fixture_t large = snapshot_entry(v, large_id);
     ASSERT_EQ(vlog_segment_roll(v, atomic_load(&v->active_slot)), VLOG_OK);
@@ -2176,9 +2176,9 @@ void test_scrub_covers_large_ordinary_and_grouped_frames(void)
 void test_scrub_reports_the_exact_corrupt_indexed_frame(void)
 {
     fresh_dir();
-    vlog_t* v = open_scrub_store(0);
-    uint8_t* clean = pattern(V_MEDIUM, 409);
-    uint8_t* damaged = pattern(V_MEDIUM, 411);
+    vlog_t *v = open_scrub_store(0);
+    uint8_t *clean = pattern(V_MEDIUM, 409);
+    uint8_t *damaged = pattern(V_MEDIUM, 411);
     (void)put(v, clean, V_MEDIUM);
     const vlog_id_t id = put(v, damaged, V_MEDIUM);
     const vlog_index_fixture_t fixture = snapshot_entry(v, id);
@@ -2194,7 +2194,7 @@ void test_scrub_reports_the_exact_corrupt_indexed_frame(void)
 
     /* keep the published sidecar valid while changing the second frame's payload after a clean
      * first frame. reopening must trust that index, leaving scrub as the reader that detects it. */
-    FILE* file = fopen(path, "r+b");
+    FILE *file = fopen(path, "r+b");
     ASSERT_TRUE(file != NULL);
     ASSERT_EQ(fseek(file, (long)payload, SEEK_SET), 0);
     uint8_t corrupt = 0;
@@ -2232,11 +2232,11 @@ void test_scrub_reports_the_exact_corrupt_indexed_frame(void)
 #ifdef TDB_FAULT_INJECTION
 typedef struct
 {
-    vlog_t* v;
+    vlog_t *v;
     int rc;
 } vlog_scrub_thread_t;
 
-static void vlog_scrub_pin_pause(vlog_t* v, uint32_t slot)
+static void vlog_scrub_pin_pause(vlog_t *v, uint32_t slot)
 {
     (void)v;
     atomic_store_explicit(&vlog_scrub_pinned_slot, slot, memory_order_release);
@@ -2244,9 +2244,9 @@ static void vlog_scrub_pin_pause(vlog_t* v, uint32_t slot)
     await_index_test_event(&vlog_scrub_pin_release);
 }
 
-static void* vlog_scrub_once(void* arg)
+static void *vlog_scrub_once(void *arg)
 {
-    vlog_scrub_thread_t* thread = arg;
+    vlog_scrub_thread_t *thread = arg;
     vlog_scrub_pass_t pass = {0};
     thread->rc = vlog_scrub_pass(thread->v, V_SCRUB_PASS_BYTES, V_SCRUB_PASS_READS, &pass);
     return NULL;
@@ -2257,8 +2257,8 @@ static void* vlog_scrub_once(void* arg)
 void test_scrub_pin_hands_a_retired_slot_back_for_reuse(void)
 {
     fresh_dir();
-    vlog_t* v = open_scrub_store(0);
-    uint8_t* old_value = pattern(V_LARGE, 413);
+    vlog_t *v = open_scrub_store(0);
+    uint8_t *old_value = pattern(V_LARGE, 413);
     (void)put(v, old_value, V_LARGE);
     const uint32_t old_slot = atomic_load(&v->active_slot);
     ASSERT_EQ(vlog_segment_roll(v, old_slot), VLOG_OK);
@@ -2863,7 +2863,7 @@ void test_concurrent_ids_are_unique(void)
 
 /* several writers share two groups while ordinary writes roll. index hits on reopen and
  * every recorded owner check the synchronization between append, seal and slot publication. */
-static void* grouped_writer(void* arg)
+static void *grouped_writer(void *arg)
 {
     const uint32_t writer = (uint32_t)(uintptr_t)arg;
     const uint8_t value = (uint8_t)writer;
@@ -2886,7 +2886,7 @@ void test_concurrent_groups_roll_and_recover_separately(void)
     ASSERT_EQ(vlog_open(VDIR, &config, &g_uniq_v), VLOG_OK);
     pthread_t threads[V_UNIQ_THREADS];
     for (uintptr_t t = 0; t < V_UNIQ_THREADS; ++t)
-        ASSERT_EQ(pthread_create(&threads[t], NULL, grouped_writer, (void*)t), 0);
+        ASSERT_EQ(pthread_create(&threads[t], NULL, grouped_writer, (void *)t), 0);
     for (int t = 0; t < V_UNIQ_THREADS; ++t) ASSERT_EQ(pthread_join(threads[t], NULL), 0);
     ASSERT_EQ(vlog_seal_idle_groups(g_uniq_v, 0, NULL), 2);
     vlog_close(g_uniq_v);
@@ -2944,14 +2944,14 @@ void test_group_pressure_seals_idle_files_within_the_fd_budget(void)
     fd_manager_t fdm;
     ASSERT_EQ(fd_manager_init(&fdm, 6), 0);
     vlog_config_t config = {.max_blob_shard_groups = UINT32_MAX, .fdm = &fdm};
-    vlog_t* v = NULL;
+    vlog_t *v = NULL;
     ASSERT_EQ(vlog_open(VDIR, &config, &v), VLOG_OK);
     const int budget = fd_manager_open_budget(&fdm);
     vlog_id_t first = 0;
     for (uint32_t i = 0; i < (uint32_t)budget + 2; ++i)
     {
         vlog_id_t id;
-        ASSERT_EQ(vlog_write_group(v, i, (const uint8_t*)"x", 1, &id, NULL), VLOG_OK);
+        ASSERT_EQ(vlog_write_group(v, i, (const uint8_t *)"x", 1, &id, NULL), VLOG_OK);
         if (!i) first = id;
         ASSERT_TRUE(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT) <= budget);
     }
@@ -3213,7 +3213,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);
     RUN_TEST(test_concurrent_groups_roll_and_recover_separately, tests_passed);
     RUN_TEST(test_group_pressure_seals_idle_files_within_the_fd_budget, tests_passed);
-    RUN_TEST(test_group_slot_pressure_preserves_live_writers_and_reuses_retired_space, tests_passed);
+    RUN_TEST(test_group_slot_pressure_preserves_live_writers_and_reuses_retired_space,
+             tests_passed);
     RUN_TEST(test_concurrent_reads_writes_and_reclaim, tests_passed);
     RUN_TEST(test_reclaim_never_retires_a_segment_a_roll_is_publishing, tests_passed);
 #ifndef _WIN32

@@ -44,7 +44,7 @@
  * @param db_threshold the database's value_separation_threshold
  * @return the threshold to hand the sstable builder, SIZE_MAX when the family keeps values inline
  */
-size_t cf_config_value_threshold(const tidesdb_column_family_config_t *cfg, size_t db_threshold);
+size_t cf_config_value_threshold(const tidesdb_column_family_config_t* cfg, size_t db_threshold);
 
 /**
  * cf_config_validate
@@ -55,8 +55,8 @@ size_t cf_config_value_threshold(const tidesdb_column_family_config_t *cfg, size
  * @param reg the encoding registry to resolve pipeline ids against, or NULL to skip that check
  * @return 0 if valid, -1 otherwise
  */
-int cf_config_validate(const tidesdb_column_family_config_t *cfg,
-                       const tidesdb_encoding_registry_t *reg);
+int cf_config_validate(const tidesdb_column_family_config_t* cfg,
+                       const tidesdb_encoding_registry_t* reg);
 
 /**
  * cf_config_warn_layout
@@ -69,7 +69,7 @@ int cf_config_validate(const tidesdb_column_family_config_t *cfg,
  * @param cfg the config to inspect, may be NULL
  * @param db_threshold the database's value_separation_threshold
  */
-void cf_config_warn_layout(const tidesdb_column_family_config_t *cfg, size_t db_threshold);
+void cf_config_warn_layout(const tidesdb_column_family_config_t* cfg, size_t db_threshold);
 
 /**
  * cf_config_serialize

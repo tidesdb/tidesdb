@@ -329,8 +329,8 @@ int64_t block_manager_write_raw(block_manager_t *bm, const void *data, uint32_t 
 
 /**
  * block_manager_write_rawv
- * append up to three payload spans as one framed block without concatenating them first. zero-length
- * spans may use a NULL base, but their concatenated payload must be non-empty.
+ * append up to three payload spans as one framed block without concatenating them first.
+ * zero-length spans may use a NULL base, but their concatenated payload must be non-empty.
  * @param bm the block manager
  * @param spans the payload spans, valid for the duration of this call
  * @param count the number of spans, from 1 through BLOCK_MANAGER_MAX_PAYLOAD_SPANS
@@ -771,9 +771,9 @@ const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, ui
  *         BLOCK_MANAGER_READ_ERR_MEMORY when bounded scratch allocation fails, or
  *         BLOCK_MANAGER_READ_ERR_IO when positioned storage reads fail
  */
-int block_manager_read_verified_block_slices(block_manager_t* bm, uint64_t offset,
-                                             uint32_t prefix_size, uint8_t* prefix,
+int block_manager_read_verified_block_slices(block_manager_t *bm, uint64_t offset,
+                                             uint32_t prefix_size, uint8_t *prefix,
                                              uint32_t slice_offset, uint32_t slice_size,
-                                             uint8_t* slice, uint32_t* payload_size);
+                                             uint8_t *slice, uint32_t *payload_size);
 
 #endif /* __BLOCK_MANAGER_H__ */

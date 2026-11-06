@@ -33,9 +33,9 @@
  * caller to resolve. a busy or io candidate taints the level -- without reading it the max cannot
  * be trusted, so the whole level returns BUSY for the caller to retry rather than risk a stale
  * older version. */
-static tidesdb_source_result_t cf_source_scan_level(cf_t* cf, int level, const uint8_t* key,
+static tidesdb_source_result_t cf_source_scan_level(cf_t *cf, int level, const uint8_t *key,
                                                     size_t key_size, uint64_t snapshot,
-                                                    tidesdb_source_version_t* best)
+                                                    tidesdb_source_version_t *best)
 {
     *best = (tidesdb_source_version_t){0};
 

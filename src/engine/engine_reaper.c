@@ -45,9 +45,9 @@
 #define ENGINE_VLOG_SCRUB_LABEL       "vlog_scrub"
 #define ENGINE_VLOG_SCRUB_INTERVAL_US 1000000
 
-static void engine_vlog_scrub_tick(void* ctx)
+static void engine_vlog_scrub_tick(void *ctx)
 {
-    tidesdb_t* db = ctx;
+    tidesdb_t *db = ctx;
     if (atomic_load_explicit(&db->closing, memory_order_acquire)) return;
     vlog_scrub_pass_t pass;
     const int rc = vlog_scrub_pass(db->vlog, VLOG_SCRUB_PASS_BYTES, VLOG_SCRUB_PASS_READS, &pass);
@@ -211,7 +211,7 @@ static void engine_wake_fd_reaper(void *ctx)
     bg_ticker_wake((bg_ticker_t *)ctx);
 }
 
-int engine_reaper_init(tidesdb_t* db, int scrub_enabled)
+int engine_reaper_init(tidesdb_t *db, int scrub_enabled)
 {
     /* seeded before the ticker starts so a transaction opened in the first second ages against a
      * real clock rather than against zero */

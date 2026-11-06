@@ -216,11 +216,11 @@ static tidesdb_source_result_t engine_sstable_source_has_newer(void *ctx, uint32
 }
 
 /* a blob always occupies its own verbatim frame, even when it has no payload bytes */
-static int engine_separate_blob(void* ctx, const uint32_t cf_index, const uint8_t* value,
-                                const size_t value_size, uint64_t* out_id)
+static int engine_separate_blob(void *ctx, const uint32_t cf_index, const uint8_t *value,
+                                const size_t value_size, uint64_t *out_id)
 {
     (void)cf_index; /* the synchronous caller has validated the family */
-    tidesdb_t* db = ctx;
+    tidesdb_t *db = ctx;
     return vlog_write(db->vlog, value, value_size, NULL, 0, out_id, NULL) == VLOG_OK ? 1 : -1;
 }
 
@@ -807,8 +807,8 @@ void engine_close(tidesdb_t *db)
     if (owned_log_sink) tidesdb_log_close_sink();
 }
 
-int engine_create_cf_locked(tidesdb_t* db, const char* name,
-                            const tidesdb_column_family_config_t* config, int is_blob)
+int engine_create_cf_locked(tidesdb_t *db, const char *name,
+                            const tidesdb_column_family_config_t *config, int is_blob)
 {
     if (!db || !name || name[0] == '\0' || !config) return TDB_ERR_INVALID_ARGS;
     if (atomic_load_explicit(&db->closing, memory_order_acquire)) return TDB_ERR_INVALID_DB;
@@ -877,7 +877,7 @@ int engine_create_cf_locked(tidesdb_t* db, const char* name,
     return TDB_SUCCESS;
 }
 
-int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_family_config_t* config,
+int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_family_config_t *config,
                      int is_blob)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;

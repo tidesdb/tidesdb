@@ -185,7 +185,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     return tdb_public_rc(engine_create_cf(db, name, config, 0));
 }
 
-int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name)
+int tidesdb_create_blob_column_family(tidesdb_t *db, const char *name)
 {
     if (!db || !name || !*name || strnlen(name, TDB_MAX_CF_NAME_LEN) >= TDB_MAX_CF_NAME_LEN)
         return TDB_ERR_INVALID_ARGS;
@@ -193,20 +193,20 @@ int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name)
     return tdb_public_rc(engine_create_cf(db, name, &config, 1));
 }
 
-int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
-                     size_t key_size, const uint8_t* value, size_t value_size)
+int tidesdb_blob_put(tidesdb_t *db, tidesdb_column_family_t *cf, const uint8_t *key,
+                     size_t key_size, const uint8_t *value, size_t value_size)
 {
     return tdb_public_rc(
-        engine_blob_put(db, (cf_t*)cf, VLOG_GROUP_UNGROUPED, key, key_size, value, value_size));
+        engine_blob_put(db, (cf_t *)cf, VLOG_GROUP_UNGROUPED, key, key_size, value, value_size));
 }
 
-int tidesdb_blob_put_group(tidesdb_t* db, tidesdb_column_family_t* cf, uint32_t group_id,
-                           const uint8_t* key, size_t key_size, const uint8_t* value,
+int tidesdb_blob_put_group(tidesdb_t *db, tidesdb_column_family_t *cf, uint32_t group_id,
+                           const uint8_t *key, size_t key_size, const uint8_t *value,
                            size_t value_size)
 {
     if (group_id == VLOG_GROUP_UNGROUPED) return TDB_ERR_INVALID_ARGS;
     return tdb_public_rc(
-        engine_blob_put(db, (cf_t*)cf, group_id, key, key_size, value, value_size));
+        engine_blob_put(db, (cf_t *)cf, group_id, key, key_size, value, value_size));
 }
 
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
@@ -321,12 +321,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     return tdb_public_rc(engine_txn_get(txn, (cf_t *)cf, key, key_size, value, value_size));
 }
 
-int tidesdb_txn_get_range(tidesdb_txn_t* txn, tidesdb_column_family_t* cf, const uint8_t* key,
-                          size_t key_size, size_t offset, size_t length, uint8_t** value,
-                          size_t* value_size)
+int tidesdb_txn_get_range(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
+                          size_t key_size, size_t offset, size_t length, uint8_t **value,
+                          size_t *value_size)
 {
     return tdb_public_rc(
-        engine_txn_get_range(txn, (cf_t*)cf, key, key_size, offset, length, value, value_size));
+        engine_txn_get_range(txn, (cf_t *)cf, key, key_size, offset, length, value, value_size));
 }
 
 int tidesdb_txn_get_ttl(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,

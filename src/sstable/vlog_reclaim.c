@@ -45,7 +45,7 @@ static uint64_t vlog_segment_cutoff(vlog_t* v, uint32_t slot)
 /* reclamation and the build tokens that bound it. a segment goes back to the filesystem only when
  * nothing in the index resolves into it and no build in flight could still be writing to it, and a
  * build token is how a builder says which segments those are */
-int vlog_build_enter(vlog_t *v)
+int vlog_build_enter(vlog_t* v)
 {
     if (!v) return -1;
 
@@ -85,7 +85,7 @@ void vlog_build_protect(vlog_t* v, const int token, const vlog_id_t id)
     }
 }
 
-void vlog_build_leave(vlog_t *v, int token)
+void vlog_build_leave(vlog_t* v, int token)
 {
     if (!v) return;
     /* a census sees either the sender or the receiver of a floor handoff, even when the
@@ -105,7 +105,7 @@ void vlog_build_leave(vlog_t *v, int token)
  * @param v vlog handle
  * @return the floor, or VLOG_BUILD_FLOOR_NONE when nothing is in flight
  */
-static uint64_t vlog_build_floor(vlog_t *v)
+static uint64_t vlog_build_floor(vlog_t* v)
 {
     uint64_t floor = VLOG_BUILD_FLOOR_NONE;
     for (int i = 0; i < VLOG_MAX_BUILDERS; i++)
@@ -136,7 +136,7 @@ uint64_t vlog_group_census_floor(vlog_t* v)
  * @param v vlog handle
  * @param slot the segment's table slot
  */
-static void vlog_index_purge_segment(vlog_t *v, uint32_t slot)
+static void vlog_index_purge_segment(vlog_t* v, uint32_t slot)
 {
     pthread_rwlock_wrlock(&v->index_rw);
     for (size_t i = 0; i < v->bucket_cap; i++)
@@ -219,7 +219,7 @@ int vlog_reclaim(vlog_t* v)
     return vlog_reclaim_before(v, VLOG_BUILD_FLOOR_NONE);
 }
 
-int vlog_mark_drainable(vlog_t *v)
+int vlog_mark_drainable(vlog_t* v)
 {
     if (!v) return 0;
 
@@ -253,7 +253,7 @@ int vlog_mark_drainable(vlog_t *v)
     return marked;
 }
 
-int vlog_should_respill(vlog_t *v, vlog_id_t id)
+int vlog_should_respill(vlog_t* v, vlog_id_t id)
 {
     if (!v || id == VLOG_ID_INVALID) return 0;
 
@@ -266,7 +266,7 @@ int vlog_should_respill(vlog_t *v, vlog_id_t id)
     return draining;
 }
 
-int vlog_evict_idle_segments(vlog_t *v, int max)
+int vlog_evict_idle_segments(vlog_t* v, int max)
 {
     if (!v) return 0;
 

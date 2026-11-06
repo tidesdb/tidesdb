@@ -448,7 +448,7 @@ static inline int tdb_fsync_parent_dir(const char *path)
  * @param dest final directory name
  * @return 0 once published, -1 if the destination is occupied or publication failed
  */
-static inline int tdb_publish_directory(const char* stage, const char* dest)
+static inline int tdb_publish_directory(const char *stage, const char *dest)
 {
 #ifdef _WIN32
     /* windows cannot rename over even an empty directory. rmdir refuses a populated target,

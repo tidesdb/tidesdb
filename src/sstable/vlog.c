@@ -199,7 +199,7 @@ static int vlog_index_put(vlog_t *v, uint64_t id, uint32_t segment, uint64_t off
 
 /* sidecars are expendable. failure to grow their staging area cannot lose a completed append
  * or produce a partial index: stop collecting for this segment and let recovery scan it. */
-static void vlog_collect_entry(vlog_pending_t* writer, const vlog_sidecar_entry_t* entry)
+static void vlog_collect_entry(vlog_pending_t *writer, const vlog_sidecar_entry_t *entry)
 {
     if (writer->incomplete) return;
     if (writer->count == writer->cap)
@@ -219,15 +219,15 @@ static void vlog_collect_entry(vlog_pending_t* writer, const vlog_sidecar_entry_
     writer->entries[writer->count++] = *entry;
 }
 
-int vlog_record_entry(vlog_t* v, uint32_t slot, vlog_pending_t* writer,
-                      const vlog_sidecar_entry_t* entry)
+int vlog_record_entry(vlog_t *v, uint32_t slot, vlog_pending_t *writer,
+                      const vlog_sidecar_entry_t *entry)
 {
     if (v->enable_vlog_indexes) vlog_collect_entry(writer, entry);
     return vlog_index_put(v, entry->id, slot, entry->offset, entry->value_len, entry->disk_len,
                           entry->chain);
 }
 
-void vlog_publish_pending(vlog_t* v, uint32_t slot, vlog_pending_t* writer, uint64_t extent,
+void vlog_publish_pending(vlog_t *v, uint32_t slot, vlog_pending_t *writer, uint64_t extent,
                           vlog_sidecar_kind_t kind)
 {
     if (writer->count && !writer->incomplete &&
@@ -270,8 +270,8 @@ static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, const uint8_t 
  * @param out_scrub_extent receives the end up to which recovery expects frames
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_MEMORY
  */
-static int vlog_scan_segment(vlog_t* v, uint32_t slot, block_manager_t* bm, uint64_t start,
-                             uint64_t fsize, uint64_t* out_max_id, uint64_t* out_scrub_extent)
+static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint64_t start,
+                             uint64_t fsize, uint64_t *out_max_id, uint64_t *out_scrub_extent)
 {
     if (!v || !bm || !out_max_id || !out_scrub_extent || start < BLOCK_MANAGER_HEADER_SIZE ||
         start > fsize)
@@ -421,7 +421,7 @@ static int vlog_adopt_segments(vlog_t *v)
     return rc;
 }
 
-int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog_t** out)
+int vlog_open_after_preflight(const char *dir, const vlog_config_t *config, vlog_t **out)
 {
     if (!dir || !config || !out) return VLOG_ERR_INVALID;
     if (strlen(dir) >= VLOG_PATH_MAX) return VLOG_ERR_INVALID;
@@ -437,7 +437,7 @@ int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog
             return VLOG_ERR_MEMORY;
         allocation += (size_t)capacity * sizeof(_Atomic(uint64_t));
     }
-    vlog_t* v = calloc(1, allocation);
+    vlog_t *v = calloc(1, allocation);
     if (!v) return VLOG_ERR_MEMORY;
 
     v->max_segments = capacity;
@@ -498,7 +498,7 @@ int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog
     return VLOG_OK;
 }
 
-int vlog_open(const char* dir, const vlog_config_t* config, vlog_t** out)
+int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
 {
     if (!dir || !config || !out) return VLOG_ERR_INVALID;
     const int rc = vlog_group_disk_preflight(dir, config->max_blob_shard_groups);
@@ -526,10 +526,10 @@ void vlog_close(vlog_t *v)
         }
         atomic_store_explicit(&v->segments[i].state, VLOG_SEG_ABSENT, memory_order_release);
     }
-    vlog_group_t* group = v->groups;
+    vlog_group_t *group = v->groups;
     while (group)
     {
-        vlog_group_t* next = group->next;
+        vlog_group_t *next = group->next;
         free(group->writer.entries);
         free(group);
         group = next;
@@ -547,9 +547,9 @@ void vlog_close(vlog_t *v)
     free(v);
 }
 
-static int vlog_write_value(vlog_t* v, uint32_t group, const uint8_t* value, size_t value_len,
-                            const uint8_t* ids, const int id_count, vlog_id_t* out_id,
-                            uint64_t* out_disk_bytes)
+static int vlog_write_value(vlog_t *v, uint32_t group, const uint8_t *value, size_t value_len,
+                            const uint8_t *ids, const int id_count, vlog_id_t *out_id,
+                            uint64_t *out_disk_bytes)
 {
     if (!v || (!value && value_len != 0) || (uint64_t)value_len > VLOG_BLK_LEN_MASK || !out_id)
         return VLOG_ERR_INVALID;
@@ -608,26 +608,26 @@ static int vlog_write_value(vlog_t* v, uint32_t group, const uint8_t* value, siz
     return rc;
 }
 
-int vlog_write(vlog_t* v, const uint8_t* value, size_t value_len, const uint8_t* ids, int id_count,
-               vlog_id_t* out_id, uint64_t* out_disk_bytes)
+int vlog_write(vlog_t *v, const uint8_t *value, size_t value_len, const uint8_t *ids, int id_count,
+               vlog_id_t *out_id, uint64_t *out_disk_bytes)
 {
     return vlog_write_value(v, VLOG_GROUP_UNGROUPED, value, value_len, ids, id_count, out_id,
                             out_disk_bytes);
 }
 
-int vlog_write_group(vlog_t* v, uint32_t group, const uint8_t* value, size_t value_len,
-                     vlog_id_t* out_id, uint64_t* out_disk_bytes)
+int vlog_write_group(vlog_t *v, uint32_t group, const uint8_t *value, size_t value_len,
+                     vlog_id_t *out_id, uint64_t *out_disk_bytes)
 {
     if (!v || group >= v->max_blob_shard_groups) return VLOG_ERR_INVALID;
     return vlog_write_value(v, group, value, value_len, NULL, 0, out_id, out_disk_bytes);
 }
 
-uint32_t vlog_group_limit(const vlog_t* v)
+uint32_t vlog_group_limit(const vlog_t *v)
 {
     return v ? v->max_blob_shard_groups : 0;
 }
 
-int vlog_group_owner_of(vlog_t* v, vlog_id_t id, uint32_t* out_group)
+int vlog_group_owner_of(vlog_t *v, vlog_id_t id, uint32_t *out_group)
 {
     if (!v || !out_group || id == VLOG_ID_INVALID) return VLOG_ERR_INVALID;
     pthread_rwlock_rdlock(&v->index_rw);

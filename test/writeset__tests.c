@@ -254,7 +254,7 @@ void test_writeset_keeps_a_live_entry_with_an_empty_value(void)
  * owner resolves or truncates the transaction's write set. */
 void test_writeset_borrows_value_bytes(void)
 {
-    tidesdb_writeset_t* ws = tidesdb_writeset_create();
+    tidesdb_writeset_t *ws = tidesdb_writeset_create();
     const uint8_t key[] = "k";
     uint8_t value[] = {'v', '1'};
     ASSERT_EQ(tidesdb_writeset_put_borrowed(ws, 0, key, 1, value, sizeof(value), -1), TDB_SUCCESS);

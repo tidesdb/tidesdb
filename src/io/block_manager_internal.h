@@ -57,7 +57,7 @@ typedef struct
     uint32_t payload_size;
     uint32_t expected_checksum;
     uint32_t payload_read;
-    XXH3_state_t* checksum_state;
+    XXH3_state_t *checksum_state;
     int complete;
 } bm_frame_verify_state_t;
 
@@ -266,7 +266,7 @@ int bm_wait_flushed(block_manager_t *bm, uint64_t need);
 
 /* as block_manager_cursor_resync_past_hole, optionally certifying an all-zero suffix when no
  * later frame is found. a short or failed read cannot certify the suffix. */
-int bm_cursor_resync_past_hole(block_manager_cursor_t* cursor, int* out_zero_tail);
+int bm_cursor_resync_past_hole(block_manager_cursor_t *cursor, int *out_zero_tail);
 
 /* cursor -- read one block at offset into the thread-local buffer, verifying its checksum */
 uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, uint32_t payload_hint,
@@ -282,7 +282,7 @@ uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, uint3
  * @param extent_limit immutable logical end of the sealed file being checked
  * @return BM_FRAME_VERIFY_MORE when ready or BM_FRAME_VERIFY_ERR_INVALID for invalid arguments
  */
-int bm_frame_verify_init(bm_frame_verify_state_t* state, XXH3_state_t* checksum_state,
+int bm_frame_verify_init(bm_frame_verify_state_t *state, XXH3_state_t *checksum_state,
                          uint64_t offset, uint64_t extent_limit);
 
 /**
@@ -297,7 +297,7 @@ int bm_frame_verify_init(bm_frame_verify_state_t* state, XXH3_state_t* checksum_
  * @param reads_used receives positioned reads attempted, including a failed read attempt
  * @return BM_FRAME_VERIFY_MORE, BM_FRAME_VERIFY_DONE, or an error class
  */
-int bm_frame_verify_step(bm_frame_verify_state_t* state, int fd, size_t byte_budget,
-                         size_t read_budget, size_t* bytes_used, size_t* reads_used);
+int bm_frame_verify_step(bm_frame_verify_state_t *state, int fd, size_t byte_budget,
+                         size_t read_budget, size_t *bytes_used, size_t *reads_used);
 
 #endif /* __BLOCK_MANAGER_INTERNAL_H__ */

@@ -45,7 +45,7 @@ void engine_close(tidesdb_t *db);
  * @param is_blob nonzero for a dedicated blob family
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_EXISTS, TDB_ERR_IO, or TDB_ERR_MEMORY
  */
-int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_family_config_t* config,
+int engine_create_cf(tidesdb_t *db, const char *name, const tidesdb_column_family_config_t *config,
                      int is_blob);
 
 /**
@@ -60,8 +60,8 @@ int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_famil
  * @param value_size logical blob length
  * @return as tidesdb_blob_put
  */
-int engine_blob_put(tidesdb_t* db, cf_t* cf, uint32_t group, const uint8_t* key, size_t key_size,
-                    const uint8_t* value, size_t value_size);
+int engine_blob_put(tidesdb_t *db, cf_t *cf, uint32_t group, const uint8_t *key, size_t key_size,
+                    const uint8_t *value, size_t value_size);
 
 /**
  * engine_drop_cf
@@ -361,8 +361,8 @@ int engine_txn_get(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
  * @return the same errors as engine_txn_get, plus TDB_ERR_INVALID_ARGS for a range outside the
  * value
  */
-int engine_txn_get_range(tidesdb_txn_t* txn, cf_t* cf, const uint8_t* key, size_t key_size,
-                         size_t offset, size_t length, uint8_t** value, size_t* value_size);
+int engine_txn_get_range(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_size,
+                         size_t offset, size_t length, uint8_t **value, size_t *value_size);
 
 /**
  * engine_txn_get_ttl
@@ -838,7 +838,7 @@ int engine_backup(tidesdb_t *db, const char *dir);
  * @param scrub_enabled nonzero to schedule verification of sealed value-log segments
  * @return TDB_SUCCESS or TDB_ERR_MEMORY
  */
-int engine_reaper_init(tidesdb_t* db, int scrub_enabled);
+int engine_reaper_init(tidesdb_t *db, int scrub_enabled);
 
 /* ===== range iteration (src/engine/engine_iter.c) ===== */
 

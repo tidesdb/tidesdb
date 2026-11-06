@@ -110,7 +110,7 @@ typedef struct
  */
 typedef struct
 {
-    _Atomic(block_manager_t *) bm;
+    _Atomic(block_manager_t*) bm;
     uint64_t number;
     tdb_refcount_t rc;
     _Atomic(int) state;
@@ -222,10 +222,10 @@ typedef struct
 struct vlog
 {
     char dir[VLOG_PATH_MAX];
-    fd_manager_t *fdm;
+    fd_manager_t* fdm;
     int sync_mode;
     uint32_t max_segments;
-    const tidesdb_encoding_registry_t *encodings;
+    const tidesdb_encoding_registry_t* encodings;
     uint64_t segment_target_bytes;
     _Atomic(uint64_t) next_id;
     _Atomic(uint64_t) next_number;
@@ -244,12 +244,12 @@ struct vlog
 #ifdef TDB_FAULT_INJECTION
     uint64_t recovery_payload_bytes;
     size_t recovery_index_hits;
-    void (*after_append)(vlog_t *v);
+    void (*after_append)(vlog_t* v);
     void (*publication_hook)(int after_rename);
 #endif
 
     pthread_rwlock_t index_rw;
-    vlog_index_entry_t *buckets;
+    vlog_index_entry_t* buckets;
     size_t bucket_cap;
     size_t bucket_count;
     size_t bucket_tomb;
@@ -300,7 +300,7 @@ int vlog_segment_scan_dir(vlog_t* v, int grouped, uint64_t* numbers, size_t max,
  * @return VLOG_OK, VLOG_ERR_IO if the file could not be opened, or VLOG_ERR_FULL when the table has
  *         no free slot
  */
-int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot);
+int vlog_segment_open(vlog_t* v, uint64_t number, uint32_t* out_slot);
 int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t* out_slot);
 int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32_t* out_slot);
 
@@ -313,7 +313,7 @@ int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32
  * @param slot table slot
  * @return the block manager, or NULL when the file could not be reopened
  */
-block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot);
+block_manager_t* vlog_segment_ensure_open(vlog_t* v, uint32_t slot);
 
 /**
  * vlog_segment_inspect
@@ -323,7 +323,7 @@ block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot);
  * @param size receives the logical length, or NULL to sync the segment instead
  * @return VLOG_OK, VLOG_ERR_INVALID for an invalid store or slot, or VLOG_ERR_IO on a file error
  */
-int vlog_segment_inspect(vlog_t *v, uint32_t slot, uint64_t *size);
+int vlog_segment_inspect(vlog_t* v, uint32_t slot, uint64_t* size);
 
 /**
  * vlog_segment_scrub_fd
@@ -345,7 +345,7 @@ void vlog_test_set_scrub_pin_hook(void (*hook)(vlog_t* v, uint32_t slot));
 
 #ifdef TDB_FAULT_INJECTION
 /* install or clear only with scans quiescent; the hook runs on the borrowed private handle */
-void vlog_test_set_cold_borrow_hook(void (*hook)(block_manager_t *bm, int syncing));
+void vlog_test_set_cold_borrow_hook(void (*hook)(block_manager_t* bm, int syncing));
 #endif
 
 /**
@@ -356,7 +356,7 @@ void vlog_test_set_cold_borrow_hook(void (*hook)(block_manager_t *bm, int syncin
  * @param slot table slot
  * @return 1 when a descriptor was released, 0 otherwise
  */
-int vlog_segment_evict(vlog_t *v, uint32_t slot);
+int vlog_segment_evict(vlog_t* v, uint32_t slot);
 
 /**
  * vlog_segment_acquire
@@ -365,7 +365,7 @@ int vlog_segment_evict(vlog_t *v, uint32_t slot);
  * @param slot table slot to reference
  * @return 1 if a reference was taken, 0 if the slot holds no live segment
  */
-int vlog_segment_acquire(vlog_t *v, uint32_t slot);
+int vlog_segment_acquire(vlog_t* v, uint32_t slot);
 
 /**
  * vlog_segment_release
@@ -373,7 +373,7 @@ int vlog_segment_acquire(vlog_t *v, uint32_t slot);
  * @param v the store
  * @param slot table slot to release
  */
-void vlog_segment_release(vlog_t *v, uint32_t slot);
+void vlog_segment_release(vlog_t* v, uint32_t slot);
 
 /**
  * vlog_segment_retire
@@ -385,7 +385,7 @@ void vlog_segment_release(vlog_t *v, uint32_t slot);
  *         a later attempt, or VLOG_ERR_BUSY when a roll made this the active segment after the
  *         caller chose it, in which case it is left open and taking appends
  */
-int vlog_segment_retire(vlog_t *v, uint32_t slot);
+int vlog_segment_retire(vlog_t* v, uint32_t slot);
 
 /**
  * vlog_segment_roll
@@ -396,7 +396,7 @@ int vlog_segment_retire(vlog_t *v, uint32_t slot);
  * @param full_slot the slot the caller observed as full
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_FULL
  */
-int vlog_segment_roll(vlog_t *v, uint32_t full_slot);
+int vlog_segment_roll(vlog_t* v, uint32_t full_slot);
 
 /**
  * vlog_segment_append
@@ -407,8 +407,8 @@ int vlog_segment_roll(vlog_t *v, uint32_t full_slot);
  * @param entry value metadata; receives the offset assigned by the block manager
  * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_FULL
  */
-int vlog_segment_append(vlog_t *v, const struct iovec *spans, int count,
-                        vlog_sidecar_entry_t *entry);
+int vlog_segment_append(vlog_t* v, const struct iovec* spans, int count,
+                        vlog_sidecar_entry_t* entry);
 
 /* same physical append and publication owners as the ordinary writer; roll_mu admits groups */
 int vlog_segment_append_group(vlog_t* v, uint32_t group, const struct iovec* spans, int count,
@@ -433,7 +433,7 @@ void vlog_publish_pending(vlog_t* v, uint32_t slot, vlog_pending_t* writer, uint
  * @param out_free receives the first reusable (empty or deleted) bucket seen, may be NULL
  * @return index of the occupied bucket holding id, or SIZE_MAX if absent
  */
-size_t vlog_index_locate(const vlog_t *v, uint64_t id, size_t *out_free);
+size_t vlog_index_locate(const vlog_t* v, uint64_t id, size_t* out_free);
 
 /**
  * vlog_chain_account
@@ -444,6 +444,6 @@ size_t vlog_index_locate(const vlog_t *v, uint64_t id, size_t *out_free);
  * @param stored on-disk bytes, negated to remove
  * @param values value count delta
  */
-void vlog_chain_account(vlog_t *v, uint64_t key, int64_t used, int64_t stored, int64_t values);
+void vlog_chain_account(vlog_t* v, uint64_t key, int64_t used, int64_t stored, int64_t values);
 
 #endif /* __VLOG_INTERNAL_H__ */

@@ -41,7 +41,7 @@
 
 /* join a directory and a leaf into dst with the platform separator; returns -1 if it would not fit
  */
-static int engine_join(char *dst, size_t cap, const char *dir, const char *leaf)
+static int engine_join(char* dst, size_t cap, const char* dir, const char* leaf)
 {
     const int n = snprintf(dst, cap, "%s%s%s", dir, PATH_SEPARATOR, leaf);
     if (n < 0 || (size_t)n >= cap) return -1;
@@ -70,9 +70,9 @@ static int engine_copy_prepare(int src_fd, int dst_fd)
     return ftruncate(dst_fd, 0) == 0 ? TDB_SUCCESS : TDB_ERR_IO;
 }
 
-int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int durable)
+int engine_copy_file(const char* src, const char* dst, uint64_t limit, const int durable)
 {
-    FILE *in = fopen(src, "rb");
+    FILE* in = fopen(src, "rb");
     if (!in)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "backup cannot read %s", src);
@@ -98,9 +98,9 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
         return TDB_ERR_IO;
     }
 #ifdef _WIN32
-    FILE *out = _fdopen(dst_fd, "wb");
+    FILE* out = _fdopen(dst_fd, "wb");
 #else
-    FILE *out = fdopen(dst_fd, "wb");
+    FILE* out = fdopen(dst_fd, "wb");
 #endif
     if (!out)
     {
@@ -110,7 +110,7 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
     }
 
     int rc = TDB_SUCCESS;
-    uint8_t *buf = malloc(ENGINE_BACKUP_COPY_BUF);
+    uint8_t* buf = malloc(ENGINE_BACKUP_COPY_BUF);
     if (!buf)
         rc = TDB_ERR_MEMORY;
     else
@@ -148,9 +148,9 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
 }
 
 /* the file name after the last path separator */
-static const char *engine_basename(const char *path)
+static const char* engine_basename(const char* path)
 {
-    const char *sep = strrchr(path, PATH_SEPARATOR[0]);
+    const char* sep = strrchr(path, PATH_SEPARATOR[0]);
     return sep ? sep + 1 : path;
 }
 
@@ -162,7 +162,7 @@ static int engine_backup_capture_manifest(tidesdb_t* db, const char* dir,
                                           tidesdb_manifest_entry_t** out_entries, int* out_count)
 {
     char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
-    const char *name = engine_basename(db->manifest->path);
+    const char* name = engine_basename(db->manifest->path);
     if (engine_join(dst, sizeof(dst), dir, name) != 0) return TDB_ERR_IO;
     if (engine_join(src, sizeof(src), db->db_path, name) != 0) return TDB_ERR_IO;
 
@@ -264,11 +264,11 @@ static int engine_backup_copy_entries(tidesdb_t* db, const char* dir,
 
 /* fsync every resident klog of one family so the copied file holds all its data, even under sync
  * none */
-static int engine_sync_cf_klogs(cf_t *cf)
+static int engine_sync_cf_klogs(cf_t* cf)
 {
     const int total = level_set_snapshot(cf->levels, NULL, 0);
     if (total <= 0) return TDB_SUCCESS;
-    level_set_snapshot_entry_t *all = calloc((size_t)total, sizeof(*all));
+    level_set_snapshot_entry_t* all = calloc((size_t)total, sizeof(*all));
     if (!all) return TDB_ERR_MEMORY;
 
     int rc = TDB_SUCCESS;
@@ -309,7 +309,7 @@ static int engine_backup_sync(tidesdb_t* db, cf_t* const* cfs, int n, uint64_t s
  * @param out_claimed set to 1 when the flag was taken and the caller must release it
  * @return TDB_SUCCESS, or TDB_ERR_LOCKED when a reclaim would not finish in time
  */
-static int engine_backup_claim_vlog_gc(tidesdb_t *db, int *out_claimed)
+static int engine_backup_claim_vlog_gc(tidesdb_t* db, int* out_claimed)
 {
     for (int tick = 0; tick < ENGINE_BACKUP_FREEZE_TICKS; tick++)
     {
@@ -339,15 +339,15 @@ static int engine_backup_into(tidesdb_t* db, const char* dir)
     /* claim every cf's compaction flag, which freezes compaction, the only path that deletes a
      * klog, so the snapshot the manifest references cannot lose a file mid-copy. the view keeps a
      * handle alive while it is claimed; DDL remains excluded until the cut has named all claims. */
-    cf_t **live = NULL;
+    cf_t** live = NULL;
     int n = 0;
-    cf_registry_view_t *view = cf_registry_view_enter(db->cfs, &live, &n);
-    cf_t **cfs = n ? malloc((size_t)n * sizeof(*cfs)) : NULL;
+    cf_registry_view_t* view = cf_registry_view_enter(db->cfs, &live, &n);
+    cf_t** cfs = n ? malloc((size_t)n * sizeof(*cfs)) : NULL;
     int claimed = 0;
     if (n && !cfs) rc = TDB_ERR_MEMORY;
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++)
     {
-        cf_t *cf = live[i];
+        cf_t* cf = live[i];
         int got = 0;
         for (int tick = 0; tick < ENGINE_BACKUP_FREEZE_TICKS; tick++)
         {

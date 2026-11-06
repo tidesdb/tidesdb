@@ -251,7 +251,7 @@ typedef struct
  * @param out_size capacity of out
  * @return VLOG_OK or VLOG_ERR_INVALID when the name would not fit
  */
-int vlog_segment_name(uint64_t number, char* out, size_t out_size);
+int vlog_segment_name(uint64_t number, char *out, size_t out_size);
 
 /**
  * vlog_open
@@ -268,7 +268,7 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out);
 
 /* engine open holds the directory lock and has already validated all grouped headers before
  * opening its manifest. avoid repeating that disk pass during value-log adoption. */
-int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog_t** out);
+int vlog_open_after_preflight(const char *dir, const vlog_config_t *config, vlog_t **out);
 
 /**
  * vlog_max_segments
@@ -295,7 +295,7 @@ void vlog_close(vlog_t *vlog);
  * @param out receives work and the segment/frame identity
  * @return VLOG_OK, VLOG_ERR_CORRUPTION, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_INVALID
  */
-int vlog_scrub_pass(vlog_t* vlog, size_t byte_budget, size_t read_budget, vlog_scrub_pass_t* out);
+int vlog_scrub_pass(vlog_t *vlog, size_t byte_budget, size_t read_budget, vlog_scrub_pass_t *out);
 
 /**
  * vlog_write
@@ -329,8 +329,8 @@ int vlog_write(vlog_t *vlog, const uint8_t *value, size_t value_len, const uint8
  * @return VLOG_OK, VLOG_ERR_INVALID when grouping is disabled or group is out of range,
  *         VLOG_ERR_MEMORY, VLOG_ERR_IO, or VLOG_ERR_FULL
  */
-int vlog_write_group(vlog_t* vlog, uint32_t group, const uint8_t* value, size_t value_len,
-                     vlog_id_t* out_id, uint64_t* out_disk_bytes);
+int vlog_write_group(vlog_t *vlog, uint32_t group, const uint8_t *value, size_t value_len,
+                     vlog_id_t *out_id, uint64_t *out_disk_bytes);
 
 /**
  * vlog_group_limit
@@ -338,7 +338,7 @@ int vlog_write_group(vlog_t* vlog, uint32_t group, const uint8_t* value, size_t 
  * @param vlog open store, or NULL
  * @return group ceiling
  */
-uint32_t vlog_group_limit(const vlog_t* vlog);
+uint32_t vlog_group_limit(const vlog_t *vlog);
 
 /**
  * vlog_group_owner_of
@@ -349,7 +349,7 @@ uint32_t vlog_group_limit(const vlog_t* vlog);
  * @param out_group receives a group id or VLOG_GROUP_UNGROUPED
  * @return VLOG_OK, VLOG_ERR_INVALID, or VLOG_ERR_NOT_FOUND
  */
-int vlog_group_owner_of(vlog_t* vlog, vlog_id_t id, uint32_t* out_group);
+int vlog_group_owner_of(vlog_t *vlog, vlog_id_t id, uint32_t *out_group);
 
 /**
  * vlog_seal_idle_groups
@@ -360,7 +360,7 @@ int vlog_group_owner_of(vlog_t* vlog, vlog_id_t id, uint32_t* out_group);
  * @param out_freed optional count of resident handles actually released
  * @return number sealed, or VLOG_ERR_INVALID for a NULL store
  */
-int vlog_seal_idle_groups(vlog_t* vlog, int max, int* out_freed);
+int vlog_seal_idle_groups(vlog_t *vlog, int max, int *out_freed);
 
 /**
  * vlog_read
@@ -388,8 +388,8 @@ int vlog_read(vlog_t *vlog, vlog_id_t id, uint8_t **out_value, size_t *out_len);
  *         are outside the value, VLOG_ERR_CORRUPTION for a bad frame or value metadata,
  *         VLOG_ERR_MEMORY, or VLOG_ERR_IO for a positioned storage failure
  */
-int vlog_read_range(vlog_t* vlog, vlog_id_t id, size_t offset, size_t length, uint8_t** out_value,
-                    size_t* out_len);
+int vlog_read_range(vlog_t *vlog, vlog_id_t id, size_t offset, size_t length, uint8_t **out_value,
+                    size_t *out_len);
 
 /**
  * vlog_reclaim
@@ -423,7 +423,7 @@ int vlog_mark_drainable(vlog_t *vlog);
  * @param vlog open store with groups enabled
  * @return exclusive upper bound for collection using these snapshots
  */
-uint64_t vlog_group_census_floor(vlog_t* vlog);
+uint64_t vlog_group_census_floor(vlog_t *vlog);
 
 /**
  * vlog_reclaim_before
@@ -432,7 +432,7 @@ uint64_t vlog_group_census_floor(vlog_t* vlog);
  * @param census_floor exclusive upper bound, UINT64_MAX for the ordinary ungrouped census
  * @return VLOG_OK or VLOG_ERR_INVALID on an invalid handle
  */
-int vlog_reclaim_before(vlog_t* vlog, uint64_t census_floor);
+int vlog_reclaim_before(vlog_t *vlog, uint64_t census_floor);
 
 /**
  * vlog_should_respill
@@ -477,7 +477,7 @@ int vlog_build_enter(vlog_t *vlog);
  * @param token the token returned by vlog_build_enter
  * @param id logical value id handed to the holder
  */
-void vlog_build_protect(vlog_t* vlog, int token, vlog_id_t id);
+void vlog_build_protect(vlog_t *vlog, int token, vlog_id_t id);
 
 /**
  * vlog_build_leave
@@ -520,7 +520,7 @@ int vlog_list_segments(vlog_t *vlog, vlog_segment_info_t *out, size_t max, size_
  * @param out_count receives how many entries were written
  * @return VLOG_OK, VLOG_ERR_INVALID, VLOG_ERR_FULL, or VLOG_ERR_IO
  */
-int vlog_backup_inventory(vlog_t* vlog, vlog_segment_info_t* out, size_t max, size_t* out_count);
+int vlog_backup_inventory(vlog_t *vlog, vlog_segment_info_t *out, size_t max, size_t *out_count);
 
 /**
  * vlog_backup_index
@@ -535,8 +535,8 @@ int vlog_backup_inventory(vlog_t* vlog, vlog_segment_info_t* out, size_t max, si
  * @return VLOG_OK when an index was published or safely omitted, VLOG_ERR_CORRUPTION,
  *         VLOG_ERR_INVALID, VLOG_ERR_MEMORY, or VLOG_ERR_IO for a destination failure
  */
-int vlog_backup_index(vlog_t* vlog, const vlog_segment_info_t* info, const char* source_path,
-                      const char* copy_path, const char* destination_dir);
+int vlog_backup_index(vlog_t *vlog, const vlog_segment_info_t *info, const char *source_path,
+                      const char *copy_path, const char *destination_dir);
 
 /**
  * vlog_get_chain_stats

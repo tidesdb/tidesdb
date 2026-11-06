@@ -907,12 +907,12 @@ static void blob_builder_respill(uint32_t group)
     vlog_config_t vcfg = {.segment_target_bytes = 8 * 1024,
                           .enable_vlog_indexes = 1,
                           .max_blob_shard_groups = grouped ? 2 : 0};
-    vlog_t* vlog = NULL;
+    vlog_t *vlog = NULL;
     ASSERT_EQ(vlog_open(TEST_SSTABLE_DIR, &vcfg, &vlog), VLOG_OK);
 
     uint64_t ids[2] = {0};
     uint64_t disk[2] = {0};
-    const uint8_t* values[] = {NULL, (const uint8_t*)"x"};
+    const uint8_t *values[] = {NULL, (const uint8_t *)"x"};
     for (size_t i = 0; i < 2; ++i)
     {
         const int rc = grouped ? vlog_write_group(vlog, group, values[i], i, &ids[i], &disk[i])
@@ -949,43 +949,44 @@ static void blob_builder_respill(uint32_t group)
     char filename[128], path[256];
     ASSERT_EQ(sstable_klog_filename(&entry, filename, sizeof(filename)), TDB_SUCCESS);
     snprintf(path, sizeof(path), "%s%s%s", TEST_SSTABLE_DIR, PATH_SEPARATOR, filename);
-    block_manager_t* klog_bm = NULL;
+    block_manager_t *klog_bm = NULL;
     ASSERT_EQ(block_manager_open(&klog_bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
 
     sstable_builder_config_t config;
     default_builder_config(&config, entry.id, path);
     config.always_separate_values = 1;
-    sstable_builder_t* builder = NULL;
+    sstable_builder_t *builder = NULL;
     ASSERT_EQ(sstable_builder_new(&builder, klog_bm, vlog, &config), TDB_SUCCESS);
     ASSERT_EQ(
-        sstable_builder_add_reference(builder, (const uint8_t*)"empty", 5, ids[0], 0, 1, 0, 0),
+        sstable_builder_add_reference(builder, (const uint8_t *)"empty", 5, ids[0], 0, 1, 0, 0),
         TDB_SUCCESS);
-    ASSERT_EQ(sstable_builder_add_reference(builder, (const uint8_t*)"tiny", 4, ids[1], 1, 2, 0, 0),
-              TDB_SUCCESS);
+    ASSERT_EQ(
+        sstable_builder_add_reference(builder, (const uint8_t *)"tiny", 4, ids[1], 1, 2, 0, 0),
+        TDB_SUCCESS);
 
-    sstable_t* sst = NULL;
+    sstable_t *sst = NULL;
     ASSERT_EQ(sstable_builder_finish(builder, &sst, NULL), TDB_SUCCESS);
     sstable_builder_free(builder);
     ASSERT_EQ(sst->vlog_ref_count, 1u);
     ASSERT_TRUE(sst->vlog_refs[0].segment != old_segment);
     ASSERT_EQ(sst->vlog_refs[0].count, 2u);
 
-    const char* keys[] = {"empty", "tiny"};
+    const char *keys[] = {"empty", "tiny"};
     const size_t lengths[] = {0, 1};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
     {
-        uint8_t* value = NULL;
+        uint8_t *value = NULL;
         size_t value_size = 0;
         uint64_t id = 0, seq = 0;
         int64_t ttl = 0;
         uint8_t deleted = 0;
-        ASSERT_EQ(sstable_get(sst, (const uint8_t*)keys[i], strlen(keys[i]), &value, &value_size,
+        ASSERT_EQ(sstable_get(sst, (const uint8_t *)keys[i], strlen(keys[i]), &value, &value_size,
                               &id, &seq, &ttl, &deleted),
                   TDB_SUCCESS);
         ASSERT_TRUE(value == NULL);
         ASSERT_TRUE(id != 0 && id != ids[i]);
         ASSERT_EQ(value_size, lengths[i]);
-        uint8_t* resolved = NULL;
+        uint8_t *resolved = NULL;
         size_t resolved_len = 0;
         ASSERT_EQ(vlog_read(vlog, id, &resolved, &resolved_len), VLOG_OK);
         ASSERT_EQ(resolved_len, lengths[i]);
@@ -1000,7 +1001,7 @@ static void blob_builder_respill(uint32_t group)
     vlog_live_add(vlog, sst->vlog_refs[0].segment, sst->vlog_refs[0].bytes,
                   sst->vlog_refs[0].count);
     ASSERT_EQ(vlog_reclaim(vlog), VLOG_OK);
-    uint8_t* gone = NULL;
+    uint8_t *gone = NULL;
     size_t gone_len = 0;
     ASSERT_EQ(vlog_read(vlog, ids[0], &gone, &gone_len), VLOG_ERR_NOT_FOUND);
     if (grouped)

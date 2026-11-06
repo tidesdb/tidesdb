@@ -41,7 +41,7 @@ static double cf_config_bits_to_double(const uint64_t bits)
     return v;
 }
 
-size_t cf_config_value_threshold(const tidesdb_column_family_config_t *cfg,
+size_t cf_config_value_threshold(const tidesdb_column_family_config_t* cfg,
                                  const size_t db_threshold)
 {
     /* the builder separates a value whose size reaches the threshold, so a threshold no value can
@@ -50,7 +50,7 @@ size_t cf_config_value_threshold(const tidesdb_column_family_config_t *cfg,
     return db_threshold;
 }
 
-void cf_config_warn_layout(const tidesdb_column_family_config_t *cfg, const size_t db_threshold)
+void cf_config_warn_layout(const tidesdb_column_family_config_t* cfg, const size_t db_threshold)
 {
     if (!cfg || cfg->btree_klog_block_size == 0 || db_threshold == 0) return;
 
@@ -69,8 +69,8 @@ void cf_config_warn_layout(const tidesdb_column_family_config_t *cfg, const size
         cfg->name, db_threshold, cfg->btree_klog_block_size, CF_CONFIG_MIN_ENTRIES_PER_BLOCK);
 }
 
-int cf_config_validate(const tidesdb_column_family_config_t *cfg,
-                       const tidesdb_encoding_registry_t *reg)
+int cf_config_validate(const tidesdb_column_family_config_t* cfg,
+                       const tidesdb_encoding_registry_t* reg)
 {
     if (!cfg) return -1;
     if (strnlen(cfg->name, TDB_MAX_CF_NAME_LEN) >= TDB_MAX_CF_NAME_LEN) return -1;
@@ -119,7 +119,7 @@ int cf_config_serialize(const tidesdb_column_family_config_t* cfg, int is_blob, 
     if (cfg->encoding_count > TDB_ENCODING_PIPELINE_MAX) return -1;
 
     const size_t len = CF_CONFIG_BLOB_FIXED_SIZE + cfg->encoding_count + (is_blob ? 1 : 0);
-    uint8_t *buf = malloc(len);
+    uint8_t* buf = malloc(len);
     if (!buf) return -1;
 
     size_t off = 0;

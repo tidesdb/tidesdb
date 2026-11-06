@@ -192,7 +192,7 @@ static int txn_separate_values(const tdb_txn_backend_t *backend, tidesdb_wal_ent
         tidesdb_wal_entry_t *e = &entries[i];
         if (e->flags & TDB_WAL_ENTRY_TOMBSTONE) continue;
 
-        int (*separate)(void*, uint32_t, const uint8_t*, size_t, uint64_t*) =
+        int (*separate)(void *, uint32_t, const uint8_t *, size_t, uint64_t *) =
             e->force_separate ? backend->separator.separate_forced : backend->separator.separate;
         if (!separate && e->force_separate) return TDB_ERR_INVALID_ARGS;
         if (!separate) continue;

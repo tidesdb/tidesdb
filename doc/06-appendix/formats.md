@@ -209,6 +209,16 @@ footer is rejected rather than read past.
 Recording the **btree node size** here rather than reading it from configuration is what lets a
 file be read with the geometry it was written with, after the configuration has changed.
 
+## Value-log recovery indexes
+
+`NNNNNNNNNNNN.vix` is a rebuildable, inode-bound index beside a value-log segment. Sealed indexes
+are a single v1 snapshot. Active-prefix v2 indexes retain the same 72-byte identity header and
+append committed deltas: `TDBVIXD1`, covered extent, record count, 48-byte records, and an XXH3-64
+trailer over that delta. The first delta is published by rename; later deltas are appended and
+fsynced. Recovery accepts every complete validated delta and ignores a short final one, then scans
+the remaining segment tail. A malformed committed delta invalidates the optional index and causes
+an authoritative segment scan.
+
 ## Partitioned bloom filter directory
 
 The resident half of an sstable's filter, written into the key log's aux region and pointed at by

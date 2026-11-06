@@ -15,7 +15,6 @@
 #define VLOG_SIDECAR_EXT      ".vix"
 #define VLOG_SIDECAR_TMP_EXT  ".vix.tmp"
 #define VLOG_SIDECAR_NAME_MAX 40
-
 typedef enum
 {
     VLOG_SIDECAR_SEALED,
@@ -50,20 +49,6 @@ typedef struct
  * @return VLOG_OK or VLOG_ERR_INVALID when arguments or capacity are invalid
  */
 int vlog_sidecar_name(uint64_t number, int temporary, char *out, size_t out_size);
-
-/**
- * vlog_sidecar_publish
- * syncs the segment and atomically publishes a sorted index through extent
- * @param v opened value log
- * @param slot segment pinned under exclusive writer admission or owned by single-threaded recovery
- * @param entries complete entries through extent, reordered by offset in place
- * @param count number of entries
- * @param extent first byte after the final complete frame
- * @param kind VLOG_SIDECAR_PREFIX preserves active preallocation and permits later appends
- * @return VLOG_OK, VLOG_ERR_INVALID, VLOG_ERR_MEMORY, VLOG_ERR_IO, or VLOG_ERR_CORRUPTION
- */
-int vlog_sidecar_publish(vlog_t *v, uint32_t slot, vlog_sidecar_entry_t *entries, size_t count,
-                         uint64_t extent, vlog_sidecar_kind_t kind);
 
 /**
  * vlog_sidecar_load

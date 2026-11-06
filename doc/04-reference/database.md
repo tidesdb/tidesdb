@@ -109,7 +109,8 @@ Pass `NULL` for `options` to use the same defaults as `tidesdb_open`. Otherwise,
 Set `enable_vlog_indexes` to a nonzero value to build a `.vix` index for separated values
 across all column families. Each additional 16 MiB of framed writes to the active segment
 triggers a checkpoint. The writer crossing that threshold waits for admitted writers to finish,
-syncs the segment, and atomically replaces the index with one covering the completed frames.
+syncs the segment, and appends the index records for newly completed frames. The first
+checkpoint publishes the index by rename. Later checkpoints append a checksummed batch and sync it.
 A large frame or concurrent writes can carry the checkpoint past the threshold. Sealing the
 segment publishes its final index.
 

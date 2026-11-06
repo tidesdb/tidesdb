@@ -37,6 +37,8 @@ static int tests_failed = 0;
  * production codec remains the source of ordinary sidecars. */
 #define VIX_HEADER_SIZE        72
 #define VIX_TRAILER_SIZE       8
+#define VIX_DELTA_HEADER_SIZE  24
+#define VIX_DELTA_COUNT_OFFSET 16
 #define VIX_ENTRY_COUNT_OFFSET 48
 
 /* a small bounded fixture that rolls several segments while keeping each payload obvious in a
@@ -1297,6 +1299,168 @@ void test_recover_missing_or_truncated_active_prefix_scans_every_payload(void)
         assert_checkpoint_payloads(v, fixture, count);
         vlog_close(v);
     }
+}
+
+/* a damaged live checkpoint is disposable: the next checkpoint replaces it, and a later open
+ * gets the repaired prefix without rereading its covered payloads. */
+void test_active_prefix_checkpoint_repairs_a_missing_or_truncated_cache(void)
+{
+    for (int truncated = 0; truncated <= 1; truncated++)
+    {
+        fresh_dir();
+        vlog_index_fixture_t fixture[2 * V_CHECKPOINT_VALUES];
+        vlog_t *v = open_checkpoint_store(VDIR);
+        ASSERT_EQ(build_checkpoint_fixture(v, fixture, V_CHECKPOINT_VALUES, 0),
+                  V_CHECKPOINT_VALUES);
+        uint64_t segment = 0;
+        ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &segment, NULL), VLOG_OK);
+        char sidecar[512];
+        index_sidecar_path(VDIR, segment, VLOG_INDEX_EXT, sidecar, sizeof(sidecar));
+        if (truncated)
+            write_test_byte(sidecar);
+        else
+            ASSERT_EQ(remove(sidecar), 0);
+
+        for (size_t i = V_CHECKPOINT_VALUES; i < 2 * V_CHECKPOINT_VALUES; i++)
+        {
+            uint8_t *value = pattern(V_CHECKPOINT_VALUE, (unsigned)(301 + i));
+            fixture[i] = snapshot_entry(v, put(v, value, V_CHECKPOINT_VALUE));
+            free(value);
+        }
+        vlog_close(v);
+
+        v = open_checkpoint_store(VDIR);
+        ASSERT_EQ(v->recovery_index_hits, 1u);
+        ASSERT_EQ(v->recovery_payload_bytes, 0u);
+        for (size_t i = 0; i < 2 * V_CHECKPOINT_VALUES; i++)
+        {
+            uint8_t *value = pattern(V_CHECKPOINT_VALUE, (unsigned)(301 + i));
+            assert_reads(v, fixture[i].id, value, V_CHECKPOINT_VALUE);
+            free(value);
+        }
+        vlog_close(v);
+    }
+}
+
+/* a torn later delta is not a reason to discard the earlier committed prefix. Recovery retains
+ * that prefix and scans only the two values whose checkpoint append was interrupted. */
+void test_recover_active_prefix_keeps_last_complete_delta(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[2 * V_CHECKPOINT_VALUES];
+    vlog_t *v = open_checkpoint_store(VDIR);
+    ASSERT_EQ(build_checkpoint_fixture(v, fixture, V_CHECKPOINT_VALUES, 0), V_CHECKPOINT_VALUES);
+    uint64_t segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &segment, NULL), VLOG_OK);
+    char sidecar[512];
+    index_sidecar_path(VDIR, segment, VLOG_INDEX_EXT, sidecar, sizeof(sidecar));
+    struct STAT_STRUCT first;
+    ASSERT_EQ(STAT_FUNC(sidecar, &first), 0);
+    for (size_t i = V_CHECKPOINT_VALUES; i < 2 * V_CHECKPOINT_VALUES; i++)
+    {
+        uint8_t *value = pattern(V_CHECKPOINT_VALUE, (unsigned)(301 + i));
+        fixture[i] = snapshot_entry(v, put(v, value, V_CHECKPOINT_VALUE));
+        free(value);
+    }
+    vlog_close(v);
+
+    struct STAT_STRUCT second;
+    ASSERT_EQ(STAT_FUNC(sidecar, &second), 0);
+    ASSERT_TRUE(second.st_size > first.st_size);
+
+    FILE *file = fopen(sidecar, "r+b");
+    ASSERT_TRUE(file != NULL);
+    ASSERT_EQ(ftruncate(tdb_fileno(file), first.st_size + VIX_DELTA_HEADER_SIZE + 1), 0);
+    ASSERT_EQ(fclose(file), 0);
+
+    v = open_checkpoint_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 1u);
+    ASSERT_EQ(v->recovery_payload_bytes, 2 * V_CHECKPOINT_VALUE);
+    for (size_t i = 0; i < 2 * V_CHECKPOINT_VALUES; i++)
+    {
+        uint8_t *value = pattern(V_CHECKPOINT_VALUE, (unsigned)(301 + i));
+        assert_reads(v, fixture[i].id, value, V_CHECKPOINT_VALUE);
+        free(value);
+    }
+    vlog_close(v);
+}
+
+/* a backup cut can cover an active prefix exactly. Its records span multiple deltas in the
+ * source and must match every copied frame before they are bound to the copy's inode. */
+void test_backup_rebinds_active_deltas_and_checks_the_copied_frames(void)
+{
+    static const char copy_dir[] = VDIR PATH_SEPARATOR "backup";
+    fresh_dir();
+    ASSERT_EQ(mkdir(copy_dir, VDIR_MODE), 0);
+    vlog_t *v = open_checkpoint_store(VDIR);
+    vlog_index_fixture_t first[V_CHECKPOINT_VALUES], second[V_CHECKPOINT_VALUES];
+    build_checkpoint_fixture(v, first, V_CHECKPOINT_VALUES, 0);
+    build_checkpoint_fixture(v, second, V_CHECKPOINT_VALUES, 0);
+    vlog_segment_info_t info;
+    size_t count = 0;
+    ASSERT_EQ(vlog_list_segments(v, &info, 1, &count), VLOG_OK);
+    ASSERT_EQ(count, 1u);
+    char name[VLOG_SEGMENT_NAME_MAX], src[256], dst[256], index[256];
+    ASSERT_EQ(vlog_segment_name(info.number, name, sizeof(name)), VLOG_OK);
+    snprintf(src, sizeof(src), "%s%s%s", VDIR, PATH_SEPARATOR, name);
+    snprintf(dst, sizeof(dst), "%s%s%s", copy_dir, PATH_SEPARATOR, name);
+    index_sidecar_path(copy_dir, info.number, VLOG_INDEX_EXT, index, sizeof(index));
+    copy_test_file(src, dst);
+    FILE *file = fopen(dst, "r+b");
+    ASSERT_TRUE(file != NULL);
+    ASSERT_EQ(ftruncate(tdb_fileno(file), (off_t)info.logical_size), 0);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(vlog_backup_index(v, &info, src, dst, copy_dir), VLOG_OK);
+
+    vlog_t *copy = open_checkpoint_store(copy_dir);
+    ASSERT_EQ(copy->recovery_index_hits, 1u);
+    ASSERT_EQ(copy->recovery_payload_bytes, 0u);
+    assert_checkpoint_payloads(copy, first, V_CHECKPOINT_VALUES);
+    assert_checkpoint_payloads(copy, second, V_CHECKPOINT_VALUES);
+    vlog_close(copy);
+
+    ASSERT_EQ(remove(index), 0);
+    file = fopen(dst, "r+b");
+    ASSERT_TRUE(file != NULL);
+    const long checksum = (long)second[0].entry.offset + BLOCK_MANAGER_SIZE_FIELD_SIZE;
+    ASSERT_EQ(fseek(file, checksum, SEEK_SET), 0);
+    const int byte = fgetc(file);
+    ASSERT_TRUE(byte != EOF);
+    ASSERT_EQ(fseek(file, checksum, SEEK_SET), 0);
+    ASSERT_TRUE(fputc(byte ^ 1, file) != EOF);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(vlog_backup_index(v, &info, src, dst, copy_dir), VLOG_ERR_CORRUPTION);
+    vlog_close(v);
+}
+
+/* a v2 delta count cannot make recovery trust bytes that are not physically present. */
+void test_recover_active_prefix_rejects_short_file_with_malicious_delta_count(void)
+{
+    fresh_dir();
+    vlog_index_fixture_t fixture[V_CHECKPOINT_VALUES];
+    vlog_t *v = open_checkpoint_store(VDIR);
+    ASSERT_EQ(build_checkpoint_fixture(v, fixture, V_CHECKPOINT_VALUES, 0), V_CHECKPOINT_VALUES);
+    uint64_t segment = 0;
+    ASSERT_EQ(vlog_segment_of(v, fixture[0].id, &segment, NULL), VLOG_OK);
+    const uint64_t next_id = vlog_next_id(v);
+    vlog_close(v);
+
+    char sidecar[512];
+    index_sidecar_path(VDIR, segment, VLOG_INDEX_EXT, sidecar, sizeof(sidecar));
+    FILE *file = fopen(sidecar, "r+b");
+    ASSERT_TRUE(file != NULL);
+    uint8_t count[8];
+    encode_uint64_le_compat(count, UINT64_MAX);
+    ASSERT_EQ(fseek(file, VIX_HEADER_SIZE + VIX_DELTA_COUNT_OFFSET, SEEK_SET), 0);
+    ASSERT_EQ(fwrite(count, 1, sizeof(count), file), sizeof(count));
+    ASSERT_EQ(fclose(file), 0);
+
+    v = open_checkpoint_store(VDIR);
+    ASSERT_EQ(v->recovery_index_hits, 0u);
+    ASSERT_EQ(v->recovery_payload_bytes, 2 * V_CHECKPOINT_VALUE);
+    assert_fixture_index(v, fixture, V_CHECKPOINT_VALUES, next_id);
+    assert_checkpoint_payloads(v, fixture, V_CHECKPOINT_VALUES);
+    vlog_close(v);
 }
 
 void test_recover_active_prefix_disabled_scans_every_payload(void)
@@ -3185,6 +3349,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_group_checkpoint_recovers_only_its_own_prefix, tests_passed);
     RUN_TEST(test_recover_active_prefix_scans_only_its_uncovered_tail, tests_passed);
     RUN_TEST(test_recover_missing_or_truncated_active_prefix_scans_every_payload, tests_passed);
+    RUN_TEST(test_active_prefix_checkpoint_repairs_a_missing_or_truncated_cache, tests_passed);
+    RUN_TEST(test_recover_active_prefix_keeps_last_complete_delta, tests_passed);
+    RUN_TEST(test_backup_rebinds_active_deltas_and_checks_the_copied_frames, tests_passed);
+    RUN_TEST(test_recover_active_prefix_rejects_short_file_with_malicious_delta_count,
+             tests_passed);
     RUN_TEST(test_recover_active_prefix_disabled_scans_every_payload, tests_passed);
     RUN_TEST(test_recover_active_prefix_ignores_a_torn_final_frame, tests_passed);
     RUN_TEST(test_recover_missing_or_truncated_sealed_index_scans_that_segment, tests_passed);

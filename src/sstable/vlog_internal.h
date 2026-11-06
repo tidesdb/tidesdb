@@ -126,6 +126,8 @@ typedef struct
     vlog_sidecar_entry_t* entries;
     size_t cap;
     size_t count;
+    size_t published_count;
+    uint64_t published_size;
     int incomplete;
     uint64_t checkpoint_at;
 } vlog_pending_t;

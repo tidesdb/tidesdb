@@ -227,21 +227,6 @@ int vlog_record_entry(vlog_t *v, uint32_t slot, vlog_pending_t *writer,
                           entry->chain);
 }
 
-void vlog_publish_pending(vlog_t *v, uint32_t slot, vlog_pending_t *writer, uint64_t extent,
-                          vlog_sidecar_kind_t kind)
-{
-    if (writer->count && !writer->incomplete &&
-        vlog_sidecar_publish(v, slot, writer->entries, writer->count, extent, kind) != VLOG_OK)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "could not publish recovery index for vlog segment %llu",
-                      (unsigned long long)v->segments[slot].number);
-    if (kind == VLOG_SIDECAR_SEALED)
-    {
-        writer->count = 0;
-        writer->incomplete = 0;
-        writer->checkpoint_at = BLOCK_MANAGER_HEADER_SIZE + VLOG_CHECKPOINT_INTERVAL_BYTES;
-    }
-}
-
 /* parse once for both a freshly encoded value and a verified block returned by a recovery scan.
  * only the ids in the actual frame describe what was stored when a codec fell back to verbatim. */
 static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, const uint8_t *ids, uint32_t size,

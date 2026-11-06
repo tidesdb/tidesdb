@@ -333,6 +333,21 @@ new id** rather than keeping the reference. Nothing is ever copied within the st
 one block for its whole life and a crash cannot leave the same id in two segments — a pass has
 either unlinked a segment or it has not.
 
+### Grouped blob segments
+
+The first explicit group write creates the `18446744073709551615.vlog` directory.
+Its name reserves the maximum unsigned 64-bit segment number. The pre-group v10
+reader rejects that number during segment discovery because it cannot allocate a
+successor. Grouped segments live inside this directory and use the same database-wide
+sequence of file numbers and logical value IDs as ordinary segments.
+
+After the 8-byte file header, each grouped file begins with one checksummed block
+whose 24-byte payload contains a reserved zero logical ID, an 8-byte group-header
+magic, the 32-bit group ID and the 32-bit group-header version. Normal verbatim value
+frames follow. Recovery validates the group header even when it can use a sealed
+index or a checkpoint. The ordinary segment format continues to identify an ungrouped
+value independently of group zero.
+
 ## Manifest record
 
 One framed block per commit, holding a batch:

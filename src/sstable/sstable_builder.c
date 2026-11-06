@@ -285,9 +285,9 @@ static int sstable_builder_emit(sstable_builder_t *builder, const uint8_t *key, 
     return TDB_SUCCESS;
 }
 
-int sstable_builder_add(sstable_builder_t *builder, const uint8_t *key, size_t key_size,
-                        const uint8_t *value, size_t value_size, uint64_t seq, int64_t ttl,
-                        uint8_t flags)
+static int sstable_builder_add_value(sstable_builder_t* builder, const uint8_t* key,
+                                     size_t key_size, const uint8_t* value, size_t value_size,
+                                     uint64_t seq, int64_t ttl, uint8_t flags, uint32_t group)
 {
     if (!builder || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
@@ -305,9 +305,12 @@ int sstable_builder_add(sstable_builder_t *builder, const uint8_t *key, size_t k
          * threshold, so they are the largest the database holds and the ones compression is worth
          * most on -- leaving them verbatim compressed only what stayed inline, which is the
          * opposite of what the size threshold selected for */
-        if (vlog_write(builder->vlog, value, value_size, builder->value_ids,
-                       builder->value_id_count, &vlog_id, &disk) != VLOG_OK)
-            return TDB_ERR_IO;
+        const int rc =
+            group == VLOG_GROUP_UNGROUPED
+                ? vlog_write(builder->vlog, value, value_size, builder->value_ids,
+                             builder->value_id_count, &vlog_id, &disk)
+                : vlog_write_group(builder->vlog, group, value, value_size, &vlog_id, &disk);
+        if (rc != VLOG_OK) return TDB_ERR_IO;
         builder->vlog_bytes += disk;
         const int noted = sstable_builder_note_value(builder, vlog_id);
         if (noted != TDB_SUCCESS) return noted;
@@ -319,6 +322,14 @@ int sstable_builder_add(sstable_builder_t *builder, const uint8_t *key, size_t k
     const uint8_t *value_to_store = (vlog_id > 0) ? NULL : value;
     return sstable_builder_emit(builder, key, key_size, value_to_store, value_size, vlog_id, seq,
                                 ttl, flags);
+}
+
+int sstable_builder_add(sstable_builder_t* builder, const uint8_t* key, size_t key_size,
+                        const uint8_t* value, size_t value_size, uint64_t seq, int64_t ttl,
+                        uint8_t flags)
+{
+    return sstable_builder_add_value(builder, key, key_size, value, value_size, seq, ttl, flags,
+                                     VLOG_GROUP_UNGROUPED);
 }
 
 uint64_t sstable_builder_klog_bytes(const sstable_builder_t *builder)
@@ -342,7 +353,15 @@ int sstable_builder_add_reference(sstable_builder_t *builder, const uint8_t *key
         size_t got = 0;
         if (vlog_read(builder->vlog, vlog_id, &value, &got) == VLOG_OK)
         {
-            const int rc = sstable_builder_add(builder, key, key_size, value, got, seq, ttl, flags);
+            uint32_t group = VLOG_GROUP_UNGROUPED;
+            if (builder->always_separate_values && vlog_group_limit(builder->vlog) &&
+                vlog_group_owner_of(builder->vlog, vlog_id, &group) != VLOG_OK)
+            {
+                free(value);
+                return TDB_ERR_IO;
+            }
+            const int rc = sstable_builder_add_value(builder, key, key_size, value, got, seq, ttl,
+                                                     flags, group);
             free(value);
             return rc;
         }

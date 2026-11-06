@@ -57,12 +57,44 @@ int engine_txn_put(tidesdb_txn_t *txn, cf_t *cf, const uint8_t *key, size_t key_
 #define ENGINE_BLOB_CLAIM_ATTEMPTS 1024
 #define ENGINE_BLOB_CLAIM_WAIT_US  1000
 
-int engine_blob_put(tidesdb_t* db, cf_t* cf, const uint8_t* key, const size_t key_size,
-                    const uint8_t* value, const size_t value_size)
+static int engine_commit_with_backend(tidesdb_txn_t* txn, const tdb_txn_backend_t* backend);
+
+typedef struct
+{
+    vlog_t* vlog;
+    uint32_t id;
+} engine_blob_group_t;
+
+static int engine_separate_group(void* ctx, uint32_t cf_index, const uint8_t* value,
+                                 size_t value_size, uint64_t* out_id)
+{
+    (void)cf_index; /* the synchronous caller has validated this one-object commit */
+    const engine_blob_group_t* group = ctx;
+    return vlog_write_group(group->vlog, group->id, value, value_size, out_id, NULL) == VLOG_OK
+               ? 1
+               : -1;
+}
+
+/* only this one-object commit borrows the placement. the WAL and every reader continue to use
+ * the resulting logical id; a later parallel put has its own separator context. */
+static int engine_commit_blob(tidesdb_txn_t* txn, uint32_t group)
+{
+    if (group == VLOG_GROUP_UNGROUPED) return engine_txn_commit(txn);
+    engine_blob_group_t placement = {txn->db->vlog, group};
+    tdb_txn_backend_t backend = txn->db->backend;
+    backend.separator.ctx = &placement;
+    backend.separator.separate_forced = engine_separate_group;
+    return engine_commit_with_backend(txn, &backend);
+}
+
+int engine_blob_put(tidesdb_t* db, cf_t* cf, const uint32_t group, const uint8_t* key,
+                    const size_t key_size, const uint8_t* value, const size_t value_size)
 {
     if (!db || !cf || !key || key_size == 0 || (!value && value_size) || !cf->is_blob ||
         cf->vlog != db->vlog)
         return TDB_ERR_INVALID_ARGS;
+    const uint32_t limit = vlog_group_limit(db->vlog);
+    if (group == VLOG_GROUP_UNGROUPED ? limit != 0 : group >= limit) return TDB_ERR_INVALID_ARGS;
     if (value_size > db->max_blob_size || key_size > TDB_BLOB_MAX_KEY_SIZE)
         return TDB_ERR_TOO_LARGE;
 
@@ -92,7 +124,7 @@ int engine_blob_put(tidesdb_t* db, cf_t* cf, const uint8_t* key, const size_t ke
                 /* rotation and flush can release the old memtable's floor between append and
                  * apply. hold a builder floor until the receiving memtable protects the id. */
                 const int token = vlog_build_enter(db->vlog);
-                rc = engine_txn_commit(txn);
+                rc = engine_commit_blob(txn, group);
                 vlog_build_leave(db->vlog, token);
             }
         }
@@ -259,11 +291,10 @@ static void engine_count_commit(tidesdb_t *db, const int rc)
         atomic_fetch_add_explicit(&db->txn_conflicts, 1, memory_order_relaxed);
 }
 
-int engine_txn_commit(tidesdb_txn_t *txn)
+static int engine_commit_with_backend(tidesdb_txn_t* txn, const tdb_txn_backend_t* backend)
 {
-    if (!txn) return TDB_ERR_INVALID_ARGS;
     tidesdb_t *db = txn->db;
-    const int rc = tdb_txn_commit(txn->inner, &db->backend, db->sources, ENGINE_NUM_SOURCES);
+    const int rc = tdb_txn_commit(txn->inner, backend, db->sources, ENGINE_NUM_SOURCES);
     engine_count_commit(db, rc);
     if (rc == TDB_SUCCESS)
     {
@@ -275,6 +306,12 @@ int engine_txn_commit(tidesdb_txn_t *txn)
         engine_maybe_rotate(db);
     }
     return rc;
+}
+
+int engine_txn_commit(tidesdb_txn_t* txn)
+{
+    if (!txn) return TDB_ERR_INVALID_ARGS;
+    return engine_commit_with_backend(txn, &txn->db->backend);
 }
 
 int engine_txn_prepare(tidesdb_txn_t *txn, const uint8_t *xid, size_t xid_size)

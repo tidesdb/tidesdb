@@ -121,7 +121,7 @@ Point reads still verify the block checksum. A missing, damaged or mismatched in
 a scan of that segment and a rebuild if the frames cover its extent. For example, copying a
 database to new files requires this scan on the first indexed open.
 
-The index option defaults to zero. Both modes write the existing v10 value-log format.
+The index option defaults to zero. Ungrouped segments use the v10 value-log format in either mode.
 Earlier v10 binaries ignore the optional index files.
 
 Set `max_blob_size` to bound the number of bytes accepted by a single `tidesdb_blob_put`.
@@ -130,6 +130,20 @@ transfer with a 16-byte value header and 16 bytes of block framing. On macOS the
 object is 2,147,483,615 bytes. Linux rounds the transfer limit down to a page boundary
 before subtracting the headers. Lowering the option on reopen still permits reads of larger
 objects already in the database.
+
+Set `max_blob_shard_groups` to opt into placement at the database level. Its default is
+zero. At zero, ordinary writes and `tidesdb_blob_put` share the ungrouped active segment.
+With a positive ceiling, call `tidesdb_blob_put_group` with an ID from zero through one
+less than the ceiling. A ceiling of one enables just group zero. The first write to each
+group opens its segment. Idle groups can seal under slot or descriptor pressure, and
+their next write opens a successor. Ordinary KV continues to append to the ungrouped segment.
+
+The group travels with the segment, including when recovery rebuilds a missing index.
+A higher ceiling takes effect on reopen. A lower ceiling, including zero, must cover every
+retained group or open returns `TDB_ERR_INVALID_ARGS` before changing the store. Choose
+the same or a sufficient ceiling when restoring a backup. A legacy executable refuses
+a directory that carries the grouped-store guard, even after its last grouped segment has
+been reclaimed. A backup containing only ungrouped files omits the guard.
 
 Set `max_vlog_segments` to choose how many value-log files this database can retain
 simultaneously. Zero or an omitted field selects 4,096. Explicit capacities range from 1

@@ -379,9 +379,7 @@ static void l0_protect_reference(tidesdb_l0_t *l0, tidesdb_memtable_t *mt, uint6
     const int token = atomic_load_explicit(&mt->vlog_token, memory_order_acquire);
     if (token == VLOG_BUILD_TOKEN_NONE) return;
 
-    uint64_t segment = 0;
-    if (vlog_id_segment(l0->vlog, vlog_id, &segment) == VLOG_OK)
-        vlog_build_lower(l0->vlog, token, segment);
+    vlog_build_protect(l0->vlog, token, vlog_id);
 }
 
 /* the shared body behind both applies -- pin the active memtable, prefix the key, put, and count a

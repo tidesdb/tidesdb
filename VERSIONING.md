@@ -50,11 +50,12 @@ version is rejected; there is no best-effort path.
 | Release | Format read | Format written | Rollback boundary |
 |---------|-------------|----------------|-------------------|
 | 10.0.x  | 10          | 10             | any 10.x          |
+| Unreleased, grouped blobs | 10 and grouped vlog segments | 10 by default, grouped segments on explicit blob placement | The grouped-store guard requires a group-aware binary. |
 
 - **10.0.0 opens the v10 format line.** It does not read anything written by
   9.x, and no migration tooling ships for that step - a 9.x database is
   migrated by dumping and reloading through the API.
-- **Rollback within 10.x is unrestricted** while every 10.x minor writes format
+- **Rollback for ungrouped files** follows the existing v10 contract while the writer uses format
   10. A minor that introduces a new format must make it opt-in and default-off,
   which is what keeps that column true; the release that changes it updates this
   table in the same commit.

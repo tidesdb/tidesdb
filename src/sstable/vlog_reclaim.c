@@ -10,6 +10,38 @@
 #include "sstable/vlog.h"
 #include "sstable/vlog_internal.h"
 
+/* grouped stores place one cutoff per physical slot after the stable descriptor table.
+ * an open writer has the maximum cutoff. once sealed, no value in the file can have an id
+ * greater than the last one drawn. this lets the same builder floors cover several writers
+ * without one long-lived group preventing collection of every younger segment. */
+static _Atomic(uint64_t)* vlog_group_epochs(vlog_t* v)
+{
+    return (_Atomic(uint64_t)*)(void*)(v->segments + v->max_segments);
+}
+
+void vlog_group_set_epoch(vlog_t* v, uint32_t slot, uint64_t epoch)
+{
+    atomic_store_explicit(&vlog_group_epochs(v)[slot], epoch, memory_order_release);
+}
+
+void vlog_group_seal_epoch(vlog_t* v, uint32_t slot)
+{
+    vlog_group_set_epoch(v, slot, atomic_load_explicit(&v->next_id, memory_order_acquire) - 1);
+}
+
+int vlog_group_slot_active(vlog_t* v, uint32_t slot)
+{
+    return v->max_blob_shard_groups &&
+           atomic_load_explicit(&vlog_group_epochs(v)[slot], memory_order_acquire) == UINT64_MAX;
+}
+
+static uint64_t vlog_segment_cutoff(vlog_t* v, uint32_t slot)
+{
+    if (v->max_blob_shard_groups)
+        return atomic_load_explicit(&vlog_group_epochs(v)[slot], memory_order_acquire);
+    return v->segments[slot].number;
+}
+
 /* reclamation and the build tokens that bound it. a segment goes back to the filesystem only when
  * nothing in the index resolves into it and no build in flight could still be writing to it, and a
  * build token is how a builder says which segments those are */
@@ -17,11 +49,12 @@ int vlog_build_enter(vlog_t *v)
 {
     if (!v) return -1;
 
-    /* the segment taking appends right now, which is the lowest-numbered one this builder can land
-     * a value in. the next number would name the segment after it and leave the one actually being
-     * written to below the floor, unprotected */
+    /* with one writer its file number bounds future writes. with several writers an older file
+     * may still take the next value, so capture the logical id that write can first draw. */
     const uint32_t slot = atomic_load_explicit(&v->active_slot, memory_order_acquire);
-    const uint64_t here = v->segments[slot].number;
+    const uint64_t here = v->max_blob_shard_groups
+                              ? atomic_load_explicit(&v->next_id, memory_order_acquire)
+                              : v->segments[slot].number;
 
     for (int i = 0; i < VLOG_MAX_BUILDERS; i++)
     {
@@ -37,43 +70,32 @@ int vlog_build_enter(vlog_t *v)
     return -1;
 }
 
-void vlog_build_lower(vlog_t *v, const int token, const uint64_t segment)
+void vlog_build_protect(vlog_t* v, const int token, const vlog_id_t id)
 {
     if (!v || token < 0 || token >= VLOG_MAX_BUILDERS) return;
+    uint64_t floor = id;
+    if (!v->max_blob_shard_groups && vlog_segment_of(v, id, &floor, NULL) != VLOG_OK) return;
 
     uint64_t held = atomic_load_explicit(&v->build_floors[token], memory_order_acquire);
-    while (segment < held &&
-           !atomic_compare_exchange_weak_explicit(&v->build_floors[token], &held, segment,
+    while (floor < held &&
+           !atomic_compare_exchange_weak_explicit(&v->build_floors[token], &held, floor,
                                                   memory_order_acq_rel, memory_order_acquire))
     {
-        /* held reloaded with the live value on failure; the loop re-checks segment < held */
+        /* held reloaded with the live value on failure; retry only while a lower floor is needed */
     }
-}
-
-int vlog_id_segment(vlog_t *v, const vlog_id_t id, uint64_t *out_segment)
-{
-    if (!v || !out_segment) return VLOG_ERR_INVALID;
-
-    pthread_rwlock_rdlock(&v->index_rw);
-    const size_t at = vlog_index_locate(v, id, NULL);
-    const int found = at != SIZE_MAX;
-    const uint32_t slot = found ? v->buckets[at].segment : 0;
-    pthread_rwlock_unlock(&v->index_rw);
-    if (!found) return VLOG_ERR_NOT_FOUND;
-
-    *out_segment = v->segments[slot].number;
-    return VLOG_OK;
 }
 
 void vlog_build_leave(vlog_t *v, int token)
 {
     if (!v) return;
+    /* a census sees either the sender or the receiver of a floor handoff, even when the
+     * receiving memtable owns an earlier slot in the array the census is walking. */
+    if (v->max_blob_shard_groups) pthread_mutex_lock(&v->roll_mu);
     if (token < 0 || token >= VLOG_MAX_BUILDERS)
-    {
         atomic_fetch_sub_explicit(&v->builds_unslotted, 1, memory_order_acq_rel);
-        return;
-    }
-    atomic_store_explicit(&v->build_floors[token], VLOG_BUILD_FLOOR_NONE, memory_order_release);
+    else
+        atomic_store_explicit(&v->build_floors[token], VLOG_BUILD_FLOOR_NONE, memory_order_release);
+    if (v->max_blob_shard_groups) pthread_mutex_unlock(&v->roll_mu);
 }
 
 /**
@@ -92,6 +114,18 @@ static uint64_t vlog_build_floor(vlog_t *v)
         if (held < floor) floor = held;
     }
     return floor;
+}
+
+/* bound a liveness census before it samples any trees. writers or installs racing those
+ * snapshots keep everything they could have reached, even if their token leaves before retire. */
+uint64_t vlog_group_census_floor(vlog_t* v)
+{
+    pthread_mutex_lock(&v->roll_mu);
+    const uint64_t first_future = atomic_load_explicit(&v->next_id, memory_order_acquire);
+    const uint64_t held =
+        atomic_load_explicit(&v->builds_unslotted, memory_order_acquire) ? 0 : vlog_build_floor(v);
+    pthread_mutex_unlock(&v->roll_mu);
+    return held < first_future ? held : first_future;
 }
 
 /**
@@ -120,26 +154,7 @@ static void vlog_index_purge_segment(vlog_t *v, uint32_t slot)
     pthread_rwlock_unlock(&v->index_rw);
 }
 
-/**
- * vlog_segment_reclaimable
- * whether a segment can be dropped outright, which needs it sealed, referenced by nothing, and out
- * of reach of every builder in flight
- * @param v vlog handle
- * @param slot the segment's table slot
- * @param active the slot currently taking appends
- * @param floor the lowest segment number any builder in flight may have written to
- * @return 1 when the segment can be unlinked, 0 otherwise
- */
-static int vlog_segment_reclaimable(vlog_t *v, uint32_t slot, uint32_t active, uint64_t floor)
-{
-    if (slot == active) return 0;
-    if (atomic_load_explicit(&v->segments[slot].state, memory_order_acquire) != VLOG_SEG_OPEN)
-        return 0;
-    if (v->segments[slot].number >= floor) return 0;
-    return atomic_load_explicit(&v->segments[slot].live_bytes, memory_order_relaxed) == 0;
-}
-
-int vlog_reclaim(vlog_t *v)
+int vlog_reclaim_before(vlog_t* v, uint64_t census_floor)
 {
     if (!v) return VLOG_ERR_INVALID;
 
@@ -150,7 +165,9 @@ int vlog_reclaim(vlog_t *v)
      * way to say which segments it might have written to */
     if (atomic_load_explicit(&v->builds_unslotted, memory_order_acquire) > 0) return VLOG_OK;
 
-    const uint64_t floor = vlog_build_floor(v);
+    const uint64_t held =
+        v->max_blob_shard_groups ? vlog_group_census_floor(v) : vlog_build_floor(v);
+    const uint64_t floor = held < census_floor ? held : census_floor;
     int drained = 0;
 
     /* counted so a pass that frees nothing can say which condition held it back, since the three
@@ -165,17 +182,19 @@ int vlog_reclaim(vlog_t *v)
          * unlinked out from under the writers */
         const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
 
-        if (i != active &&
-            atomic_load_explicit(&v->segments[i].state, memory_order_acquire) == VLOG_SEG_OPEN)
+        if (i == active ||
+            atomic_load_explicit(&v->segments[i].state, memory_order_acquire) != VLOG_SEG_OPEN)
+            continue;
+        const uint64_t cutoff = vlog_segment_cutoff(v, i);
+        if (cutoff == UINT64_MAX) continue; /* another group's active writer */
+        sealed++;
+        if (atomic_load_explicit(&v->segments[i].live_bytes, memory_order_relaxed) != 0) continue;
+        empty++;
+        if (cutoff >= floor)
         {
-            sealed++;
-            if (atomic_load_explicit(&v->segments[i].live_bytes, memory_order_relaxed) == 0)
-            {
-                empty++;
-                if (v->segments[i].number >= floor) held_by_floor++;
-            }
+            held_by_floor++;
+            continue;
         }
-        if (!vlog_segment_reclaimable(v, i, active, floor)) continue;
 
         /* the index is purged first. an entry left behind would resolve into a slot about to hold a
          * different file, and a read of a dead id would then return another value's bytes rather
@@ -193,6 +212,11 @@ int vlog_reclaim(vlog_t *v)
 
     if (drained > 0) atomic_fetch_add_explicit(&v->reclaim_passes, 1, memory_order_relaxed);
     return VLOG_OK;
+}
+
+int vlog_reclaim(vlog_t* v)
+{
+    return vlog_reclaim_before(v, VLOG_BUILD_FLOOR_NONE);
 }
 
 int vlog_mark_drainable(vlog_t *v)
@@ -218,7 +242,8 @@ int vlog_mark_drainable(vlog_t *v)
         /* the segment taking appends is never marked. it is still growing, so the share of it that
          * is live says nothing yet, and rewriting values into the very segment being emptied would
          * not converge */
-        const int worth = i != active && live > 0 && vlog_segment_inspect(v, i, &size) == VLOG_OK &&
+        const int worth = i != active && live > 0 && vlog_segment_cutoff(v, i) != UINT64_MAX &&
+                          vlog_segment_inspect(v, i, &size) == VLOG_OK &&
                           live <= size / VLOG_RECLAIM_LIVE_DIVISOR;
 
         atomic_store_explicit(&v->segments[i].draining, worth, memory_order_relaxed);
@@ -251,6 +276,13 @@ int vlog_evict_idle_segments(vlog_t *v, int max)
     {
         if (max > 0 && freed >= max) break;
         freed += vlog_segment_evict(v, i);
+    }
+    if (v->max_blob_shard_groups && (max == 0 || freed < max))
+    {
+        int released = 0;
+        (void)vlog_seal_idle_groups(v, max ? max - freed : 0,
+                                    &released); /* count descriptors only */
+        freed += released;
     }
     return freed;
 }

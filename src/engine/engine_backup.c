@@ -20,6 +20,7 @@
 #include "io/block_manager.h"
 #include "manifest/manifest.h"
 #include "sstable/sstable.h"
+#include "sstable/vlog_group_disk.h"
 #include "txn/mvcc.h"
 
 /* a backup directory and its per-cf subdirectories are created with the same mode as the live db */
@@ -187,8 +188,25 @@ static int engine_backup_copy_vlog(tidesdb_t *db, const char *dir)
     for (size_t i = 0; rc == TDB_SUCCESS && i < count; i++)
     {
         char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
-        if (engine_join(src, sizeof(src), db->db_path, segs[i].name) != 0 ||
-            engine_join(dst, sizeof(dst), dir, segs[i].name) != 0)
+        const char* source_dir = db->db_path;
+        const char* destination_dir = dir;
+        char source_guard[ENGINE_BACKUP_PATH_MAX], destination_guard[ENGINE_BACKUP_PATH_MAX];
+        if (segs[i].group != VLOG_GROUP_UNGROUPED)
+        {
+            if (engine_join(source_guard, sizeof(source_guard), db->db_path,
+                            VLOG_GROUP_GUARD_NAME) != 0 ||
+                engine_join(destination_guard, sizeof(destination_guard), dir,
+                            VLOG_GROUP_GUARD_NAME) != 0 ||
+                vlog_group_disk_guard_create(dir) != VLOG_OK)
+            {
+                rc = TDB_ERR_IO;
+                break;
+            }
+            source_dir = source_guard;
+            destination_dir = destination_guard;
+        }
+        if (engine_join(src, sizeof(src), source_dir, segs[i].name) != 0 ||
+            engine_join(dst, sizeof(dst), destination_dir, segs[i].name) != 0)
             rc = TDB_ERR_IO;
         else
             rc = engine_copy_file(src, dst, segs[i].logical_size, 1);

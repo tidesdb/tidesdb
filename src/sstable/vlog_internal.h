@@ -101,7 +101,27 @@ typedef struct
     _Atomic(uint64_t) live_bytes;
     _Atomic(uint64_t) live_count;
     _Atomic(int) draining;
+    uint32_t group;
 } vlog_segment_t;
+
+/* one active writer's rebuildable index, also reused as recovery scratch before publication */
+typedef struct
+{
+    vlog_sidecar_entry_t* entries;
+    size_t cap;
+    size_t count;
+    int incomplete;
+    uint64_t checkpoint_at;
+} vlog_pending_t;
+
+/* only active groups have nodes. roll_mu covers the list, append admission and publication. */
+typedef struct vlog_group
+{
+    uint32_t id;
+    uint32_t slot;
+    vlog_pending_t writer;
+    struct vlog_group* next;
+} vlog_group_t;
 
 /**
  * vlog_index_entry_t
@@ -201,12 +221,9 @@ struct vlog
      * exclusive side before it publishes a sidecar or changes the active slot. index_rw protects
      * the accumulating vector between concurrent writers; recovery runs before either can enter. */
     int enable_vlog_indexes;
+    uint32_t max_blob_shard_groups;
     pthread_rwlock_t seal_rw;
-    vlog_sidecar_entry_t *pending;
-    size_t pending_cap;
-    size_t pending_count;
-    int pending_incomplete;
-    uint64_t checkpoint_at; /* next logical extent due, protected by seal_rw */
+    vlog_pending_t writer;
 #ifdef TDB_FAULT_INJECTION
     uint64_t recovery_payload_bytes;
     size_t recovery_index_hits;
@@ -226,6 +243,7 @@ struct vlog
     uint64_t chain_stored[VLOG_MAX_CHAINS];
     uint64_t chain_values[VLOG_MAX_CHAINS];
     int chain_n;
+    _Atomic(int) builds_unslotted;
 
     /* every byte this log has ever appended, reclamation's own rewrites included. the live and
      * stored totals describe what is held now, which cannot answer what the device was asked to
@@ -235,7 +253,7 @@ struct vlog
     _Atomic(uint64_t) reclaim_passes;
     _Atomic(uint64_t) segments_retired;
     _Atomic(uint64_t) build_floors[VLOG_MAX_BUILDERS];
-    _Atomic(int) builds_unslotted;
+    vlog_group_t* groups;
     vlog_segment_t segments[];
 };
 
@@ -248,6 +266,7 @@ struct vlog
  * @return VLOG_OK or VLOG_ERR_INVALID when the name would not fit
  */
 int vlog_segment_name(uint64_t number, char *out, size_t out_size);
+int vlog_segment_parse_number(const char* name, uint64_t* out_number);
 
 /**
  * vlog_segment_scan_dir
@@ -261,7 +280,7 @@ int vlog_segment_name(uint64_t number, char *out, size_t out_size);
  * @param out_count receives how many were found
  * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_INVALID, or VLOG_ERR_FULL when too many segments remain
  */
-int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_count);
+int vlog_segment_scan_dir(vlog_t* v, int grouped, uint64_t* numbers, size_t max, size_t* out_count);
 
 /**
  * vlog_segment_open
@@ -273,6 +292,8 @@ int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_
  *         no free slot
  */
 int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot);
+int vlog_segment_adopt(vlog_t* v, uint64_t number, int grouped, uint32_t* out_slot);
+int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32_t* out_slot);
 
 /**
  * vlog_segment_ensure_open
@@ -362,11 +383,20 @@ int vlog_segment_roll(vlog_t *v, uint32_t full_slot);
 int vlog_segment_append(vlog_t *v, const struct iovec *spans, int count,
                         vlog_sidecar_entry_t *entry);
 
+/* same physical append and publication owners as the ordinary writer; roll_mu admits groups */
+int vlog_segment_append_group(vlog_t* v, uint32_t group, const struct iovec* spans, int count,
+                              vlog_sidecar_entry_t* entry);
+int vlog_group_slot_active(vlog_t* v, uint32_t slot);
+void vlog_group_set_epoch(vlog_t* v, uint32_t slot, uint64_t epoch);
+void vlog_group_seal_epoch(vlog_t* v, uint32_t slot);
+
 /* called under index_rw by an admitted writer, or during single-threaded recovery */
-int vlog_record_entry(vlog_t *v, uint32_t slot, const vlog_sidecar_entry_t *entry);
+int vlog_record_entry(vlog_t* v, uint32_t slot, vlog_pending_t* writer,
+                      const vlog_sidecar_entry_t* entry);
 
 /* active checkpoints keep accumulating entries; a seal releases the vector for the next segment */
-void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent, vlog_sidecar_kind_t kind);
+void vlog_publish_pending(vlog_t* v, uint32_t slot, vlog_pending_t* writer, uint64_t extent,
+                          vlog_sidecar_kind_t kind);
 
 /**
  * vlog_index_locate

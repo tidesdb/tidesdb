@@ -75,6 +75,10 @@
 #define VLOG_DEFAULT_MAX_SEGMENTS 4096
 #define VLOG_MAX_SEGMENTS         65536
 
+/* legacy and ordinary values have no shard-group owner. this is deliberately outside every
+ * caller-supplied group range, including a range whose ceiling is UINT32_MAX. */
+#define VLOG_GROUP_UNGROUPED UINT32_MAX
+
 /* an append rolls to a fresh segment once the active one reaches this, unless the config overrides
  * it. large enough that rolling is rare and descriptor pressure stays low, small enough that
  * draining one segment is a bounded amount of copying */
@@ -117,6 +121,7 @@ typedef struct
     uint64_t segment_target_bytes;
     int enable_vlog_indexes;
     uint32_t max_segments;
+    uint32_t max_blob_shard_groups;
     const tidesdb_encoding_registry_t *encodings;
     fd_manager_t *fdm;
 } vlog_config_t;
@@ -196,13 +201,15 @@ typedef struct
 /**
  * vlog_segment_info_t
  * one segment's identity and logical length, for a caller copying the store elsewhere
- * @param name the segment's file name within the store directory, no path
+ * @param name the segment's canonical file name, without a directory component
+ * @param group VLOG_GROUP_UNGROUPED for a root file; otherwise its authoritative shard owner
  * @param logical_size bytes to copy for a faithful duplicate; a preallocated tail beyond this is
  *        not part of the segment's contents
  */
 typedef struct
 {
-    char name[VLOG_SEGMENT_NAME_MAX];
+    char name[VLOG_SEGMENT_NAME_MAX - sizeof(uint32_t)];
+    uint32_t group;
     uint64_t logical_size;
 } vlog_segment_info_t;
 
@@ -218,6 +225,10 @@ typedef struct
  *         when the retained nonempty files leave no slot for the fresh active segment
  */
 int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out);
+
+/* engine open holds the directory lock and has already validated all grouped headers before
+ * opening its manifest. avoid repeating that disk pass during value-log adoption. */
+int vlog_open_after_preflight(const char* dir, const vlog_config_t* config, vlog_t** out);
 
 /**
  * vlog_max_segments
@@ -253,6 +264,51 @@ void vlog_close(vlog_t *vlog);
  */
 int vlog_write(vlog_t *vlog, const uint8_t *value, size_t value_len, const uint8_t *ids,
                int id_count, vlog_id_t *out_id, uint64_t *out_disk_bytes);
+
+/**
+ * vlog_write_group
+ * appends a verbatim blob to its explicitly selected shard-group segment
+ * @param vlog open store with grouped blobs enabled
+ * @param group shard-group id, below vlog_group_limit and never VLOG_GROUP_UNGROUPED
+ * @param value bytes borrowed until this call returns, NULL only for an empty blob
+ * @param value_len byte length of value
+ * @param out_id receives the logical value id
+ * @param out_disk_bytes optional framed byte count
+ * @return VLOG_OK, VLOG_ERR_INVALID when grouping is disabled or group is out of range,
+ *         VLOG_ERR_MEMORY, VLOG_ERR_IO, or VLOG_ERR_FULL
+ */
+int vlog_write_group(vlog_t* vlog, uint32_t group, const uint8_t* value, size_t value_len,
+                     vlog_id_t* out_id, uint64_t* out_disk_bytes);
+
+/**
+ * vlog_group_limit
+ * returns the configured exclusive shard-group upper bound, or zero when grouping is disabled
+ * @param vlog open store, or NULL
+ * @return group ceiling
+ */
+uint32_t vlog_group_limit(const vlog_t* vlog);
+
+/**
+ * vlog_group_owner_of
+ * resolves a value's persisted shard-group owner, returning the ungrouped sentinel for ordinary
+ * and legacy values
+ * @param vlog open store
+ * @param id indexed logical value id
+ * @param out_group receives a group id or VLOG_GROUP_UNGROUPED
+ * @return VLOG_OK, VLOG_ERR_INVALID, or VLOG_ERR_NOT_FOUND
+ */
+int vlog_group_owner_of(vlog_t* vlog, vlog_id_t id, uint32_t* out_group);
+
+/**
+ * vlog_seal_idle_groups
+ * seals up to max currently active grouped segments without allocating successors, or all when max
+ * is zero; their next write lazily opens a fresh segment
+ * @param vlog open store
+ * @param max maximum grouped segments to seal, or zero for all
+ * @param out_freed optional count of resident handles actually released
+ * @return number sealed, or VLOG_ERR_INVALID for a NULL store
+ */
+int vlog_seal_idle_groups(vlog_t* vlog, int max, int* out_freed);
 
 /**
  * vlog_read
@@ -294,6 +350,23 @@ int vlog_reclaim(vlog_t *vlog);
 int vlog_mark_drainable(vlog_t *vlog);
 
 /**
+ * vlog_group_census_floor
+ * capture the oldest possibly uninstalled value before sampling grouped-store table liveness
+ * @param vlog open store with groups enabled
+ * @return exclusive upper bound for collection using these snapshots
+ */
+uint64_t vlog_group_census_floor(vlog_t* vlog);
+
+/**
+ * vlog_reclaim_before
+ * reclaim sealed segments using a previously bounded liveness census
+ * @param vlog open store
+ * @param census_floor exclusive upper bound, UINT64_MAX for the ordinary ungrouped census
+ * @return VLOG_OK or VLOG_ERR_INVALID on an invalid handle
+ */
+int vlog_reclaim_before(vlog_t* vlog, uint64_t census_floor);
+
+/**
  * vlog_should_respill
  * whether a value sits in a segment being emptied, so a compaction carrying it forward should write
  * it afresh instead of keeping the reference. carrying it would leave the old segment referenced by
@@ -330,28 +403,13 @@ int vlog_build_enter(vlog_t *vlog);
 #define VLOG_BUILD_TOKEN_NONE (-2)
 
 /**
- * vlog_build_lower
- * lower a held token's floor to cover the segment a value already landed in. a token records the
- * segment that was active when it was taken, which is only at or below what the holder goes on to
- * write. a holder that adopts a value written before it existed -- a memtable receiving a reference
- * a commit produced while an earlier memtable was active -- has to reach further back than that, or
- * the value's segment sits below every floor in flight and a reclaim may drain it
+ * vlog_build_protect
+ * extend a held floor to a value written before this memtable or prepare took ownership
  * @param vlog handle
- * @param token the token from vlog_build_enter; a token outside the slotted range is ignored, since
- * it already holds reclamation off entirely
- * @param segment the segment number to cover; a value at or above the token's floor changes nothing
+ * @param token the token returned by vlog_build_enter
+ * @param id logical value id handed to the holder
  */
-void vlog_build_lower(vlog_t *vlog, int token, uint64_t segment);
-
-/**
- * vlog_id_segment
- * the number of the segment a value's bytes live in, so a holder can lower its floor to reach them
- * @param vlog handle
- * @param id the value's id
- * @param out_segment receives the segment number
- * @return VLOG_OK, VLOG_ERR_INVALID, or VLOG_ERR_NOT_FOUND when the index does not name the id
- */
-int vlog_id_segment(vlog_t *vlog, vlog_id_t id, uint64_t *out_segment);
+void vlog_build_protect(vlog_t* vlog, int token, vlog_id_t id);
 
 /**
  * vlog_build_leave

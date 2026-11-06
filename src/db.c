@@ -110,6 +110,9 @@ int tidesdb_open_with_options(const tidesdb_config_t *config, const tidesdb_open
         if (options->size >=
             offsetof(tidesdb_open_options_t, max_blob_size) + sizeof(options->max_blob_size))
             resolved_options.max_blob_size = options->max_blob_size;
+        if (options->size >= offsetof(tidesdb_open_options_t, max_blob_shard_groups) +
+                                 sizeof(options->max_blob_shard_groups))
+            resolved_options.max_blob_shard_groups = options->max_blob_shard_groups;
         if (options->size >= offsetof(tidesdb_open_options_t, max_vlog_segments) +
                                  sizeof(options->max_vlog_segments))
         {
@@ -190,7 +193,17 @@ int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name)
 int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
                      size_t key_size, const uint8_t* value, size_t value_size)
 {
-    return tdb_public_rc(engine_blob_put(db, (cf_t*)cf, key, key_size, value, value_size));
+    return tdb_public_rc(
+        engine_blob_put(db, (cf_t*)cf, VLOG_GROUP_UNGROUPED, key, key_size, value, value_size));
+}
+
+int tidesdb_blob_put_group(tidesdb_t* db, tidesdb_column_family_t* cf, uint32_t group_id,
+                           const uint8_t* key, size_t key_size, const uint8_t* value,
+                           size_t value_size)
+{
+    if (group_id == VLOG_GROUP_UNGROUPED) return TDB_ERR_INVALID_ARGS;
+    return tdb_public_rc(
+        engine_blob_put(db, (cf_t*)cf, group_id, key, key_size, value, value_size));
 }
 
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name)

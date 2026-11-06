@@ -52,6 +52,7 @@ int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_famil
  * engine_blob_put
  * resolve the immutable media key at a snapshot and commit a borrowed value if absent
  * @param db owning database
+ * @param group shard group or VLOG_GROUP_UNGROUPED for the default path
  * @param cf dedicated blob family
  * @param key nonempty media key
  * @param key_size key length
@@ -59,7 +60,7 @@ int engine_create_cf(tidesdb_t* db, const char* name, const tidesdb_column_famil
  * @param value_size logical blob length
  * @return as tidesdb_blob_put
  */
-int engine_blob_put(tidesdb_t* db, cf_t* cf, const uint8_t* key, size_t key_size,
+int engine_blob_put(tidesdb_t* db, cf_t* cf, uint32_t group, const uint8_t* key, size_t key_size,
                     const uint8_t* value, size_t value_size);
 
 /**

@@ -88,6 +88,12 @@ Obtain its handle with `tidesdb_get_column_family`. Write an object with
 the object and can contain 1 through 65,536 bytes. The caller owns both buffers and can
 reuse them as soon as the synchronous call returns.
 
+With `max_blob_shard_groups` enabled, write the object with
+`tidesdb_blob_put_group(db, cf, group_id, key, key_size, value, value_size)`.
+An identical retry with another valid group keeps the original placement.
+A database with grouping disabled rejects an explicit group, and a grouped
+database requires one, including for an empty object.
+
 An absent key creates an object. An identical retry returns `TDB_SUCCESS`. Different
 bytes under the same live key return `TDB_ERR_CONFLICT`. A long-held competing transaction
 can return `TDB_ERR_LOCKED`, which the caller can retry. Passing `NULL` and a value length

@@ -16,7 +16,7 @@
 #include "../src/internal/types.h" /* TDB_KV_FLAG_TOMBSTONE */
 #include "../src/sstable/btree/btree.h"
 #include "../src/sstable/sstable.h"
-#include "../src/sstable/vlog.h"
+#include "../src/sstable/vlog_internal.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -898,27 +898,41 @@ void test_builder_respills_a_value_out_of_a_draining_segment(void)
 /* a blob family keeps even empty and tiny values separated when a draining segment is rewritten;
  * otherwise a later GC would leave those values inline while only large blobs kept vlog lifetime
  * accounting. */
-void test_blob_builder_respills_empty_and_tiny_references(void)
+static void blob_builder_respill(uint32_t group)
 {
     (void)remove_directory(TEST_SSTABLE_DIR);
     ASSERT_EQ(mkdir(TEST_SSTABLE_DIR, TEST_SSTABLE_DIR_PERMISSIONS), 0);
 
-    vlog_config_t vcfg = {.segment_target_bytes = 8 * 1024};
+    const int grouped = group != VLOG_GROUP_UNGROUPED;
+    vlog_config_t vcfg = {.segment_target_bytes = 8 * 1024,
+                          .enable_vlog_indexes = 1,
+                          .max_blob_shard_groups = grouped ? 2 : 0};
     vlog_t* vlog = NULL;
     ASSERT_EQ(vlog_open(TEST_SSTABLE_DIR, &vcfg, &vlog), VLOG_OK);
 
     uint64_t ids[2] = {0};
     uint64_t disk[2] = {0};
-    ASSERT_EQ(vlog_write(vlog, NULL, 0, NULL, 0, &ids[0], &disk[0]), VLOG_OK);
-    ASSERT_EQ(vlog_write(vlog, (const uint8_t*)"x", 1, NULL, 0, &ids[1], &disk[1]), VLOG_OK);
+    const uint8_t* values[] = {NULL, (const uint8_t*)"x"};
+    for (size_t i = 0; i < 2; ++i)
+    {
+        const int rc = grouped ? vlog_write_group(vlog, group, values[i], i, &ids[i], &disk[i])
+                               : vlog_write(vlog, values[i], i, NULL, 0, &ids[i], &disk[i]);
+        ASSERT_EQ(rc, VLOG_OK);
+    }
+    const size_t at = vlog_index_locate(vlog, ids[0], NULL);
+    ASSERT_TRUE(at != SIZE_MAX);
+    const uint32_t old_slot = vlog->buckets[at].segment;
     uint8_t filler[1024];
     memset(filler, 'V', sizeof(filler));
     for (int i = 0; i < 24; i++)
     {
         uint64_t ignored_id = 0;
         uint64_t ignored_disk = 0;
-        ASSERT_EQ(vlog_write(vlog, filler, sizeof(filler), NULL, 0, &ignored_id, &ignored_disk),
-                  VLOG_OK);
+        const int rc =
+            grouped
+                ? vlog_write_group(vlog, group, filler, sizeof(filler), &ignored_id, &ignored_disk)
+                : vlog_write(vlog, filler, sizeof(filler), NULL, 0, &ignored_id, &ignored_disk);
+        ASSERT_EQ(rc, VLOG_OK);
     }
 
     uint64_t old_segment = 0;
@@ -975,6 +989,9 @@ void test_blob_builder_respills_empty_and_tiny_references(void)
         size_t resolved_len = 0;
         ASSERT_EQ(vlog_read(vlog, id, &resolved, &resolved_len), VLOG_OK);
         ASSERT_EQ(resolved_len, lengths[i]);
+        uint32_t owner = ~group;
+        ASSERT_EQ(vlog_group_owner_of(vlog, id, &owner), VLOG_OK);
+        ASSERT_EQ(owner, group);
         if (lengths[i] > 0) ASSERT_EQ(resolved[0], 'x');
         free(resolved);
     }
@@ -986,9 +1003,49 @@ void test_blob_builder_respills_empty_and_tiny_references(void)
     uint8_t* gone = NULL;
     size_t gone_len = 0;
     ASSERT_EQ(vlog_read(vlog, ids[0], &gone, &gone_len), VLOG_ERR_NOT_FOUND);
+    if (grouped)
+    {
+        /* reclaim really freed the old slot. place another group's record there and check both
+         * generations, including after recovery has rebuilt the missing destination index. */
+        vlog_id_t fresh = 0;
+        ASSERT_EQ(vlog_write_group(vlog, 1, filler, sizeof(filler), &fresh, NULL), VLOG_OK);
+        const size_t fresh_at = vlog_index_locate(vlog, fresh, NULL);
+        ASSERT_TRUE(fresh_at != SIZE_MAX);
+        ASSERT_EQ(vlog->buckets[fresh_at].segment, old_slot);
+        ASSERT_EQ(vlog_should_respill(vlog, fresh), 0);
+        ASSERT_TRUE(vlog->segments[old_slot].number != old_segment);
+        uint32_t owner;
+        ASSERT_EQ(vlog_group_owner_of(vlog, ids[0], &owner), VLOG_ERR_NOT_FOUND);
+        ASSERT_TRUE(vlog_seal_idle_groups(vlog, 0, NULL) >= 1);
+        uint64_t number;
+        ASSERT_EQ(vlog_segment_of(vlog, fresh, &number, NULL), VLOG_OK);
+        char name[VLOG_SIDECAR_NAME_MAX], sidecar[256];
+        ASSERT_EQ(vlog_sidecar_name(number, 0, name, sizeof(name)), VLOG_OK);
+        ASSERT_TRUE(snprintf(sidecar, sizeof(sidecar), "%s%s%s", TEST_SSTABLE_DIR, PATH_SEPARATOR,
+                             name) > 0);
+        vlog_close(vlog);
+        ASSERT_EQ(remove(sidecar), 0);
+        ASSERT_EQ(vlog_open(TEST_SSTABLE_DIR, &vcfg, &vlog), VLOG_OK);
+        ASSERT_EQ(vlog_group_owner_of(vlog, fresh, &owner), VLOG_OK);
+        ASSERT_EQ(owner, 1u);
+        ASSERT_EQ(vlog_read(vlog, fresh, &gone, &gone_len), VLOG_OK);
+        ASSERT_EQ(gone_len, sizeof(filler));
+        ASSERT_EQ(memcmp(gone, filler, sizeof(filler)), 0);
+        free(gone);
+    }
     sstable_close(sst);
     vlog_close(vlog);
     (void)remove_directory(TEST_SSTABLE_DIR);
+}
+
+void test_blob_builder_respills_empty_and_tiny_references(void)
+{
+    blob_builder_respill(VLOG_GROUP_UNGROUPED);
+}
+
+void test_blob_respill_retains_group_across_slot_reuse_and_missing_index(void)
+{
+    blob_builder_respill(0);
 }
 
 /* a value carries the encoding it was written under, not the one of whatever table happens to
@@ -1841,6 +1898,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_builder_records_vlog_segment_references, tests_passed);
     RUN_TEST(test_builder_respills_a_value_out_of_a_draining_segment, tests_passed);
     RUN_TEST(test_blob_builder_respills_empty_and_tiny_references, tests_passed);
+    RUN_TEST(test_blob_respill_retains_group_across_slot_reuse_and_missing_index, tests_passed);
     RUN_TEST(test_respilled_value_crosses_codecs_intact, tests_passed);
     RUN_TEST(test_builder_tombstone_count, tests_passed);
     RUN_TEST(test_get_through_cache, tests_passed);

@@ -20,6 +20,7 @@
 #include "engine_internal.h"
 #include "flush/flush.h"
 #include "io/block_manager.h"
+#include "sstable/vlog_group_disk.h"
 #include "txn/cf_source.h"
 #include "txn/wal_record.h"
 
@@ -397,7 +398,6 @@ static int engine_open_init(tidesdb_t *db, const tidesdb_config_t *config)
     /* the database directory must exist; an already-present directory is not an error */
     if (mkdir(db->db_path, ENGINE_DB_DIR_MODE) != 0 && errno != EEXIST) return TDB_ERR_IO;
 
-    engine_open_log_sink(db);
     return TDB_SUCCESS;
 }
 
@@ -454,6 +454,21 @@ static int engine_open_stores(tidesdb_t *db, const tidesdb_open_options_t *optio
      * begin recovering a database another one already owns */
     if (engine_build_path(db->db_path, ENGINE_LOCK_FILENAME, path, sizeof(path)) != TDB_SUCCESS)
         return TDB_ERR_INVALID_ARGS;
+    /* a restore has no LOCK file. avoid creating one solely to reject an incompatible grouped
+     * store, then repeat this check under the lock below to close the race with a writer which
+     * creates a group after this observation. preflight is deliberately read-only. */
+    struct STAT_STRUCT lock_stat;
+    const int lock_stat_rc = STAT_FUNC(path, &lock_stat);
+    if (lock_stat_rc != 0 && errno == ENOENT)
+    {
+        const int early_group_rc =
+            vlog_group_disk_preflight(db->db_path, options->max_blob_shard_groups);
+        if (early_group_rc == VLOG_ERR_INVALID) return TDB_ERR_INVALID_ARGS;
+        if (early_group_rc == VLOG_ERR_CORRUPTION) return TDB_ERR_CORRUPTION;
+        if (early_group_rc != VLOG_OK) return TDB_ERR_IO;
+    }
+    else if (lock_stat_rc != 0)
+        return TDB_ERR_IO;
     int lock_rc = TDB_LOCK_ERROR;
     db->lock_fd = tdb_open_lock_file(path, &lock_rc);
     /* the open is what refuses a second handle in this same process, on the platforms whose locks
@@ -469,6 +484,16 @@ static int engine_open_stores(tidesdb_t *db, const tidesdb_open_options_t *optio
         return lock_rc == TDB_LOCK_HELD ? TDB_ERR_LOCKED : TDB_ERR_IO;
     }
 
+    /* inspect grouped ownership only after exclusive ownership closes the open-to-close race with
+     * another writer, and before either the manifest or configured log sink can change a store
+     * an incompatible opener must leave untouched. */
+    const int group_rc = vlog_group_disk_preflight(db->db_path, options->max_blob_shard_groups);
+    if (group_rc == VLOG_ERR_INVALID) return TDB_ERR_INVALID_ARGS;
+    if (group_rc == VLOG_ERR_CORRUPTION) return TDB_ERR_CORRUPTION;
+    if (group_rc != VLOG_OK) return TDB_ERR_IO;
+
+    engine_open_log_sink(db);
+
     if (engine_build_path(db->db_path, ENGINE_MANIFEST_FILENAME, path, sizeof(path)) != TDB_SUCCESS)
         return TDB_ERR_INVALID_ARGS;
     db->manifest = tidesdb_manifest_open(path);
@@ -480,8 +505,9 @@ static int engine_open_stores(tidesdb_t *db, const tidesdb_open_options_t *optio
                               .segment_target_bytes = db->config.vlog_segment_size,
                               .enable_vlog_indexes = options->enable_vlog_indexes != 0,
                               .max_segments = (uint32_t)options->max_vlog_segments,
+                              .max_blob_shard_groups = options->max_blob_shard_groups,
                               .fdm = db->fdm_inited ? &db->fdm : NULL};
-    if (vlog_open(db->db_path, &vc, &db->vlog) != VLOG_OK) return TDB_ERR_IO;
+    if (vlog_open_after_preflight(db->db_path, &vc, &db->vlog) != VLOG_OK) return TDB_ERR_IO;
     return TDB_SUCCESS;
 }
 

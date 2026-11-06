@@ -408,6 +408,8 @@ void engine_vlog_gc(tidesdb_t *db)
      * and go. every sstable already records which segments its separated values live in, so this
      * reads no file and touches no key -- deriving the same answer by scanning every key of every
      * table would not finish on a store large enough to need reclaiming */
+    const uint64_t floor =
+        vlog_group_limit(db->vlog) ? vlog_group_census_floor(db->vlog) : UINT64_MAX;
     vlog_live_reset(db->vlog);
 
     int rc = TDB_SUCCESS;
@@ -433,7 +435,7 @@ void engine_vlog_gc(tidesdb_t *db)
      * value in it */
     if (rc != TDB_SUCCESS) return;
 
-    (void)vlog_reclaim(db->vlog);
+    (void)vlog_reclaim_before(db->vlog, floor); /* a later pass retries busy segments */
 
     /* what is left is the segments that are mostly but not entirely dead, which the store cannot
      * empty on its own. marking them makes the next compaction carrying one of their values rewrite

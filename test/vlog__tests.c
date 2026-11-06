@@ -1109,6 +1109,42 @@ void test_recover_sealed_indexes_skip_payloads_and_preserve_every_index_field(vo
     vlog_close(v);
 }
 
+/* each active group has its own contiguous prefix. interleaving another segment must never
+ * record its frames in the covered prefix or hide the first group's uncovered tail. */
+void test_group_checkpoint_recovers_only_its_own_prefix(void)
+{
+    fresh_dir();
+    vlog_config_t config = {.enable_vlog_indexes = 1, .max_blob_shard_groups = UINT32_MAX};
+    vlog_t* v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &config, &v), VLOG_OK);
+    ASSERT_TRUE(v->groups == NULL);
+    uint8_t* large = pattern(VLOG_CHECKPOINT_INTERVAL_BYTES, 42);
+    const uint8_t tail = 7;
+    vlog_id_t ids[4];
+    ASSERT_EQ(vlog_write_group(v, UINT32_MAX - 1, &tail, 1, &ids[0], NULL), VLOG_OK);
+    ASSERT_EQ(vlog_write_group(v, 0, large, VLOG_CHECKPOINT_INTERVAL_BYTES, &ids[1], NULL),
+              VLOG_OK);
+    ASSERT_EQ(vlog_write(v, &tail, 1, NULL, 0, &ids[2], NULL), VLOG_OK);
+    ASSERT_EQ(vlog_write_group(v, 0, &tail, 1, &ids[3], NULL), VLOG_OK);
+    ASSERT_TRUE(v->groups && v->groups->next && !v->groups->next->next);
+    vlog_close(v);
+
+    ASSERT_EQ(vlog_open(VDIR, &config, &v), VLOG_OK);
+    ASSERT_EQ(v->recovery_index_hits, 1u);
+    ASSERT_EQ(v->recovery_payload_bytes, 3u);
+    const uint32_t owners[] = {UINT32_MAX - 1, 0, VLOG_GROUP_UNGROUPED, 0};
+    for (size_t i = 0; i < sizeof(owners) / sizeof(owners[0]); ++i)
+    {
+        uint32_t owner;
+        ASSERT_EQ(vlog_group_owner_of(v, ids[i], &owner), VLOG_OK);
+        ASSERT_EQ(owner, owners[i]);
+        assert_reads(v, ids[i], i == 1 ? large : &tail,
+                     i == 1 ? VLOG_CHECKPOINT_INTERVAL_BYTES : 1);
+    }
+    vlog_close(v);
+    free(large);
+}
+
 void test_recover_active_prefix_scans_only_its_uncovered_tail(void)
 {
     fresh_dir();
@@ -2499,6 +2535,109 @@ void test_concurrent_ids_are_unique(void)
     vlog_close(g_uniq_v);
 }
 
+/* several writers share two groups while ordinary writes roll. index hits on reopen and
+ * every recorded owner check the synchronization between append, seal and slot publication. */
+static void* grouped_writer(void* arg)
+{
+    const uint32_t writer = (uint32_t)(uintptr_t)arg;
+    const uint8_t value = (uint8_t)writer;
+    for (int i = 0; i < V_UNIQ_PER; ++i)
+    {
+        const uint32_t group = writer % 3;
+        const int rc =
+            group == 2 ? vlog_write(g_uniq_v, &value, 1, NULL, 0, &g_uniq_ids[writer][i], NULL)
+                       : vlog_write_group(g_uniq_v, group, &value, 1, &g_uniq_ids[writer][i], NULL);
+        ASSERT_EQ(rc, VLOG_OK);
+    }
+    return NULL;
+}
+
+void test_concurrent_groups_roll_and_recover_separately(void)
+{
+    fresh_dir();
+    vlog_config_t config = {
+        .enable_vlog_indexes = 1, .max_blob_shard_groups = 2, .segment_target_bytes = V_SEG_TARGET};
+    ASSERT_EQ(vlog_open(VDIR, &config, &g_uniq_v), VLOG_OK);
+    pthread_t threads[V_UNIQ_THREADS];
+    for (uintptr_t t = 0; t < V_UNIQ_THREADS; ++t)
+        ASSERT_EQ(pthread_create(&threads[t], NULL, grouped_writer, (void*)t), 0);
+    for (int t = 0; t < V_UNIQ_THREADS; ++t) ASSERT_EQ(pthread_join(threads[t], NULL), 0);
+    ASSERT_EQ(vlog_seal_idle_groups(g_uniq_v, 0, NULL), 2);
+    vlog_close(g_uniq_v);
+    ASSERT_EQ(vlog_open(VDIR, &config, &g_uniq_v), VLOG_OK);
+    ASSERT_TRUE(g_uniq_v->recovery_index_hits > 2);
+    for (int t = 0; t < V_UNIQ_THREADS; ++t)
+    {
+        const uint32_t want = t % 3 == 2 ? VLOG_GROUP_UNGROUPED : (uint32_t)(t % 3);
+        const uint8_t value = (uint8_t)t;
+        for (int i = 0; i < V_UNIQ_PER; ++i)
+        {
+            uint32_t owner;
+            ASSERT_EQ(vlog_group_owner_of(g_uniq_v, g_uniq_ids[t][i], &owner), VLOG_OK);
+            ASSERT_EQ(owner, want);
+            assert_reads(g_uniq_v, g_uniq_ids[t][i], &value, 1);
+        }
+    }
+    vlog_close(g_uniq_v);
+}
+
+/* exhausting physical slots may seal idle groups, but it cannot publish a fourth file or
+ * retire a group which is still accepting writes. once GC frees a slot, the same put succeeds. */
+void test_group_slot_pressure_preserves_live_writers_and_reuses_retired_space(void)
+{
+    fresh_dir();
+    vlog_config_t config = {.max_segments = 3, .max_blob_shard_groups = 3};
+    vlog_t *v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &config, &v), VLOG_OK);
+    const uint8_t value = 0x12;
+    vlog_id_t first, second, third = VLOG_ID_INVALID;
+    ASSERT_EQ(vlog_write_group(v, 0, &value, 1, &first, NULL), VLOG_OK);
+    ASSERT_EQ(vlog_write_group(v, 1, &value, 1, &second, NULL), VLOG_OK);
+    const uint32_t original_slot = snapshot_entry(v, first).entry.segment;
+    ASSERT_EQ(vlog_segment_retire(v, original_slot), VLOG_ERR_BUSY);
+    ASSERT_EQ(vlog_segment_evict(v, original_slot), 0);
+    const uint64_t before = atomic_load(&v->next_number);
+    ASSERT_EQ(vlog_write_group(v, 2, &value, 1, &third, NULL), VLOG_ERR_FULL);
+    ASSERT_EQ(third, VLOG_ID_INVALID);
+    ASSERT_EQ(atomic_load(&v->next_number), before);
+    assert_reads(v, first, &value, 1);
+    assert_reads(v, second, &value, 1);
+    ASSERT_EQ(vlog_reclaim(v), VLOG_OK);
+    ASSERT_EQ(vlog_write_group(v, 2, &value, 1, &third, NULL), VLOG_OK);
+    ASSERT_EQ(snapshot_entry(v, third).entry.segment, original_slot);
+    assert_reads(v, third, &value, 1);
+    assert_gone(v, first);
+    vlog_close(v);
+}
+
+/* cap resident writers independently of the caller's id space. a sealed, unreferenced group
+ * becomes collectible while an older ordinary file and a later builder both remain open. */
+void test_group_pressure_seals_idle_files_within_the_fd_budget(void)
+{
+    fresh_dir();
+    fd_manager_t fdm;
+    ASSERT_EQ(fd_manager_init(&fdm, 6), 0);
+    vlog_config_t config = {.max_blob_shard_groups = UINT32_MAX, .fdm = &fdm};
+    vlog_t* v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &config, &v), VLOG_OK);
+    const int budget = fd_manager_open_budget(&fdm);
+    vlog_id_t first = 0;
+    for (uint32_t i = 0; i < (uint32_t)budget + 2; ++i)
+    {
+        vlog_id_t id;
+        ASSERT_EQ(vlog_write_group(v, i, (const uint8_t*)"x", 1, &id, NULL), VLOG_OK);
+        if (!i) first = id;
+        ASSERT_TRUE(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT) <= budget);
+    }
+    const int later = vlog_build_enter(v);
+    ASSERT_EQ(vlog_reclaim(v), VLOG_OK);
+    assert_gone(v, first);
+    vlog_build_leave(v, later);
+    vlog_close(v);
+    ASSERT_EQ(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT), 0);
+    fd_manager_destroy(&fdm);
+}
+
 typedef struct
 {
     vlog_t *v;
@@ -2690,6 +2829,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_recover_appends_to_a_fresh_segment, tests_passed);
     RUN_TEST(test_recover_sealed_indexes_skip_payloads_and_preserve_every_index_field,
              tests_passed);
+    RUN_TEST(test_group_checkpoint_recovers_only_its_own_prefix, tests_passed);
     RUN_TEST(test_recover_active_prefix_scans_only_its_uncovered_tail, tests_passed);
     RUN_TEST(test_recover_missing_or_truncated_active_prefix_scans_every_payload, tests_passed);
     RUN_TEST(test_recover_active_prefix_disabled_scans_every_payload, tests_passed);
@@ -2738,6 +2878,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_invalid_args, tests_passed);
     RUN_TEST(test_many_values_stress, tests_passed);
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);
+    RUN_TEST(test_concurrent_groups_roll_and_recover_separately, tests_passed);
+    RUN_TEST(test_group_pressure_seals_idle_files_within_the_fd_budget, tests_passed);
+    RUN_TEST(test_group_slot_pressure_preserves_live_writers_and_reuses_retired_space, tests_passed);
     RUN_TEST(test_concurrent_reads_writes_and_reclaim, tests_passed);
     RUN_TEST(test_reclaim_never_retires_a_segment_a_roll_is_publishing, tests_passed);
 #ifndef _WIN32

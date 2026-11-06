@@ -75,9 +75,7 @@ static void engine_lower_prepared_floor_locked(tidesdb_t *db, const tidesdb_wal_
     for (int e = 0; e < count; e++)
     {
         if (!(entries[e].flags & TDB_WAL_ENTRY_VLOG_REF)) continue;
-        uint64_t segment = 0;
-        if (vlog_id_segment(db->vlog, entries[e].vlog_id, &segment) == VLOG_OK)
-            vlog_build_lower(db->vlog, db->prepare_vlog_token, segment);
+        vlog_build_protect(db->vlog, db->prepare_vlog_token, entries[e].vlog_id);
     }
 }
 

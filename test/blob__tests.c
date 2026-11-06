@@ -16,6 +16,7 @@
 #include "../src/compat.h"
 #include "../src/engine/engine_types.h"
 #include "../src/sstable/sstable.h"
+#include "../src/sstable/vlog_group_disk.h"
 #include "../src/txn/wal_record.h"
 #include "test_utils.h"
 
@@ -36,6 +37,10 @@ static int tests_failed = 0;
 #define BLOB_PHASE_PRE_WAL    "pre-wal"
 #define BLOB_PHASE_POST_WAL   "post-wal"
 #define BLOB_CHILD_NTH        "0"
+
+_Static_assert(offsetof(tidesdb_open_options_t, reserved) + sizeof(uint32_t) ==
+                   sizeof(tidesdb_open_options_t),
+               "keep the size-tagged options prefix free of implicit tail padding");
 
 static const char* blob_exe = NULL;
 
@@ -82,6 +87,8 @@ static int blob_force_gc_before_wal(void* ctx, const uint8_t* batch, size_t size
     if (blob_gc_probe->rc == VLOG_OK)
         blob_gc_probe->rc =
             vlog_write(blob_gc_probe->db->vlog, &filler, sizeof(filler), NULL, 0, &filler_id, NULL);
+    if (blob_gc_probe->rc == VLOG_OK && vlog_group_limit(blob_gc_probe->db->vlog))
+        ASSERT_EQ(vlog_seal_idle_groups(blob_gc_probe->db->vlog, 0, NULL), 1);
     /* the new memtable takes a floor in the successor segment. release the previous memtable's
      * floor here, while the object still has no WAL entry or L0 reference. */
     if (blob_gc_probe->rc == VLOG_OK) blob_gc_probe->rc = tidesdb_flush_memtable(blob_gc_probe->db);
@@ -421,7 +428,7 @@ void test_blob_put_wal_and_flush_preserve_the_value_log_reference(void)
 /* the pre-apply builder token is the only guard left after an older memtable flushes. force the
  * newly appended blob segment to seal, then reclaim it inside the WAL seam; a successful read
  * proves reclaim could not unlink the reference before L0 took ownership */
-void test_blob_put_builder_floor_survives_gc_before_l0_handoff(void)
+static void blob_gc_before_l0_handoff(uint32_t max_groups)
 {
     const uint8_t key[] = "gc-window";
     uint8_t value[BLOB_GC_VALUE_BYTES];
@@ -430,7 +437,7 @@ void test_blob_put_builder_floor_survives_gc_before_l0_handoff(void)
     memset(value, 0x9d, sizeof(value));
     tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
     cfg.vlog_segment_size = BLOB_GC_SEGMENT_BYTES;
-    tidesdb_open_options_t options = {.size = sizeof(options)};
+    tidesdb_open_options_t options = {.size = sizeof(options), .max_blob_shard_groups = max_groups};
     tidesdb_t* db = NULL;
     ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
     tidesdb_column_family_config_t plain_config = tidesdb_default_column_family_config();
@@ -448,15 +455,29 @@ void test_blob_put_builder_floor_survives_gc_before_l0_handoff(void)
     blob_gc_probe_t probe;
     memset(&probe, 0, sizeof(probe));
     blob_install_gc_probe(db, &probe);
-    ASSERT_EQ(tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value)), TDB_SUCCESS);
+    const int rc =
+        max_groups ? tidesdb_blob_put_group(db, cf, 0, key, sizeof(key) - 1, value, sizeof(value))
+                   : tidesdb_blob_put(db, cf, key, sizeof(key) - 1, value, sizeof(value));
+    ASSERT_EQ(rc, TDB_SUCCESS);
     blob_remove_gc_probe(db, &probe);
     ASSERT_EQ(probe.rc, VLOG_OK);
     ASSERT_TRUE(probe.after.reclaim_calls > probe.before.reclaim_calls);
     ASSERT_EQ(probe.after.segments_retired, probe.before.segments_retired);
+    ASSERT_EQ(vlog_reclaim(db->vlog), VLOG_OK); /* the receiving memtable now owns the hold */
     blob_expect_value(db, cf, key, sizeof(key) - 1, value, sizeof(value));
 
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
     (void)remove_directory(dir);
+}
+
+void test_blob_put_builder_floor_survives_gc_before_l0_handoff(void)
+{
+    blob_gc_before_l0_handoff(0);
+}
+
+void test_grouped_blob_builder_and_memtable_handoff_protect_a_sealed_group(void)
+{
+    blob_gc_before_l0_handoff(1);
 }
 
 typedef struct
@@ -580,6 +601,187 @@ void test_blob_put_survives_wal_sync_flush_and_reopen_for_each_sync_mode(void)
     (void)remove_directory(dir);
 }
 
+/* first exercise the piece-5 size tag with nonzero bytes beyond its end. a shorter tag cannot
+ * turn on placement. the explicit API must distinguish a missing group from a supplied zero. */
+void test_blob_group_zero_requires_opt_in_and_an_explicit_id(void)
+{
+    char dir[] = BLOB_DB_DIR;
+    (void)remove_directory(dir);
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    tidesdb_open_options_t options = {
+        .size = offsetof(tidesdb_open_options_t, max_blob_shard_groups),
+        .max_blob_shard_groups = 1,
+        .reserved = UINT32_MAX};
+    tidesdb_t* db = NULL;
+    const uint8_t key = 'k', value = 'v';
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* media = blob_create_cf(db);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, 0, &key, 1, &value, 1), TDB_ERR_INVALID_ARGS);
+    vlog_stats_t stats;
+    ASSERT_EQ(vlog_get_stats(db->vlog, &stats), VLOG_OK);
+    ASSERT_EQ(stats.bytes_written, 0u);
+    ASSERT_EQ(stats.segment_count, 1u);
+    ASSERT_EQ(tidesdb_blob_put(db, media, &key, 1, &value, 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    options.size = sizeof(options);
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    media = tidesdb_get_column_family(db, BLOB_CF);
+    /* validate placement before the idempotent-key check, too */
+    ASSERT_EQ(tidesdb_blob_put(db, media, &key, 1, &value, 1), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, 1, &key, 1, &value, 1), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, UINT32_MAX, &key, 1, &value, 1),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, 0, &key, 1, &value, 1), TDB_SUCCESS);
+    ASSERT_EQ(vlog_get_stats(db->vlog, &stats), VLOG_OK);
+    ASSERT_EQ(stats.bytes_written, 0u);
+    const uint8_t fresh = 'g';
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, 0, &fresh, 1, NULL, 0), TDB_SUCCESS);
+    blob_expect_value(db, media, &fresh, 1, NULL, 0);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+}
+
+/* a crashed grouped-file publisher can leave either its unpublished temporary name or a torn final
+ * header. preflight must ignore only the former, reject the latter before recovery opens anything,
+ * and leave the bytes as forensic evidence rather than letting block-manager recovery rewrite it.
+ */
+void test_blob_group_preflight_is_read_only_for_torn_and_temporary_files(void)
+{
+    char dir[] = BLOB_DB_DIR;
+    char guard[MAX_FILE_PATH_LENGTH], temporary[MAX_FILE_PATH_LENGTH], torn[MAX_FILE_PATH_LENGTH];
+    (void)remove_directory(dir);
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    tidesdb_open_options_t options = {.size = sizeof(options), .max_blob_shard_groups = 2};
+    tidesdb_t* db = NULL;
+    const uint8_t key = 'k', value = 'v';
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* media = blob_create_cf(db);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, 1, &key, 1, &value, 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_TRUE(
+        snprintf(guard, sizeof(guard), "%s%s%s", dir, PATH_SEPARATOR, VLOG_GROUP_GUARD_NAME) > 0);
+    ASSERT_TRUE(snprintf(temporary, sizeof(temporary), "%s%s%s.tmp", guard, PATH_SEPARATOR,
+                         "000000000777.vlog") > 0);
+    int open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef _WIN32
+    open_flags |= O_BINARY;
+#endif
+    const int temp_fd = open(temporary, open_flags, 0644);
+    ASSERT_TRUE(temp_fd >= 0);
+    ASSERT_EQ(write(temp_fd, "partial", sizeof("partial") - 1), (ssize_t)(sizeof("partial") - 1));
+    ASSERT_EQ(close(temp_fd), 0);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_TRUE(snprintf(torn, sizeof(torn), "%s%s%s", guard, PATH_SEPARATOR, "000000000778.vlog") >
+                0);
+    const int torn_fd = open(torn, open_flags, 0644);
+    ASSERT_TRUE(torn_fd >= 0);
+    uint8_t torn_header[BLOCK_MANAGER_HEADER_SIZE] = {0};
+    encode_uint32_le_compat(torn_header, BLOCK_MANAGER_MAGIC);
+    torn_header[BLOCK_MANAGER_MAGIC_SIZE] = BLOCK_MANAGER_VERSION;
+    ASSERT_EQ(write(torn_fd, torn_header, sizeof(torn_header)), (ssize_t)sizeof(torn_header));
+    ASSERT_EQ(ftruncate(torn_fd, BLOCK_MANAGER_HEADER_SIZE + 4096), 0);
+    ASSERT_EQ(close(torn_fd), 0);
+    struct STAT_STRUCT before, after;
+    ASSERT_EQ(STAT_FUNC(torn, &before), 0);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_ERR_CORRUPTION);
+    ASSERT_TRUE(db == NULL);
+    ASSERT_EQ(STAT_FUNC(torn, &after), 0);
+    ASSERT_EQ(after.st_size, before.st_size);
+    (void)remove_directory(dir);
+}
+
+static void blob_expect_owner(vlog_t* vlog, vlog_id_t id, uint32_t want)
+{
+    uint32_t group = ~want;
+    ASSERT_EQ(vlog_group_owner_of(vlog, id, &group), VLOG_OK);
+    ASSERT_EQ(group, want);
+}
+
+/* a near-maximum ceiling touches two distant groups. all three routes reach the same WAL and
+ * backup owners. a backup has its own files and must recover placement from the data itself. */
+void test_blob_sparse_groups_interleave_with_kv_and_restore(void)
+{
+    char dir[] = BLOB_DB_DIR, backup[] = BLOB_DB_DIR "_backup";
+    (void)remove_directory(dir);
+    (void)remove_directory(backup);
+    tidesdb_config_t cfg = blob_config(dir, TDB_SYNC_FULL);
+    cfg.value_separation_threshold = 1;
+    tidesdb_open_options_t options = {
+        .size = sizeof(options), .enable_vlog_indexes = 1, .max_blob_shard_groups = UINT32_MAX - 1};
+    tidesdb_t* db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_t* media = blob_create_cf(db);
+    tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, BLOB_PLAIN_CF, &config), TDB_SUCCESS);
+    tidesdb_column_family_t* kv = tidesdb_get_column_family(db, BLOB_PLAIN_CF);
+    const uint8_t a = 'a', b = 'b', k = 'k';
+    const uint32_t high = options.max_blob_shard_groups - 1;
+    vlog_stats_t stats;
+    ASSERT_EQ(vlog_get_stats(db->vlog, &stats), VLOG_OK);
+    ASSERT_EQ(stats.segment_count, 1u);
+    blob_wal_probe_t probe = {0};
+    blob_install_wal_probe(db, &probe);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, 0, &a, 1, &a, 1), TDB_SUCCESS);
+    const vlog_id_t id_a = probe.entry.vlog_id;
+    tidesdb_txn_t* txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, kv, &k, 1, &k, 1, -1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+    const vlog_id_t id_k = probe.entry.vlog_id;
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, high, &b, 1, &b, 1), TDB_SUCCESS);
+    const vlog_id_t id_b = probe.entry.vlog_id;
+    blob_remove_wal_probe(db, &probe);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, high, &a, 1, &a, 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, high, &a, 1, &b, 1), TDB_ERR_CONFLICT);
+    blob_expect_owner(db->vlog, id_a, 0);
+    blob_expect_owner(db->vlog, id_b, high);
+    blob_expect_owner(db->vlog, id_k, VLOG_GROUP_UNGROUPED);
+    ASSERT_EQ(vlog_get_stats(db->vlog, &stats), VLOG_OK);
+    ASSERT_EQ(stats.segment_count, 3u);
+    ASSERT_EQ(stats.value_count, 3u);
+    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT), 3);
+    ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_backup(db, backup), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    cfg.db_path = backup;
+    cfg.log_to_file = 1;
+    options.max_blob_shard_groups = high;
+    ASSERT_TRUE(access(BLOB_DB_DIR "_backup" PATH_SEPARATOR "LOCK", F_OK) != 0);
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_ERR_INVALID_ARGS);
+    ASSERT_TRUE(db == NULL);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_ERR_INVALID_ARGS);
+    ASSERT_TRUE(db == NULL);
+    ASSERT_TRUE(access(BLOB_DB_DIR "_backup" PATH_SEPARATOR "LOG", F_OK) != 0);
+    ASSERT_TRUE(access(BLOB_DB_DIR "_backup" PATH_SEPARATOR "LOCK", F_OK) != 0);
+    cfg.log_to_file = 0;
+    options.max_blob_shard_groups = UINT32_MAX;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    media = tidesdb_get_column_family(db, BLOB_CF);
+    kv = tidesdb_get_column_family(db, BLOB_PLAIN_CF);
+    blob_expect_owner(db->vlog, id_a, 0);
+    blob_expect_owner(db->vlog, id_b, high);
+    blob_expect_owner(db->vlog, id_k, VLOG_GROUP_UNGROUPED);
+    blob_expect_value(db, media, &a, 1, &a, 1);
+    blob_expect_value(db, media, &b, 1, &b, 1);
+    blob_expect_value(db, kv, &k, 1, &k, 1);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, UINT32_MAX, &k, 1, &k, 1), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_blob_put_group(db, media, UINT32_MAX - 1, &k, 1, &k, 1), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(dir);
+    (void)remove_directory(backup);
+}
+
 int main(int argc, char** argv)
 {
     if (argc == 4 && strcmp(argv[1], BLOB_CHILD_FLAG) == 0)
@@ -589,12 +791,16 @@ int main(int argc, char** argv)
     }
     blob_exe = argv[0];
     INIT_TEST_FILTER(argc, argv);
+    RUN_TEST(test_blob_group_zero_requires_opt_in_and_an_explicit_id, tests_passed);
+    RUN_TEST(test_blob_group_preflight_is_read_only_for_torn_and_temporary_files, tests_passed);
+    RUN_TEST(test_blob_sparse_groups_interleave_with_kv_and_restore, tests_passed);
     RUN_TEST(test_blob_put_requires_a_blob_column_family, tests_passed);
     RUN_TEST(test_blob_put_is_idempotent_and_conflicts_on_different_bytes, tests_passed);
     RUN_TEST(test_blob_put_copies_before_return_and_accepts_an_empty_object, tests_passed);
     RUN_TEST(test_blob_put_enforces_the_configured_size_limit_before_side_effects, tests_passed);
     RUN_TEST(test_blob_put_wal_and_flush_preserve_the_value_log_reference, tests_passed);
     RUN_TEST(test_blob_put_builder_floor_survives_gc_before_l0_handoff, tests_passed);
+    RUN_TEST(test_grouped_blob_builder_and_memtable_handoff_protect_a_sealed_group, tests_passed);
     RUN_TEST(test_blob_put_crash_on_either_side_of_wal_publication, tests_passed);
     RUN_TEST(test_blob_put_concurrent_creators_obey_identity, tests_passed);
     RUN_TEST(test_blob_put_survives_wal_sync_flush_and_reopen_for_each_sync_mode, tests_passed);

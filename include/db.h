@@ -400,6 +400,9 @@ typedef struct tidesdb_config_t
  *                          requires a free slot after adopting all retained nonempty segments
  * @param max_blob_size maximum logical bytes per blob put. zero selects the largest verbatim value
  *                      that fits one value-log frame on this platform
+ * @param max_blob_shard_groups zero for ungrouped writes (default). a positive ceiling requires
+ *                              each blob put to name a group below it. groups allocate on demand
+ * @param reserved reserved ABI space, ignored. initialize to zero. future options follow this field
  */
 typedef struct tidesdb_open_options_t
 {
@@ -407,6 +410,8 @@ typedef struct tidesdb_open_options_t
     uint64_t enable_vlog_indexes;
     uint64_t max_vlog_segments;
     uint64_t max_blob_size;
+    uint32_t max_blob_shard_groups;
+    uint32_t reserved;
 } tidesdb_open_options_t;
 
 /* ===== statistics ===== */
@@ -720,7 +725,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
  *                at least the size field, and fields beyond size retain their defaults
  * @param db out -- the open database handle on success, untouched on failure
  * @return TDB_SUCCESS and the same errors as tidesdb_open, or TDB_ERR_INVALID_ARGS when options
- *         names less than its size field or requests more than 65536 value-log slots
+ *         names less than its size field, requests more than 65536 value-log slots, or excludes
+ *         a retained blob shard group
  */
 int tidesdb_open_with_options(const tidesdb_config_t *config,
                               const tidesdb_open_options_t *options, tidesdb_t **db);
@@ -767,7 +773,7 @@ int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name);
 /**
  * tidesdb_blob_put
  * synchronously create one immutable blob, or check that a live key already holds identical bytes
- * @param db open database whose WAL sync policy applies to this commit
+ * @param db open database with shard groups disabled, whose WAL sync policy applies to this commit
  * @param cf blob column family belonging to db
  * @param key media key
  * @param key_size key length in bytes, from 1 through TDB_BLOB_MAX_KEY_SIZE
@@ -779,6 +785,23 @@ int tidesdb_create_blob_column_family(tidesdb_t* db, const char* name);
  */
 int tidesdb_blob_put(tidesdb_t* db, tidesdb_column_family_t* cf, const uint8_t* key,
                      size_t key_size, const uint8_t* value, size_t value_size);
+
+/**
+ * tidesdb_blob_put_group
+ * synchronously create an immutable blob in its shard group using the same identity and durability
+ * rules as tidesdb_blob_put. an identical retry keeps the original placement
+ * @param db open database with max_blob_shard_groups greater than zero
+ * @param cf blob column family belonging to db
+ * @param group_id shard group in the range [0, max_blob_shard_groups)
+ * @param key media key
+ * @param key_size key length in bytes, from 1 through TDB_BLOB_MAX_KEY_SIZE
+ * @param value bytes borrowed until return, may be NULL when value_size is zero
+ * @param value_size logical size, including zero for a present, empty object
+ * @return the same results as tidesdb_blob_put, or TDB_ERR_INVALID_ARGS for an unavailable group
+ */
+int tidesdb_blob_put_group(tidesdb_t* db, tidesdb_column_family_t* cf, uint32_t group_id,
+                           const uint8_t* key, size_t key_size, const uint8_t* value,
+                           size_t value_size);
 
 /**
  * tidesdb_drop_column_family

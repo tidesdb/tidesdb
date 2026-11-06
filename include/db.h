@@ -395,11 +395,15 @@ typedef struct tidesdb_config_t
  *             the size field is invalid
  * @param enable_vlog_indexes nonzero to checkpoint active value-log segments and index them on
  *                            seal, 0 for full payload-scan recovery (default)
+ * @param max_vlog_segments simultaneous value-log slots, including the active segment. 0 selects
+ *                          4096 (default), and the largest supported capacity is 65536. reopening
+ *                          requires a free slot after adopting all retained nonempty segments
  */
 typedef struct tidesdb_open_options_t
 {
     size_t size;
     uint64_t enable_vlog_indexes;
+    uint64_t max_vlog_segments;
 } tidesdb_open_options_t;
 
 /* ===== statistics ===== */
@@ -713,7 +717,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
  *                at least the size field, and fields beyond size retain their defaults
  * @param db out -- the open database handle on success, untouched on failure
  * @return TDB_SUCCESS and the same errors as tidesdb_open, or TDB_ERR_INVALID_ARGS when options
- *         names less than its size field
+ *         names less than its size field or requests more than 65536 value-log slots
  */
 int tidesdb_open_with_options(const tidesdb_config_t *config,
                               const tidesdb_open_options_t *options, tidesdb_t **db);

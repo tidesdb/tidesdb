@@ -62,21 +62,10 @@ static int vlog_segment_parse_name(const char *name, uint64_t *out_number)
     return 1;
 }
 
-/* insertion-sort the collected numbers ascending; the count is bounded by the segment table so the
- * quadratic cost is bounded with it, and a store is opened once */
-static void vlog_segment_sort(uint64_t *numbers, size_t count)
+static int vlog_compare_numbers(const void *left, const void *right)
 {
-    for (size_t i = 1; i < count; i++)
-    {
-        const uint64_t key = numbers[i];
-        size_t j = i;
-        while (j > 0 && numbers[j - 1] > key)
-        {
-            numbers[j] = numbers[j - 1];
-            j--;
-        }
-        numbers[j] = key;
-    }
+    const uint64_t a = *(const uint64_t *)left, b = *(const uint64_t *)right;
+    return (a > b) - (a < b);
 }
 
 /* a cursor finding no readable blocks can mean a torn tail. only the exact size and a valid
@@ -158,7 +147,7 @@ int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_
     if (closedir(d) != 0 && rc == VLOG_OK) rc = VLOG_ERR_IO;
 
     if (rc != VLOG_OK) return rc;
-    vlog_segment_sort(numbers, count);
+    qsort(numbers, count, sizeof(*numbers), vlog_compare_numbers);
     *out_count = count;
     return VLOG_OK;
 }
@@ -166,7 +155,7 @@ int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_
 /* claim the lowest free slot in the table, raising the high-water so scans stop early */
 static int vlog_segment_claim_slot(vlog_t *v, uint32_t *out_slot)
 {
-    for (uint32_t i = 0; i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < v->max_segments; i++)
     {
         if (atomic_load_explicit(&v->segments[i].state, memory_order_acquire) != VLOG_SEG_ABSENT)
             continue;
@@ -183,6 +172,27 @@ static int vlog_segment_claim_slot(vlog_t *v, uint32_t *out_slot)
     return VLOG_ERR_FULL;
 }
 
+/* charge both cached and temporary descriptors against the same process budget */
+static int vlog_segment_open_file(vlog_t *v, uint64_t number, block_manager_t **bm)
+{
+    char path[VLOG_PATH_MAX];
+    if (vlog_segment_path(v, number, path, sizeof(path)) != VLOG_OK) return VLOG_ERR_INVALID;
+
+    const int rc = v->fdm
+                       ? fd_manager_bm_open(v->fdm, bm, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
+                       : block_manager_open(bm, path, v->sync_mode);
+    if (rc != 0) return VLOG_ERR_IO;
+    if (v->fdm) fd_manager_note_open(v->fdm, FD_LABEL_VLOG_SEGMENT);
+    return VLOG_OK;
+}
+
+static int vlog_segment_close_file(vlog_t *v, block_manager_t *bm)
+{
+    const int rc = block_manager_close(bm);
+    if (v->fdm) fd_manager_note_close(v->fdm, FD_LABEL_VLOG_SEGMENT);
+    return rc == 0 ? VLOG_OK : VLOG_ERR_IO;
+}
+
 int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot)
 {
     if (!v || !out_slot) return VLOG_ERR_INVALID;
@@ -191,17 +201,9 @@ int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot)
     const int claimed = vlog_segment_claim_slot(v, &slot);
     if (claimed != VLOG_OK) return claimed;
 
-    char path[VLOG_PATH_MAX];
-    if (vlog_segment_path(v, number, path, sizeof(path)) != VLOG_OK) return VLOG_ERR_INVALID;
-
-    /* opened through the budget when there is one, so descriptor exhaustion wakes the reaper and
-     * retries rather than failing the store outright */
     block_manager_t *bm = NULL;
-    const int opened =
-        v->fdm ? fd_manager_bm_open(v->fdm, &bm, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
-               : block_manager_open(&bm, path, v->sync_mode);
-    if (opened != 0) return VLOG_ERR_IO;
-    if (v->fdm) fd_manager_note_open(v->fdm, FD_LABEL_VLOG_SEGMENT);
+    const int rc = vlog_segment_open_file(v, number, &bm);
+    if (rc != VLOG_OK) return rc;
 
     atomic_store_explicit(&v->segments[slot].bm, bm, memory_order_relaxed);
     v->segments[slot].number = number;
@@ -230,7 +232,7 @@ int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot)
 
 int vlog_segment_acquire(vlog_t *v, uint32_t slot)
 {
-    if (!v || slot >= VLOG_MAX_SEGMENTS) return 0;
+    if (!v || slot >= v->max_segments) return 0;
     if (atomic_load_explicit(&v->segments[slot].state, memory_order_acquire) != VLOG_SEG_OPEN)
         return 0;
     return tdb_try_ref(&v->segments[slot].rc);
@@ -238,13 +240,13 @@ int vlog_segment_acquire(vlog_t *v, uint32_t slot)
 
 void vlog_segment_release(vlog_t *v, uint32_t slot)
 {
-    if (!v || slot >= VLOG_MAX_SEGMENTS) return;
+    if (!v || slot >= v->max_segments) return;
     (void)tdb_unref(&v->segments[slot].rc);
 }
 
 int vlog_segment_retire(vlog_t *v, uint32_t slot)
 {
-    if (!v || slot >= VLOG_MAX_SEGMENTS) return VLOG_ERR_INVALID;
+    if (!v || slot >= v->max_segments) return VLOG_ERR_INVALID;
     if (atomic_load_explicit(&v->segments[slot].state, memory_order_acquire) != VLOG_SEG_OPEN)
         return VLOG_OK;
 
@@ -296,11 +298,7 @@ int vlog_segment_retire(vlog_t *v, uint32_t slot)
     const int have_path = vlog_segment_path(v, v->segments[slot].number, path, sizeof(path));
 
     block_manager_t *bm = atomic_exchange(&v->segments[slot].bm, NULL);
-    if (bm)
-    {
-        (void)block_manager_close(bm);
-        if (v->fdm) fd_manager_note_close(v->fdm, FD_LABEL_VLOG_SEGMENT);
-    }
+    if (bm) (void)vlog_segment_close_file(v, bm); /* reclaim unlinks the file below */
     /* unlink the cache first: an interruption can always rebuild it from a surviving segment. */
     if (have_path == VLOG_OK)
     {
@@ -451,25 +449,57 @@ block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot)
     block_manager_t *bm = atomic_load_explicit(&v->segments[slot].bm, memory_order_acquire);
     if (bm) return bm;
 
-    char path[VLOG_PATH_MAX];
-    if (vlog_segment_path(v, v->segments[slot].number, path, sizeof(path)) != VLOG_OK) return NULL;
-
     block_manager_t *opened = NULL;
-    const int rc =
-        v->fdm ? fd_manager_bm_open(v->fdm, &opened, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
-               : block_manager_open(&opened, path, v->sync_mode);
-    if (rc != 0) return NULL;
+    if (vlog_segment_open_file(v, v->segments[slot].number, &opened) != VLOG_OK) return NULL;
 
     block_manager_t *expected = NULL;
-    if (atomic_compare_exchange_strong(&v->segments[slot].bm, &expected, opened))
+    if (atomic_compare_exchange_strong(&v->segments[slot].bm, &expected, opened)) return opened;
+
+    (void)vlog_segment_close_file(v, opened); /* another reader installed the resident handle */
+    return expected;
+}
+
+#ifdef TDB_FAULT_INJECTION
+static void (*vlog_cold_borrow_hook)(block_manager_t *bm, int syncing);
+
+void vlog_test_set_cold_borrow_hook(void (*hook)(block_manager_t *bm, int syncing))
+{
+    vlog_cold_borrow_hook = hook;
+}
+#endif
+
+int vlog_segment_inspect(vlog_t *v, uint32_t slot, uint64_t *size)
+{
+    if (!v || slot >= v->max_segments) return VLOG_ERR_INVALID;
+    vlog_segment_t *segment = &v->segments[slot];
+    block_manager_t *bm = atomic_load_explicit(&segment->bm, memory_order_acquire);
+    const int cold = bm == NULL;
+    if (cold)
     {
-        if (v->fdm) fd_manager_note_open(v->fdm, FD_LABEL_VLOG_SEGMENT);
-        return opened;
+        if (vlog_segment_open_file(v, segment->number, &bm) != VLOG_OK) return VLOG_ERR_IO;
+#ifdef TDB_FAULT_INJECTION
+        if (vlog_cold_borrow_hook) vlog_cold_borrow_hook(bm, size == NULL);
+#endif
     }
 
-    /* another thread reopened first, so this one is surplus and is closed uncounted */
-    (void)block_manager_close(opened);
-    return expected;
+    const int rc = size ? block_manager_get_size(bm, size) : block_manager_escalate_fsync(bm);
+    if (cold)
+    {
+        if (!size && rc != 0)
+        {
+            /* a clean retry can hide lost writes. retain the failed handle, or transfer its
+             * first error to the handle installed by another borrower. our slot pin protects
+             * that handle through the handoff without excluding other readers during fsync. */
+            block_manager_t *installed = NULL;
+            if (atomic_compare_exchange_strong(&segment->bm, &installed, bm)) return VLOG_ERR_IO;
+            (void)block_manager_latch_error(installed, block_manager_last_errno(bm));
+        }
+        if (vlog_segment_close_file(v, bm) != VLOG_OK) return VLOG_ERR_IO;
+    }
+    /* a concurrent sync may have published an error while this one was in the kernel */
+    if (!size && block_manager_last_errno(atomic_load_explicit(&segment->bm, memory_order_acquire)))
+        return VLOG_ERR_IO;
+    return rc == 0 ? VLOG_OK : VLOG_ERR_IO;
 }
 
 int vlog_segment_evict(vlog_t *v, uint32_t slot)
@@ -484,14 +514,19 @@ int vlog_segment_evict(vlog_t *v, uint32_t slot)
 
     /* claims the window only when no reader is inside, so a read in flight is never closed under */
     if (!tdb_refcount_begin_evict(&v->segments[slot].rc, VLOG_SEG_BASELINE)) return 0;
-    block_manager_t *bm = atomic_exchange(&v->segments[slot].bm, NULL);
+    block_manager_t *bm = atomic_load_explicit(&v->segments[slot].bm, memory_order_relaxed);
+    /* a fresh descriptor could report a clean sync for data the device already lost. keep the
+     * failed handle until retirement so every durability barrier still sees its first error. */
+    if (bm && block_manager_last_errno(bm) == 0)
+        atomic_store_explicit(&v->segments[slot].bm, NULL, memory_order_release);
+    else
+        bm = NULL;
     /* the restored count is always the baseline here, so there is nothing to act on -- a reader
      * acquires through tdb_try_ref, which waits the window out rather than counting through it, and
      * a release can only follow an acquire that would have failed the claim above */
     (void)tdb_refcount_end_evict(&v->segments[slot].rc, VLOG_SEG_BASELINE);
 
     if (!bm) return 0;
-    (void)block_manager_close(bm);
-    if (v->fdm) fd_manager_note_close(v->fdm, FD_LABEL_VLOG_SEGMENT);
+    (void)vlog_segment_close_file(v, bm); /* this idle descriptor has already been detached */
     return 1;
 }

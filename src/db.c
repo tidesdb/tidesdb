@@ -100,13 +100,19 @@ int tidesdb_open_with_options(const tidesdb_config_t *config, const tidesdb_open
     if (!config || !db) return TDB_ERR_INVALID_ARGS;
     if (!config->db_path || config->db_path[0] == '\0') return TDB_ERR_INVALID_ARGS;
 
-    int enable_vlog_indexes = 0;
+    tidesdb_open_options_t resolved_options = {0};
     if (options != NULL)
     {
         if (options->size < sizeof(options->size)) return TDB_ERR_INVALID_ARGS;
         if (options->size >= offsetof(tidesdb_open_options_t, enable_vlog_indexes) +
                                  sizeof(options->enable_vlog_indexes))
-            enable_vlog_indexes = options->enable_vlog_indexes != 0;
+            resolved_options.enable_vlog_indexes = options->enable_vlog_indexes;
+        if (options->size >= offsetof(tidesdb_open_options_t, max_vlog_segments) +
+                                 sizeof(options->max_vlog_segments))
+        {
+            if (options->max_vlog_segments > VLOG_MAX_SEGMENTS) return TDB_ERR_INVALID_ARGS;
+            resolved_options.max_vlog_segments = options->max_vlog_segments;
+        }
     }
 
     /* fill the fields that treat 0 as auto with their defaults, leaving explicit choices untouched
@@ -128,7 +134,7 @@ int tidesdb_open_with_options(const tidesdb_config_t *config, const tidesdb_open
     if (resolved.memtable_skip_list_probability <= 0.0f)
         resolved.memtable_skip_list_probability = d.memtable_skip_list_probability;
 
-    return tdb_public_rc(engine_open(&resolved, enable_vlog_indexes, db));
+    return tdb_public_rc(engine_open(&resolved, &resolved_options, db));
 }
 
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)

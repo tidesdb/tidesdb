@@ -592,6 +592,15 @@ int block_manager_buffered_lag(block_manager_t *bm, uint64_t *out_lag, uint64_t 
 int block_manager_escalate_fsync(block_manager_t *bm);
 
 /**
+ * block_manager_latch_error
+ * remember a write or sync error for subsequent durability barriers on this file handle
+ * @param bm the block manager
+ * @param err positive errno to retain
+ * @return 1 if this was the first error recorded, 0 if already latched or the arguments are invalid
+ */
+int block_manager_latch_error(block_manager_t *bm, int err);
+
+/**
  * block_manager_last_errno
  * the errno of the write or sync that failed on this handle, or 0 when none has. reading errno
  * directly is not enough in buffered mode, where the failing syscall runs on the flush thread and

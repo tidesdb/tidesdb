@@ -204,8 +204,7 @@ static int vlog_write_sidecar(FILE *file, block_manager_t *bm, uint64_t number, 
 int vlog_sidecar_publish(vlog_t *v, uint32_t slot, vlog_sidecar_entry_t *entries, size_t count,
                          uint64_t extent, vlog_sidecar_kind_t kind)
 {
-    if (!v || !entries || !count || slot >= VLOG_MAX_SEGMENTS ||
-        extent < BLOCK_MANAGER_HEADER_SIZE ||
+    if (!v || !entries || !count || slot >= v->max_segments || extent < BLOCK_MANAGER_HEADER_SIZE ||
         count > (extent - BLOCK_MANAGER_HEADER_SIZE) / VLOG_SIDECAR_MIN_FRAME)
         return VLOG_ERR_INVALID;
     const uint64_t number = v->segments[slot].number;
@@ -312,7 +311,7 @@ static int vlog_read_sidecar(FILE *file, block_manager_t *bm, uint64_t number,
 int vlog_sidecar_load(vlog_t *v, uint32_t slot, uint64_t logical_extent, vlog_sidecar_entry_t **out,
                       size_t *count, uint64_t *out_extent)
 {
-    if (!v || !out || !count || !out_extent || slot >= VLOG_MAX_SEGMENTS ||
+    if (!v || !out || !count || !out_extent || slot >= v->max_segments ||
         logical_extent < BLOCK_MANAGER_HEADER_SIZE)
         return VLOG_ERR_INVALID;
     *out = NULL;

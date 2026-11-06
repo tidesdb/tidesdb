@@ -7,12 +7,14 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+#include <errno.h>
+
+#include "../external/xxhash.h"
 #include "../src/base/errors.h"
 #include "../src/io/block_manager.h"
 #include "../src/io/block_manager_fault.h"
 #include "../src/sstable/vlog.h"
 #include "../src/sstable/vlog_internal.h" /* the segment table, for the retire guard test */
-#include "../external/xxhash.h"
 #include "test_utils.h"
 
 #ifndef _WIN32
@@ -254,7 +256,7 @@ static void make_header_only_segment(uint64_t number, char *path, size_t path_si
 static uint64_t active_segment_number(vlog_t *v)
 {
     const uint32_t slot = atomic_load_explicit(&v->active_slot, memory_order_acquire);
-    ASSERT_TRUE(slot < VLOG_MAX_SEGMENTS);
+    ASSERT_TRUE(slot < vlog_max_segments(v));
     return v->segments[slot].number;
 }
 
@@ -1761,6 +1763,73 @@ void test_recover_preserves_torn_and_corrupt_segment_candidates(void)
     vlog_close(v);
 }
 
+/* the maximum table is exercised without creating 65,536 files: synthetic occupied middle slots
+ * force a normal roll from a real active file into slot 65,535. the payload there proves it is a
+ * real usable slot, and the following roll verifies the one-past-the-end boundary. */
+void test_selected_segment_capacity_uses_the_last_slot_and_rejects_overflow(void)
+{
+    fresh_dir();
+    ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
+    const vlog_config_t defaults = {.encodings = &g_vlog_reg, .sync_mode = BLOCK_MANAGER_SYNC_NONE};
+    vlog_t *v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &defaults, &v), VLOG_OK);
+    ASSERT_EQ(vlog_max_segments(v), VLOG_DEFAULT_MAX_SEGMENTS);
+    vlog_close(v);
+
+    fresh_dir();
+    const vlog_config_t maximum = {.encodings = &g_vlog_reg,
+                                   .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                                   .segment_target_bytes = BLOCK_MANAGER_HEADER_SIZE + 1,
+                                   .max_segments = VLOG_MAX_SEGMENTS};
+    ASSERT_EQ(vlog_open(VDIR, &maximum, &v), VLOG_OK);
+    ASSERT_EQ(vlog_max_segments(v), VLOG_MAX_SEGMENTS);
+    const uint8_t first_value = 1;
+    const uint8_t last_value = 2;
+    vlog_id_t id = VLOG_ID_INVALID;
+    ASSERT_EQ(vlog_write(v, &first_value, sizeof(first_value), NULL, 0, &id, NULL), VLOG_OK);
+    const uint32_t first_slot = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    ASSERT_EQ(first_slot, 0);
+    for (uint32_t slot = 1; slot + 1 < VLOG_MAX_SEGMENTS; slot++)
+        atomic_store_explicit(&v->segments[slot].state, VLOG_SEG_OPEN, memory_order_release);
+    ASSERT_EQ(vlog_segment_roll(v, first_slot), VLOG_OK);
+    ASSERT_EQ(atomic_load_explicit(&v->active_slot, memory_order_acquire), VLOG_MAX_SEGMENTS - 1);
+
+    vlog_id_t last_id = VLOG_ID_INVALID;
+    ASSERT_EQ(vlog_write(v, &last_value, sizeof(last_value), NULL, 0, &last_id, NULL), VLOG_OK);
+    const size_t bucket = vlog_index_locate(v, last_id, NULL);
+    ASSERT_TRUE(bucket != SIZE_MAX);
+    ASSERT_EQ(v->buckets[bucket].segment, VLOG_MAX_SEGMENTS - 1);
+    uint8_t *got = NULL;
+    size_t got_size = 0;
+    ASSERT_EQ(vlog_read(v, last_id, &got, &got_size), VLOG_OK);
+    ASSERT_EQ(got_size, sizeof(last_value));
+    ASSERT_EQ(got[0], last_value);
+    free(got);
+    ASSERT_EQ(vlog_write(v, &last_value, sizeof(last_value), NULL, 0, &id, NULL), VLOG_ERR_FULL);
+    ASSERT_EQ(vlog_segment_acquire(v, VLOG_MAX_SEGMENTS), 0);
+    for (uint32_t slot = 1; slot + 1 < VLOG_MAX_SEGMENTS; slot++)
+        atomic_store_explicit(&v->segments[slot].state, VLOG_SEG_ABSENT, memory_order_release);
+    vlog_close(v);
+
+    /* both real files contain a value. adoption must leave room for the fresh active segment. */
+    vlog_config_t reopen = maximum;
+    reopen.max_segments = 2;
+    v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &reopen, &v), VLOG_ERR_FULL);
+    ASSERT_TRUE(v == NULL);
+    reopen.max_segments++;
+    ASSERT_EQ(vlog_open(VDIR, &reopen, &v), VLOG_OK);
+    assert_reads(v, last_id, &last_value, sizeof(last_value));
+    vlog_close(v);
+
+    const vlog_config_t overflow = {.encodings = &g_vlog_reg,
+                                    .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                                    .max_segments = VLOG_MAX_SEGMENTS + 1u};
+    v = NULL;
+    ASSERT_EQ(vlog_open(VDIR, &overflow, &v), VLOG_ERR_INVALID);
+    ASSERT_TRUE(v == NULL);
+}
+
 #ifndef _WIN32
 void test_recover_prunes_more_than_segment_cap_header_only_files_under_low_fd_limit(void)
 {
@@ -1774,12 +1843,12 @@ void test_recover_prunes_more_than_segment_cap_header_only_files_under_low_fd_li
     ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low_limit), 0);
 
     char path[512];
-    for (uint64_t i = 0; i <= VLOG_MAX_SEGMENTS; i++)
+    for (uint64_t i = 0; i <= VLOG_DEFAULT_MAX_SEGMENTS; i++)
         make_header_only_segment(i, path, sizeof(path));
 
     vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
     ASSERT_EQ((int)segment_count(v), 1);
-    ASSERT_EQ(active_segment_number(v), VLOG_MAX_SEGMENTS + 1);
+    ASSERT_EQ(active_segment_number(v), VLOG_DEFAULT_MAX_SEGMENTS + 1);
     vlog_close(v);
 
     ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &saved_limit), 0);
@@ -1794,9 +1863,9 @@ void test_recover_torn_tail_ignored(void)
     const vlog_id_t ia = put(v, a, V_SMALL);
     const vlog_id_t ib = put(v, b, V_MEDIUM);
 
-    vlog_segment_info_t infos[VLOG_MAX_SEGMENTS];
+    vlog_segment_info_t infos[VLOG_DEFAULT_MAX_SEGMENTS];
     size_t n = 0;
-    ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_MAX_SEGMENTS, &n) == VLOG_OK);
+    ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_DEFAULT_MAX_SEGMENTS, &n) == VLOG_OK);
     ASSERT_EQ((int)n, 1);
     char path[512];
     snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, infos[0].name);
@@ -1841,9 +1910,9 @@ void test_read_detects_corruption(void)
     const vlog_id_t ia = put(v, a, V_MEDIUM);
     assert_reads(v, ia, a, V_MEDIUM);
 
-    vlog_segment_info_t infos[VLOG_MAX_SEGMENTS];
+    vlog_segment_info_t infos[VLOG_DEFAULT_MAX_SEGMENTS];
     size_t n = 0;
-    ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_MAX_SEGMENTS, &n) == VLOG_OK);
+    ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_DEFAULT_MAX_SEGMENTS, &n) == VLOG_OK);
     char path[512];
     snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, infos[0].name);
     vlog_close(v);
@@ -2096,9 +2165,9 @@ void test_list_segments_reports_each(void)
     for (int i = 0; i < V_MANY; i++) (void)put(v, val, V_MEDIUM);
     free(val);
 
-    vlog_segment_info_t infos[VLOG_MAX_SEGMENTS];
+    vlog_segment_info_t infos[VLOG_DEFAULT_MAX_SEGMENTS];
     size_t n = 0;
-    ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_MAX_SEGMENTS, &n) == VLOG_OK);
+    ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_DEFAULT_MAX_SEGMENTS, &n) == VLOG_OK);
     ASSERT_EQ((int)n, (int)segment_count(v));
     for (size_t i = 0; i < n; i++)
     {
@@ -2126,7 +2195,7 @@ void test_sync_succeeds(void)
     vlog_close(v);
 }
 
-#ifdef __linux__
+#ifndef _WIN32
 void test_sync_failure_is_sticky_and_keeps_the_resident_segment(void)
 {
     fresh_dir();
@@ -2136,7 +2205,7 @@ void test_sync_failure_is_sticky_and_keeps_the_resident_segment(void)
     free(value);
 
     const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
-    uint32_t inactive = VLOG_MAX_SEGMENTS;
+    uint32_t inactive = VLOG_DEFAULT_MAX_SEGMENTS;
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
     for (uint32_t i = 0; i < high; i++)
         if (i != active && atomic_load_explicit(&v->segments[i].bm, memory_order_acquire))
@@ -2144,25 +2213,161 @@ void test_sync_failure_is_sticky_and_keeps_the_resident_segment(void)
             inactive = i;
             break;
         }
-    ASSERT_TRUE(inactive < VLOG_MAX_SEGMENTS);
+    ASSERT_TRUE(inactive < VLOG_DEFAULT_MAX_SEGMENTS);
 
     block_manager_t *const bm =
         atomic_load_explicit(&v->segments[inactive].bm, memory_order_acquire);
     const int real_fd = dup(bm->fd);
     ASSERT_TRUE(real_fd >= 0);
-    const int null_fd = open("/dev/null", O_RDWR);
-    ASSERT_TRUE(null_fd >= 0);
-    ASSERT_TRUE(dup2(null_fd, bm->fd) >= 0);
-    close(null_fd);
+    int pipe_fd[2];
+    ASSERT_EQ(pipe(pipe_fd), 0);
+    ASSERT_TRUE(dup2(pipe_fd[1], bm->fd) >= 0);
+    ASSERT_EQ(close(pipe_fd[0]), 0);
+    ASSERT_EQ(close(pipe_fd[1]), 0);
 
     ASSERT_EQ(vlog_sync(v), VLOG_ERR_IO);
     ASSERT_TRUE(dup2(real_fd, bm->fd) >= 0);
     close(real_fd);
 
-    /* restoring a working descriptor must not erase the first sync failure */
+    /* a later sweep must preserve the descriptor that carries the failed durability barrier */
+    ASSERT_EQ(vlog_segment_evict(v, inactive), 0);
     ASSERT_EQ(vlog_sync(v), VLOG_ERR_IO);
     ASSERT_TRUE(atomic_load_explicit(&v->segments[inactive].bm, memory_order_acquire) == bm);
     vlog_close(v);
+}
+#endif
+
+#if defined(TDB_FAULT_INJECTION) && !defined(_WIN32)
+typedef struct
+{
+    vlog_t *v;
+    int syncing;
+    block_manager_t *borrowed;
+    _Atomic(int) entered;
+    _Atomic(int) resume;
+    pthread_t thread;
+    int rc;
+} vlog_cold_scan_t;
+
+static vlog_cold_scan_t *paused_cold_scan;
+
+static void pause_cold_borrow(block_manager_t *bm, int syncing)
+{
+    if (syncing != paused_cold_scan->syncing) return;
+    paused_cold_scan->borrowed = bm;
+    atomic_store(&paused_cold_scan->entered, 1);
+    await_index_test_event(&paused_cold_scan->resume);
+}
+
+static void *run_cold_scan(void *arg)
+{
+    vlog_cold_scan_t *scan = arg;
+    vlog_stats_t stats;
+    scan->rc = scan->syncing ? vlog_sync(scan->v) : vlog_get_stats(scan->v, &stats);
+    return NULL;
+}
+
+/* the only cold file in the fixture is slot zero. pause after its private open, with its pin held
+ */
+static void start_cold_scan(vlog_cold_scan_t *scan)
+{
+    paused_cold_scan = scan;
+    vlog_test_set_cold_borrow_hook(pause_cold_borrow);
+    ASSERT_EQ(pthread_create(&scan->thread, NULL, run_cold_scan, scan), 0);
+    await_index_test_event(&scan->entered);
+}
+
+static void finish_cold_scan(vlog_cold_scan_t *scan, int expected)
+{
+    atomic_store(&scan->resume, 1);
+    ASSERT_EQ(pthread_join(scan->thread, NULL), 0);
+    vlog_test_set_cold_borrow_hook(NULL);
+    paused_cold_scan = NULL;
+    ASSERT_EQ(scan->rc, expected);
+}
+
+static vlog_t *open_cold_scan_fixture(uint8_t value, vlog_id_t *id)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
+    *id = put(v, &value, sizeof(value));
+    ASSERT_EQ(vlog_segment_roll(v, 0), VLOG_OK);
+    ASSERT_EQ(vlog_segment_evict(v, 0), 1);
+    return v;
+}
+
+void test_cold_sync_preserves_stats_and_reader_borrows(void)
+{
+    const uint8_t value = 'v';
+    vlog_id_t id;
+    vlog_t *v = open_cold_scan_fixture(value, &id);
+
+    /* a stats pin defeated the old sync's single eviction attempt, leaving the slot resident */
+    vlog_cold_scan_t stats = {.v = v};
+    start_cold_scan(&stats);
+    ASSERT_EQ(vlog_sync(v), VLOG_OK);
+    finish_cold_scan(&stats, VLOG_OK);
+    ASSERT_TRUE(atomic_load(&v->segments[0].bm) == NULL);
+
+    /* a real read may want a cached handle. completing a private sync must leave that handle alone
+     */
+    vlog_cold_scan_t sync = {.v = v, .syncing = 1};
+    start_cold_scan(&sync);
+    assert_reads(v, id, &value, sizeof(value));
+    block_manager_t *resident = atomic_load(&v->segments[0].bm);
+    ASSERT_TRUE(resident != NULL && resident != sync.borrowed);
+    finish_cold_scan(&sync, VLOG_OK);
+    ASSERT_TRUE(atomic_load(&v->segments[0].bm) == resident);
+    vlog_close(v);
+}
+
+static void check_failed_cold_sync(int with_reader)
+{
+    const uint8_t value = 'v';
+    vlog_id_t id;
+    vlog_t *v = open_cold_scan_fixture(value, &id);
+    vlog_cold_scan_t sync = {.v = v, .syncing = 1};
+    start_cold_scan(&sync);
+    block_manager_t *expected = sync.borrowed;
+    if (with_reader)
+    {
+        assert_reads(v, id, &value, sizeof(value));
+        expected = atomic_load(&v->segments[0].bm);
+        ASSERT_TRUE(expected != NULL && expected != sync.borrowed);
+    }
+
+    /* fail the actual fsync on the private fd. keep its original file so the next barrier
+     * would succeed if the surviving handle forgot the error */
+    int pipes[2];
+    ASSERT_EQ(pipe(pipes), 0);
+    const int synced = fdatasync(pipes[1]);
+    const int pipe_error = errno;
+    ASSERT_EQ(synced, -1);
+    ASSERT_TRUE(pipe_error > 0);
+    const int saved = dup(sync.borrowed->fd);
+    ASSERT_TRUE(saved >= 0);
+    ASSERT_TRUE(dup2(pipes[1], sync.borrowed->fd) >= 0);
+    ASSERT_EQ(close(pipes[0]), 0);
+    ASSERT_EQ(close(pipes[1]), 0);
+
+    finish_cold_scan(&sync, VLOG_ERR_IO);
+    ASSERT_TRUE(atomic_load(&v->segments[0].bm) == expected);
+    ASSERT_EQ(block_manager_last_errno(expected), pipe_error);
+    if (!with_reader) ASSERT_TRUE(dup2(saved, expected->fd) >= 0);
+    ASSERT_EQ(close(saved), 0);
+    ASSERT_EQ(vlog_segment_evict(v, 0), 0);
+    ASSERT_EQ(vlog_sync(v), VLOG_ERR_IO);
+    vlog_close(v);
+}
+
+void test_cold_sync_failure_promotes_the_private_handle(void)
+{
+    check_failed_cold_sync(0);
+}
+
+void test_cold_sync_failure_transfers_to_the_reader_installed_handle(void)
+{
+    check_failed_cold_sync(1);
 }
 #endif
 
@@ -2487,6 +2692,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_active_checkpoint_waits_for_out_of_order_completion, tests_passed);
 #endif
     RUN_TEST(test_recover_preserves_torn_and_corrupt_segment_candidates, tests_passed);
+    RUN_TEST(test_selected_segment_capacity_uses_the_last_slot_and_rejects_overflow, tests_passed);
 #ifndef _WIN32
     RUN_TEST(test_recover_prunes_more_than_segment_cap_header_only_files_under_low_fd_limit,
              tests_passed);
@@ -2500,8 +2706,13 @@ int main(int argc, char **argv)
     RUN_TEST(test_retire_refuses_the_segment_taking_appends, tests_passed);
     RUN_TEST(test_list_segments_reports_each, tests_passed);
     RUN_TEST(test_sync_succeeds, tests_passed);
-#ifdef __linux__
+#ifndef _WIN32
     RUN_TEST(test_sync_failure_is_sticky_and_keeps_the_resident_segment, tests_passed);
+#endif
+#if defined(TDB_FAULT_INJECTION) && !defined(_WIN32)
+    RUN_TEST(test_cold_sync_preserves_stats_and_reader_borrows, tests_passed);
+    RUN_TEST(test_cold_sync_failure_promotes_the_private_handle, tests_passed);
+    RUN_TEST(test_cold_sync_failure_transfers_to_the_reader_installed_handle, tests_passed);
 #endif
     RUN_TEST(test_invalid_args, tests_passed);
     RUN_TEST(test_many_values_stress, tests_passed);

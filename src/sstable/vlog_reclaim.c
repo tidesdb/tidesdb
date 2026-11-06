@@ -156,7 +156,7 @@ int vlog_reclaim(vlog_t *v)
     /* counted so a pass that frees nothing can say which condition held it back, since the three
      * reasons want different fixes and the totals alone cannot tell them apart */
     uint32_t sealed = 0, empty = 0, held_by_floor = 0;
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         /* read per iteration rather than once for the pass. an appender that fills the active
          * segment rolls to a fresh one while this loop is running, so a slot hoisted before it
@@ -202,7 +202,7 @@ int vlog_mark_drainable(vlog_t *v)
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
     int marked = 0;
 
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
 
@@ -218,8 +218,7 @@ int vlog_mark_drainable(vlog_t *v)
         /* the segment taking appends is never marked. it is still growing, so the share of it that
          * is live says nothing yet, and rewriting values into the very segment being emptied would
          * not converge */
-        const int worth = i != active && live > 0 &&
-                          block_manager_get_size(vlog_segment_ensure_open(v, i), &size) == 0 &&
+        const int worth = i != active && live > 0 && vlog_segment_inspect(v, i, &size) == VLOG_OK &&
                           live <= size / VLOG_RECLAIM_LIVE_DIVISOR;
 
         atomic_store_explicit(&v->segments[i].draining, worth, memory_order_relaxed);
@@ -248,7 +247,7 @@ int vlog_evict_idle_segments(vlog_t *v, int max)
 
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
     int freed = 0;
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (max > 0 && freed >= max) break;
         freed += vlog_segment_evict(v, i);

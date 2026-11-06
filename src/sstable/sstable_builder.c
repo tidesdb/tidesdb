@@ -458,7 +458,8 @@ static int sstable_write_footer(sstable_builder_t *builder, const btree_t *tree,
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
-    const int rc = sstable_footer_serialize(&footer, &buf, &buf_size);
+    const int rc =
+        sstable_footer_serialize(&footer, vlog_max_segments(builder->vlog), &buf, &buf_size);
     if (rc != TDB_SUCCESS) return rc;
 
     block_manager_block_t *block = block_manager_block_create(buf_size, buf);

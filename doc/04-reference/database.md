@@ -121,8 +121,26 @@ Point reads still verify the block checksum. A missing, damaged or mismatched in
 a scan of that segment and a rebuild if the frames cover its extent. For example, copying a
 database to new files requires this scan on the first indexed open.
 
-The default is zero. Both modes write the existing v10 value-log format. Older binaries can
-read these value logs and ignore the optional index files.
+The index option defaults to zero. Both modes write the existing v10 value-log format.
+Earlier v10 binaries ignore the optional index files.
+
+Set `max_vlog_segments` to choose how many value-log files this database can retain
+simultaneously. Zero or an omitted field selects 4,096. Explicit capacities range from 1
+through 65,536. The engine allocates the slot table once per open. Segment file numbers
+and logical value IDs stay 64-bit at every capacity.
+
+Allow one slot for the fresh active file on reopen. With 65,536 slots, a store can reopen
+with at most 65,535 retained nonempty files. Another free slot is needed when the active
+segment next rolls. Reopening a backup follows the same rule. Recovery uses the database's
+descriptor budget, and backup opens cold segments one at a time.
+
+At the default capacity, new SSTables keep the v10 limit of 4,096 distinct segment
+references per footer. Before using an older binary on a copy of an extended store,
+check both its retained file count and its SSTables. The older reader needs room for
+a new active file in its 4,096 slots and enough process descriptors for adoption.
+An older binary can skip an unreadable L1 SSTable and still open the database.
+Keys in a table whose footer names more than 4,096 segments can then appear missing.
+Use the extended-capacity reader for such a store.
 
 ### Parameters
 

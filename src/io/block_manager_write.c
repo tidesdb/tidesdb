@@ -19,10 +19,7 @@ void bm_note_write_failure(block_manager_t *bm)
 {
     const int err = errno ? errno : EIO;
     /* the first failure is the one that explains the rest, so only it is reported */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&bm->flush_error, &expected, err,
-                                                 memory_order_release, memory_order_acquire))
-        return;
+    if (!block_manager_latch_error(bm, err)) return;
 
     if (tdb_errno_to_result(err) == TDB_ERR_NO_SPACE)
     {

@@ -148,6 +148,7 @@ typedef struct
  *        the whole table
  * @param roll_mu serializes sealing the active segment and opening its successor, so exactly one
  *        thread creates each segment file
+ * @param max_segments the number of slots allocated in segments
  * @param segments the fixed segment table; a slot's address never moves, which is what lets a
  *        reader hold one across an unlocked read
  * @param index_rw guards the id map, the space counters and every index repoint. a reader-writer
@@ -187,6 +188,7 @@ struct vlog
     char dir[VLOG_PATH_MAX];
     fd_manager_t *fdm;
     int sync_mode;
+    uint32_t max_segments;
     const tidesdb_encoding_registry_t *encodings;
     uint64_t segment_target_bytes;
     _Atomic(uint64_t) next_id;
@@ -194,7 +196,6 @@ struct vlog
     _Atomic(uint32_t) active_slot;
     _Atomic(uint32_t) seg_high;
     pthread_mutex_t roll_mu;
-    vlog_segment_t segments[VLOG_MAX_SEGMENTS];
 
     /* indexed writers hold a shared admission through their map update. the roller takes the
      * exclusive side before it publishes a sidecar or changes the active slot. index_rw protects
@@ -235,6 +236,7 @@ struct vlog
     _Atomic(uint64_t) segments_retired;
     _Atomic(uint64_t) build_floors[VLOG_MAX_BUILDERS];
     _Atomic(int) builds_unslotted;
+    vlog_segment_t segments[];
 };
 
 /**
@@ -282,6 +284,21 @@ int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot);
  * @return the block manager, or NULL when the file could not be reopened
  */
 block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot);
+
+/**
+ * vlog_segment_inspect
+ * size or sync a pinned segment without populating the descriptor cache during a successful scan
+ * @param v the store
+ * @param slot slot already pinned by the caller
+ * @param size receives the logical length, or NULL to sync the segment instead
+ * @return VLOG_OK, VLOG_ERR_INVALID for an invalid store or slot, or VLOG_ERR_IO on a file error
+ */
+int vlog_segment_inspect(vlog_t *v, uint32_t slot, uint64_t *size);
+
+#ifdef TDB_FAULT_INJECTION
+/* install or clear only with scans quiescent; the hook runs on the borrowed private handle */
+void vlog_test_set_cold_borrow_hook(void (*hook)(block_manager_t *bm, int syncing));
+#endif
 
 /**
  * vlog_segment_evict

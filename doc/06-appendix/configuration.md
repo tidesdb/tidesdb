@@ -19,7 +19,8 @@ all defaults.
 
 | Open option | Default | Effect |
 | --- | --- | --- |
-| `enable_vlog_indexes` | 0 | Checkpoint the shared value log after each additional 16 MiB of framed writes and publish its final `.vix` on seal. Reopen scans only the uncovered tail on a checkpoint hit. An absent, damaged or mismatched index triggers a full scan of that segment. Applies to separated values in every column family. Earlier v10 binaries can read the value log. |
+| `enable_vlog_indexes` | 0 | Checkpoint the shared value log after each additional 16 MiB of framed writes and publish its final `.vix` on seal. Reopen scans only the uncovered tail on a checkpoint hit. An absent, damaged or mismatched index triggers a full scan of that segment. Applies to separated values in every column family. Earlier v10 binaries ignore optional index files. |
+| `max_vlog_segments` | 4,096 | Maximum simultaneous slots per database, including the active file. Zero selects the default. Explicit values range from 1 to 65,536. Leave a free slot for each roll or reopen. Older readers need a slot in their 4,096-slot table and support at most 4,096 distinct segment references per SSTable. |
 
 ## Database configuration
 

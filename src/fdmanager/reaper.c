@@ -18,7 +18,7 @@
 int fd_reaper_run(fd_manager_t *fdm, sstable_t *const *candidates, const int n_candidates,
                   vlog_t *vlog)
 {
-    if (!fdm || !candidates) return 0;
+    if (!fdm || n_candidates < 0 || (n_candidates > 0 && !candidates)) return 0;
 
     const int budget = fd_manager_open_budget(fdm);
     if (budget >= INT_MAX) return 0; /* unlimited, no soft cap to reclaim toward */

@@ -24,12 +24,15 @@
 /* one histogram entry on disk -- segment number, framed bytes, value count */
 #define TDB_SSTABLE_VLOG_REF_BYTES 24
 
-int sstable_footer_serialize(const sstable_footer_t *footer, uint8_t **out, size_t *out_size)
+int sstable_footer_serialize(const sstable_footer_t *footer, uint32_t max_refs, uint8_t **out,
+                             size_t *out_size)
 {
     if (!footer || !out || !out_size) return TDB_ERR_INVALID_ARGS;
     if (footer->encoding_count > TDB_ENCODING_PIPELINE_MAX) return TDB_ERR_INVALID_ARGS;
 
-    if (footer->vlog_ref_count > SSTABLE_VLOG_REF_MAX) return TDB_ERR_INVALID_ARGS;
+    if (max_refs > SSTABLE_VLOG_REF_MAX || footer->vlog_ref_count > max_refs ||
+        (footer->vlog_ref_count && !footer->vlog_refs))
+        return TDB_ERR_INVALID_ARGS;
 
     const size_t total = TDB_SSTABLE_FOOTER_FIXED_BYTES + sizeof(uint32_t) + footer->min_key_size +
                          sizeof(uint32_t) + footer->max_key_size + sizeof(uint8_t) +
@@ -270,7 +273,7 @@ static int sstable_footer_parse_vlog_refs(const uint8_t **p, size_t *rem, sstabl
     *rem -= sizeof(uint32_t);
 
     if (out->vlog_ref_count > SSTABLE_VLOG_REF_MAX ||
-        *rem < (size_t)out->vlog_ref_count * TDB_SSTABLE_VLOG_REF_BYTES)
+        out->vlog_ref_count > *rem / TDB_SSTABLE_VLOG_REF_BYTES)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR,
                       "sstable footer declares %u value-log refs with %zu bytes left",

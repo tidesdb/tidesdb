@@ -73,11 +73,6 @@ static void engine_fd_reaper_tick(void *ctx)
 
     sstable_t **cands = NULL;
     const int n = engine_collect_sstables(db, &cands);
-    if (n <= 0)
-    {
-        free(cands);
-        return;
-    }
     /* only a table holding a descriptor has anything to give back, and a database keeps far more
      * sstables than it keeps open -- every one merged away or never read since an eviction is dead
      * weight here. dropping them before the ordering spares both the sort and the sweep the whole
@@ -92,7 +87,7 @@ static void engine_fd_reaper_tick(void *ctx)
     }
     /* still handed on with none of its own, since the sweep gives back value-log segments before it
      * looks at any candidate and that phase is owed a tick whatever the klogs are doing */
-    qsort(cands, (size_t)resident, sizeof(*cands), engine_sstable_lru_cmp);
+    if (resident > 1) qsort(cands, (size_t)resident, sizeof(*cands), engine_sstable_lru_cmp);
     (void)fd_reaper_run(&db->fdm, cands, resident, db->vlog);
     for (int i = 0; i < resident; i++)
         if (sstable_unref(cands[i])) sstable_close(cands[i]);

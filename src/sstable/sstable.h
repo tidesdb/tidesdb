@@ -254,11 +254,13 @@ typedef struct
  * sstable_footer_serialize
  * encode a footer into a freshly allocated buffer the caller frees and writes as one klog block
  * @param footer the footer to encode
+ * @param max_refs the writing database's simultaneous segment capacity
  * @param out out -- newly allocated bytes on success, owned by the caller
  * @param out_size out -- length of the encoded footer
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS on a bad argument, or TDB_ERR_MEMORY
  */
-int sstable_footer_serialize(const sstable_footer_t *footer, uint8_t **out, size_t *out_size);
+int sstable_footer_serialize(const sstable_footer_t *footer, uint32_t max_refs, uint8_t **out,
+                             size_t *out_size);
 
 /**
  * sstable_footer_parse

@@ -19,11 +19,12 @@
  * and value log, seed the mvcc clock, and create the empty cf registry and worker registry. the
  * config is expected already validated and defaulted by the facade
  * @param config the resolved configuration, borrowed (db_path is copied)
- * @param enable_vlog_indexes whether value-log segments publish indexes at checkpoints and seal
+ * @param options open-time options validated by the facade, with absent fields zeroed
  * @param out out -- the open engine on success, owned by the caller (freed by engine_close)
  * @return TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_MEMORY, or TDB_ERR_IO
  */
-int engine_open(const tidesdb_config_t *config, int enable_vlog_indexes, tidesdb_t **out);
+int engine_open(const tidesdb_config_t *config, const tidesdb_open_options_t *options,
+                tidesdb_t **out);
 
 /**
  * engine_close

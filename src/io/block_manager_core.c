@@ -395,6 +395,14 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     return 0;
 }
 
+int block_manager_latch_error(block_manager_t *bm, const int err)
+{
+    if (!bm || err <= 0) return 0;
+    int expected = 0;
+    return atomic_compare_exchange_strong_explicit(&bm->flush_error, &expected, err,
+                                                   memory_order_release, memory_order_relaxed);
+}
+
 int block_manager_last_errno(const block_manager_t *bm)
 {
     if (!bm) return 0;

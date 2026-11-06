@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../src/base/encoding/serialization.h"
 #include "../src/base/errors.h"
 #include "../src/cache/cache.h"
 #include "../src/fdmanager/fdmanager.h"
@@ -92,7 +93,8 @@ static void build_klog(const char *path, int64_t *root, int64_t *first, int64_t 
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
-    ASSERT_EQ(sstable_footer_serialize(&footer, &buf, &buf_size), TDB_SUCCESS);
+    ASSERT_EQ(sstable_footer_serialize(&footer, VLOG_DEFAULT_MAX_SEGMENTS, &buf, &buf_size),
+              TDB_SUCCESS);
 
     block_manager_block_t *block = block_manager_block_create(buf_size, buf);
     ASSERT_TRUE(block != NULL);
@@ -128,7 +130,8 @@ void test_footer_roundtrip(void)
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
-    ASSERT_EQ(sstable_footer_serialize(&in, &buf, &buf_size), TDB_SUCCESS);
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_DEFAULT_MAX_SEGMENTS, &buf, &buf_size),
+              TDB_SUCCESS);
 
     sstable_footer_t out = {0};
     ASSERT_EQ(sstable_footer_parse(buf, buf_size, &out), TDB_SUCCESS);
@@ -165,7 +168,8 @@ void test_footer_roundtrip_empty(void)
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
-    ASSERT_EQ(sstable_footer_serialize(&in, &buf, &buf_size), TDB_SUCCESS);
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_DEFAULT_MAX_SEGMENTS, &buf, &buf_size),
+              TDB_SUCCESS);
 
     sstable_footer_t out = {0};
     ASSERT_EQ(sstable_footer_parse(buf, buf_size, &out), TDB_SUCCESS);
@@ -177,6 +181,51 @@ void test_footer_roundtrip_empty(void)
 
     free(buf);
     sstable_footer_free(&out);
+}
+
+/* the v10 trailer length is unchanged. the writer applies the store's cap, while the
+ * reader checks both the supported maximum and the space left in the actual footer block. */
+void test_footer_extended_vlog_refs(void)
+{
+    sstable_footer_t in = {.version = TDB_SSTABLE_FORMAT_VERSION,
+                           .vlog_ref_count = VLOG_MAX_SEGMENTS};
+    in.vlog_refs = calloc(in.vlog_ref_count, sizeof(*in.vlog_refs));
+    ASSERT_TRUE(in.vlog_refs != NULL);
+    for (uint32_t i = 0; i < in.vlog_ref_count; i++)
+        in.vlog_refs[i] = (sstable_vlog_ref_t){.segment = UINT64_MAX - i, .bytes = i, .count = 1};
+
+    uint8_t *buf = NULL;
+    size_t size = 0;
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_DEFAULT_MAX_SEGMENTS, &buf, &size),
+              TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_MAX_SEGMENTS, &buf, &size), TDB_SUCCESS);
+    sstable_footer_t out;
+    ASSERT_EQ(sstable_footer_parse(buf, size - 1, &out), TDB_ERR_CORRUPTION);
+    ASSERT_EQ(sstable_footer_parse(buf, size, &out), TDB_SUCCESS);
+    ASSERT_EQ(out.vlog_ref_count, in.vlog_ref_count);
+    for (uint32_t i = 0; i < out.vlog_ref_count; i++)
+    {
+        ASSERT_EQ(out.vlog_refs[i].segment, in.vlog_refs[i].segment);
+        ASSERT_EQ(out.vlog_refs[i].bytes, in.vlog_refs[i].bytes);
+        ASSERT_EQ(out.vlog_refs[i].count, in.vlog_refs[i].count);
+    }
+    sstable_footer_free(&out);
+    free(buf);
+
+    /* obtain the count field's location from an empty trailer so the fixture follows the encoder */
+    in.vlog_ref_count = 0;
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_MAX_SEGMENTS, &buf, &size), TDB_SUCCESS);
+    const size_t ref_bytes = 3 * sizeof(uint64_t);
+    const uint32_t overflow = VLOG_MAX_SEGMENTS + 1;
+    const size_t oversized = size + overflow * ref_bytes;
+    uint8_t *too_many = realloc(buf, oversized);
+    ASSERT_TRUE(too_many != NULL);
+    tdb_encode_be32(overflow, too_many + size - sizeof(uint32_t));
+    ASSERT_EQ(sstable_footer_parse(too_many, oversized, &out), TDB_ERR_CORRUPTION);
+    in.vlog_ref_count = overflow;
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_MAX_SEGMENTS, &buf, &size), TDB_ERR_INVALID_ARGS);
+    free(too_many);
+    sstable_footer_free(&in);
 }
 
 /* a bad magic, a wrong version, and a truncated buffer are each rejected as corruption */
@@ -191,7 +240,8 @@ void test_footer_rejects_bad_input(void)
 
     uint8_t *buf = NULL;
     size_t buf_size = 0;
-    ASSERT_EQ(sstable_footer_serialize(&in, &buf, &buf_size), TDB_SUCCESS);
+    ASSERT_EQ(sstable_footer_serialize(&in, VLOG_DEFAULT_MAX_SEGMENTS, &buf, &buf_size),
+              TDB_SUCCESS);
 
     sstable_footer_t out = {0};
     ASSERT_EQ(sstable_footer_parse(buf, buf_size - 1, &out),
@@ -1684,6 +1734,7 @@ int main(int argc, char **argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_footer_roundtrip, tests_passed);
     RUN_TEST(test_footer_roundtrip_empty, tests_passed);
+    RUN_TEST(test_footer_extended_vlog_refs, tests_passed);
     RUN_TEST(test_footer_rejects_bad_input, tests_passed);
     RUN_TEST(test_klog_filename, tests_passed);
     RUN_TEST(test_open_from_manifest, tests_passed);

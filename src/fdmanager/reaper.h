@@ -29,7 +29,8 @@
  * sstables are evicted before warmer ones. a candidate a reader currently holds is left open and
  * skipped; the next run retries it. an unlimited fd manager (no soft cap) reclaims nothing.
  * @param fdm the descriptor-budget service
- * @param candidates the sstables to consider, ordered oldest-access-first, NULL entries skipped;
+ * @param candidates the sstables to consider, ordered oldest-access-first, NULL when n_candidates
+ *                   is zero, and NULL entries otherwise skipped;
  *                   the caller holds a reference on each for the length of the call, which is
  *                   counted into the resting count the evicting window is claimed at
  * @param n_candidates the number of candidates

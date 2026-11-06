@@ -72,7 +72,8 @@
 
 /* the segment table is sized once at open and never grows, so a segment's slot address is stable
  * for the life of the store and a reader can hold one without a lock */
-#define VLOG_MAX_SEGMENTS 4096
+#define VLOG_DEFAULT_MAX_SEGMENTS 4096
+#define VLOG_MAX_SEGMENTS         65536
 
 /* an append rolls to a fresh segment once the active one reaches this, unless the config overrides
  * it. large enough that rolling is rare and descriptor pressure stays low, small enough that
@@ -101,6 +102,7 @@ typedef struct vlog vlog_t;
  * what a vlog is opened with, sourced from the owning database config
  * @param sync_mode block manager sync mode every segment file is opened with
  * @param segment_target_bytes size at which the active segment seals and a fresh one opens
+ * @param max_segments simultaneous segment slots including the active one, 0 for the default
  * @param enable_vlog_indexes whether segments publish a rebuildable index at checkpoints and seal
  * @param encodings the db-global registry a stored value's recorded ids resolve against. the
  *        registry is db-global even though a pipeline is per-family, so the store can decode any
@@ -114,6 +116,7 @@ typedef struct
     int sync_mode;
     uint64_t segment_target_bytes;
     int enable_vlog_indexes;
+    uint32_t max_segments;
     const tidesdb_encoding_registry_t *encodings;
     fd_manager_t *fdm;
 } vlog_config_t;
@@ -212,9 +215,17 @@ typedef struct
  * @param config codec, durability and segment sizing
  * @param out receives the handle on success
  * @return VLOG_OK, VLOG_ERR_INVALID on bad args, VLOG_ERR_MEMORY, VLOG_ERR_IO, or VLOG_ERR_FULL
- *         when the directory holds more segments than the table can address
+ *         when the retained nonempty files leave no slot for the fresh active segment
  */
 int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out);
+
+/**
+ * vlog_max_segments
+ * the fixed capacity selected when the store was opened
+ * @param vlog open store, or NULL for the default
+ * @return the maximum simultaneous segment count, including the active segment
+ */
+uint32_t vlog_max_segments(const vlog_t *vlog);
 
 /**
  * vlog_close

@@ -363,18 +363,24 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *max_id)
  */
 static int vlog_adopt_segments(vlog_t *v)
 {
-    uint64_t *numbers = calloc(VLOG_MAX_SEGMENTS, sizeof(*numbers));
+    uint64_t *numbers = calloc(v->max_segments, sizeof(*numbers));
     if (!numbers) return VLOG_ERR_MEMORY;
 
     size_t count = 0;
-    int rc = vlog_segment_scan_dir(v, numbers, VLOG_MAX_SEGMENTS, &count);
+    /* reopening always installs a new active file after the recovered ones */
+    int rc = vlog_segment_scan_dir(v, numbers, v->max_segments - 1, &count);
     uint64_t max_id = 0;
+    const int budget = v->fdm ? fd_manager_open_budget(v->fdm) : 0;
 
     for (size_t i = 0; rc == VLOG_OK && i < count; i++)
     {
         uint32_t slot = 0;
         rc = vlog_segment_open(v, numbers[i], &slot);
-        if (rc == VLOG_OK) rc = vlog_recover_segment(v, slot, &max_id);
+        if (rc != VLOG_OK) break;
+        rc = vlog_recover_segment(v, slot, &max_id);
+        /* no reaper runs during adoption. keep one place in the budget for the fresh active file */
+        if (v->fdm && fd_manager_open_total(v->fdm) >= budget)
+            (void)vlog_segment_evict(v, slot); /* later reads reopen this sealed segment */
     }
     free(numbers);
 
@@ -387,9 +393,14 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
     if (!dir || !config || !out) return VLOG_ERR_INVALID;
     if (strlen(dir) >= VLOG_PATH_MAX) return VLOG_ERR_INVALID;
 
-    vlog_t *v = calloc(1, sizeof(*v));
+    const uint32_t capacity =
+        config->max_segments ? config->max_segments : VLOG_DEFAULT_MAX_SEGMENTS;
+    if (capacity > VLOG_MAX_SEGMENTS) return VLOG_ERR_INVALID;
+
+    vlog_t *v = calloc(1, sizeof(*v) + capacity * sizeof(*v->segments));
     if (!v) return VLOG_ERR_MEMORY;
 
+    v->max_segments = capacity;
     memcpy(v->dir, dir, strlen(dir) + 1);
     v->enable_vlog_indexes = config->enable_vlog_indexes;
     v->checkpoint_at = BLOCK_MANAGER_HEADER_SIZE + VLOG_CHECKPOINT_INTERVAL_BYTES;
@@ -403,7 +414,7 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
                                                                : VLOG_DEFAULT_SEGMENT_TARGET_BYTES;
     atomic_init(&v->next_id, 1);
     atomic_init(&v->next_number, 0);
-    atomic_init(&v->active_slot, 0);
+    atomic_init(&v->active_slot, capacity); /* every adopted file is eligible for eviction */
     atomic_init(&v->seg_high, 0);
     if (v->enable_vlog_indexes && pthread_rwlock_init(&v->seal_rw, NULL) != 0)
     {
@@ -442,11 +453,16 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
     return VLOG_OK;
 }
 
+uint32_t vlog_max_segments(const vlog_t *v)
+{
+    return v ? v->max_segments : VLOG_DEFAULT_MAX_SEGMENTS;
+}
+
 void vlog_close(vlog_t *v)
 {
     if (!v) return;
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (atomic_load_explicit(&v->segments[i].state, memory_order_acquire) != VLOG_SEG_OPEN)
             continue;
@@ -680,11 +696,10 @@ int vlog_sync(vlog_t *v)
     if (!v) return VLOG_ERR_INVALID;
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
     int rc = VLOG_OK;
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
-        block_manager_t *bm = vlog_segment_ensure_open(v, i);
-        if (!bm || block_manager_escalate_fsync(bm) != 0) rc = VLOG_ERR_IO;
+        if (vlog_segment_inspect(v, i, NULL) != VLOG_OK) rc = VLOG_ERR_IO;
         vlog_segment_release(v, i);
     }
     return rc;
@@ -696,7 +711,7 @@ int vlog_list_segments(vlog_t *v, vlog_segment_info_t *out, size_t max, size_t *
 
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
     size_t count = 0;
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
         if (count >= max)
@@ -705,12 +720,11 @@ int vlog_list_segments(vlog_t *v, vlog_segment_info_t *out, size_t max, size_t *
             return VLOG_ERR_FULL;
         }
         uint64_t size = 0;
-        block_manager_t *bm = vlog_segment_ensure_open(v, i);
-        const int sized = bm ? block_manager_get_size(bm, &size) : -1;
+        const int sized = vlog_segment_inspect(v, i, &size);
         const int named =
             vlog_segment_name(v->segments[i].number, out[count].name, sizeof(out[count].name));
         vlog_segment_release(v, i);
-        if (sized != 0 || named != VLOG_OK) return VLOG_ERR_IO;
+        if (sized != VLOG_OK || named != VLOG_OK) return VLOG_ERR_IO;
         out[count].logical_size = size;
         count++;
     }
@@ -753,12 +767,11 @@ int vlog_get_stats(vlog_t *v, vlog_stats_t *out)
 
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
     uint64_t total = 0, segments = 0, live = 0, drainable = 0;
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
         uint64_t size = 0;
-        block_manager_t *bm = vlog_segment_ensure_open(v, i);
-        if (bm && block_manager_get_size(bm, &size) == 0) total += size;
+        if (vlog_segment_inspect(v, i, &size) == VLOG_OK) total += size;
         if (atomic_load_explicit(&v->segments[i].draining, memory_order_relaxed)) drainable++;
         live += atomic_load_explicit(&v->segments[i].live_bytes, memory_order_relaxed);
         segments++;
@@ -798,7 +811,7 @@ uint64_t vlog_next_id(vlog_t *v)
 static uint32_t vlog_slot_of_number(vlog_t *v, uint64_t number)
 {
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         if (atomic_load_explicit(&v->segments[i].state, memory_order_acquire) != VLOG_SEG_OPEN)
             continue;
@@ -820,7 +833,7 @@ void vlog_live_reset(vlog_t *v)
 {
     if (!v) return;
     const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
-    for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
+    for (uint32_t i = 0; i < high; i++)
     {
         atomic_store_explicit(&v->segments[i].live_bytes, 0, memory_order_relaxed);
         atomic_store_explicit(&v->segments[i].live_count, 0, memory_order_relaxed);

@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "base/encoding/serialization.h" /* TDB_WAL_EXT */
+#include "base/encoding/serialization.h" /* TDB_SSTABLE_KLOG_NAME_MAX */
 #include "base/errors.h"
 #include "base/log.h"
 #include "column_family/level/level_set.h"
@@ -44,14 +44,6 @@ static int engine_join(char *dst, size_t cap, const char *dir, const char *leaf)
     const int n = snprintf(dst, cap, "%s%s%s", dir, PATH_SEPARATOR, leaf);
     if (n < 0 || (size_t)n >= cap) return -1;
     return 0;
-}
-
-/* whether a top-level file is a write-ahead log; the backup skips wals since the flush already
- * drained every committed write into the copied sstables, and a live wal would copy torn */
-static int engine_is_wal_name(const char *name)
-{
-    const size_t nlen = strlen(name), elen = strlen(TDB_WAL_EXT);
-    return nlen >= elen && strcmp(name + nlen - elen, TDB_WAL_EXT) == 0;
 }
 
 /* compare opened files before truncating, so path aliases cannot destroy the source */
@@ -134,6 +126,7 @@ int engine_copy_file(const char *src, const char *dst, uint64_t limit, const int
                 break;
             }
             remaining -= got;
+            if (got < want) break; /* EOF or a read error, checked below against the extent */
         }
         if (rc == TDB_SUCCESS && (ferror(in) || (limit != UINT64_MAX && remaining > 0)))
             rc = TDB_ERR_IO;
@@ -159,19 +152,6 @@ static const char *engine_basename(const char *path)
     return sep ? sep + 1 : path;
 }
 
-/* the logical length to copy a value-log segment to, or zero when the name is not a segment the
- * store currently holds. a segment's preallocated tail is not part of its contents, so copying the
- * whole file would produce a backup that differs from the source */
-static uint64_t engine_backup_segment_size(const vlog_segment_info_t *segs, size_t n,
-                                           const char *name)
-{
-    for (size_t i = 0; i < n; i++)
-    {
-        if (strcmp(segs[i].name, name) == 0) return segs[i].logical_size;
-    }
-    return 0;
-}
-
 /* copy the manifest into dir. the length is measured and applied inside one hold, because a commit
  * that pushes the log past its rollover bound renames a fresh snapshot over this path -- a length
  * measured before the copy would then be applied to a file that is not the one it described.
@@ -192,55 +172,27 @@ static int engine_backup_copy_manifest(tidesdb_t *db, const char *dir)
     return rc;
 }
 
-/* copy the db's top-level files into dir: each value-log segment to its logical size, every wal
- * skipped, the manifest already taken, every cf subdirectory left for the manifest-driven klog
- * pass */
-static int engine_backup_copy_toplevel(tidesdb_t *db, const char *dir)
+/* reclaim is excluded across the copy, so every name in this inventory stays reachable.
+ * copy each segment once to its logical extent, even when its file has a preallocated tail. */
+static int engine_backup_copy_vlog(tidesdb_t *db, const char *dir)
 {
-    vlog_segment_info_t *segs = calloc(VLOG_MAX_SEGMENTS, sizeof(*segs));
+    if (!db->vlog) return TDB_SUCCESS;
+    const uint32_t capacity = vlog_max_segments(db->vlog);
+    vlog_segment_info_t *segs = calloc(capacity, sizeof(*segs));
     if (!segs) return TDB_ERR_MEMORY;
-    size_t n_segs = 0;
-    if (db->vlog && vlog_list_segments(db->vlog, segs, VLOG_MAX_SEGMENTS, &n_segs) != VLOG_OK)
+
+    size_t count = 0;
+    int rc =
+        vlog_list_segments(db->vlog, segs, capacity, &count) == VLOG_OK ? TDB_SUCCESS : TDB_ERR_IO;
+    for (size_t i = 0; rc == TDB_SUCCESS && i < count; i++)
     {
-        free(segs);
-        return TDB_ERR_IO;
-    }
-    const char *manifest_name = engine_basename(db->manifest->path);
-
-    DIR *d = opendir(db->db_path);
-    if (!d) return TDB_ERR_IO;
-
-    int rc = TDB_SUCCESS;
-    struct dirent *ent;
-    while (rc == TDB_SUCCESS && (ent = readdir(d)) != NULL)
-    {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-        if (engine_is_wal_name(ent->d_name)) continue;
-
         char src[ENGINE_BACKUP_PATH_MAX], dst[ENGINE_BACKUP_PATH_MAX];
-        if (engine_join(src, sizeof(src), db->db_path, ent->d_name) != 0 ||
-            engine_join(dst, sizeof(dst), dir, ent->d_name) != 0)
-        {
+        if (engine_join(src, sizeof(src), db->db_path, segs[i].name) != 0 ||
+            engine_join(dst, sizeof(dst), dir, segs[i].name) != 0)
             rc = TDB_ERR_IO;
-            break;
-        }
-
-        struct stat st;
-        if (stat(src, &st) != 0)
-        {
-            rc = TDB_ERR_IO;
-            break;
-        }
-        if (S_ISDIR(st.st_mode)) continue; /* a cf subdirectory, copied by the klog pass */
-
-        if (strcmp(ent->d_name, manifest_name) == 0) continue; /* already taken, under its hold */
-
-        /* a segment retired between the listing and this pass is already fully reclaimed, so
-         * skipping it copies a store that is consistent rather than one missing live values */
-        const uint64_t size = engine_backup_segment_size(segs, n_segs, ent->d_name);
-        if (size > 0) rc = engine_copy_file(src, dst, size, 1);
+        else
+            rc = engine_copy_file(src, dst, segs[i].logical_size, 1);
     }
-    closedir(d);
     free(segs);
     return rc;
 }
@@ -323,7 +275,7 @@ static int engine_backup_sync(tidesdb_t *db, cf_t *const *cfs, int n)
 static int engine_backup_copy(tidesdb_t *db, const char *dir, cf_t *const *cfs, int n)
 {
     int rc = engine_backup_copy_manifest(db, dir);
-    if (rc == TDB_SUCCESS) rc = engine_backup_copy_toplevel(db, dir);
+    if (rc == TDB_SUCCESS) rc = engine_backup_copy_vlog(db, dir);
     for (int i = 0; i < n && rc == TDB_SUCCESS; i++) rc = engine_backup_copy_cf(db, cfs[i], dir);
     return rc;
 }

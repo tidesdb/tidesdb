@@ -17,10 +17,15 @@
 #include "../src/engine/engine_internal.h" /* ENGINE_FIRST_WAL_GENERATION */
 #include "../src/engine/engine_types.h"
 #include "../src/manifest/manifest.h" /* the inner txn a prefix delete is buffered on */
+#include "../src/sstable/vlog_internal.h" /* direct sealed-slot eviction in the fd-bound fixture */
 #include "../src/txn/mvcc.h"          /* TDB_MVCC_COMMIT_RING_SIZE, the eviction window */
 #include "../src/txn/txn.h"           /* tdb_txn_delete_prefix, not yet a public call */
 #include "db.h"
 #include "test_utils.h"
+
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 /* the E1 engine skeleton: open assembles the db-level singletons, the mvcc clock, an empty cf
  * registry, and the worker registry; close tears them down in order. these tests drive the public
@@ -2296,6 +2301,17 @@ void test_engine_compact_range(void)
 }
 
 #define ENGINE_TEST_BACKUP_DIR "." PATH_SEPARATOR "test_engine_backup"
+/* one tiny value per segment keeps the extended backup/reopen fixture focused on inventory and
+ * descriptor accounting rather than payload size. reopening needs a successor beyond retention. */
+#define ENGINE_TEST_EXTENDED_RETAINED_SEGMENTS (VLOG_DEFAULT_MAX_SEGMENTS + 1u)
+#define ENGINE_TEST_EXTENDED_SLOT_CAPACITY     (ENGINE_TEST_EXTENDED_RETAINED_SEGMENTS + 1u)
+#define ENGINE_TEST_EXTENDED_FD_LIMIT          64
+#define ENGINE_TEST_EXTENDED_RLIMIT            128
+#define ENGINE_TEST_EXTENDED_VALUE             "v"
+#define ENGINE_TEST_EXTENDED_READ_FDS          2
+#define ENGINE_TEST_REAPER_SEGMENTS            160
+#define ENGINE_TEST_REAPER_RLIMIT              32
+#define ENGINE_TEST_REAPER_VALUE               "r"
 
 /* a checkpoint flushes the memtable to L1 and returns cleanly, and every key survives a reopen */
 void test_engine_checkpoint(void)
@@ -2381,6 +2397,130 @@ void test_engine_backup_existing_empty_directory(void)
 {
     engine_test_backup(1);
 }
+
+#ifndef _WIN32
+/* before its first flush a database has no sstable candidate, but repeated public separated-value
+ * writes still create sealed segments. an emfile wake must evict those segments and let both the
+ * remaining writes and their L0 reads complete without a test-side eviction. */
+void test_engine_reaper_evicts_vlog_before_the_first_sstable(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    struct rlimit saved_limit;
+    ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &saved_limit), 0);
+    struct rlimit limited = saved_limit;
+    if (limited.rlim_cur > ENGINE_TEST_REAPER_RLIMIT) limited.rlim_cur = ENGINE_TEST_REAPER_RLIMIT;
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limited), 0);
+
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    cfg.value_separation_threshold = 1;
+    cfg.vlog_segment_size = BLOCK_MANAGER_HEADER_SIZE + 1;
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    for (uint32_t i = 0; i < ENGINE_TEST_REAPER_SEGMENTS; i++)
+    {
+        char key[32];
+        ASSERT_TRUE(snprintf(key, sizeof(key), "reaper-%05u", i) > 0);
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key),
+                                  (const uint8_t *)ENGINE_TEST_REAPER_VALUE,
+                                  sizeof(ENGINE_TEST_REAPER_VALUE) - 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), TDB_SUCCESS);
+    ASSERT_EQ(stats.vlog_segment_count, ENGINE_TEST_REAPER_SEGMENTS);
+    engine_assert_committed(db, cf, "reaper-00000", ENGINE_TEST_REAPER_VALUE);
+    engine_assert_committed(db, cf, "reaper-00159", ENGINE_TEST_REAPER_VALUE);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &saved_limit), 0);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* the backup must inventory every retained value-log file without warming all of them, then its
+ * directly-openable copy must recover with room for a fresh append segment under a real fd limit.
+ */
+void test_engine_backup_extended_vlog_respects_fd_budget(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+
+    struct rlimit saved_limit;
+    ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &saved_limit), 0);
+    struct rlimit limited = saved_limit;
+    if (limited.rlim_cur > ENGINE_TEST_EXTENDED_RLIMIT)
+        limited.rlim_cur = ENGINE_TEST_EXTENDED_RLIMIT;
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limited), 0);
+
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    cfg.max_open_sstables = ENGINE_TEST_EXTENDED_FD_LIMIT;
+    cfg.value_separation_threshold = 1;
+    cfg.vlog_segment_size = BLOCK_MANAGER_HEADER_SIZE + 1;
+    const tidesdb_open_options_t options = {
+        .size = sizeof(options), .max_vlog_segments = ENGINE_TEST_EXTENDED_SLOT_CAPACITY};
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+
+    for (uint32_t i = 0; i < ENGINE_TEST_EXTENDED_RETAINED_SEGMENTS; i++)
+    {
+        char key[32];
+        ASSERT_TRUE(snprintf(key, sizeof(key), "extended-%05u", i) > 0);
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)key, strlen(key),
+                                  (const uint8_t *)ENGINE_TEST_EXTENDED_VALUE,
+                                  sizeof(ENGINE_TEST_EXTENDED_VALUE) - 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+        /* every append after the first rolled to its matching slot, so release just the sealed
+         * predecessor instead of repeatedly scanning the growing fixture. */
+        if (i > 0) ASSERT_EQ(vlog_segment_evict(db->vlog, i - 1), 1);
+    }
+    ASSERT_EQ(vlog_max_segments(db->vlog), ENGINE_TEST_EXTENDED_SLOT_CAPACITY);
+    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT), 1);
+
+    ASSERT_EQ(tidesdb_backup(db, ENGINE_TEST_BACKUP_DIR), TDB_SUCCESS);
+    ASSERT_EQ(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT), 1);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    char backup_path[] = ENGINE_TEST_BACKUP_DIR;
+    cfg = engine_test_config(backup_path);
+    cfg.max_open_sstables = ENGINE_TEST_EXTENDED_FD_LIMIT;
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &options, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    tidesdb_db_stats_t stats;
+    ASSERT_EQ(tidesdb_get_db_stats(db, &stats), TDB_SUCCESS);
+    ASSERT_EQ(stats.vlog_segment_count, ENGINE_TEST_EXTENDED_SLOT_CAPACITY);
+    ASSERT_TRUE(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT) <=
+                fd_manager_open_budget(&db->fdm));
+    engine_assert_committed(db, cf, "extended-00000", ENGINE_TEST_EXTENDED_VALUE);
+    engine_assert_committed(db, cf, "extended-04096", ENGINE_TEST_EXTENDED_VALUE);
+    ASSERT_TRUE(fd_manager_open_count(&db->fdm, FD_LABEL_VLOG_SEGMENT) <=
+                fd_manager_open_budget(&db->fdm) + ENGINE_TEST_EXTENDED_READ_FDS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &saved_limit), 0);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+}
+#endif
 
 /* rejecting a backup into the live directory preserves the source across a reopen */
 void test_engine_backup_rejects_source_directory(void)
@@ -5045,6 +5185,7 @@ void test_engine_open_options_enable_vlog_indexes_for_ordinary_kv(void)
     /* an options payload ending at its size tag is a supported older caller and must leave the
      * newer field disabled. the shared fixture seals an ordinary KV value-log segment. */
     ASSERT_EQ(tidesdb_open_with_options(&cfg, &short_options, &db), TDB_SUCCESS);
+    ASSERT_EQ(vlog_max_segments(db->vlog), VLOG_DEFAULT_MAX_SEGMENTS);
     tidesdb_column_family_config_t cc = tidesdb_default_column_family_config();
     ASSERT_EQ(tidesdb_create_column_family(db, "kv", &cc), TDB_SUCCESS);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "kv");
@@ -5081,6 +5222,30 @@ void test_engine_open_options_enable_vlog_indexes_for_ordinary_kv(void)
     ASSERT_EQ(tidesdb_txn_commit(read), TDB_SUCCESS);
     tidesdb_txn_free(read);
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+}
+
+/* a newer options tail is ignored for an older size-tagged caller, while a supplied value past the
+ * public maximum is refused before opening or modifying the database. */
+void test_engine_open_options_vlog_capacity_preserves_prefix_abi_and_rejects_overflow(void)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+    const tidesdb_open_options_t prefix = {
+        .size = offsetof(tidesdb_open_options_t, max_vlog_segments),
+        .max_vlog_segments = UINT64_MAX,
+    };
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &prefix, &db), TDB_SUCCESS);
+    ASSERT_EQ(vlog_max_segments(db->vlog), VLOG_DEFAULT_MAX_SEGMENTS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    const tidesdb_open_options_t overflow = {.size = sizeof(overflow),
+                                             .max_vlog_segments = UINT64_MAX};
+    db = NULL;
+    ASSERT_EQ(tidesdb_open_with_options(&cfg, &overflow, &db), TDB_ERR_INVALID_ARGS);
+    ASSERT_TRUE(db == NULL);
     (void)remove_directory(ENGINE_TEST_DB_DIR);
 }
 
@@ -7862,6 +8027,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_checkpoint, tests_passed);
     RUN_TEST(test_engine_backup, tests_passed);
     RUN_TEST(test_engine_backup_existing_empty_directory, tests_passed);
+#ifndef _WIN32
+    RUN_TEST(test_engine_reaper_evicts_vlog_before_the_first_sstable, tests_passed);
+    RUN_TEST(test_engine_backup_extended_vlog_respects_fd_budget, tests_passed);
+#endif
     RUN_TEST(test_engine_backup_rejects_nonempty_directory, tests_passed);
     RUN_TEST(test_engine_backup_rejects_source_directory, tests_passed);
     RUN_TEST(test_engine_list_column_families, tests_passed);
@@ -7901,6 +8070,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_clone_column_family, tests_passed);
     RUN_TEST(test_engine_vlog_segment_size_is_honoured, tests_passed);
     RUN_TEST(test_engine_open_options_enable_vlog_indexes_for_ordinary_kv, tests_passed);
+    RUN_TEST(test_engine_open_options_vlog_capacity_preserves_prefix_abi_and_rejects_overflow,
+             tests_passed);
     RUN_TEST(test_engine_value_separation_is_db_level_with_a_family_opt_out, tests_passed);
     RUN_TEST(test_engine_memtable_reference_resolves_on_every_path, tests_passed);
     RUN_TEST(test_engine_separated_value_survives_reopen_and_reclaim, tests_passed);

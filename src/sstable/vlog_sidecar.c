@@ -30,6 +30,21 @@ static const uint8_t vlog_sidecar_delta_magic[8] = {'T', 'D', 'B', 'V', 'I', 'X'
 
 #define VLOG_SIDECAR_DELTA_HEADER_SIZE 24u
 
+/* the legacy Windows CRT lacks the C11 exclusive stream mode. preserve exclusive creation
+ * before handing the descriptor to the same buffered writer used on other platforms. */
+static FILE* vlog_sidecar_open_exclusive(const char* path)
+{
+#ifdef _WIN32
+    const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0666);
+    if (fd < 0) return NULL;
+    FILE* file = _fdopen(fd, "wb");
+    if (!file) (void)close(fd); /* only the stream takes ownership on success */
+    return file;
+#else
+    return fopen(path, "wbx");
+#endif
+}
+
 /* form dir/basename without ever accepting a filename from disk */
 static int vlog_sidecar_path(const char* dir, uint64_t number, int temporary, char* out,
                              size_t out_size)
@@ -294,7 +309,7 @@ static int vlog_sidecar_publish(vlog_t* v, uint32_t slot, vlog_pending_t* writer
     if (!file)
     {
         if (remove(tmp) != 0 && errno != ENOENT) return VLOG_ERR_IO;
-        file = fopen(tmp, "wbx");
+        file = vlog_sidecar_open_exclusive(tmp);
         if (!file) return VLOG_ERR_IO;
     }
     const size_t count = writer->count - first;
@@ -531,7 +546,7 @@ static int vlog_rebind_index(FILE* index, int source_fd, int copy_fd,
         {
             /* only the directory rename publishes these files. a failed rebind discards the stage.
              */
-            FILE* out = fopen(path, "wbx");
+            FILE* out = vlog_sidecar_open_exclusive(path);
             if (!out)
                 rc = VLOG_ERR_IO;
             else

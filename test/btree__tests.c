@@ -944,9 +944,34 @@ void test_btree_max_size_keys_flush_and_keep_versions_together()
         int64_t ttl = 0;
         uint8_t deleted = 0;
         key[0] = i;
-        ASSERT_EQ(
-            btree_get(tree, key, key_size, &value, &value_size, &vlog_offset, &seq, &ttl, &deleted),
-            0);
+        const int rc =
+            btree_get(tree, key, key_size, &value, &value_size, &vlog_offset, &seq, &ttl, &deleted);
+        if (rc != 0)
+        {
+            /* distinguish a missing key from an unreadable frame or an incorrectly routed leaf */
+            uint32_t size = 0;
+            int frame = 0;
+            (void)block_manager_borrow_block_data_at_offset_checked(bm, tree->root_offset, 0, &size,
+                                                                    &frame);
+            fprintf(stderr, "max key %u: get=%d root=%" PRId64 " frame=%d bytes=%u\n", i, rc,
+                    tree->root_offset, frame, size);
+            btree_node_t *root = NULL;
+            cache_entry_t *pin = NULL;
+            if (btree_node_read_cached(tree, tree->root_offset, &root, &pin) == 0)
+            {
+                if (root->type == BTREE_NODE_INTERNAL)
+                    for (uint32_t j = 0; j <= root->num_entries; j++)
+                    {
+                        const int64_t offset = root->child_offsets[j];
+                        const uint8_t *raw = block_manager_borrow_block_data_at_offset_checked(
+                            bm, offset, 0, &size, &frame);
+                        fprintf(stderr, "child %u offset=%" PRId64 " frame=%d bytes=%u type=%d\n",
+                                j, offset, frame, size, raw && size ? (int)raw[0] : -1);
+                    }
+                btree_node_done(root, pin);
+            }
+        }
+        ASSERT_EQ(rc, 0);
         ASSERT_EQ(value_size, 1);
         ASSERT_EQ(value[0], i == 0 ? newest_value : (uint8_t)(10 + i));
         ASSERT_EQ(seq, i == 0 ? 2 : (uint64_t)(3 + i));

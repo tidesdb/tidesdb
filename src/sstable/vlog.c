@@ -530,8 +530,7 @@ void vlog_close(vlog_t *v)
     while (group)
     {
         vlog_group_t *next = group->next;
-        free(group->writer.entries);
-        free(group);
+        vlog_group_unref(group);
         group = next;
     }
     pthread_mutex_destroy(&v->roll_mu);

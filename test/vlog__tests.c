@@ -2878,6 +2878,32 @@ static void *grouped_writer(void *arg)
     return NULL;
 }
 
+#ifdef TDB_FAULT_INJECTION
+void test_group_append_allows_an_independent_route_and_reaper(void)
+{
+    fresh_dir();
+    vlog_config_t config = {.enable_vlog_indexes = 1, .max_blob_shard_groups = 2};
+    ASSERT_EQ(vlog_open(VDIR, &config, &g_uniq_v), VLOG_OK);
+    atomic_store(&vlog_append_hook_entered, 0);
+    atomic_store(&vlog_append_hook_release, 0);
+    g_uniq_v->after_append = vlog_index_append_pause;
+
+    pthread_t first;
+    ASSERT_EQ(pthread_create(&first, NULL, grouped_writer, NULL), 0);
+    await_index_test_event(&vlog_append_hook_entered);
+    ASSERT_EQ(vlog_seal_idle_groups(g_uniq_v, 0, NULL), 0);
+    const uint8_t value = 42;
+    vlog_id_t id = 0;
+    ASSERT_EQ(vlog_write_group(g_uniq_v, 1, &value, 1, &id, NULL), VLOG_OK);
+    /* the reaper may now seal group one while the first writer still owns group zero */
+    ASSERT_EQ(vlog_seal_idle_groups(g_uniq_v, 0, NULL), 1);
+    atomic_store(&vlog_append_hook_release, 1);
+    ASSERT_EQ(pthread_join(first, NULL), 0);
+    assert_reads(g_uniq_v, id, &value, 1);
+    vlog_close(g_uniq_v);
+}
+#endif
+
 void test_concurrent_groups_roll_and_recover_separately(void)
 {
     fresh_dir();
@@ -3211,6 +3237,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_invalid_args, tests_passed);
     RUN_TEST(test_many_values_stress, tests_passed);
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);
+#ifdef TDB_FAULT_INJECTION
+    RUN_TEST(test_group_append_allows_an_independent_route_and_reaper, tests_passed);
+#endif
     RUN_TEST(test_concurrent_groups_roll_and_recover_separately, tests_passed);
     RUN_TEST(test_group_pressure_seals_idle_files_within_the_fd_budget, tests_passed);
     RUN_TEST(test_group_slot_pressure_preserves_live_writers_and_reuses_retired_space,

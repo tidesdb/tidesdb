@@ -130,11 +130,14 @@ typedef struct
     uint64_t checkpoint_at;
 } vlog_pending_t;
 
-/* only active groups have nodes. roll_mu covers the list, append admission and publication. */
+/* roll_mu protects the route list. the list and admitted appenders each hold a reference;
+ * only writers to this group share its append lock, including index checkpoints and rollover. */
 typedef struct vlog_group
 {
     uint32_t id;
     uint32_t slot;
+    tdb_refcount_t refs;
+    pthread_mutex_t append_mu;
     vlog_pending_t writer;
     struct vlog_group* next;
 } vlog_group_t;
@@ -410,7 +413,10 @@ int vlog_segment_roll(vlog_t* v, uint32_t full_slot);
 int vlog_segment_append(vlog_t* v, const struct iovec* spans, int count,
                         vlog_sidecar_entry_t* entry);
 
-/* same physical append and publication owners as the ordinary writer; roll_mu admits groups */
+/* release one route reference, destroying the detached writer after its final caller leaves */
+void vlog_group_unref(vlog_group_t* group);
+
+/* same physical append and publication owners as the ordinary writer */
 int vlog_segment_append_group(vlog_t* v, uint32_t group, const struct iovec* spans, int count,
                               vlog_sidecar_entry_t* entry);
 int vlog_group_slot_active(vlog_t* v, uint32_t slot);

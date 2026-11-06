@@ -298,7 +298,7 @@ int vlog_segment_create_group(vlog_t* v, uint64_t number, uint32_t group, uint32
         (void)remove(temporary); /* an incomplete temporary is ignored and retried */
         return rc;
     }
-    if (atomic_rename_file(temporary, path) != 0 || tdb_fsync_parent_dir(path) != 0)
+    if (tdb_replace_file(temporary, path) != 0 || tdb_fsync_parent_dir(path) != 0)
     {
         (void)remove(temporary); /* an incomplete temporary is ignored and retried */
         return VLOG_ERR_IO;
@@ -547,39 +547,49 @@ int vlog_segment_append(vlog_t* v, const struct iovec* spans, int count,
     return VLOG_ERR_FULL;
 }
 
-/* detach the requested active route or, for pressure relief, the least recently used route.
- * the list contains at most one node per occupied slot; its size is independent of the ceiling. */
+/* take an exact route, or the oldest route with only the list's reference. scanning past
+ * a busy writer lets the descriptor reaper continue without waiting on its I/O. */
 static vlog_group_t* vlog_take_group(vlog_t* v, uint32_t id)
 {
-    vlog_group_t* prev = NULL;
+    vlog_group_t *match = NULL, *before = NULL, *prev = NULL;
     for (vlog_group_t* group = v->groups; group; group = group->next)
     {
-        if (group->id == id || (id == VLOG_GROUP_UNGROUPED && !group->next))
+        if (group->id == id || (id == VLOG_GROUP_UNGROUPED && atomic_load(&group->refs) == 1))
         {
-            if (prev)
-                prev->next = group->next;
-            else
-                v->groups = group->next;
-            return group;
+            match = group;
+            before = prev;
+            if (group->id == id) break;
         }
         prev = group;
     }
-    return NULL;
+    if (match)
+    {
+        if (before)
+            before->next = match->next;
+        else
+            v->groups = match->next;
+    }
+    return match;
 }
 
-static void vlog_release_group(vlog_group_t* group)
+void vlog_group_unref(vlog_group_t* group)
 {
-    free(group->writer.entries);
-    free(group);
+    if (tdb_unref(&group->refs))
+    {
+        pthread_mutex_destroy(&group->append_mu);
+        free(group->writer.entries);
+        free(group);
+    }
 }
 
+/* negative means every route is in use; zero can also mean a sealed file kept a reader's fd */
 static int vlog_seal_oldest_locked(vlog_t* v)
 {
     vlog_group_t* group = vlog_take_group(v, VLOG_GROUP_UNGROUPED);
-    if (!group) return 0;
+    if (!group) return -1;
     vlog_seal_writer(v, group->slot, &group->writer);
     const int freed = vlog_segment_evict(v, group->slot);
-    vlog_release_group(group);
+    vlog_group_unref(group);
     return freed;
 }
 
@@ -595,6 +605,7 @@ int vlog_seal_idle_groups(vlog_t* v, int max, int* out_freed)
     while (v->groups && (!max || sealed < max))
     {
         const int freed = vlog_seal_oldest_locked(v);
+        if (freed < 0) break;
         if (out_freed) *out_freed += freed;
         ++sealed;
     }
@@ -626,9 +637,13 @@ int vlog_backup_inventory(vlog_t* v, vlog_segment_info_t* out, size_t max, size_
     {
         /* the fd reaper can also seal idle groups during a transaction cut. */
         pthread_mutex_lock(&v->roll_mu);
-        while (v->groups)
-            (void)vlog_seal_oldest_locked(v); /* each iteration removes one active group */
+        while (v->groups && vlog_seal_oldest_locked(v) >= 0)
+        {
+            /* each successful seal removes a route; a caller outside the cut can be busy */
+        }
+        const int busy = v->groups != NULL;
         pthread_mutex_unlock(&v->roll_mu);
+        if (busy) return VLOG_ERR_BUSY;
     }
     const int rc = vlog_list_segments(v, out, max, out_count);
     if (rc != VLOG_OK || *out_count < VLOG_MAX_SEGMENTS) return rc;
@@ -639,14 +654,21 @@ int vlog_backup_inventory(vlog_t* v, vlog_segment_info_t* out, size_t max, size_
     return VLOG_ERR_FULL;
 }
 
-static int vlog_group_append_locked(vlog_t* v, uint32_t id, const struct iovec* spans, int count,
-                                    vlog_sidecar_entry_t* entry)
+/* roll_mu owns new file numbers and list membership. pin the route before releasing it so
+ * a queued writer can safely wait on its own group without holding up unrelated groups. */
+static int vlog_acquire_group_locked(vlog_t* v, uint32_t id, vlog_group_t** out)
 {
     vlog_group_t* group = vlog_take_group(v, id);
     if (!group)
     {
         group = calloc(1, sizeof(*group));
         if (!group) return VLOG_ERR_MEMORY;
+        if (pthread_mutex_init(&group->append_mu, NULL) != 0)
+        {
+            free(group);
+            return VLOG_ERR_IO;
+        }
+        atomic_init(&group->refs, 1);
         if (v->fdm && fd_manager_open_total(v->fdm) >= fd_manager_open_budget(v->fdm))
             (void)vlog_seal_oldest_locked(v); /* make room for this group's first descriptor */
         group->id = id;
@@ -658,29 +680,51 @@ static int vlog_group_append_locked(vlog_t* v, uint32_t id, const struct iovec* 
         {
             if (rc == VLOG_ERR_FULL)
                 (void)vlog_seal_oldest_locked(v); /* GC can now reclaim an idle, dead segment */
-            vlog_release_group(group);
+            vlog_group_unref(group);
             return rc;
         }
     }
-    /* roll_mu admits only one writer to this route. ordinary index insertions still share
-     * index_rw; a seal can never overtake the completed frame's insertion. */
-    int rc = VLOG_ERR_BUSY;
-    if (vlog_segment_acquire(v, group->slot))
-    {
-        rc = vlog_append_to_slot(v, group->slot, &group->writer, spans, count, entry);
-        if (rc == VLOG_OK && v->enable_vlog_indexes &&
-            entry->offset + entry->disk_len >= group->writer.checkpoint_at)
-            vlog_checkpoint_writer(v, group->slot, &group->writer);
-        vlog_segment_release(v, group->slot);
-    }
-    if (rc == VLOG_ERR_FULL)
-    {
-        vlog_seal_writer(v, group->slot, &group->writer);
-        vlog_release_group(group);
-        return VLOG_ERR_BUSY; /* retry immediately on a fresh segment */
-    }
     group->next = v->groups;
     v->groups = group;
+    tdb_ref(&group->refs);
+    *out = group;
+    return VLOG_OK;
+}
+
+static int vlog_group_append(vlog_t* v, uint32_t id, const struct iovec* spans, int count,
+                             vlog_sidecar_entry_t* entry)
+{
+    vlog_group_t* group = NULL;
+    pthread_mutex_lock(&v->roll_mu);
+    const int admitted = vlog_acquire_group_locked(v, id, &group);
+    pthread_mutex_unlock(&v->roll_mu);
+    if (admitted != VLOG_OK) return admitted;
+
+    /* an earlier writer can retire this route before a waiter wins append_mu. the waiter
+     * still owns its route reference, sees the sentinel and retries against the new file. */
+    int rc = VLOG_ERR_BUSY;
+    pthread_mutex_lock(&group->append_mu);
+    const uint32_t slot = group->slot;
+    if (slot != VLOG_MAX_SEGMENTS && vlog_segment_acquire(v, slot))
+    {
+        rc = vlog_append_to_slot(v, slot, &group->writer, spans, count, entry);
+        if (rc == VLOG_OK && v->enable_vlog_indexes &&
+            entry->offset + entry->disk_len >= group->writer.checkpoint_at)
+            vlog_checkpoint_writer(v, slot, &group->writer);
+        if (rc == VLOG_ERR_FULL)
+        {
+            vlog_seal_writer(v, slot, &group->writer);
+            pthread_mutex_lock(&v->roll_mu);
+            (void)vlog_take_group(v, id); /* this route is still the unique owner of id */
+            group->slot = VLOG_MAX_SEGMENTS;
+            pthread_mutex_unlock(&v->roll_mu);
+            vlog_group_unref(group); /* drop the list's reference; waiters retain theirs */
+            rc = VLOG_ERR_BUSY;
+        }
+        vlog_segment_release(v, slot);
+    }
+    pthread_mutex_unlock(&group->append_mu);
+    vlog_group_unref(group);
     return rc;
 }
 
@@ -689,9 +733,7 @@ int vlog_segment_append_group(vlog_t* v, uint32_t id, const struct iovec* spans,
 {
     for (int attempt = 0; attempt < VLOG_APPEND_MAX_ATTEMPTS; ++attempt)
     {
-        pthread_mutex_lock(&v->roll_mu);
-        const int rc = vlog_group_append_locked(v, id, spans, count, entry);
-        pthread_mutex_unlock(&v->roll_mu);
+        const int rc = vlog_group_append(v, id, spans, count, entry);
         if (rc == VLOG_ERR_FULL)
             usleep(VLOG_APPEND_FULL_PAUSE_US);
         else if (rc != VLOG_ERR_BUSY)

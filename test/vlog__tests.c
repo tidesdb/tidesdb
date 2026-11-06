@@ -9,15 +9,28 @@
 
 #include "../src/base/errors.h"
 #include "../src/io/block_manager.h"
+#include "../src/io/block_manager_fault.h"
 #include "../src/sstable/vlog.h"
 #include "../src/sstable/vlog_internal.h" /* the segment table, for the retire guard test */
 #include "test_utils.h"
+
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define VDIR      "." PATH_SEPARATOR "test_vlog_db"
 #define VDIR_MODE 0755
+
+#define VLOG_RECOVERY_CHILD_FLAG  "--vlog-recovery-child"
+#define VLOG_RECOVERY_CHILD_PHASE "open"
+#define VLOG_RECOVERY_CHILD_POLLS 5000
+
+#ifdef TDB_FAULT_INJECTION
+static const char *vlog_test_exe = NULL;
+#endif
 
 /* a target small enough that a handful of values seals a segment, so tests exercise rolling and
  * reclaim without writing the hundreds of megabytes the shipped default would need */
@@ -178,6 +191,54 @@ static size_t segment_count(vlog_t *v)
     ASSERT_TRUE(vlog_get_stats(v, &st) == VLOG_OK);
     return (size_t)st.segment_count;
 }
+
+static void make_header_only_segment(uint64_t number, char *path, size_t path_size)
+{
+    char name[VLOG_SEGMENT_NAME_MAX];
+    ASSERT_TRUE(vlog_segment_name(number, name, sizeof(name)) == VLOG_OK);
+    ASSERT_TRUE(snprintf(path, path_size, "%s%s%s", VDIR, PATH_SEPARATOR, name) > 0);
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+    ASSERT_EQ(block_manager_close(bm), 0);
+}
+
+static uint64_t active_segment_number(vlog_t *v)
+{
+    const uint32_t slot = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    ASSERT_TRUE(slot < VLOG_MAX_SEGMENTS);
+    return v->segments[slot].number;
+}
+
+#ifdef TDB_FAULT_INJECTION
+static _Atomic(int) vlog_recovery_child_done = 0;
+
+static void *vlog_recovery_child_open(void *arg)
+{
+    (void)arg;
+    const vlog_config_t cfg = {.sync_mode = BLOCK_MANAGER_SYNC_NONE};
+    vlog_t *v = NULL;
+    if (vlog_open(VDIR, &cfg, &v) == VLOG_OK) vlog_close(v);
+    atomic_store_explicit(&vlog_recovery_child_done, 1, memory_order_release);
+    return NULL;
+}
+
+/* the worker freezes in the successor header write; exit without closing the store */
+static void vlog_recovery_child(void)
+{
+    atomic_store_explicit(&vlog_recovery_child_done, 0, memory_order_release);
+    block_manager_fault_arm_torn(1);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, vlog_recovery_child_open, NULL) != 0) _exit(2);
+    for (int i = 0; i < VLOG_RECOVERY_CHILD_POLLS; i++)
+    {
+        if (block_manager_fault_tripped()) _exit(0);
+        if (atomic_load_explicit(&vlog_recovery_child_done, memory_order_acquire)) _exit(3);
+        usleep(1000);
+    }
+    _exit(4);
+}
+#endif
 
 /* state that exactly these ids are still referenced, the way installed sstables do, then reclaim.
  * one pass drops every segment nothing holds, so there is nothing to repeat */
@@ -743,6 +804,139 @@ void test_recover_appends_to_a_fresh_segment(void)
     vlog_close(v);
 }
 
+void test_recover_prunes_header_only_segments_before_adoption(void)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    uint8_t *value = pattern(V_MEDIUM, 57);
+    const vlog_id_t saved = put(v, value, V_MEDIUM);
+    vlog_close(v);
+
+    char empty_a[512], empty_b[512];
+    make_header_only_segment(7, empty_a, sizeof(empty_a));
+    make_header_only_segment(17, empty_b, sizeof(empty_b));
+
+    /* the fresh successor must be numbered past both removed files */
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ((int)segment_count(v), 2);
+    ASSERT_EQ(active_segment_number(v), 18);
+    ASSERT_TRUE(access(empty_a, F_OK) != 0);
+    ASSERT_TRUE(access(empty_b, F_OK) != 0);
+    assert_reads(v, saved, value, V_MEDIUM);
+    vlog_close(v);
+
+    /* another idle reopen still leaves only the data segment and its fresh successor */
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ((int)segment_count(v), 2);
+    ASSERT_EQ(active_segment_number(v), 19);
+    assert_reads(v, saved, value, V_MEDIUM);
+    free(value);
+    vlog_close(v);
+}
+
+#ifdef TDB_FAULT_INJECTION
+void test_recover_cleanup_survives_a_torn_fresh_successor(void)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    uint8_t *value = pattern(V_MEDIUM, 59);
+    const vlog_id_t saved = put(v, value, V_MEDIUM);
+    vlog_close(v);
+
+    char empty[512], torn_successor[512];
+    make_header_only_segment(7, empty, sizeof(empty));
+    char name[VLOG_SEGMENT_NAME_MAX];
+    ASSERT_EQ(vlog_segment_name(8, name, sizeof(name)), VLOG_OK);
+    ASSERT_TRUE(
+        snprintf(torn_successor, sizeof(torn_successor), "%s%s%s", VDIR, PATH_SEPARATOR, name) > 0);
+
+    int child_status = -1;
+    ASSERT_EQ(test_spawn_self(vlog_test_exe, VLOG_RECOVERY_CHILD_FLAG, VLOG_RECOVERY_CHILD_PHASE,
+                              "1", &child_status),
+              0);
+    ASSERT_EQ(child_status, 0);
+
+    /* the interrupted open removed the empty file before it tore the successor header */
+    ASSERT_TRUE(access(empty, F_OK) != 0);
+    ASSERT_EQ(access(torn_successor, F_OK), 0);
+    struct STAT_STRUCT torn_stat;
+    ASSERT_EQ(STAT_FUNC(torn_successor, &torn_stat), 0);
+    ASSERT_TRUE(torn_stat.st_size < BLOCK_MANAGER_HEADER_SIZE);
+
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    assert_reads(v, saved, value, V_MEDIUM);
+    ASSERT_TRUE(active_segment_number(v) > 8);
+    free(value);
+    vlog_close(v);
+}
+#endif
+
+void test_recover_preserves_torn_and_corrupt_segment_candidates(void)
+{
+    fresh_dir();
+    char corrupt[512], torn[512];
+    make_header_only_segment(9, corrupt, sizeof(corrupt));
+    make_header_only_segment(10, torn, sizeof(torn));
+
+    /* a bad header of the right size and a valid header with trailing bytes must both survive */
+    FILE *f = fopen(corrupt, "r+b");
+    ASSERT_TRUE(f != NULL);
+    uint8_t good_header = 0;
+    ASSERT_EQ(fread(&good_header, 1, 1, f), 1);
+    const uint8_t bad_header = (uint8_t)(good_header ^ 0xff);
+    ASSERT_EQ(fseek(f, 0, SEEK_SET), 0);
+    ASSERT_EQ(fwrite(&bad_header, 1, 1, f), 1);
+    test_fsync_file(f);
+    ASSERT_EQ(fclose(f), 0);
+
+    f = fopen(torn, "ab");
+    ASSERT_TRUE(f != NULL);
+    const uint8_t torn_tail = 0xa5;
+    ASSERT_EQ(fwrite(&torn_tail, 1, 1, f), 1);
+    test_fsync_file(f);
+    ASSERT_EQ(fclose(f), 0);
+
+    vlog_t *failed = NULL;
+    const vlog_config_t cfg = {.sync_mode = BLOCK_MANAGER_SYNC_NONE};
+    ASSERT_EQ(vlog_open(VDIR, &cfg, &failed), VLOG_ERR_IO);
+    ASSERT_TRUE(failed == NULL);
+    ASSERT_EQ(access(corrupt, F_OK), 0);
+    ASSERT_EQ(access(torn, F_OK), 0);
+
+    /* with the bad header removed, permissive recovery can adopt the torn tail */
+    ASSERT_EQ(remove(corrupt), 0);
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ(access(torn, F_OK), 0);
+    ASSERT_EQ((int)segment_count(v), 2);
+    ASSERT_EQ(active_segment_number(v), 11);
+    vlog_close(v);
+}
+
+#ifndef _WIN32
+void test_recover_prunes_more_than_segment_cap_header_only_files_under_low_fd_limit(void)
+{
+    fresh_dir();
+
+    /* the old backlog exceeds the slot table and must be filtered one file at a time */
+    struct rlimit saved_limit;
+    ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &saved_limit), 0);
+    struct rlimit low_limit = saved_limit;
+    if (low_limit.rlim_cur > 64) low_limit.rlim_cur = 64;
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low_limit), 0);
+
+    char path[512];
+    for (uint64_t i = 0; i <= VLOG_MAX_SEGMENTS; i++)
+        make_header_only_segment(i, path, sizeof(path));
+
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ((int)segment_count(v), 1);
+    ASSERT_EQ(active_segment_number(v), VLOG_MAX_SEGMENTS + 1);
+    vlog_close(v);
+
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &saved_limit), 0);
+}
+#endif
+
 void test_recover_torn_tail_ignored(void)
 {
     fresh_dir();
@@ -1083,6 +1277,46 @@ void test_sync_succeeds(void)
     vlog_close(v);
 }
 
+#ifdef __linux__
+void test_sync_failure_is_sticky_and_keeps_the_resident_segment(void)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, V_SEG_TARGET);
+    uint8_t *value = pattern(V_MEDIUM, 61);
+    for (int i = 0; i < V_MANY; i++) (void)put(v, value, V_MEDIUM);
+    free(value);
+
+    const uint32_t active = atomic_load_explicit(&v->active_slot, memory_order_acquire);
+    uint32_t inactive = VLOG_MAX_SEGMENTS;
+    const uint32_t high = atomic_load_explicit(&v->seg_high, memory_order_acquire);
+    for (uint32_t i = 0; i < high; i++)
+        if (i != active && atomic_load_explicit(&v->segments[i].bm, memory_order_acquire))
+        {
+            inactive = i;
+            break;
+        }
+    ASSERT_TRUE(inactive < VLOG_MAX_SEGMENTS);
+
+    block_manager_t *const bm =
+        atomic_load_explicit(&v->segments[inactive].bm, memory_order_acquire);
+    const int real_fd = dup(bm->fd);
+    ASSERT_TRUE(real_fd >= 0);
+    const int null_fd = open("/dev/null", O_RDWR);
+    ASSERT_TRUE(null_fd >= 0);
+    ASSERT_TRUE(dup2(null_fd, bm->fd) >= 0);
+    close(null_fd);
+
+    ASSERT_EQ(vlog_sync(v), VLOG_ERR_IO);
+    ASSERT_TRUE(dup2(real_fd, bm->fd) >= 0);
+    close(real_fd);
+
+    /* restoring a working descriptor must not erase the first sync failure */
+    ASSERT_EQ(vlog_sync(v), VLOG_ERR_IO);
+    ASSERT_TRUE(atomic_load_explicit(&v->segments[inactive].bm, memory_order_acquire) == bm);
+    vlog_close(v);
+}
+#endif
+
 void test_invalid_args(void)
 {
     fresh_dir();
@@ -1337,6 +1571,14 @@ void test_concurrent_reads_writes_and_reclaim(void)
 
 int main(int argc, char **argv)
 {
+#ifdef TDB_FAULT_INJECTION
+    if (argc >= 2 && strcmp(argv[1], VLOG_RECOVERY_CHILD_FLAG) == 0)
+    {
+        vlog_recovery_child();
+        return 2; /* the child always exits itself */
+    }
+    vlog_test_exe = argv[0];
+#endif
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_open_fresh_empty, tests_passed);
     RUN_TEST(test_roundtrip_one_byte, tests_passed);
@@ -1363,6 +1605,15 @@ int main(int argc, char **argv)
     RUN_TEST(test_recover_keeps_everything, tests_passed);
     RUN_TEST(test_recover_after_reclaim, tests_passed);
     RUN_TEST(test_recover_appends_to_a_fresh_segment, tests_passed);
+    RUN_TEST(test_recover_prunes_header_only_segments_before_adoption, tests_passed);
+#ifdef TDB_FAULT_INJECTION
+    RUN_TEST(test_recover_cleanup_survives_a_torn_fresh_successor, tests_passed);
+#endif
+    RUN_TEST(test_recover_preserves_torn_and_corrupt_segment_candidates, tests_passed);
+#ifndef _WIN32
+    RUN_TEST(test_recover_prunes_more_than_segment_cap_header_only_files_under_low_fd_limit,
+             tests_passed);
+#endif
     RUN_TEST(test_recover_torn_tail_ignored, tests_passed);
     RUN_TEST(test_read_detects_corruption, tests_passed);
     RUN_TEST(test_read_reports_corruption_when_the_chain_cannot_be_resolved, tests_passed);
@@ -1372,6 +1623,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_retire_refuses_the_segment_taking_appends, tests_passed);
     RUN_TEST(test_list_segments_reports_each, tests_passed);
     RUN_TEST(test_sync_succeeds, tests_passed);
+#ifdef __linux__
+    RUN_TEST(test_sync_failure_is_sticky_and_keeps_the_resident_segment, tests_passed);
+#endif
     RUN_TEST(test_invalid_args, tests_passed);
     RUN_TEST(test_many_values_stress, tests_passed);
     RUN_TEST(test_concurrent_ids_are_unique, tests_passed);

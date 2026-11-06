@@ -79,21 +79,70 @@ static void vlog_segment_sort(uint64_t *numbers, size_t count)
     }
 }
 
-int vlog_segment_scan_dir(const char *dir, uint64_t *numbers, size_t max, size_t *out_count)
+/* a cursor finding no readable blocks can mean a torn tail. only the exact size and a valid
+ * block-manager header prove that the file never held a value. */
+static int vlog_segment_remove_empty(const char *path, int *removed)
 {
-    if (!dir || !numbers || !out_count) return VLOG_ERR_INVALID;
+    *removed = 0;
+    struct STAT_STRUCT st;
+    if (STAT_FUNC(path, &st) != 0) return VLOG_ERR_IO;
+    if (st.st_size != BLOCK_MANAGER_HEADER_SIZE) return VLOG_OK;
+
+    block_manager_t *bm = NULL;
+    if (block_manager_open_pre(&bm, path, BLOCK_MANAGER_SYNC_NONE, 0) != 0) return VLOG_ERR_IO;
+    uint64_t size = 0;
+    const int sized = block_manager_get_size(bm, &size);
+    const int closed = block_manager_close(bm);
+    if (sized != 0 || closed != 0) return VLOG_ERR_IO;
+    if (size != BLOCK_MANAGER_HEADER_SIZE) return VLOG_OK;
+    if (remove(path) != 0) return VLOG_ERR_IO;
+    *removed = 1;
+    return VLOG_OK;
+}
+
+int vlog_segment_scan_dir(vlog_t *v, uint64_t *numbers, size_t max, size_t *out_count)
+{
+    if (!v || !numbers || !out_count) return VLOG_ERR_INVALID;
     *out_count = 0;
 
-    DIR *d = opendir(dir);
-    if (!d) return VLOG_OK; /* no directory yet is a fresh store, not a failure */
+    DIR *d = opendir(v->dir);
+    if (!d) return errno == ENOENT ? VLOG_OK : VLOG_ERR_IO;
 
     size_t count = 0;
     int rc = VLOG_OK;
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL)
+    for (;;)
     {
+        errno = 0;
+        ent = readdir(d);
+        if (!ent)
+        {
+            if (errno != 0) rc = VLOG_ERR_IO;
+            break;
+        }
         uint64_t number = 0;
         if (!vlog_segment_parse_name(ent->d_name, &number)) continue;
+        if (number == UINT64_MAX)
+        {
+            rc = VLOG_ERR_FULL; /* no fresh successor can be named */
+            break;
+        }
+        /* recovery is the sole writer of next_number until the store is published */
+        if (number >= atomic_load(&v->next_number)) atomic_store(&v->next_number, number + 1);
+
+        char path[VLOG_PATH_MAX];
+        const int n = snprintf(path, sizeof(path), "%s%s%s", v->dir, PATH_SEPARATOR, ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path))
+        {
+            rc = VLOG_ERR_INVALID;
+            break;
+        }
+        int removed = 0;
+        rc = vlog_segment_remove_empty(path, &removed);
+        if (rc != VLOG_OK) break;
+        if (removed) continue;
+
+        /* apply the slot limit after removing empty files, including in older stores */
         if (count >= max)
         {
             rc = VLOG_ERR_FULL;
@@ -101,7 +150,7 @@ int vlog_segment_scan_dir(const char *dir, uint64_t *numbers, size_t max, size_t
         }
         numbers[count++] = number;
     }
-    closedir(d);
+    if (closedir(d) != 0 && rc == VLOG_OK) rc = VLOG_ERR_IO;
 
     if (rc != VLOG_OK) return rc;
     vlog_segment_sort(numbers, count);

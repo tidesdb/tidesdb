@@ -265,7 +265,7 @@ static int vlog_adopt_segments(vlog_t *v)
     if (!numbers) return VLOG_ERR_MEMORY;
 
     size_t count = 0;
-    int rc = vlog_segment_scan_dir(v->dir, numbers, VLOG_MAX_SEGMENTS, &count);
+    int rc = vlog_segment_scan_dir(v, numbers, VLOG_MAX_SEGMENTS, &count);
     uint64_t max_id = 0;
 
     for (size_t i = 0; rc == VLOG_OK && i < count; i++)

@@ -11,14 +11,20 @@
 
 #include "sstable/vlog.h"
 
-/* a sealed segment's immutable index is kept beside it, never in the manifest */
+/* a segment's latest index is kept beside it, never in the manifest */
 #define VLOG_SIDECAR_EXT      ".vix"
 #define VLOG_SIDECAR_TMP_EXT  ".vix.tmp"
 #define VLOG_SIDECAR_NAME_MAX 40
 
+typedef enum
+{
+    VLOG_SIDECAR_SEALED,
+    VLOG_SIDECAR_PREFIX
+} vlog_sidecar_kind_t;
+
 /**
  * vlog_sidecar_entry_t
- * the compact recovery information for one value in a sealed segment
+ * the compact recovery information for one completed value
  * @param id nonzero logical value id
  * @param offset block-frame offset in the segment
  * @param value_len original uncompressed value length
@@ -36,7 +42,7 @@ typedef struct
 
 /**
  * vlog_sidecar_name
- * formats a sealed segment's published or temporary sidecar name
+ * formats a segment's published or temporary sidecar name
  * @param number segment file number
  * @param temporary nonzero for the unpublished .vix.tmp name
  * @param out receives the basename
@@ -47,29 +53,31 @@ int vlog_sidecar_name(uint64_t number, int temporary, char *out, size_t out_size
 
 /**
  * vlog_sidecar_publish
- * writes, binds, syncs and atomically publishes a sorted sidecar for one sealed extent
+ * syncs the segment and atomically publishes a sorted index through extent
  * @param v opened value log
- * @param slot sealed segment table slot, pinned by the roller or exclusively owned at recovery
- * @param entries complete entries for the segment, reordered by offset in place
+ * @param slot segment pinned under exclusive writer admission or owned by single-threaded recovery
+ * @param entries complete entries through extent, reordered by offset in place
  * @param count number of entries
  * @param extent first byte after the final complete frame
+ * @param kind VLOG_SIDECAR_PREFIX preserves active preallocation and permits later appends
  * @return VLOG_OK, VLOG_ERR_INVALID, VLOG_ERR_MEMORY, VLOG_ERR_IO, or VLOG_ERR_CORRUPTION
  */
 int vlog_sidecar_publish(vlog_t *v, uint32_t slot, vlog_sidecar_entry_t *entries, size_t count,
-                         uint64_t extent);
+                         uint64_t extent, vlog_sidecar_kind_t kind);
 
 /**
  * vlog_sidecar_load
- * validates a published sidecar against its immutable segment without reading value bytes
+ * validates a published sidecar against its segment without reading covered value bytes
  * @param v opened value log
  * @param slot segment table slot, exclusively owned during recovery
- * @param extent expected sealed logical extent
+ * @param extent segment size at reopen, which may include a physical reservation
  * @param entries receives owned compact entries on success
  * @param count receives the entry count on success
+ * @param indexed_extent receives the first byte after the validated frames on success
  * @return VLOG_OK when the sidecar is fully usable, otherwise a VLOG_ERR_* failure
  */
 int vlog_sidecar_load(vlog_t *v, uint32_t slot, uint64_t extent, vlog_sidecar_entry_t **entries,
-                      size_t *count);
+                      size_t *count, uint64_t *indexed_extent);
 
 /**
  * vlog_sidecar_unlink

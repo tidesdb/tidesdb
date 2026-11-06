@@ -397,7 +397,7 @@ static int engine_open_init(tidesdb_t *db, const tidesdb_config_t *config)
  * open the db-level stores every column family shares -- the block cache, the descriptor budget,
  * the arena pool, the manifest, and the value log
  * @param db the database, already through engine_open_init
- * @param enable_vlog_indexes whether sealed value-log segments publish rebuildable indexes
+ * @param enable_vlog_indexes whether value-log segments publish indexes at checkpoints and seal
  * @return TDB_SUCCESS, TDB_ERR_MEMORY, TDB_ERR_IO, or TDB_ERR_INVALID_ARGS on an unformattable path
  */
 static int engine_open_stores(tidesdb_t *db, const int enable_vlog_indexes)

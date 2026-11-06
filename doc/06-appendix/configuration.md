@@ -19,7 +19,7 @@ all defaults.
 
 | Open option | Default | Effect |
 | --- | --- | --- |
-| `enable_vlog_indexes` | 0 | Publish a rebuildable `.vix` sidecar when a shared value-log segment seals. This covers separated values in every column family. Recovery falls back to the authoritative `.vlog` when a sidecar is absent, damaged, stale, or copied from another segment. Ordinary value logs remain readable by earlier v10 binaries. |
+| `enable_vlog_indexes` | 0 | Checkpoint the shared value log after each additional 16 MiB of framed writes and publish its final `.vix` on seal. Reopen scans only the uncovered tail on a checkpoint hit. An absent, damaged or mismatched index triggers a full scan of that segment. Applies to separated values in every column family. Earlier v10 binaries can read the value log. |
 
 ## Database configuration
 

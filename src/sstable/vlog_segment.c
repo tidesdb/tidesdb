@@ -333,7 +333,7 @@ static int vlog_roll_locked(vlog_t *v, uint32_t full_slot)
         uint64_t extent = 0;
         if (!bm || block_manager_get_size(bm, &extent) != 0 || block_manager_last_errno(bm) != 0)
             v->pending_incomplete = 1;
-        vlog_publish_pending(v, full_slot, extent);
+        vlog_publish_pending(v, full_slot, extent, VLOG_SIDECAR_SEALED);
     }
     atomic_store_explicit(&v->active_slot, slot, memory_order_release);
     return VLOG_OK;
@@ -390,6 +390,29 @@ static int vlog_append_to_slot(vlog_t *v, uint32_t slot, const uint8_t *payload,
     return rc;
 }
 
+/* drop shared admission before taking its exclusive side. every earlier reservation has then
+ * completed its physical write and map update, or poisoned the descriptor. the roll and other
+ * checkpoint contenders may have won in between, so recheck the slot and the byte threshold. */
+static void vlog_checkpoint_active(vlog_t *v, uint32_t slot)
+{
+    pthread_rwlock_wrlock(&v->seal_rw);
+    if (slot == atomic_load_explicit(&v->active_slot, memory_order_acquire) &&
+        vlog_segment_acquire(v, slot))
+    {
+        block_manager_t *bm = vlog_segment_ensure_open(v, slot);
+        uint64_t extent = 0;
+        if (bm && block_manager_get_size(bm, &extent) == 0 && extent >= v->checkpoint_at)
+        {
+            /* rate-limit failed cache writes too. a previously published prefix stays usable. */
+            v->checkpoint_at = extent + VLOG_CHECKPOINT_INTERVAL_BYTES;
+            if (block_manager_last_errno(bm) == 0)
+                vlog_publish_pending(v, slot, extent, VLOG_SIDECAR_PREFIX);
+        }
+        vlog_segment_release(v, slot);
+    }
+    pthread_rwlock_unlock(&v->seal_rw);
+}
+
 int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
                         vlog_sidecar_entry_t *entry)
 {
@@ -405,7 +428,12 @@ int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
             rc = vlog_append_to_slot(v, slot, payload, (uint32_t)payload_len, entry);
             vlog_segment_release(v, slot);
         }
-        if (v->enable_vlog_indexes) pthread_rwlock_unlock(&v->seal_rw);
+        if (v->enable_vlog_indexes)
+        {
+            const int due = rc == VLOG_OK && entry->offset + entry->disk_len >= v->checkpoint_at;
+            pthread_rwlock_unlock(&v->seal_rw);
+            if (due) vlog_checkpoint_active(v, slot);
+        }
         if (rc == VLOG_ERR_BUSY) continue;
         if (rc != VLOG_ERR_FULL) return rc;
 

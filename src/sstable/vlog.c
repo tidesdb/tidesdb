@@ -225,14 +225,18 @@ int vlog_record_entry(vlog_t *v, uint32_t slot, const vlog_sidecar_entry_t *entr
                           entry->chain);
 }
 
-void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent)
+void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent, vlog_sidecar_kind_t kind)
 {
     if (v->pending_count && !v->pending_incomplete &&
-        vlog_sidecar_publish(v, slot, v->pending, v->pending_count, extent) != VLOG_OK)
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "vlog segment %llu will require a recovery scan",
+        vlog_sidecar_publish(v, slot, v->pending, v->pending_count, extent, kind) != VLOG_OK)
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "could not publish recovery index for vlog segment %llu",
                       (unsigned long long)v->segments[slot].number);
-    v->pending_count = 0;
-    v->pending_incomplete = 0;
+    if (kind == VLOG_SIDECAR_SEALED)
+    {
+        v->pending_count = 0;
+        v->pending_incomplete = 0;
+        v->checkpoint_at = BLOCK_MANAGER_HEADER_SIZE + VLOG_CHECKPOINT_INTERVAL_BYTES;
+    }
 }
 
 /* parse once for both a freshly encoded value and a verified block returned by a recovery scan.
@@ -256,15 +260,19 @@ static vlog_sidecar_entry_t vlog_frame_entry(const uint8_t *data, uint32_t size,
  * @param v vlog handle
  * @param slot the segment's table slot
  * @param bm opened block manager for this segment
+ * @param start first byte not already recovered from a valid sidecar
  * @param fsize recovery extent at open
  * @param out_max_id raised to the highest id seen
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_MEMORY
  */
-static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint64_t fsize,
-                             uint64_t *out_max_id)
+static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint64_t start,
+                             uint64_t fsize, uint64_t *out_max_id)
 {
+    if (!v || !bm || !out_max_id || start < BLOCK_MANAGER_HEADER_SIZE || start > fsize)
+        return VLOG_ERR_INVALID;
     block_manager_cursor_t cur;
     if (block_manager_cursor_init_stack(&cur, bm) != 0) return VLOG_ERR_IO;
+    if (block_manager_cursor_goto(&cur, start) != 0) return VLOG_ERR_IO;
 
     int rc = VLOG_OK;
     while (cur.current_pos < fsize)
@@ -273,6 +281,9 @@ static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint
         block_manager_block_t *block = block_manager_cursor_read(&cur);
         if (!block)
         {
+            /* salvage later frames as usual, but keep the last valid prefix if the physical
+             * extent includes an unfinished reservation or a preallocated tail. */
+            v->pending_incomplete = 1;
             if (block_manager_cursor_resync_past_hole(&cur) == 0) continue;
             if (block_manager_cursor_skip_corrupt(&cur) == 0) continue;
             break;
@@ -294,6 +305,7 @@ static int vlog_scan_segment(vlog_t *v, uint32_t slot, block_manager_t *bm, uint
         if (rc != VLOG_OK) break;
         if (block_manager_cursor_next(&cur) != 0) break;
     }
+    if (cur.current_pos != fsize) v->pending_incomplete = 1;
     return rc;
 }
 
@@ -305,7 +317,10 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *max_id)
 
     vlog_sidecar_entry_t *entries = NULL;
     size_t count = 0;
-    if (v->enable_vlog_indexes && vlog_sidecar_load(v, slot, extent, &entries, &count) == VLOG_OK)
+    uint64_t indexed_extent = 0;
+    uint64_t start = BLOCK_MANAGER_HEADER_SIZE;
+    if (v->enable_vlog_indexes &&
+        vlog_sidecar_load(v, slot, extent, &entries, &count, &indexed_extent) == VLOG_OK)
     {
         int rc = VLOG_OK;
         for (size_t i = 0; rc == VLOG_OK && i < count; ++i)
@@ -314,15 +329,29 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *max_id)
             rc = vlog_index_put(v, e->id, slot, e->offset, e->value_len, e->disk_len, e->chain);
             if (e->id > *max_id) *max_id = e->id;
         }
-        free(entries);
 #ifdef TDB_FAULT_INJECTION
         ++v->recovery_index_hits;
 #endif
-        return rc;
+        if (rc != VLOG_OK || indexed_extent == extent)
+        {
+            free(entries);
+            return rc;
+        }
+
+        /* no earlier recovery leaves entries pending: a sealed publish clears them. retaining the
+         * decoded allocation avoids copying a potentially large durable prefix before the tail
+         * scanner appends the newly discovered frames. */
+        free(v->pending);
+        v->pending = entries;
+        v->pending_cap = count;
+        v->pending_count = count;
+        v->pending_incomplete = 0;
+        start = indexed_extent;
     }
 
-    const int rc = vlog_scan_segment(v, slot, bm, extent, max_id);
-    if (v->enable_vlog_indexes && rc == VLOG_OK) vlog_publish_pending(v, slot, extent);
+    const int rc = vlog_scan_segment(v, slot, bm, start, extent, max_id);
+    if (v->enable_vlog_indexes && rc == VLOG_OK)
+        vlog_publish_pending(v, slot, extent, VLOG_SIDECAR_SEALED);
     return rc;
 }
 
@@ -363,6 +392,7 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
 
     memcpy(v->dir, dir, strlen(dir) + 1);
     v->enable_vlog_indexes = config->enable_vlog_indexes;
+    v->checkpoint_at = BLOCK_MANAGER_HEADER_SIZE + VLOG_CHECKPOINT_INTERVAL_BYTES;
     v->sync_mode = config->sync_mode;
     v->fdm = config->fdm;
     /* no builder is in flight yet, so every slot is free and nothing is protected */

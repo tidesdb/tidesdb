@@ -393,8 +393,8 @@ typedef struct tidesdb_config_t
  * @param size bytes the caller supplied, set to sizeof(tidesdb_open_options_t). a shorter known
  *             prefix is accepted and leaves later fields at their defaults; a value smaller than
  *             the size field is invalid
- * @param enable_vlog_indexes nonzero to publish rebuildable indexes for sealed value-log segments,
- *                             0 to retain payload-scan recovery, which is the default
+ * @param enable_vlog_indexes nonzero to checkpoint active value-log segments and index them on
+ *                            seal, 0 for full payload-scan recovery (default)
  */
 typedef struct tidesdb_open_options_t
 {

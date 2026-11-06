@@ -106,12 +106,20 @@ int rc = tidesdb_open_with_options(&config, &options, &db);
 Pass `NULL` for `options` to use the same defaults as `tidesdb_open`. Otherwise, set
 `options.size` to `sizeof(options)`. The library reads only fields that fit within that size.
 
-Set `enable_vlog_indexes` to a nonzero value to publish a rebuildable `.vix` beside each
-sealed value-log segment. This applies to ordinary separated values across all column families.
-Recovery checks the sidecar against the segment's identity, extent and frame metadata. An index
-hit skips the value bytes. Point reads still verify the block checksum. A missing, damaged or
-mismatched index triggers a scan of that segment and a rebuild if the frames cover its extent.
-For example, copying a database to new files requires this scan on the first indexed open.
+Set `enable_vlog_indexes` to a nonzero value to build a `.vix` index for separated values
+across all column families. Each additional 16 MiB of framed writes to the active segment
+triggers a checkpoint. The writer crossing that threshold waits for admitted writers to finish,
+syncs the segment, and atomically replaces the index with one covering the completed frames.
+A large frame or concurrent writes can carry the checkpoint past the threshold. Sealing the
+segment publishes its final index.
+
+On reopen, TidesDB checks the index against the segment's identity, extent and frame metadata.
+A sealed index covers the entire file. An active checkpoint lets recovery skip the covered
+value bytes and scan from the first uncovered frame. After a crash, this scan also checks
+preallocated space for later completed frames. New writes go to a fresh segment.
+Point reads still verify the block checksum. A missing, damaged or mismatched index triggers
+a scan of that segment and a rebuild if the frames cover its extent. For example, copying a
+database to new files requires this scan on the first indexed open.
 
 The default is zero. Both modes write the existing v10 value-log format. Older binaries can
 read these value logs and ignore the optional index files.

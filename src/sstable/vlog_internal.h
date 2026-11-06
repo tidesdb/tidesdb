@@ -40,6 +40,9 @@
  * failing the write outright would report a lost race as an error */
 #define VLOG_APPEND_FULL_PAUSE_US 200
 
+/* framed bytes between attempts to publish an active segment's durable prefix */
+#define VLOG_CHECKPOINT_INTERVAL_BYTES (16ull * 1024 * 1024)
+
 /* a segment holding no more than this fraction of itself live is worth putting through compaction
  * to empty it, as a divisor: a half. rewriting the tables that reference a mostly-live segment
  * would move nearly all of it forward to recover nearly nothing, so the threshold is what keeps
@@ -202,6 +205,7 @@ struct vlog
     size_t pending_cap;
     size_t pending_count;
     int pending_incomplete;
+    uint64_t checkpoint_at; /* next logical extent due, protected by seal_rw */
 #ifdef TDB_FAULT_INJECTION
     uint64_t recovery_payload_bytes;
     size_t recovery_index_hits;
@@ -344,9 +348,8 @@ int vlog_segment_append(vlog_t *v, const uint8_t *payload, size_t payload_len,
 /* called under index_rw by an admitted writer, or during single-threaded recovery */
 int vlog_record_entry(vlog_t *v, uint32_t slot, const vlog_sidecar_entry_t *entry);
 
-/* publish the accumulated complete segment if possible. sidecar failures leave scan recovery in
- * charge. starts the next segment with an empty vector, reusing its capacity. */
-void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent);
+/* active checkpoints keep accumulating entries; a seal releases the vector for the next segment */
+void vlog_publish_pending(vlog_t *v, uint32_t slot, uint64_t extent, vlog_sidecar_kind_t kind);
 
 /**
  * vlog_index_locate

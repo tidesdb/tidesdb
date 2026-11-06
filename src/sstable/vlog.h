@@ -101,7 +101,7 @@ typedef struct vlog vlog_t;
  * what a vlog is opened with, sourced from the owning database config
  * @param sync_mode block manager sync mode every segment file is opened with
  * @param segment_target_bytes size at which the active segment seals and a fresh one opens
- * @param enable_vlog_indexes whether every sealed segment publishes a rebuildable index sidecar
+ * @param enable_vlog_indexes whether segments publish a rebuildable index at checkpoints and seal
  * @param encodings the db-global registry a stored value's recorded ids resolve against. the
  *        registry is db-global even though a pipeline is per-family, so the store can decode any
  *        value it holds

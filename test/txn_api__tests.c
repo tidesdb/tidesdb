@@ -7,6 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 #include "../src/base/thread.h" /* threads retired without a join */
+#include "../src/engine/engine_types.h"
+#include "../src/sstable/vlog_internal.h"
 #include "db.h"
 #include "test_utils.h"
 
@@ -69,6 +71,66 @@ static int txnapi_get(tidesdb_t *db, tidesdb_column_family_t *cf, const char *ke
     (void)tidesdb_txn_rollback(txn);
     tidesdb_txn_free(txn);
     return rc;
+}
+
+/* locate the frame through the id index so the fault hits the same value before or after flush */
+static void txnapi_corrupt_vlog_value(tidesdb_t *db, vlog_id_t id)
+{
+    vlog_t *vlog = db->vlog;
+    pthread_rwlock_rdlock(&vlog->index_rw);
+    const size_t bucket = vlog_index_locate(vlog, id, NULL);
+    ASSERT_TRUE(bucket != SIZE_MAX);
+    const uint32_t slot = vlog->buckets[bucket].segment;
+    const uint64_t offset = vlog->buckets[bucket].offset;
+    const uint64_t segment = vlog->segments[slot].number;
+    pthread_rwlock_unlock(&vlog->index_rw);
+
+    char name[VLOG_SEGMENT_NAME_MAX];
+    ASSERT_EQ(vlog_segment_name(segment, name, sizeof(name)), VLOG_OK);
+    char path[VLOG_PATH_MAX];
+    const int len = snprintf(path, sizeof(path), "%s%s%s", db->db_path, PATH_SEPARATOR, name);
+    ASSERT_TRUE(len > 0 && (size_t)len < sizeof(path));
+
+    FILE *f = fopen(path, "r+b");
+    ASSERT_TRUE(f != NULL);
+    ASSERT_EQ(
+        fseek(f, (long)(offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + VLOG_BLK_HDR_SIZE), SEEK_SET),
+        0);
+    const uint8_t damaged = 0xa5;
+    ASSERT_EQ(fwrite(&damaged, 1, 1, f), 1);
+    test_fsync_file(f);
+    ASSERT_EQ(fclose(f), 0);
+}
+
+/* both the memtable and an installed table must report damage to the separated value */
+void test_txn_get_reports_corrupt_separated_value_without_retrying(void)
+{
+    for (int flushed = 0; flushed <= 1; flushed++)
+    {
+        (void)remove_directory(TXNAPI_DB_DIR);
+        char db_path[] = TXNAPI_DB_DIR;
+        tidesdb_config_t cfg = tidesdb_default_config();
+        cfg.db_path = db_path;
+        cfg.value_separation_threshold = 1;
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = txnapi_make_cf(db, TXNAPI_CF, TDB_ISOLATION_READ_COMMITTED);
+        txnapi_put(db, cf, "spilled", "this value proves the healthy point-read path first");
+        ASSERT_EQ(txnapi_get(db, cf, "spilled"), TDB_SUCCESS);
+        if (flushed)
+        {
+            ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
+            ASSERT_EQ(txnapi_get(db, cf, "spilled"), TDB_SUCCESS);
+        }
+
+        const vlog_id_t id = vlog_next_id(db->vlog) - 1;
+        ASSERT_TRUE(id != VLOG_ID_INVALID);
+        txnapi_corrupt_vlog_value(db, id);
+        ASSERT_EQ(txnapi_get(db, cf, "spilled"), TDB_ERR_CORRUPTION);
+
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+        (void)remove_directory(TXNAPI_DB_DIR);
+    }
 }
 
 /* buffer a write inside an already open transaction, so a case can shape a buffer around savepoints
@@ -839,6 +901,7 @@ int main(int argc, char **argv)
     INIT_TEST_FILTER(argc, argv);
     RUN_TEST(test_txn_request_abort_makes_the_transaction_fail_with_its_own_code, tests_passed);
     RUN_TEST(test_txn_get_notrack_answers_as_get_does, tests_passed);
+    RUN_TEST(test_txn_get_reports_corrupt_separated_value_without_retrying, tests_passed);
     RUN_TEST(test_txn_begin_cf_adopts_the_family_isolation, tests_passed);
     RUN_TEST(test_txn_single_delete_hides_key_across_flush_and_reopen, tests_passed);
     RUN_TEST(test_savepoint_rollback_discards_only_the_writes_taken_after_the_mark, tests_passed);

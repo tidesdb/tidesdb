@@ -238,6 +238,6 @@ int bm_wait_flushed(block_manager_t *bm, uint64_t need);
 
 /* cursor -- read one block at offset into the thread-local buffer, verifying its checksum */
 uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, uint32_t payload_hint,
-                           uint32_t *out_size);
+                           uint32_t *out_size, int *out_rc);
 
 #endif /* __BLOCK_MANAGER_INTERNAL_H__ */

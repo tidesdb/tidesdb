@@ -231,7 +231,7 @@ static int txn_probe_newer(const tidesdb_source_t *sources, int num_sources, uin
     {
         const tidesdb_source_result_t r = tidesdb_source_stack_has_newer(
             sources, num_sources, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
-        if (r != TDB_SOURCE_BUSY) return TDB_SUCCESS;
+        if (r != TDB_SOURCE_BUSY) return r < 0 ? (int)r : TDB_SUCCESS;
         if (attempt < TDB_TXN_BUSY_SPIN_THRESHOLD)
             cpu_pause();
         else
@@ -266,7 +266,7 @@ static int txn_probe_range_newer(const tidesdb_source_t *sources, int num_source
         const tidesdb_source_result_t r =
             tidesdb_source_stack_range_has_newer(sources, num_sources, cf_index, lo, lo_size, hi,
                                                  hi_size, seq_floor, seq_ceiling, newer);
-        if (r != TDB_SOURCE_BUSY) return TDB_SUCCESS;
+        if (r != TDB_SOURCE_BUSY) return r < 0 ? (int)r : TDB_SUCCESS;
         if (attempt < TDB_TXN_BUSY_SPIN_THRESHOLD)
             cpu_pause();
         else

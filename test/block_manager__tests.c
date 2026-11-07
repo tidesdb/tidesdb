@@ -2035,35 +2035,36 @@ void test_block_manager_borrow_block_data_at_offset(void)
     /* no hint at all, so the reader uses its own default and collects the rest if it must */
     uint32_t size = 0;
     const uint8_t *borrowed =
-        block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset, 0, &size);
+        block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset, 0, &size, NULL);
     ASSERT_TRUE(borrowed != NULL);
     ASSERT_EQ(size, (uint32_t)(strlen(first_data) + 1));
     ASSERT_EQ(memcmp(borrowed, first_data, size), 0);
 
     /* the exact payload size, which is the one-syscall case */
-    borrowed = block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset,
-                                                         (uint32_t)(strlen(first_data) + 1), &size);
+    borrowed = block_manager_borrow_block_data_at_offset(
+        bm, (uint64_t)first_offset, (uint32_t)(strlen(first_data) + 1), &size, NULL);
     ASSERT_TRUE(borrowed != NULL);
     ASSERT_EQ(size, (uint32_t)(strlen(first_data) + 1));
     ASSERT_EQ(memcmp(borrowed, first_data, size), 0);
 
     /* far more than the block holds -- the value log's case, where the hint is an upper bound */
-    borrowed =
-        block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset, 64u * 1024, &size);
+    borrowed = block_manager_borrow_block_data_at_offset(bm, (uint64_t)first_offset, 64u * 1024,
+                                                         &size, NULL);
     ASSERT_TRUE(borrowed != NULL);
     ASSERT_EQ(size, (uint32_t)(strlen(first_data) + 1));
     ASSERT_EQ(memcmp(borrowed, first_data, size), 0);
 
     /* a second borrow answers with its own block rather than whatever the buffer last held, which
      * is the failure a shared per-thread buffer invites */
-    borrowed = block_manager_borrow_block_data_at_offset(bm, (uint64_t)second_offset, 0, &size);
+    borrowed =
+        block_manager_borrow_block_data_at_offset(bm, (uint64_t)second_offset, 0, &size, NULL);
     ASSERT_TRUE(borrowed != NULL);
     ASSERT_EQ(size, (uint32_t)(strlen(second_data) + 1));
     ASSERT_EQ(memcmp(borrowed, second_data, size), 0);
 
     /* an offset past everything written is a refusal, not a read of whatever is there */
     ASSERT_TRUE(block_manager_borrow_block_data_at_offset(bm, (uint64_t)second_offset + (1u << 20),
-                                                          0, &size) == NULL);
+                                                          0, &size, NULL) == NULL);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("test_borrow.db");

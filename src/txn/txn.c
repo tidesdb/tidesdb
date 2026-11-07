@@ -413,6 +413,7 @@ static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, 
             if (ttl) *ttl = v.ttl > 0 ? v.ttl : -1;
             return TDB_SUCCESS;
         }
+        if (r < 0) return (int)r;
         /* TDB_SOURCE_BUSY -- back off and retry; never surface it */
         if (attempt < TDB_TXN_BUSY_SPIN_THRESHOLD)
             cpu_pause();

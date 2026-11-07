@@ -717,10 +717,12 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, uint64_t offset
  *                     size, so a block larger than the default read hint still costs one syscall
  *                     instead of two; 0 asks for the default
  * @param data_size output parameter for the payload size (not including header)
+ * @param out_rc optional result: TDB_SUCCESS, TDB_ERR_INVALID_ARGS, TDB_ERR_IO, TDB_ERR_CORRUPTION,
+ *               or TDB_ERR_MEMORY
  * @return borrowed pointer to the verified payload, or NULL on a read, bounds, or checksum failure
  */
 const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, uint64_t offset,
-                                                         uint32_t payload_hint,
-                                                         uint32_t *data_size);
+                                                         uint32_t payload_hint, uint32_t *data_size,
+                                                         int *out_rc);
 
 #endif /* __BLOCK_MANAGER_H__ */

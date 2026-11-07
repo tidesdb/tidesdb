@@ -8,6 +8,7 @@
  */
 #include "../src/base/thread.h" /* threads retired without a join */
 #include "../src/engine/engine_types.h"
+#include "../src/io/block_manager_fault.h"
 #include "../src/sstable/vlog_internal.h"
 #include "db.h"
 #include "test_utils.h"
@@ -122,6 +123,12 @@ void test_txn_get_reports_corrupt_separated_value_without_retrying(void)
             ASSERT_EQ(tidesdb_flush_memtable(db), TDB_SUCCESS);
             ASSERT_EQ(txnapi_get(db, cf, "spilled"), TDB_SUCCESS);
         }
+
+        /* recover from a signal interruption without treating actual damage as retryable */
+        block_manager_fault_arm_read(1, 1, EINTR);
+        ASSERT_EQ(txnapi_get(db, cf, "spilled"), TDB_SUCCESS);
+        ASSERT_TRUE(block_manager_fault_read_count() >= 2);
+        block_manager_fault_arm_read(0, 0, 0);
 
         const vlog_id_t id = vlog_next_id(db->vlog) - 1;
         ASSERT_TRUE(id != VLOG_ID_INVALID);

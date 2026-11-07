@@ -174,6 +174,21 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     return 0;
 }
 
+/* retry only interrupted syscalls, leaving short reads and permanent errors to the block reader */
+static ssize_t bm_pread_retry(int fd, void *buf, size_t size, off_t offset)
+{
+    for (int attempt = 0; attempt < BM_READ_EINTR_MAX; attempt++)
+    {
+#ifdef TDB_FAULT_INJECTION
+        const ssize_t got = block_manager_fault_pread(fd, buf, size, offset);
+#else
+        const ssize_t got = pread(fd, buf, size, offset);
+#endif
+        if (got >= 0 || errno != EINTR) return got;
+    }
+    return -1;
+}
+
 /**
  * bm_read_block_tls
  * reads a full block (header + payload) at `offset` into the thread-local buffer.
@@ -203,7 +218,8 @@ uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t e
         return NULL;
     }
 
-    const ssize_t got = pread(fd, buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE + hint, (off_t)offset);
+    const ssize_t got =
+        bm_pread_retry(fd, buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE + hint, (off_t)offset);
     if (BM_UNLIKELY(got < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE)) return NULL;
 
     const uint32_t size = decode_uint32_le_compat(buf);
@@ -243,8 +259,8 @@ uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t e
         }
 
         const off_t rem_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have;
-        if (BM_UNLIKELY(pread(fd, buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have, size - have,
-                              rem_offset) != (ssize_t)(size - have)))
+        if (BM_UNLIKELY(bm_pread_retry(fd, buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have,
+                                       size - have, rem_offset) != (ssize_t)(size - have)))
             return NULL;
     }
 

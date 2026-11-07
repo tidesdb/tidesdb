@@ -9,16 +9,46 @@
 #ifndef __TIDESDB_BLOCK_MANAGER_FAULT_H__
 #define __TIDESDB_BLOCK_MANAGER_FAULT_H__
 
-/* deterministic write-fault injection for crash-recovery tests. every durable block-manager write
+/* deterministic read and write faults for storage tests. every durable block-manager write
  * funnels through pwrite_all, so arming a torn write at the nth call reproduces exactly the on-disk
  * state a crash mid-write would leave, without a real process crash or its scheduling
  * nondeterminism. the whole feature compiles out unless TDB_FAULT_INJECTION is defined, so a
- * production build pays nothing and the hot write path is unchanged. */
+ * production build pays nothing. read faults are local to the calling thread so a background
+ * reader cannot consume an interruption meant for a foreground read. */
 
 #ifdef TDB_FAULT_INJECTION
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "compat.h"
+
+/**
+ * block_manager_fault_arm_read
+ * fail consecutive block reads in this thread, leaving background readers unaffected
+ * @param nth the 1-based read at which failures begin, or 0 to disarm while counting
+ * @param count how many consecutive reads fail
+ * @param error the errno to return without reading any bytes
+ */
+void block_manager_fault_arm_read(uint64_t nth, uint64_t count, int error);
+
+/**
+ * block_manager_fault_read_count
+ * count block-read attempts in this thread since the last arm
+ * @return the number of attempts, including injected failures
+ */
+uint64_t block_manager_fault_read_count(void);
+
+/**
+ * block_manager_fault_pread
+ * the block reader's syscall with a deterministic error at the armed attempt
+ * @param fd file descriptor
+ * @param buf destination buffer
+ * @param size requested byte count
+ * @param offset position in the file
+ * @return the pread result, or -1 with the injected errno
+ */
+ssize_t block_manager_fault_pread(int fd, void *buf, size_t size, off_t offset);
 
 /* the intercept clamps a torn write to this fraction of its bytes, a partial write like a crash mid
  * pwrite; expressed as a numerator over a denominator so the split is a named quantity */

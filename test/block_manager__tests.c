@@ -8,7 +8,7 @@
  */
 
 #include "../external/xxhash.h"
-#include "../src/io/block_manager.h"
+#include "../src/io/block_manager_internal.h"
 #include "db.h" /* the TDB_ERR_* result codes the errno mapping produces */
 #include "test_utils.h"
 #ifndef _WIN32
@@ -3065,6 +3065,58 @@ void test_block_manager_large_block_read_roundtrip(void)
     (void)remove(path);
 }
 
+/* inject at each syscall of a block larger than the hint, including its remainder read */
+void test_block_manager_read_retries_only_eintr(void)
+{
+    const char *path = "test_read_eintr.db";
+    (void)remove(path);
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE), 0);
+    uint8_t payload[BM_READ_HINT_BYTES * 2];
+    memset(payload, 0x5a, sizeof(payload));
+    const int64_t offset = block_manager_write_raw(bm, payload, sizeof(payload));
+    ASSERT_TRUE(offset >= 0);
+
+    for (uint64_t nth = 1; nth <= 2; nth++)
+    {
+        uint32_t size = 0;
+        int rc = TDB_ERR_IO;
+        block_manager_fault_arm_read(nth, 2, EINTR);
+        const uint8_t *got =
+            block_manager_borrow_block_data_at_offset(bm, (uint64_t)offset, 0, &size, &rc);
+        ASSERT_EQ(rc, TDB_SUCCESS);
+        ASSERT_TRUE(got != NULL);
+        ASSERT_EQ(size, sizeof(payload));
+        ASSERT_EQ(memcmp(got, payload, size), 0);
+        ASSERT_EQ(block_manager_fault_read_count(), 4);
+
+        block_manager_fault_arm_read(nth, BM_READ_EINTR_MAX, EINTR);
+        ASSERT_TRUE(
+            block_manager_borrow_block_data_at_offset(bm, (uint64_t)offset, 0, &size, &rc) == NULL);
+        ASSERT_EQ(rc, TDB_ERR_IO);
+        ASSERT_EQ(block_manager_fault_read_count(), nth - 1 + BM_READ_EINTR_MAX);
+
+        block_manager_fault_arm_read(nth, 1, EIO);
+        ASSERT_TRUE(
+            block_manager_borrow_block_data_at_offset(bm, (uint64_t)offset, 0, &size, &rc) == NULL);
+        ASSERT_EQ(rc, TDB_ERR_IO);
+        ASSERT_EQ(block_manager_fault_read_count(), nth);
+    }
+
+    block_manager_fault_arm_read(0, 0, 0);
+    payload[0] ^= 1;
+    ASSERT_EQ(pwrite(bm->fd, payload, 1, (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE), 1);
+    uint32_t size = 0;
+    int rc = TDB_SUCCESS;
+    ASSERT_TRUE(block_manager_borrow_block_data_at_offset(bm, (uint64_t)offset, 0, &size, &rc) ==
+                NULL);
+    ASSERT_EQ(rc, TDB_ERR_CORRUPTION);
+    ASSERT_EQ(block_manager_fault_read_count(), 2);
+    block_manager_fault_arm_read(0, 0, 0);
+    ASSERT_EQ(block_manager_close(bm), 0);
+    (void)remove(path);
+}
+
 /* buffered-append mode -- write through block_manager_open_buffered (staging ring + flush thread),
  * then reopen on the direct path to prove the on-disk bytes are identical and every record survives
  */
@@ -3416,6 +3468,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_block_manager_strict_validation_rejects_garbage_tail, tests_passed);
     RUN_TEST(test_block_manager_permissive_validation_truncates_prealloc_tail, tests_passed);
     RUN_TEST(test_block_manager_large_block_read_roundtrip, tests_passed);
+    RUN_TEST(test_block_manager_read_retries_only_eintr, tests_passed);
 
     RUN_TEST(test_block_manager_buffered_roundtrip, tests_passed);
     RUN_TEST(test_block_manager_buffered_concurrent, tests_passed);

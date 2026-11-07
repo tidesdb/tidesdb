@@ -251,8 +251,8 @@ if(TIDESDB_WARN_STRICT AND (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPIL
     endforeach()
 endif()
 
-# deterministic write-fault injection for crash-recovery tests and fuzzers; compiled out of a plain
-# production build so the hot write path pays nothing. PUBLIC so a test can call the arm/disarm api
+# deterministic storage faults for tests and fuzzers; compiled out of a plain production build
+# so read and write paths pay nothing. PUBLIC so a test can call the arm/disarm api
 if(TIDESDB_BUILD_TESTS OR TIDESDB_BUILD_FUZZERS)
     target_compile_definitions(tidesdb PUBLIC TDB_FAULT_INJECTION)
 endif()

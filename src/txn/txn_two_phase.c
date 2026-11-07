@@ -112,6 +112,11 @@ int tdb_txn_commit_prepared(tdb_txn_t *txn, const tdb_txn_backend_t *backend)
      * itself in the claims, since the store cannot show it yet; a record still reading as prepared
      * would place the batch above that commit, and a read of a key the batch writes would pass */
     const uint64_t seq = tidesdb_mvcc_draw(txn->clock, &txn->commit);
+    if (seq == 0)
+    {
+        tidesdb_mvcc_commit_prepared(&txn->commit);
+        return TDB_ERR_LOCKED;
+    }
     for (int i = 0; i < txn->prepared_count; i++) txn->prepared_entries[i].seq = seq;
 
     /* the COMMIT record carries the write set, so it is both the decision and the only durable copy

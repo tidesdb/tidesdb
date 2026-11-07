@@ -3,7 +3,8 @@ on: [push, pull_request]
 jobs:
   formatting-check:
     name: Formatting Check
-    runs-on: ubuntu-latest
+    # keep the runner on a release that provides the pinned clang-format-14 package
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
     - name: Install clang-format

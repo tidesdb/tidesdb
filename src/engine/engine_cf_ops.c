@@ -122,15 +122,12 @@ int engine_cf_update_runtime_config(tidesdb_t *db, cf_t *cf,
     return rc;
 }
 
-/* claim a family for a DDL operation, waiting out an in-flight compaction; a family that stays
- * claimed for the whole wait reports locked, since these results reach a public caller and the
- * internal contention code must not */
-static int engine_cf_claim(cf_t *cf)
+int engine_claim_maintenance(_Atomic(int) *flag)
 {
     for (int tick = 0; tick < ENGINE_CF_QUIESCE_TICKS; tick++)
     {
         int expected = 0;
-        if (atomic_compare_exchange_strong(&cf->compacting, &expected, 1)) return TDB_SUCCESS;
+        if (atomic_compare_exchange_strong(flag, &expected, 1)) return TDB_SUCCESS;
         usleep(ENGINE_CF_QUIESCE_STALL_US);
     }
     return TDB_ERR_LOCKED;
@@ -154,7 +151,7 @@ static int engine_rename_cf_locked(tidesdb_t *db, const char *old_name, const ch
      * the family is still claimed for the update. the claim is not protecting files here, it keeps
      * a second DDL and the compaction planner off the config while it is replaced, which is the
      * same reason a runtime config update takes it */
-    int rc = engine_cf_claim(cf);
+    int rc = engine_claim_maintenance(&cf->compacting);
     if (rc != TDB_SUCCESS) return rc;
 
     rc = cf_registry_rename(db->cfs, cf, new_name);
@@ -258,7 +255,7 @@ static int engine_clone_cf_locked(tidesdb_t *db, const char *src_name, const cha
     if (!src) return TDB_ERR_NOT_FOUND;
     if (cf_registry_get_by_name(db->cfs, dst_name)) return TDB_ERR_EXISTS;
 
-    int rc = engine_cf_claim(src);
+    int rc = engine_claim_maintenance(&src->compacting);
     if (rc != TDB_SUCCESS) return rc;
 
     /* land the source's memtable data in L1 so the clone captures every committed write */
@@ -286,7 +283,7 @@ static int engine_clone_cf_locked(tidesdb_t *db, const char *src_name, const cha
          * family after it gives its borrow back, so holding the registry alone does not keep a
          * planner off dst while its level set is rebuilt. claiming dst waits that planner out,
          * which is the quiesce cf_reload_levels requires */
-        rc = engine_cf_claim(dst);
+        rc = engine_claim_maintenance(&dst->compacting);
         if (rc == TDB_SUCCESS)
         {
             /* no rotation lock across the copy: that lock is what every committer takes to rotate

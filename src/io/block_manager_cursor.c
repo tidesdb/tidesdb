@@ -6,6 +6,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
+#include "base/errors.h"
 #include "block_manager_internal.h"
 
 /**
@@ -173,6 +174,21 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
     return 0;
 }
 
+/* retry only interrupted syscalls, leaving short reads and permanent errors to the block reader */
+static ssize_t bm_pread_retry(int fd, void *buf, size_t size, off_t offset)
+{
+    for (int attempt = 0; attempt < BM_READ_EINTR_MAX; attempt++)
+    {
+#ifdef TDB_FAULT_INJECTION
+        const ssize_t got = block_manager_fault_pread(fd, buf, size, offset);
+#else
+        const ssize_t got = pread(fd, buf, size, offset);
+#endif
+        if (got >= 0 || errno != EINTR) return got;
+    }
+    return -1;
+}
+
 /**
  * bm_read_block_tls
  * reads a full block (header + payload) at `offset` into the thread-local buffer.
@@ -186,21 +202,32 @@ int block_manager_cursor_skip_corrupt(block_manager_cursor_t *cursor)
  * @param payload_hint bytes of payload to fetch alongside the header, for a caller that already
  * knows the size; 0 or anything under the default asks for BM_READ_HINT_BYTES
  * @param out_size set to the payload size on success
+ * @param out_rc optional storage error or TDB_SUCCESS
  * @return pointer to the verified payload inside the TLS buffer, or NULL on failure
  */
 uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t extent_limit,
-                           const uint32_t payload_hint, uint32_t *out_size)
+                           const uint32_t payload_hint, uint32_t *out_size, int *out_rc)
 {
+    if (out_rc) *out_rc = TDB_ERR_IO;
     /* first pread -- header + a hint of payload in one syscall */
     const uint32_t hint = payload_hint > BM_READ_HINT_BYTES ? payload_hint : BM_READ_HINT_BYTES;
     uint8_t *buf = bm_get_read_buf(BLOCK_MANAGER_BLOCK_HEADER_SIZE + hint);
-    if (BM_UNLIKELY(!buf)) return NULL;
+    if (BM_UNLIKELY(!buf))
+    {
+        if (out_rc) *out_rc = TDB_ERR_MEMORY;
+        return NULL;
+    }
 
-    const ssize_t got = pread(fd, buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE + hint, (off_t)offset);
+    const ssize_t got =
+        bm_pread_retry(fd, buf, BLOCK_MANAGER_BLOCK_HEADER_SIZE + hint, (off_t)offset);
     if (BM_UNLIKELY(got < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE)) return NULL;
 
     const uint32_t size = decode_uint32_le_compat(buf);
-    if (BM_UNLIKELY(size == 0)) return NULL;
+    if (BM_UNLIKELY(size == 0))
+    {
+        if (out_rc) *out_rc = TDB_ERR_CORRUPTION;
+        return NULL;
+    }
     const uint32_t checksum = decode_uint32_le_compat(buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
 
     /* a block claiming to extend past the data extent is garbage (off-boundary
@@ -209,7 +236,11 @@ uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t e
     {
         const uint64_t frame_end =
             offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)size + BLOCK_MANAGER_FOOTER_SIZE;
-        if (BM_UNLIKELY(frame_end > extent_limit)) return NULL;
+        if (BM_UNLIKELY(frame_end > extent_limit))
+        {
+            if (out_rc) *out_rc = TDB_ERR_CORRUPTION;
+            return NULL;
+        }
     }
 
     /* payload bytes already in buf (the first read may also have pulled the footer
@@ -221,18 +252,27 @@ uint8_t *bm_read_block_tls(const int fd, const uint64_t offset, const uint64_t e
     {
         /* grow the TLS buffer if needed -- realloc preserves the bytes already read */
         buf = bm_get_read_buf(BLOCK_MANAGER_BLOCK_HEADER_SIZE + size);
-        if (BM_UNLIKELY(!buf)) return NULL;
+        if (BM_UNLIKELY(!buf))
+        {
+            if (out_rc) *out_rc = TDB_ERR_MEMORY;
+            return NULL;
+        }
 
         const off_t rem_offset = (off_t)offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have;
-        if (BM_UNLIKELY(pread(fd, buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have, size - have,
-                              rem_offset) != (ssize_t)(size - have)))
+        if (BM_UNLIKELY(bm_pread_retry(fd, buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE + have,
+                                       size - have, rem_offset) != (ssize_t)(size - have)))
             return NULL;
     }
 
     uint8_t *payload = buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (BM_UNLIKELY(verify_checksum(payload, size, checksum) != 0)) return NULL;
+    if (BM_UNLIKELY(verify_checksum(payload, size, checksum) != 0))
+    {
+        if (out_rc) *out_rc = TDB_ERR_CORRUPTION;
+        return NULL;
+    }
 
     *out_size = size;
+    if (out_rc) *out_rc = TDB_SUCCESS;
     return payload;
 }
 
@@ -254,7 +294,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     const uint64_t file_size = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
 
     uint32_t block_size = 0;
-    uint8_t *payload = bm_read_block_tls(bm->fd, offset, file_size, 0, &block_size);
+    uint8_t *payload = bm_read_block_tls(bm->fd, offset, file_size, 0, &block_size, NULL);
     if (BM_UNLIKELY(!payload)) return NULL;
 
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t) + block_size);
@@ -334,7 +374,7 @@ int block_manager_cursor_resync_past_hole(block_manager_cursor_t *cursor)
             /* validate the whole frame by re-reading it -- the checksum inside bm_read_block_tls is
              * the gate that rejects a false-positive magic */
             uint32_t validated_size = 0;
-            if (bm_read_block_tls(cursor->bm->fd, block_start, extent, 0, &validated_size) &&
+            if (bm_read_block_tls(cursor->bm->fd, block_start, extent, 0, &validated_size, NULL) &&
                 validated_size == fsize)
             {
                 cursor->current_pos = block_start;
@@ -613,7 +653,7 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
      * survives it */
     const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
     uint32_t block_size = 0;
-    uint8_t *payload = bm_read_block_tls(bm->fd, offset, extent, 0, &block_size);
+    uint8_t *payload = bm_read_block_tls(bm->fd, offset, extent, 0, &block_size, NULL);
     if (BM_UNLIKELY(!payload)) return -1;
 
     uint8_t *block_data = malloc(block_size);
@@ -627,12 +667,16 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
 
 const uint8_t *block_manager_borrow_block_data_at_offset(block_manager_t *bm, const uint64_t offset,
                                                          const uint32_t payload_hint,
-                                                         uint32_t *data_size)
+                                                         uint32_t *data_size, int *out_rc)
 {
-    if (!bm || !data_size) return NULL;
+    if (!bm || !data_size)
+    {
+        if (out_rc) *out_rc = TDB_ERR_INVALID_ARGS;
+        return NULL;
+    }
 
     /* the same untrusted-offset reasoning as the owning read above applies -- the frame is bounded
      * by the file before anything sizes a buffer from it */
     const uint64_t extent = atomic_load_explicit(&bm->current_file_size, memory_order_acquire);
-    return bm_read_block_tls(bm->fd, offset, extent, payload_hint, data_size);
+    return bm_read_block_tls(bm->fd, offset, extent, payload_hint, data_size, out_rc);
 }

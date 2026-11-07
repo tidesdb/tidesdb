@@ -25,6 +25,36 @@ static _Atomic(uint64_t) g_fault_count = 0;
 /* set once the torn write happened, so every later write fails outright */
 static _Atomic(int) g_fault_tripped = 0;
 
+static _Thread_local uint64_t read_fault_nth;
+static _Thread_local uint64_t read_fault_left;
+static _Thread_local uint64_t read_fault_count;
+static _Thread_local int read_fault_errno;
+
+void block_manager_fault_arm_read(uint64_t nth, uint64_t count, int error)
+{
+    read_fault_nth = nth;
+    read_fault_left = count;
+    read_fault_count = 0;
+    read_fault_errno = error;
+}
+
+uint64_t block_manager_fault_read_count(void)
+{
+    return read_fault_count;
+}
+
+ssize_t block_manager_fault_pread(int fd, void *buf, size_t size, off_t offset)
+{
+    read_fault_count++;
+    if (read_fault_nth != 0 && read_fault_count >= read_fault_nth && read_fault_left > 0)
+    {
+        read_fault_left--;
+        errno = read_fault_errno;
+        return -1;
+    }
+    return pread(fd, buf, size, offset);
+}
+
 void block_manager_fault_arm_torn(uint64_t nth)
 {
     atomic_store_explicit(&g_fault_count, 0, memory_order_relaxed);

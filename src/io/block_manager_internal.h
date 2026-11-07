@@ -14,7 +14,7 @@
 #include "io/block_manager.h"
 #include "xxhash.h"
 #ifdef TDB_FAULT_INJECTION
-#include "io/block_manager_fault.h" /* the pwrite_all crash-recovery test hook */
+#include "io/block_manager_fault.h" /* block-manager read and write test faults */
 #endif
 
 #define BM_UNLIKELY(x) TDB_UNLIKELY(x)
@@ -32,6 +32,9 @@
  * which is what the value log and the btree node read do; this value only governs the callers that
  * cannot know. */
 #define BM_READ_HINT_BYTES (4u * 1024u)
+
+/* an interrupted read transfers no bytes; cap retries so a signal storm cannot hold a caller */
+#define BM_READ_EINTR_MAX 100
 
 /* a block at or below this size is read without consulting the memory budget, covering every data
  * block and the common small footer block so the hot read path is just integer compares. blocks
@@ -238,6 +241,6 @@ int bm_wait_flushed(block_manager_t *bm, uint64_t need);
 
 /* cursor -- read one block at offset into the thread-local buffer, verifying its checksum */
 uint8_t *bm_read_block_tls(int fd, uint64_t offset, uint64_t extent_limit, uint32_t payload_hint,
-                           uint32_t *out_size);
+                           uint32_t *out_size, int *out_rc);
 
 #endif /* __BLOCK_MANAGER_INTERNAL_H__ */

@@ -251,19 +251,14 @@ int tidesdb_backup(tidesdb_t *db, const char *dir);
 
 ### Description
 
-Flushes the memtable, then copies the manifest, the shared value log, and every sstable the
-manifest references — all at a single manifest snapshot, with compaction held off, so the
-copy can never reference a file a merge deleted mid-copy.
+Returns a database directory that can be opened with
+[`tidesdb_open`](/reference/database#tidesdb_open). It contains a single point in the
+committed transaction history across all column families.
 
-The result is a database directory, not an archive. Point
-[`tidesdb_open`](/reference/database#tidesdb_open) at it and it opens.
-
-The database stays writable throughout, and the copy is a single point in time somewhere between
-the call and its return. It holds every write committed before the call, since the flush at the
-start lands them in sstables, plus every write that a later flush landed before the backup copied
-its manifest. Nothing past that point is included and nothing before it is missing, the same shape
-a crash at that moment would leave. To know exactly which writes made it, commit a marker key just
-before the call and treat it as the guaranteed floor.
+Backup lets in-flight writers finish, flushes their data, and captures the manifest, table
+inventory, and value-log lengths. New writers can wait during capture. They resume before the
+bulk file copies, while compaction and reclamation keep the captured files available.
+A prepared transaction still awaiting its decision is outside this committed snapshot.
 
 Cost and free space required are proportional to the live on-disk size.
 
@@ -279,7 +274,7 @@ Cost and free space required are proportional to the live on-disk size.
 | Code | Cause |
 | --- | --- |
 | `TDB_ERR_INVALID_ARGS` | `db` or `dir` is `NULL` |
-| `TDB_ERR_LOCKED` | A column family stayed under compaction for the whole freeze window, so it could not be copied at a consistent point. Retryable |
+| `TDB_ERR_LOCKED` | Backup timed out waiting for writers, a flush, compaction, or value-log reclamation. Retryable |
 | `TDB_ERR_MEMORY` | Allocation failed |
 | `TDB_ERR_IO` | The destination is nonempty, the directory could not be created or inspected, or a file could not be read or written |
 

@@ -627,7 +627,7 @@ int btree_node_read_with_codec(block_manager_t *bm, const int64_t offset, btree_
      * manager's default guess would otherwise cost a second syscall on every descent */
     uint32_t block_size = 0;
     const uint8_t *block_data_ptr = block_manager_borrow_block_data_at_offset(
-        bm, (uint64_t)offset, node_size_hint, &block_size);
+        bm, (uint64_t)offset, node_size_hint, &block_size, NULL);
     if (!block_data_ptr) return -1;
 
     const uint8_t *data = block_data_ptr;

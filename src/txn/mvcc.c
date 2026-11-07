@@ -40,6 +40,10 @@
 #define TDB_MVCC_VISIBLE_PARK_US  1000
 #define TDB_MVCC_VISIBLE_PARK_MAX 100000
 
+#define TDB_MVCC_BACKUP_STARTING UINT64_MAX
+#define TDB_MVCC_BACKUP_PARK_US  1000
+#define TDB_MVCC_BACKUP_PARK_MAX 60000
+
 tidesdb_mvcc_t *tidesdb_mvcc_create(void)
 {
     tidesdb_mvcc_t *m = calloc(1, sizeof(*m));
@@ -68,6 +72,7 @@ tidesdb_mvcc_t *tidesdb_mvcc_create(void)
     pthread_mutex_init(&m->visible_lock, NULL);
     (void)tdb_cond_init_monotonic(&m->visible_cv);
     atomic_init(&m->visible_waiters, 0);
+    atomic_init(&m->backup_bound, 0);
     pthread_mutex_init(&m->range_lock, NULL);
     m->orphans = NULL;
     pthread_mutex_init(&m->orphan_lock, NULL);
@@ -135,7 +140,7 @@ static uint64_t mvcc_take_seq(tidesdb_mvcc_t *m)
             (uint64_t)m->ring_capacity - 1)
             return 0;
         if (atomic_compare_exchange_weak_explicit(&m->global_seq, &seq, seq + 1,
-                                                  memory_order_acq_rel, memory_order_acquire))
+                                                  memory_order_seq_cst, memory_order_seq_cst))
             return seq;
     }
     return 0;
@@ -144,6 +149,38 @@ static uint64_t mvcc_take_seq(tidesdb_mvcc_t *m)
 uint64_t tidesdb_mvcc_current_seq(const tidesdb_mvcc_t *m)
 {
     return atomic_load_explicit(&m->global_seq, memory_order_acquire);
+}
+
+int tidesdb_mvcc_backup_begin(tidesdb_mvcc_t *m, uint64_t *out_bound)
+{
+    if (!m || !out_bound) return -1;
+    uint64_t idle = 0;
+    if (!atomic_compare_exchange_strong_explicit(&m->backup_bound, &idle, TDB_MVCC_BACKUP_STARTING,
+                                                 memory_order_seq_cst, memory_order_seq_cst))
+        return -1;
+    /* in the sequentially consistent order, a draw which passed its gate before STARTING
+     * already incremented global_seq. every later draw observes STARTING or the sampled bound. */
+    const uint64_t bound = atomic_load_explicit(&m->global_seq, memory_order_seq_cst);
+    atomic_store_explicit(&m->backup_bound, bound, memory_order_seq_cst);
+    *out_bound = bound;
+    return 0;
+}
+
+void tidesdb_mvcc_backup_end(tidesdb_mvcc_t *m)
+{
+    if (!m) return;
+    atomic_store_explicit(&m->backup_bound, 0, memory_order_seq_cst);
+}
+
+static int mvcc_backup_wait(tidesdb_mvcc_t *m, const uint64_t seq)
+{
+    for (int park = 0; park < TDB_MVCC_BACKUP_PARK_MAX; ++park)
+    {
+        const uint64_t bound = atomic_load_explicit(&m->backup_bound, memory_order_seq_cst);
+        if (bound != TDB_MVCC_BACKUP_STARTING && (bound == 0 || seq < bound)) return 0;
+        usleep(TDB_MVCC_BACKUP_PARK_US);
+    }
+    return -1;
 }
 
 /**
@@ -735,11 +772,13 @@ uint64_t tidesdb_mvcc_draw(tidesdb_mvcc_t *m, tidesdb_mvcc_commit_t *commit)
     {
         if (commit) atomic_store_explicit(&commit->seq, TDB_MVCC_SEQ_DRAWING, memory_order_release);
         atomic_thread_fence(memory_order_seq_cst);
-        seq = atomic_fetch_add_explicit(&m->global_seq, 1, memory_order_acq_rel);
+        seq = atomic_fetch_add_explicit(&m->global_seq, 1, memory_order_seq_cst);
     }
     tidesdb_mvcc_mark(m, seq, 0);
     if (commit) atomic_store_explicit(&commit->seq, seq, memory_order_release);
-    return seq;
+    if (mvcc_backup_wait(m, seq) == 0) return seq;
+    tidesdb_mvcc_mark_aborted(m, seq);
+    return 0;
 }
 
 void tidesdb_mvcc_commit_prepared(tidesdb_mvcc_commit_t *commit)

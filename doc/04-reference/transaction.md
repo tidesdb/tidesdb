@@ -842,6 +842,7 @@ successful commit.
 | `TDB_ERR_INVALID_ARGS` | `txn` is `NULL` or not active |
 | `TDB_ERR_TXN_EXPIRED` | The transaction is no longer active |
 | `TDB_ERR_TXN_ABORTED` | Another thread called `tidesdb_txn_request_abort` on the transaction |
+| `TDB_ERR_LOCKED` | Backup held write admission past the wait limit. Retry the whole transaction. |
 | `TDB_ERR_IO` | The write-ahead log append failed |
 | `TDB_ERR_MEMORY` | Allocation failed |
 
@@ -1034,6 +1035,7 @@ Once prepared, the transaction survives a restart:
 | `TDB_ERR_INVALID_ARGS` | `NULL` `txn` or `xid`, `xid_size` of 0, or a transaction not in the active state |
 | `TDB_ERR_TXN_EXPIRED` | The transaction is no longer active |
 | `TDB_ERR_TXN_ABORTED` | Another thread called `tidesdb_txn_request_abort` on the transaction |
+| `TDB_ERR_LOCKED` | Backup held write admission past the wait limit. Retry the whole transaction. |
 | `TDB_ERR_IO` / `TDB_ERR_MEMORY` | The prepare record could not be logged |
 
 ### See Also
@@ -1068,6 +1070,7 @@ can retry the same decision.
 | Code | Cause |
 | --- | --- |
 | `TDB_ERR_INVALID_ARGS` | `txn` is `NULL` or not prepared |
+| `TDB_ERR_LOCKED` | Backup held write admission past the wait limit. The transaction stays prepared. Retry the decision. |
 | `TDB_ERR_IO` / `TDB_ERR_MEMORY` | The decision could not be logged; the transaction stays prepared and the call may be retried |
 
 ## tidesdb_txn_rollback_prepared

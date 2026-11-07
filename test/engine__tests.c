@@ -18,6 +18,7 @@
 #include "../src/engine/engine_types.h"
 #include "../src/manifest/manifest.h" /* the inner txn a prefix delete is buffered on */
 #include "../src/txn/mvcc.h"          /* TDB_MVCC_COMMIT_RING_SIZE, the eviction window */
+#include "../src/txn/mvcc_internal.h" /* backup_bound, the physical-cut admission gate */
 #include "../src/txn/txn.h"           /* tdb_txn_delete_prefix, not yet a public call */
 #include "db.h"
 #include "test_utils.h"
@@ -74,6 +75,11 @@ static int tests_failed = 0;
 
 #define ENGINE_TEST_LOCKED_RETRIES    100
 #define ENGINE_TEST_LOCKED_BACKOFF_US 1000
+
+/* the delayed-apply backup regression waits for an intentionally split two-key apply to reach its
+ * interposition point. keep the test bounded if a future failure prevents either worker running. */
+#define ENGINE_BACKUP_APPLY_WAIT_TICKS 5000
+#define ENGINE_BACKUP_APPLY_WAIT_US    1000
 
 /* how many of those backoffs to spend waiting for the wal's flush thread to put staged records on
  * the device. under the default sync mode a commit stages its record and returns without waiting
@@ -2375,6 +2381,97 @@ void test_engine_backup(void)
 void test_engine_backup_existing_empty_directory(void)
 {
     engine_test_backup(1);
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    int (*apply)(void *ctx, const tidesdb_wal_entry_t *entries, int count);
+    pthread_t thread;
+    int rc;
+} engine_backup_race_t;
+
+static engine_backup_race_t *engine_backup_race;
+
+static void *engine_backup_runner(void *arg)
+{
+    engine_backup_race_t *race = arg;
+    race->rc = tidesdb_backup(race->db, ENGINE_TEST_BACKUP_DIR);
+    return NULL;
+}
+
+/* start the actual backup between the two entry writes of a single transaction. release the
+ * second entry when backup gates writers (fixed) or rotates the half-applied batch (regression). */
+static int engine_backup_split_apply(void *ctx, const tidesdb_wal_entry_t *entries, int count)
+{
+    engine_backup_race_t *race = engine_backup_race;
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(race->apply(ctx, entries, 1), 0);
+    const uint64_t generation = atomic_load(&race->db->active_wal_gen);
+    ASSERT_EQ(pthread_create(&race->thread, NULL, engine_backup_runner, race), 0);
+    for (int tick = 0; tick < ENGINE_BACKUP_APPLY_WAIT_TICKS; tick++)
+    {
+        if (atomic_load(&race->db->clock->backup_bound) != 0 ||
+            atomic_load(&race->db->active_wal_gen) != generation)
+            return race->apply(ctx, entries + 1, 1);
+        usleep(ENGINE_BACKUP_APPLY_WAIT_US);
+    }
+    ASSERT_TRUE(0);
+    return -1;
+}
+
+static void engine_test_backup_split_apply(int prepared)
+{
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_t *db = NULL;
+    tidesdb_column_family_t *cf = NULL;
+    engine_open_with_cf(db_path, &db, &cf);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)"first", 5, (const uint8_t *)"A", 1, 0),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (const uint8_t *)"second", 6, (const uint8_t *)"B", 1, 0),
+              TDB_SUCCESS);
+    if (prepared)
+    {
+        const uint8_t xid[] = "backup";
+        ASSERT_EQ(tidesdb_txn_prepare(txn, xid, sizeof(xid) - 1), TDB_SUCCESS);
+    }
+
+    engine_backup_race_t race = {.db = db, .apply = db->backend.apply, .rc = TDB_ERR_IO};
+    engine_backup_race = &race;
+    db->backend.apply = engine_backup_split_apply;
+    ASSERT_EQ(prepared ? tidesdb_txn_commit_prepared(txn) : tidesdb_txn_commit(txn), TDB_SUCCESS);
+    ASSERT_EQ(pthread_join(race.thread, NULL), 0);
+    ASSERT_EQ(race.rc, TDB_SUCCESS);
+    db->backend.apply = race.apply;
+    engine_backup_race = NULL;
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    char backup_path[] = ENGINE_TEST_BACKUP_DIR;
+    tidesdb_config_t cfg = engine_test_config(backup_path);
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "kv");
+    ASSERT_TRUE(cf != NULL);
+    engine_assert_committed(db, cf, "first", "A");
+    engine_assert_committed(db, cf, "second", "B");
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    (void)remove_directory(ENGINE_TEST_BACKUP_DIR);
+}
+
+void test_engine_backup_keeps_a_delayed_sequence_across_rotation(void)
+{
+    engine_test_backup_split_apply(0);
+}
+
+void test_engine_backup_keeps_a_delayed_prepared_decision_across_rotation(void)
+{
+    engine_test_backup_split_apply(1);
 }
 
 /* rejecting a backup into the live directory preserves the source across a reopen */
@@ -7774,6 +7871,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_checkpoint, tests_passed);
     RUN_TEST(test_engine_backup, tests_passed);
     RUN_TEST(test_engine_backup_existing_empty_directory, tests_passed);
+    RUN_TEST(test_engine_backup_keeps_a_delayed_sequence_across_rotation, tests_passed);
+    RUN_TEST(test_engine_backup_keeps_a_delayed_prepared_decision_across_rotation, tests_passed);
     RUN_TEST(test_engine_backup_rejects_nonempty_directory, tests_passed);
     RUN_TEST(test_engine_backup_rejects_source_directory, tests_passed);
     RUN_TEST(test_engine_list_column_families, tests_passed);

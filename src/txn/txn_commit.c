@@ -752,6 +752,14 @@ int txn_write_phase(tdb_txn_t *txn, const tdb_txn_backend_t *backend,
      * validation follows, since it orders this commit against the claims it meets by that sequence
      */
     const uint64_t seq = tidesdb_mvcc_draw(txn->clock, &txn->commit);
+    if (seq == 0)
+    {
+        txn_release_claims(txn);
+        txn->state = TDB_TXN_ABORTED;
+        txn_leave_registry(txn);
+        free(entries);
+        return TDB_ERR_LOCKED;
+    }
     for (int i = 0; i < count; i++) entries[i].seq = seq;
 
     if (txn->isolation > TDB_ISOLATION_READ_COMMITTED)

@@ -21,19 +21,15 @@ choose rather than one the engine chooses.
 
 `tidesdb_backup` writes a consistent, directly-openable copy into a directory you name.
 
-It flushes the memtable, then copies the manifest, the value log, and every sstable the manifest
-references — at a single manifest snapshot, with compaction held off, so the copy can never
-reference a file a merge deleted mid-copy.
+Backup waits for in-flight transactions to finish, flushes their data, and captures the
+manifest and the lengths of its files. New writing transactions can wait during this step.
+They can commit again while the value log and sstables are copied.
 
-**Write-ahead logs are deliberately not copied.** The flush at the start put every committed write
-into the sstables being copied, so a log would add nothing, and a log still being appended to would
-copy torn. That is also why the copy has nothing to replay when you open it.
+The copy includes the transactions committed at that point. A transaction still awaiting a
+two-phase decision has no committed data to copy. Write-ahead logs are omitted, since all
+committed writes at the cut are already in the sstables.
 
-- The database **stays writable** throughout.
-- The copy is **one point in time** between the call and its return. It holds every write committed
-  before the call, plus whatever a later flush landed before the backup copied its manifest, with
-  nothing past that point and nothing before it missing. Commit a marker key just before the call
-  if you need a guaranteed floor.
+- Commit a marker key before the call if you need a guaranteed lower bound on the copy.
 - Cost and free space needed are proportional to the live on-disk size.
 
 The result is a database directory, not an archive. Restore by pointing `tidesdb_open` at it, or

@@ -73,14 +73,11 @@ nothing is ever moved within the store — a segment is either unlinked whole or
 
 ## Reading
 
-A read resolves the id to a segment slot, an offset and a length under the index read lock, drops
-that lock, and only then takes a **reference on the segment** before fetching the block. It holds
-no lock a reclamation can take.
-
-The reference is acquired *after* the index lock is released rather than under it, which is what
-makes acquiring able to fail: a reclaim may retire the segment in that window. That is not an
-error but the answer — the id resolved to a segment that no longer exists, so the read reports
-the value absent rather than touching a file being unlinked.
+A read resolves the id to a segment slot, offset, and length under the index read lock.
+It takes a reference on the segment before releasing the lock. Reclamation must remove
+the id from the same index before it can retire the segment and reuse the slot. The
+reference therefore keeps the resolved file available through the read. The file I/O
+and checksum verification run after the reader releases the index lock.
 
 The reference is the whole lifetime protocol. It is the same
 [refcount with an evicting window](/internals/sstable#lifetime) the sstable uses: a segment rests

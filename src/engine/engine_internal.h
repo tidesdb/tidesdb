@@ -32,6 +32,14 @@
 #define ENGINE_WAL_GEN_LIST_INIT 8
 
 /**
+ * engine_claim_maintenance
+ * wait for exclusive use of a compaction or value-log reclamation flag
+ * @param flag the maintenance claim, released by storing zero when finished
+ * @return TDB_SUCCESS on acquisition or TDB_ERR_LOCKED when the bounded wait expires
+ */
+int engine_claim_maintenance(_Atomic(int) *flag);
+
+/**
  * engine_build_path
  * join a directory and a component name with the platform separator
  * @param dir the directory the name sits under

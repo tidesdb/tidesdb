@@ -8,6 +8,24 @@
  */
 #include "source.h"
 
+#include "sstable/vlog.h"
+
+tidesdb_source_result_t tidesdb_source_vlog_error(const int vlog_rc)
+{
+    switch (vlog_rc)
+    {
+        case VLOG_ERR_CORRUPTION:
+            return TDB_SOURCE_CORRUPTION;
+        case VLOG_ERR_MEMORY:
+            return TDB_SOURCE_MEMORY;
+        case VLOG_ERR_NOT_FOUND:
+        case VLOG_ERR_BUSY:
+            return TDB_SOURCE_BUSY;
+        default:
+            return TDB_SOURCE_IO;
+    }
+}
+
 tidesdb_source_result_t tidesdb_source_stack_range_has_newer(
     const tidesdb_source_t *sources, const int count, const uint32_t cf_index, const uint8_t *lo,
     const size_t lo_size, const uint8_t *hi, const size_t hi_size, const uint64_t seq_floor,
@@ -28,7 +46,7 @@ tidesdb_source_result_t tidesdb_source_stack_range_has_newer(
 
         const tidesdb_source_result_t r = s->range_has_newer(
             s->ctx, cf_index, lo, lo_size, hi, hi_size, seq_floor, seq_ceiling, newer);
-        if (r == TDB_SOURCE_BUSY) return TDB_SOURCE_BUSY;
+        if (r != TDB_SOURCE_FOUND && r != TDB_SOURCE_NOT_FOUND) return r;
         if (*newer) return TDB_SOURCE_FOUND; /* one is enough to decide the commit */
         if (r == TDB_SOURCE_FOUND) held = 1;
     }
@@ -52,7 +70,7 @@ tidesdb_source_result_t tidesdb_source_stack_get(const tidesdb_source_t *sources
         /* a hit wins immediately -- newest-first ordering makes it the newest visible version. a
          * busy source short-circuits rather than falling through to an older source and risking a
          * stale read, since the busy source might hold a newer version the reader must see */
-        if (r == TDB_SOURCE_FOUND || r == TDB_SOURCE_BUSY) return r;
+        if (r != TDB_SOURCE_NOT_FOUND) return r;
     }
     return TDB_SOURCE_NOT_FOUND;
 }
@@ -74,7 +92,7 @@ tidesdb_source_result_t tidesdb_source_stack_has_newer(const tidesdb_source_t *s
         {
             const tidesdb_source_result_t r =
                 s->has_newer(s->ctx, cf_index, key, key_size, seq_floor, seq_ceiling, newer);
-            if (r == TDB_SOURCE_FOUND || r == TDB_SOURCE_BUSY) return r;
+            if (r != TDB_SOURCE_NOT_FOUND) return r;
             continue;
         }
 
@@ -83,7 +101,7 @@ tidesdb_source_result_t tidesdb_source_stack_has_newer(const tidesdb_source_t *s
         if (!s->get) continue;
         tidesdb_source_version_t v;
         const tidesdb_source_result_t r = s->get(s->ctx, cf_index, key, key_size, seq_ceiling, &v);
-        if (r == TDB_SOURCE_BUSY) return r;
+        if (r != TDB_SOURCE_FOUND && r != TDB_SOURCE_NOT_FOUND) return r;
         if (r == TDB_SOURCE_FOUND)
         {
             *newer = v.seq > seq_floor;

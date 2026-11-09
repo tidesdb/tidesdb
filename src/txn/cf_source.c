@@ -202,8 +202,8 @@ static tidesdb_source_result_t cf_source_get(void *ctx, uint32_t cf_index, const
         {
             uint8_t *resolved = NULL;
             size_t resolved_len = 0;
-            if (vlog_read(cf->vlog, vlog_id, &resolved, &resolved_len) != VLOG_OK)
-                return TDB_SOURCE_BUSY;
+            const int rc = vlog_read(cf->vlog, vlog_id, &resolved, &resolved_len);
+            if (rc != VLOG_OK) return tidesdb_source_vlog_error(rc);
             best.value = resolved;
             best.value_size = resolved_len;
         }

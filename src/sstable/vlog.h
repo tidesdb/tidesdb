@@ -242,14 +242,13 @@ int vlog_write(vlog_t *vlog, const uint8_t *value, size_t value_len, const uint8
 
 /**
  * vlog_read
- * reads a value's block, verifies it, and returns the decompressed bytes. takes no lock a
- * reclamation holds, so a concurrent reclaim never delays a read
+ * pins the segment holding the id, then reads and verifies its block outside the index lock
  * @param vlog handle
  * @param id logical id from the klog entry, must not be VLOG_ID_INVALID
  * @param out_value receives a newly allocated buffer the caller frees
  * @param out_len receives the value length
- * @return VLOG_OK, VLOG_ERR_NOT_FOUND if the id is unknown, VLOG_ERR_CORRUPTION on a bad block,
- *         VLOG_ERR_MEMORY, or VLOG_ERR_IO
+ * @return VLOG_OK, VLOG_ERR_NOT_FOUND if the id is unknown, VLOG_ERR_BUSY on transient contention,
+ *         VLOG_ERR_CORRUPTION on a bad block, VLOG_ERR_MEMORY, or VLOG_ERR_IO
  */
 int vlog_read(vlog_t *vlog, vlog_id_t id, uint8_t **out_value, size_t *out_len);
 

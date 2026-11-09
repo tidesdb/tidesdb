@@ -8,6 +8,7 @@
  */
 #include "sstable/vlog.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -536,6 +537,12 @@ static int vlog_decode_value(const vlog_t *v, const uint8_t *payload, uint32_t p
     return VLOG_OK;
 }
 
+static int vlog_read_result(const int rc)
+{
+    if (rc == TDB_ERR_CORRUPTION) return VLOG_ERR_CORRUPTION;
+    return rc == TDB_ERR_MEMORY ? VLOG_ERR_MEMORY : VLOG_ERR_IO;
+}
+
 int vlog_read(vlog_t *v, vlog_id_t id, uint8_t **out_value, size_t *out_len)
 {
     if (!v || id == VLOG_ID_INVALID || !out_value || !out_len) return VLOG_ERR_INVALID;
@@ -551,21 +558,28 @@ int vlog_read(vlog_t *v, vlog_id_t id, uint8_t **out_value, size_t *out_len)
         offset = v->buckets[found].offset;
         value_len = v->buckets[found].value_len;
     }
+    /* reclaim takes the write lock to purge this id before reusing its slot. pin the resolved
+     * file here, then release the lock before reopening the descriptor or reading data. */
+    const int pinned = found != SIZE_MAX && vlog_segment_acquire(v, slot);
     pthread_rwlock_unlock(&v->index_rw);
 
     if (found == SIZE_MAX) return VLOG_ERR_NOT_FOUND;
-
-    /* the reference is what keeps the segment's file open across the read; a reclaim draining it
-     * concurrently waits for this to drop before it unlinks anything */
-    if (!vlog_segment_acquire(v, slot)) return VLOG_ERR_NOT_FOUND;
+    if (!pinned) return VLOG_ERR_BUSY;
 
     const uint32_t hint = (uint32_t)(VLOG_BLK_HDR_SIZE + value_len);
     uint32_t payload_len = 0;
-    const uint8_t *payload = block_manager_borrow_block_data_at_offset(
-        vlog_segment_ensure_open(v, slot), offset, hint, &payload_len);
+    int read = TDB_ERR_IO;
+    block_manager_t *bm = vlog_segment_ensure_open(v, slot);
+    if (!bm)
+    {
+        const int rc = errno == EMFILE || errno == ENFILE ? VLOG_ERR_BUSY : VLOG_ERR_IO;
+        vlog_segment_release(v, slot);
+        return rc;
+    }
+    const uint8_t *payload =
+        block_manager_borrow_block_data_at_offset(bm, offset, hint, &payload_len, &read);
     vlog_segment_release(v, slot);
-
-    if (!payload) return VLOG_ERR_IO;
+    if (!payload) return vlog_read_result(read);
     if (payload_len < VLOG_BLK_HDR_SIZE || decode_uint64_le_compat(payload) != id)
         return VLOG_ERR_CORRUPTION;
 

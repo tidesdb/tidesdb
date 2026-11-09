@@ -10,6 +10,7 @@
 #define __TIDESDB_TXN_SOURCE_H__
 
 #include "../compat.h"
+#include "base/errors.h"
 
 /* the pluggable read data-source abstraction. a transaction read of a given column family fans out
  * across, newest-first: the transaction's own uncommitted write buffer (read-your-own-writes); the
@@ -29,13 +30,25 @@
  * @param TDB_SOURCE_NOT_FOUND the source holds no version of the key visible at the snapshot
  * @param TDB_SOURCE_FOUND the source holds a visible version, returned in the out version
  * @param TDB_SOURCE_BUSY the source is transiently unavailable (e.g. layout moved mid-scan); retry
+ * @param TDB_SOURCE_CORRUPTION, _IO, _MEMORY terminal value-read failures
  */
 typedef enum
 {
     TDB_SOURCE_NOT_FOUND = 0,
     TDB_SOURCE_FOUND = 1,
-    TDB_SOURCE_BUSY = 2
+    TDB_SOURCE_BUSY = 2,
+    TDB_SOURCE_CORRUPTION = TDB_ERR_CORRUPTION,
+    TDB_SOURCE_IO = TDB_ERR_IO,
+    TDB_SOURCE_MEMORY = TDB_ERR_MEMORY
 } tidesdb_source_result_t;
+
+/**
+ * tidesdb_source_vlog_error
+ * translate a failed value-log read for the transaction layer
+ * @param vlog_rc value-log error code
+ * @return TDB_SOURCE_BUSY for a transient miss or contention, otherwise the terminal read error
+ */
+tidesdb_source_result_t tidesdb_source_vlog_error(int vlog_rc);
 
 /**
  * tidesdb_source_version_t
@@ -196,8 +209,8 @@ tidesdb_source_result_t tidesdb_source_stack_range_has_newer(const tidesdb_sourc
  * @param key_size length of key
  * @param snapshot the reader's snapshot sequence
  * @param out receives the winning version on TDB_SOURCE_FOUND (caller frees out->value)
- * @return TDB_SOURCE_FOUND with out set, TDB_SOURCE_NOT_FOUND if no source has the key, or
- *         TDB_SOURCE_BUSY if a source was transiently unavailable
+ * @return TDB_SOURCE_FOUND with out set, TDB_SOURCE_NOT_FOUND if no source has the key,
+ *         TDB_SOURCE_BUSY if a source was transiently unavailable, or a terminal value-read result
  */
 tidesdb_source_result_t tidesdb_source_stack_get(const tidesdb_source_t *sources, int count,
                                                  uint32_t cf_index, const uint8_t *key,

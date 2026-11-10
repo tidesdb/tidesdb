@@ -493,17 +493,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake
-      
+
       - name: Build TidesDB
         run: |
           cmake -S . -B build
           cmake --build build --config Release
-      
+
       - name: Create test database
         run: |
           TIDESDB_PORTABLE_DIR=./build/testdb ./build/portable_db_create
@@ -568,13 +568,13 @@ jobs:
           - os: ubuntu-latest
             name: Linux x86
             arch: x86
-    
+
     name: Test portability on ${{ matrix.name }}
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Download database
         uses: actions/download-artifact@v4
         with:
@@ -607,11 +607,11 @@ jobs:
           sudo apt update
           sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
             libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 build-essential cmake pkg-config
-      
+
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install zstd lz4 snappy
-      
+
       - name: Setup vcpkg binary cache (Windows MSVC)
         if: runner.os == 'Windows' && matrix.compiler == 'msvc'
         shell: pwsh
@@ -677,7 +677,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON
           cmake --build build --config Release
           cmake --install build
-      
+
       - name: Build TidesDB (Windows MinGW)
         if: matrix.compiler == 'mingw'
         shell: msys2 {0}
@@ -884,16 +884,24 @@ jobs:
           cmake --build build
           cmake --install build
 
+      - name: Create unprivileged user
+        run: |
+          # the container runs as root and TidesDB refuses to open as root, so the build and the
+          # tests run as a plain user. the base image has no such user; runuser itself ships in
+          # util-linux, which the image already has
+          useradd -m -u 54321 oracle
+          # the checkout action pulled the code as root
+          chown -R oracle:oracle "$GITHUB_WORKSPACE"
+
       - name: Configure CMake
-        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+        run: runuser -u oracle -- cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
 
       - name: Build
-        run: cmake --build build --config Release
+        run: runuser -u oracle -- cmake --build build --config Release
 
       - name: Run tests
         run: |
-          cd build
-          ctest -V --output-on-failure --timeout 5400 --build-config Release
+          runuser -u oracle -- bash -c "cd build && ctest -V --output-on-failure --timeout 5400 --build-config Release"
 
   fuzz:
     runs-on: ubuntu-latest

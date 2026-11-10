@@ -623,10 +623,46 @@ static int engine_open_threads(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
+#ifndef WIN32
+#ifdef TDB_TEST_INTERNALS
+static _Thread_local uid_t (*engine_geteuid_fn)(void) = geteuid;
+
+void engine_test_set_geteuid(uid_t (*fn)(void))
+{
+    engine_geteuid_fn = fn ? fn : geteuid;
+}
+#define ENGINE_GETEUID() engine_geteuid_fn()
+#else
+#define ENGINE_GETEUID() geteuid()
+#endif
+#endif
+
+static int engine_check_privileges(void)
+{
+/* Hard stop when someone tries opening the engine as root / with sudo */
+#ifndef WIN32
+    if (ENGINE_GETEUID() == 0) /* 0 is root's uid */
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "cannot open TidesDB as root; run as an unprivileged user. "
+                      "If the database is already owned by root, change its ownership "
+                      "to the intended user and group with: "
+                      "chown -R <user>:<group> <database_path>");
+
+        return TDB_ERR_ROOT_EXECUTION;
+    }
+#endif
+
+    return TDB_SUCCESS;
+}
+
 int engine_open(const tidesdb_config_t *config, tidesdb_t **out)
 {
     if (!config || !config->db_path || config->db_path[0] == '\0' || !out)
         return TDB_ERR_INVALID_ARGS;
+
+    int rc = engine_check_privileges();
+    if (rc != TDB_SUCCESS) return rc;
 
     tidesdb_t *db = calloc(1, sizeof(*db));
     if (!db) return TDB_ERR_MEMORY;
@@ -637,7 +673,7 @@ int engine_open(const tidesdb_config_t *config, tidesdb_t **out)
     /* each stage leaves whatever it opened on db, so one engine_close unwinds however far this got
      */
     int recovered = 0;
-    int rc = engine_open_init(db, config);
+    rc = engine_open_init(db, config);
     if (rc == TDB_SUCCESS) rc = engine_open_stores(db);
     if (rc == TDB_SUCCESS) rc = engine_open_recover(db, &recovered);
     if (rc == TDB_SUCCESS) rc = engine_open_txn(db);

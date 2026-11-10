@@ -60,11 +60,11 @@ void test_strerror_distinct_messages(void)
  * someone reads a log and finds an error that will not say what it is */
 void test_strerror_covers_every_public_code(void)
 {
-    static const int codes[] = {TDB_SUCCESS,          TDB_ERR_MEMORY,      TDB_ERR_INVALID_ARGS,
-                                TDB_ERR_NOT_FOUND,    TDB_ERR_IO,          TDB_ERR_CORRUPTION,
-                                TDB_ERR_EXISTS,       TDB_ERR_CONFLICT,    TDB_ERR_TOO_LARGE,
-                                TDB_ERR_MEMORY_LIMIT, TDB_ERR_INVALID_DB,  TDB_ERR_LOCKED,
-                                TDB_ERR_READONLY,     TDB_ERR_TXN_EXPIRED, TDB_ERR_NO_SPACE};
+    static const int codes[] = {
+        TDB_SUCCESS,       TDB_ERR_MEMORY,       TDB_ERR_INVALID_ARGS, TDB_ERR_NOT_FOUND,
+        TDB_ERR_IO,        TDB_ERR_CORRUPTION,   TDB_ERR_EXISTS,       TDB_ERR_CONFLICT,
+        TDB_ERR_TOO_LARGE, TDB_ERR_MEMORY_LIMIT, TDB_ERR_INVALID_DB,   TDB_ERR_LOCKED,
+        TDB_ERR_READONLY,  TDB_ERR_TXN_EXPIRED,  TDB_ERR_NO_SPACE,     TDB_ERR_ROOT_EXECUTION};
 
     for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++)
     {

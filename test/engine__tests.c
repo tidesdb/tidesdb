@@ -412,7 +412,8 @@ static void *engine_create_racer(void *arg)
 {
     engine_create_racer_t *r = (engine_create_racer_t *)arg;
     tidesdb_column_family_config_t cfc = tidesdb_default_column_family_config();
-    while (!atomic_load(r->go));
+    while (!atomic_load(r->go))
+        ;
     r->rc = tidesdb_create_column_family(r->db, "same_name", &cfc);
     return NULL;
 }

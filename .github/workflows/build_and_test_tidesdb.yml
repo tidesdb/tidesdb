@@ -85,7 +85,7 @@ jobs:
             crossbuild-essential-powerpc \
             gcc-powerpc-linux-gnu \
             g++-powerpc-linux-gnu \
-            qemu-user-static \
+            qemu-user-binfmt \
             build-essential cmake pkg-config \
             git wget
 
@@ -134,7 +134,7 @@ jobs:
             crossbuild-essential-riscv64 \
             gcc-riscv64-linux-gnu \
             g++-riscv64-linux-gnu \
-            qemu-user-static
+            qemu-user-binfmt
 
           mkdir -p /tmp/riscv64-deps
           cd /tmp/riscv64-deps
@@ -175,7 +175,7 @@ jobs:
             crossbuild-essential-powerpc \
             gcc-powerpc-linux-gnu \
             g++-powerpc-linux-gnu \
-            qemu-user-static \
+            qemu-user-binfmt \
             build-essential cmake pkg-config \
             git wget
 
@@ -346,7 +346,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
             -DCMAKE_C_FLAGS="-mlongcall" \
             -DCMAKE_FIND_ROOT_PATH=/usr/powerpc-linux-gnu \
-            -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-ppc-static;-L;/usr/powerpc-linux-gnu" \
+            -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-ppc;-L;/usr/powerpc-linux-gnu" \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
@@ -367,7 +367,7 @@ jobs:
             -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
             -DCMAKE_FIND_ROOT_PATH=/usr/riscv64-linux-gnu \
-            -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-riscv64-static;-L;/usr/riscv64-linux-gnu" \
+            -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-riscv64;-L;/usr/riscv64-linux-gnu" \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \

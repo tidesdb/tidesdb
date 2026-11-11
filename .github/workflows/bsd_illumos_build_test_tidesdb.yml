@@ -276,6 +276,8 @@ jobs:
             mkdir -p /usr/local/etc/pkg/repos
             echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
             echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
+            pkg update -f
+            pkg upgrade -y openssl libressl curl || true
             pkg install -y pkgconf liblz4 zstd snappy
             pkg install -y cmake rsync
           run: |

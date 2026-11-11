@@ -208,7 +208,7 @@ jobs:
 
   omnios-build:
     runs-on: ubuntu-latest
-    name: OmniOS (Illumos) r151058
+    name: OmniOS (Illumos) r151060
 
     steps:
       - name: Checkout repository
@@ -217,12 +217,12 @@ jobs:
       - name: Build and test on OmniOS (Illumos)
         uses: vmactions/omnios-vm@v1
         with:
-          release: "r151058"
+          release: "r151060"
           usesh: true
           sync: rsync
           copyback: false
           prepare: |
-            pkg set-publisher -G '*' -g https://pkg.omnios.org/r151058/extra extra.omnios || true
+            pkg set-publisher -G '*' -g https://pkg.omnios.org/r151060/extra extra.omnios || true
             pkg install ooce/developer/cmake gcc13 lz4 zstd
           run: |
             echo "*=====================================*"

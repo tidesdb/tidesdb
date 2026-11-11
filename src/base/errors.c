@@ -50,6 +50,8 @@ const char *tidesdb_strerror(const int code)
             return "transaction aborted by another thread";
         case TDB_ERR_TOO_OLD:
             return "sequence is older than the oldest reconstructable point in time";
+        case TDB_ERR_ROOT_EXECUTION:
+            return "cannot open as root; database files would be owned by root";
         default:
             return "unknown error";
     }

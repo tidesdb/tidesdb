@@ -525,6 +525,39 @@ void test_engine_open_keeps_the_duplicate_name_that_holds_data(void)
     engine_open_duplicate_name(ENGINE_TEST_DUP_EMPTY);
 }
 
+#ifndef WIN32
+static uid_t engine_test_fake_root_euid(void)
+{
+    return 0;
+}
+#endif
+
+/* opening as root is refused before anything touches the directory, so no root-owned files land on
+ * disk */
+void test_engine_open_as_root(void)
+{
+#ifndef WIN32
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+    char db_path[] = ENGINE_TEST_DB_DIR;
+    tidesdb_config_t cfg = engine_test_config(db_path);
+
+    engine_test_set_geteuid(engine_test_fake_root_euid);
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_ERR_ROOT_EXECUTION);
+    ASSERT_TRUE(db == NULL);
+    engine_test_set_geteuid(NULL); /* restore before anything else can fail */
+
+    /* the check runs before engine_open_init, so the directory was never created */
+    struct stat st;
+    ASSERT_TRUE(stat(ENGINE_TEST_DB_DIR, &st) != 0);
+
+    /* and a normal open still works */
+    ASSERT_EQ(tidesdb_open(&cfg, &db), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    (void)remove_directory(ENGINE_TEST_DB_DIR);
+#endif
+}
+
 /* a committed put reads back within its own transaction and from a later one */
 void test_engine_txn_put_get(void)
 {
@@ -7950,6 +7983,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_engine_abandoned_prepares_keep_their_keys_held, tests_passed);
     RUN_TEST(test_engine_copy_file_checks_expected_length, tests_passed);
     RUN_TEST(test_engine_raise_open_file_limit, tests_passed);
+    RUN_TEST(test_engine_open_as_root, tests_passed);
 #ifdef __linux__
     RUN_TEST(test_engine_copy_file_rejects_aliases, tests_passed);
     RUN_TEST(test_engine_copy_file_reports_a_failed_sync, tests_passed);

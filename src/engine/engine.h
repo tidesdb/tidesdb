@@ -901,4 +901,15 @@ int engine_iter_ttl(tidesdb_iter_t *it, int64_t *ttl);
 int engine_iter_key_value(tidesdb_iter_t *it, uint8_t **key, size_t *key_size, uint8_t **value,
                           size_t *value_size);
 
+#if defined(TDB_TEST_INTERNALS) && !defined(WIN32)
+#include <sys/types.h>
+/**
+ * engine_test_set_geteuid
+ * replace the effective-uid source engine_open checks, so a test can pose as root without being
+ * root. thread-local; NULL restores geteuid
+ * @param fn the uid source, or NULL for the real one
+ */
+void engine_test_set_geteuid(uid_t (*fn)(void));
+#endif
+
 #endif /* __TIDESDB_ENGINE_H__ */

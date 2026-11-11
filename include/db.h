@@ -163,6 +163,12 @@ typedef enum
  * whatever survived instead of what was true */
 #define TDB_ERR_TOO_OLD -17
 
+/*
+ * the user tried opening the engine as root, which is not permitted since ownership of the database
+ * would belong to the root user, and reopening the engine as regular user would fail.
+ */
+#define TDB_ERR_ROOT_EXECUTION -18
+
 /**
  * tidesdb_strerror
  * a short human-readable description of a result code, for logging and error messages
